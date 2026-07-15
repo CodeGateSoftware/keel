@@ -31,3 +31,5 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+# UP042: the design spec pins `class X(str, Enum)` explicitly (not `StrEnum`) for these types.
+ignore = ["UP042"]
