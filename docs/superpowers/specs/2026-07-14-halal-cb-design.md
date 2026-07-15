@@ -1,7 +1,7 @@
 # halal-cb — Design Spec
 
 **Date:** 2026-07-14
-**Status:** Approved design — ready for implementation planning
+**Status:** ⚠️ SUPERSEDED by `2026-07-15-halal-cb-autotrade-design.md` — that spec extends this preview-only advisory MVP into an autonomous auto-trading agent (SQLite tracking, rule engine, safety rails). This doc remains the record of the original advisory design.
 **Author:** Elmehdi Aitbrahim (with Claude)
 
 ---
