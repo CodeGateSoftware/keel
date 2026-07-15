@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# databases
+*.db
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# os
+.DS_Store
