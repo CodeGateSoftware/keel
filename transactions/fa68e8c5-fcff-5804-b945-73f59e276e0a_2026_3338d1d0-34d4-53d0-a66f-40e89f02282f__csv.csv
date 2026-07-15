@@ -1,0 +1,7 @@
+
+Transactions
+User,Elmehdi Aitbrahim,fa68e8c5-fcff-5804-b945-73f59e276e0a
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+697c0bcbf9ac3ae221aea6e0,2026-01-30 01:39:23 UTC,Advanced Trade Buy,BTC,0.00060264,USD,$82967.13,$49.99931,$49.99931,$0.00,Bought 0.00060264 BTC for 49.9993112232 USDC on BTC-USDC at 82967.13 USDC/BTC,,
+697b9d1a5ae3c50ce9bbf305,2026-01-29 17:47:06 UTC,Buy,USDC,50,USD,$1.00,$50.00,$50.00,$0.00,Bought 50 USDC for 50 USD using Bank of America - Adv ... ****8233,,
+69766495c6c5bc95fe7aac96,2026-01-25 18:44:37 UTC,Advanced Trade Buy,BTC,0.00034472,USD,$87025.00,$29.99926,$29.99926,$0.00,Bought 0.00034472 BTC for 29.999258 USD on BTC-USD at 87025 USD/BTC,,

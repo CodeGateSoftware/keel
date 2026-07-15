@@ -1,0 +1,10 @@
+
+Transactions
+User,Elmehdi Aitbrahim,fa68e8c5-fcff-5804-b945-73f59e276e0a
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+6a187e6a01f119fd3e83f290,2026-05-28 17:42:02 UTC,Reward Income,USDC,0.013329,USD,$1.00,$0.01333,$0.01333,$0.00,Received 0.013329 USDC from Coinbase Rewards,,
+6a17b3f56e9405b018c7098e,2026-05-28 03:18:13 UTC,Advanced Trade Buy,BTC,0.00013606,USD,$73492.65,$9.99941,$9.99941,$0.00,Bought 0.00013606 BTC for 9.999409959 USDC on BTC-USDC at 73492.65 USDC/BTC,,
+6a0f3f5c47529cc4b585850d,2026-05-21 17:22:36 UTC,Reward Income,USDC,0.017087,USD,$1.00,$0.01709,$0.01709,$0.00,Received 0.017087 USDC from Coinbase Rewards,,
+6a0724dbe5af3e02743cbb59,2026-05-15 13:51:23 UTC,Advanced Trade Buy,ETH,0.00451292,USD,$2215.86,$10.00,$10.00,$0.00,Bought 0.00451292 ETH for 9.9999989112 USDC on ETH-USDC at 2215.86 USDC/ETH,,
+6a06022fc50e0b825bb7ed56,2026-05-14 17:11:11 UTC,Reward Income,USDC,0.019902,USD,$1.00,$0.01990,$0.01990,$0.00,Received 0.019902 USDC from Coinbase Rewards,,
+69fcd21da49629632ebae58b,2026-05-07 17:55:41 UTC,Reward Income,USDC,0.019888,USD,$1.00,$0.01989,$0.01989,$0.00,Received 0.019888 USDC from Coinbase Rewards,,

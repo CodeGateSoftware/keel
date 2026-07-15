@@ -1,0 +1,21 @@
+
+Transactions
+User,Elmehdi Aitbrahim,fa68e8c5-fcff-5804-b945-73f59e276e0a
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+69a05c52c33f369b423a9838,2026-02-26 14:44:34 UTC,Reward Income,USDC,0.033038,USD,$1.00,$0.03304,$0.03304,$0.00,Received 0.033038 USDC from Coinbase Rewards,,
+699d1ff3c25b8c3569af0879,2026-02-24 03:50:11 UTC,Advanced Trade Buy,BTC,0.00047318,USD,$63400.00,$29.99961,$29.99961,$0.00,Bought 0.00047318 BTC for 29.999612 USDC on BTC-USDC at 63400 USDC/BTC,,
+699cfbf1dc38cdfb1b5721fc,2026-02-24 01:16:33 UTC,Advanced Trade Buy,ETH,0.00549979,USD,$1818.25,$9.99999,$9.99999,$0.00,Bought 0.00549979 ETH for 9.9999931675 USDC on ETH-USDC at 1818.25 USDC/ETH,,
+699cb9843cc58f41e2f2254a,2026-02-23 20:33:08 UTC,Buy,USDC,10,USD,$1.00,$10.00,$10.00,$0.00,Bought 10 USDC for 10 USD using Bank of America - Adv ... ****8233,,
+699cb855c7d0c32e2031fe34,2026-02-23 20:28:05 UTC,Buy,USDC,30,USD,$1.00,$30.00,$30.00,$0.00,Bought 30 USDC for 30 USD using Bank of America - Adv ... ****8233,,
+699bb17b3c3b2345547c854d,2026-02-23 01:46:35 UTC,Advanced Trade Buy,BTC,0.00076923,USD,$65000.00,$49.99995,$49.99995,$0.00,Bought 0.00076923 BTC for 49.99995 USDC on BTC-USDC at 65000 USDC/BTC,,
+699727190bbbc50d39e71e50,2026-02-19 15:07:05 UTC,Reward Income,USDC,0.033023,USD,$1.00,$0.03302,$0.03302,$0.00,Received 0.033023 USDC from Coinbase Rewards,,
+698de7b0dcdfd5678cee3770,2026-02-12 14:46:08 UTC,Reward Income,USDC,0.014151,USD,$1.00,$0.01415,$0.01415,$0.00,Received 0.014151 USDC from Coinbase Rewards,,
+6985dd71b57b02a331ef46cf,2026-02-06 12:24:17 UTC,Buy,BTC,0.00014951,USD,$66231.53,$9.90228,$10.00,0.0977239497,Bought 0.00014951 BTC for 10 USD using Bank of America - Adv ... ****8233,,
+6985dc4fcef1adebfba02c0e,2026-02-06 12:19:27 UTC,Buy,USDC,50,USD,$1.00,$50.00,$50.00,$0.00,Bought 50 USDC for 50 USD using Bank of America - Adv ... ****8233,,
+6984dfecbcea3b16051fbc6a,2026-02-05 18:22:36 UTC,Advanced Trade Buy,ETH,0.00517826,USD,$1931.15,$10.00,$10.00,$0.00,Bought 0.00517826 ETH for 9.999996799 USDC on ETH-USDC at 1931.15 USDC/ETH,,
+6984d1629e593f9ee5802604,2026-02-05 17:20:34 UTC,Advanced Trade Buy,BTC,0.00075187,USD,$66500.00,$49.99936,$49.99936,$0.00,Bought 0.00075187 BTC for 49.999355 USDC on BTC-USDC at 66500 USDC/BTC,,
+6984c9abc5d546b094fea1b6,2026-02-05 16:47:39 UTC,Buy,XRP,7.778738,USD,$1.2715,$9.89067,$10.00,0.109334633,Bought 7.778738 XRP for 10 USD using Bank of America - Adv ... ****8233,,
+6984c8f4a6490945f0ea2457,2026-02-05 16:44:36 UTC,Buy,USDC,10,USD,$1.00,$10.00,$10.00,$0.00,Bought 10 USDC for 10 USD using Bank of America - Adv ... ****8233,,
+6984c8bbcca988122382ae3b,2026-02-05 16:43:39 UTC,Buy,BTC,0.00073024,USD,$67826.74,$49.52980,$50.00,0.4702013824,Bought 0.00073024 BTC for 50 USD using Bank of America - Adv ... ****8233,,
+6984c87d56b529c157350dfe,2026-02-05 16:42:37 UTC,Buy,USDC,50,USD,$1.00,$50.00,$50.00,$0.00,Bought 50 USDC for 50 USD using Bank of America - Adv ... ****8233,,
+6984acba73cea4cb3e39807c,2026-02-05 14:44:10 UTC,Reward Income,USDC,0.004716,USD,$1.00,$0.00472,$0.00472,$0.00,Received 0.004716 USDC from Coinbase Rewards,,

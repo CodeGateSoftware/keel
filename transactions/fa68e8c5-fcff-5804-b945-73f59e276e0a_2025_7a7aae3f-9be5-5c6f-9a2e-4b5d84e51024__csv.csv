@@ -1,0 +1,17 @@
+
+Transactions
+User,Elmehdi Aitbrahim,fa68e8c5-fcff-5804-b945-73f59e276e0a
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+68dc3a99f41df3999a013347,2025-09-30 20:16:25 UTC,Convert,XRP,3.399706,USD,$2.85945,$9.72129,$10.00129,0.1,Converted 10 USDC to 3.399706 XRP,,
+68dc3a9970c6a8f355009730,2025-09-30 20:16:25 UTC,Convert,USDC,-10,USD,$1.00,$10.00,$10.00,$0.00,Converted 10 USDC to 3.399706 XRP,,
+68dc3a73f1ca78cac6773da9,2025-09-30 20:15:47 UTC,Convert,BTC,0.00034036,USD,$114194.285,$38.86717,$40.00717,0.4,Converted 40 USDC to 0.00034036 BTC,,
+68dc3a73f1ca78cac6773da3,2025-09-30 20:15:47 UTC,Convert,USDC,-40,USD,$1.00,$40.00,$40.00,$0.00,Converted 40 USDC to 0.00034036 BTC,,
+68dc3a4ac1469daf1db5161c,2025-09-30 20:15:06 UTC,Buy,USDC,50,USD,$1.00,$50.00,$50.00,$0.00,Bought 50 USDC for 50 USD using Bank of America - Adv ... ****8233,,
+68da92b8612bed3d8ccd6b04,2025-09-29 14:07:52 UTC,Convert,XRP,6.728189,USD,$2.8883,$19.43303,$20.00303,0.2,Converted 20 USDC to 6.728189 XRP,,
+68da92b763e37eed0dc80601,2025-09-29 14:07:51 UTC,Convert,USDC,-20,USD,$1.00,$20.00,$20.00,$0.00,Converted 20 USDC to 6.728189 XRP,,
+68da9277694620e7713eb51e,2025-09-29 14:06:47 UTC,Convert,BTC,0.00068533,USD,$113439.68,$77.74362,$80.01362,0.8,Converted 80 USDC to 0.00068533 BTC,,
+68da927618df99e7c407d5ae,2025-09-29 14:06:46 UTC,Convert,USDC,-80,USD,$1.00,$80.00,$80.00,$0.00,Converted 80 USDC to 0.00068533 BTC,,
+68da91bd8b5394366278d177,2025-09-29 14:03:41 UTC,Buy,USDC,100,USD,$1.00,$100.00,$100.00,$0.00,Bought 100 USDC for 100 USD using Bank of America - Adv ... ****8233,,
+68bd22a45e33224e8847142c,2025-09-07 06:13:56 UTC,Incentives Rewards Payout,BTC,0.0000271260971547,USD,$110594.605,$3.00,$3.00,$0.00,,,
+68bb17a5fecd409373f71aec,2025-09-05 17:02:29 UTC,Buy,XRP,10.369718,USD,$2.81165,$29.15602,$30.00,0.2939823853,Bought 10.369718 XRP for 30 USD using Cash (USD),,
+68bb174fa40e8d953ab3dffe,2025-09-05 17:01:03 UTC,Deposit,USD,30,USD,$1.00,$30.00,$30.00,$0.00,Deposit from Bank of America - Adv ... ****8233,,
