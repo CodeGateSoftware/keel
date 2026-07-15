@@ -14,8 +14,10 @@
 trading strategy on a dedicated Coinbase Advanced portfolio. It extends the original advisory tool into
 a system that:
 
-1. **Tracks everything in a SQLite database** — imports historical transactions from `transactions/*.csv`,
-   records all future (paper + live) trades, and computes P&L over time.
+1. **Tracks everything in a SQLite database** — imports historical transactions from `transactions/*.csv`
+   **and records every future transaction the agent conducts** (every previewed, placed, and filled order —
+   paper and live — written to the DB before and after execution as part of the audit trail, §6/§14), then
+   computes P&L over time. No agent-conducted transaction goes unrecorded.
 2. **Monitors the market** on a schedule (spot + candles for the allowlist and current holdings) and
    evaluates a **curated, data-tuned rule library** via a **confluence-scoring engine (CTS)**.
 3. **Executes trades** with a **confirm/bypass toggle** — confirmation required by default; when bypassed,
