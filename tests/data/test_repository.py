@@ -216,3 +216,133 @@ def test_set_state_overwrites_existing_key(repo):
     repo.set_state("kill_switch", True)
 
     assert repo.get_state("kill_switch") is True
+
+
+# -- rules -------------------------------------------------------------------
+
+
+def test_insert_rule_returns_id_and_defaults_status_to_candidate(repo):
+    rule_id = repo.insert_rule("pullback_continuation", {"lookback": 20})
+
+    assert isinstance(rule_id, int)
+    rows = repo.get_rules()
+    assert len(rows) == 1
+    assert rows[0]["id"] == rule_id
+    assert rows[0]["kind"] == "pullback_continuation"
+    assert rows[0]["params"] == {"lookback": 20}
+    assert rows[0]["status"] == "candidate"
+    assert rows[0]["created_at"] is not None
+
+
+def test_insert_rule_accepts_explicit_status(repo):
+    rule_id = repo.insert_rule("dca", {"budget_usd": 50}, status="live")
+
+    row = repo.get_rules()[0]
+    assert row["id"] == rule_id
+    assert row["status"] == "live"
+
+
+def test_insert_rule_ids_increment(repo):
+    id1 = repo.insert_rule("rsi_meanrev", {})
+    id2 = repo.insert_rule("rsi_meanrev", {})
+
+    assert id2 > id1
+
+
+def test_get_rules_filters_by_status(repo):
+    repo.insert_rule("a", {}, status="candidate")
+    repo.insert_rule("b", {}, status="live")
+    repo.insert_rule("c", {}, status="live")
+
+    live = repo.get_rules(status="live")
+    assert {r["kind"] for r in live} == {"b", "c"}
+
+    all_rules = repo.get_rules()
+    assert len(all_rules) == 3
+
+
+def test_update_rule_status_updates_status_and_promoted_at(repo):
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="candidate")
+
+    repo.update_rule_status(rule_id, "paper")
+
+    row = repo.get_rules()[0]
+    assert row["status"] == "paper"
+    assert row["promoted_at"] is not None
+    assert row["demoted_at"] is None
+
+
+def test_update_rule_status_to_disabled_sets_demoted_at(repo):
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="live")
+
+    repo.update_rule_status(rule_id, "disabled")
+
+    row = repo.get_rules()[0]
+    assert row["status"] == "disabled"
+    assert row["demoted_at"] is not None
+
+
+# -- orders (get_orders) ------------------------------------------------------
+
+
+def test_get_orders_filters_by_mode_product_and_status(repo):
+    repo.insert_order(_order(mode="paper", product_id="BTC-USD", status="filled"))
+    repo.insert_order(_order(mode="paper", product_id="ETH-USD", status="pending"))
+    repo.insert_order(_order(mode="live", product_id="BTC-USD", status="filled"))
+
+    paper_orders = repo.get_orders(mode="paper")
+    assert len(paper_orders) == 2
+    assert all(o["mode"] == "paper" for o in paper_orders)
+
+    btc_paper = repo.get_orders(mode="paper", product_id="BTC-USD")
+    assert len(btc_paper) == 1
+    assert btc_paper[0]["product_id"] == "BTC-USD"
+
+    filled = repo.get_orders(status="filled")
+    assert len(filled) == 2
+
+    everything = repo.get_orders()
+    assert len(everything) == 3
+
+
+def test_get_orders_ordered_by_id_and_decodes_decimal(repo):
+    id1 = repo.insert_order(_order())
+    id2 = repo.insert_order(_order())
+
+    rows = repo.get_orders()
+    assert [r["id"] for r in rows] == [id1, id2]
+    assert rows[0]["qty"] == Decimal("0.5")
+
+
+# -- signals -------------------------------------------------------------------
+
+
+def _signal(**overrides: Any) -> dict[str, Any]:
+    base = dict(
+        rule_id=None,
+        product_id="BTC-USD",
+        ts=1_700_000_000,
+        indicators='{"cts_factors": []}',
+        cts_score="5",
+        fired=1,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_insert_signal_returns_id_and_round_trips(repo):
+    signal_id = repo.insert_signal(_signal())
+
+    assert isinstance(signal_id, int)
+    row = repo._conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+    assert row["product_id"] == "BTC-USD"
+    assert row["ts"] == 1_700_000_000
+    assert row["cts_score"] == "5"
+    assert row["fired"] == 1
+
+
+def test_insert_signal_ids_increment(repo):
+    id1 = repo.insert_signal(_signal())
+    id2 = repo.insert_signal(_signal())
+
+    assert id2 > id1
