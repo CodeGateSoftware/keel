@@ -14,16 +14,29 @@ In production, inject the real client:
     transport = RESTClient(api_key=secrets["api_key"], api_secret=secrets["api_secret"])
     client = CoinbaseClient(transport)
 
-Order *placement* is intentionally out of scope for Phase 1 -- `place_order` raises
-`NotImplementedError` until halal review + risk rails land in Phase 3.
+`place_order` talks to the live order-creation endpoint. It performs **no halal/risk checks
+itself** -- callers (the Phase-3 executor + guards) must run rails and any confirm-mode gate
+before calling it; `cb_client` stays a thin, dumb transport wrapper.
 """
 
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
 from halal_cb.types import Candle, Granularity, Side
+
+# `order_configuration` nests exactly one config-type key (e.g. "market_market_ioc",
+# "limit_limit_gtc", "stop_limit_stop_limit_gtc") whose value carries these size/price fields
+# as strings -- decimal-map them the same way the other money fields are mapped.
+_ORDER_CONFIG_DECIMAL_FIELDS = (
+    "quote_size",
+    "base_size",
+    "limit_price",
+    "stop_price",
+    "stop_trigger_price",
+)
 
 
 class Transport(Protocol):
@@ -41,6 +54,15 @@ class Transport(Protocol):
         self, product_id: str, side: str, order_configuration: dict, **kwargs: Any
     ) -> Any: ...
 
+    def create_order(
+        self,
+        client_order_id: str,
+        product_id: str,
+        side: str,
+        order_configuration: dict,
+        **kwargs: Any,
+    ) -> Any: ...
+
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:
     """Read `key` from a plain dict OR a `coinbase-advanced-py` `BaseResponse` object.
@@ -52,6 +74,30 @@ def _field(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _decimal_map_order_configuration(raw: Any) -> dict[str, dict[str, Any]]:
+    """Decimal-map size/price fields nested one level inside `order_configuration`.
+
+    `order_configuration` is `{config_type: {field: value, ...}}` (e.g.
+    `{"market_market_ioc": {"quote_size": "100.00"}}`) -- as a plain dict from fixtures, or as
+    the `coinbase-advanced-py` `OrderConfiguration` wrapper (attrs) wrapping a nested wrapper
+    object, matching however `_field` above distinguishes dicts from `BaseResponse` objects.
+    """
+    if not raw:
+        return {}
+    config_items = raw.items() if isinstance(raw, dict) else vars(raw).items()
+
+    mapped: dict[str, dict[str, Any]] = {}
+    for config_type, config in config_items:
+        if config is None:
+            continue
+        config_dict = dict(config) if isinstance(config, dict) else dict(vars(config))
+        for field in _ORDER_CONFIG_DECIMAL_FIELDS:
+            if config_dict.get(field) is not None:
+                config_dict[field] = Decimal(config_dict[field])
+        mapped[config_type] = config_dict
+    return mapped
 
 
 def _candle_from_raw(raw: Any) -> Candle:
@@ -136,8 +182,43 @@ class CoinbaseClient:
         result["warning"] = _field(response, "warning", []) or []
         return result
 
-    def place_order(
-        self, product_id: str, side: Side, order_configuration: dict
-    ) -> dict:
-        """Order placement is out of Phase-1 scope -- added in Phase 3 with halal + risk rails."""
-        raise NotImplementedError("Order placement is added in Phase 3")
+    def place_order(self, product_id: str, side: Side, order_configuration: dict) -> dict:
+        """Place a live order -- supports market/limit/stop configs, no funds-moving retries.
+
+        Callers (the Phase-3 executor) are responsible for running rails/guards and any
+        confirm-mode gate *before* calling this -- `place_order` itself performs no risk
+        checks, it only talks to the transport and normalizes the response. A fresh
+        `client_order_id` is generated per call for idempotency on the Coinbase side.
+        """
+        side_str = side.value if isinstance(side, Side) else side
+        client_order_id = str(uuid.uuid4())
+        response = self._transport.create_order(
+            client_order_id=client_order_id,
+            product_id=product_id,
+            side=side_str,
+            order_configuration=order_configuration,
+        )
+
+        success = bool(_field(response, "success", False))
+        success_response = _field(response, "success_response") or {}
+        error_response = _field(response, "error_response") or {}
+        raw_order_configuration = _field(response, "order_configuration")
+
+        result: dict[str, Any] = {
+            "success": success,
+            "order_id": _field(success_response, "order_id"),
+            "product_id": _field(success_response, "product_id", product_id),
+            "side": _field(success_response, "side", side_str),
+            "client_order_id": _field(success_response, "client_order_id", client_order_id),
+            "order_configuration": _decimal_map_order_configuration(raw_order_configuration),
+            "error": None,
+        }
+        if not success:
+            result["error"] = {
+                "error": _field(error_response, "error"),
+                "message": _field(error_response, "message"),
+                "error_details": _field(error_response, "error_details"),
+                "preview_failure_reason": _field(error_response, "preview_failure_reason"),
+                "new_order_failure_reason": _field(error_response, "new_order_failure_reason"),
+            }
+        return result
