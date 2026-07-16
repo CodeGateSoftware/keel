@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -49,6 +50,8 @@ _ORDER_COLUMNS = (
     "updated_at",
 )
 _ORDER_MONEY_FIELDS = ("qty", "limit_price", "fee", "expected_fill", "actual_fill")
+
+_SIGNAL_COLUMNS = ("rule_id", "product_id", "ts", "indicators", "cts_score", "fired")
 
 
 def _dec_to_text(value: Any) -> str | None:
@@ -227,11 +230,91 @@ class Repository:
             return None
         return self._order_row_to_dict(row)
 
+    def get_orders(
+        self,
+        mode: str | None = None,
+        product_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List orders, optionally filtered by `mode`/`product_id`/`status`, oldest first."""
+        query = "SELECT * FROM orders WHERE 1=1"
+        params: list[Any] = []
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        if product_id is not None:
+            query += " AND product_id = ?"
+            params.append(product_id)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY id"
+
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._order_row_to_dict(row) for row in rows]
+
     def _order_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         for field in _ORDER_MONEY_FIELDS:
             d[field] = _text_to_dec(d[field])
         return d
+
+    # -- rules -----------------------------------------------------------------
+
+    def insert_rule(
+        self, kind: str, params: dict[str, Any], status: str = "candidate"
+    ) -> int:
+        """Insert a new `rules` row (JSON-encoding `params`) and return its `id`."""
+        cursor = self._conn.execute(
+            "INSERT INTO rules (kind, params, status, created_at) VALUES (?, ?, ?, ?)",
+            (kind, json.dumps(params), status, int(time.time())),
+        )
+        self._conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    def get_rules(self, status: str | None = None) -> list[dict[str, Any]]:
+        """List rules (JSON-decoding `params`), optionally filtered by `status`."""
+        if status is None:
+            rows = self._conn.execute("SELECT * FROM rules ORDER BY id").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM rules WHERE status = ? ORDER BY id", (status,)
+            ).fetchall()
+        return [self._rule_row_to_dict(row) for row in rows]
+
+    def update_rule_status(self, rule_id: int, status: str) -> None:
+        """Set `rules.status`, stamping `demoted_at` (status `disabled`) or `promoted_at`
+        (any other status -- `paper`/`live`) with the current time.
+        """
+        column = "demoted_at" if status == "disabled" else "promoted_at"
+        self._conn.execute(
+            f"UPDATE rules SET status = ?, {column} = ? WHERE id = ?",
+            (status, int(time.time()), rule_id),
+        )
+        self._conn.commit()
+
+    def _rule_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["params"] = json.loads(d["params"]) if d["params"] else {}
+        return d
+
+    # -- signals -----------------------------------------------------------------
+
+    def insert_signal(self, signal: dict[str, Any]) -> int:
+        """Insert a new `signals` row and return its `id`."""
+        values: dict[str, Any] = {col: signal.get(col) for col in _SIGNAL_COLUMNS}
+        if values["fired"] is None:
+            values["fired"] = 0
+
+        columns_sql = ", ".join(_SIGNAL_COLUMNS)
+        placeholders_sql = ", ".join(f":{c}" for c in _SIGNAL_COLUMNS)
+        cursor = self._conn.execute(
+            f"INSERT INTO signals ({columns_sql}) VALUES ({placeholders_sql})", values
+        )
+        self._conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
 
     # -- agent_state (KV) -----------------------------------------------------
 
