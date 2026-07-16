@@ -15,12 +15,10 @@ persisted there yet would violate that FK, so paper orders leave `rule_id` NULL 
 instead carry `rule_name` plus this module's own reconstruction fields (`role`,
 `entry_order_id`, pnl/mfe/mae/outcome/etc.) JSON-encoded in `orders.raw_response` --
 the column live trading reserves for a broker's raw response, unused for paper
-fills. `track_record()` reads that back out to reconstruct `Trade`s and aggregate
-them into the same `BacktestResult` shape `backtest.py` produces, so paper and
-historical stats are directly comparable. `Repository` has no bulk order query, so
-`track_record()` reaches into its `sqlite3.Connection` directly (read-only) to scan
-paper orders -- the only other option, threading a new query method through
-`repository.py`, is out of this module's scope.
+fills. `track_record()` reads that back out (via `Repository.get_orders(mode='paper')`,
+P3 Task 1) to reconstruct `Trade`s and aggregates them via the shared
+`strategy.stats.summarize` helper into the same `BacktestResult` shape `backtest.py`
+produces, so paper and historical stats are directly comparable.
 """
 
 from __future__ import annotations
@@ -30,8 +28,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from halal_cb.data.repository import Repository
-from halal_cb.strategy.backtest import BacktestResult
 from halal_cb.strategy.rules.base import Action, Setup, Signal, Trade
+from halal_cb.strategy.stats import BacktestResult, summarize
 from halal_cb.types import Candle, Side
 
 # Position sizing (money management) is out of scope here, same as backtest.py:
@@ -236,102 +234,24 @@ class PaperTrader:
         return order_id
 
 
-def _summarize(trades: list[Trade]) -> BacktestResult:
-    """Aggregate `trades` into a `BacktestResult`. Mirrors `backtest.py`'s
-    `_summarize` formula exactly (duplicated rather than imported, since that helper
-    is private to `backtest.py` and this module is scoped to not depend on it beyond
-    the public `BacktestResult` shape) so paper and historical stats stay directly
-    comparable. Only *closed* trades count toward the aggregate metrics; a still-open
-    trade is included in `trades` for visibility only.
-    """
-    closed = [t for t in trades if t.outcome != "open"]
-    n_trades = len(closed)
-
-    if n_trades == 0:
-        return BacktestResult(
-            trades=trades,
-            n_trades=0,
-            win_rate=0.0,
-            avg_win=Decimal(0),
-            avg_loss=Decimal(0),
-            expectancy=Decimal(0),
-            profit_factor=Decimal(0),
-            max_drawdown=Decimal(0),
-            max_losing_streak=0,
-            avg_mfe=Decimal(0),
-            avg_mae=Decimal(0),
-        )
-
-    wins = [t for t in closed if t.outcome == "win"]
-    losses = [t for t in closed if t.outcome == "loss"]
-
-    win_rate = len(wins) / n_trades
-    avg_win = (sum((t.pnl for t in wins), Decimal(0)) / len(wins)) if wins else Decimal(0)
-    avg_loss = (sum((t.pnl for t in losses), Decimal(0)) / len(losses)) if losses else Decimal(0)
-    expectancy = sum((t.pnl for t in closed), Decimal(0)) / n_trades
-
-    gross_profit = sum((t.pnl for t in wins), Decimal(0))
-    gross_loss = abs(sum((t.pnl for t in losses), Decimal(0)))
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = Decimal("Infinity")
-    else:
-        profit_factor = Decimal(0)
-
-    running = Decimal(0)
-    peak = Decimal(0)
-    max_drawdown = Decimal(0)
-    streak = 0
-    max_losing_streak = 0
-    for t in closed:
-        running += t.pnl
-        peak = max(peak, running)
-        max_drawdown = max(max_drawdown, peak - running)
-        if t.outcome == "loss":
-            streak += 1
-            max_losing_streak = max(max_losing_streak, streak)
-        else:
-            streak = 0
-
-    avg_mfe = sum((t.mfe for t in closed), Decimal(0)) / n_trades
-    avg_mae = sum((t.mae for t in closed), Decimal(0)) / n_trades
-
-    return BacktestResult(
-        trades=trades,
-        n_trades=n_trades,
-        win_rate=win_rate,
-        avg_win=avg_win,
-        avg_loss=avg_loss,
-        expectancy=expectancy,
-        profit_factor=profit_factor,
-        max_drawdown=max_drawdown,
-        max_losing_streak=max_losing_streak,
-        avg_mfe=avg_mfe,
-        avg_mae=avg_mae,
-    )
-
-
 def track_record(repo: Repository, rule_name: str) -> BacktestResult:
     """Aggregate `rule_name`'s paper trades (from `orders(mode='paper')`) into a
     `BacktestResult`-shaped summary, directly comparable to `backtest.backtest()`'s
     historical output.
     """
-    rows = repo._conn.execute(  # noqa: SLF001 - Repository has no bulk order query; see module docstring.
-        "SELECT id, raw_response FROM orders WHERE mode = 'paper' ORDER BY id"
-    ).fetchall()
+    orders = repo.get_orders(mode="paper")
 
     entries: dict[int, dict] = {}
     exits: list[dict] = []
-    for row in rows:
-        raw = row["raw_response"]
+    for order in orders:
+        raw = order["raw_response"]
         if not raw:
             continue
         payload = json.loads(raw)
         if payload.get("rule_name") != rule_name:
             continue
         if payload.get("role") == "entry":
-            entries[row["id"]] = payload
+            entries[order["id"]] = payload
         elif payload.get("role") == "exit":
             exits.append(payload)
 
@@ -372,4 +292,4 @@ def track_record(repo: Repository, rule_name: str) -> BacktestResult:
             )
         )
 
-    return _summarize(trades)
+    return summarize(trades)
