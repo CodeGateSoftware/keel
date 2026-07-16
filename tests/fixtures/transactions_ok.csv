@@ -1,0 +1,8 @@
+
+Transactions
+User,Test User,test-user-id
+
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+tx-001,2025-09-30 20:16:25 UTC,Convert,XRP,3.399706,USD,$2.85945,$9.72129,$10.00129,0.1,Converted 10 USDC to 3.399706 XRP,,
+tx-002,2025-10-31 18:30:30 UTC,Buy,PAXG,0.00247456,USD,"$4,001.54",$9.90205,$10.00,0.0979491776,Bought 0.00247456 PAXG for 10 USD using Cash (USD),,
+tx-003,2026-01-30 01:39:23 UTC,Advanced Trade Buy,BTC,0.00060264,USD,"$114,194.285",$49.99931,$49.99931,$0.00,Bought 0.00060264 BTC for 49.9993112232 USDC on BTC-USDC at 82967.13 USDC/BTC,,
