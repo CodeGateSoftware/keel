@@ -1,0 +1,16 @@
+{
+  "order_total": "100.60",
+  "commission_total": "0.60",
+  "errs": [],
+  "warning": [],
+  "quote_size": "100.00",
+  "base_size": "0.00152834",
+  "best_bid": "65420.00",
+  "best_ask": "65440.00",
+  "is_max": false,
+  "order_margin_total": null,
+  "leverage": null,
+  "long_leverage": null,
+  "short_leverage": null,
+  "slippage": null
+}
