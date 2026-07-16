@@ -117,7 +117,8 @@ def test_can_promote_accumulates_all_failing_reasons() -> None:
 
 def test_can_promote_respects_custom_config_floors() -> None:
     cfg = PromotionConfig(min_trades=5, min_rr=Decimal("1.0"), min_win_rate=0.5)
-    ok, reasons = can_promote(_stats(n_trades=6, win_rate=0.5, avg_win=Decimal("10"), avg_loss=Decimal("-9")), cfg)
+    stats = _stats(n_trades=6, win_rate=0.5, avg_win=Decimal("10"), avg_loss=Decimal("-9"))
+    ok, reasons = can_promote(stats, cfg)
     assert ok is True
     assert reasons == []
 
