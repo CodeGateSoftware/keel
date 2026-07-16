@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "success_response": {
+    "order_id": "b1cd9a3b-4e5f-4a3c-9c8a-1f2e3d4c5b6a",
+    "product_id": "BTC-USD",
+    "side": "BUY",
+    "client_order_id": "6a5e1e4a-7c8b-4d9e-9f0a-2b3c4d5e6f7a"
+  },
+  "order_configuration": {
+    "market_market_ioc": {
+      "quote_size": "100.00"
+    }
+  }
+}
