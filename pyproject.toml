@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "coinbase-advanced-py>=1.8.4",
+    "cryptography>=49.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
 ]

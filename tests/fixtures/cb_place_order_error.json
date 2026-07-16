@@ -1,0 +1,15 @@
+{
+  "success": false,
+  "error_response": {
+    "error": "INSUFFICIENT_FUND",
+    "message": "Insufficient balance in source account",
+    "error_details": "",
+    "preview_failure_reason": "PREVIEW_INSUFFICIENT_FUND",
+    "new_order_failure_reason": "INSUFFICIENT_FUND"
+  },
+  "order_configuration": {
+    "market_market_ioc": {
+      "quote_size": "100.00"
+    }
+  }
+}
