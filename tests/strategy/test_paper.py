@@ -244,16 +244,14 @@ class TestNoLiveOrders:
 class TestTrackRecord:
     def _win(self, repo: Repository, rule_name: str, ts: int) -> None:
         trader = PaperTrader(repo)
-        trader.on_signal(
-            _enter_signal(rule_name=rule_name, setup=_setup(entry="100", stop="90", target="120", ts=ts))
-        )
+        setup = _setup(entry="100", stop="90", target="120", ts=ts)
+        trader.on_signal(_enter_signal(rule_name=rule_name, setup=setup))
         trader.on_candle("BTC-USD", _candle(ts + 60, "115", "121", "114", "120"))
 
     def _loss(self, repo: Repository, rule_name: str, ts: int) -> None:
         trader = PaperTrader(repo)
-        trader.on_signal(
-            _enter_signal(rule_name=rule_name, setup=_setup(entry="100", stop="90", target="120", ts=ts))
-        )
+        setup = _setup(entry="100", stop="90", target="120", ts=ts)
+        trader.on_signal(_enter_signal(rule_name=rule_name, setup=setup))
         trader.on_candle("BTC-USD", _candle(ts + 60, "95", "96", "89", "90"))
 
     def test_returns_backtest_result_shape(self, repo: Repository) -> None:
