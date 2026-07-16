@@ -275,15 +275,13 @@ def _fib_confluence(
 
 
 def _persist_signal(repo: Repository, signal: Signal, cts_result: indicators_cts.CTSResult) -> None:
-    """Write an emitted `Signal` to the `signals` table (schema: `data/db.py`).
+    """Write an emitted `Signal` to the `signals` table via `Repository.insert_signal`
+    (schema: `data/db.py`; P3 Task 1 added the typed method).
 
-    `Repository` doesn't yet expose a typed `insert_signal` method (this task is scoped to
-    `engine.py` alone -- adding one is a `data/repository.py` change for a future task), so
-    this inserts directly through the underlying connection. `rule_id` is left `NULL` (no
-    DB-backed `rules` row lookup is wired here -- Task 9's promotion lifecycle owns that
-    linkage); `indicators` carries the full CTS breakdown + setup for audit/explainability;
-    `fired=1` marks this as an actionable, gate-cleared signal -- rejected candidates are
-    never persisted at all.
+    `rule_id` is left `NULL` (no DB-backed `rules` row lookup is wired here -- Task 9's
+    promotion lifecycle owns that linkage); `indicators` carries the full CTS breakdown +
+    setup for audit/explainability; `fired=1` marks this as an actionable, gate-cleared
+    signal -- rejected candidates are never persisted at all.
     """
     setup = signal.setup
     payload = {
@@ -304,18 +302,13 @@ def _persist_signal(repo: Repository, signal: Signal, cts_result: indicators_cts
             for f in cts_result.factors
         ],
     }
-    repo._conn.execute(
-        """
-        INSERT INTO signals (rule_id, product_id, ts, indicators, cts_score, fired)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            None,
-            signal.product_id,
-            signal.ts,
-            json.dumps(payload, default=str),
-            str(signal.cts_score),
-            1,
-        ),
+    repo.insert_signal(
+        {
+            "rule_id": None,
+            "product_id": signal.product_id,
+            "ts": signal.ts,
+            "indicators": json.dumps(payload, default=str),
+            "cts_score": str(signal.cts_score),
+            "fired": 1,
+        }
     )
-    repo._conn.commit()
