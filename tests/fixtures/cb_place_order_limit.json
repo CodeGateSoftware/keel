@@ -1,0 +1,16 @@
+{
+  "success": true,
+  "success_response": {
+    "order_id": "c2de0b4c-5f60-4b5d-ad9b-2030415263f8",
+    "product_id": "BTC-USD",
+    "side": "SELL",
+    "client_order_id": "7b6f2f5b-8d9c-5e0f-a01b-3c4d5e6f7a8b"
+  },
+  "order_configuration": {
+    "limit_limit_gtc": {
+      "base_size": "0.00150000",
+      "limit_price": "66000.00",
+      "post_only": false
+    }
+  }
+}
