@@ -16,3 +16,6 @@ dist/
 
 # os
 .DS_Store
+
+# Claude Code agent worktrees / transcripts
+.claude/
