@@ -1,0 +1,6 @@
+
+Transactions
+User,Test User,test-user-id
+
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+dir-tx-003,2025-09-07 06:13:56 UTC,Incentives Rewards Payout,BTC,0.0000271260971547,USD,$110594.605,$3.00,$3.00,$0.00,,,

@@ -1,0 +1,10 @@
+"This report includes all taxable activity on Coinbase with realized gains or losses. Informational purposes only."
+
+
+
+Gain/loss report
+User,test-user-id,test@example.com
+
+Transaction Type,Transaction ID,Tax lot ID,Asset name,Amount,Date Acquired,Cost basis (USD),Date of Disposition,Proceeds (USD),Gains (Losses) (USD),Holding period (Days),Data source
+Trade,d6909a16-1da4-5ce0-b6d2-6c67e91dd86e,b70634a6-4b20-475c-8b56-e74dc1332f18,USDC,80,09/29/2025,80,09/29/2025,77.7436158944,-2.2563841056,0,Coinbase
+Trade,c07fa470-55a0-5845-a15e-c4afabad3453,b70634a6-4b20-475c-8b56-e74dc1332f18,USDC,20,09/29/2025,20,09/29/2025,19.4330282887,-0.5669717113,0,Coinbase
