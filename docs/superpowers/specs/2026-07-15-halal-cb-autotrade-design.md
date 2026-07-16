@@ -266,9 +266,27 @@ Enforced in `guards.py` **before every order**, **un-overridable in any mode (in
     alert (§10.4/§22.1).
 12. **Kill-switch + full audit log** — one flag halts all autonomy; every order logged before/after.
 
-**Operational security:** CDP key in git-ignored `.env`, **scoped to a dedicated portfolio, no withdrawal
-scope** (agent can never move funds out); exchange counterparty risk (Coinbase custody) is a named, accepted
-risk; fund the portfolio with only a small losable slice (§22.3).
+**Operational security (built in Phase 3):**
+- **API key scoping:** CDP key **scoped to a dedicated portfolio, no withdrawal scope** (agent can never move
+  funds out); exchange counterparty risk (Coinbase custody) is a named, accepted risk; fund with only a small
+  losable slice (§22.3).
+- **No classic user authentication.** For a local single-user CLI/daemon, logins/accounts/sessions are YAGNI
+  (OS access already opens that door). We invest instead in the two controls below.
+- **Portable encrypted secrets vault** (`security/secrets.py`): the CDP key/secret (and any remote-control token)
+  live in an **AES-GCM-encrypted `secrets.enc`** unlocked by a **master passphrase** (passphrase → scrypt KDF →
+  key). One file, **copyable between machines** (explicitly *not* the machine-bound OS Keychain, so it's
+  transportable). `chmod 600`; secrets never logged; `.enc`/`.env` git-ignored. An optional per-machine keychain
+  *cache* of the derived key may be added for convenience, but the portable `.enc` is the source of truth.
+- **Dangerous-action authorization gate** (`security/authz.py`): a passphrase (stored as a scrypt hash,
+  rate-limited) required **only** to **arm bypass/autonomous mode**, **raise caps above config maxima**, or
+  **disable the kill-switch / resume**. Read-only commands and confirm-mode trades need none. This is local
+  *authorization*, not a login — it forces intentionality and blocks casual/accidental/shoulder-surf misuse of
+  the autonomy capability.
+- **Honest boundary:** on a single-user machine the real security boundary is the **OS account + full-disk
+  encryption**. These controls are defense-in-depth (reduce plaintext exposure, prevent casual misuse); they do
+  **not** stop an attacker who already holds the OS account. Stated so they aren't mistaken for more.
+- **Remote control & phone notifications** are a **deferred future enhancement** (off by default; local-only until
+  toggled) — designed separately in `2026-07-16-halal-cb-remote-control-design.md`, to be implemented later.
 
 ## 15. Insights & journaling
 
