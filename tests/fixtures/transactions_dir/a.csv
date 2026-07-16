@@ -1,0 +1,7 @@
+
+Transactions
+User,Test User,test-user-id
+
+ID,Timestamp,Transaction Type,Asset,Quantity Transacted,Price Currency,Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes,Sender Address,Recipient Address
+dir-tx-001,2025-09-05 17:01:03 UTC,Deposit,USD,30,USD,$1.00,$30.00,$30.00,$0.00,Deposit from Bank,,
+dir-tx-002,2025-09-05 17:02:29 UTC,Buy,XRP,10.369718,USD,$2.81165,$29.15602,$30.00,0.2939823853,Bought 10.369718 XRP for 30 USD using Cash,,
