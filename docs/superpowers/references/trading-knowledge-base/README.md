@@ -56,6 +56,7 @@ reference valid across the split without rewriting them.
 | 23 | "How to Trade Cryptocurrencies with Deriv" (Vince Stanzione **ebook**, 56pp; CFD-broker promo) | extracted (1 new system + refinements; premise excluded) | [source-23](./sources/source-23.md) |
 | 24 | "10 Chart Patterns Every Pro Trader Should Know" (Vince Stanzione **ebook**, 24pp; pattern catalog) | extracted (thin; reinforces §23.1 breakout; subjective patterns → v2) | [source-24](./sources/source-24.md) |
 | 25 | "The Complete Guide to Trading" (Corporate Finance Institute, 2018 **textbook**, 116pp) | extracted (NEW: ADX trend-strength filter + good-trade principle; Parts 1–2 out of scope) | [source-25](./sources/source-25.md) |
+| 26 | "7 Traits of Successful Financial Traders" (Vince Stanzione **ebook**, 25pp; psychology) | extracted (thin; NEW pyramiding + 20-SMA exit; reinforces trend-following pivot) | [source-26](./sources/source-26.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -75,8 +76,8 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `strategy/engine.py` | Identify→Predict→Decide→Execute; **CTS scoring → rail-bounded execution**; 4 graded entry techniques; kill-zone entry gate; multi-TF bias; news filter; **ADX + MACD-up as breakout-confirmation confluence factors (§25.1, §25.3)** | §2.0, §3.2, §3.6, §8.1, §9.1, §17.1, §17.2, §25.1 |
 | `strategy/backtest.py` | Backtest, intrabar order-of-events, spread/slippage modeling, MFE/MAE, no-overlap realism | §1.7, §2.3, §4.2, §20.2, §20.5 |
 | `strategy/promotion.py` | Paper gate, promotion/demotion, expectancy + R:R≥1.5–2 & win≥55%, min-sample (100 trades/5yr), edge decay; **TODO: per-rule-class floor — trend-followers earn on R:R not win% & would fail the global 55% bar (§23.1); "good trade vs winning trade" = evaluate by expectancy/R:R not outcome (§25.5)** | §1.6, §4.5, §5.2, §6.3, §20.6, §23.1, §25.5 |
-| `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity | §4.7, §20.3, §20.4 |
-| `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2 |
+| `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **NEW: pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1 |
+| `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2, **20-SMA close-below & trail-to-breakeven §26.2**); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2, §26.2 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
 
@@ -123,3 +124,9 @@ the **expectancy-based per-class promotion floor** via the "good trade vs winnin
 So the breakout-family rule to prototype now has: buy-strength entry (Donchian/ascending-triangle) +
 **ADX/MACD-up confirmation** + channel-low trail (§23.2) + pattern-height/measured-move target options +
 a low-win/high-R:R promotion floor. Then validate via `keel simulate`.
+**Source 26 (Stanzione psychology ebook) is thin/reinforcing** but adds **pyramiding / scale-into-winners**
+(§26.1 — the sanctioned opposite of the no-martingale rail; optional later `money_mgmt` enhancement,
+default off) and a simple **20-SMA close-below exit + trail-to-breakeven** (§26.2); it also strongly
+endorses the trend-following pivot (the author's own profits came from trend following) and cautions —
+via KISS — to keep the ADX/MACD confluence set minimal and price-first. **Stanzione psychology content has
+saturated** (23/24/26 mostly reinforce).
