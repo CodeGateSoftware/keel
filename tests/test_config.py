@@ -107,6 +107,29 @@ def test_load_config_quote_currency_empty_raises_configerror(write_config):
         load_config(path)
 
 
+def test_load_config_promotion_defaults_are_canonical_proving_floors(write_config):
+    """Phase-1 placeholders (30 trades / 40% win) were replaced with the canonical
+    proving-gate floors from spec §6.2/§11 (Issue #66): 100 trades / 55% win rate.
+    """
+    text = VALID_CONFIG_YAML.replace(
+        """promotion:
+  min_trades: 100
+  min_expectancy: 0.0
+  min_rr: 1.5
+  min_win_rate: 0.55
+""",
+        "",
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.promotion.min_trades == 100
+    assert config.promotion.min_win_rate == Decimal("0.55")
+    assert config.promotion.min_rr == Decimal("1.5")
+    assert config.promotion.min_expectancy == Decimal("0")
+
+
 def test_load_config_market_data_granularities_and_history_days(valid_config_path):
     from keel.types import Granularity
 

@@ -65,10 +65,10 @@ class AutoTradeConfig:
 
 @dataclass(frozen=True)
 class PromotionConfig:
-    min_trades: int = 30
+    min_trades: int = 100
     min_expectancy: Decimal = Decimal("0")
     min_rr: Decimal = Decimal("1.5")
-    min_win_rate: Decimal = Decimal("0.4")
+    min_win_rate: Decimal = Decimal("0.55")
 
 
 @dataclass(frozen=True)
@@ -233,13 +233,13 @@ def load_config(path: str | Path) -> Config:
             bypass_arm_ttl_sec=int(auto_trade_raw.get("bypass_arm_ttl_sec", 3600)),
         ),
         promotion=PromotionConfig(
-            min_trades=int(promotion_raw.get("min_trades", 30)),
+            min_trades=int(promotion_raw.get("min_trades", 100)),
             min_expectancy=_to_decimal(
                 promotion_raw.get("min_expectancy", "0"), "promotion.min_expectancy"
             ),
             min_rr=_to_decimal(promotion_raw.get("min_rr", "1.5"), "promotion.min_rr"),
             min_win_rate=_to_decimal(
-                promotion_raw.get("min_win_rate", "0.4"), "promotion.min_win_rate"
+                promotion_raw.get("min_win_rate", "0.55"), "promotion.min_win_rate"
             ),
         ),
         money_mgmt=MoneyMgmtConfig(
