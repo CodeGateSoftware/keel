@@ -54,6 +54,7 @@ reference valid across the split without rewriting them.
 | 21 | "High- vs Low-Probability Setup" (AUD/CAD short, double-top + seasonality; ~22m) | extracted | [source-21](./sources/source-21.md) |
 | 22 | "5 Things to Know Before Trading Crypto" (crypto-specific; ~4m) | extracted (on-topic) | [source-22](./sources/source-22.md) |
 | 23 | "How to Trade Cryptocurrencies with Deriv" (Vince Stanzione **ebook**, 56pp; CFD-broker promo) | extracted (1 new system + refinements; premise excluded) | [source-23](./sources/source-23.md) |
+| 24 | "10 Chart Patterns Every Pro Trader Should Know" (Vince Stanzione **ebook**, 24pp; pattern catalog) | extracted (thin; reinforces §23.1 breakout; subjective patterns → v2) | [source-24](./sources/source-24.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -74,8 +75,8 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `strategy/backtest.py` | Backtest, intrabar order-of-events, spread/slippage modeling, MFE/MAE, no-overlap realism | §1.7, §2.3, §4.2, §20.2, §20.5 |
 | `strategy/promotion.py` | Paper gate, promotion/demotion, expectancy + R:R≥1.5–2 & win≥55%, min-sample (100 trades/5yr), edge decay; **TODO: per-rule-class floor — trend-followers earn on R:R not win% and would fail the global 55% bar (§23.1)** | §1.6, §4.5, §5.2, §6.3, §20.6, §23.1 |
 | `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity | §4.7, §20.3, §20.4 |
-| `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1 |
-| `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3 |
+| `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2 |
+| `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
 
 ### The hard rails (un-overridable, incl. bypass mode)
@@ -94,7 +95,8 @@ Carry trades (**entire Source 18 excluded as riba**, §18), hedging, bonds, marg
 Decisions I made that are worth confirming/overriding:
 1. **Long-only translations** of short setups → exit/don't-buy filters (§2.1, §7.1, §9.3).
 2. **Deferrals to v2:** harmonics (Gartley/ABCD/Cipher), Fibonacci Inversion, Wall-Street-cheat-sheet
-   macro-cycle (§3.4, §8.4, §9.3–9.4).
+   macro-cycle (§3.4, §8.4, §9.3–9.4); **subjective chart-pattern geometry — H&S, cup & handle,
+   rounding top/bottom, wedges (§24.5)** — same reason (discretionary trendline/curve fitting, overfit).
 3. **Rule consolidation:** Sources 2 & 7 merged into one parameterized rule (§7.1).
 4. **New rails beyond the original four** (see hard-rails list above).
 5. **Riba exclusions:** carry/hedging/bonds/margin (§4.9, §10.10).
@@ -108,3 +110,7 @@ proved catch falling knives (see [[halal-cb-autotrade-project]]). It plus a wide
 stop (§23.2) directly targets the two milestone-6 findings (negative dip-buy edge + too-tight stops).
 **Next concrete step:** prototype the long-only Donchian breakout rule (+ `breakout` detector, per-class
 promotion floor) and validate it through `keel simulate` on the cached 5yr data. Then fold into the spec.
+Source 24 (chart-pattern catalog) is thin but **reinforces the breakout direction** (ascending-triangle /
+base breakouts = same buy-strength thesis) and adds two small levers to fold in when building it: a
+`pattern_height` target method (§24.2) and a data-spike feed guard (§24.3); its subjective patterns are
+deferred to v2 (§24.5).
