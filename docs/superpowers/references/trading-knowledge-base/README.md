@@ -53,6 +53,7 @@ reference valid across the split without rewriting them.
 | 20 | "How Professionals Backtest" (backtest + money-mgmt + pivot optimization; ~80m) | extracted (rich) | [source-20](./sources/source-20.md) |
 | 21 | "High- vs Low-Probability Setup" (AUD/CAD short, double-top + seasonality; ~22m) | extracted | [source-21](./sources/source-21.md) |
 | 22 | "5 Things to Know Before Trading Crypto" (crypto-specific; ~4m) | extracted (on-topic) | [source-22](./sources/source-22.md) |
+| 23 | "How to Trade Cryptocurrencies with Deriv" (Vince Stanzione **ebook**, 56pp; CFD-broker promo) | extracted (1 new system + refinements; premise excluded) | [source-23](./sources/source-23.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -68,10 +69,10 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `analysis/indicators.py` | EMA / RSI (+divergence) / MACD / ATR / Fib retrace+extension / deceleration | §1.4, §1.5, §3.1, §3.3, §4.4 |
 | `analysis/insights.py` | AI behavioral/seasonality analysis; edge-decay detection; BTC cycle/seasonality context; seasonality as low-weight CTS factor; pivot-slice auto-pruning of weak pair/day/time/rule buckets | §6.1, §6.2, §6.3, §12.3, §14.3, §20.7, §21.2 |
 | `analysis/pnl.py` | FIFO P&L, drawdown / time-in-drawdown, recovery table | §4.6, §10.5, §2.4 |
-| `strategy/rules/` | Parameterized pullback-continuation family; RSI mean-reversion; DCA/dip-buy; deferred (harmonics incl. full Gartley, Fib-inversion, BTC macro-cycle) | §2.1, §3.3, §7.1, §9.3, §12.1, §15.2 |
+| `strategy/rules/` | Parameterized pullback-continuation family; RSI mean-reversion; DCA/dip-buy; **NEW: Donchian channel breakout (trend-following/buy-strength, long-only) — candidate to replace refuted dip-buying**; deferred (harmonics incl. full Gartley, Fib-inversion, BTC macro-cycle) | §2.1, §3.3, §7.1, §9.3, §12.1, §15.2, **§23.1** |
 | `strategy/engine.py` | Identify→Predict→Decide→Execute; **CTS scoring → rail-bounded execution**; 4 graded entry techniques; kill-zone entry gate; multi-TF bias; news filter | §2.0, §3.2, §3.6, §8.1, §9.1, §17.1, §17.2 |
 | `strategy/backtest.py` | Backtest, intrabar order-of-events, spread/slippage modeling, MFE/MAE, no-overlap realism | §1.7, §2.3, §4.2, §20.2, §20.5 |
-| `strategy/promotion.py` | Paper gate, promotion/demotion, expectancy + R:R≥1.5–2 & win≥55%, min-sample (100 trades/5yr), edge decay | §1.6, §4.5, §5.2, §6.3, §20.6 |
+| `strategy/promotion.py` | Paper gate, promotion/demotion, expectancy + R:R≥1.5–2 & win≥55%, min-sample (100 trades/5yr), edge decay; **TODO: per-rule-class floor — trend-followers earn on R:R not win% and would fail the global 55% bar (§23.1)** | §1.6, §4.5, §5.2, §6.3, §20.6, §23.1 |
 | `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity | §4.7, §20.3, §20.4 |
 | `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3 |
@@ -100,5 +101,10 @@ Decisions I made that are worth confirming/overriding:
 6. **CTS dynamic aggressiveness** bounded by rails (§8.1 ⚠️, §10.6).
 
 ## Status
-11 trading sources + 1 out-of-scope. Content has **saturated** on structure; recent sources
-mostly refine/rename/reinforce. Next step (pending user): fold into the finalized design spec.
+Structure has **saturated** — most sources now refine/reinforce rather than reshape. **Source 23 is the
+exception with a genuinely new lead:** the **Donchian channel breakout** (§23.1) — a *trend-following,
+buy-strength* rule that is the structural opposite of the pullback/RSI dip-buying rules the sim just
+proved catch falling knives (see [[halal-cb-autotrade-project]]). It plus a wide channel-low trailing
+stop (§23.2) directly targets the two milestone-6 findings (negative dip-buy edge + too-tight stops).
+**Next concrete step:** prototype the long-only Donchian breakout rule (+ `breakout` detector, per-class
+promotion floor) and validate it through `keel simulate` on the cached 5yr data. Then fold into the spec.
