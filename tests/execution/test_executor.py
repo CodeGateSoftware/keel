@@ -57,6 +57,7 @@ class FakeBroker:
         preview: dict[str, Any] | None = None,
         place_success: bool = True,
         place_order_id: str = "broker-order-1",
+        usdc_balance: Decimal | None = Decimal("1000000"),
     ) -> None:
         self._preview = preview or {
             "order_total": Decimal("50.00"),
@@ -67,9 +68,17 @@ class FakeBroker:
         self._place_success = place_success
         self._place_order_id_seq = 0
         self._place_order_id_prefix = place_order_id
+        self._usdc_balance = usdc_balance
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[str] = []
+        self.get_accounts_calls = 0
+
+    def get_accounts(self) -> list[dict[str, Any]]:
+        self.get_accounts_calls += 1
+        if self._usdc_balance is None:
+            return [{"currency": "USDC", "available_balance": None}]
+        return [{"currency": "USDC", "available_balance": self._usdc_balance}]
 
     def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
         self.preview_calls.append(
@@ -127,6 +136,9 @@ def repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
+    # A very large monthly allowance so pre-existing (non-rail-14) tests aren't incidentally
+    # tripped by it; rail-14-specific tests below override with `repo.set_subscription(...)`.
+    r.set_subscription(Decimal("10000000"), "opportunistic", now_ts=NOW_TS)
     return r
 
 
@@ -311,6 +323,83 @@ def test_kill_switch_vetoes_even_in_bypass_mode(repo):
     assert any(v.startswith("kill_switch") for v in result.vetoed_by)
 
 
+# -- rail 13: USDC-funding wiring (Issue #59) ----------------------------------------------------
+
+
+class _BrokerAccountsError:
+    """`get_accounts` raises (a simulated broker outage); `preview_order`/`place_order` raise
+    too if ever reached -- isolates "the balance fetch itself failed" from a generic
+    NoNetworkBroker veto, and proves the failure alone is enough to veto without ever previewing
+    or placing.
+    """
+
+    def get_accounts(self) -> list[dict[str, Any]]:
+        raise ConnectionError("simulated broker outage fetching accounts")
+
+    def preview_order(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("preview_order must not be called when the balance fetch failed")
+
+    def place_order(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("place_order must not be called when the balance fetch failed")
+
+
+def test_execute_fetches_the_available_quote_balance_for_a_buy_and_places(repo):
+    broker = FakeBroker(usdc_balance=Decimal("100000"))
+    signal = _enter_signal()
+
+    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.placed is True
+    assert broker.get_accounts_calls == 1
+
+
+def test_broker_balance_fetch_error_vetoes_the_buy_before_preview_or_place(repo):
+    broker = _BrokerAccountsError()
+    signal = _enter_signal()
+
+    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert result.preview is None
+    assert any(v.startswith("usdc_funding") for v in result.vetoed_by)
+    assert repo.get_orders() == []
+
+
+def test_insufficient_usdc_balance_vetoes_the_buy_before_preview_or_place(repo):
+    broker = FakeBroker(usdc_balance=Decimal("10"))  # entry 50000, qty ~1 -> notional ~50000
+    signal = _enter_signal()
+
+    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert result.preview is None
+    assert any(v.startswith("usdc_funding") for v in result.vetoed_by)
+    assert repo.get_orders() == []
+
+
+def test_exit_signal_never_fetches_a_balance(repo):
+    """SELL is exempt from rail 13 -- the executor shouldn't even bother fetching a balance for
+    an EXIT, since it wouldn't be used."""
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+    broker = FakeBroker()
+    signal = Signal(
+        rule_name="target_harvest",
+        product_id="BTC-USD",
+        action=Action.EXIT,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+
+    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.placed is True
+    assert broker.get_accounts_calls == 0
+
+
 # -- bypass mode: compliant -> placed without a prompt --------------------------------------------
 
 
@@ -362,6 +451,37 @@ def test_broker_place_failure_is_logged_but_not_placed(repo):
     assert result.order_id is not None  # still logged (audit trail even on rejection)
     order = repo.get_order(result.order_id)
     assert order["status"] == "rejected"
+
+
+# -- rail 14: monthly-allowance wiring (Issue #59) -----------------------------------------------
+
+
+def test_monthly_allowance_vetoes_a_buy_over_the_live_subscription_cap(repo):
+    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    broker = FakeBroker()
+    signal = _enter_signal()
+
+    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert any(v.startswith("monthly_subscription_allowance") for v in result.vetoed_by)
+    assert len(broker.place_calls) == 0
+
+
+def test_monthly_allowance_updated_subscription_takes_effect_on_the_next_order(repo):
+    """No snapshot, no restart, no config edit -- the executor doesn't cache the allowance
+    anywhere; it always flows straight through to `guards.check`'s live `repo.get_subscription()`
+    read."""
+    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    broker = FakeBroker()
+    signal = _enter_signal()
+
+    first = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    assert first.placed is False
+
+    repo.set_subscription(Decimal("10000000"), "opportunistic", now_ts=NOW_TS)
+    second = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    assert second.placed is True
 
 
 # -- DCA sizing --------------------------------------------------------------------------------
