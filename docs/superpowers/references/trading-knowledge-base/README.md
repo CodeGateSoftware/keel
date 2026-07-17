@@ -67,6 +67,7 @@ reference valid across the split without rewriting them.
 | 34 | "The Trader's Bible" (T3 Live, 2025, 28pp; US equities/options day-trading) | extracted (**NEW: close-based stop** targets stop-defect; confluence-ordering + first-retest; options/gaps/earnings excluded/N-A) | [source-34](./sources/source-34.md) |
 | 35 | "Quantified Edge: Using AI, ChatGPT & Python" (Metaverse Trading Academy, 2025, 65pp) | extracted (**LLM-feature reference** — validates §5 asymmetry + craft; NEW breakeven-winrate formula; SMC/order-flow deferred/N-A) | [source-35](./sources/source-35.md) |
 | 36 | "7 Trading Themes for 2026" (Vince Stanzione **ebook**, 36pp; macro-outlook) | extracted (low value — time-bound predictions = no-oracle §6.4; reinforces wider-stops + narrow allowlist; negative LLM exemplar) | [source-36](./sources/source-36.md) |
+| 37 | "How to Trade Forex" (Vince Stanzione **ebook**, 76pp) | extracted (near-total dup of §23/§27 — MA/Donchian/RSI + reused appendices; sessions marginal; options/multipliers/carry excluded) | [source-37](./sources/source-37.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -197,3 +198,9 @@ value / out of scope by our **no-oracle principle (§6.4)**; reinforces only wid
 + narrow BTC/ETH allowlist & real-utility/no-meme screening (§28.3/§33), and serves as a clean **negative
 exemplar** of the price-forecasting the LLM feature must never do (§36.2→§35.1). CFDs/leverage/shorting/
 options/ETFs all excluded. No action.
+**Source 37 (Stanzione "How to Trade Forex")** is a **near-total duplicate** of the §23/§27 technical
+content (MA-crossover / Donchian 20-day / RSI 70-30) with reused appendices — **no new content**; reinforces
+the Donchian/Turtle family only. Sessions/time-of-day (§37.1) is marginal (already handled by pivot-slice
+time-bucket pruning; doesn't port to 24/7 crypto). Digital options/multipliers/carry excluded.
+**Stanzione/Deriv ebook stream is EXHAUSTED (23/24/26/27/36/37) — stop feeding Stanzione/Deriv titles;
+prioritize new-technique books + the Turtle-rule build.**
