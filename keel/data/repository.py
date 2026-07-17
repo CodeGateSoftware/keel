@@ -365,3 +365,40 @@ class Repository:
                 "updated_at": now_ts,
             },
         )
+
+    # -- bypass arm token (Issue #60, in-process bypass hardening) ---------
+
+    def arm_bypass(self, now_ts: int, ttl_sec: int) -> None:
+        """Arm autonomous bypass mode for `ttl_sec` seconds starting at `now_ts`.
+
+        Overwrites any previous arm token outright -- there is only ever one live token, and
+        arming again (e.g. re-running `keel arm-bypass`) always resets the window from `now_ts`
+        rather than extending the old one. `agent.run_once`'s own `is_bypass_armed` check reads
+        this token fresh on every cycle, so it is the one place bypass mode can be authorized
+        from -- CLI (`keel arm-bypass`, passphrase-gated) or any other authenticated caller.
+        """
+        self.set_state(
+            "bypass_arm",
+            {"armed_at": now_ts, "armed_until": now_ts + ttl_sec},
+        )
+
+    def is_bypass_armed(self, now_ts: int) -> bool:
+        """True iff a bypass-arm token exists and `now_ts` is still inside its window.
+
+        Freshness is a strict `now_ts < armed_until` (matching `market_feed.is_fresh`'s own
+        convention elsewhere in this codebase) -- the instant `armed_until` is reached, the
+        token is treated as expired, not one tick still-good.
+        """
+        token = self.get_state("bypass_arm")
+        if token is None:
+            return False
+        return now_ts < token["armed_until"]
+
+    def disarm_bypass(self) -> None:
+        """Clear the bypass-arm token immediately.
+
+        Fail-safe direction: disarming only ever *reduces* capability, so unlike `arm_bypass`
+        this needs no passphrase gate at the CLI layer -- it is always safe to call, including
+        when nothing is currently armed (a no-op).
+        """
+        self.set_state("bypass_arm", None)
