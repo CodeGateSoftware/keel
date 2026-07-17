@@ -66,9 +66,12 @@ __all__ = [
     "run",
 ]
 
-# Rolling ONE_HOUR window size handed to `Rule.detect`/`engine.evaluate` -- large enough for
-# every existing rule's longest lookback (EMA-200, 90-bar-equivalent structure) without carrying
-# an asset's entire multi-year history into every bar's evaluation.
+# Floor for the rolling ONE_HOUR window size handed to `Rule.detect`/`engine.evaluate` -- large
+# enough for every existing rule's longest lookback (EMA-200, 90-bar-equivalent structure) even
+# when `config.market_data.history_days` is tiny. The window actually used by `run()` is
+# `_window_bars(config)` (`max(WINDOW_BARS, history_days * 24)`), which for the default
+# `history_days=365` grows to ~8760 hourly bars -- matching what the LIVE agent
+# (`agent.run_once`) evaluates against, instead of hardcoding a much shorter, unfaithful cap.
 WINDOW_BARS = 300
 
 # Idle-span telemetry: a "no signal fired while price moved a lot" span is recorded once both
@@ -165,8 +168,18 @@ def _union_hourly_ts(
     return sorted(ts_set)
 
 
-def _window_1h(hourly: list[Candle], idx: int) -> list[Candle]:
-    start = max(0, idx - WINDOW_BARS + 1)
+def _window_bars(config: Config) -> int:
+    """Rolling ONE_HOUR window length for the account pass: `history_days * 24` hourly bars/day
+    (`ONE_HOUR` is the trading TF), floored at `WINDOW_BARS` so tiny configs still warm up
+    indicators. Mirrors the LIVE agent's `agent.run_once`, which evaluates against
+    `config.market_data.history_days` (default 365 -> ~8760 hourly bars) -- deriving this from
+    config keeps the account pass faithful to production instead of a hardcoded, much shorter
+    cap."""
+    return max(WINDOW_BARS, config.market_data.history_days * 24)
+
+
+def _window_1h(hourly: list[Candle], idx: int, window_bars: int) -> list[Candle]:
+    start = max(0, idx - window_bars + 1)
     return hourly[start : idx + 1]
 
 
@@ -187,6 +200,7 @@ def run(
     equity sampling, idle-span telemetry).
     """
     account = SimAccount(fee_pct, slippage_pct)
+    window_bars = _window_bars(config)
     telemetry = SimTelemetry()
     trades: list[SimTrade] = []
     equity_curve: list[tuple[int, Decimal]] = []
@@ -236,7 +250,7 @@ def run(
 
             daily_idx = bisect.bisect_right(daily_ts_by_asset[asset], t)
             candles_by_tf: dict[Granularity, list[Candle]] = {
-                Granularity.ONE_HOUR: _window_1h(hourly, idx),
+                Granularity.ONE_HOUR: _window_1h(hourly, idx, window_bars),
                 Granularity.ONE_DAY: daily_by_asset[asset][:daily_idx],
             }
 

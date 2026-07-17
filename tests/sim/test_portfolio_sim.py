@@ -318,6 +318,55 @@ def test_monthly_contributions_counted_once_per_utc_month():
 # ---------------------------------------------------------------------------
 
 
+def test_window_scales_up_with_history_days():
+    """`history_days=365` (the default) should derive a rolling ONE_HOUR window of `365*24=8760`
+    bars -- far above the old hardcoded 300 -- so with 400 available bars the spy rule should see
+    every bar up to the current one (`min(available_bars, 365*24) == 400`), never truncated."""
+    n = 400
+    hourly = [_candle(i * _HOUR, "100", "101", "99", "100") for i in range(n)]
+    spy = _SpyRule("BTC-USD")
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(market_data=MarketDataConfig(granularities=[], history_days=365))
+
+    run(
+        [spy],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("0"),
+    )
+
+    assert spy.calls, "the spy rule was never driven"
+    max_window = max(len(all_ts) for _, all_ts in spy.calls)
+    assert max_window == n, (
+        f"expected the window to grow to all {n} available bars, got {max_window}"
+    )
+
+
+def test_window_floors_at_300_bars_for_small_history_days():
+    """A tiny `history_days` (well under `300/24 ~= 12.5` days) should still floor the rolling
+    window at 300 bars so indicators have enough history to warm up."""
+    n = 400
+    hourly = [_candle(i * _HOUR, "100", "101", "99", "100") for i in range(n)]
+    spy = _SpyRule("BTC-USD")
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(market_data=MarketDataConfig(granularities=[], history_days=5))
+
+    run(
+        [spy],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("0"),
+    )
+
+    assert spy.calls, "the spy rule was never driven"
+    max_window = max(len(all_ts) for _, all_ts in spy.calls)
+    assert max_window == 300, f"expected the 300-bar floor to apply, got {max_window}"
+
+
 def test_idle_span_recorded_on_big_move_with_no_signal():
     hourly = []
     price = Decimal("100")
