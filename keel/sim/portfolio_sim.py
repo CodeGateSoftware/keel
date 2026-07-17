@@ -4,9 +4,25 @@
 Walks the ascending UNION of `ONE_HOUR` timestamps across every asset in `candles_by_asset`
 between `start_ts` and `end_ts`, driving each asset's assigned `Rule`(s) through
 `strategy.engine.evaluate()` on a rolling, lookahead-free window (`WINDOW_BARS` hourly bars plus
-every daily bar with `ts <= t`), opening/closing at most one position per asset on a single
-shared `sim.account.SimAccount`, and recording per-trade (`SimTrade`) and portfolio-level
-(`SimTelemetry`) data for the report/verdict stage (Task 7, `sim/report.py`).
+every daily bar with `ts <= t`), opening/closing at most one RULE (risk-defined) position per
+asset on a single shared `sim.account.SimAccount`, and recording per-trade (`SimTrade`) and
+portfolio-level (`SimTelemetry`) data for the report/verdict stage (Task 7, `sim/report.py`).
+
+**Sizing is CLAMPED, not rejected (Issue #85):** a rule signal's fixed-fractional risk size
+(`execution.sizing.size`) is clamped down to `account.max_affordable_notional()` -- the tightest
+of available USDC cash, per-asset concentration headroom, and total-exposure headroom -- before
+`can_open` ever sees it, instead of being rejected outright whenever the raw risk-sized notional
+happened to exceed one of those. `can_open` remains the hard safety veto (a clamped intent is
+only skipped if it still doesn't pass, or clamps below `DUST_FLOOR`); it is never weakened.
+
+**DCA is a separate sleeve, not a slot-occupant (Issue #85):** a DCA-class setup (`no_stop` /
+`order_class == "dca"` context, `strategy/rules/dca.py`) is scheduled accumulation, not a
+risk-defined trade -- it is evaluated and (re)bought on every bar regardless of whether that
+asset's RULE slot is currently held, via `account.open(..., dca=True)`, which accumulates into a
+separate per-asset DCA lot (`SimAccount.dca_positions`) that this simulator never closes (DCA has
+no exit signal by design). Before this fix, DCA and rule trades shared the single per-asset
+`held` slot, so an asset accumulating DCA (which never exits) permanently froze that asset's rule
+evaluation.
 
 **Interpretive notes** (the plan's Task 6 prose leaves a few specifics implicit):
 
@@ -50,13 +66,14 @@ from keel.analysis import regime
 from keel.config import Config
 from keel.execution import sizing
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
-from keel.sim.account import OpenIntent, SimAccount
+from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.strategy import engine, indicators_cts
 from keel.strategy.backtest import _resolve_order, _touches
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import Rule, Setup, Signal
 from keel.types import Candle, Granularity
 
 __all__ = [
+    "DUST_FLOOR",
     "IDLE_SPAN_MIN_HOURS",
     "MOVE_THRESHOLD_PCT",
     "WINDOW_BARS",
@@ -79,6 +96,12 @@ WINDOW_BARS = 300
 # across it exceeds MOVE_THRESHOLD_PCT (5%).
 IDLE_SPAN_MIN_HOURS = 24
 MOVE_THRESHOLD_PCT = Decimal("0.05")
+
+# Issue #85: a risk-sized notional CLAMPED down to available headroom (cash / concentration /
+# exposure) below this floor isn't worth opening -- fee+slippage would dominate a sub-$1 order.
+# The entry is skipped, not rejected outright (matching every other clamp-not-reject in this
+# module), so the next bar gets a fresh chance once headroom recovers.
+DUST_FLOOR = Decimal("1")
 
 _SECONDS_PER_HOUR = 3600
 
@@ -126,6 +149,10 @@ class SimResult:
     contributions: list[tuple[int, Decimal]]
     coverage: dict
     telemetry: SimTelemetry
+    # DCA-sleeve holdings at the end of the run, keyed by asset (Issue #85) -- accumulated,
+    # marked-to-market lots that never generate a `SimTrade` (DCA never exits by design, see the
+    # module docstring); exposed here so callers/tests can see DCA and rule trades coexisting.
+    dca_positions: dict[str, OpenPosition] = field(default_factory=dict)
 
 
 @dataclass
@@ -254,28 +281,34 @@ def run(
                 Granularity.ONE_DAY: daily_by_asset[asset][:daily_idx],
             }
 
-            if asset in held:
+            # The RULE slot's exit check runs first and independently of DCA (Issue #85): DCA
+            # positions are never in `held`, so this only ever resolves a risk-defined position.
+            was_held = asset in held
+            if was_held:
                 _process_held(
                     asset, idx, hourly, current, candles_by_tf, held, account, trades, telemetry
                 )
-                continue
 
             asset_rules = rules_by_asset.get(asset)
             if not asset_rules:
                 continue
 
-            fired = _process_flat(
-                asset,
-                idx,
-                hourly,
-                candles_by_tf,
-                asset_rules,
-                account,
-                config,
-                latest_price,
-                held,
-                telemetry,
-                t,
+            signals = engine.evaluate(asset_rules, candles_by_tf)
+            telemetry.signals_emitted += len(signals)
+            _record_cts_telemetry(signals, candles_by_tf, telemetry)
+
+            # DCA continuation runs every bar regardless of the RULE slot's state -- a DCA
+            # sleeve keeps buying on its own cadence even while a rule position is held.
+            _process_dca_signals(asset, idx, hourly, signals, account, config, t)
+
+            if was_held:
+                # The RULE slot was occupied at the START of this bar -- defer new rule-entry
+                # evaluation (and idle tracking) to the next bar, matching the pre-#85 cadence.
+                continue
+
+            fired = _process_rule_signals(
+                asset, idx, hourly, signals, rules_by_asset[asset], account, config,
+                latest_price, held, t,
             )
             _track_idle(asset, current, fired, idle, telemetry)
 
@@ -310,6 +343,7 @@ def run(
         contributions=contributions,
         coverage={},
         telemetry=telemetry,
+        dca_positions=dict(account.dca_positions),
     )
 
 
@@ -329,31 +363,30 @@ def _process_held(
     trades: list[SimTrade],
     telemetry: SimTelemetry,
 ) -> None:
-    """Resolve `asset`'s held position against the current bar: conservative intrabar
+    """Resolve `asset`'s held RULE position against the current bar: conservative intrabar
     stop-vs-target resolution first (via `strategy.backtest`'s reused `_touches`/`_resolve_order`
     -- with no finer-than-hourly series ever available here, ambiguity always resolves to the
     stop, exactly matching `backtest.py`'s documented no-finer-data fallback), then
-    `Rule.exit_signal` if neither level was touched. DCA-class (no-stop) positions skip the
-    price-touch checks entirely -- they have no stop/target to resolve, per `dca.py`'s design."""
+    `Rule.exit_signal` if neither level was touched. `held` only ever contains risk-defined RULE
+    positions (Issue #85) -- DCA setups are filtered out before ever reaching `held` (see
+    `_process_rule_signals`), so every position resolved here has a real stop/target."""
     h = held[asset]
     setup = h.setup
-    is_dca = _is_dca_setup(setup)
 
     h.mfe = max(h.mfe, current.high - h.entry_fill)
     h.mae = max(h.mae, h.entry_fill - current.low)
 
     exit_price: Decimal | None = None
 
-    if not is_dca:
-        stop_touched = _touches(current, setup.stop)
-        target_touched = _touches(current, setup.target)
-        if stop_touched and target_touched:
-            order = _resolve_order(idx, hourly, None, {"target": setup.target, "stop": setup.stop})
-            exit_price = setup.target if order == "target" else setup.stop
-        elif stop_touched:
-            exit_price = setup.stop
-        elif target_touched:
-            exit_price = setup.target
+    stop_touched = _touches(current, setup.stop)
+    target_touched = _touches(current, setup.target)
+    if stop_touched and target_touched:
+        order = _resolve_order(idx, hourly, None, {"target": setup.target, "stop": setup.stop})
+        exit_price = setup.target if order == "target" else setup.stop
+    elif stop_touched:
+        exit_price = setup.stop
+    elif target_touched:
+        exit_price = setup.target
 
     if exit_price is None and h.rule.exit_signal(setup, candles_by_tf):
         exit_price = current.close
@@ -399,43 +432,17 @@ def _process_held(
     del held[asset]
 
 
-def _process_flat(
-    asset: str,
-    idx: int,
-    hourly: list[Candle],
-    candles_by_tf: dict[Granularity, list[Candle]],
-    asset_rules: list[Rule],
-    account: SimAccount,
-    config: Config,
-    latest_price: dict[str, Decimal],
-    held: dict[str, _Held],
-    telemetry: SimTelemetry,
-    now_ts: int,
-) -> bool:
-    """Evaluate `asset_rules` for `asset` on this bar and open at most one position (one position
-    per asset -- `run()` only calls this while `asset` is flat).
-
-    Returns `True` iff `engine.evaluate` produced at least one ENTER signal this bar (opened or
-    not) -- the idle-span tracker resets its anchor whenever a signal fires, whether or not it
-    was ultimately filled.
-    """
-    signals = engine.evaluate(asset_rules, candles_by_tf)
-    telemetry.signals_emitted += len(signals)
-    if not signals:
-        return False
-
+def _record_cts_telemetry(
+    signals: list[Signal], candles_by_tf: dict[Granularity, list[Candle]], telemetry: SimTelemetry
+) -> None:
+    """For *every* ENTER signal `evaluate()` emits this bar (DCA or rule-class, opened or not),
+    tally which CTS confluence factors were present/absent -- feeds Task 7's "unfed CTS factors"
+    gap-analysis detector. Runs once per bar regardless of the RULE slot's held/flat state."""
     window_1h = candles_by_tf[Granularity.ONE_HOUR]
-    rules_by_name = {rule.name: rule for rule in asset_rules}
-    opened = False
-
     for signal in signals:
         setup = signal.setup
         if setup is None:
             continue
-        rule = rules_by_name.get(signal.rule_name)
-        if rule is None:
-            continue
-
         cts_result = indicators_cts.score(engine._assemble_cts_context(setup, window_1h))
         for factor in cts_result.factors:
             bucket = (
@@ -445,17 +452,29 @@ def _process_flat(
             )
             bucket[factor.name] = bucket.get(factor.name, 0) + 1
 
-        if opened:
-            continue  # only one position per asset per bar
 
-        is_dca = _is_dca_setup(setup)
+def _process_dca_signals(
+    asset: str,
+    idx: int,
+    hourly: list[Candle],
+    signals: list[Signal],
+    account: SimAccount,
+    config: Config,
+    now_ts: int,
+) -> None:
+    """Buy every DCA-class signal this bar into the separate DCA sleeve (`account.dca_positions`,
+    via `account.open(..., dca=True)`), regardless of whether the asset's RULE slot is currently
+    held -- DCA is scheduled accumulation on its own cadence (`strategy/rules/dca.py`'s `detect`
+    already gates *when* it fires), not a risk-defined trade competing for the rule slot. Skips a
+    signal only when it fails `can_open`'s hard safety veto or there's no next bar to fill at."""
+    for signal in signals:
+        setup = signal.setup
+        if setup is None or not _is_dca_setup(setup):
+            continue
+
         try:
-            if is_dca:
-                budget = setup.context.get("size_usd") or config.dca.budget_usd
-                qty = sizing.dca_size(budget, setup.entry)
-            else:
-                equity = account.mark_to_market(latest_price)
-                qty = sizing.size(equity, config.risk_pct, setup.entry, setup.stop)
+            budget = setup.context.get("size_usd") or config.dca.budget_usd
+            qty = sizing.dca_size(budget, setup.entry)
         except ValueError:
             continue
 
@@ -464,9 +483,90 @@ def _process_flat(
             asset=asset,
             qty=qty,
             entry=setup.entry,
-            stop=None if is_dca else setup.stop,
+            stop=None,
             notional=notional,
-            is_dca=is_dca,
+            is_dca=True,
+            rule_kind=signal.rule_name,
+        )
+
+        ok, _reasons = account.can_open(intent, config, now_ts)
+        if not ok:
+            continue
+
+        fill_idx = idx + 1
+        if fill_idx >= len(hourly):
+            continue  # no next bar to fill at -- the signal is lost, not a rejection
+
+        fill_bar = hourly[fill_idx]
+        account.open(intent, fill_bar.open, fill_bar.ts, dca=True)
+
+
+def _process_rule_signals(
+    asset: str,
+    idx: int,
+    hourly: list[Candle],
+    signals: list[Signal],
+    asset_rules: list[Rule],
+    account: SimAccount,
+    config: Config,
+    latest_price: dict[str, Decimal],
+    held: dict[str, _Held],
+    now_ts: int,
+) -> bool:
+    """Open at most one risk-defined RULE position for `asset` this bar from `signals` (only
+    called while `asset`'s rule slot is flat -- DCA-class signals are handled separately by
+    `_process_dca_signals` and never compete for this slot).
+
+    The risk-sized notional (`execution.sizing.size`) is CLAMPED down to
+    `account.max_affordable_notional()` -- the tightest of available USDC cash, per-asset
+    concentration headroom, and total-exposure headroom -- instead of being rejected outright
+    when it exceeds one of those (Issue #85); `can_open` remains the hard safety veto a clamped
+    intent must still pass. A signal is skipped (not opened) only if the clamped notional falls
+    below `DUST_FLOOR`, or the clamped intent still somehow fails `can_open`, or there's no next
+    bar to fill at.
+
+    Returns `True` iff `signals` contained at least one non-DCA (rule-class) ENTER signal this
+    bar (opened or not) -- the idle-span tracker resets its anchor whenever a rule signal fires,
+    whether or not it was ultimately filled. DCA firing on its own cadence deliberately does NOT
+    count here: a regular DCA heartbeat shouldn't mask a genuine rule-signal drought.
+    """
+    rules_by_name = {rule.name: rule for rule in asset_rules}
+    rule_signal_fired = False
+
+    for signal in signals:
+        setup = signal.setup
+        if setup is None or _is_dca_setup(setup):
+            continue
+        rule_signal_fired = True
+
+        if asset in held:
+            continue  # only one RULE position per asset at a time
+
+        rule = rules_by_name.get(signal.rule_name)
+        if rule is None:
+            continue
+
+        try:
+            equity = account.mark_to_market(latest_price)
+            qty = sizing.size(equity, config.risk_pct, setup.entry, setup.stop)
+        except ValueError:
+            continue
+
+        risk_notional = sizing.spend(qty, setup.entry)
+        headroom = account.max_affordable_notional(asset, config, now_ts)
+        clamped_notional = min(risk_notional, headroom)
+        if clamped_notional < DUST_FLOOR:
+            continue
+        if clamped_notional < risk_notional:
+            qty = clamped_notional / setup.entry
+
+        intent = OpenIntent(
+            asset=asset,
+            qty=qty,
+            entry=setup.entry,
+            stop=setup.stop,
+            notional=clamped_notional,
+            is_dca=False,
             rule_kind=rule.name,
         )
 
@@ -490,9 +590,8 @@ def _process_flat(
             cts_score=signal.cts_score,
             entry_technique=signal.entry_technique,
         )
-        opened = True
 
-    return True
+    return rule_signal_fired
 
 
 def _track_idle(

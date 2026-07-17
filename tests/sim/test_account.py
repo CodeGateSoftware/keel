@@ -297,6 +297,178 @@ def test_monthly_allowance_opportunistic_pacing_ignores_the_business_day_pace():
     assert reasons == []
 
 
+# -- monthly/daily rail = trading VOLUME (buys + sells), Issue #85 ---------------------------------
+
+
+def test_month_volume_includes_sell_notional_unlike_guards_buy_only_spend():
+    """`SimAccount`'s monthly rail counts trading VOLUME (buys + sells) -- Coinbase One's actual
+    fee-free perk is a monthly volume allowance, not a buy-only spend cap. `execution.guards.check`
+    (rail 14, `_monthly_buy_spend_usd`) still counts BUY notional only and is untouched by this
+    issue -- an intentional, documented sim/live divergence (see `sim/account.py`'s module
+    docstring). This closed BTC round-trip (buy 200 + sell 200 = 400 volume) would leave a
+    buy-only system with just 200 of month-to-date spend; the sim sees the full 400.
+    """
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", notional=Decimal("200"), entry=Decimal("100")), Decimal("100"), DAY0
+    )
+    acc.close("BTC", fill_price=Decimal("100"), now_ts=DAY0)  # +200 volume: 400 total this month
+
+    config = _config(monthly_allowance_usd=Decimal("350"))  # buy-only spend (200) fits; volume
+    # (400) doesn't.
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("1")), config, DAY0)
+
+    assert ok is False
+    assert any("allowance" in r.lower() for r in reasons)
+
+
+def test_day_volume_includes_sell_notional_unlike_guards_buy_only_spend():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", notional=Decimal("100"), entry=Decimal("100")), Decimal("100"), DAY0
+    )
+    acc.close("BTC", fill_price=Decimal("100"), now_ts=DAY0)  # +100 volume: 200 total today
+
+    config = _config(max_per_day_usd=Decimal("250"))  # buy-only spend (100) fits; volume
+    # (200) + this order (100) = 300 doesn't.
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), config, DAY0)
+
+    assert ok is False
+    assert any("per_day_cap" in r for r in reasons)
+
+
+def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred():
+    """Direct guards-vs-sim comparison demonstrating the documented divergence: a BTC round-trip
+    (buy then sell, both today) leaves `guards.check` seeing only the buy leg (150) against its
+    month-to-date BUY spend, while `SimAccount` sees the full round-trip (300) as volume -- so an
+    order that guards would allow, the sim correctly (by its own, volume-based rail) rejects.
+    """
+    now_ts = JAN15
+    month_start, _ = guards._utc_month_bounds(now_ts)
+
+    conn = connect(":memory:")
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", now_ts)
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=now_ts)
+    _seed_filled_buy(
+        repo, product_id="BTC-USD", qty=Decimal("1.5"), price=Decimal("100"), created_at=now_ts - 60
+    )
+    _seed_filled_sell(
+        repo, product_id="BTC-USD", qty=Decimal("1.5"), price=Decimal("100"), created_at=now_ts - 30
+    )
+
+    account = SimAccount(fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+    account.deposit(Decimal("500"), now_ts=now_ts - 60)
+    account.open(
+        OpenIntent(
+            asset="BTC", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
+            notional=Decimal("150"), is_dca=True, rule_kind="dca",
+        ),
+        fill_price=Decimal("100"),
+        now_ts=now_ts - 60,
+    )
+    account.close("BTC", fill_price=Decimal("100"), now_ts=now_ts - 30)
+
+    config = _config(monthly_allowance_usd=Decimal("200"))  # guards: 150 buy-spend, room for 50
+    # more; sim: 300 volume already exceeds 200 outright.
+    order_intent = OrderIntent(
+        product_id="BTC-USD", side=Side.BUY, qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
+        notional=Decimal("50"), is_dca=True, rule_kind="dca", available_quote=account.cash_usdc,
+    )
+    sim_intent = OpenIntent(
+        asset="BTC", qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
+        notional=Decimal("50"), is_dca=True, rule_kind="dca",
+    )
+
+    guard_result = guards.check(order_intent, repo, config, now_ts)
+    sim_ok, sim_reasons = account.can_open(sim_intent, config, now_ts)
+
+    assert guard_result.ok is True  # buy-only: 150 + 50 = 200, exactly at the cap
+    assert sim_ok is False  # volume: 300 already exceeds the 200 cap before this order
+    assert any("allowance" in r.lower() for r in sim_reasons)
+
+
+# -- max_affordable_notional: the headroom `sim.portfolio_sim` clamps risk-sized orders to -------
+
+
+def test_max_affordable_notional_bound_by_cash_when_it_is_the_tightest_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("500"), DAY0)
+    config = _config(monthly_allowance_usd=Decimal("1000000"))
+
+    headroom = acc.max_affordable_notional("BTC", config, DAY0)
+
+    assert headroom == Decimal("500")
+
+
+def test_max_affordable_notional_bound_by_per_asset_concentration():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(
+        max_exposure_usd=Decimal("1000"),
+        max_per_asset_pct=Decimal("0.1"),
+        monthly_allowance_usd=Decimal("1000000"),
+    )
+
+    headroom = acc.max_affordable_notional("BTC", config, DAY0)
+
+    assert headroom == Decimal("100")  # 0.1 * 1000
+
+
+def test_max_affordable_notional_bound_by_total_exposure():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_exposure_usd=Decimal("500"), monthly_allowance_usd=Decimal("1000000"))
+    acc.open(_intent(asset="ETH", notional=Decimal("300")), Decimal("100"), DAY0)
+
+    headroom = acc.max_affordable_notional("BTC", config, DAY0)
+
+    assert headroom == Decimal("200")  # 500 - 300 already open (in another asset)
+
+
+def test_max_affordable_notional_bound_by_monthly_allowance():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(monthly_allowance_usd=Decimal("75"))
+
+    headroom = acc.max_affordable_notional("BTC", config, DAY0)
+
+    assert headroom == Decimal("75")
+
+
+def test_max_affordable_notional_combines_rule_and_dca_notional_for_the_same_asset():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(
+        max_exposure_usd=Decimal("1000"),
+        max_per_asset_pct=Decimal("0.5"),
+        monthly_allowance_usd=Decimal("1000000"),
+    )
+    acc.open(_intent(asset="BTC", notional=Decimal("100")), Decimal("100"), DAY0, dca=True)
+
+    headroom = acc.max_affordable_notional("BTC", config, DAY0)
+
+    assert headroom == Decimal("400")  # 0.5*1000 - 100 already-open DCA notional
+
+
+def test_max_affordable_notional_never_goes_negative():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(monthly_allowance_usd=Decimal("100"))
+    acc.open(_intent(asset="BTC", notional=Decimal("100000")), Decimal("100"), DAY0)  # blows
+    # every cap except the ones already-open exposure doesn't touch
+
+    headroom = acc.max_affordable_notional("ETH", config, DAY0)
+
+    assert headroom >= Decimal("0")
+
+
 # -- DCA is NOT exempt from any spend cap (matches rail 14) ----------------------------------------
 
 
@@ -433,6 +605,112 @@ def test_mark_to_market_is_cash_plus_exposure():
     assert mtm == acc.cash_usdc + Decimal("300")
 
 
+# -- DCA sleeve: separate from the rule slot, accumulates, never auto-closes (Issue #85) -----------
+
+
+def test_open_with_dca_true_lands_in_dca_positions_not_positions():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("1000"), DAY0)
+
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+        dca=True,
+    )
+
+    assert "BTC" not in acc.positions
+    assert "BTC" in acc.dca_positions
+    assert acc.dca_positions["BTC"].qty == Decimal("1")
+
+
+def test_dca_open_accumulates_qty_and_weighted_average_cost():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("10000"), DAY0)
+
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("100"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+        dca=True,
+    )
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("200"), notional=Decimal("200")),
+        Decimal("200"),
+        DAY0,
+        dca=True,
+    )
+
+    lot = acc.dca_positions["BTC"]
+    assert lot.qty == Decimal("2")
+    assert lot.entry_fill == Decimal("150")  # (100*1 + 200*1) / 2
+
+
+def test_dca_position_and_rule_position_coexist_on_the_same_asset():
+    """The bug this fix retires: DCA and a risk-defined rule trade used to share one per-asset
+    slot, so an asset accumulating DCA permanently froze the rule slot. They're now independent."""
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("10000"), DAY0)
+
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100")), Decimal("100"), DAY0,
+        dca=True,
+    )
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100"), is_dca=False),
+        Decimal("100"),
+        DAY0,
+    )
+
+    assert "BTC" in acc.dca_positions
+    assert "BTC" in acc.positions
+
+    pnl = acc.close("BTC", fill_price=Decimal("110"), now_ts=DAY0)  # closes the RULE slot only
+
+    assert pnl > 0
+    assert "BTC" not in acc.positions
+    assert "BTC" in acc.dca_positions  # the DCA lot is untouched by closing the rule slot
+
+
+def test_dca_and_rule_notional_both_count_toward_the_same_per_asset_concentration_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.5"))
+    acc.open(
+        _intent(asset="BTC", notional=Decimal("400")), Decimal("100"), DAY0, dca=True
+    )  # dca=400
+
+    # 400 (dca) + 150 (rule) = 550 > 500 (0.5*1000)
+    blocked, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("150")), config, DAY0)
+    assert blocked is False
+    assert any("per_asset_concentration_cap" in r for r in reasons)
+
+    allowed, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("100")), config, DAY0)
+    assert allowed is True
+    assert reasons == []
+
+
+def test_exposure_usd_includes_dca_positions():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("1000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("100"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+        dca=True,
+    )
+    acc.open(
+        _intent(asset="ETH", qty=Decimal("2"), entry=Decimal("100"), notional=Decimal("200"),
+                is_dca=False),
+        Decimal("100"),
+        DAY0,
+    )
+
+    exposure = acc.exposure_usd({"BTC": Decimal("150"), "ETH": Decimal("50")})
+
+    assert exposure == Decimal("250")  # 1*150 (dca) + 2*50 (rule)
+
+
 # -- dataclasses -----------------------------------------------------------------------------------
 
 
@@ -513,11 +791,20 @@ def _seed_filled_sell(
 def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     """A repo + account pair with equivalent spend-cap state:
 
-    - BTC: one order filled earlier this month (not today) -- exposure=200, month_spend +=200.
-    - ETH: bought then sold again *today* -- nets to ~0 exposure but still contributes +150 to
-      today's (and this month's) BUY spend, without leaving any open/correlated ETH exposure
-      (so rail 5, outside the spend-cap subset, never trips).
-    - cash_usdc == 300 after all of the above (a clean USDC-funding boundary).
+    - BTC: one order filled earlier this month (not today) -- exposure=200, month volume +=200.
+    - PAXG: bought (not sold) *today* -- exposure=150, contributes +150 to today's (and this
+      month's) volume. PAXG (not ETH) specifically -- it's gold-backed and excluded from rail 5
+      (correlation-adjusted sizing, `guards.UNCORRELATED_ASSETS`), which is outside the spend-cap
+      subset `SimAccount` enforces; using a correlated asset here would trip rail 5 on the guards
+      side with no sim-side equivalent to compare against.
+    - cash_usdc == 150 after all of the above (a clean USDC-funding boundary).
+
+    Deliberately BUY-only (Issue #85): `SimAccount`'s day/month rail now counts VOLUME (buys +
+    sells, see `sim/account.py`'s module docstring), while `guards.check` counts BUY notional
+    only -- an intentional, documented sim/live divergence. Keeping this SHARED scenario free of
+    any SELL keeps every rail (including per-day/monthly-allowance) in genuine full parity here;
+    the divergence itself is exercised directly by
+    `test_month_and_day_volume_include_sell_notional_unlike_guards_buy_only_spend` below.
     """
     month_start, _ = guards._utc_month_bounds(now_ts)
 
@@ -533,12 +820,8 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
         created_at=month_start + 3600,
     )
     _seed_filled_buy(
-        repo, product_id="ETH-USD", qty=Decimal("1.5"), price=Decimal("100"),
+        repo, product_id="PAXG-USD", qty=Decimal("1.5"), price=Decimal("100"),
         created_at=now_ts - 60,
-    )
-    _seed_filled_sell(
-        repo, product_id="ETH-USD", qty=Decimal("1.5"), price=Decimal("100"),
-        created_at=now_ts - 30,
     )
 
     account = SimAccount(fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
@@ -553,15 +836,14 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     )
     account.open(
         OpenIntent(
-            asset="ETH", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
+            asset="PAXG", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
             notional=Decimal("150"), is_dca=True, rule_kind="dca",
         ),
         fill_price=Decimal("100"),
         now_ts=now_ts - 60,
     )
-    account.close("ETH", fill_price=Decimal("100"), now_ts=now_ts - 30)
 
-    assert account.cash_usdc == Decimal("300")  # sanity: matches the docstring above
+    assert account.cash_usdc == Decimal("150")  # sanity: matches the docstring above
     return repo, account
 
 
@@ -611,9 +893,10 @@ def test_parity_with_guards_check_opportunistic_pacing():
         pacing="opportunistic",
     )
 
-    # boundaries: per_order=120, per_day=130 (280-150), monthly=150 (500-350),
-    # usdc=300 (cash), per_asset=350 (0.55*1000-200), exposure=800 (1000-200)
-    boundaries = (120, 130, 150, 300, 350, 800)
+    # boundaries: per_order=120, per_day=130 (280-150), monthly=150 (500-350) -- coincides with
+    # usdc=150 (cash=150) here, per_asset=350 (0.55*1000-200), exposure=650 (1000-350, since ETH
+    # (150) is left open in this BUY-only scenario -- see `_parity_scenario`'s docstring).
+    boundaries = (120, 130, 150, 350, 650)
     notionals = sorted(
         {1, 2000}
         | {b - 1 for b in boundaries}
@@ -645,7 +928,9 @@ def test_parity_with_guards_check_even_daily_pacing():
     month_spend_baseline = Decimal("350")
     paced_boundary = int(min(paced_cap, Decimal("2000")) - month_spend_baseline)
 
-    boundaries = {120, 130, 300, 350, 800, paced_boundary}
+    # usdc=150 (cash=150), exposure=650 (1000-350) -- see `_parity_scenario`'s docstring for why
+    # ETH (150) is left open rather than netted to ~0 in this BUY-only shared scenario.
+    boundaries = {120, 130, 150, 350, 650, paced_boundary}
     notionals = sorted(
         {1}
         | {b - 1 for b in boundaries}
