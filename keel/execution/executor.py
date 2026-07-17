@@ -40,6 +40,15 @@ invariant rail 9 enforces on entries, applied directly here since the replacemen
 min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has no
 separate entry price of its own. `scale_out` closes part of a position (a rule-driven partial
 profit-take) through the same guard+preview+place+log pipeline as a plain SELL leg.
+
+**USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
+available `config.quote_currency` (default USDC) balance from `broker.get_accounts()` and hands
+it to `guards.check` via `OrderIntent.available_quote` -- guards itself has no broker access, by
+design. This happens *before* `guards.check` runs (the balance is an input to the rail, not
+something guarded itself), so it is the one broker call this module makes ahead of the guard
+gate; `_fetch_available_quote` swallows any exception from the call and returns `None`, which
+rail 13 then treats as fail-closed (vetoes the BUY) exactly like an unknown balance from a
+missing quote-currency account. SELL intents never fetch a balance (the rail exempts them).
 """
 
 from __future__ import annotations
@@ -101,7 +110,7 @@ def execute(
     if now_ts is None:
         now_ts = int(time.time())
 
-    intent = _build_intent(signal, repo, config)
+    intent = _build_intent(signal, broker, repo, config)
     if intent is None:
         return ExecutionResult(
             placed=False,
@@ -142,7 +151,38 @@ def _is_dca_setup(context: dict[str, Any]) -> bool:
     return bool(context.get("no_stop")) or context.get("order_class") == "dca"
 
 
-def _build_intent(signal: Signal, repo: Repository, config: Config) -> OrderIntent | None:
+def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
+    """Live available `quote_currency` (default USDC) balance from `broker.get_accounts()`.
+
+    `None` on any failure -- a broker error, a malformed response, or simply no account for
+    `quote_currency` -- so rail 13 (USDC-funding) fails closed rather than guessing. This is
+    the one broker call `execute()` makes *before* `guards.check` runs: it's an input the rail
+    needs, not itself something the guard gate protects (no funds move, no order is placed).
+    """
+    try:
+        accounts = broker.get_accounts()
+    except Exception:
+        return None
+
+    for account in accounts or []:
+        currency = account.get("currency") if isinstance(account, dict) else getattr(
+            account, "currency", None
+        )
+        if currency != quote_currency:
+            continue
+        balance = account.get("available_balance") if isinstance(account, dict) else getattr(
+            account, "available_balance", None
+        )
+        if balance is None:
+            return None
+        return balance if isinstance(balance, Decimal) else Decimal(str(balance))
+
+    return None
+
+
+def _build_intent(
+    signal: Signal, broker: Any, repo: Repository, config: Config
+) -> OrderIntent | None:
     """Size `signal` into an `OrderIntent`, or `None` for an EXIT with nothing open to sell."""
     if signal.action == Action.ENTER:
         setup = signal.setup
@@ -158,6 +198,8 @@ def _build_intent(signal: Signal, repo: Repository, config: Config) -> OrderInte
             qty = sizing.size(equity, config.risk_pct, setup.entry, setup.stop)
             stop = setup.stop
 
+        available_quote = _fetch_available_quote(broker, config.quote_currency)
+
         return OrderIntent(
             product_id=signal.product_id,
             side=Side.BUY,
@@ -167,6 +209,7 @@ def _build_intent(signal: Signal, repo: Repository, config: Config) -> OrderInte
             notional=sizing.spend(qty, setup.entry),
             is_dca=is_dca,
             rule_kind=signal.rule_name,
+            available_quote=available_quote,
         )
 
     # EXIT: sell the currently held position, reconstructed from the orders audit log.

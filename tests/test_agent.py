@@ -57,6 +57,10 @@ class FakeBroker:
         self.place_calls: list[dict[str, Any]] = []
         self._order_seq = 0
 
+    def get_accounts(self) -> list[dict[str, Any]]:
+        """A comfortably large USDC balance -- rail 13 (USDC-funding) fails closed otherwise."""
+        return [{"currency": "USDC", "available_balance": Decimal("1000000")}]
+
     def get_candles(
         self, product_id: str, granularity: Granularity, start: int, end: int
     ) -> list[Candle]:

@@ -3,8 +3,8 @@
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
 `monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `rules
 list|backtest|promote|demote|disable` (`data.repository` + `strategy.backtest`/`promotion`),
-`pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch), and a Phase-4 `insights`
-stub.
+`pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch), `subscription show|set`
+(the DB-backed monthly-allowance rail 14 reads live, Issue #59), and a Phase-4 `insights` stub.
 
 **Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
 `{arm_bypass, raise_caps, disable_killswitch, unlock_vault}` require the passphrase gate. In this
@@ -36,7 +36,7 @@ import functools
 import sys
 import time
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import click
@@ -130,6 +130,20 @@ def _open_repo(ctx: click.Context) -> Repository:
 
 def _load_cfg(ctx: click.Context) -> Config:
     return load_config(ctx.obj["config_path"])
+
+
+def _ensure_subscription_seeded(repo: Repository, config: Config, now_ts: int) -> None:
+    """Persist `config.yaml`'s `subscription:` block into the DB the *first* time it's touched.
+
+    Once a subscription row exists, the DB is authoritative (`execution.guards`' rail 14 reads
+    it live on every `check()` call) -- this never clobbers a value an operator already set via
+    `subscription set`, it only seeds the initial default from config.yaml if the DB has never
+    been given one.
+    """
+    if repo.get_state("subscription") is None:
+        repo.set_subscription(
+            config.subscription.monthly_allowance_usd, config.subscription.pacing, now_ts
+        )
 
 
 def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only against fakes
@@ -293,6 +307,7 @@ def agent_cmd(
     config = _load_cfg(ctx)
     config = replace(config, auto_trade=replace(config.auto_trade, mode=mode))
     repo = _open_repo(ctx)
+    _ensure_subscription_seeded(repo, config, int(time.time()))
     broker = _build_broker(config)
 
     if not loop:
@@ -493,6 +508,80 @@ def pnl(ctx: click.Context, asset: str | None, raw_marks: tuple[str, ...]) -> No
         if a in unrealized_by_asset:
             line += f" unrealized={unrealized_by_asset[a]}"
         click.echo(line)
+
+
+# -- subscription (rail 14, monthly-allowance) ---------------------------------------------------
+
+
+@cli.group("subscription")
+def subscription_group() -> None:
+    """View or update the live monthly-allowance subscription (execution.guards rail 14).
+
+    This is a config-level change (adjusting a spending allowance), not a dangerous trade
+    action -- unlike `agent --bypass`/`resume` it requires no passphrase gate. The DB row it
+    writes is authoritative: `guards.check` reads it fresh on every order, so an update here
+    takes effect on the very next order, with no restart.
+    """
+
+
+@subscription_group.command("show")
+@click.pass_context
+@with_disclaimer
+def subscription_show(ctx: click.Context) -> None:
+    """Show the live subscription (config.yaml only ever seeds it once, on first use)."""
+    repo = _open_repo(ctx)
+    config = _load_cfg(ctx)
+    _ensure_subscription_seeded(repo, config, int(time.time()))
+    sub = repo.get_subscription()
+    click.echo(
+        f"monthly_allowance_usd={sub['monthly_allowance_usd']} pacing={sub['pacing']} "
+        f"updated_at={sub['updated_at']}"
+    )
+
+
+@subscription_group.command("set")
+@click.option(
+    "--monthly-allowance",
+    "monthly_allowance_raw",
+    required=True,
+    help="New monthly BUY allowance in USD, e.g. 500.",
+)
+@click.option(
+    "--pacing",
+    type=click.Choice(["opportunistic", "even_daily"]),
+    default=None,
+    help="Pacing mode (default: keep the current value).",
+)
+@click.pass_context
+@with_disclaimer
+def subscription_set(
+    ctx: click.Context, monthly_allowance_raw: str, pacing: str | None
+) -> None:
+    """Update the live subscription -- enforced by rail 14 starting with the very next order."""
+    repo = _open_repo(ctx)
+    config = _load_cfg(ctx)
+    _ensure_subscription_seeded(repo, config, int(time.time()))
+
+    try:
+        monthly_allowance_usd = Decimal(monthly_allowance_raw)
+    except InvalidOperation:
+        click.echo(
+            f"Error: --monthly-allowance must be a number, got {monthly_allowance_raw!r}",
+            err=True,
+        )
+        ctx.exit(1)
+        return
+    if monthly_allowance_usd < 0:
+        click.echo("Error: --monthly-allowance must be non-negative", err=True)
+        ctx.exit(1)
+        return
+
+    new_pacing = pacing if pacing is not None else repo.get_subscription()["pacing"]
+    repo.set_subscription(monthly_allowance_usd, new_pacing, int(time.time()))
+    click.echo(
+        f"subscription updated: monthly_allowance_usd={monthly_allowance_usd} "
+        f"pacing={new_pacing}"
+    )
 
 
 # -- kill / resume ------------------------------------------------------------------------------

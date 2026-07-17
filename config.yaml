@@ -49,3 +49,10 @@ money_mgmt:
 dca:
   budget_usd: 50
   cadence_days: 7
+
+# quote-currency the executor draws BUY notional from (rail 13, USDC-funding) -- never bank/ACH.
+quote_currency: USDC
+
+subscription:
+  monthly_allowance_usd: 500
+  pacing: opportunistic  # opportunistic (monthly cap only) | even_daily (also paces per business day)

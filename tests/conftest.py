@@ -52,6 +52,12 @@ money_mgmt:
 dca:
   budget_usd: 50
   cadence_days: 7
+
+quote_currency: USDC
+
+subscription:
+  monthly_allowance_usd: 500
+  pacing: opportunistic
 """
 
 
