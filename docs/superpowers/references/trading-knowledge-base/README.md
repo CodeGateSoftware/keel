@@ -61,6 +61,7 @@ reference valid across the split without rewriting them.
 | 28 | "The Economics of Islamic Finance and Securitization" (Jobst, IMF WP 07/117, 2007, 37pp) | extracted (**compliance FOUNDATION** — grounds all exclusions + NEW haram-sector screen; securitization out of scope) | [source-28](./sources/source-28.md) |
 | 29 | "Islamic Banking Processes and Products" (Oracle white paper, 2017, 14pp) | extracted (thin; reinforces §28 — AAOIFI ref + scholarly-divergence caveat; banking products out of scope) | [source-29](./sources/source-29.md) |
 | 30 | "Understanding Riba in Islamic Finance" (Azzad Asset Mgmt white paper, 3pp) | extracted (thin; NEW riba al-fadl → spot-settlement grounding + stablecoin parity; AAOIFI re-confirmed) | [source-30](./sources/source-30.md) |
+| 31 | "Risk Management in Mudharabah and Musharakah Financing" (Febianto, iECONS 2007, 30pp) | extracted (mostly out-of-scope/saturated; only nugget: ghorm vs gharar rationale) | [source-31](./sources/source-31.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -159,4 +160,7 @@ broadly prohibited. No new rails/strategy. **Source 30 (Azzad riba paper)** adds
 (deferred same-commodity/currency exchange = riba, another reason forwards/futures are out) + a **stablecoin/
 same-asset "parity only" note** (already satisfied by rail-13 USDC funding + no crypto-crypto pairs); re-confirms
 AAOIFI. **Compliance sources 28/29/30 have covered the ground — recommend pausing further Islamic-finance papers**
-(likely pure reinforcement).
+(likely pure reinforcement). **Source 31 (mudharabah/musharakah risk paper) confirmed this** — out-of-scope
+(bank PLS-financing risk, not trading risk); only nugget = **ghorm vs gharar / al-ghorm bil ghonm** ("no
+liability, no gain" → profit is legitimized by bearing real owned-asset risk; sharpens §28.2 rationale, no
+rule change). **Islamic-finance stream is exhausted (28→31); pause it.**
