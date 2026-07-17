@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.promotion: the promotion/demotion lifecycle (P2 Task 9).
+"""Tests for keel.strategy.promotion: the promotion/demotion lifecycle (P2 Task 9).
 
 Builds `BacktestResult` fixtures directly (this module must not depend on `backtest.py`'s
 simulation internals, `paper.py`, or `engine.py` — it only consumes the `BacktestResult`
@@ -12,10 +12,10 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.strategy.backtest import BacktestResult
-from halal_cb.strategy.promotion import PromotionConfig, can_promote, should_demote, transition
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.strategy.backtest import BacktestResult
+from keel.strategy.promotion import PromotionConfig, can_promote, should_demote, transition
 
 
 def _stats(

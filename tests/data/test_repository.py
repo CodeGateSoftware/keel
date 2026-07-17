@@ -1,4 +1,4 @@
-"""Tests for halal_cb.data.repository.Repository."""
+"""Tests for keel.data.repository.Repository."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.types import Candle, Granularity
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.types import Candle, Granularity
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.rules.dca: the DCA / dip-buy backbone rule (spec §8 rule 3,
+"""Tests for keel.strategy.rules.dca: the DCA / dip-buy backbone rule (spec §8 rule 3,
 §10.8/§12.1). Scheduled accumulation, market-buy, no stop, scaled up on dips from recent high,
 never exits on signal.
 """
@@ -9,9 +9,9 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.strategy.rules.base import Setup
-from halal_cb.strategy.rules.dca import Dca
-from halal_cb.types import Candle, Granularity
+from keel.strategy.rules.base import Setup
+from keel.strategy.rules.dca import Dca
+from keel.types import Candle, Granularity
 
 _DAY = 86_400
 

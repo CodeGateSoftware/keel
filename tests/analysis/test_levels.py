@@ -1,4 +1,4 @@
-"""Tests for halal_cb.analysis.levels: swing pivots, S/R clustering, round numbers,
+"""Tests for keel.analysis.levels: swing pivots, S/R clustering, round numbers,
 role reversal, and nearest-level lookup.
 """
 
@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.analysis.levels import (
+from keel.analysis.levels import (
     Level,
     find_levels,
     is_round_number,
@@ -15,7 +15,7 @@ from halal_cb.analysis.levels import (
     swing_highs,
     swing_lows,
 )
-from halal_cb.types import Candle
+from keel.types import Candle
 
 
 def _c(ts: int, o: str, h: str, l: str, c: str, v: str = "1") -> Candle:  # noqa: E741

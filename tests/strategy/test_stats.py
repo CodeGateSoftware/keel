@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.stats: the shared trade-aggregation helper (P3 Task 1).
+"""Tests for keel.strategy.stats: the shared trade-aggregation helper (P3 Task 1).
 
 Extracted out of the identical `_summarize` implementations previously duplicated in
 `backtest.py` and `paper.py`. Builds `Trade` fixtures directly (no backtester/paper-trader
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.strategy.rules.base import Trade
-from halal_cb.strategy.stats import BacktestResult, summarize
-from halal_cb.types import Side
+from keel.strategy.rules.base import Trade
+from keel.strategy.stats import BacktestResult, summarize
+from keel.types import Side
 
 
 def _trade(

@@ -1,11 +1,11 @@
-"""Tests for halal_cb.analysis.regime: condition (trend structure) and phase (run/pullback)."""
+"""Tests for keel.analysis.regime: condition (trend structure) and phase (run/pullback)."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.analysis.regime import Condition, Phase, detect_condition, detect_phase, is_tradeable
-from halal_cb.types import Candle
+from keel.analysis.regime import Condition, Phase, detect_condition, detect_phase, is_tradeable
+from keel.types import Candle
 
 
 def make_candle(ts: int, value: float, spread: Decimal = Decimal("0.5")) -> Candle:

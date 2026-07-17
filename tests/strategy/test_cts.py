@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.indicators_cts: the CTS confluence scorer.
+"""Tests for keel.strategy.indicators_cts: the CTS confluence scorer.
 
 Additive scoring over named confluence factors (spec §9) -> a total score that
 selects one of the 4 graded entry techniques (spec §9/§17.1).
@@ -6,7 +6,7 @@ selects one of the 4 graded entry techniques (spec §9/§17.1).
 
 from __future__ import annotations
 
-from halal_cb.strategy.indicators_cts import (
+from keel.strategy.indicators_cts import (
     DEFAULT_WEIGHTS,
     CTSFactor,
     CTSResult,

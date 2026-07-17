@@ -1,4 +1,4 @@
-"""Tests for halal_cb.data.db: connect() and migrate()."""
+"""Tests for keel.data.db: connect() and migrate()."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from halal_cb.data.db import connect, migrate
+from keel.data.db import connect, migrate
 
 EXPECTED_TABLES = {
     "transactions",

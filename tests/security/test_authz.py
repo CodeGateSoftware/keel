@@ -1,4 +1,4 @@
-"""Tests for halal_cb.security.authz: set_passphrase, verify, require, AuthzError.
+"""Tests for keel.security.authz: set_passphrase, verify, require, AuthzError.
 
 Main spec §14 "Dangerous-action authorization gate": a passphrase (stored as a scrypt hash,
 rate-limited) is required only for {arm_bypass, raise_caps, disable_killswitch, unlock_vault}.
@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from halal_cb.security.authz import (
+from keel.security.authz import (
     DANGEROUS_ACTIONS,
     MAX_ATTEMPTS,
     AuthzError,

@@ -1,0 +1,348 @@
+"""The scheduled agent loop, confirm mode (P3 Task 8).
+
+`run_once()` is a single cycle: poll fresh candles (`data.market_feed.poll_once`), reconstruct
+the `live` rules (`repo.get_rules("live")` -> real `Rule` instances, `RULE_REGISTRY` below),
+`strategy.engine.evaluate` them for ENTER `Signal`s, drive EXIT `Signal`s off currently-held
+positions, and run every signal through `execution.executor.execute` (confirm|bypass, from
+`config.auto_trade.mode`) -- respecting the kill-switch (`repo.get_state("kill_switch")`)
+throughout. `loop()` is the scheduled wrapper: call `run_once` every `interval_sec` until
+`stop_flag()` returns `True`.
+
+**This closes the Phase-2 gap** `strategy/engine.py`'s own docstring calls out: `evaluate()`
+only ever emits ENTER signals (rules + read-only market data, no notion of what's currently
+held). Something has to own position state and ask each rule's `exit_signal(held, candles_by_tf)`
+whether to close it -- in Phase 2 that was deferred to "the paper trader's job"; in live trading
+it's this module's job. Position ownership is tracked in `agent_state` under
+`position_rule:<product_id>` (the rule name that opened the currently-held position) -- the
+`orders` table has no column for it (live fills leave `rule_id` NULL, per `executor.py`'s own
+docstring: paper mode encodes `rule_name` in `raw_response`, but live orders don't), so this
+loop is the one place that source of truth lives, set the moment an ENTER places
+(`ExecutionResult.placed`) and cleared the moment the matching EXIT places.
+
+**Rule reconstruction.** `rules.kind`/`rules.params` (P3 Task 1's `Repository.get_rules`) round-
+trip through `json.dumps`/`json.loads`, so `params` on the way back out is JSON-plain (strings/
+numbers/lists) even though the real rule constructors want `Decimal`s, a `Granularity` enum, and
+tuples (`PullbackContinuation.granularity`/`buffer_ticks`/`ema_periods`,
+`RsiMeanReversion.timeframe`/its several `Decimal` fields). `RULE_REGISTRY` + `_build_rule` are
+the coercion boundary: a caller (this module, or a future CLI command that lists live rules)
+only ever deals in real `Rule` instances, never in raw JSON dicts.
+
+**Confirm mode has no interactive prompt here.** `run_once`'s signature (per the plan) is fixed
+to `(broker, repo, config, now_ts)` -- there is no `confirm_fn` slot for a human-in-the-loop
+approval callback. So in `mode="confirm"`, every `executor.execute` call is made with
+`confirm_fn=None`, which -- per `executor.execute`'s own contract -- fails closed: the order is
+previewed and logged but never placed. That is the intended behavior, not an oversight: wiring
+an actual interactive confirm prompt is the CLI's job (Task 9's `agent --loop --confirm`), which
+can drive `run_once`/`loop` with a real `confirm_fn` some other way, or review the previewed-but-
+unplaced orders out of band. `mode="bypass"` places without a prompt, still subject to every
+guard rail (un-overridable, per `guards.check`).
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any
+
+from keel.config import Config
+from keel.data import market_feed
+from keel.data.repository import Repository
+from keel.execution import executor
+from keel.execution.executor import ExecutionResult
+from keel.execution.guards import FEED_STALENESS_CYCLES
+from keel.strategy import engine
+from keel.strategy.rules.base import Action, Rule, Setup, Signal
+from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+from keel.types import Granularity, Side
+
+# -- rule reconstruction: DB row (kind, JSON-plain params) -> a real Rule instance -------------
+
+RULE_REGISTRY: dict[str, type[Rule]] = {
+    "pullback_continuation": PullbackContinuation,
+    "rsi_meanrev": RsiMeanReversion,
+    "dca": Dca,
+}
+
+# Constructor kwargs that must be coerced back from JSON-plain (str) to `Decimal`, per kind.
+_DECIMAL_PARAMS: dict[str, tuple[str, ...]] = {
+    "pullback_continuation": ("buffer_ticks",),
+    "rsi_meanrev": (
+        "atr_mult",
+        "fixed_stop_pct",
+        "fixed_rr",
+        "level_tolerance",
+        "support_proximity_pct",
+    ),
+    "dca": ("budget_usd", "dip_bonus_pct"),
+}
+
+# The constructor kwarg holding a `Granularity`, stored as its `.value` string, per kind.
+_GRANULARITY_PARAMS: dict[str, str] = {
+    "pullback_continuation": "granularity",
+    "rsi_meanrev": "timeframe",
+}
+
+
+def _build_rule(row: dict[str, Any]) -> Rule:
+    """Reconstruct a real `Rule` instance from a `repo.get_rules()` row.
+
+    Raises `ValueError` for a `kind` not in `RULE_REGISTRY` -- an unrecognized rule kind in the
+    `live` set is a configuration error, not something to silently skip (consistent with this
+    codebase's fail-loud posture elsewhere, e.g. `executor.execute`'s unknown-mode check).
+    """
+    kind = row["kind"]
+    rule_cls = RULE_REGISTRY.get(kind)
+    if rule_cls is None:
+        raise ValueError(
+            f"agent: no rule registered for kind {kind!r} -- known kinds: "
+            f"{sorted(RULE_REGISTRY)!r}"
+        )
+
+    kwargs = dict(row.get("params") or {})
+
+    for key in _DECIMAL_PARAMS.get(kind, ()):
+        if key in kwargs and kwargs[key] is not None:
+            kwargs[key] = Decimal(str(kwargs[key]))
+
+    gran_key = _GRANULARITY_PARAMS.get(kind)
+    if gran_key is not None and gran_key in kwargs:
+        kwargs[gran_key] = Granularity(kwargs[gran_key])
+
+    if kind == "pullback_continuation":
+        if "ema_periods" in kwargs:
+            kwargs["ema_periods"] = tuple(kwargs["ema_periods"])
+        if "signal_patterns" in kwargs:
+            kwargs["signal_patterns"] = tuple(kwargs["signal_patterns"])
+
+    return rule_cls(**kwargs)
+
+
+# -- freshness -----------------------------------------------------------------------------
+
+_GRANULARITY_ORDER: dict[Granularity, int] = {g: i for i, g in enumerate(Granularity)}
+
+
+def _finest_granularity(granularities: list[Granularity]) -> Granularity | None:
+    """The most granular (shortest bar) configured timeframe -- the best single signal of
+    "is fresh market data still arriving", matching `strategy.engine._trading_granularity`'s
+    own "finest available" fallback. Checking staleness against *every* configured granularity
+    would be wrong: a `ONE_DAY` series is expected to go up to ~24h between closed candles, far
+    longer than any sane `interval_sec`-scaled staleness window, so it would spuriously flag a
+    perfectly healthy feed as stale.
+    """
+    if not granularities:
+        return None
+    return min(granularities, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
+
+
+# -- held-position reconstruction (mirrors execution.executor._held_position) -----------------
+
+
+def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]:
+    """Net held qty + average cost basis for `product_id`, from filled live orders -- the same
+    audit-log-as-source-of-truth approach `executor._held_position`/`guards.py` use.
+    """
+    buy_qty = Decimal("0")
+    buy_cost = Decimal("0")
+    sell_qty = Decimal("0")
+    for order in repo.get_orders(mode="live", product_id=product_id, status="filled"):
+        price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
+        qty = order["qty"] or Decimal("0")
+        if order["side"] == Side.BUY.value:
+            buy_qty += qty
+            buy_cost += qty * (price or Decimal("0"))
+        elif order["side"] == Side.SELL.value:
+            sell_qty += qty
+
+    net_qty = buy_qty - sell_qty
+    avg_cost = (buy_cost / buy_qty) if buy_qty > 0 else Decimal("0")
+    return (net_qty if net_qty > 0 else Decimal("0")), avg_cost
+
+
+def _handle_exits(
+    product_id: str,
+    product_rules: list[Rule],
+    candles_by_tf: dict[Granularity, list[Any]],
+    repo: Repository,
+    broker: Any,
+    config: Config,
+    mode: str,
+    now_ts: int,
+) -> list[ExecutionResult]:
+    """Ask the owning rule whether to close `product_id`'s held position, and execute the EXIT
+    if it fires. A no-op (`[]`) when there's nothing held, or no rule is on record as owning it
+    (`position_rule:<product_id>` unset -- e.g. a position this loop never opened).
+    """
+    qty, avg_cost = _held_position(repo, product_id)
+    if qty <= 0:
+        return []
+
+    owning_rule_name = repo.get_state(f"position_rule:{product_id}")
+    if not owning_rule_name:
+        return []
+
+    owning_rule = next((r for r in product_rules if r.name == owning_rule_name), None)
+    if owning_rule is None:
+        return []
+
+    stop = repo.get_state(f"open_stop:{product_id}", default=avg_cost)
+    held_setup = Setup(
+        product_id=product_id,
+        direction="long",
+        entry=avg_cost,
+        stop=stop,
+        target=avg_cost,
+        context={},
+        ts=now_ts,
+    )
+    if not owning_rule.exit_signal(held_setup, candles_by_tf):
+        return []
+
+    exit_signal = Signal(
+        rule_name=owning_rule.name,
+        product_id=product_id,
+        action=Action.EXIT,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=now_ts,
+    )
+    result = executor.execute(
+        exit_signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
+    )
+    if result.placed:
+        repo.set_state(f"position_rule:{product_id}", None)
+    return [result]
+
+
+# -- one cycle -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LoopResult:
+    """The outcome of one `run_once` cycle."""
+
+    ts: int
+    skipped: bool
+    skip_reason: str | None
+    mode: str | None
+    polled: int
+    products: list[str] = field(default_factory=list)
+    stale_products: list[str] = field(default_factory=list)
+    enter_signals: list[Signal] = field(default_factory=list)
+    enter_results: list[ExecutionResult] = field(default_factory=list)
+    exit_results: list[ExecutionResult] = field(default_factory=list)
+
+
+def _confirm_or_bypass(config: Config) -> str:
+    """`config.auto_trade.mode` if it's a valid executor mode, else the safe default.
+
+    `AutoTradeConfig.mode` defaults to `"paper"` (a Phase-1 placeholder, spec §21) which isn't
+    an `executor.execute` mode at all -- per the Global Constraints, confirm mode is *always*
+    the default, so anything other than an explicit `"bypass"` falls back to `"confirm"` rather
+    than raising or silently bypassing rails.
+    """
+    mode = config.auto_trade.mode
+    return mode if mode in ("confirm", "bypass") else "confirm"
+
+
+def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> LoopResult:
+    """One agent cycle: poll -> (kill-switch / stale-data gates) -> evaluate -> exits -> entries.
+
+    The kill-switch is checked *before* anything else (no poll, no evaluation, no orders) --
+    `repo.get_state("kill_switch", default=True)` fails closed exactly like `guards.check`'s
+    rail 12, so an agent that has never been explicitly `resume`d never trades. Per-product
+    staleness (`market_feed.is_fresh`) is checked after polling and only skips *that* product;
+    the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
+    """
+    if repo.get_state("kill_switch", default=True):
+        return LoopResult(
+            ts=now_ts, skipped=True, skip_reason="kill_switch", mode=None, polled=0
+        )
+
+    rules = [_build_rule(row) for row in repo.get_rules("live")]
+    products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
+    granularities = list(config.market_data.granularities)
+
+    polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
+    # The feed-health heartbeat `guards.check`'s rail 12 reads -- nothing else in the system
+    # sets this key, so the loop that actually calls `poll_once` each cycle is responsible for
+    # recording that the check happened, independent of whether it found anything new.
+    repo.set_state("last_feed_ts", now_ts)
+
+    mode = _confirm_or_bypass(config)
+    max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
+    finest = _finest_granularity(granularities)
+
+    enter_signals: list[Signal] = []
+    enter_results: list[ExecutionResult] = []
+    exit_results: list[ExecutionResult] = []
+    stale_products: list[str] = []
+
+    for product_id in products:
+        if finest is not None and not market_feed.is_fresh(
+            repo, product_id, finest, now_ts, max_age_sec
+        ):
+            stale_products.append(product_id)
+            continue
+
+        product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
+        candles_by_tf = {g: repo.get_candles(product_id, g) for g in granularities}
+
+        exit_results.extend(
+            _handle_exits(
+                product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts
+            )
+        )
+
+        for signal in engine.evaluate(product_rules, candles_by_tf, repo=repo):
+            enter_signals.append(signal)
+            result = executor.execute(
+                signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
+            )
+            enter_results.append(result)
+            if result.placed:
+                repo.set_state(f"position_rule:{product_id}", signal.rule_name)
+
+    return LoopResult(
+        ts=now_ts,
+        skipped=False,
+        skip_reason=None,
+        mode=mode,
+        polled=polled,
+        products=products,
+        stale_products=stale_products,
+        enter_signals=enter_signals,
+        enter_results=enter_results,
+        exit_results=exit_results,
+    )
+
+
+# -- scheduled wrapper -----------------------------------------------------------------------
+
+
+def loop(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    interval_sec: float,
+    stop_flag: Callable[[], bool],
+) -> list[LoopResult]:
+    """Run `run_once` every `interval_sec` until `stop_flag()` returns `True`.
+
+    `stop_flag` is checked once per cycle, *before* that cycle runs -- a `stop_flag` that's
+    already `True` runs zero cycles. Tests drive this deterministically with a call-counting
+    closure (e.g. "stop after N cycles") and `interval_sec=0` so the loop doesn't actually
+    sleep.
+    """
+    results: list[LoopResult] = []
+    while not stop_flag():
+        results.append(run_once(broker, repo, config, now_ts=int(time.time())))
+        if interval_sec:
+            time.sleep(interval_sec)
+    return results

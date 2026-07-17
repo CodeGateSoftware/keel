@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.rules.base: the shared strategy interfaces and value
+"""Tests for keel.strategy.rules.base: the shared strategy interfaces and value
 types (Action, Setup, Signal, Trade, Rule) that all downstream rules/engine/backtest
 modules import.
 """
@@ -9,14 +9,14 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.strategy.rules.base import (
+from keel.strategy.rules.base import (
     Action,
     Rule,
     Setup,
     Signal,
     Trade,
 )
-from halal_cb.types import Candle, Granularity, Side
+from keel.types import Candle, Granularity, Side
 
 
 def _setup(

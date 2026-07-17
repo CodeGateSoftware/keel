@@ -1,4 +1,4 @@
-"""Tests for halal_cb.data.csv_import."""
+"""Tests for keel.data.csv_import."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from halal_cb.data.csv_import import ImportResult, import_csv, import_dir
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
+from keel.data.csv_import import ImportResult, import_csv, import_dir
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 

@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for halal-cb tests."""
+"""Shared pytest fixtures for keel tests."""
 
 from __future__ import annotations
 

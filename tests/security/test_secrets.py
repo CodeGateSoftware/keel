@@ -1,4 +1,4 @@
-"""Tests for halal_cb.security.secrets: the portable AES-GCM encrypted secrets vault.
+"""Tests for keel.security.secrets: the portable AES-GCM encrypted secrets vault.
 
 Main spec §14 Part A: master passphrase -> scrypt KDF -> key -> AES-GCM encrypt/decrypt a JSON
 secrets blob in `secrets.enc`, copyable between machines.
@@ -10,7 +10,7 @@ import stat
 
 import pytest
 
-from halal_cb.security.secrets import VaultError, load_vault, migrate_from_env, save_vault
+from keel.security.secrets import VaultError, load_vault, migrate_from_env, save_vault
 
 SECRETS = {
     "api_key": "organizations/abc/apiKeys/def",

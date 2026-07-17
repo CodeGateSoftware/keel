@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.backtest: the historical backtest engine.
+"""Tests for keel.strategy.backtest: the historical backtest engine.
 
 Drives the backtester with test-only `Rule` subclasses (per the Phase 2 plan, this
 module must not depend on any concrete rule implementation) against small,
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.strategy.backtest import BacktestResult, backtest
-from halal_cb.strategy.rules.base import Rule, Setup
-from halal_cb.types import Candle, Granularity, Side
+from keel.strategy.backtest import BacktestResult, backtest
+from keel.strategy.rules.base import Rule, Setup
+from keel.types import Candle, Granularity, Side
 
 
 def _candle(ts: int, o: str, h: str, l: str, c: str) -> Candle:  # noqa: E741 - matches OHLC convention

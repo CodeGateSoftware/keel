@@ -1,7 +1,7 @@
-# halal-cb runtime configuration.
+# keel runtime configuration.
 #
 # These are Phase 1 placeholders (spec §21 open item) — no live orders are placed in Phase 1.
-# `allowlist` and `caps` are required and validated by halal_cb.config.load_config; missing or
+# `allowlist` and `caps` are required and validated by keel.config.load_config; missing or
 # invalid values raise ConfigError naming the offending key rather than silently defaulting.
 
 allowlist:
