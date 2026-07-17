@@ -39,10 +39,10 @@ auto_trade:
   bypass_arm_ttl_sec: 3600
 
 promotion:
-  min_trades: 30
+  min_trades: 100
   min_expectancy: 0.0
   min_rr: 1.5
-  min_win_rate: 0.40
+  min_win_rate: 0.55
 
 money_mgmt:
   profit_trigger_pct: 0.10
