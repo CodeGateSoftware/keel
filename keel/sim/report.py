@@ -61,6 +61,7 @@ from decimal import Decimal
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimResult, SimTelemetry
+from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
 from keel.strategy.backtest import backtest
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
 from keel.strategy.promotion import PromotionConfig, can_promote
@@ -601,6 +602,50 @@ def _render_benchmark_section(account_metrics: dict, benchmark: BenchmarkResult)
     return lines
 
 
+_TIER_MODE_LABELS: dict[str, str] = {WITHIN_CAP: "Within cap", OVER_CAP: "Over cap"}
+
+
+def _render_tier_section(tier_results: list[TierFeeResult]) -> list[str]:
+    """"Subscription tier & fee analysis" (Issue #86) -- one row per (tier, mode) in
+    `tier_results`: does staying WITHIN a Coinbase One tier's fee-free monthly trading-volume
+    allowance, or trading freely and paying the taker fee OVER it, net out ahead once the tier's
+    own subscription cost is subtracted too? See `sim.tiers`' module docstring for the
+    fee-layering interpretation `fees_usd` here represents."""
+    lines = [
+        "## Subscription tier & fee analysis",
+        "",
+        "For each Coinbase One tier: staying WITHIN the fee-free monthly trading-volume "
+        "allowance (a throttled run, 0 trading fees, subscription still due) vs trading freely "
+        "and paying the taker fee on volume EXCEEDING it (\"over cap\"). Premium's allowance is "
+        "unlimited, so its within-cap and over-cap rows are identical.",
+        "",
+    ]
+    if not tier_results:
+        lines.append("_No tier/fee analysis was computed for this run._")
+        return lines
+
+    lines.append(
+        "| Tier | Mode | Total volume | Free volume | Paid volume | Trading fees | "
+        "Subscription | Gross P&L | Net P&L | Profits cover fees? |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    for r in tier_results:
+        mode_label = _TIER_MODE_LABELS.get(r.mode, r.mode)
+        lines.append(
+            f"| {r.tier_name} | {mode_label} | {r.total_volume_usd} | {r.free_volume_usd} | "
+            f"{r.paid_volume_usd} | {r.fees_usd} | {r.subscription_usd} | {r.gross_pnl_usd} | "
+            f"{r.net_pnl_usd} | {'yes' if r.profits_cover_fees else 'no'} |"
+        )
+
+    best = max(tier_results, key=lambda r: r.net_pnl_usd)
+    lines.append("")
+    lines.append(
+        f"**Takeaway:** {best.tier_name} ({_TIER_MODE_LABELS.get(best.mode, best.mode).lower()}) "
+        f"nets the best outcome of this matrix, at {best.net_pnl_usd} net P&L."
+    )
+    return lines
+
+
 def _render_gaps_section(gaps: list[GapItem]) -> list[str]:
     lines = ["## Knowledge & data gaps -> training backlog", ""]
     if not gaps:
@@ -640,12 +685,18 @@ def render_markdown(
     verdict: Verdict,
     gaps: list[GapItem],
     in_sample: bool = True,
+    tier_results: list[TierFeeResult] | None = None,
 ) -> str:
-    """Render the full report (spec §6 structure) as one Markdown string.
+    """Render the full report (spec §6 structure, plus Issue #86's tier/fee matrix) as one
+    Markdown string.
 
     Section order: verdict box, data coverage, edge table, account results, benchmark comparison,
-    knowledge & data gaps, caveats. Pure string assembly -- no file I/O (the CLI, Task 8, writes
-    the result to `--out`).
+    subscription tier & fee analysis, knowledge & data gaps, caveats. Pure string assembly -- no
+    file I/O (the CLI, Task 8, writes the result to `--out`).
+
+    `tier_results` (Issue #86) is optional and defaults to an empty matrix (renders a
+    "not computed" placeholder) so every existing caller of this function keeps working
+    unchanged.
     """
     sections = [
         _render_verdict_section(verdict, in_sample),
@@ -653,6 +704,7 @@ def render_markdown(
         _render_edge_section(edge),
         _render_account_section(account_metrics),
         _render_benchmark_section(account_metrics, benchmark),
+        _render_tier_section(tier_results or []),
         _render_gaps_section(gaps),
         _render_caveats_section(),
     ]

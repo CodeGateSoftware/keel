@@ -70,6 +70,7 @@ from keel.sim import benchmark as benchmark_mod
 from keel.sim import metrics as metrics_mod
 from keel.sim import portfolio_sim
 from keel.sim import report as report_mod
+from keel.sim import tiers as tiers_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Candle, Granularity
@@ -798,6 +799,84 @@ def _build_account_metrics(
     }
 
 
+def _build_tier_results(
+    config: Config,
+    rules: list[Any],
+    candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
+    sim_natural: portfolio_sim.SimResult,
+    natural_metrics: dict[str, Any],
+    start_ts: int,
+    now_ts: int,
+    monthly_contribution: Decimal,
+    skip_within_cap: bool,
+) -> list[tiers_mod.TierFeeResult]:
+    """Assemble the Coinbase One tier/fee analysis matrix (Issue #86) -- one `OVER_CAP` row per
+    `config.tiers` entry (always, from `sim_natural`, the already-computed natural/unthrottled
+    run) plus one `WITHIN_CAP` row per tier: an unlimited tier (`free_volume_usd is None`, e.g.
+    Premium) reuses `sim_natural` (nothing to throttle); a finite-free-volume tier gets its own
+    separate throttled `portfolio_sim.run(..., monthly_volume_cap=tier.free_volume_usd)` pass
+    UNLESS `skip_within_cap`, in which case that tier's within-cap row is simply omitted (only
+    the cheap over-cap overlay, reusing `sim_natural`, is computed).
+    """
+    natural_n_months = len(sim_natural.contributions)
+    natural_gross_pnl = natural_metrics.get("net_pnl_usd", Decimal("0"))
+
+    results: list[tiers_mod.TierFeeResult] = []
+    for tier in config.tiers:
+        results.append(
+            tiers_mod.compute_tier_fee_result(
+                monthly_volume=sim_natural.monthly_volume,
+                n_months=natural_n_months,
+                tier=tier,
+                mode=tiers_mod.OVER_CAP,
+                taker_pct=config.fees.taker_pct,
+                gross_pnl_usd=natural_gross_pnl,
+            )
+        )
+
+        if tier.free_volume_usd is None:
+            # Unlimited allowance -- nothing to throttle; within-cap == over-cap (Premium).
+            results.append(
+                tiers_mod.compute_tier_fee_result(
+                    monthly_volume=sim_natural.monthly_volume,
+                    n_months=natural_n_months,
+                    tier=tier,
+                    mode=tiers_mod.WITHIN_CAP,
+                    taker_pct=config.fees.taker_pct,
+                    gross_pnl_usd=natural_gross_pnl,
+                )
+            )
+            continue
+
+        if skip_within_cap:
+            continue
+
+        within_sim = portfolio_sim.run(
+            rules,
+            candles_by_asset,
+            config,
+            start_ts=start_ts,
+            end_ts=now_ts,
+            monthly_contribution=monthly_contribution,
+            fee_pct=_SIM_FEE_PCT,
+            slippage_pct=_SIM_SLIPPAGE_PCT,
+            monthly_volume_cap=tier.free_volume_usd,
+        )
+        within_metrics = _build_account_metrics(within_sim, start_ts, now_ts)
+        results.append(
+            tiers_mod.compute_tier_fee_result(
+                monthly_volume=within_sim.monthly_volume,
+                n_months=len(within_sim.contributions),
+                tier=tier,
+                mode=tiers_mod.WITHIN_CAP,
+                taker_pct=config.fees.taker_pct,
+                gross_pnl_usd=within_metrics.get("net_pnl_usd", Decimal("0")),
+            )
+        )
+
+    return results
+
+
 def _default_report_path(now_ts: int) -> Path:
     date_str = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y-%m-%d")
     return Path("docs/superpowers/reports") / f"{date_str}-engine-validation.md"
@@ -831,6 +910,16 @@ def _default_report_path(now_ts: int) -> Path:
     default=False,
     help="Never touch the network; simulate over whatever is already cached in the DB.",
 )
+@click.option(
+    "--skip-within-cap",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip the extra throttled sim runs for the tier/fee analysis (Issue #86) -- only the "
+        "cheap over-cap fee overlay is computed, from the natural run already being done "
+        "anyway. Finite-free-volume tiers' within-cap rows are omitted."
+    ),
+)
 @click.pass_context
 @with_disclaimer
 def simulate(
@@ -842,6 +931,7 @@ def simulate(
     artifact: bool,
     refresh: bool,
     no_fetch: bool,
+    skip_within_cap: bool,
 ) -> None:
     """Simulate the deterministic engine over historical candles (read-only; no authz gate).
 
@@ -849,6 +939,12 @@ def simulate(
     DB (`--db`, never in-memory), replays the real rule set through the engine + a dollar
     account, compares it to a DCA benchmark, and writes a GO-LIVE/TRAIN-MORE report. See
     `docs/superpowers/plans/2026-07-17-engine-validation-simulation.md` Task 8.
+
+    Also computes a Coinbase One subscription-tier/fee analysis (Issue #86): for each configured
+    tier (`config.tiers`), whether staying WITHIN its fee-free monthly trading-volume allowance
+    (a separate, throttled sim run per finite-free-volume tier) or trading freely and paying the
+    taker fee on volume EXCEEDING it ("over cap") nets out ahead. This means up to 3 total sim
+    passes (natural + one throttled run per finite-free-volume tier) unless `--skip-within-cap`.
     """
     now_ts = int(time.time())
     config = _load_cfg(ctx)
@@ -921,8 +1017,27 @@ def simulate(
         sim.telemetry, sim.coverage, move_threshold_pct=portfolio_sim.MOVE_THRESHOLD_PCT
     )
 
+    tier_results = _build_tier_results(
+        config,
+        rules,
+        candles_by_asset,
+        sim,
+        account_metrics,
+        start_ts,
+        now_ts,
+        monthly_contribution,
+        skip_within_cap,
+    )
+
     md = report_mod.render_markdown(
-        sim, edge, account_metrics, benchmark, verdict, gaps, in_sample=True
+        sim,
+        edge,
+        account_metrics,
+        benchmark,
+        verdict,
+        gaps,
+        in_sample=True,
+        tier_results=tier_results,
     )
 
     out = Path(out_path) if out_path is not None else _default_report_path(now_ts)

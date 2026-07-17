@@ -153,6 +153,11 @@ class SimResult:
     # marked-to-market lots that never generate a `SimTrade` (DCA never exits by design, see the
     # module docstring); exposed here so callers/tests can see DCA and rule trades coexisting.
     dca_positions: dict[str, OpenPosition] = field(default_factory=dict)
+    # Every opened AND closed order's notional (trading VOLUME, Issue #85's buys+sells
+    # convention), aggregated by UTC calendar month and keyed by each month's start ts
+    # (`SimAccount.monthly_volume`) -- feeds the Coinbase One tier/fee analysis (Issue #86,
+    # `sim.tiers`), which needs per-month volume to compute over-cap fees correctly.
+    monthly_volume: dict[int, Decimal] = field(default_factory=dict)
 
 
 @dataclass
@@ -219,12 +224,24 @@ def run(
     monthly_contribution: Decimal,
     fee_pct: Decimal = Decimal("0.006"),
     slippage_pct: Decimal = Decimal("0.0005"),
+    monthly_volume_cap: Decimal | None = None,
 ) -> SimResult:
     """Simulate `rules` (each bound to one asset via `Rule.product_id`) over `candles_by_asset`.
 
     See the module docstring for the loop's exact semantics (no-lookahead window assembly,
     conservative stop-vs-target resolution, next-bar-open fills, monthly contributions, daily
     equity sampling, idle-span telemetry).
+
+    `monthly_volume_cap` (Issue #86, Coinbase One tier/fee analysis): when `None` (default), the
+    account trades naturally -- sizing is clamped only by `SimAccount.max_affordable_notional`'s
+    existing six caps (cash / concentration / exposure / etc, Issue #85), which can push a
+    month's trading VOLUME (buys+sells) past any particular subscription tier's fee-free
+    allowance. When set to a `Decimal`, every order's clamp ALSO floors headroom to the volume
+    remaining before that ceiling this UTC month, so the account never trades enough in a month
+    to exceed `monthly_volume_cap` -- i.e. it never owes a fee under a tier whose free allowance
+    equals `monthly_volume_cap`. This throttles both the RULE-slot clamp and the DCA sleeve (DCA
+    is skipped for the cycle, not partially filled, if it would breach the remaining volume --
+    consistent with DCA's fixed-budget-per-cycle semantics elsewhere in this module).
     """
     account = SimAccount(fee_pct, slippage_pct)
     window_bars = _window_bars(config)
@@ -299,7 +316,9 @@ def run(
 
             # DCA continuation runs every bar regardless of the RULE slot's state -- a DCA
             # sleeve keeps buying on its own cadence even while a rule position is held.
-            _process_dca_signals(asset, idx, hourly, signals, account, config, t)
+            _process_dca_signals(
+                asset, idx, hourly, signals, account, config, t, monthly_volume_cap
+            )
 
             if was_held:
                 # The RULE slot was occupied at the START of this bar -- defer new rule-entry
@@ -308,7 +327,7 @@ def run(
 
             fired = _process_rule_signals(
                 asset, idx, hourly, signals, rules_by_asset[asset], account, config,
-                latest_price, held, t,
+                latest_price, held, t, monthly_volume_cap,
             )
             _track_idle(asset, current, fired, idle, telemetry)
 
@@ -344,6 +363,7 @@ def run(
         coverage={},
         telemetry=telemetry,
         dca_positions=dict(account.dca_positions),
+        monthly_volume=account.monthly_volume(),
     )
 
 
@@ -461,12 +481,17 @@ def _process_dca_signals(
     account: SimAccount,
     config: Config,
     now_ts: int,
+    monthly_volume_cap: Decimal | None = None,
 ) -> None:
     """Buy every DCA-class signal this bar into the separate DCA sleeve (`account.dca_positions`,
     via `account.open(..., dca=True)`), regardless of whether the asset's RULE slot is currently
     held -- DCA is scheduled accumulation on its own cadence (`strategy/rules/dca.py`'s `detect`
     already gates *when* it fires), not a risk-defined trade competing for the rule slot. Skips a
-    signal only when it fails `can_open`'s hard safety veto or there's no next bar to fill at."""
+    signal only when it fails `can_open`'s hard safety veto, there's no next bar to fill at, or
+    (Issue #86) it would push this UTC month's trading volume past `monthly_volume_cap` -- DCA is
+    SKIPPED for the cycle in that case, not partially filled, matching its fixed-budget-per-cycle
+    semantics (unlike the RULE slot's risk-sized notional, which IS clamped, see
+    `_process_rule_signals`)."""
     for signal in signals:
         setup = signal.setup
         if setup is None or not _is_dca_setup(setup):
@@ -479,6 +504,12 @@ def _process_dca_signals(
             continue
 
         notional = sizing.spend(qty, setup.entry)
+
+        if monthly_volume_cap is not None:
+            remaining = monthly_volume_cap - account.month_volume(now_ts)
+            if notional > remaining:
+                continue  # would exceed the fee-free monthly volume cap -- skip this cycle
+
         intent = OpenIntent(
             asset=asset,
             qty=qty,
@@ -512,6 +543,7 @@ def _process_rule_signals(
     latest_price: dict[str, Decimal],
     held: dict[str, _Held],
     now_ts: int,
+    monthly_volume_cap: Decimal | None = None,
 ) -> bool:
     """Open at most one risk-defined RULE position for `asset` this bar from `signals` (only
     called while `asset`'s rule slot is flat -- DCA-class signals are handled separately by
@@ -524,6 +556,10 @@ def _process_rule_signals(
     intent must still pass. A signal is skipped (not opened) only if the clamped notional falls
     below `DUST_FLOOR`, or the clamped intent still somehow fails `can_open`, or there's no next
     bar to fill at.
+
+    `monthly_volume_cap` (Issue #86), when set, additionally floors the clamp to the volume
+    remaining before that ceiling this UTC month (`account.max_affordable_notional`'s own
+    `monthly_volume_cap` param) -- see `run()`'s docstring.
 
     Returns `True` iff `signals` contained at least one non-DCA (rule-class) ENTER signal this
     bar (opened or not) -- the idle-span tracker resets its anchor whenever a rule signal fires,
@@ -553,7 +589,9 @@ def _process_rule_signals(
             continue
 
         risk_notional = sizing.spend(qty, setup.entry)
-        headroom = account.max_affordable_notional(asset, config, now_ts)
+        headroom = account.max_affordable_notional(
+            asset, config, now_ts, monthly_volume_cap=monthly_volume_cap
+        )
         clamped_notional = min(risk_notional, headroom)
         if clamped_notional < DUST_FLOOR:
             continue
