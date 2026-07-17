@@ -48,7 +48,9 @@ import functools
 import sys
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 import click
@@ -56,14 +58,19 @@ import click
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
 from keel.config import Config, load_config
+from keel.data import history as history_mod
 from keel.data import market_feed
 from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.security import authz
+from keel.sim import benchmark as benchmark_mod
+from keel.sim import metrics as metrics_mod
+from keel.sim import portfolio_sim
+from keel.sim import report as report_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
-from keel.types import Granularity
+from keel.types import Candle, Granularity
 
 DISCLAIMER = (
     "keel is a personal tool, not financial advice and not religious (Shariah) advice. "
@@ -561,6 +568,267 @@ def pnl(ctx: click.Context, asset: str | None, raw_marks: tuple[str, ...]) -> No
         if a in unrealized_by_asset:
             line += f" unrealized={unrealized_by_asset[a]}"
         click.echo(line)
+
+
+# -- simulate (Sim Task 8) -------------------------------------------------------------------
+
+# Match `strategy/backtest.backtest`'s / `sim/portfolio_sim.run`'s own defaults so the edge
+# table, the account pass, and the benchmarks all price fills identically.
+_SIM_FEE_PCT = Decimal("0.006")
+_SIM_SLIPPAGE_PCT = Decimal("0.0005")
+_SIM_GRANULARITIES = [Granularity.ONE_HOUR, Granularity.ONE_DAY]
+_DAYS_PER_YEAR = 365
+
+
+def _default_sim_products(config: Config) -> list[str]:
+    return [f"{asset}-USD" for asset in config.allowlist]
+
+
+def _parse_products_option(products: str | None, config: Config) -> list[str]:
+    if not products:
+        return _default_sim_products(config)
+    return [p.strip() for p in products.split(",") if p.strip()]
+
+
+def _sim_asset(product_id: str) -> str:
+    return product_id.split("-")[0]
+
+
+def _load_sim_candles(
+    repo: Repository, products: list[str], start_ts: int, end_ts: int
+) -> tuple[dict[str, dict[Granularity, list[Candle]]], dict[str, list[tuple[int, Decimal]]]]:
+    """Load cached candles for `products` into `(candles_by_asset, prices_by_asset)`.
+
+    `candles_by_asset`/`prices_by_asset` are keyed by bare asset code (`"BTC"`, not
+    `"BTC-USD"`) to match `sim.portfolio_sim`/`sim.benchmark`'s convention (rules bind to an
+    asset via `Rule.product_id`, `Config.target_weights` is asset-keyed).
+    """
+    candles_by_asset: dict[str, dict[Granularity, list[Candle]]] = {}
+    prices_by_asset: dict[str, list[tuple[int, Decimal]]] = {}
+    for product in products:
+        asset = _sim_asset(product)
+        per_tf = {
+            gran: repo.get_candles(product, gran, start_ts, end_ts) for gran in _SIM_GRANULARITIES
+        }
+        candles_by_asset[asset] = per_tf
+        prices_by_asset[asset] = [(c.ts, c.close) for c in per_tf[Granularity.ONE_DAY]]
+    return candles_by_asset, prices_by_asset
+
+
+def _sim_coverage(
+    repo: Repository, products: list[str], start_ts: int
+) -> dict[tuple[str, Granularity], history_mod.CoverageInfo]:
+    """Per-asset cached-candle coverage (no network -- reads whatever's already in the DB)."""
+    coverage: dict[tuple[str, Granularity], history_mod.CoverageInfo] = {}
+    for product in products:
+        asset = _sim_asset(product)
+        for gran in _SIM_GRANULARITIES:
+            coverage[(asset, gran)] = history_mod.coverage(repo, product, gran, start_ts)
+    return coverage
+
+
+def _print_sim_coverage(
+    db_path: str, coverage: dict[tuple[str, Granularity], history_mod.CoverageInfo]
+) -> None:
+    click.echo(f"data cached in: {db_path}")
+    for (asset, granularity), info in sorted(
+        coverage.items(), key=lambda kv: (kv[0][0], kv[0][1].value)
+    ):
+        click.echo(
+            f"  coverage {asset} {granularity.value}: n_candles={info.n_candles} "
+            f"first_ts={info.first_ts} last_ts={info.last_ts} gaps={info.gaps}"
+        )
+
+
+def _build_account_metrics(
+    sim: portfolio_sim.SimResult, start_ts: int, end_ts: int
+) -> dict[str, Any]:
+    """Reduce `sim.equity_curve`/`sim.contributions`/`sim.trades` into the account-metrics
+    dict `report.build_verdict`/`report.render_markdown` consume (see their docstrings for the
+    keys each reads)."""
+    equity_curve = sim.equity_curve
+    contributed = sum((amount for _, amount in sim.contributions), Decimal("0"))
+    ending_value = equity_curve[-1][1] if equity_curve else Decimal("0")
+    total_return_pct = (
+        (ending_value - contributed) / contributed if contributed > 0 else Decimal("0")
+    )
+    max_dd = metrics_mod.max_drawdown_pct(equity_curve)
+    returns = metrics_mod.daily_returns(equity_curve)
+    # Money-weighted IRR/CAGR treat contributions as outflows (negative) and the ending
+    # portfolio value as the single inflow -- see `sim.metrics.irr`/`cagr_money_weighted`.
+    cashflows = [(ts, -amount) for ts, amount in sim.contributions]
+
+    closed_trades = [t for t in sim.trades if t.outcome != "open"]
+    per_asset_pnl: dict[str, Decimal] = {}
+    for trade in closed_trades:
+        per_asset_pnl[trade.asset] = per_asset_pnl.get(trade.asset, Decimal("0")) + (
+            trade.pnl or Decimal("0")
+        )
+    avg_hold_hours = (
+        sum(
+            (Decimal(t.exit_ts - t.entry_ts) / Decimal(3600) for t in closed_trades),
+            Decimal("0"),
+        )
+        / len(closed_trades)
+        if closed_trades
+        else Decimal("0")
+    )
+
+    return {
+        "contributed": contributed,
+        "ending_value": ending_value,
+        "net_pnl_usd": ending_value - contributed,
+        "total_return_pct": total_return_pct,
+        "irr": metrics_mod.irr(cashflows, ending_value),
+        "cagr": metrics_mod.cagr_money_weighted(cashflows, ending_value, start_ts, end_ts),
+        "max_drawdown_pct": max_dd,
+        "return_per_drawdown": metrics_mod.return_per_drawdown(total_return_pct, max_dd),
+        "sharpe": metrics_mod.sharpe(returns),
+        "sortino": metrics_mod.sortino(returns),
+        "trade_count": len(closed_trades),
+        "avg_hold_hours": avg_hold_hours,
+        "per_asset_pnl": per_asset_pnl,
+    }
+
+
+def _default_report_path(now_ts: int) -> Path:
+    date_str = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y-%m-%d")
+    return Path("docs/superpowers/reports") / f"{date_str}-engine-validation.md"
+
+
+@cli.command()
+@click.option("--years", type=int, default=5, show_default=True, help="History depth to simulate.")
+@click.option(
+    "--products",
+    default=None,
+    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+)
+@click.option(
+    "--contribution",
+    default="500",
+    show_default=True,
+    help="Simulated monthly USD/USDC contribution.",
+)
+@click.option(
+    "--out", "out_path", default=None, type=click.Path(), help="Report output path (Markdown)."
+)
+@click.option(
+    "--artifact", is_flag=True, default=False, help="Also emit the HTML artifact (Sim Task 9)."
+)
+@click.option(
+    "--refresh", is_flag=True, default=False, help="Re-fetch history instead of trusting the cache."
+)
+@click.option(
+    "--no-fetch",
+    is_flag=True,
+    default=False,
+    help="Never touch the network; simulate over whatever is already cached in the DB.",
+)
+@click.pass_context
+@with_disclaimer
+def simulate(
+    ctx: click.Context,
+    years: int,
+    products: str | None,
+    contribution: str,
+    out_path: str | None,
+    artifact: bool,
+    refresh: bool,
+    no_fetch: bool,
+) -> None:
+    """Simulate the deterministic engine over historical candles (read-only; no authz gate).
+
+    Pulls (unless `--no-fetch`) and caches ~`--years` years of candle history in the persistent
+    DB (`--db`, never in-memory), replays the real rule set through the engine + a dollar
+    account, compares it to a DCA benchmark, and writes a GO-LIVE/TRAIN-MORE report. See
+    `docs/superpowers/plans/2026-07-17-engine-validation-simulation.md` Task 8.
+    """
+    now_ts = int(time.time())
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+
+    product_list = _parse_products_option(products, config)
+    months = years * 12
+    monthly_contribution = Decimal(contribution)
+    start_ts = now_ts - years * _DAYS_PER_YEAR * 86400
+
+    if not no_fetch:
+        client = _build_broker(config)
+        history_mod.ensure_history(
+            client,
+            repo,
+            product_list,
+            _SIM_GRANULARITIES,
+            years,
+            now_ts,
+            sleep_fn=time.sleep,
+            refresh=refresh,
+        )
+
+    coverage = _sim_coverage(repo, product_list, start_ts)
+    _print_sim_coverage(ctx.obj["db_path"], coverage)
+
+    candles_by_asset, prices_by_asset = _load_sim_candles(repo, product_list, start_ts, now_ts)
+    rules = [agent._build_rule(row) for row in repo.get_rules()]
+
+    edge = report_mod.edge_table(rules, candles_by_asset, _SIM_FEE_PCT, _SIM_SLIPPAGE_PCT)
+
+    sim = portfolio_sim.run(
+        rules,
+        candles_by_asset,
+        config,
+        start_ts=start_ts,
+        end_ts=now_ts,
+        monthly_contribution=monthly_contribution,
+        fee_pct=_SIM_FEE_PCT,
+        slippage_pct=_SIM_SLIPPAGE_PCT,
+    )
+    sim.coverage = coverage
+
+    account_metrics = _build_account_metrics(sim, start_ts, now_ts)
+
+    benchmark = benchmark_mod.dca_into_allowlist(
+        prices_by_asset,
+        config.target_weights,
+        monthly_contribution,
+        months,
+        _SIM_FEE_PCT,
+        _SIM_SLIPPAGE_PCT,
+    )
+    # Secondary benchmark (spec: DCA-into-BTC); not fed into the verdict gate, but computed so
+    # a future report revision can surface it without another sim pass.
+    benchmark_mod.dca_into_btc(
+        prices_by_asset, monthly_contribution, months, _SIM_FEE_PCT, _SIM_SLIPPAGE_PCT
+    )
+
+    promo_cfg = promotion_mod.PromotionConfig(
+        min_trades=config.promotion.min_trades,
+        min_expectancy=config.promotion.min_expectancy,
+        min_rr=config.promotion.min_rr,
+        min_win_rate=float(config.promotion.min_win_rate),
+    )
+    verdict = report_mod.build_verdict(
+        edge[report_mod.POOLED_KEY], account_metrics, benchmark, sim.coverage, promo_cfg
+    )
+    gaps = report_mod.analyze_gaps(
+        sim.telemetry, sim.coverage, move_threshold_pct=portfolio_sim.MOVE_THRESHOLD_PCT
+    )
+
+    md = report_mod.render_markdown(
+        sim, edge, account_metrics, benchmark, verdict, gaps, in_sample=True
+    )
+
+    out = Path(out_path) if out_path is not None else _default_report_path(now_ts)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md)
+
+    click.echo(f"verdict: {verdict.status}")
+    click.echo(f"report written to {out}")
+    if verdict.reasons:
+        click.echo("failing gates: " + "; ".join(verdict.reasons))
+
+    if artifact:
+        click.echo("artifact: use Task 9 (keel/sim/artifact.py) -- not yet wired")
 
 
 # -- subscription (rail 14, monthly-allowance) ---------------------------------------------------
