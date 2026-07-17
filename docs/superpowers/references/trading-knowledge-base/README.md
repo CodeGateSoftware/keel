@@ -68,6 +68,7 @@ reference valid across the split without rewriting them.
 | 35 | "Quantified Edge: Using AI, ChatGPT & Python" (Metaverse Trading Academy, 2025, 65pp) | extracted (**LLM-feature reference** — validates §5 asymmetry + craft; NEW breakeven-winrate formula; SMC/order-flow deferred/N-A) | [source-35](./sources/source-35.md) |
 | 36 | "7 Trading Themes for 2026" (Vince Stanzione **ebook**, 36pp; macro-outlook) | extracted (low value — time-bound predictions = no-oracle §6.4; reinforces wider-stops + narrow allowlist; negative LLM exemplar) | [source-36](./sources/source-36.md) |
 | 37 | "How to Trade Forex" (Vince Stanzione **ebook**, 76pp) | extracted (near-total dup of §23/§27 — MA/Donchian/RSI + reused appendices; sessions marginal; options/multipliers/carry excluded) | [source-37](./sources/source-37.md) |
+| 38 | "How to Trade Stocks" (Vince Stanzione **ebook**, 58pp) | extracted (near-total dup of §23/§27/§37; stock fundamentals/dividends N/A to crypto; reinforces no-oracle only) | [source-38](./sources/source-38.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -202,5 +203,6 @@ options/ETFs all excluded. No action.
 content (MA-crossover / Donchian 20-day / RSI 70-30) with reused appendices — **no new content**; reinforces
 the Donchian/Turtle family only. Sessions/time-of-day (§37.1) is marginal (already handled by pivot-slice
 time-bucket pruning; doesn't port to 24/7 crypto). Digital options/multipliers/carry excluded.
-**Stanzione/Deriv ebook stream is EXHAUSTED (23/24/26/27/36/37) — stop feeding Stanzione/Deriv titles;
-prioritize new-technique books + the Turtle-rule build.**
+**Stanzione/Deriv ebook stream is EXHAUSTED (23/24/26/27/36/37/38) — stop feeding Stanzione/Deriv titles;
+prioritize new-technique books + the Turtle-rule build.** (Source 38 "How to Trade Stocks" = same
+MA/Donchian/RSI dup; stock fundamentals/dividends N/A to crypto; reinforces no-oracle only.)
