@@ -20,3 +20,6 @@ dist/
 
 # Claude Code agent worktrees / transcripts
 .claude/
+
+# personal Coinbase exports (PII) -- local only, never committed
+transactions/
