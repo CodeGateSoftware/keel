@@ -63,6 +63,7 @@ reference valid across the split without rewriting them.
 | 30 | "Understanding Riba in Islamic Finance" (Azzad Asset Mgmt white paper, 3pp) | extracted (thin; NEW riba al-fadl → spot-settlement grounding + stablecoin parity; AAOIFI re-confirmed) | [source-30](./sources/source-30.md) |
 | 31 | "Risk Management in Mudharabah and Musharakah Financing" (Febianto, iECONS 2007, 30pp) | extracted (mostly out-of-scope/saturated; only nugget: ghorm vs gharar rationale) | [source-31](./sources/source-31.md) |
 | 32 | "Developments in Risk Management in Islamic Finance: A Review" (Al Rahahleh et al., 2019, 23pp) | extracted (out-of-scope/saturated; only nugget: negative/positive screening vocabulary) | [source-32](./sources/source-32.md) |
+| 33 | "A Review on Portfolio Optimization Models for Islamic Finance" (Lim et al., AIMS Math 2023, 28pp) | extracted (MPT declined-direction; **NEW: zakat 2.5% report**; reinforces long-only/Sortino/per-asset cap) | [source-33](./sources/source-33.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -85,7 +86,7 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **ATR ("N") volatility-based sizing — smaller size when more volatile, crypto-essential (Turtle, §27.1)**; **pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1, §27.1 |
 | `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2, **20-SMA close-below & trail-to-breakeven §26.2**); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2, §26.2 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
-| `CompliancePolicy` (HalalPolicy) | Shariah grounding of the exclusion set: riba (al-nasee'ah + **al-fadl §30.1**)/gharar/maisir → no leverage/derivatives/options; ownership+profit-loss-sharing → spot long-only permissible; **spot/immediate settlement mandatory (deferred same-commodity/currency exchange = riba); same-asset/stablecoin swaps only at parity §30.1**; **`haram_sector` screen at allowlist admission**; low-turnover as compliance value; **AAOIFI = authoritative screening-standards reference (2 sources); keep policy pluggable + document our conservative interpretation §29.1–29.2** | §28.1–28.4, §29.1–29.2, §30.1, §30.3 |
+| `CompliancePolicy` (HalalPolicy) | Shariah grounding of the exclusion set: riba (al-nasee'ah + **al-fadl §30.1**)/gharar/maisir → no leverage/derivatives/options; ownership+profit-loss-sharing → spot long-only permissible; **spot/immediate settlement mandatory (deferred same-commodity/currency exchange = riba); same-asset/stablecoin swaps only at parity §30.1**; **`haram_sector` screen at allowlist admission**; low-turnover as compliance value; **AAOIFI = authoritative screening-standards reference (2 sources); keep policy pluggable + document our conservative interpretation §29.1–29.2**; **NEW positive obligation: optional zakat-estimate report (~2.5% mkt value/lunar yr, report-only) §33.1** | §28.1–28.4, §29.1–29.2, §30.1, §30.3, §33.1 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
 
 ### The hard rails (un-overridable, incl. bypass mode)
@@ -168,3 +169,8 @@ rule change). **Source 32 (Islamic-finance risk-management review) confirmed exh
 risk-management literature review; only nugget = **negative vs positive Shariah screening** (our
 CompliancePolicy = the automated "negative screen"; "positive"/ethics screening noted, out of conservative
 scope). **Islamic-finance stream is exhausted (28→32); STOP feeding compliance papers — they now add nothing.**
+**Source 33 (Islamic portfolio-optimization review)** is a **declined-direction** paper (project already
+declined MPT/mean-variance = riba/quant-stack, spec §10) but surfaced one genuinely new *positive* item:
+**zakat** (2.5%/lunar-yr wealth purification → optional report-only feature §33.1); it also reinforces
+long-only (short = gharar), the Sortino/downside-risk success bar, and the per-asset cap, and **validates
+keeping MPT declined**. Exclusion-side compliance remains exhausted; zakat is the one add.
