@@ -60,6 +60,7 @@ reference valid across the split without rewriting them.
 | 27 | "How to Trade Commodities" (Vince Stanzione **ebook**, 50pp) | extracted (mostly dup/reinforce; **HIGH: Turtle Trading = canonical breakout spec**) | [source-27](./sources/source-27.md) |
 | 28 | "The Economics of Islamic Finance and Securitization" (Jobst, IMF WP 07/117, 2007, 37pp) | extracted (**compliance FOUNDATION** — grounds all exclusions + NEW haram-sector screen; securitization out of scope) | [source-28](./sources/source-28.md) |
 | 29 | "Islamic Banking Processes and Products" (Oracle white paper, 2017, 14pp) | extracted (thin; reinforces §28 — AAOIFI ref + scholarly-divergence caveat; banking products out of scope) | [source-29](./sources/source-29.md) |
+| 30 | "Understanding Riba in Islamic Finance" (Azzad Asset Mgmt white paper, 3pp) | extracted (thin; NEW riba al-fadl → spot-settlement grounding + stablecoin parity; AAOIFI re-confirmed) | [source-30](./sources/source-30.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -82,7 +83,7 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **ATR ("N") volatility-based sizing — smaller size when more volatile, crypto-essential (Turtle, §27.1)**; **pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1, §27.1 |
 | `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2, **20-SMA close-below & trail-to-breakeven §26.2**); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2, §26.2 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
-| `CompliancePolicy` (HalalPolicy) | Shariah grounding of the exclusion set: riba/gharar/maisir → no leverage/derivatives/options; ownership+profit-loss-sharing → spot long-only permissible; **NEW `haram_sector` screen at allowlist admission**; low-turnover as compliance value; **AAOIFI = authoritative screening-standards reference; keep policy pluggable + document our conservative interpretation (scholars differ) §29.1–29.2** | §28.1, §28.2, §28.3, §28.4, §29.1, §29.2 |
+| `CompliancePolicy` (HalalPolicy) | Shariah grounding of the exclusion set: riba (al-nasee'ah + **al-fadl §30.1**)/gharar/maisir → no leverage/derivatives/options; ownership+profit-loss-sharing → spot long-only permissible; **spot/immediate settlement mandatory (deferred same-commodity/currency exchange = riba); same-asset/stablecoin swaps only at parity §30.1**; **`haram_sector` screen at allowlist admission**; low-turnover as compliance value; **AAOIFI = authoritative screening-standards reference (2 sources); keep policy pluggable + document our conservative interpretation §29.1–29.2** | §28.1–28.4, §29.1–29.2, §30.1, §30.3 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
 
 ### The hard rails (un-overridable, incl. bypass mode)
@@ -153,4 +154,9 @@ machinery is out of scope. **Source 29 (Oracle Islamic-banking white paper) satu
 dimension** — only 3 takeaways: **AAOIFI** = the authoritative screening-standards reference; a
 **scholarly-divergence caveat** (halal-screening isn't monolithic → keep CompliancePolicy pluggable +
 document our conservative interpretation); and industry-practice confirmation that forwards/derivatives are
-broadly prohibited. No new rails/strategy.
+broadly prohibited. No new rails/strategy. **Source 30 (Azzad riba paper)** adds one nuance — **riba al-fadl**
+(unequal same-commodity exchange) → an independent shariah grounding that **settlement must be spot/immediate**
+(deferred same-commodity/currency exchange = riba, another reason forwards/futures are out) + a **stablecoin/
+same-asset "parity only" note** (already satisfied by rail-13 USDC funding + no crypto-crypto pairs); re-confirms
+AAOIFI. **Compliance sources 28/29/30 have covered the ground — recommend pausing further Islamic-finance papers**
+(likely pure reinforcement).
