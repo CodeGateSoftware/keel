@@ -120,6 +120,33 @@ def test_load_config_market_data_granularities_and_history_days(valid_config_pat
     assert config.market_data.history_days == 365
 
 
+# -- auto_trade.bypass_arm_ttl_sec (Issue #60, bypass-arm hardening) ---------------------------
+
+
+def test_load_config_bypass_arm_ttl_sec_default_is_one_hour(valid_config_path):
+    config = load_config(valid_config_path)
+
+    assert config.auto_trade.bypass_arm_ttl_sec == 3600
+
+
+def test_load_config_bypass_arm_ttl_sec_overridable(write_config):
+    text = VALID_CONFIG_YAML.replace("bypass_arm_ttl_sec: 3600", "bypass_arm_ttl_sec: 120")
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.auto_trade.bypass_arm_ttl_sec == 120
+
+
+def test_load_config_bypass_arm_ttl_sec_absent_falls_back_to_default(write_config):
+    text = VALID_CONFIG_YAML.replace("  bypass_arm_ttl_sec: 3600\n", "")
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.auto_trade.bypass_arm_ttl_sec == 3600
+
+
 def test_load_secrets_missing_env_returns_empty_dict(tmp_path):
     missing_path = tmp_path / "does-not-exist.env"
 

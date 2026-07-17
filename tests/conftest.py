@@ -36,6 +36,7 @@ auto_trade:
   mode: paper
   enabled: false
   interval_sec: 900
+  bypass_arm_ttl_sec: 3600
 
 promotion:
   min_trades: 30
