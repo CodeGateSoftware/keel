@@ -131,10 +131,27 @@ class _FirstBarRule(Rule):
         return {"name": self.name, "params": self.params}
 
 
-class _AlwaysOnDcaRule(Rule):
-    """Fires a no-stop, DCA-exempt setup on every bar while flat (bypassing the regime/kill-zone
-    gates -- out of scope for this test) and exits on the very next bar it's checked. Used only
-    to prove `run()` never opens a second position in an asset while one is already held."""
+def _zigzag_candle(i: int) -> Candle:
+    """One bar of a rising zigzag (alternating pronounced peak/trough bars on a rising baseline)
+    -- `analysis.regime.detect_condition` classifies this BULLISH (higher-highs, higher-lows)
+    from a 6-bar window onward, unlike flat/monotonic candles, which it classifies CHOPPY (no
+    swing structure) and would starve `engine.evaluate`'s choppy-regime gate."""
+    if i % 2 == 0:
+        base = 200 + i
+        o, h, lo, c = base, base + 5, base - 2, base + 2
+    else:
+        base = 100 + i
+        o, h, lo, c = base, base + 2, base - 5, base - 2
+    return _candle(i * _HOUR, str(o), str(h), str(lo), str(c))
+
+
+class _AlwaysOnRule(Rule):
+    """Fires a real, risk-defined (non-DCA) setup on every bar while flat, with a stop/target set
+    so far from price that neither is ever touched -- `exit_signal` (not a stop/target touch)
+    always closes the position on the very next bar it's checked. Used to prove `run()` never
+    opens a second RULE position in an asset while one is already held (DCA positions, tracked
+    separately, coexisting with the rule slot is exercised by
+    `test_dca_and_rule_positions_coexist_on_the_same_asset`)."""
 
     name = "always_on"
     params: dict = {}
@@ -149,9 +166,9 @@ class _AlwaysOnDcaRule(Rule):
             product_id=self.product_id,
             direction="long",
             entry=latest.close,
-            stop=Decimal("0"),
-            target=latest.close,
-            context={"no_stop": True, "order_class": "dca"},
+            stop=Decimal("0.01"),  # far below any zigzag candle -- never touched
+            target=Decimal("999999"),  # far above any zigzag candle -- never touched
+            context={},
             ts=latest.ts,
         )
 
@@ -214,10 +231,10 @@ def test_no_lookahead_spy_rule_never_sees_future_candles():
 
 
 def test_one_position_per_asset_never_overlaps():
-    hourly = [_candle(i * _HOUR, "100", "101", "99", "100") for i in range(20)]
+    hourly = [_zigzag_candle(i) for i in range(30)]
     candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
-    rule = _AlwaysOnDcaRule("BTC-USD")
-    config = _config(dca=DcaConfig(budget_usd=Decimal("50")))
+    rule = _AlwaysOnRule("BTC-USD")
+    config = _config()
 
     result = run(
         [rule],
@@ -399,3 +416,139 @@ def test_idle_span_recorded_on_big_move_with_no_signal():
     assert asset == "BTC"
     assert move_pct > MOVE_THRESHOLD_PCT
     assert start_ts < end_ts
+
+
+# ---------------------------------------------------------------------------
+# Issue #85: clamp-not-reject sizing, DCA sleeve separate from the rule slot
+# ---------------------------------------------------------------------------
+
+
+class _OnceDcaRule(Rule):
+    """Fires a DCA-class setup exactly once (on the asset's first bar) -- used only to prove a
+    DCA lot and a RULE position can coexist for the same asset within one `run()`."""
+
+    name = "dca_once"
+    params: dict = {}
+
+    def __init__(self, product_id: str, budget_usd: Decimal = Decimal("50")) -> None:
+        self.product_id = product_id
+        self.budget_usd = budget_usd
+
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        hourly = candles_by_tf[Granularity.ONE_HOUR]
+        if len(hourly) != 1:
+            return None
+        latest = hourly[-1]
+        return Setup(
+            product_id=self.product_id,
+            direction="long",
+            entry=latest.close,
+            stop=Decimal("0"),
+            target=latest.close,
+            context={"no_stop": True, "order_class": "dca", "size_usd": self.budget_usd},
+            ts=latest.ts,
+        )
+
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
+        return False
+
+    def describe(self) -> dict:
+        return {"name": self.name, "params": self.params}
+
+
+def test_sufficient_usdc_opens_rule_positions_instead_of_zero_trades():
+    """Issue #85's root-cause fix: a risk-sized notional that exceeds a cap used to be REJECTED
+    outright (0 trades, ever -- the sim account rejected 100% of rule orders). It's now CLAMPED
+    down to whatever headroom is available and still opens -- here the old Phase-1 fabricated
+    $100 per-order cap is the binding constraint, so the trade opens at $100, not $0.
+    """
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    rule = _FirstBarRule(
+        "BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200")
+    )
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(
+        caps=Caps(
+            max_per_order_usd=Decimal("100"),  # the old Phase-1 fabricated placeholder
+            max_per_day_usd=Decimal("300"),  # the old Phase-1 fabricated placeholder
+            max_exposure_usd=Decimal("1000000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+    )
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert len(result.trades) > 0
+    trade = result.trades[0]
+    assert trade.qty == Decimal("1")  # clamped notional $100 / entry $100 = qty 1
+
+
+def test_cash_constrained_account_clamps_notional_to_available_usdc():
+    """A risk-sized notional bigger than the account's actual USDC cash is clamped down to
+    exactly that cash headroom (not rejected) -- `entry=100, stop=99` (a tight 1% stop) sizes to
+    2x equity at `risk_pct=0.02`, comfortably exceeding a small deposit."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    rule = _FirstBarRule(
+        "BTC-USD", entry=Decimal("100"), stop=Decimal("99"), target=Decimal("200")
+    )
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config()  # every other cap roomy -- cash is the only binding constraint
+    cash = Decimal("500")
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=cash,
+    )
+
+    assert len(result.trades) > 0
+    trade = result.trades[0]
+    assert trade.qty * Decimal("100") == cash  # clamped to exactly the deposited cash
+
+
+def test_dca_and_rule_positions_coexist_on_the_same_asset():
+    """The bug this issue retires: DCA used to occupy the single per-asset slot and (since it
+    never exits) permanently freeze rule evaluation for that asset. A DCA lot and a RULE position
+    now open independently for the same asset within one run."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    dca_rule = _OnceDcaRule("BTC-USD", budget_usd=Decimal("50"))
+    risk_rule = _FirstBarRule(
+        "BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200")
+    )
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config()
+
+    result = run(
+        [dca_rule, risk_rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert "BTC" in result.dca_positions
+    assert result.dca_positions["BTC"].qty > 0
+    assert any(tr.asset == "BTC" for tr in result.trades)  # the RULE position also opened

@@ -17,8 +17,12 @@ target_weights:
 risk_pct: 0.01
 
 caps:
-  max_per_order_usd: 100
-  max_per_day_usd: 300
+  # max_per_order_usd / max_per_day_usd are OPTIONAL internal RISK limits, not real Coinbase
+  # limits -- Coinbase One's only subscription constraint is monthly fee-free trading VOLUME
+  # (see `subscription:` below). They default to a non-binding $1B when omitted (Issue #85);
+  # set explicit values here only if you want an extra per-order/per-day risk ceiling tighter
+  # than the exposure/concentration caps below. Left at their non-binding default here so
+  # risk-sized rule orders ($400-24k typical) aren't silently rejected.
   max_exposure_usd: 5000
   max_per_asset_pct: 0.50
 

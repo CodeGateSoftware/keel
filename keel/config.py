@@ -37,12 +37,28 @@ def _non_negative_decimal(value: Any, key: str) -> Decimal:
     return amount
 
 
+# Issue #85: `max_per_order_usd`/`max_per_day_usd` were Phase-1 PLACEHOLDER guesses ($100/$300),
+# never real Coinbase limits -- Coinbase One's only subscription constraint is monthly fee-free
+# trading VOLUME (`SubscriptionConfig.monthly_allowance_usd`), not a per-order or per-day $ cap.
+# Risk-sized rule orders routinely land in the $400-24k range, so a $100/$300 default silently
+# rejected 100% of them. These two fields are now OPTIONAL internal risk knobs -- a user MAY
+# still tighten them in `config.yaml` -- but absent an explicit value they default to this
+# effectively-unlimited sentinel so they never bind. The real, binding constraints are USDC
+# funding (cash on hand), per-asset concentration (`max_per_asset_pct`), and total exposure
+# (`max_exposure_usd`) -- `sim.portfolio_sim` CLAMPs a risk-sized order down to whichever of
+# those is tightest instead of rejecting the signal outright (see `sim/account.py`'s
+# `max_affordable_notional`). The cap-enforcement logic itself (`SimAccount.can_open`,
+# `execution.guards.check`) is unchanged -- it still vetoes any order that exceeds whatever
+# caps ARE configured; only the shipped defaults stop being a silent, fabricated blocker.
+NON_BINDING_CAP_USD = Decimal("1000000000")  # $1B -- not a real limit, just "don't bind"
+
+
 @dataclass(frozen=True)
 class Caps:
-    max_per_order_usd: Decimal
-    max_per_day_usd: Decimal
     max_exposure_usd: Decimal
     max_per_asset_pct: Decimal
+    max_per_order_usd: Decimal = NON_BINDING_CAP_USD
+    max_per_day_usd: Decimal = NON_BINDING_CAP_USD
 
 
 @dataclass(frozen=True)
@@ -117,11 +133,17 @@ class Config:
     quote_currency: str = "USDC"
 
 
+# Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
+# internal risk knobs (see `NON_BINDING_CAP_USD` above) and fall back to a non-binding default
+# when absent from `caps:` -- they're never silently REQUIRED, but if present they're still
+# validated/enforced like any other cap.
 _REQUIRED_CAP_KEYS = (
-    "max_per_order_usd",
-    "max_per_day_usd",
     "max_exposure_usd",
     "max_per_asset_pct",
+)
+_OPTIONAL_CAP_KEYS = (
+    "max_per_order_usd",
+    "max_per_day_usd",
 )
 
 
@@ -138,20 +160,24 @@ def _parse_allowlist(raw: dict[str, Any]) -> list[str]:
 def _parse_caps(raw: dict[str, Any]) -> Caps:
     caps_raw = raw.get("caps")
     if not caps_raw or not isinstance(caps_raw, dict):
-        raise ConfigError("caps: missing; must define " + ", ".join(_REQUIRED_CAP_KEYS))
+        raise ConfigError(
+            "caps: missing; must define " + ", ".join(_REQUIRED_CAP_KEYS + _OPTIONAL_CAP_KEYS)
+        )
     for key in _REQUIRED_CAP_KEYS:
         if key not in caps_raw:
             raise ConfigError(f"caps.{key}: missing")
     return Caps(
-        max_per_order_usd=_non_negative_decimal(
-            caps_raw["max_per_order_usd"], "caps.max_per_order_usd"
-        ),
-        max_per_day_usd=_non_negative_decimal(caps_raw["max_per_day_usd"], "caps.max_per_day_usd"),
         max_exposure_usd=_non_negative_decimal(
             caps_raw["max_exposure_usd"], "caps.max_exposure_usd"
         ),
         max_per_asset_pct=_non_negative_decimal(
             caps_raw["max_per_asset_pct"], "caps.max_per_asset_pct"
+        ),
+        max_per_order_usd=_non_negative_decimal(
+            caps_raw.get("max_per_order_usd", NON_BINDING_CAP_USD), "caps.max_per_order_usd"
+        ),
+        max_per_day_usd=_non_negative_decimal(
+            caps_raw.get("max_per_day_usd", NON_BINDING_CAP_USD), "caps.max_per_day_usd"
         ),
     )
 
