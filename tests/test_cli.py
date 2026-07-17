@@ -1,12 +1,12 @@
-"""Tests for halal_cb.cli -- the CLI (P3 Task 9).
+"""Tests for keel.cli -- the CLI (P3 Task 9).
 
 Every test drives the CLI through `click.testing.CliRunner` -- no live network, no live broker.
 `FakeBroker` below duck-types `CoinbaseClient` (`get_candles`/`preview_order`/`place_order`/
 `cancel_order`), modeled on `tests/test_agent.py::FakeBroker`; tests that need a broker monkeypatch
-`halal_cb.cli._build_broker` (the one seam that would otherwise construct a real, network-talking
+`keel.cli._build_broker` (the one seam that would otherwise construct a real, network-talking
 `CoinbaseClient`) to return it instead.
 
-Dangerous commands (`agent --bypass`, `resume`) are gated by `halal_cb.security.authz`; read-only
+Dangerous commands (`agent --bypass`, `resume`) are gated by `keel.security.authz`; read-only
 commands (`db import`, `monitor`, `rules list`, `pnl`) are not and work with no `authz.json` on
 disk at all.
 """
@@ -19,11 +19,11 @@ from typing import Any
 
 from click.testing import CliRunner
 
-import halal_cb.cli as cli_module
-from halal_cb.cli import DISCLAIMER, cli
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.security import authz
+import keel.cli as cli_module
+from keel.cli import DISCLAIMER, cli
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.security import authz
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
 PASSPHRASE = "correct-horse-battery-staple"

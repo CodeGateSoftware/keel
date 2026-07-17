@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.engine: the per-bar evaluation engine (Task 7).
+"""Tests for keel.strategy.engine: the per-bar evaluation engine (Task 7).
 
 Drives `evaluate()` with a mix of real, merged rules (`PullbackContinuation`, `Dca`) for
 realistic CTS-context assembly, and a small test-only scripted `Rule` (mirroring the
@@ -14,13 +14,13 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.strategy.engine import DEFAULT_RR_FLOOR, evaluate
-from halal_cb.strategy.rules.base import Action, Rule, Setup
-from halal_cb.strategy.rules.dca import Dca
-from halal_cb.strategy.rules.pullback_continuation import PullbackContinuation
-from halal_cb.types import Candle, Granularity, Side
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.strategy.engine import DEFAULT_RR_FLOOR, evaluate
+from keel.strategy.rules.base import Action, Rule, Setup
+from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.types import Candle, Granularity, Side
 
 _DAY = 86_400
 

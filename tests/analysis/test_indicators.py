@@ -1,4 +1,4 @@
-"""Tests for halal_cb.analysis.indicators.
+"""Tests for keel.analysis.indicators.
 
 Numeric functions (ema/rsi/macd/atr) are checked against small hand-computed
 reference values (tolerance 1e-6). Fib retracement/extension levels are checked
@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.analysis.indicators import (
+from keel.analysis.indicators import (
     atr,
     deceleration,
     ema,
@@ -25,7 +25,7 @@ from halal_cb.analysis.indicators import (
     rsi,
     rsi_divergence,
 )
-from halal_cb.types import Candle
+from keel.types import Candle
 
 
 def _candle(ts, o, h, low, c, v="1"):

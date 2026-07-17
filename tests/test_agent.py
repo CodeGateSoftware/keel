@@ -1,4 +1,4 @@
-"""Tests for halal_cb.agent -- the scheduled agent loop, confirm mode (P3 Task 8).
+"""Tests for keel.agent -- the scheduled agent loop, confirm mode (P3 Task 8).
 
 `run_once()` is the one-cycle composition this module drives: poll fresh candles
 (`market_feed.poll_once`) -> stale-data check (`market_feed.is_fresh`) -> reconstruct `live`
@@ -18,9 +18,9 @@ from typing import Any
 
 import pytest
 
-from halal_cb import agent
-from halal_cb.agent import LoopResult, _build_rule, loop, run_once
-from halal_cb.config import (
+from keel import agent
+from keel.agent import LoopResult, _build_rule, loop, run_once
+from keel.config import (
     AutoTradeConfig,
     Caps,
     Config,
@@ -28,11 +28,11 @@ from halal_cb.config import (
     MarketDataConfig,
     MoneyMgmtConfig,
 )
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.strategy.rules.base import Rule, Setup
-from halal_cb.strategy.rules.pullback_continuation import PullbackContinuation
-from halal_cb.types import Candle, Granularity, Side
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.types import Candle, Granularity, Side
 
 PRODUCT = "BTC-USD"
 

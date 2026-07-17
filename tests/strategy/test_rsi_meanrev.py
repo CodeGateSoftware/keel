@@ -1,11 +1,11 @@
-"""Tests for halal_cb.strategy.rules.rsi_meanrev: the RSI mean-reversion rule.
+"""Tests for keel.strategy.rules.rsi_meanrev: the RSI mean-reversion rule.
 
 Long-only: `detect()` fires a long `Setup` on an RSI oversold bounce at a known
 support level (optionally gated on bullish RSI divergence); `exit_signal()` fires
 when RSI is overbought (never a short — overbought is exit/don't-buy only).
 
-Fixtures are hand-tuned against the *real* `halal_cb.analysis.indicators.rsi` /
-`rsi_divergence` and `halal_cb.analysis.levels.find_levels` implementations (Wilder's
+Fixtures are hand-tuned against the *real* `keel.analysis.indicators.rsi` /
+`rsi_divergence` and `keel.analysis.levels.find_levels` implementations (Wilder's
 RSI seeded at `period`, swing-pivot support clustering) so the numeric claims in each
 test's comment are verifiable, not assumed.
 """
@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.strategy.rules.base import Setup
-from halal_cb.strategy.rules.rsi_meanrev import RsiMeanReversion
-from halal_cb.types import Candle, Granularity
+from keel.strategy.rules.base import Setup
+from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+from keel.types import Candle, Granularity
 
 
 def _c(ts: int, o: str, h: str, low: str, c: str, v: str = "1") -> Candle:

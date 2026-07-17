@@ -1,4 +1,4 @@
-"""Tests for halal_cb.execution.executor -- the order executor (P3 Task 4).
+"""Tests for keel.execution.executor -- the order executor (P3 Task 4).
 
 `execute()` turns a `Signal` into a guarded live order: build an `OrderIntent` (sized via
 `execution.sizing`), run `guards.check` FIRST (un-overridable -- a violation must never reach
@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from halal_cb.config import (
+from keel.config import (
     AutoTradeConfig,
     Caps,
     Config,
@@ -25,9 +25,9 @@ from halal_cb.config import (
     MarketDataConfig,
     MoneyMgmtConfig,
 )
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.execution.executor import (
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.execution.executor import (
     ExecutionResult,
     execute,
     handle_oco_fill,
@@ -36,8 +36,8 @@ from halal_cb.execution.executor import (
     scale_out,
     trail_stop_atr,
 )
-from halal_cb.strategy.rules.base import Action, Setup, Signal
-from halal_cb.types import Side
+from keel.strategy.rules.base import Action, Setup, Signal
+from keel.types import Side
 
 NOW_TS = 1_700_000_000
 

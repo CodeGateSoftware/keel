@@ -1,4 +1,4 @@
-"""Tests for `halal_cb.data.cb_client.CoinbaseClient`.
+"""Tests for `keel.data.cb_client.CoinbaseClient`.
 
 `CoinbaseClient` never talks to the network directly -- it wraps an injected transport that
 duck-types `coinbase.rest.RESTClient`. Every test here injects a `FakeTransport` that returns
@@ -12,8 +12,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from halal_cb.data.cb_client import CoinbaseClient
-from halal_cb.types import Candle, Granularity, Side
+from keel.data.cb_client import CoinbaseClient
+from keel.types import Candle, Granularity, Side
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 

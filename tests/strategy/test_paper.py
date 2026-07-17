@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.paper: the forward paper-trading simulator.
+"""Tests for keel.strategy.paper: the forward paper-trading simulator.
 
 `PaperTrader` consumes `Signal`s (task 1's shared type) directly -- it does not
 import `engine.py` (task 7 builds in parallel, per the Phase 2 wave-C split) -- and
@@ -13,12 +13,12 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.strategy.backtest import BacktestResult
-from halal_cb.strategy.paper import PaperTrader, track_record
-from halal_cb.strategy.rules.base import Action, Setup, Signal
-from halal_cb.types import Candle, Side
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.strategy.backtest import BacktestResult
+from keel.strategy.paper import PaperTrader, track_record
+from keel.strategy.rules.base import Action, Setup, Signal
+from keel.types import Candle, Side
 
 FEE_PCT = Decimal("0.006")
 SLIPPAGE_PCT = Decimal("0.0005")

@@ -1,4 +1,4 @@
-"""Tests for halal_cb.config: load_config, load_secrets, ConfigError."""
+"""Tests for keel.config: load_config, load_secrets, ConfigError."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.config import Config, ConfigError, load_config, load_secrets
+from keel.config import Config, ConfigError, load_config, load_secrets
 
 from .conftest import VALID_CONFIG_YAML
 
@@ -56,7 +56,7 @@ def test_load_config_caps_typed_and_correct(valid_config_path):
 
 
 def test_load_config_market_data_granularities_and_history_days(valid_config_path):
-    from halal_cb.types import Granularity
+    from keel.types import Granularity
 
     config = load_config(valid_config_path)
 
@@ -86,7 +86,7 @@ def test_load_secrets_reads_cdp_keys(tmp_path):
 def test_types_importable_with_correct_field_types():
     from decimal import Decimal as Dec
 
-    from halal_cb.types import Candle, Granularity, Side
+    from keel.types import Candle, Granularity, Side
 
     assert Granularity.ONE_MINUTE.value == "ONE_MINUTE"
     assert Granularity.ONE_DAY.value == "ONE_DAY"

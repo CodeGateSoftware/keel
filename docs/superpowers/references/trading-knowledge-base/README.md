@@ -1,4 +1,4 @@
-# Trading Knowledge Base — Sourced & Adapted for `halal-cb`
+# Trading Knowledge Base — Sourced & Adapted for `keel`
 
 **Purpose:** Cumulative extraction from trading-course transcripts, translated into
 deterministic, implementable rules/tools for our **halal spot-crypto, long-only,

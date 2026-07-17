@@ -1,4 +1,4 @@
-"""Tests for `halal_cb.data.market_feed`.
+"""Tests for `keel.data.market_feed`.
 
 `market_feed` wires an injected `CoinbaseClient` (#7) to `Repository` (#2) to keep the
 `candles` table populated. Every test here injects a `FakeClient` that serves canned,
@@ -11,10 +11,10 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.market_feed import backfill, is_fresh, poll_once
-from halal_cb.data.repository import Repository
-from halal_cb.types import Candle, Granularity
+from keel.data.db import connect, migrate
+from keel.data.market_feed import backfill, is_fresh, poll_once
+from keel.data.repository import Repository
+from keel.types import Candle, Granularity
 
 GRAN_SEC = 3600  # ONE_HOUR
 NOW = 1_700_100_000  # fixed, aligned to an hour boundary

@@ -1,8 +1,8 @@
-"""Tests for halal_cb.analysis.pnl: FIFO realized/unrealized P&L, position sizing,
+"""Tests for keel.analysis.pnl: FIFO realized/unrealized P&L, position sizing,
 daily pnl_daily snapshots, and drawdown/recovery metrics.
 
 Transaction dicts mirror the shape returned by `Repository.get_transactions()`
-(see halal_cb/data/repository.py): coinbase_id, source, type, asset, ts, qty,
+(see keel/data/repository.py): coinbase_id, source, type, asset, ts, qty,
 price, subtotal, total, fees, notes, rule_id, order_id. Only the fields pnl.py
 actually consumes (type, asset, ts, qty, price, fees) are populated here.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.analysis.pnl import (
+from keel.analysis.pnl import (
     Position,
     daily_snapshot,
     max_drawdown,

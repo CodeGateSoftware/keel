@@ -1,4 +1,4 @@
-"""Tests for halal_cb.execution.sizing: fixed-fractional risk sizing + DCA sizing (P3 Task 2).
+"""Tests for keel.execution.sizing: fixed-fractional risk sizing + DCA sizing (P3 Task 2).
 
 `size()` implements fixed-fractional position sizing: risk a fixed percentage of equity per
 trade, with the stop distance (in price, never pips) determining quantity. `spend()` converts a
@@ -13,7 +13,7 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.execution.sizing import dca_size, size, spend
+from keel.execution.sizing import dca_size, size, spend
 
 
 def test_size_fixed_fractional_risk() -> None:

@@ -1,4 +1,4 @@
-"""Tests for halal_cb.strategy.rules.pullback_continuation.PullbackContinuation.
+"""Tests for keel.strategy.rules.pullback_continuation.PullbackContinuation.
 
 Fixtures below are hand-tuned candle series verified to satisfy (or deliberately fail) the
 rule's gates: bullish condition + pullback phase (analysis.regime), EMA fan alignment
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from halal_cb.analysis import indicators
-from halal_cb.strategy.rules.pullback_continuation import PullbackContinuation
-from halal_cb.types import Candle, Granularity
+from keel.analysis import indicators
+from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.types import Candle, Granularity
 
 _EMA_PERIODS = (3, 5, 8)
 _BUFFER_TICKS = Decimal("0.02")
@@ -186,7 +186,7 @@ class TestDetectRejectsNonSetups:
 
 class TestTargetMethods:
     def test_swing_target_is_previous_swing_high(self) -> None:
-        from halal_cb.analysis import levels
+        from keel.analysis import levels
 
         rule = _rule(target_method="swing")
         candles = _bullish_pullback_candles()
@@ -200,7 +200,7 @@ class TestTargetMethods:
         assert setup.rr == (setup.target - setup.entry) / (setup.entry - setup.stop)
 
     def test_fib_ext_target_is_1272_extension_of_last_swing_move(self) -> None:
-        from halal_cb.analysis import levels
+        from keel.analysis import levels
 
         rule = _rule(target_method="fib_ext")
         candles = _bullish_pullback_candles()

@@ -1,4 +1,4 @@
-"""Tests for halal_cb.analysis.candles: pure candlestick primitives and pattern detectors.
+"""Tests for keel.analysis.candles: pure candlestick primitives and pattern detectors.
 
 Fixtures are hand-built Candle instances chosen so each detector's boundary conditions are
 exercised with both a positive (pattern present) and a negative (pattern absent) case, per
@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from halal_cb.analysis.candles import (
+from keel.analysis.candles import (
     body,
     is_doji,
     is_hammer,
@@ -25,7 +25,7 @@ from halal_cb.analysis.candles import (
     range_,
     upper_wick,
 )
-from halal_cb.types import Candle
+from keel.types import Candle
 
 
 def mk(ts: int, o: str, h: str, l: str, c: str, v: str = "1") -> Candle:  # noqa: E741

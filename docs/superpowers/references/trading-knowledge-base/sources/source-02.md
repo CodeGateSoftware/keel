@@ -83,7 +83,7 @@ Four leaks: **silly donations** (trading without a proven system), **rollover/ca
 costs**, **spread fluctuations**, **tax**. A **1% recurring fee ≈ years of extra work**
 (compounding example: 8% vs 7% net over decades = millions / +7 years to FI). → Model
 fees realistically in the backtester and **track actual fees per trade in the DB**;
-reconcile against the halal-cb live fee gate.
+reconcile against the keel live fee gate.
 - **Halal/spot notes:** rollover/carry and spread-betting/tax mechanics are Forex-specific.
   **Carry/rollover = interest ⇒ riba ⇒ already excluded** (we hold spot, no overnight
   financing). Keep only the general lesson: *fees compound — measure and minimize them.*

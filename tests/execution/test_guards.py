@@ -1,4 +1,4 @@
-"""Tests for halal_cb.execution.guards -- the twelve §14 hard rails.
+"""Tests for keel.execution.guards -- the twelve §14 hard rails.
 
 Each rail gets a focused test: a fully compliant baseline intent (`_intent()` against an empty,
 freshly-seeded `repo`) passes every rail; each rail test perturbs exactly the dimension that rail
@@ -14,17 +14,17 @@ from typing import Any
 
 import pytest
 
-from halal_cb.config import (
+from keel.config import (
     AutoTradeConfig,
     Caps,
     Config,
     MarketDataConfig,
     MoneyMgmtConfig,
 )
-from halal_cb.data.db import connect, migrate
-from halal_cb.data.repository import Repository
-from halal_cb.execution.guards import GuardResult, OrderIntent, check
-from halal_cb.types import Side
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.execution.guards import GuardResult, OrderIntent, check
+from keel.types import Side
 
 NOW_TS = 1_700_000_000  # 2023-11-14T22:13:20Z -- well inside its UTC day for boundary tests
 
