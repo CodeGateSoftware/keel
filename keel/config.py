@@ -119,6 +119,51 @@ class SubscriptionConfig:
 
 
 @dataclass(frozen=True)
+class TierConfig:
+    """One Coinbase One subscription tier (Issue #86) -- `sim.tiers`/`keel simulate`'s tier/fee
+    analysis matrix compares staying WITHIN a tier's fee-free monthly trading-volume allowance
+    against trading freely and paying the taker fee on volume EXCEEDING it.
+
+    `free_volume_usd is None` means an UNLIMITED fee-free allowance (Premium) -- there is no
+    volume beyond which fees apply, so within-cap and over-cap analysis collapse to the same
+    (always fee-free) result for that tier.
+    """
+
+    name: str
+    free_volume_usd: Decimal | None
+    subscription_usd_month: Decimal
+
+
+@dataclass(frozen=True)
+class FeesConfig:
+    """Coinbase Advanced trading fees applied to volume beyond a tier's free allowance
+    (Issue #86) -- the `<$1k-30d-volume` account tier's published rate. `taker_pct` is the sim's
+    default fee-schedule rate (fills are modeled market-style, at next-bar open); `maker_pct` is
+    exposed for a caller that wants to model limit-order fills instead."""
+
+    taker_pct: Decimal = Decimal("0.012")
+    maker_pct: Decimal = Decimal("0.006")
+
+
+def _default_tiers() -> tuple[TierConfig, ...]:
+    """Real Coinbase One tiers (Issue #86) -- see `TierConfig`'s docstring for `free_volume_usd
+    is None` ("Premium" is unlimited)."""
+    return (
+        TierConfig(
+            name="Basic", free_volume_usd=Decimal("500"), subscription_usd_month=Decimal("4.99")
+        ),
+        TierConfig(
+            name="Preferred",
+            free_volume_usd=Decimal("10000"),
+            subscription_usd_month=Decimal("29.99"),
+        ),
+        TierConfig(
+            name="Premium", free_volume_usd=None, subscription_usd_month=Decimal("299.99")
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class Config:
     allowlist: list[str]
     target_weights: dict[str, Decimal]
@@ -130,6 +175,8 @@ class Config:
     money_mgmt: MoneyMgmtConfig = field(default_factory=MoneyMgmtConfig)
     dca: DcaConfig = field(default_factory=DcaConfig)
     subscription: SubscriptionConfig = field(default_factory=SubscriptionConfig)
+    tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
+    fees: FeesConfig = field(default_factory=FeesConfig)
     quote_currency: str = "USDC"
 
 
@@ -205,6 +252,53 @@ def _parse_market_data(raw: dict[str, Any]) -> MarketDataConfig:
             f"market_data.history_days: expected an integer, got {history_days!r}"
         ) from exc
     return MarketDataConfig(granularities=granularities, history_days=history_days)
+
+
+def _parse_tiers(raw: dict[str, Any]) -> tuple[TierConfig, ...]:
+    """Parse `tiers:` (Issue #86) -- optional, like every other pass-through block; absent or
+    empty falls back to `_default_tiers()`'s real Coinbase One defaults."""
+    tiers_raw = raw.get("tiers")
+    if not tiers_raw:
+        return _default_tiers()
+    if not isinstance(tiers_raw, list):
+        raise ConfigError(
+            "tiers: must be a list of {name, free_volume_usd, subscription_usd_month}"
+        )
+
+    tiers: list[TierConfig] = []
+    for i, entry in enumerate(tiers_raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"tiers[{i}]: must be a mapping")
+        name = entry.get("name")
+        if not name or not isinstance(name, str):
+            raise ConfigError(f"tiers[{i}].name: missing or invalid")
+        free_volume_raw = entry.get("free_volume_usd")
+        free_volume_usd = (
+            None
+            if free_volume_raw is None
+            else _non_negative_decimal(free_volume_raw, f"tiers[{i}].free_volume_usd")
+        )
+        subscription_usd_month = _non_negative_decimal(
+            entry.get("subscription_usd_month", "0"), f"tiers[{i}].subscription_usd_month"
+        )
+        tiers.append(
+            TierConfig(
+                name=name,
+                free_volume_usd=free_volume_usd,
+                subscription_usd_month=subscription_usd_month,
+            )
+        )
+    return tuple(tiers)
+
+
+def _parse_fees(raw: dict[str, Any]) -> FeesConfig:
+    """Parse `fees:` (Issue #86) -- optional, falls back to the real Coinbase Advanced
+    `<$1k-30d-volume` rate (`FeesConfig`'s defaults) when absent."""
+    fees_raw = raw.get("fees") or {}
+    return FeesConfig(
+        taker_pct=_non_negative_decimal(fees_raw.get("taker_pct", "0.012"), "fees.taker_pct"),
+        maker_pct=_non_negative_decimal(fees_raw.get("maker_pct", "0.006"), "fees.maker_pct"),
+    )
 
 
 def load_config(path: str | Path) -> Config:
@@ -293,6 +387,8 @@ def load_config(path: str | Path) -> Config:
             ),
             pacing=pacing,
         ),
+        tiers=_parse_tiers(raw),
+        fees=_parse_fees(raw),
         quote_currency=quote_currency,
     )
 

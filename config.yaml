@@ -64,3 +64,27 @@ quote_currency: USDC
 subscription:
   monthly_allowance_usd: 500
   pacing: opportunistic  # opportunistic (monthly cap only) | even_daily (also paces per business day)
+
+# Coinbase One subscription tiers (Issue #86) -- fee-free monthly TRADING VOLUME (buys + sells)
+# allowance per tier, used by `keel simulate`'s tier/fee analysis matrix to compare staying
+# within a tier's free volume (throttled, 0 trading fees, but you still pay the subscription)
+# against trading freely and paying the taker fee on volume EXCEEDING it.
+# free_volume_usd: null means unlimited (Premium -- always fee-free, no cap to exceed).
+tiers:
+  - name: Basic
+    free_volume_usd: 500
+    subscription_usd_month: 4.99
+  - name: Preferred
+    free_volume_usd: 10000
+    subscription_usd_month: 29.99
+  - name: Premium
+    free_volume_usd: null
+    subscription_usd_month: 299.99
+
+# Coinbase Advanced trading fees applied to volume beyond a tier's free allowance, for a
+# <$1k-30d-volume account (Coinbase's published fee schedule). taker_pct is the sim's default --
+# it fills market-style at next-bar open; maker_pct is exposed for a caller that wants to model
+# limit-order fills instead.
+fees:
+  taker_pct: 0.012
+  maker_pct: 0.006

@@ -1021,6 +1021,81 @@ def test_simulate_artifact_flag_writes_html_next_to_markdown(tmp_path, monkeypat
     assert str(html_path) in result.output
 
 
+def test_simulate_no_fetch_skip_within_cap_still_produces_over_cap_tier_table(
+    tmp_path, monkeypatch
+):
+    """Issue #86: `--skip-within-cap` skips the extra throttled sim runs but still computes and
+    renders the over-cap tier/fee overlay (cheap -- reuses the natural run already being done)."""
+    db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+
+    def _boom(config):  # pragma: no cover -- only invoked if the test fails its own contract
+        raise AssertionError("_build_broker must never be called under --no-fetch")
+
+    monkeypatch.setattr(cli_module, "_build_broker", _boom)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "simulate",
+            "--no-fetch",
+            "--skip-within-cap",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report_text = out_path.read_text()
+    assert "Subscription tier & fee analysis" in report_text
+    assert "Basic" in report_text
+    assert "Preferred" in report_text
+    assert "Premium" in report_text
+    assert "Over cap" in report_text
+
+
+def test_simulate_no_fetch_default_runs_full_tier_matrix(tmp_path, monkeypatch):
+    """Without `--skip-within-cap` (the default), the tier/fee matrix includes within-cap rows
+    too, from the extra throttled sim runs."""
+    db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+    monkeypatch.setattr(
+        cli_module,
+        "_build_broker",
+        lambda config: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report_text = out_path.read_text()
+    assert "Subscription tier & fee analysis" in report_text
+    assert "Within cap" in report_text
+    assert "Over cap" in report_text
+
+
 # -- insights (stub) ----------------------------------------------------------------------------
 
 

@@ -244,12 +244,30 @@ class SimAccount:
 
         return (not reasons, reasons)
 
-    def max_affordable_notional(self, asset: str, config: Config, now_ts: int) -> Decimal:
+    def max_affordable_notional(
+        self,
+        asset: str,
+        config: Config,
+        now_ts: int,
+        monthly_volume_cap: Decimal | None = None,
+    ) -> Decimal:
         """The binding headroom for a new order in `asset` right now -- the same six caps
         `can_open` enforces, expressed as a single $ ceiling instead of a pass/fail, so a caller
         (`sim.portfolio_sim`) can CLAMP a risk-sized candidate notional down to what `can_open`
         would actually allow instead of rejecting the signal outright. Never negative -- returns
-        `Decimal("0")` once any cap is already exhausted."""
+        `Decimal("0")` once any cap is already exhausted.
+
+        `monthly_volume_cap`, if given, is an EXTERNAL fee-free monthly trading-volume ceiling
+        (Issue #86's Coinbase One tier/fee analysis -- not one of `can_open`'s six caps), used
+        only by `sim.portfolio_sim`'s RULE-slot clamp (a caller opening a position that WILL
+        later close, unlike a single-leg DCA buy). Headroom is floored to HALF of whatever
+        volume remains before `monthly_volume_cap` this UTC month -- reserving the other half
+        for this same position's own eventual CLOSE leg, since Issue #85's volume convention
+        counts both legs (buys+sells) but only the OPEN leg is clamped here; the close, when it
+        happens, is never rejected (an open position must always be allowed to exit). This is a
+        conservative approximation, not an exact guarantee, for a position whose exit price ends
+        up far from its entry -- see `sim.portfolio_sim`'s `monthly_volume_cap` docstring.
+        """
         headroom = self.cash_usdc  # rail 13: USDC-funding
         headroom = min(headroom, config.caps.max_per_order_usd)
         headroom = min(headroom, config.caps.max_per_day_usd - self._day_volume(now_ts))
@@ -258,7 +276,29 @@ class SimAccount:
         headroom = min(headroom, per_asset_limit - self._asset_notional(asset))
         effective_monthly_cap = self._monthly_allowance_cap(config, now_ts)
         headroom = min(headroom, effective_monthly_cap - self._month_volume(now_ts))
+        if monthly_volume_cap is not None:
+            remaining = monthly_volume_cap - self._month_volume(now_ts)
+            headroom = min(headroom, max(remaining, Decimal("0")) / 2)
         return max(headroom, Decimal("0"))
+
+    def month_volume(self, now_ts: int) -> Decimal:
+        """Public accessor for month-to-date trading volume (buys+sells) as of `now_ts` (Issue
+        #86) -- callers outside this ledger (e.g. `sim.portfolio_sim`'s DCA-sleeve throttle) read
+        this instead of the private `_month_volume` to check remaining headroom against an
+        external monthly allowance."""
+        return self._month_volume(now_ts)
+
+    def monthly_volume(self) -> dict[int, Decimal]:
+        """The full volume ledger (every opened AND closed order's notional -- see module
+        docstring) aggregated by UTC calendar month, keyed by each month's start ts
+        (`execution.guards._utc_month_bounds`). Feeds the Coinbase One tier/fee analysis
+        (Issue #86, `sim.tiers`), which needs each month's trading volume to compute over-cap
+        fees per month, not just a running total."""
+        out: dict[int, Decimal] = {}
+        for ts, notional in self._volume_log:
+            month_start, _ = _utc_month_bounds(ts)
+            out[month_start] = out.get(month_start, Decimal("0")) + notional
+        return out
 
     # -- open / close: fill-time economics -----------------------------------------------------
 
