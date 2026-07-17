@@ -143,6 +143,13 @@ def repo() -> Repository:
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
+    # `_config()` below defaults `auto_trade.mode` to "bypass" -- Issue #60 (bypass-arm
+    # hardening) means `run_once` now refuses that mode unarmed. Every pre-existing test in
+    # this module was written against "bypass just works"; arming here (a huge ttl so no test's
+    # `now_ts` can ever run past `armed_until`) keeps that behavior for tests that aren't
+    # specifically exercising the arm/disarm/expiry gate itself (those call
+    # `repo.disarm_bypass()` or a short ttl explicitly).
+    r.arm_bypass(now_ts=0, ttl_sec=10**12)
     return r
 
 
@@ -261,6 +268,75 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     assert repo.get_state(f"position_rule:{PRODUCT}") == "dca"
     # and records that the feed was checked this cycle (guards rail 12 reads this).
     assert repo.get_state("last_feed_ts") == 90_000
+
+
+# -- run_once: bypass-arm hardening (Issue #60) --------------------------------------------------
+
+
+def test_bypass_without_armed_token_places_nothing_and_reports_refusal(repo):
+    """The core fix: `config.auto_trade.mode == "bypass"` with no armed token must not place
+    any order, even though a real, merged `Dca` rule would otherwise fire -- it fails safe by
+    falling back to confirm behavior (`confirm_fn=None` -> never placed) and surfaces why.
+    """
+    repo.disarm_bypass()
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert len(result.enter_signals) == 1  # the rule still fires...
+    assert result.enter_results[0].placed is False  # ...but nothing is placed.
+    assert broker.place_calls == []
+    assert result.mode == "confirm"  # fell back, fail-safe
+    assert result.bypass_refused_reason is not None
+    assert "armed" in result.bypass_refused_reason.lower()
+    assert repo.get_orders() == []
+
+
+def test_bypass_with_expired_token_places_nothing(repo):
+    repo.arm_bypass(now_ts=1_000, ttl_sec=10)  # armed_until = 1_010
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)  # long past armed_until
+
+    assert result.enter_results[0].placed is False
+    assert broker.place_calls == []
+    assert result.mode == "confirm"
+    assert result.bypass_refused_reason is not None
+
+
+def test_bypass_with_fresh_armed_token_places_normally(repo):
+    """A freshly armed token (well within ttl) lets bypass through -- still subject to every
+    guard, but with no confirm prompt required, exactly like bypass behaved before Issue #60."""
+    repo.disarm_bypass()
+    repo.arm_bypass(now_ts=1_000, ttl_sec=100_000)  # armed_until = 101_000
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)  # inside the armed window
+
+    assert result.mode == "bypass"
+    assert result.bypass_refused_reason is None
+    assert result.enter_results[0].placed is True
+    assert len(broker.place_calls) == 1
+    assert repo.get_orders(mode="live", product_id=PRODUCT)[0]["side"] == "BUY"
+
+
+def test_confirm_mode_unaffected_by_arming_state(repo):
+    """`mode="confirm"` never even looks at the arm token -- arm-check only gates bypass."""
+    repo.disarm_bypass()
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    config = _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=50_000))
+
+    result = run_once(broker, repo, config, now_ts=90_000)
+
+    assert result.mode == "confirm"
+    assert result.bypass_refused_reason is None  # bypass was never requested
+    assert result.enter_results[0].placed is False  # confirm_fn=None -> fails closed, as always
+    assert broker.place_calls == []
 
 
 # -- run_once: EXIT wiring on a held position ---------------------------------------------------
