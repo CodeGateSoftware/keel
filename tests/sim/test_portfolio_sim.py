@@ -552,3 +552,128 @@ def test_dca_and_rule_positions_coexist_on_the_same_asset():
     assert "BTC" in result.dca_positions
     assert result.dca_positions["BTC"].qty > 0
     assert any(tr.asset == "BTC" for tr in result.trades)  # the RULE position also opened
+
+
+# ---------------------------------------------------------------------------
+# Issue #86: monthly_volume_cap throttles the account to a fee-free tier's allowance
+# ---------------------------------------------------------------------------
+
+
+def _mild_zigzag_candle(i: int) -> Candle:
+    """One bar of a rising zigzag with a HIGH baseline and TINY oscillation amplitude (~0.1%
+    swings, not `_zigzag_candle`'s ~50% swings) -- still classifies BULLISH (real swing
+    structure, clearing `analysis.regime.detect_condition`'s choppy gate) but keeps a round
+    trip's exit price close to its entry price, so `_AlwaysOnRule`'s open-then-immediately-exit
+    cadence exercises the `monthly_volume_cap` throttle without the close leg's notional (itself
+    unclamped, see `SimAccount.max_affordable_notional`'s docstring) blowing past the cap."""
+    base = 10_000 + i
+    if i % 2 == 0:
+        o, h, lo, c = base, base + 5, base - 2, base + 2
+    else:
+        o, h, lo, c = base, base + 2, base - 5, base - 2
+    return _candle(i * _HOUR, str(o), str(h), str(lo), str(c))
+
+
+def test_monthly_volume_cap_none_trades_naturally_and_can_exceed_a_small_allowance():
+    """Baseline: with `monthly_volume_cap=None` (default), a well-funded account's trading
+    volume is free to exceed a small allowance like $500/mo -- proves the throttle in the next
+    test is actually doing something, not just naturally never binding."""
+    hourly = [_mild_zigzag_candle(i) for i in range(30)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    rule = _AlwaysOnRule("BTC-USD")
+    config = _config()
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("1000000"),
+    )
+
+    total_volume = sum(result.monthly_volume.values(), Decimal("0"))
+    assert total_volume > Decimal("500")
+
+
+def test_monthly_volume_cap_throttles_account_below_the_cap():
+    """With `monthly_volume_cap=500`, the same well-funded, always-trading account never lets a
+    single UTC month's trading volume (buys+sells) exceed $500 -- proving the cap actually binds
+    every order's clamp, not just the first one."""
+    hourly = [_mild_zigzag_candle(i) for i in range(30)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    rule = _AlwaysOnRule("BTC-USD")
+    config = _config()
+    cap = Decimal("500")
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("1000000"),
+        monthly_volume_cap=cap,
+    )
+
+    assert result.monthly_volume, "expected at least one month of trading volume"
+    for month_volume in result.monthly_volume.values():
+        assert month_volume <= cap
+    # the throttle should still have let SOME trading happen, not just zeroed it out entirely.
+    assert sum(result.monthly_volume.values(), Decimal("0")) > Decimal("0")
+
+
+def test_monthly_volume_cap_dust_below_floor_stops_all_new_rule_trades():
+    """A `monthly_volume_cap` of 0 leaves zero headroom for any new RULE-slot order -- no trades
+    open at all (every clamped notional is 0, below `DUST_FLOOR`)."""
+    hourly = [_zigzag_candle(i) for i in range(30)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    rule = _AlwaysOnRule("BTC-USD")
+    config = _config()
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+        monthly_volume_cap=Decimal("0"),
+    )
+
+    assert result.trades == []
+    assert sum(result.monthly_volume.values(), Decimal("0")) == Decimal("0")
+
+
+def test_monthly_volume_aggregates_by_utc_month():
+    """`SimResult.monthly_volume` buckets the volume ledger by UTC calendar month, and the sum
+    across months equals the total of every trade's notional (entry + exit, Issue #85's
+    buys+sells convention)."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    rule = _FirstBarRule(
+        "BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200")
+    )
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config()
+
+    result = run(
+        [rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.outcome == "open"  # never exits in this short series
+    # the volume ledger records the CANDIDATE order's notional (qty * setup.entry, pre-slippage
+    # -- see `SimAccount`'s module docstring), not `trade.entry` (post-slippage fill price).
+    expected_volume = trade.qty * Decimal("100")  # only the entry leg has filled so far
+    total_bucketed = sum(result.monthly_volume.values(), Decimal("0"))
+    assert total_bucketed == expected_volume

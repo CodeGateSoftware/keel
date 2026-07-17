@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from keel.config import TierConfig
 from keel.data.history import CoverageInfo
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimResult, SimTelemetry
@@ -23,6 +24,7 @@ from keel.sim.report import (
     edge_table,
     render_markdown,
 )
+from keel.sim.tiers import OVER_CAP, WITHIN_CAP, compute_tier_fee_result
 from keel.strategy.promotion import PromotionConfig
 from keel.strategy.rules.base import Rule, Setup
 from keel.strategy.stats import BacktestResult
@@ -480,3 +482,150 @@ def test_render_markdown_out_of_sample_label():
     assert "IN-SAMPLE" not in md
     assert "OUT-OF-SAMPLE" in md
     assert "r1" in md
+
+
+# ---------------------------------------------------------------------------
+# render_markdown -- Issue #86 tier/fee analysis matrix
+# ---------------------------------------------------------------------------
+
+_TIERS_FOR_TESTS = (
+    TierConfig(
+        name="Basic", free_volume_usd=Decimal("500"), subscription_usd_month=Decimal("4.99")
+    ),
+    TierConfig(
+        name="Preferred",
+        free_volume_usd=Decimal("10000"),
+        subscription_usd_month=Decimal("29.99"),
+    ),
+    TierConfig(name="Premium", free_volume_usd=None, subscription_usd_month=Decimal("299.99")),
+)
+
+
+def _full_tier_matrix() -> list:
+    """One over-cap AND one within-cap row per tier -- 3 tiers x 2 modes == 6 rows, matching
+    what `keel simulate`'s default (non `--skip-within-cap`) path assembles."""
+    monthly_volume = {0: Decimal("2000")}
+    rows = []
+    for tier in _TIERS_FOR_TESTS:
+        rows.append(
+            compute_tier_fee_result(
+                monthly_volume=monthly_volume,
+                n_months=1,
+                tier=tier,
+                mode=OVER_CAP,
+                taker_pct=Decimal("0.012"),
+                gross_pnl_usd=Decimal("100"),
+            )
+        )
+        rows.append(
+            compute_tier_fee_result(
+                monthly_volume=monthly_volume,
+                n_months=1,
+                tier=tier,
+                mode=WITHIN_CAP,
+                taker_pct=Decimal("0.012"),
+                gross_pnl_usd=Decimal("80"),
+            )
+        )
+    return rows
+
+
+def _minimal_render_markdown_args(tier_results):
+    sim = SimResult(
+        trades=[],
+        equity_curve=[(0, Decimal("0")), (86400, Decimal("500"))],
+        contributions=[(0, Decimal("500"))],
+        coverage={},
+        telemetry=_empty_telemetry(),
+    )
+    edge = {POOLED_KEY: _pooled_result()}
+    account_metrics = dict(
+        _PASSING_ACCOUNT_METRICS, contributed=Decimal("500"), ending_value=Decimal("600")
+    )
+    benchmark = _benchmark()
+    verdict = build_verdict(
+        pooled=_pooled_result(),
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=benchmark,
+        coverage={},
+        promotion_cfg=CANONICAL,
+    )
+    gaps = analyze_gaps(_empty_telemetry(), coverage={}, move_threshold_pct=Decimal("0.05"))
+    return render_markdown(
+        sim,
+        edge,
+        account_metrics,
+        benchmark,
+        verdict,
+        gaps,
+        in_sample=True,
+        tier_results=tier_results,
+    )
+
+
+def test_render_markdown_tier_section_renders_all_three_tiers_and_both_modes():
+    md = _minimal_render_markdown_args(_full_tier_matrix())
+
+    assert "Subscription tier & fee analysis" in md
+    for tier_name in ("Basic", "Preferred", "Premium"):
+        assert tier_name in md
+    assert "Within cap" in md
+    assert "Over cap" in md
+    assert "Net P&L" in md
+    # net P&L values from the fixture should appear verbatim in the rendered table.
+    assert md.count("| Basic |") == 2
+    assert md.count("| Preferred |") == 2
+    assert md.count("| Premium |") == 2
+
+
+def test_render_markdown_tier_section_shows_profits_cover_fees_yes_and_no():
+    over = compute_tier_fee_result(
+        monthly_volume={0: Decimal("50000")},
+        n_months=1,
+        tier=_TIERS_FOR_TESTS[0],  # Basic, $500 free
+        mode=OVER_CAP,
+        taker_pct=Decimal("0.012"),
+        gross_pnl_usd=Decimal("1"),  # tiny gross P&L, dwarfed by fees -> net negative
+    )
+    within = compute_tier_fee_result(
+        monthly_volume={0: Decimal("50000")},
+        n_months=1,
+        tier=_TIERS_FOR_TESTS[0],
+        mode=WITHIN_CAP,
+        taker_pct=Decimal("0.012"),
+        gross_pnl_usd=Decimal("100"),  # comfortably net positive, 0 fees
+    )
+    assert over.profits_cover_fees is False
+    assert within.profits_cover_fees is True
+
+    md = _minimal_render_markdown_args([over, within])
+
+    assert "no" in md.lower()
+    assert "yes" in md.lower()
+
+
+def test_render_markdown_no_tier_results_renders_placeholder_not_crash():
+    md = _minimal_render_markdown_args(None)
+
+    assert "Subscription tier & fee analysis" in md
+    assert "not computed" in md.lower() or "no tier" in md.lower()
+
+
+def test_render_markdown_backward_compatible_without_tier_results_kwarg():
+    """Every existing caller of `render_markdown` (positional args, no `tier_results`) must keep
+    working unchanged."""
+    sim = SimResult(
+        trades=[], equity_curve=[], contributions=[], coverage={}, telemetry=_empty_telemetry()
+    )
+    verdict = Verdict(
+        status="TRAIN MORE", reasons=["r1"], data_sufficient=True, g2_pass=False, g3_pass=True
+    )
+    md = render_markdown(
+        sim,
+        {POOLED_KEY: _pooled_result(n_trades=0)},
+        {},
+        _benchmark(),
+        verdict,
+        [],
+    )
+    assert "Subscription tier & fee analysis" in md

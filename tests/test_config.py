@@ -143,6 +143,70 @@ def test_load_config_market_data_granularities_and_history_days(valid_config_pat
     assert config.market_data.history_days == 365
 
 
+# -- tiers / fees (Issue #86, Coinbase One tier/fee analysis) ----------------------------------
+
+
+def test_load_config_tiers_and_fees_default_to_real_coinbase_one_values(valid_config_path):
+    """`VALID_CONFIG_YAML` has no `tiers:`/`fees:` block -- absent, they fall back to the real
+    Coinbase One tiers/fee schedule, not Phase-1 placeholders."""
+    config = load_config(valid_config_path)
+
+    assert [t.name for t in config.tiers] == ["Basic", "Preferred", "Premium"]
+    basic, preferred, premium = config.tiers
+    assert basic.free_volume_usd == Decimal("500")
+    assert basic.subscription_usd_month == Decimal("4.99")
+    assert preferred.free_volume_usd == Decimal("10000")
+    assert preferred.subscription_usd_month == Decimal("29.99")
+    assert premium.free_volume_usd is None  # unlimited
+    assert premium.subscription_usd_month == Decimal("299.99")
+
+    assert config.fees.taker_pct == Decimal("0.012")
+    assert config.fees.maker_pct == Decimal("0.006")
+
+
+def test_load_config_tiers_and_fees_overridable(write_config):
+    text = (
+        VALID_CONFIG_YAML
+        + """
+tiers:
+  - name: Solo
+    free_volume_usd: 100
+    subscription_usd_month: 1.00
+  - name: Unlimited
+    free_volume_usd: null
+    subscription_usd_month: 50.00
+
+fees:
+  taker_pct: 0.02
+  maker_pct: 0.01
+"""
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert [t.name for t in config.tiers] == ["Solo", "Unlimited"]
+    assert config.tiers[0].free_volume_usd == Decimal("100")
+    assert config.tiers[1].free_volume_usd is None
+    assert config.fees.taker_pct == Decimal("0.02")
+    assert config.fees.maker_pct == Decimal("0.01")
+
+
+def test_load_config_tier_missing_name_raises_configerror(write_config):
+    text = (
+        VALID_CONFIG_YAML
+        + """
+tiers:
+  - free_volume_usd: 100
+    subscription_usd_month: 1.00
+"""
+    )
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="tiers"):
+        load_config(path)
+
+
 # -- auto_trade.bypass_arm_ttl_sec (Issue #60, bypass-arm hardening) ---------------------------
 
 
