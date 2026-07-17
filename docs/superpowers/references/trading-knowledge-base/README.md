@@ -58,6 +58,7 @@ reference valid across the split without rewriting them.
 | 25 | "The Complete Guide to Trading" (Corporate Finance Institute, 2018 **textbook**, 116pp) | extracted (NEW: ADX trend-strength filter + good-trade principle; Parts 1–2 out of scope) | [source-25](./sources/source-25.md) |
 | 26 | "7 Traits of Successful Financial Traders" (Vince Stanzione **ebook**, 25pp; psychology) | extracted (thin; NEW pyramiding + 20-SMA exit; reinforces trend-following pivot) | [source-26](./sources/source-26.md) |
 | 27 | "How to Trade Commodities" (Vince Stanzione **ebook**, 50pp) | extracted (mostly dup/reinforce; **HIGH: Turtle Trading = canonical breakout spec**) | [source-27](./sources/source-27.md) |
+| 28 | "The Economics of Islamic Finance and Securitization" (Jobst, IMF WP 07/117, 2007, 37pp) | extracted (**compliance FOUNDATION** — grounds all exclusions + NEW haram-sector screen; securitization out of scope) | [source-28](./sources/source-28.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -80,6 +81,7 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **ATR ("N") volatility-based sizing — smaller size when more volatile, crypto-essential (Turtle, §27.1)**; **pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1, §27.1 |
 | `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2, **20-SMA close-below & trail-to-breakeven §26.2**); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2, §26.2 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
+| `CompliancePolicy` (HalalPolicy) | Shariah grounding of the exclusion set: riba/gharar/maisir → no leverage/derivatives/options; ownership+profit-loss-sharing → spot long-only permissible; **NEW `haram_sector` screen at allowlist admission**; low-turnover as compliance value | §28.1, §28.2, §28.3, §28.4 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
 
 ### The hard rails (un-overridable, incl. bypass mode)
@@ -93,6 +95,8 @@ stale-data/feed-health guard (§10.4). CTS dynamic sizing moves **only within** 
 Carry trades (**entire Source 18 excluded as riba**, §18), hedging, bonds, margin/leverage/lots, short-selling, scalping — see §4.9, §10.10, §18.
 Also **N/A (no crypto analog): TRIN / ARMS breadth index** (needs a stock-index advance-decline basket, §25.6); fixed-income/money-market asset classes (interest = riba, §25.6).
 **Digital / binary / barrier options** (Rise-Fall, Touch/No-Touch, Ends-Between, Accumulators) → **excluded: not spot + maysir/gharar** (gambling/excessive-uncertainty), §27.4. Swap/rollover financing = riba (§27.4).
+
+**Authoritative grounding (Source 28 — IMF paper on Islamic finance):** the exclusions above map 1:1 to the shariah prohibitions — **riba** (interest/guaranteed return → leverage/swap/carry/bonds), **gharar** (excessive uncertainty → *all* derivatives: CFDs/futures/forwards/options), **maisir** (gambling → binary/digital options + speculation). The **ownership + profit-loss-sharing** principle is *why* **spot long-only is permissible** while derivatives are not (§28.1–28.2). Two additions from §28: (a) **NEW `haram_sector` screen** at **allowlist admission** — exclude gambling/adult/prohibited-sector tokens + riba-yield/lending tokens (§28.4); (b) **low-turnover** is itself a compliance value (high churn drifts toward maisir) → reinforces the anti-scalping rail + trend-following hold bias (§28.3).
 
 ---
 
@@ -139,3 +143,9 @@ volatility sizing + ~2×ATR stop (attacks the "stops too tight for crypto" defec
 trailing exit + low-win/high-R:R promotion floor.** Turtle is a proven, published trend-follower — a
 confidence anchor that the pivot is a real documented edge. Prototype this and validate via `keel simulate`.
 **The Stanzione ebook stream has saturated** (23/24/26/27); 27 earned its keep on the Turtle spec alone.
+**Source 28 (IMF Islamic-finance paper) is a new source TYPE — a compliance foundation, not a strategy.**
+It gives authoritative shariah grounding (riba/gharar/maisir) for every exclusion rail, explains why spot
+long-only is permissible while all derivatives/options are not, and adds a **`haram_sector` allowlist-
+admission screen** (§28.4) + a low-turnover-as-compliance note (§28.3). Wire the sector screen into
+CompliancePolicy; cite this paper in the design spec's compliance section. Its securitization/sukuk
+machinery is out of scope.
