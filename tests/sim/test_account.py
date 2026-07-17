@@ -1,0 +1,656 @@
+"""Tests for `keel.sim.account` -- the simulation account ledger and its spend-cap subset of
+`execution.guards.check`.
+
+`SimAccount.can_open` enforces exactly the spend-cap rails of `guards.check` (per-order, per-day,
+exposure, per-asset%, USDC-funding, monthly-allowance) -- never the non-cap rails (allowlist,
+min-move, averaging-into-losers, stop-widening, sell-only-on-rule, drawdown breaker,
+stale-data/kill-switch, correlation-adjusted sizing). The critical `test_parity_with_guards_check_*`
+tests build an equivalent `Repository`/`Config` state and assert `SimAccount.can_open` agrees with
+`guards.check` across a grid of notionals spanning every cap boundary.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+
+import pytest
+
+from keel.config import (
+    Caps,
+    Config,
+    MarketDataConfig,
+    SubscriptionConfig,
+)
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.execution import guards
+from keel.execution.guards import OrderIntent
+from keel.sim.account import OpenIntent, OpenPosition, SimAccount
+from keel.types import Side
+
+
+def _ts(year: int, month: int, day: int, hour: int = 12) -> int:
+    return int(datetime(year, month, day, hour, 0, 0, tzinfo=UTC).timestamp())
+
+
+DAY0 = _ts(2024, 1, 10)
+JAN15 = _ts(2024, 1, 15)
+JAN20 = _ts(2024, 1, 20)
+FEB01 = _ts(2024, 2, 1)
+
+
+def _config(
+    *,
+    max_per_order_usd: Decimal = Decimal("1000000"),
+    max_per_day_usd: Decimal = Decimal("1000000"),
+    max_exposure_usd: Decimal = Decimal("1000000"),
+    max_per_asset_pct: Decimal = Decimal("1"),
+    monthly_allowance_usd: Decimal = Decimal("500"),
+    pacing: str = "opportunistic",
+) -> Config:
+    return Config(
+        allowlist=["BTC", "ETH", "PAXG"],
+        target_weights={},
+        risk_pct=Decimal("0.01"),
+        caps=Caps(
+            max_per_order_usd=max_per_order_usd,
+            max_per_day_usd=max_per_day_usd,
+            max_exposure_usd=max_exposure_usd,
+            max_per_asset_pct=max_per_asset_pct,
+        ),
+        market_data=MarketDataConfig(granularities=[], history_days=365),
+        subscription=SubscriptionConfig(
+            monthly_allowance_usd=monthly_allowance_usd, pacing=pacing
+        ),
+    )
+
+
+@pytest.fixture
+def sim_config() -> Config:
+    """Roomy on every cap except the $500 monthly allowance (the plan's illustrative default)."""
+    return _config()
+
+
+def _intent(
+    *,
+    asset: str = "BTC",
+    qty: Decimal | None = None,
+    entry: Decimal = Decimal("100"),
+    stop: Decimal | None = None,
+    notional: Decimal = Decimal("50"),
+    is_dca: bool = True,
+    rule_kind: str = "dca",
+) -> OpenIntent:
+    if qty is None:
+        qty = notional / entry
+    return OpenIntent(
+        asset=asset,
+        qty=qty,
+        entry=entry,
+        stop=stop,
+        notional=notional,
+        is_dca=is_dca,
+        rule_kind=rule_kind,
+    )
+
+
+# -- deposit ---------------------------------------------------------------------------------
+
+
+def test_deposit_adds_cash_and_contributed():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("500"), DAY0)
+    acc.deposit(Decimal("250"), DAY0)
+
+    assert acc.cash_usdc == Decimal("750")
+    assert acc.contributed == Decimal("750")
+
+
+def test_deposit_resets_month_spend_on_month_rollover(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), JAN15)
+    acc.open(_intent(notional=Decimal("500")), fill_price=Decimal("100"), now_ts=JAN15)
+
+    # month maxed at $500 -- same month (JAN20), still blocked
+    ok, reasons = acc.can_open(_intent(notional=Decimal("1")), sim_config, JAN20)
+    assert ok is False
+    assert any("allowance" in r.lower() for r in reasons)
+
+    # a new UTC month -- allowance is fresh again
+    acc.deposit(Decimal("500"), FEB01)
+    ok, reasons = acc.can_open(_intent(notional=Decimal("1")), sim_config, FEB01)
+    assert ok is True
+    assert reasons == []
+
+
+# -- per-order cap ------------------------------------------------------------------------------
+
+
+def test_per_order_cap_rejects_over_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_per_order_usd=Decimal("100"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, DAY0)
+
+    assert ok is False
+    assert any("per_order_cap" in r for r in reasons)
+
+
+def test_per_order_cap_allows_at_exact_boundary():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_per_order_usd=Decimal("100"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), config, DAY0)
+
+    assert ok is True
+    assert reasons == []
+
+
+# -- per-day cap ----------------------------------------------------------------------------------
+
+
+def test_per_day_cap_rejects_when_running_total_exceeds_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(_intent(notional=Decimal("260")), fill_price=Decimal("100"), now_ts=DAY0)
+    config = _config(max_per_day_usd=Decimal("300"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("50")), config, DAY0)  # 260+50=310>300
+
+    assert ok is False
+    assert any("per_day_cap" in r for r in reasons)
+
+
+def test_per_day_cap_ignores_spend_from_a_prior_day():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(_intent(notional=Decimal("260")), fill_price=Decimal("100"), now_ts=DAY0 - 1_000_000)
+    config = _config(max_per_day_usd=Decimal("300"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("50")), config, DAY0)
+
+    assert ok is True
+    assert reasons == []
+
+
+# -- exposure cap ----------------------------------------------------------------------------------
+
+
+def test_exposure_cap_rejects_over_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(
+        _intent(asset="ETH", notional=Decimal("960")),
+        fill_price=Decimal("100"),
+        now_ts=DAY0 - 1_000_000,
+    )
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("1"))
+
+    ok, reasons = acc.can_open(
+        _intent(asset="BTC", notional=Decimal("45")), config, DAY0
+    )  # 960+45=1005>1000
+
+    assert ok is False
+    assert any("total_exposure_cap" in r for r in reasons)
+
+
+# -- per-asset concentration cap -------------------------------------------------------------------
+
+
+def test_per_asset_cap_rejects_over_cap_even_when_total_exposure_has_room():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.1"))
+
+    # per-asset limit = 0.1 * 1000 = 100; notional 150 exceeds it even though total exposure (0)
+    # has plenty of room against max_exposure_usd (1000).
+    ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, DAY0)
+
+    assert ok is False
+    assert any("per_asset_concentration_cap" in r for r in reasons)
+
+
+# -- USDC-funding ----------------------------------------------------------------------------------
+
+
+def test_usdc_funding_blocks_when_cash_below_notional(sim_config):
+    acc = SimAccount(fee_pct=Decimal("0.006"), slippage_pct=Decimal("0.0005"))
+    acc.deposit(Decimal("50"), now_ts=DAY0)
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), sim_config, DAY0)
+
+    assert ok is False
+    assert any("usdc" in r.lower() for r in reasons)
+
+
+def test_usdc_funding_blocks_when_cash_is_zero(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("1")), sim_config, DAY0)
+
+    assert ok is False
+    assert any("usdc" in r.lower() for r in reasons)
+
+
+def test_usdc_funding_passes_when_cash_exactly_covers_notional(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100"), DAY0)
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), sim_config, DAY0)
+
+    assert ok is True
+    assert reasons == []
+
+
+# -- monthly subscription-allowance ----------------------------------------------------------------
+
+
+def test_monthly_allowance_caps_cumulative_buys(sim_config):
+    # sim_config.subscription.monthly_allowance_usd == 500
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)  # plenty of cash; allowance is the binding cap
+    acc.open(_intent(notional=Decimal("450")), fill_price=Decimal("10"), now_ts=DAY0)
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), sim_config, DAY0)
+
+    assert ok is False
+    assert any("allowance" in r.lower() for r in reasons)
+
+
+def test_monthly_allowance_ignores_spend_from_a_prior_month(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(
+        _intent(notional=Decimal("450")), fill_price=Decimal("10"), now_ts=DAY0 - 40 * 86400
+    )
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("100")), sim_config, DAY0)
+
+    assert ok is True
+    assert reasons == []
+
+
+def test_monthly_allowance_even_daily_pacing_vetoes_a_burst_within_the_flat_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), JAN15)
+    # 2024-01-15 (Monday) is business day 10 of 23 in Jan 2024 -> paced cap = 220/23*10 ~ 95.65,
+    # tighter than the 220 flat monthly cap.
+    config = _config(monthly_allowance_usd=Decimal("220"), pacing="even_daily")
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, JAN15)
+
+    assert ok is False
+    assert any("allowance" in r.lower() for r in reasons)
+
+
+def test_monthly_allowance_opportunistic_pacing_ignores_the_business_day_pace():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), JAN15)
+    config = _config(monthly_allowance_usd=Decimal("220"), pacing="opportunistic")
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, JAN15)
+
+    assert ok is True
+    assert reasons == []
+
+
+# -- DCA is NOT exempt from any spend cap (matches rail 14) ----------------------------------------
+
+
+def test_dca_is_not_exempt_from_the_per_order_cap():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_per_order_usd=Decimal("100"))
+
+    ok, reasons = acc.can_open(
+        _intent(notional=Decimal("150"), is_dca=True, rule_kind="dca"), config, DAY0
+    )
+
+    assert ok is False
+    assert any("per_order_cap" in r for r in reasons)
+
+
+# -- collects every violation, never short-circuits ------------------------------------------------
+
+
+def test_can_open_collects_multiple_violations_without_short_circuiting(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    # no deposit -- cash_usdc stays 0, so usdc_funding always trips too
+    config = _config(max_per_order_usd=Decimal("10"), monthly_allowance_usd=Decimal("5"))
+
+    ok, reasons = acc.can_open(_intent(notional=Decimal("50")), config, DAY0)
+
+    assert ok is False
+    keys = {r.split(":", 1)[0] for r in reasons}
+    assert {"per_order_cap", "usdc_funding", "monthly_subscription_allowance"} <= keys
+
+
+# -- open / close: fees, slippage, realized pnl ----------------------------------------------------
+
+
+def test_open_debits_cash_including_fee_and_slippage():
+    acc = SimAccount(fee_pct=Decimal("0.01"), slippage_pct=Decimal("0.01"))
+    acc.deposit(Decimal("1000"), DAY0)
+
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100")),
+        fill_price=Decimal("100"),
+        now_ts=DAY0,
+    )
+
+    entry_fill = Decimal("100") * (Decimal(1) + Decimal("0.01"))  # 101
+    entry_fee = entry_fill * Decimal("1") * Decimal("0.01")  # 1.01
+    expected_cash = Decimal("1000") - entry_fill - entry_fee
+    assert acc.cash_usdc == expected_cash
+    assert "BTC" in acc.positions
+    position = acc.positions["BTC"]
+    assert position.entry_fill == entry_fill
+    assert position.qty == Decimal("1")
+
+
+def test_open_then_close_realizes_pnl_net_of_fees():
+    acc = SimAccount(Decimal("0.006"), Decimal("0.0005"))
+    acc.deposit(Decimal("1000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("100"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+    )
+
+    pnl = acc.close("BTC", fill_price=Decimal("120"), now_ts=DAY0)
+
+    assert pnl > 0
+    assert "BTC" not in acc.positions
+    assert acc.realized_pnl == pnl
+
+
+def test_close_realizes_a_loss_when_exit_is_below_entry():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("1000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("100"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+    )
+
+    pnl = acc.close("BTC", fill_price=Decimal("80"), now_ts=DAY0)
+
+    assert pnl == Decimal("-20")
+    assert acc.cash_usdc == Decimal("1000") - Decimal("100") + Decimal("80")
+
+
+def test_close_frees_up_exposure_for_a_subsequent_open(sim_config):
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    config = _config(max_exposure_usd=Decimal("100"), max_per_asset_pct=Decimal("1"))
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), entry=Decimal("100"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
+    )
+    # fully deployed against the exposure cap -- a second open should be blocked
+    blocked, _ = acc.can_open(_intent(asset="ETH", notional=Decimal("1")), config, DAY0)
+    assert blocked is False
+
+    acc.close("BTC", fill_price=Decimal("100"), now_ts=DAY0)
+
+    allowed, reasons = acc.can_open(_intent(asset="ETH", notional=Decimal("50")), config, DAY0)
+    assert allowed is True
+    assert reasons == []
+
+
+# -- exposure / mark-to-market reporting -----------------------------------------------------------
+
+
+def test_exposure_usd_marks_open_positions_to_current_prices():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("1000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), entry=Decimal("100"), notional=Decimal("200")),
+        Decimal("100"),
+        DAY0,
+    )
+
+    exposure = acc.exposure_usd({"BTC": Decimal("150")})
+
+    assert exposure == Decimal("300")  # 2 * 150
+
+
+def test_mark_to_market_is_cash_plus_exposure():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("1000"), DAY0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), entry=Decimal("100"), notional=Decimal("200")),
+        Decimal("100"),
+        DAY0,
+    )
+
+    mtm = acc.mark_to_market({"BTC": Decimal("150")})
+
+    assert mtm == acc.cash_usdc + Decimal("300")
+
+
+# -- dataclasses -----------------------------------------------------------------------------------
+
+
+def test_open_position_and_open_intent_are_plain_dataclasses():
+    position = OpenPosition(
+        asset="BTC",
+        qty=Decimal("1"),
+        entry_fill=Decimal("100"),
+        entry_ts=DAY0,
+        stop=Decimal("95"),
+        rule_kind="pullback_continuation",
+    )
+    intent = OpenIntent(
+        asset="BTC",
+        qty=Decimal("1"),
+        entry=Decimal("100"),
+        stop=Decimal("95"),
+        notional=Decimal("100"),
+        is_dca=False,
+        rule_kind="pullback_continuation",
+    )
+
+    assert position.asset == "BTC"
+    assert intent.notional == Decimal("100")
+
+
+# -- parity with execution.guards.check ------------------------------------------------------------
+
+
+def _seed_filled_buy(
+    repo: Repository, *, product_id: str, qty: Decimal, price: Decimal, created_at: int
+) -> None:
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id=product_id,
+            side=Side.BUY.value,
+            order_type="market",
+            qty=qty,
+            limit_price=price,
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=price,
+            actual_fill=price,
+            raw_response=None,
+            confirmation="auto",
+            rule_id=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def _seed_filled_sell(
+    repo: Repository, *, product_id: str, qty: Decimal, price: Decimal, created_at: int
+) -> None:
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id=product_id,
+            side=Side.SELL.value,
+            order_type="market",
+            qty=qty,
+            limit_price=price,
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=price,
+            actual_fill=price,
+            raw_response=None,
+            confirmation="auto",
+            rule_id=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
+    """A repo + account pair with equivalent spend-cap state:
+
+    - BTC: one order filled earlier this month (not today) -- exposure=200, month_spend +=200.
+    - ETH: bought then sold again *today* -- nets to ~0 exposure but still contributes +150 to
+      today's (and this month's) BUY spend, without leaving any open/correlated ETH exposure
+      (so rail 5, outside the spend-cap subset, never trips).
+    - cash_usdc == 300 after all of the above (a clean USDC-funding boundary).
+    """
+    month_start, _ = guards._utc_month_bounds(now_ts)
+
+    conn = connect(":memory:")
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", now_ts)
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=now_ts)
+
+    _seed_filled_buy(
+        repo, product_id="BTC-USD", qty=Decimal("2"), price=Decimal("100"),
+        created_at=month_start + 3600,
+    )
+    _seed_filled_buy(
+        repo, product_id="ETH-USD", qty=Decimal("1.5"), price=Decimal("100"),
+        created_at=now_ts - 60,
+    )
+    _seed_filled_sell(
+        repo, product_id="ETH-USD", qty=Decimal("1.5"), price=Decimal("100"),
+        created_at=now_ts - 30,
+    )
+
+    account = SimAccount(fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+    account.deposit(Decimal("500"), now_ts=month_start + 3600)
+    account.open(
+        OpenIntent(
+            asset="BTC", qty=Decimal("2"), entry=Decimal("100"), stop=None,
+            notional=Decimal("200"), is_dca=True, rule_kind="dca",
+        ),
+        fill_price=Decimal("100"),
+        now_ts=month_start + 3600,
+    )
+    account.open(
+        OpenIntent(
+            asset="ETH", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
+            notional=Decimal("150"), is_dca=True, rule_kind="dca",
+        ),
+        fill_price=Decimal("100"),
+        now_ts=now_ts - 60,
+    )
+    account.close("ETH", fill_price=Decimal("100"), now_ts=now_ts - 30)
+
+    assert account.cash_usdc == Decimal("300")  # sanity: matches the docstring above
+    return repo, account
+
+
+def _assert_parity(repo, account, config, now_ts, notionals):
+    for notional in notionals:
+        notional = Decimal(notional)
+        order_intent = OrderIntent(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            qty=notional / Decimal("100"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=notional,
+            is_dca=True,
+            rule_kind="dca",
+            available_quote=account.cash_usdc,
+        )
+        sim_intent = OpenIntent(
+            asset="BTC",
+            qty=notional / Decimal("100"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=notional,
+            is_dca=True,
+            rule_kind="dca",
+        )
+
+        guard_result = guards.check(order_intent, repo, config, now_ts)
+        sim_ok, sim_reasons = account.can_open(sim_intent, config, now_ts)
+
+        assert sim_ok == guard_result.ok, (
+            f"parity mismatch at notional={notional}: "
+            f"sim_ok={sim_ok} sim_reasons={sim_reasons} "
+            f"guards_ok={guard_result.ok} guards_violations={guard_result.violations}"
+        )
+
+
+def test_parity_with_guards_check_opportunistic_pacing():
+    now_ts = JAN15
+    repo, account = _parity_scenario(now_ts)
+    config = _config(
+        max_per_order_usd=Decimal("120"),
+        max_per_day_usd=Decimal("280"),
+        max_exposure_usd=Decimal("1000"),
+        max_per_asset_pct=Decimal("0.55"),
+        monthly_allowance_usd=Decimal("500"),
+        pacing="opportunistic",
+    )
+
+    # boundaries: per_order=120, per_day=130 (280-150), monthly=150 (500-350),
+    # usdc=300 (cash), per_asset=350 (0.55*1000-200), exposure=800 (1000-200)
+    boundaries = (120, 130, 150, 300, 350, 800)
+    notionals = sorted(
+        {1, 2000}
+        | {b - 1 for b in boundaries}
+        | {b for b in boundaries}
+        | {b + 1 for b in boundaries}
+    )
+
+    _assert_parity(repo, account, config, now_ts, notionals)
+
+
+def test_parity_with_guards_check_even_daily_pacing():
+    now_ts = JAN15
+    repo, account = _parity_scenario(now_ts)
+    config = _config(
+        max_per_order_usd=Decimal("120"),
+        max_per_day_usd=Decimal("280"),
+        max_exposure_usd=Decimal("1000"),
+        max_per_asset_pct=Decimal("0.55"),
+        monthly_allowance_usd=Decimal("2000"),
+        pacing="even_daily",
+    )
+
+    # derive the paced boundary from the same helpers the implementation is required to reuse,
+    # so this test doesn't hardcode a hand-computed business-day count.
+    dt = datetime.fromtimestamp(now_ts, tz=UTC)
+    biz_in_month = guards._business_days_in_month(dt.year, dt.month)
+    biz_elapsed = guards._business_days_elapsed(dt.year, dt.month, dt.day)
+    paced_cap = (Decimal("2000") / biz_in_month) * biz_elapsed
+    month_spend_baseline = Decimal("350")
+    paced_boundary = int(min(paced_cap, Decimal("2000")) - month_spend_baseline)
+
+    boundaries = {120, 130, 300, 350, 800, paced_boundary}
+    notionals = sorted(
+        {1}
+        | {b - 1 for b in boundaries}
+        | {b for b in boundaries}
+        | {b + 1 for b in boundaries}
+    )
+
+    _assert_parity(repo, account, config, now_ts, notionals)
