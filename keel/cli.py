@@ -64,6 +64,7 @@ from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.security import authz
+from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
 from keel.sim import metrics as metrics_mod
 from keel.sim import portfolio_sim
@@ -828,7 +829,12 @@ def simulate(
         click.echo("failing gates: " + "; ".join(verdict.reasons))
 
     if artifact:
-        click.echo("artifact: use Task 9 (keel/sim/artifact.py) -- not yet wired")
+        html = artifact_mod.render_html(
+            sim, benchmark, verdict, gaps, account_metrics, in_sample=True
+        )
+        html_path = out.with_suffix(".html")
+        html_path.write_text(html)
+        click.echo(f"artifact written to {html_path}")
 
 
 # -- subscription (rail 14, monthly-allowance) ---------------------------------------------------

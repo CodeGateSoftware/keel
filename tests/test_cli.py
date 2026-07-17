@@ -858,8 +858,9 @@ def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monke
         assert result.exit_code == 0, result.output
 
 
-def test_simulate_artifact_flag_prints_not_yet_wired(tmp_path, monkeypatch):
+def test_simulate_artifact_flag_writes_html_next_to_markdown(tmp_path, monkeypatch):
     db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
     repo = _repo_at(db_path)
     _seed_candles_for_allowlist(repo, int(time.time()))
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
@@ -875,13 +876,20 @@ def test_simulate_artifact_flag_prints_not_yet_wired(tmp_path, monkeypatch):
             "--years",
             "1",
             "--out",
-            str(tmp_path / "report.md"),
+            str(out_path),
             "--artifact",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert "task 9" in result.output.lower()
+    html_path = out_path.with_suffix(".html")
+    assert out_path.exists()
+    assert html_path.exists()
+    html_text = html_path.read_text()
+    assert "<svg" in html_text
+    assert "http://" not in html_text
+    assert "https://" not in html_text
+    assert str(html_path) in result.output
 
 
 # -- insights (stub) ----------------------------------------------------------------------------
