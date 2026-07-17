@@ -66,6 +66,7 @@ reference valid across the split without rewriting them.
 | 33 | "A Review on Portfolio Optimization Models for Islamic Finance" (Lim et al., AIMS Math 2023, 28pp) | extracted (MPT declined-direction; **NEW: zakat 2.5% report**; reinforces long-only/Sortino/per-asset cap) | [source-33](./sources/source-33.md) |
 | 34 | "The Trader's Bible" (T3 Live, 2025, 28pp; US equities/options day-trading) | extracted (**NEW: close-based stop** targets stop-defect; confluence-ordering + first-retest; options/gaps/earnings excluded/N-A) | [source-34](./sources/source-34.md) |
 | 35 | "Quantified Edge: Using AI, ChatGPT & Python" (Metaverse Trading Academy, 2025, 65pp) | extracted (**LLM-feature reference** — validates §5 asymmetry + craft; NEW breakeven-winrate formula; SMC/order-flow deferred/N-A) | [source-35](./sources/source-35.md) |
+| 36 | "7 Trading Themes for 2026" (Vince Stanzione **ebook**, 36pp; macro-outlook) | extracted (low value — time-bound predictions = no-oracle §6.4; reinforces wider-stops + narrow allowlist; negative LLM exemplar) | [source-36](./sources/source-36.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -191,3 +192,8 @@ promotion floor a formula (`win_rate > 1/(1+R:R)`; R:R 3 ⇒ 25%) (§35.2). Rein
 stop via SMC's **liquidity-sweep-vs-BOS** (a wick beyond a level is a stop-hunt, not a breakout — require a
 close, §35.3). SMC order-blocks/FVG deferred to v2; delta/footprint/order-flow N/A (no tick data). Possible
 future: Market Profile POC/value-area (low priority).
+**Source 36 (Stanzione "7 Trading Themes for 2026")** is a time-bound macro-**prediction** report → low
+value / out of scope by our **no-oracle principle (§6.4)**; reinforces only wider-crypto-stops (§22.1/§34.1)
++ narrow BTC/ETH allowlist & real-utility/no-meme screening (§28.3/§33), and serves as a clean **negative
+exemplar** of the price-forecasting the LLM feature must never do (§36.2→§35.1). CFDs/leverage/shorting/
+options/ETFs all excluded. No action.
