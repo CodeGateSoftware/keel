@@ -69,6 +69,7 @@ reference valid across the split without rewriting them.
 | 36 | "7 Trading Themes for 2026" (Vince Stanzione **ebook**, 36pp; macro-outlook) | extracted (low value — time-bound predictions = no-oracle §6.4; reinforces wider-stops + narrow allowlist; negative LLM exemplar) | [source-36](./sources/source-36.md) |
 | 37 | "How to Trade Forex" (Vince Stanzione **ebook**, 76pp) | extracted (near-total dup of §23/§27 — MA/Donchian/RSI + reused appendices; sessions marginal; options/multipliers/carry excluded) | [source-37](./sources/source-37.md) |
 | 38 | "How to Trade Stocks" (Vince Stanzione **ebook**, 58pp) | extracted (near-total dup of §23/§27/§37; stock fundamentals/dividends N/A to crypto; reinforces no-oracle only) | [source-38](./sources/source-38.md) |
+| 39 | "Trading Cryptocurrencies 1" (Swissquote primer, 16pp) | extracted (crypto-fundamentals education, no strategy; reinforces halving-cycle low-weight + custody only) | [source-39](./sources/source-39.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
