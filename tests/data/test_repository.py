@@ -332,6 +332,13 @@ def test_insert_rule_ids_increment(repo):
     assert id2 > id1
 
 
+def test_insert_rule_honors_explicit_now_ts(repo):
+    rule_id = repo.insert_rule("dca", {}, now_ts=1_700_000_000)
+
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["created_at"] == 1_700_000_000
+
+
 def test_get_rules_filters_by_status(repo):
     repo.insert_rule("a", {}, status="candidate")
     repo.insert_rule("b", {}, status="live")

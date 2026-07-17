@@ -262,12 +262,22 @@ class Repository:
     # -- rules -----------------------------------------------------------------
 
     def insert_rule(
-        self, kind: str, params: dict[str, Any], status: str = "candidate"
+        self,
+        kind: str,
+        params: dict[str, Any],
+        status: str = "candidate",
+        now_ts: int | None = None,
     ) -> int:
-        """Insert a new `rules` row (JSON-encoding `params`) and return its `id`."""
+        """Insert a new `rules` row (JSON-encoding `params`) and return its `id`.
+
+        `now_ts` stamps `created_at`; defaults to `int(time.time())` when the caller doesn't
+        supply one, but a CLI-boundary caller (e.g. `keel rules seed`) should pass its own single
+        `now_ts` so every row from one invocation shares an identical `created_at`.
+        """
+        created_at = now_ts if now_ts is not None else int(time.time())
         cursor = self._conn.execute(
             "INSERT INTO rules (kind, params, status, created_at) VALUES (?, ?, ?, ?)",
-            (kind, json.dumps(params), status, int(time.time())),
+            (kind, json.dumps(params), status, created_at),
         )
         self._conn.commit()
         assert cursor.lastrowid is not None

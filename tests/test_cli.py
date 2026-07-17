@@ -21,6 +21,7 @@ from typing import Any
 from click.testing import CliRunner
 
 import keel.cli as cli_module
+from keel.agent import RULE_REGISTRY, _build_rule
 from keel.cli import DISCLAIMER, cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
@@ -682,6 +683,134 @@ def test_rules_disable_sets_terminal_status(tmp_path):
     assert result.exit_code == 0, result.output
     row = {r["id"]: r for r in repo.get_rules()}[rule_id]
     assert row["status"] == "disabled"
+
+
+# -- rules seed (Issue #81 -- the `rules` table starts empty, seed candidates from the built-in
+# `RULE_REGISTRY` so the engine has something to trade) --------------------------------------
+
+
+def test_rules_seed_populates_products_times_kinds(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "rules", "seed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = repo.get_rules("candidate")
+    # valid_config_path's allowlist is BTC/ETH/PAXG (3 products) x all of RULE_REGISTRY (3 kinds).
+    assert len(rows) == 3 * len(RULE_REGISTRY)
+    assert "seeded=9 skipped=0" in result.output
+
+
+def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+    args = ["--db", str(db_path), "--config", str(valid_config_path), "rules", "seed"]
+
+    first = runner.invoke(cli, args)
+    assert first.exit_code == 0, first.output
+
+    second = runner.invoke(cli, args)
+
+    assert second.exit_code == 0, second.output
+    assert "seeded=0 skipped=9" in second.output
+    assert len(repo.get_rules()) == 3 * len(RULE_REGISTRY)
+
+
+def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+    args = ["--db", str(db_path), "--config", str(valid_config_path), "rules", "seed"]
+
+    first = runner.invoke(cli, args)
+    assert first.exit_code == 0, first.output
+
+    second = runner.invoke(cli, [*args, "--force"])
+
+    assert second.exit_code == 0, second.output
+    assert "seeded=9 skipped=0" in second.output
+    assert len(repo.get_rules()) == 2 * 3 * len(RULE_REGISTRY)
+
+
+def test_rules_seed_respects_products_and_kinds_options(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "rules", "seed",
+            "--products", "BTC-USD",
+            "--kinds", "dca",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = repo.get_rules()
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "dca"
+    assert rows[0]["params"]["product_id"] == "BTC-USD"
+
+
+def test_rules_seed_unknown_kind_errors(tmp_path):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "rules", "seed",
+            "--products", "BTC-USD",
+            "--kinds", "not_a_real_kind",
+        ],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_rules_seed_rows_round_trip_through_build_rule(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "rules", "seed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = repo.get_rules()
+    assert rows
+    for row in rows:
+        rule = _build_rule(row)
+        assert rule.product_id == row["params"]["product_id"]
+
+
+def test_rules_seed_needs_no_passphrase(tmp_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--authz-path", str(authz_path),
+            "rules", "seed",
+            "--products", "BTC-USD",
+            "--kinds", "dca",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not authz_path.exists()
 
 
 # -- pnl --------------------------------------------------------------------------------------
