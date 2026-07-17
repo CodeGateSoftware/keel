@@ -3,8 +3,9 @@
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
 `monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `arm-bypass`/
 `disarm-bypass` (the `agent_state` bypass-arm token `agent.run_once` itself enforces, Issue #60),
-`rules list|backtest|promote|demote|disable` (`data.repository` + `strategy.backtest`/
-`promotion`), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
+`rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
+`promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
+Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
 `subscription show|set` (the DB-backed monthly-allowance rail 14 reads live, Issue #59), and a
 Phase-4 `insights` stub.
 
@@ -518,6 +519,111 @@ def rules_disable(ctx: click.Context, rule_id: int) -> None:
     row = _require_rule_row(ctx, repo, rule_id)
     repo.update_rule_status(rule_id, "disabled")
     click.echo(f"rule {rule_id} ({row['kind']}): status -> disabled")
+
+
+def _json_plain(value: Any) -> Any:
+    """Coerce `value` into the JSON-plain form `Repository.insert_rule` expects for `params`.
+
+    `Rule.describe()`'s `params` dict holds real `Decimal`s and tuples (constructor kwargs, not
+    storage types) -- `insert_rule` round-trips `params` through plain `json.dumps`/`json.loads`
+    (see `agent._build_rule`'s own docstring), so a `Decimal` here would raise `TypeError` at
+    insert time. This is the inverse of `agent._build_rule`'s `_DECIMAL_PARAMS`/tuple coercion:
+    `Decimal` -> `str`, tuple -> list, recursively through nested dicts/lists.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_plain(v) for v in value]
+    return value
+
+
+@rules_group.command("seed")
+@click.option(
+    "--products",
+    default=None,
+    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+)
+@click.option(
+    "--kinds",
+    default=None,
+    help="Comma-separated rule kinds (default: every kind in agent.RULE_REGISTRY).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Insert a new candidate rule even if one already exists for a (kind, product) pair.",
+)
+@click.pass_context
+@with_disclaimer
+def rules_seed(ctx: click.Context, products: str | None, kinds: str | None, force: bool) -> None:
+    """Seed the `rules` table with one `candidate` rule per (kind, product) pair (Issue #81).
+
+    The `rules` table starts out empty and nothing else populates it -- with zero rows,
+    `agent.run_once`/`keel simulate` have no strategies to evaluate at all, no matter how
+    `config.yaml` or the promotion floor are set. This seeds one row per (kind, product) using
+    each rule kind's own constructor defaults (`RULE_REGISTRY[kind](product_id=...).describe()`),
+    so the resulting rows are exactly what `agent._build_rule` already knows how to
+    reconstruct -- they still start at `candidate` and must clear `rules promote` before they can
+    trade `paper`/`live`.
+
+    Idempotent by (kind, product_id): re-running this with no `--force` skips any pair that
+    already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
+    script) without piling up duplicate candidates. `--force` inserts a fresh candidate anyway.
+
+    Read-only w.r.t. the exchange: no network call, no authz gate -- it only ever writes local
+    `rules` rows, exactly like `rules promote`/`demote`/`disable`.
+    """
+    repo = _open_repo(ctx)
+    now_ts = int(time.time())
+
+    if products:
+        product_list = [p.strip() for p in products.split(",") if p.strip()]
+    else:
+        config = _load_cfg(ctx)
+        product_list = _default_sim_products(config)
+
+    if kinds:
+        kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
+    else:
+        kind_list = list(agent.RULE_REGISTRY)
+
+    unknown_kinds = [k for k in kind_list if k not in agent.RULE_REGISTRY]
+    if unknown_kinds:
+        click.echo(
+            f"Error: unknown rule kind(s) {unknown_kinds!r}; known kinds: "
+            f"{sorted(agent.RULE_REGISTRY)!r}",
+            err=True,
+        )
+        ctx.exit(1)
+        return
+
+    existing_keys = {
+        (row["kind"], (row["params"] or {}).get("product_id")) for row in repo.get_rules()
+    }
+
+    seeded: list[str] = []
+    skipped: list[str] = []
+    for kind in kind_list:
+        rule_cls = agent.RULE_REGISTRY[kind]
+        for product in product_list:
+            label = f"{kind}:{product}"
+            if not force and (kind, product) in existing_keys:
+                skipped.append(label)
+                continue
+            rule = rule_cls(product_id=product)
+            params = _json_plain(rule.describe()["params"])
+            params["product_id"] = product
+            repo.insert_rule(kind, params, status="candidate", now_ts=now_ts)
+            seeded.append(label)
+
+    click.echo(f"seeded={len(seeded)} skipped={len(skipped)}")
+    for label in seeded:
+        click.echo(f"  seeded: {label}")
+    for label in skipped:
+        click.echo(f"  skipped: {label}")
 
 
 # -- pnl ------------------------------------------------------------------------------
