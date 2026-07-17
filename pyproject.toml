@@ -8,11 +8,15 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "click>=8.4.2",
     "coinbase-advanced-py>=1.8.4",
     "cryptography>=49.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
 ]
+
+[project.scripts]
+halal-cb = "halal_cb.cli:cli"
 
 [build-system]
 requires = ["uv_build>=0.10.4,<0.11.0"]
