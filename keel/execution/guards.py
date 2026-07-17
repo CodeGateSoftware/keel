@@ -1,9 +1,11 @@
 """THE HARD RAILS (§14) — enforced before every order, un-overridable.
 
-`check()` runs the twelve safety rails from the main spec's §14 before any order is placed, in
-every `auto_trade` mode (confirm *and* bypass) and for both rule-trading and DCA order classes.
-It never short-circuits: every violated rail is collected and reported so an operator (or the
-executor, Task 4) sees the full picture, not just the first trip-wire.
+`check()` runs the twelve safety rails from the main spec's §14, plus two later, equally
+un-overridable safety-critical rails added by Issue #59 (USDC-funding + monthly-allowance),
+before any order is placed, in every `auto_trade` mode (confirm *and* bypass) and for both
+rule-trading and DCA order classes. It never short-circuits: every violated rail is collected
+and reported so an operator (or the executor, Task 4) sees the full picture, not just the first
+trip-wire.
 
 Design notes on rails that need state this repo doesn't compute anywhere else yet (Task 3 lands
 before the executor/money_mgmt modules that would normally produce some of these numbers):
@@ -31,11 +33,35 @@ through drawdowns on a fixed small budget/cadence, not a rule-trading signal. It
 rail 11 (the DD breaker — stated explicitly in the plan) and, for the same functional reason,
 rail 8 (no-averaging-into-losers would otherwise block the exact buying-the-dip behavior DCA
 exists to do). DCA remains bound by every other rail, explicitly including the allowlist, the
-per-asset cap, and the kill-switch (§12.6).
+per-asset cap, and the kill-switch (§12.6) -- and, explicitly, rails 13/14 below: DCA orders are
+themselves the recurring "subscription" spend rail 14 exists to cap.
+
+Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
+
+- Rail 13 (USDC-funding) never lets a BUY draw from a linked bank/ACH source -- it may only
+  spend an already-settled quote-currency (default USDC) balance that is `> 0` AND covers the
+  order's notional. The balance isn't computed here (guards has no broker access, by design --
+  it's a pure checker); the caller (the executor) fetches it live from the broker and hands it
+  in via `OrderIntent.available_quote`. **Fails closed**: `None` (broker error, missing quote
+  account, anything unknown) vetoes the BUY exactly like rail 12 treats an unset kill-switch or
+  a never-recorded feed timestamp -- silence is not consent to spend. SELL is exempt (it
+  produces USDC, it doesn't consume it).
+- Rail 14 (monthly subscription-allowance) caps this calendar month's live BUY notional (own
+  spend, from the orders audit log, `_monthly_buy_spend_usd`) plus this order's notional against
+  a **live, DB-backed** subscription (`repo.get_subscription()`/`repo.set_subscription()`,
+  `data/repository.py`) -- read fresh on every `check()` call, never cached or snapshotted, so
+  updating the subscription (e.g. via `keel subscription set`) changes the enforced cap on the
+  very next order with no restart or config edit. `config.yaml`'s `subscription:` block is only
+  ever a one-time *seed* for that DB row (see `cli.py`'s `_ensure_subscription_seeded`) -- once
+  set, the DB row is authoritative. Optional `pacing="even_daily"` additionally caps cumulative
+  month-to-date spend to `monthly_allowance_usd / business_days_in_month * business_days_elapsed`
+  (Mon-Fri, no holiday calendar) so the flat monthly cap can't be blown in one early-month burst;
+  `pacing="opportunistic"` (default) skips that extra check.
 """
 
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -67,11 +93,16 @@ class OrderIntent:
     notional: Decimal
     is_dca: bool
     rule_kind: str
+    # Rail 13 (USDC-funding): the live available quote-currency (default USDC) balance, fetched
+    # by the caller (the executor) from the broker -- guards has no broker access of its own.
+    # `None` means "unknown/unavailable" and fails the BUY closed, same as a missing quote
+    # account or a broker error while fetching it.
+    available_quote: Decimal | None = None
 
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all twelve rails: `ok` iff `violations` is empty."""
+    """The outcome of running all fourteen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -125,8 +156,46 @@ def _daily_spend_usd(repo: Repository, now_ts: int) -> Decimal:
     return total
 
 
+def _utc_month_bounds(ts: int) -> tuple[int, int]:
+    """Return `[start, end)` epoch seconds for the UTC calendar month containing `ts`."""
+    dt = datetime.fromtimestamp(ts, tz=UTC)
+    start = datetime(dt.year, dt.month, 1, tzinfo=UTC)
+    end_year, end_month = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    end = datetime(end_year, end_month, 1, tzinfo=UTC)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _monthly_buy_spend_usd(repo: Repository, now_ts: int) -> Decimal:
+    """Sum of this (UTC) calendar month's BUY notional across all products, from the orders
+    audit log -- rail 14's month-to-date figure."""
+    start, end = _utc_month_bounds(now_ts)
+    total = Decimal("0")
+    for order in repo.get_orders(mode="live"):
+        if order["side"] != Side.BUY.value or order["status"] not in _ACTIVE_ORDER_STATUSES:
+            continue
+        created_at = order.get("created_at")
+        if created_at is None or not (start <= created_at < end):
+            continue
+        total += _order_notional(order)
+    return total
+
+
+def _is_business_day(year: int, month: int, day: int) -> bool:
+    return datetime(year, month, day, tzinfo=UTC).weekday() < 5  # Mon-Fri, no holiday calendar
+
+
+def _business_days_in_month(year: int, month: int) -> int:
+    days_in_month = calendar.monthrange(year, month)[1]
+    return sum(1 for day in range(1, days_in_month + 1) if _is_business_day(year, month, day))
+
+
+def _business_days_elapsed(year: int, month: int, day: int) -> int:
+    """Business days from the 1st of the month through `day`, inclusive."""
+    return sum(1 for d in range(1, day + 1) if _is_business_day(year, month, d))
+
+
 def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) -> GuardResult:
-    """Run all twelve §14 hard rails against `intent`. Never short-circuits.
+    """Run all fourteen §14 (+ Issue #59) hard rails against `intent`. Never short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* bypass) — un-overridable.
     """
@@ -266,5 +335,61 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
     if last_feed_ts is None or (now_ts - last_feed_ts) > staleness_threshold:
         age = "never recorded" if last_feed_ts is None else f"{now_ts - last_feed_ts}s old"
         violations.append(f"stale_data: feed is stale ({age}; threshold {staleness_threshold}s)")
+
+    # 13. USDC-funding — a BUY may only spend an already-settled quote-currency balance, never
+    #     a linked bank/ACH source. Fails closed: an unknown balance (`None`) vetoes the BUY.
+    #     SELL is exempt -- it produces quote currency, it doesn't consume it (Issue #59).
+    if is_buy:
+        balance = intent.available_quote
+        if balance is None:
+            violations.append(
+                f"usdc_funding: available {config.quote_currency} balance is unknown/"
+                "unavailable -- failing closed, BUY vetoed"
+            )
+        elif balance <= 0:
+            violations.append(
+                f"usdc_funding: available {config.quote_currency} balance {balance} is not "
+                "greater than 0"
+            )
+        elif balance < intent.notional:
+            shortfall = intent.notional - balance
+            violations.append(
+                f"usdc_funding: available {config.quote_currency} balance {balance} is short "
+                f"{shortfall} of the {intent.notional} order notional"
+            )
+
+    # 14. Monthly subscription-allowance — month-to-date live BUY spend + this order must not
+    #     exceed the *live* subscription (`repo.get_subscription()`, DB-authoritative, read fresh
+    #     on every call so a `subscription set` update takes effect immediately). DCA is NOT
+    #     exempt -- it's exactly the recurring spend this rail exists to cap (Issue #59).
+    if is_buy:
+        subscription = repo.get_subscription()
+        allowance = subscription["monthly_allowance_usd"]
+        pacing = subscription["pacing"]
+        monthly_spend = _monthly_buy_spend_usd(repo, now_ts)
+        projected_monthly = monthly_spend + intent.notional
+
+        effective_cap = allowance
+        pacing_note = ""
+        if pacing == "even_daily":
+            dt = datetime.fromtimestamp(now_ts, tz=UTC)
+            biz_days_in_month = _business_days_in_month(dt.year, dt.month)
+            biz_days_elapsed = _business_days_elapsed(dt.year, dt.month, dt.day)
+            if biz_days_in_month > 0:
+                paced_cap = (allowance / biz_days_in_month) * biz_days_elapsed
+                if paced_cap < effective_cap:
+                    effective_cap = paced_cap
+                    pacing_note = (
+                        f" (even_daily pacing: {biz_days_elapsed}/{biz_days_in_month} business "
+                        f"days elapsed -> paced cap {paced_cap})"
+                    )
+
+        if projected_monthly > effective_cap:
+            remaining = max(effective_cap - monthly_spend, Decimal("0"))
+            violations.append(
+                "monthly_subscription_allowance: month-to-date BUY spend "
+                f"{monthly_spend} + {intent.notional} = {projected_monthly} exceeds the "
+                f"allowance cap {effective_cap}{pacing_note} -- remaining allowance {remaining}"
+            )
 
     return GuardResult(ok=not violations, violations=violations)

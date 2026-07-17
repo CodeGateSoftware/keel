@@ -29,14 +29,23 @@ from keel.types import Side
 NOW_TS = 1_700_000_000  # 2023-11-14T22:13:20Z -- well inside its UTC day for boundary tests
 
 
+_LARGE_ALLOWANCE = Decimal("10000000")
+
+
 @pytest.fixture
 def repo() -> Repository:
-    """A freshly migrated repo, pre-seeded with a fully compliant `agent_state`."""
+    """A freshly migrated repo, pre-seeded with a fully compliant `agent_state`.
+
+    The subscription is seeded with a very large allowance so pre-existing rail tests (which
+    don't exercise rail 14) aren't incidentally tripped by it; rail-14-specific tests below
+    override it with `repo.set_subscription(...)` to exercise realistic caps.
+    """
     conn = connect(":memory:")
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
+    r.set_subscription(_LARGE_ALLOWANCE, "opportunistic", now_ts=NOW_TS)
     return r
 
 
@@ -79,6 +88,7 @@ def _intent(**overrides: Any) -> OrderIntent:
         notional=Decimal("50"),
         is_dca=False,
         rule_kind="pullback_continuation",
+        available_quote=_LARGE_ALLOWANCE,  # comfortably covers every notional used below
     )
     base.update(overrides)
     return OrderIntent(**base)
@@ -440,6 +450,186 @@ def test_rail12_missing_feed_timestamp_treated_as_stale(repo):
 
     assert result.ok is False
     assert _keys(result) == {"stale_data"}
+
+
+# -- rail 13: USDC-funding (never draw from bank/ACH) ----------------------------------------------
+
+
+def test_rail13_usdc_funding_passes_when_balance_covers_notional(repo):
+    intent = _intent(available_quote=Decimal("100"), notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail13_usdc_funding_rejects_when_balance_is_short_of_notional(repo):
+    intent = _intent(available_quote=Decimal("30"), notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"usdc_funding"}
+    assert any("20" in v for v in result.violations)  # shortfall = 50 - 30
+
+
+def test_rail13_usdc_funding_rejects_zero_balance(repo):
+    intent = _intent(available_quote=Decimal("0"), notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"usdc_funding"}
+
+
+def test_rail13_usdc_funding_fails_closed_when_balance_is_unknown(repo):
+    """`available_quote=None` -- broker error or missing quote account -- vetoes the BUY. Silence
+    is not consent to draw funds, same fail-closed posture as rail 12's kill-switch."""
+    intent = _intent(available_quote=None, notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"usdc_funding"}
+
+
+def test_rail13_usdc_funding_exempts_sell_even_with_no_balance(repo):
+    intent = _intent(
+        side=Side.SELL, stop=None, rule_kind="target_harvest", available_quote=None
+    )
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+# -- rail 14: monthly subscription-allowance -------------------------------------------------------
+
+
+def _roomy_config() -> Config:
+    """A config with every other cap raised out of the way, so only rail 14 can trip."""
+    return _config(
+        max_per_order_usd=Decimal("100000"),
+        max_per_day_usd=Decimal("100000"),
+        max_exposure_usd=Decimal("100000000"),
+        max_per_asset_pct=Decimal("1"),
+    )
+
+
+def test_rail14_monthly_allowance_passes_under_cap(repo):
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    intent = _intent(notional=Decimal("100"))
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail14_monthly_allowance_rejects_over_cap(repo):
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("4.5"),
+        price=Decimal("100"),  # notional 450, already spent this month
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("100"))  # 450 + 100 = 550 > 500
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+def test_rail14_monthly_allowance_ignores_spend_from_a_prior_month(repo):
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("10"),
+        price=Decimal("100"),  # notional 1000, but in October -- a prior calendar month
+        created_at=NOW_TS - 20 * 86400,
+    )
+    intent = _intent(notional=Decimal("100"))
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail14_updated_subscription_is_read_live_at_the_next_check(repo):
+    """The allowance is read fresh from `repo.get_subscription()` on every call -- no snapshot,
+    no restart, no config edit needed for an update to take effect."""
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    intent = _intent(notional=Decimal("150"))
+    config = _roomy_config()
+
+    before = check(intent, repo, config, NOW_TS)
+    assert before.ok is True
+
+    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    after_lowered = check(intent, repo, config, NOW_TS)
+    assert after_lowered.ok is False
+    assert _keys(after_lowered) == {"monthly_subscription_allowance"}
+
+    repo.set_subscription(Decimal("1000"), "opportunistic", now_ts=NOW_TS)
+    after_raised = check(intent, repo, config, NOW_TS)
+    assert after_raised.ok is True
+
+
+def test_rail14_even_daily_pacing_vetoes_a_burst_within_the_monthly_cap(repo):
+    # NOW_TS (2023-11-14, a Tuesday) is business day 10 of 22 in November -> paced cap =
+    # 220 / 22 * 10 = 100, tighter than the 220 flat monthly cap.
+    repo.set_subscription(Decimal("220"), "even_daily", now_ts=NOW_TS)
+    intent = _intent(notional=Decimal("150"))  # under the 220 monthly cap, over the paced 100
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+def test_rail14_even_daily_pacing_allows_spend_within_the_paced_cap(repo):
+    repo.set_subscription(Decimal("220"), "even_daily", now_ts=NOW_TS)
+    intent = _intent(notional=Decimal("100"))  # exactly at the paced cap (220/22*10 = 100)
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail14_opportunistic_pacing_ignores_the_business_day_pace(repo):
+    # Same numbers as the pacing-burst test above, but pacing="opportunistic" -- only the flat
+    # monthly cap applies, so the same burst that trips even_daily passes here.
+    repo.set_subscription(Decimal("220"), "opportunistic", now_ts=NOW_TS)
+    intent = _intent(notional=Decimal("150"))
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail14_dca_is_bound_by_the_monthly_allowance(repo):
+    """Unlike rails 8/11, DCA is NOT exempt from the subscription allowance -- DCA orders are
+    exactly the recurring "subscription" spend the rail exists to cap."""
+    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    intent = _intent(
+        notional=Decimal("600"), is_dca=True, rule_kind="dca", stop=None
+    )  # 600 > 500
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"monthly_subscription_allowance"}
 
 
 # -- collects every violation, never short-circuits ------------------------------------------------
