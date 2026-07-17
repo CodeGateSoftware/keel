@@ -55,6 +55,58 @@ def test_load_config_caps_typed_and_correct(valid_config_path):
     assert config.caps.max_per_asset_pct == Decimal("0.50")
 
 
+def test_load_config_subscription_and_quote_currency_defaults(valid_config_path):
+    config = load_config(valid_config_path)
+
+    assert config.quote_currency == "USDC"
+    assert config.subscription.monthly_allowance_usd == Decimal("500")
+    assert config.subscription.pacing == "opportunistic"
+
+
+def test_load_config_subscription_and_quote_currency_absent_falls_back_to_defaults(write_config):
+    text = VALID_CONFIG_YAML.replace(
+        """quote_currency: USDC
+
+subscription:
+  monthly_allowance_usd: 500
+  pacing: opportunistic
+""",
+        "",
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.quote_currency == "USDC"
+    assert config.subscription.monthly_allowance_usd == Decimal("500")
+    assert config.subscription.pacing == "opportunistic"
+
+
+def test_load_config_subscription_pacing_even_daily(write_config):
+    text = VALID_CONFIG_YAML.replace("pacing: opportunistic", "pacing: even_daily")
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.subscription.pacing == "even_daily"
+
+
+def test_load_config_subscription_invalid_pacing_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML.replace("pacing: opportunistic", "pacing: yolo")
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="subscription.pacing"):
+        load_config(path)
+
+
+def test_load_config_quote_currency_empty_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML.replace("quote_currency: USDC", "quote_currency: ''")
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="quote_currency"):
+        load_config(path)
+
+
 def test_load_config_market_data_granularities_and_history_days(valid_config_path):
     from keel.types import Granularity
 

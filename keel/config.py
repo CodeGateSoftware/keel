@@ -80,6 +80,23 @@ class DcaConfig:
     cadence_days: int = 7
 
 
+_VALID_PACING_MODES = ("opportunistic", "even_daily")
+
+
+@dataclass(frozen=True)
+class SubscriptionConfig:
+    """Rail 14 (monthly subscription-allowance) settings — see `execution/guards.py`.
+
+    `pacing="opportunistic"` (default) only enforces the flat monthly cap. `pacing="even_daily"`
+    additionally caps cumulative month-to-date spend to
+    `monthly_allowance_usd / business_days_in_month * business_days_elapsed`, so the allowance
+    can't be blown in one burst early in the month.
+    """
+
+    monthly_allowance_usd: Decimal = Decimal("500")
+    pacing: str = "opportunistic"
+
+
 @dataclass(frozen=True)
 class Config:
     allowlist: list[str]
@@ -91,6 +108,8 @@ class Config:
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
     money_mgmt: MoneyMgmtConfig = field(default_factory=MoneyMgmtConfig)
     dca: DcaConfig = field(default_factory=DcaConfig)
+    subscription: SubscriptionConfig = field(default_factory=SubscriptionConfig)
+    quote_currency: str = "USDC"
 
 
 _REQUIRED_CAP_KEYS = (
@@ -183,6 +202,18 @@ def load_config(path: str | Path) -> Config:
     promotion_raw = raw.get("promotion") or {}
     money_mgmt_raw = raw.get("money_mgmt") or {}
     dca_raw = raw.get("dca") or {}
+    subscription_raw = raw.get("subscription") or {}
+
+    pacing = subscription_raw.get("pacing", "opportunistic")
+    if pacing not in _VALID_PACING_MODES:
+        raise ConfigError(
+            f"subscription.pacing: invalid value {pacing!r}; must be one of "
+            f"{_VALID_PACING_MODES!r}"
+        )
+
+    quote_currency = raw.get("quote_currency", "USDC")
+    if not isinstance(quote_currency, str) or not quote_currency:
+        raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
 
     return Config(
         allowlist=allowlist,
@@ -223,6 +254,14 @@ def load_config(path: str | Path) -> Config:
             budget_usd=_to_decimal(dca_raw.get("budget_usd", "0"), "dca.budget_usd"),
             cadence_days=int(dca_raw.get("cadence_days", 7)),
         ),
+        subscription=SubscriptionConfig(
+            monthly_allowance_usd=_non_negative_decimal(
+                subscription_raw.get("monthly_allowance_usd", "500"),
+                "subscription.monthly_allowance_usd",
+            ),
+            pacing=pacing,
+        ),
+        quote_currency=quote_currency,
     )
 
 
