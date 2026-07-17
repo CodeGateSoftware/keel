@@ -62,6 +62,7 @@ reference valid across the split without rewriting them.
 | 29 | "Islamic Banking Processes and Products" (Oracle white paper, 2017, 14pp) | extracted (thin; reinforces §28 — AAOIFI ref + scholarly-divergence caveat; banking products out of scope) | [source-29](./sources/source-29.md) |
 | 30 | "Understanding Riba in Islamic Finance" (Azzad Asset Mgmt white paper, 3pp) | extracted (thin; NEW riba al-fadl → spot-settlement grounding + stablecoin parity; AAOIFI re-confirmed) | [source-30](./sources/source-30.md) |
 | 31 | "Risk Management in Mudharabah and Musharakah Financing" (Febianto, iECONS 2007, 30pp) | extracted (mostly out-of-scope/saturated; only nugget: ghorm vs gharar rationale) | [source-31](./sources/source-31.md) |
+| 32 | "Developments in Risk Management in Islamic Finance: A Review" (Al Rahahleh et al., 2019, 23pp) | extracted (out-of-scope/saturated; only nugget: negative/positive screening vocabulary) | [source-32](./sources/source-32.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -163,4 +164,7 @@ AAOIFI. **Compliance sources 28/29/30 have covered the ground — recommend paus
 (likely pure reinforcement). **Source 31 (mudharabah/musharakah risk paper) confirmed this** — out-of-scope
 (bank PLS-financing risk, not trading risk); only nugget = **ghorm vs gharar / al-ghorm bil ghonm** ("no
 liability, no gain" → profit is legitimized by bearing real owned-asset risk; sharpens §28.2 rationale, no
-rule change). **Islamic-finance stream is exhausted (28→31); pause it.**
+rule change). **Source 32 (Islamic-finance risk-management review) confirmed exhaustion again** — out-of-scope bank
+risk-management literature review; only nugget = **negative vs positive Shariah screening** (our
+CompliancePolicy = the automated "negative screen"; "positive"/ethics screening noted, out of conservative
+scope). **Islamic-finance stream is exhausted (28→32); STOP feeding compliance papers — they now add nothing.**
