@@ -291,6 +291,127 @@ def test_resume_with_correct_passphrase_disengages(tmp_path):
     assert repo.get_state("kill_switch") is False
 
 
+# -- subscription (rail 14, monthly-allowance) -------------------------------------------------
+
+
+def test_subscription_show_seeds_from_config_yaml_on_first_use(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "subscription", "show"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "monthly_allowance_usd=500" in result.output
+    assert "pacing=opportunistic" in result.output
+    repo = _repo_at(db_path)
+    assert repo.get_subscription()["monthly_allowance_usd"] == Decimal("500")
+
+
+def test_subscription_set_updates_the_live_allowance_no_passphrase_needed(
+    tmp_path, valid_config_path
+):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "subscription", "set", "--monthly-allowance", "1000", "--pacing", "even_daily",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    sub = repo.get_subscription()
+    assert sub["monthly_allowance_usd"] == Decimal("1000")
+    assert sub["pacing"] == "even_daily"
+
+
+def test_subscription_set_without_pacing_keeps_the_existing_pacing(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "subscription", "set", "--monthly-allowance", "1000", "--pacing", "even_daily",
+        ],
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "subscription", "set", "--monthly-allowance", "250",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    sub = repo.get_subscription()
+    assert sub["monthly_allowance_usd"] == Decimal("250")
+    assert sub["pacing"] == "even_daily"  # unchanged
+
+
+def test_subscription_set_rejects_a_negative_allowance(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "subscription", "set", "--monthly-allowance", "-50",
+        ],
+    )
+
+    assert result.exit_code != 0
+    # rejected before it ever overwrites the (config.yaml-seeded) live value.
+    repo = _repo_at(db_path)
+    assert repo.get_subscription()["monthly_allowance_usd"] == Decimal("500")
+
+
+def test_subscription_set_rejects_a_non_numeric_allowance(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "subscription", "set", "--monthly-allowance", "not-a-number",
+        ],
+    )
+
+    assert result.exit_code != 0
+    repo = _repo_at(db_path)
+    assert repo.get_subscription()["monthly_allowance_usd"] == Decimal("500")
+
+
+def test_agent_seeds_the_subscription_from_config_on_first_run(
+    tmp_path, valid_config_path, monkeypatch
+):
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    assert repo.get_subscription()["monthly_allowance_usd"] == Decimal("500")
+
+
 # -- monitor ----------------------------------------------------------------------------------
 
 
