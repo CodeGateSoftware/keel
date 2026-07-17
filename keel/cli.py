@@ -1,20 +1,32 @@
 """keel command-line interface (P3 Task 9).
 
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
-`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `rules
-list|backtest|promote|demote|disable` (`data.repository` + `strategy.backtest`/`promotion`),
-`pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch), `subscription show|set`
-(the DB-backed monthly-allowance rail 14 reads live, Issue #59), and a Phase-4 `insights` stub.
+`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `arm-bypass`/
+`disarm-bypass` (the `agent_state` bypass-arm token `agent.run_once` itself enforces, Issue #60),
+`rules list|backtest|promote|demote|disable` (`data.repository` + `strategy.backtest`/
+`promotion`), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
+`subscription show|set` (the DB-backed monthly-allowance rail 14 reads live, Issue #59), and a
+Phase-4 `insights` stub.
 
 **Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
 `{arm_bypass, raise_caps, disable_killswitch, unlock_vault}` require the passphrase gate. In this
-CLI's surface that's `agent --bypass` (`arm_bypass`) and `resume` (`disable_killswitch`) --
-`kill` (engaging the kill-switch) is a *safe* action and always allowed; every other command here
-is read-only or a local rules-table/DB mutation with no live-trading blast radius, so per the plan
-("read-only commands require no passphrase") they are not gated. There is no CLI surface for
-`raise_caps`/`unlock_vault` in this task -- caps are config-file-only (no runtime override exists
-in the merged `execution.guards`/`config` modules) and the vault (`security.secrets`) has no CLI
-command in this task's scope.
+CLI's surface that's `agent --bypass` and `arm-bypass` (both map to the `arm_bypass` action) and
+`resume` (`disable_killswitch`) -- `kill` (engaging the kill-switch) and `disarm-bypass` are
+*safe* actions (they only ever reduce capability) and are always allowed; every other command
+here is read-only or a local rules-table/DB mutation with no live-trading blast radius, so per
+the plan ("read-only commands require no passphrase") they are not gated. There is no CLI surface
+for `raise_caps`/`unlock_vault` in this task -- caps are config-file-only (no runtime override
+exists in the merged `execution.guards`/`config` modules) and the vault (`security.secrets`) has
+no CLI command in this task's scope.
+
+**`agent --bypass`'s passphrase gate is not sufficient on its own (Issue #60).** It only guards
+this CLI entry point -- any other caller invoking `agent.run_once`/`agent.loop` in-process with
+`config.auto_trade.mode == "bypass"` would bypass it entirely. `agent.run_once` therefore also
+requires a separately armed, time-limited token (`Repository.is_bypass_armed`, set by
+`arm-bypass`) before it will actually run in bypass mode -- an unarmed or expired request fails
+safe to confirm-mode behavior (nothing placed) regardless of how `run_once` was invoked. Both
+gates apply to the CLI path (defense in depth); only the arm-token check is un-bypassable
+in-process.
 
 **No interactive hangs in tests.** `--passphrase` may be passed explicitly; if omitted, it is only
 read via an interactive `click.prompt` when stdin is a real TTY (`_resolve_passphrase`) --
@@ -264,6 +276,10 @@ def _print_loop_result(result: agent.LoopResult) -> None:
         f"products={result.products} stale={result.stale_products} "
         f"signals={len(result.enter_signals)} entered={entered} exited={exited}"
     )
+    if result.bypass_refused_reason is not None:
+        # Issue #60: `run_once` itself refused bypass (unarmed/expired token) and fell back to
+        # confirm mode -- surface *why*, not just the silently-different `mode=confirm` above.
+        click.echo(f"[{result.ts}] bypass refused: {result.bypass_refused_reason}")
 
 
 @cli.command()
@@ -324,6 +340,43 @@ def agent_cmd(
 
     for result in agent.loop(broker, repo, config, interval, stop_flag):
         _print_loop_result(result)
+
+
+# -- arm-bypass / disarm-bypass (Issue #60, bypass-arm hardening) ---------------------------
+
+
+@cli.command("arm-bypass")
+@click.option("--passphrase", default=None, help="Required to arm bypass mode.")
+@click.pass_context
+@with_disclaimer
+def arm_bypass_cmd(ctx: click.Context, passphrase: str | None) -> None:
+    """Arm autonomous bypass mode for a limited window (dangerous: requires the passphrase).
+
+    This is the second, in-process enforcement layer `agent.run_once` itself checks
+    (`repo.is_bypass_armed`) before ever honoring `config.auto_trade.mode == "bypass"` -- the
+    existing `agent --bypass --passphrase` gate alone is not enough, since that only guards the
+    CLI entry point, not a caller that invokes `agent.run_once`/`agent.loop` directly. The
+    window lasts `config.auto_trade.bypass_arm_ttl_sec` seconds (default 3600 = 1h) from now;
+    call this again to reset it, or `keel disarm-bypass` to clear it early.
+    """
+    _require_authz(ctx, _ARM_BYPASS, passphrase)
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+    now_ts = int(time.time())
+    ttl_sec = config.auto_trade.bypass_arm_ttl_sec
+    repo.arm_bypass(now_ts, ttl_sec)
+    click.echo(f"bypass ARMED: expires at {now_ts + ttl_sec} (ttl={ttl_sec}s)")
+
+
+@cli.command("disarm-bypass")
+@click.pass_context
+@with_disclaimer
+def disarm_bypass_cmd(ctx: click.Context) -> None:
+    """Clear the bypass-arm token immediately. Always allowed (safe action; only reduces
+    capability -- fail-safe direction, unlike arming, needs no passphrase)."""
+    repo = _open_repo(ctx)
+    repo.disarm_bypass()
+    click.echo("bypass DISARMED.")
 
 
 # -- rules ------------------------------------------------------------------------------
