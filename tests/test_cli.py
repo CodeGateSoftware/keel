@@ -25,6 +25,7 @@ from keel.cli import DISCLAIMER, cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.security import authz
+from keel.types import Candle, Granularity
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
 PASSPHRASE = "correct-horse-battery-staple"
@@ -754,6 +755,133 @@ def test_pnl_overall_report(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "total realized P&L:" in result.output
+
+
+# -- simulate -------------------------------------------------------------------------------
+
+
+def _seed_candles_for_allowlist(repo: Repository, now_ts: int) -> None:
+    """A tiny, deterministic candle set for the default `config.yaml` allowlist
+    (BTC-USD/ETH-USD/PAXG-USD) -- just enough for `simulate --no-fetch` to run end to end
+    without ever touching the network."""
+    hour = now_ts - (now_ts % 3600)
+    for product in ("BTC-USD", "ETH-USD", "PAXG-USD"):
+        hourly = [
+            Candle(
+                ts=hour - i * 3600,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+            )
+            for i in range(72, -1, -1)
+        ]
+        daily = [
+            Candle(
+                ts=hour - i * 86400,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+            )
+            for i in range(5, -1, -1)
+        ]
+        repo.upsert_candles(product, Granularity.ONE_HOUR, hourly)
+        repo.upsert_candles(product, Granularity.ONE_DAY, daily)
+
+
+def test_simulate_no_fetch_produces_report_and_never_touches_network(tmp_path, monkeypatch):
+    db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+
+    def _boom(config):  # pragma: no cover -- only invoked if the test fails its own contract
+        raise AssertionError("_build_broker must never be called under --no-fetch")
+
+    monkeypatch.setattr(cli_module, "_build_broker", _boom)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert out_path.exists()
+    report_text = out_path.read_text()
+    assert report_text.lower().count("verdict") >= 1
+    assert "verdict:" in result.output.lower()
+    assert "cached" in result.output.lower()
+    assert "coverage" in result.output.lower()
+
+
+def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monkeypatch):
+    """A second `--no-fetch` run over the same persistent DB reuses the cached candles with no
+    network -- `_build_broker` must never be constructed either time."""
+    db_path = tmp_path / "sim.db"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_broker",
+        lambda config: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
+    )
+
+    runner = CliRunner()
+    for i in range(2):
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(db_path),
+                "simulate",
+                "--no-fetch",
+                "--years",
+                "1",
+                "--out",
+                str(tmp_path / f"report{i}.md"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+
+def test_simulate_artifact_flag_prints_not_yet_wired(tmp_path, monkeypatch):
+    db_path = tmp_path / "sim.db"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(tmp_path / "report.md"),
+            "--artifact",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "task 9" in result.output.lower()
 
 
 # -- insights (stub) ----------------------------------------------------------------------------
