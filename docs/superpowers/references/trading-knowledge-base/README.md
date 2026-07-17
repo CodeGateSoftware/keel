@@ -57,6 +57,7 @@ reference valid across the split without rewriting them.
 | 24 | "10 Chart Patterns Every Pro Trader Should Know" (Vince Stanzione **ebook**, 24pp; pattern catalog) | extracted (thin; reinforces §23.1 breakout; subjective patterns → v2) | [source-24](./sources/source-24.md) |
 | 25 | "The Complete Guide to Trading" (Corporate Finance Institute, 2018 **textbook**, 116pp) | extracted (NEW: ADX trend-strength filter + good-trade principle; Parts 1–2 out of scope) | [source-25](./sources/source-25.md) |
 | 26 | "7 Traits of Successful Financial Traders" (Vince Stanzione **ebook**, 25pp; psychology) | extracted (thin; NEW pyramiding + 20-SMA exit; reinforces trend-following pivot) | [source-26](./sources/source-26.md) |
+| 27 | "How to Trade Commodities" (Vince Stanzione **ebook**, 50pp) | extracted (mostly dup/reinforce; **HIGH: Turtle Trading = canonical breakout spec**) | [source-27](./sources/source-27.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -72,11 +73,11 @@ Thematic view — which agent module each theme feeds, and where it's sourced.
 | `analysis/indicators.py` | EMA / RSI (+divergence) / MACD (12/26/9) / ATR / Fib retrace+extension / deceleration; **NEW: ADX/DMI trend-strength (dir-blind; confirms real trend, rejects false breakouts) §25.1** | §1.4, §1.5, §3.1, §3.3, §4.4, §25.1, §25.3 |
 | `analysis/insights.py` | AI behavioral/seasonality analysis; edge-decay detection; BTC cycle/seasonality context; seasonality as low-weight CTS factor; pivot-slice auto-pruning of weak pair/day/time/rule buckets | §6.1, §6.2, §6.3, §12.3, §14.3, §20.7, §21.2 |
 | `analysis/pnl.py` | FIFO P&L, drawdown / time-in-drawdown, recovery table | §4.6, §10.5, §2.4 |
-| `strategy/rules/` | Parameterized pullback-continuation family; RSI mean-reversion; DCA/dip-buy; **NEW: Donchian channel breakout (trend-following/buy-strength, long-only) — candidate to replace refuted dip-buying**; deferred (harmonics incl. full Gartley, Fib-inversion, BTC macro-cycle) | §2.1, §3.3, §7.1, §9.3, §12.1, §15.2, **§23.1** |
+| `strategy/rules/` | Parameterized pullback-continuation family; RSI mean-reversion; DCA/dip-buy; **NEW: Donchian channel breakout (trend-following/buy-strength, long-only) = canonical Turtle system — 20-day-high entry / 10-day-low ASYMMETRIC exit + ATR sizing/stops (§27.1); candidate to replace refuted dip-buying**; deferred (harmonics incl. full Gartley, Fib-inversion, BTC macro-cycle) | §2.1, §3.3, §7.1, §9.3, §12.1, §15.2, **§23.1, §27.1** |
 | `strategy/engine.py` | Identify→Predict→Decide→Execute; **CTS scoring → rail-bounded execution**; 4 graded entry techniques; kill-zone entry gate; multi-TF bias; news filter; **ADX + MACD-up as breakout-confirmation confluence factors (§25.1, §25.3)** | §2.0, §3.2, §3.6, §8.1, §9.1, §17.1, §17.2, §25.1 |
 | `strategy/backtest.py` | Backtest, intrabar order-of-events, spread/slippage modeling, MFE/MAE, no-overlap realism | §1.7, §2.3, §4.2, §20.2, §20.5 |
 | `strategy/promotion.py` | Paper gate, promotion/demotion, expectancy + R:R≥1.5–2 & win≥55%, min-sample (100 trades/5yr), edge decay; **TODO: per-rule-class floor — trend-followers earn on R:R not win% & would fail the global 55% bar (§23.1); "good trade vs winning trade" = evaluate by expectancy/R:R not outcome (§25.5)** | §1.6, §4.5, §5.2, §6.3, §20.6, §23.1, §25.5 |
-| `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **NEW: pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1 |
+| `strategy/money_mgmt.py` | Smooth-ratio sizing ramp (profit-trigger + acceleration) bounded by total & weekly DD caps; fixed-fractional on current equity; **ATR ("N") volatility-based sizing — smaller size when more volatile, crypto-essential (Turtle, §27.1)**; **pyramiding / scale-into-winners (position-level, never losers; rail-bounded, default off) §26.1** | §4.7, §20.3, §20.4, §26.1, §27.1 |
 | `execution/executor.py` | Order lifecycle (close-validate, one-candle validity), OCO/bracket, partial exits, buffers, ATR stops, trailing-stop algorithm (+ channel-low trail §23.2, **20-SMA close-below & trail-to-breakeven §26.2**); target methods (1:1 / swing-high / Fib ext / **pattern-height §24.2**) | §2.2, §3.5, §7.4, §8.2, §17.3, §19.1, §23.2, §24.2, §26.2 |
 | `execution/guards.py` | **The hard rails** (see below); crypto-volatility calibration; API-key security / no-withdrawal scope / custody risk; **data-spike guard (implausible-vs-ATR bad-tick §24.3)** | §4.1, §5.1, §8.1, §10.3, §10.4, §22.1, §22.3, §24.3 |
 | DB schema | transactions/candles/orders/rules/signals/backtests/pnl_daily/agent_state; journal fields | §1.7, §2.5, §4.6 |
@@ -91,6 +92,7 @@ stale-data/feed-health guard (§10.4). CTS dynamic sizing moves **only within** 
 ### Explicit exclusions (halal / spot)
 Carry trades (**entire Source 18 excluded as riba**, §18), hedging, bonds, margin/leverage/lots, short-selling, scalping — see §4.9, §10.10, §18.
 Also **N/A (no crypto analog): TRIN / ARMS breadth index** (needs a stock-index advance-decline basket, §25.6); fixed-income/money-market asset classes (interest = riba, §25.6).
+**Digital / binary / barrier options** (Rise-Fall, Touch/No-Touch, Ends-Between, Accumulators) → **excluded: not spot + maysir/gharar** (gambling/excessive-uncertainty), §27.4. Swap/rollover financing = riba (§27.4).
 
 ---
 
@@ -130,3 +132,10 @@ default off) and a simple **20-SMA close-below exit + trail-to-breakeven** (§26
 endorses the trend-following pivot (the author's own profits came from trend following) and cautions —
 via KISS — to keep the ADX/MACD confluence set minimal and price-first. **Stanzione psychology content has
 saturated** (23/24/26 mostly reinforce).
+**Source 27 (Stanzione commodities ebook) is mostly duplication** (it re-embeds the Source-24 pattern
+guide) **but the Turtle Trading section fully specifies the breakout rule to build:** long-only Turtle =
+**20-day-high entry / 10-day-low ASYMMETRIC exit (new vs §23.1's 20/20) + ADX>25 confirmation + ATR
+volatility sizing + ~2×ATR stop (attacks the "stops too tight for crypto" defect) + 1% risk + ATR/10-day
+trailing exit + low-win/high-R:R promotion floor.** Turtle is a proven, published trend-follower — a
+confidence anchor that the pivot is a real documented edge. Prototype this and validate via `keel simulate`.
+**The Stanzione ebook stream has saturated** (23/24/26/27); 27 earned its keep on the Turtle spec alone.
