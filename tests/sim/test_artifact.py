@@ -127,7 +127,9 @@ def test_render_html_is_self_contained_document():
 
 
 def test_render_html_in_sample_label():
-    html = render_html(_sim(), _benchmark(), _verdict(), _gaps(), _account_metrics(), in_sample=True)
+    html = render_html(
+        _sim(), _benchmark(), _verdict(), _gaps(), _account_metrics(), in_sample=True
+    )
     assert "IN-SAMPLE" in html
 
 
