@@ -33,6 +33,10 @@ auto_trade:
   mode: paper
   enabled: false
   interval_sec: 900
+  # how long a `keel arm-bypass` token stays valid (seconds) before bypass mode requires
+  # re-arming (Issue #60) -- `keel agent --bypass` still needs a fresh armed token even with
+  # the CLI passphrase gate satisfied.
+  bypass_arm_ttl_sec: 3600
 
 promotion:
   min_trades: 30

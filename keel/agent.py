@@ -36,10 +36,19 @@ an actual interactive confirm prompt is the CLI's job (Task 9's `agent --loop --
 can drive `run_once`/`loop` with a real `confirm_fn` some other way, or review the previewed-but-
 unplaced orders out of band. `mode="bypass"` places without a prompt, still subject to every
 guard rail (un-overridable, per `guards.check`).
+
+**Bypass requires an armed token (Issue #60).** `mode="bypass"` additionally requires
+`repo.is_bypass_armed(now_ts)` -- an explicit, authenticated, time-limited arm set by
+`Repository.arm_bypass` (wired to the CLI's passphrase-gated `keel arm-bypass` command). This
+check is enforced by `_confirm_or_bypass` inside `run_once` itself, not only at the CLI, so a
+caller invoking `run_once`/`loop` directly with `config.auto_trade.mode == "bypass"` cannot skip
+it -- an unarmed or expired request fails safe by falling back to `"confirm"` (which places
+nothing without a `confirm_fn`) rather than trading autonomously.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -58,6 +67,8 @@ from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
 from keel.types import Granularity, Side
+
+logger = logging.getLogger(__name__)
 
 # -- rule reconstruction: DB row (kind, JSON-plain params) -> a real Rule instance -------------
 
@@ -237,18 +248,42 @@ class LoopResult:
     enter_signals: list[Signal] = field(default_factory=list)
     enter_results: list[ExecutionResult] = field(default_factory=list)
     exit_results: list[ExecutionResult] = field(default_factory=list)
+    # Issue #60 (bypass-arm hardening): non-`None` iff `config.auto_trade.mode == "bypass"` was
+    # requested but `repo.is_bypass_armed(now_ts)` was `False` -- `mode` above then reports the
+    # *effective* mode actually used (always `"confirm"` in that case), and this field explains
+    # why the fallback happened. `None` whenever bypass wasn't requested, or was armed and ran.
+    bypass_refused_reason: str | None = None
 
 
-def _confirm_or_bypass(config: Config) -> str:
-    """`config.auto_trade.mode` if it's a valid executor mode, else the safe default.
+def _confirm_or_bypass(config: Config, repo: Repository, now_ts: int) -> tuple[str, str | None]:
+    """The effective executor mode for this cycle, plus an optional bypass-refusal reason.
 
     `AutoTradeConfig.mode` defaults to `"paper"` (a Phase-1 placeholder, spec §21) which isn't
     an `executor.execute` mode at all -- per the Global Constraints, confirm mode is *always*
-    the default, so anything other than an explicit `"bypass"` falls back to `"confirm"` rather
-    than raising or silently bypassing rails.
+    the default, so anything other than an explicit `"bypass"`/`"confirm"` falls back to
+    `"confirm"` rather than raising or silently bypassing rails.
+
+    **Issue #60 (bypass-arm hardening).** A request for `"bypass"` is only honored if
+    `repo.is_bypass_armed(now_ts)` is `True` -- an explicit, authenticated, time-limited arm
+    (`keel arm-bypass`, passphrase-gated, or any other caller that has called
+    `repo.arm_bypass`) recently granted it. This check lives here, inside `run_once`'s own call
+    path, specifically so it cannot be bypassed by a caller that invokes `agent.run_once`
+    in-process with `config.auto_trade.mode == "bypass"` and skips the CLI's passphrase gate
+    entirely -- the CLI gate (`cli._require_authz`) is defense-in-depth, this is the
+    un-overridable second layer. An unarmed/expired request fails safe: it falls back to
+    `"confirm"` (which, with no `confirm_fn`, places nothing -- see `executor.execute`'s own
+    contract) rather than raising or silently proceeding, and the second return value carries a
+    human-readable reason a caller can log or surface.
     """
     mode = config.auto_trade.mode
-    return mode if mode in ("confirm", "bypass") else "confirm"
+    if mode not in ("confirm", "bypass"):
+        return "confirm", None
+    if mode == "bypass" and not repo.is_bypass_armed(now_ts):
+        return "confirm", (
+            "bypass mode requested but not armed (no active `keel arm-bypass` token, or it "
+            "expired) -- falling back to confirm mode; no order will be placed"
+        )
+    return mode, None
 
 
 def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> LoopResult:
@@ -275,7 +310,9 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
     # recording that the check happened, independent of whether it found anything new.
     repo.set_state("last_feed_ts", now_ts)
 
-    mode = _confirm_or_bypass(config)
+    mode, bypass_refused_reason = _confirm_or_bypass(config, repo, now_ts)
+    if bypass_refused_reason is not None:
+        logger.warning("agent.run_once: %s", bypass_refused_reason)
     max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
     finest = _finest_granularity(granularities)
 
@@ -320,6 +357,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
         enter_signals=enter_signals,
         enter_results=enter_results,
         exit_results=exit_results,
+        bypass_refused_reason=bypass_refused_reason,
     )
 
 

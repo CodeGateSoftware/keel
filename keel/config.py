@@ -56,6 +56,11 @@ class AutoTradeConfig:
     mode: str = "paper"
     enabled: bool = False
     interval_sec: int = 900
+    # Issue #60: how long a `keel arm-bypass` token stays valid (`Repository.arm_bypass`'s
+    # `ttl_sec`) before `agent.run_once` refuses `mode="bypass"` again and falls back to
+    # `"confirm"`. 3600s (1h) is a sensible default -- long enough for one supervised session,
+    # short enough that a forgotten arm doesn't grant unattended autonomy indefinitely.
+    bypass_arm_ttl_sec: int = 3600
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,7 @@ def load_config(path: str | Path) -> Config:
             mode=auto_trade_raw.get("mode", "paper"),
             enabled=bool(auto_trade_raw.get("enabled", False)),
             interval_sec=int(auto_trade_raw.get("interval_sec", 900)),
+            bypass_arm_ttl_sec=int(auto_trade_raw.get("bypass_arm_ttl_sec", 3600)),
         ),
         promotion=PromotionConfig(
             min_trades=int(promotion_raw.get("min_trades", 30)),

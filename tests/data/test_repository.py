@@ -254,6 +254,53 @@ def test_set_subscription_overwrites_the_previous_value(repo):
     assert sub["updated_at"] == 1_700_001_000
 
 
+# -- bypass arm token (Issue #60, in-process bypass hardening) ---------------
+
+
+def test_is_bypass_armed_false_when_never_armed(repo):
+    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
+
+
+def test_is_bypass_armed_true_right_after_arm_within_ttl(repo):
+    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
+
+    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
+    assert repo.is_bypass_armed(now_ts=1_700_003_599) is True
+
+
+def test_is_bypass_armed_false_once_now_ts_reaches_armed_until(repo):
+    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
+
+    # armed_until = 1_700_000_000 + 3600 = 1_700_003_600 -- freshness is a strict `<`.
+    assert repo.is_bypass_armed(now_ts=1_700_003_600) is False
+    assert repo.is_bypass_armed(now_ts=1_700_004_000) is False
+
+
+def test_is_bypass_armed_false_after_disarm(repo):
+    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
+    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
+
+    repo.disarm_bypass()
+
+    assert repo.is_bypass_armed(now_ts=1_700_000_001) is False
+
+
+def test_arm_bypass_overwrites_a_previous_arm(repo):
+    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=10)
+    repo.arm_bypass(now_ts=1_700_000_100, ttl_sec=3600)
+
+    # the earlier, shorter-lived arm is gone; the new one governs.
+    assert repo.is_bypass_armed(now_ts=1_700_000_015) is True
+    assert repo.is_bypass_armed(now_ts=1_700_003_699) is True
+    assert repo.is_bypass_armed(now_ts=1_700_003_700) is False
+
+
+def test_disarm_bypass_is_a_no_op_when_never_armed(repo):
+    repo.disarm_bypass()  # must not raise
+
+    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
+
+
 # -- rules -------------------------------------------------------------------
 
 

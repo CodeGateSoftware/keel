@@ -13,6 +13,7 @@ disk at all.
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -224,6 +225,140 @@ def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypat
 
     assert result.exit_code == 0, result.output
     assert result.output.count("skipped: kill_switch") == 3
+
+
+# -- arm-bypass / disarm-bypass (Issue #60, bypass-arm hardening) ------------------------------
+
+
+def test_arm_bypass_without_passphrase_is_refused(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "arm-bypass",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "denied" in result.output.lower()
+    repo = _repo_at(db_path)
+    assert repo.is_bypass_armed(now_ts=0) is False
+
+
+def test_arm_bypass_with_wrong_passphrase_is_refused(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "arm-bypass", "--passphrase", "wrong-passphrase",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "denied" in result.output.lower()
+    repo = _repo_at(db_path)
+    assert repo.is_bypass_armed(now_ts=0) is False
+
+
+def test_arm_bypass_with_correct_passphrase_arms(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "arm-bypass", "--passphrase", PASSPHRASE,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "armed" in result.output.lower()
+    repo = _repo_at(db_path)
+    # `valid_config_path`'s auto_trade.bypass_arm_ttl_sec is 3600 -- armed "now" is well inside.
+    assert repo.is_bypass_armed(now_ts=int(time.time())) is True
+
+
+def test_disarm_bypass_clears_the_token_no_passphrase_needed(tmp_path, valid_config_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "arm-bypass", "--passphrase", PASSPHRASE,
+        ],
+    )
+    repo = _repo_at(db_path)
+    assert repo.is_bypass_armed(now_ts=int(time.time())) is True
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "disarm-bypass",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "disarmed" in result.output.lower()
+    repo = _repo_at(db_path)
+    assert repo.is_bypass_armed(now_ts=int(time.time())) is False
+
+
+def test_agent_bypass_without_arm_bypass_places_nothing_even_with_passphrase(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The Issue #60 gap being closed: the CLI passphrase gate on `agent --bypass` alone is not
+    enough -- without a separate `arm-bypass` call, `run_once` itself refuses to trade
+    autonomously and the CLI surfaces that refusal."""
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("kill_switch", False)
+    repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "--authz-path", str(authz_path),
+            "agent", "--bypass", "--passphrase", PASSPHRASE,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "bypass" in result.output.lower()
+    assert "not armed" in result.output.lower() or "refused" in result.output.lower()
+    repo = _repo_at(db_path)
+    assert repo.get_orders() == []
 
 
 # -- kill / resume ----------------------------------------------------------------------------
