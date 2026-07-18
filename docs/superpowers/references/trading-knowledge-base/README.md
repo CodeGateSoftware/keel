@@ -80,6 +80,9 @@ reference valid across the split without rewriting them.
 | 47 | "Buying Puts to Open" (Swissquote options series pt.6) | ⛔ out of scope — option + bearish/short-equivalent (doubly excluded); logged compactly under §42, no action | [source-47](./sources/source-47.md) |
 | 48 | "Selling Puts to Open" (Swissquote options series pt.7) | ⛔ out of scope — options-income (cash-secured put, =§34.7); logged compactly under §42, no action | [source-48](./sources/source-48.md) |
 | 49 | "Conclusion" (Swissquote options series pt.8 of 8) | ⛔ out of scope — closes options series; exotic strategies excluded, generic advice reinforces only; no action | [source-49](./sources/source-49.md) |
+| 50 | "Introduction to Stock Investing: Corporate Analysis" (Swissquote primer, 9pp, 2022) | ⛔ out of scope — equity fundamental-analysis ratios, N/A to crypto (=§38.3); one reinforcement: CAPM/Alpha/Beta = negative exemplar re-grounding the declined CAPM/MPT (riba via Rf); no action | [source-50](./sources/source-50.md) |
+| 51 | "Building a Diversified Portfolio" (Swissquote primer, 19pp, 2022) | ⛔ largely out of scope — passive ETF asset-allocation (ETFs not our instrument; bonds/bond-ETFs/intermarket-cycle = riba/no-oracle; fixed-weight rebalancing = wrong paradigm); reinforces correlation-sizing + narrow allowlist ("redundancy doesn't diversify" → correlated alts = near-single exposure); no action | [source-51](./sources/source-51.md) |
+| 52 | "Introduction to ETF and Funds Investing" (Swissquote primer, 22pp, 2022) | ⧉ near-dup of §51 ETF material (not re-extracted) + ⛔ out of scope — ETNs (debt=riba)/ETCs/mutual funds are non-spot fund wrappers; bond/money-market funds=riba; value/growth=equity fundamentals N/A (§50); reinforces capital-gains-only (never yield/riba) + liquid-no-lockup; no action | [source-52](./sources/source-52.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
@@ -217,3 +220,31 @@ time-bucket pruning; doesn't port to 24/7 crypto). Digital options/multipliers/c
 **Stanzione/Deriv ebook stream is EXHAUSTED (23/24/26/27/36/37/38) — stop feeding Stanzione/Deriv titles;
 prioritize new-technique books + the Turtle-rule build.** (Source 38 "How to Trade Stocks" = same
 MA/Donchian/RSI dup; stock fundamentals/dividends N/A to crypto; reinforces no-oracle only.)
+**Source 50 (Swissquote "Introduction to Stock Investing: Corporate Analysis")** is an **equity
+fundamental-analysis** primer (Revenue/EBITDA/FCF/EPS/P/E/ROA/ROE/liquidity/solvency ratios) → **out of
+scope / N/A to crypto** (tokens have no financial statements; same as §38.3). One reinforcement earns its
+keep: its **CAPM-derived Alpha/Beta** section is a **negative exemplar** that re-grounds our **declined
+CAPM/MPT** decision (spec §10, §33) — CAPM is anchored on a **risk-free rate (`Rf`) = riba**, and we already
+use absolute **Sortino/drawdown + ATR/correlation sizing** instead of market-beta/alpha (§50.1). No new
+rules/rails/allowlist change. **Fundamental analysis is not our lane** (we are technical/spot/long-only) —
+**recommend not feeding further equity-fundamentals or valuation-ratio primers**; they're structurally N/A to
+crypto. Value remains in **crypto-appropriate *technical* strategy books** + the Turtle-rule / per-class-floor build.
+**Source 51 (Swissquote "Building a Diversified Portfolio")** is a **passive ETF asset-allocation** primer →
+**largely out of scope**: ETFs aren't our instrument (we hold spot coins directly), **bonds/bond-ETFs +
+the commodity→inflation→rates→bonds→stocks intermarket cycle are riba / no-oracle (excluded)**, a
+stocks/bonds/cash allocation doesn't map to single-asset spot crypto, and **fixed-weight rebalancing is a
+paradigm we don't use** (we're rule-driven; overweight is already capped by the per-asset rail). One
+reinforcement earns its keep: the **"redundancy doesn't diversify"** point *sharpens* our
+**correlation-adjusted-sizing rail + narrow BTC/ETH allowlist** — correlated alts are near-single exposure,
+so breadth ≠ diversification (§51.1). No new rules/rails/allowlist change. **Recommend not feeding further
+ETF / passive-allocation primers** — structurally off our lane (single-asset, spot, long-only, rule-driven).
+**The Swissquote primer stream (39–51) has now saturated across every topic they publish** (crypto
+fundamentals, options, equity fundamentals, portfolio/ETF allocation) — pause Swissquote titles; prioritize
+crypto-appropriate *technical* strategy books + the Turtle build.
+**Source 52 (Swissquote "Introduction to ETF and Funds Investing")** proves the saturation point — its ETF
+half is a **verbatim duplicate of §51** (not re-extracted), and its new material (**ETNs = debt/riba, ETCs,
+mutual funds**) is **out of scope by instrument/riba** (fund wrappers we don't trade; bond/money-market funds
+= riba; value/growth = equity fundamentals N/A per §50). Only faint reinforcements: keel earns via
+**capital-gains only, never distribution/yield** (riba screen), and prefers **liquid, no-lock-up spot**. No
+new rules/rails/allowlist change. **Swissquote primer stream (39–52) exhausted across every topic they
+publish — stop feeding Swissquote titles;** value is in crypto-appropriate *technical* strategy books + the Turtle build.
