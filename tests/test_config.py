@@ -234,6 +234,71 @@ def test_load_config_bypass_arm_ttl_sec_absent_falls_back_to_default(write_confi
     assert config.auto_trade.bypass_arm_ttl_sec == 3600
 
 
+# -- logging (engine-activity logging feature) --------------------------------------------------
+
+
+def test_load_config_logging_defaults(valid_config_path):
+    config = load_config(valid_config_path)
+
+    assert config.logging.verbose is False
+    assert config.logging.file == "logs/keel.log"
+    assert config.logging.max_file_mb == 25
+    assert config.logging.file_count == 5
+
+
+def test_load_config_logging_overridable(write_config):
+    text = (
+        VALID_CONFIG_YAML
+        + """
+logging:
+  verbose: true
+  file: logs/custom.log
+  max_file_mb: 10
+  file_count: 3
+"""
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.logging.verbose is True
+    assert config.logging.file == "logs/custom.log"
+    assert config.logging.max_file_mb == 10
+    assert config.logging.file_count == 3
+
+
+def test_load_config_logging_max_file_mb_zero_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nlogging:\n  max_file_mb: 0\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="logging.max_file_mb"):
+        load_config(path)
+
+
+def test_load_config_logging_max_file_mb_negative_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nlogging:\n  max_file_mb: -5\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="logging.max_file_mb"):
+        load_config(path)
+
+
+def test_load_config_logging_file_count_zero_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nlogging:\n  file_count: 0\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="logging.file_count"):
+        load_config(path)
+
+
+def test_load_config_logging_empty_file_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nlogging:\n  file: ''\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="logging.file"):
+        load_config(path)
+
+
 def test_load_secrets_missing_env_returns_empty_dict(tmp_path):
     missing_path = tmp_path / "does-not-exist.env"
 

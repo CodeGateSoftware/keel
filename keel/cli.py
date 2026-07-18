@@ -64,6 +64,7 @@ from keel.data import market_feed
 from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.logging_setup import configure_logging
 from keel.security import authz
 from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
@@ -151,7 +152,19 @@ def _open_repo(ctx: click.Context) -> Repository:
 
 
 def _load_cfg(ctx: click.Context) -> Config:
-    return load_config(ctx.obj["config_path"])
+    """Load `config.yaml` and wire up engine-activity logging from it.
+
+    `--verbose`/`-v` on the root `cli` group (`ctx.obj["verbose"]`) overrides
+    `config.logging.verbose` to `True` before `configure_logging` is called, so the flag always
+    wins over whatever `config.yaml` says. Every command that loads config (agent/monitor/
+    simulate/etc.) gets logging configured this way, right when the config it's built from
+    becomes available.
+    """
+    config = load_config(ctx.obj["config_path"])
+    if ctx.obj.get("verbose"):
+        config = replace(config, logging=replace(config.logging, verbose=True))
+    configure_logging(config.logging)
+    return config
 
 
 def _ensure_subscription_seeded(repo: Repository, config: Config, now_ts: int) -> None:
@@ -200,13 +213,24 @@ def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only 
     show_default=True,
     help="Passphrase-gate state file (see `keel.security.authz`).",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Log major operations/decisions (INFO), not just errors -- overrides config.yaml's "
+    "logging.verbose. Errors/exceptions are always logged regardless of this flag.",
+)
 @click.pass_context
-def cli(ctx: click.Context, db_path: str, config_path: str, authz_path: str) -> None:
+def cli(
+    ctx: click.Context, db_path: str, config_path: str, authz_path: str, verbose: bool
+) -> None:
     """keel: an offline-first, halal, guard-railed Coinbase auto-trading agent."""
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
     ctx.obj["config_path"] = config_path
     ctx.obj["authz_path"] = authz_path
+    ctx.obj["verbose"] = verbose
 
 
 # -- db import ------------------------------------------------------------------------------
