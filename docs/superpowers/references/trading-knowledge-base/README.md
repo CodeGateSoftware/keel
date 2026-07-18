@@ -79,6 +79,7 @@ reference valid across the split without rewriting them.
 | 46 | "Selling a Covered Call to Open" (Swissquote options series pt.5) | ⛔ out of scope — options-income (written-call leg excluded; hold spot, no option overlay); logged compactly under §42, no action | [source-46](./sources/source-46.md) |
 | 47 | "Buying Puts to Open" (Swissquote options series pt.6) | ⛔ out of scope — option + bearish/short-equivalent (doubly excluded); logged compactly under §42, no action | [source-47](./sources/source-47.md) |
 | 48 | "Selling Puts to Open" (Swissquote options series pt.7) | ⛔ out of scope — options-income (cash-secured put, =§34.7); logged compactly under §42, no action | [source-48](./sources/source-48.md) |
+| 49 | "Conclusion" (Swissquote options series pt.8 of 8) | ⛔ out of scope — closes options series; exotic strategies excluded, generic advice reinforces only; no action | [source-49](./sources/source-49.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
