@@ -4,9 +4,10 @@ The canonical, decades-validated Turtle Trading system (Dennis/Eckhardt), long-o
 on a confirmed close above the prior N-day Donchian high, gated by ADX>25 trend confirmation
 (§25.1 -- "ADX<25 = ranging, stand aside", rejects false breakouts) and size/stop off ATR
 ("N" in Turtle parlance, §27.1 -- "Turtles used ~2N" for the stop). The exit channel is
-deliberately **asymmetric**: a shorter Donchian-low lookback than the entry lookback (Turtle
-System-1 = 20/10) so winners are given room to run on the way up but the trade is cut faster
-on the way down than the entry signal took to fire.
+deliberately **asymmetric**: a shorter Donchian-low lookback than the entry lookback (a 2:1
+ratio; classic Turtle System-1 is 20/10, this rule defaults to a longer 40/20 -- see below) so
+winners are given room to run on the way up but the trade is cut faster on the way down than the
+entry signal took to fire.
 
 Long-only spot, no shorts: this rule only ever emits a **long** `Setup` (a close above the
 high channel); the opposite side (a close below the low channel) is exit-only, wired through
@@ -18,9 +19,12 @@ the evaluation engine via `getattr(rule, "granularity")` -- see
 a daily trend-follower, and that is not cosmetic: ADX is a *daily-scale* trend measure. On
 noisy hourly bars +DI/-DI cancel out and ADX stays structurally suppressed (measured ~7 median
 / 18 max on real hourly BTC/ETH regardless of period), so an ADX>25 gate on hourly data never
-fires and the rule produces zero trades. On daily candles ADX(14) has a ~26 median and 20-day-
-high breakouts routinely coincide with ADX>25. So the lookback defaults are DAY counts (Turtle
-System-1 20/10 + ADX(14) + 20-day ATR "N").
+fires and the rule produces zero trades. On daily candles ADX(14) has a ~26 median and
+Donchian-high breakouts routinely coincide with ADX>25. So the lookback defaults are DAY counts.
+The entry/exit default to **40/20** -- a longer channel than the classic Turtle System-1 20/10 --
+chosen by **walk-forward out-of-sample validation** on cached 5yr BTC/ETH/PAXG (every entry
+lookback longer than 20 beat 20 out-of-sample; 40 was the most robust across held-out years). The
+2:1 asymmetric ratio, ADX(14) gate, and 20-day ATR "N" are unchanged.
 
 **Forming-bar lookahead guard.** The two backtest passes present the daily series differently:
 - The *edge* backtester (`strategy.backtest.backtest`) drives the rule on its native series
@@ -58,8 +62,8 @@ class TurtleBreakout(Rule):
     def __init__(
         self,
         product_id: str,
-        entry_lookback: int = 20,  # 20 trading days (Donchian high, entry) -- Turtle System-1
-        exit_lookback: int = 10,  # 10 days (Donchian low, asymmetric channel exit)
+        entry_lookback: int = 40,  # Donchian-high entry (days); walk-forward OOS default (was 20)
+        exit_lookback: int = 20,  # Donchian-low asymmetric exit (days); half the entry (was 10)
         adx_period: int = 14,  # 14 days -- classic ADX
         adx_threshold: float = 25.0,  # ADX>25 trend confirmation (KB §25.1)
         atr_period: int = 20,  # 20 days = Turtle's "N"
