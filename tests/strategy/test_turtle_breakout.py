@@ -134,8 +134,9 @@ class TestGranularity:
 
     def test_defaults_are_day_counts(self) -> None:
         rule = TurtleBreakout(product_id="BTC-USD")
-        assert rule.params["entry_lookback"] == 20
-        assert rule.params["exit_lookback"] == 10
+        # 40/20 = walk-forward OOS-validated default (longer than the classic 20/10 Turtle S1)
+        assert rule.params["entry_lookback"] == 40
+        assert rule.params["exit_lookback"] == 20
         assert rule.params["adx_period"] == 14
         assert rule.params["atr_period"] == 20
 
