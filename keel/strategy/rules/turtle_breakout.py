@@ -75,6 +75,9 @@ class TurtleBreakout(Rule):
         atr_stop_mult: Decimal = Decimal("2"),  # 2N stop (KB -- fixes 'stops too tight for crypto')
         use_macd_confirm: bool = False,  # optional MACD histogram>0 filter
         s1_filter: bool = False,  # Turtle S1 profitable-trade filter (default off); see detect()
+        min_volume_filter: bool = False,  # require above-average breakout volume (default off)
+        volume_ma_period: int = 20,  # lookback for the average-volume comparison (days)
+        volume_mult: float = 1.2,  # breakout volume must exceed volume_mult x the average
         target_rr: Decimal = Decimal("6"),  # distant nominal take-profit; see detect()
         name: str = "turtle_breakout",
     ) -> None:
@@ -86,6 +89,8 @@ class TurtleBreakout(Rule):
             raise ValueError("adx_period must be positive")
         if atr_period <= 0:
             raise ValueError("atr_period must be positive")
+        if volume_ma_period <= 0:
+            raise ValueError("volume_ma_period must be positive")
 
         self.name = name
         self.product_id = product_id
@@ -99,6 +104,9 @@ class TurtleBreakout(Rule):
             "atr_stop_mult": atr_stop_mult,
             "use_macd_confirm": use_macd_confirm,
             "s1_filter": s1_filter,
+            "min_volume_filter": min_volume_filter,
+            "volume_ma_period": volume_ma_period,
+            "volume_mult": volume_mult,
             "target_rr": target_rr,
         }
         # memoizes the S1-filter decision by the completed-history's last ts, so the account
@@ -156,6 +164,18 @@ class TurtleBreakout(Rule):
             histogram = macd(closes)[2]
             if not histogram[-1] > 0:
                 return None
+
+        # Low-volume breakout filter (default off): a breakout on thin volume is a likely
+        # fakeout, so require the breakout bar's volume to exceed `volume_mult` x the average
+        # volume of the prior `volume_ma_period` completed days (KB §54.23). Skips the entry
+        # otherwise. Insufficient volume history -> not applied (allow).
+        if self.params["min_volume_filter"]:
+            vperiod = self.params["volume_ma_period"]
+            prior = daily[-vperiod - 1 : -1]
+            if prior:
+                avg_vol = sum((c.volume for c in prior), Decimal(0)) / len(prior)
+                if not current.volume > Decimal(str(self.params["volume_mult"])) * avg_vol:
+                    return None
 
         atr_now = Decimal(str(atr(work, atr_period)[-1]))
         if atr_now <= 0:
