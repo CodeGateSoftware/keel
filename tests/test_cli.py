@@ -700,9 +700,9 @@ def test_rules_seed_populates_products_times_kinds(tmp_path, valid_config_path):
 
     assert result.exit_code == 0, result.output
     rows = repo.get_rules("candidate")
-    # valid_config_path's allowlist is BTC/ETH/PAXG (3 products) x all of RULE_REGISTRY (3 kinds).
+    # valid_config_path's allowlist is BTC/ETH/PAXG (3 products) x all of RULE_REGISTRY (N kinds).
     assert len(rows) == 3 * len(RULE_REGISTRY)
-    assert "seeded=9 skipped=0" in result.output
+    assert f"seeded={3 * len(RULE_REGISTRY)} skipped=0" in result.output
 
 
 def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
@@ -717,7 +717,7 @@ def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
     second = runner.invoke(cli, args)
 
     assert second.exit_code == 0, second.output
-    assert "seeded=0 skipped=9" in second.output
+    assert f"seeded=0 skipped={3 * len(RULE_REGISTRY)}" in second.output
     assert len(repo.get_rules()) == 3 * len(RULE_REGISTRY)
 
 
@@ -733,7 +733,7 @@ def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path)
     second = runner.invoke(cli, [*args, "--force"])
 
     assert second.exit_code == 0, second.output
-    assert "seeded=9 skipped=0" in second.output
+    assert f"seeded={3 * len(RULE_REGISTRY)} skipped=0" in second.output
     assert len(repo.get_rules()) == 2 * 3 * len(RULE_REGISTRY)
 
 

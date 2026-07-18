@@ -39,13 +39,27 @@ from keel.types import Candle, Granularity, Side
 
 __all__ = ["BacktestResult", "backtest"]
 
-# Placeholder key used to present the single candle series to `Rule.detect()`/
+# Default key used to present the single candle series to `Rule.detect()`/
 # `Rule.exit_signal()` in the `dict[Granularity, list[Candle]]` shape the interface
-# expects. This backtester drives one series at one (unspecified) timeframe; a rule
-# under test should read `next(iter(candles_by_tf.values()))` rather than depend on
-# this exact key. True multi-timeframe backtesting is the evaluation engine's job
-# (task 7), not this module's.
+# expects, for a rule that doesn't declare its own trading timeframe (`Dca`). Rules that
+# do declare one (`granularity`/`timeframe`) are keyed by that instead (see
+# `_rule_trading_tf`), so a daily-native rule like `TurtleBreakout` receives its candles
+# under `ONE_DAY`. True multi-timeframe backtesting is the evaluation engine's job (task 7),
+# not this module's.
 _TRADING_TF = Granularity.ONE_HOUR
+
+
+def _rule_trading_tf(rule: Rule) -> Granularity:
+    """The rule's trading timeframe, mirroring `engine._trading_granularity`'s attribute
+    lookup order (`granularity` then `timeframe`), falling back to `_TRADING_TF` (ONE_HOUR)
+    for a rule that declares neither. Keys the per-bar window so each rule receives its
+    single series under the granularity it actually reads.
+    """
+    for attr in ("granularity", "timeframe"):
+        value = getattr(rule, attr, None)
+        if isinstance(value, Granularity):
+            return value
+    return _TRADING_TF
 
 
 @dataclass
@@ -166,9 +180,10 @@ def backtest(
     trades: list[Trade] = []
     position: _OpenPosition | None = None
     pending: Setup | None = None
+    trading_tf = _rule_trading_tf(rule)
 
     for i, candle in enumerate(candles):
-        candles_by_tf = {_TRADING_TF: candles[: i + 1]}
+        candles_by_tf = {trading_tf: candles[: i + 1]}
 
         if position is None and pending is None:
             pending = rule.detect(candles_by_tf)

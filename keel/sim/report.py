@@ -62,7 +62,7 @@ from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimResult, SimTelemetry
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
-from keel.strategy.backtest import backtest
+from keel.strategy.backtest import _rule_trading_tf, backtest
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
 from keel.strategy.promotion import PromotionConfig, can_promote
 from keel.strategy.rules.base import Rule
@@ -139,15 +139,20 @@ def edge_table(
     fee_pct: Decimal,
     slippage_pct: Decimal,
 ) -> dict[str, BacktestResult]:
-    """Backtest every rule in `rules` over its own asset's `ONE_HOUR` series, plus a pooled entry.
+    """Backtest every rule in `rules` over its own asset's native-timeframe series, plus a pooled
+    entry.
 
     Each `rule` is bound to one asset via `rule.product_id` (matching `portfolio_sim.run`'s
-    convention). Results are keyed `"{rule.name}:{asset}"` (not bare `rule.name`) so two rules of
-    the same kind bound to different assets don't collide. `POOLED_KEY` (`"__pooled__"`) holds
+    convention). A rule is backtested on the series for ITS OWN trading timeframe
+    (`_rule_trading_tf` -- `ONE_HOUR` for the hourly rules, `ONE_DAY` for the daily-native
+    `TurtleBreakout`), with the `ONE_HOUR` series passed as `finer_candles` for intrabar
+    stop/target resolution when the rule's own timeframe is coarser. Results are keyed
+    `"{rule.name}:{asset}"` (not bare `rule.name`) so two rules of the same kind bound to
+    different assets don't collide. `POOLED_KEY` (`"__pooled__"`) holds
     `strategy.stats.summarize()` over every rule's trades concatenated -- the pooled sample
     `build_verdict`'s G2 gate is checked against.
 
-    A rule whose asset has no cached `ONE_HOUR` candles gets an empty series (an all-zero
+    A rule whose asset has no cached candles for its timeframe gets an empty series (an all-zero
     `BacktestResult`, `n_trades=0`) rather than raising -- absent data is a data-coverage gap
     (see `analyze_gaps`), not a crash.
     """
@@ -156,8 +161,13 @@ def edge_table(
 
     for rule in rules:
         asset = _asset(rule.product_id)
-        hourly = candles_by_asset.get(asset, {}).get(Granularity.ONE_HOUR, [])
-        result = backtest(rule, hourly, fee_pct=fee_pct, slippage_pct=slippage_pct)
+        tf = _rule_trading_tf(rule)
+        per_tf = candles_by_asset.get(asset, {})
+        series = per_tf.get(tf, [])
+        finer = per_tf.get(Granularity.ONE_HOUR, []) if tf != Granularity.ONE_HOUR else None
+        result = backtest(
+            rule, series, finer_candles=finer, fee_pct=fee_pct, slippage_pct=slippage_pct
+        )
         results[f"{rule.name}:{asset}"] = result
         pooled_trades.extend(result.trades)
 
