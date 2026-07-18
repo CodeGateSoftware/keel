@@ -703,6 +703,94 @@ correlation rail **rolling (60-day)**; (3) **do not report a whole-period Sharpe
 mostly-cash days distort it; keep the drawdown/Sortino verdict (now textbook-endorsed) and consider a
 mean-reversion partner rule for high-noise assets.
 
+# Part 3 — Ch 12 (Volume, Open Interest, and Breadth), Ch 19 (Multiple Time Frames)
+
+## §54.23 — Volume: confirmation, spikes, indicators, and the low-volume filter — *Ch 12*
+**Module: `strategy/engine.py` (volume filter), `analysis/indicators.py` (volume indicators), `execution/executor.py` (VWAP)**
+
+Crypto trades 24/7 with **real volume**, so unlike open-interest/breadth (below) this chapter *does*
+apply. Core principles: **volume normally *leads* price and *confirms* direction.**
+
+| Volume | Price | Interpretation |
+|---|---|---|
+| rising | rising | confirms the rise |
+| rising | falling | confirms the drop |
+| falling | rising | **weak rally** (no support) |
+| falling | falling | weak pullback |
+
+- **Volume spike (a top/bottom warning):** a day with volume ≥ **2× (often 3–4×)** the recent norm
+  = the crowd has all piled in → **the move is exhausted; a reversal usually follows** ("the crowd is
+  always wrong on timing"). Detect robustly by lagging the average so the spike + its run-up don't
+  contaminate it: `V_t > T × average(V over n days ending t−5)`. **High volume = high risk** (ties to
+  the §54.20 price-shock detector — spikes often accompany shocks).
+- **Volume indicators (all hand-rollable in Decimal; most useful for crypto):**
+  ```
+  NormVol_t   = 100 × V_t / average(V, N)              (today's volume as % of normal; N=50/200)
+  Force Index = (Close_t − Close_{t−1}) × Volume_t     (Elder; 2-day EMA=timing, 13-day EMA=trend, buy>0)
+  OBV_t       = OBV_{t−1} + sign(Close_t − Close_{t−1}) × Volume_t   (Granville; use vs its MA; DIVERGENCE = warning)
+  MFI         = RSI-style 0–100 on typical price TP=(H+L+C)/3 weighted by volume (overbought/oversold)
+  VWMACD_t    = EMA(ΣC·V/ΣV, 12) − EMA(ΣC·V/ΣV, 26), signal 9   (volume-weighted MACD; better timing than MACD)
+  A/D (Chaikin)= AD_{t−1} + (C−O)/(H−L) × V ;  PVT = PVT_{t−1} + (C_t/C_{t−1} − 1)·V   (cash/crypto only, not back-adj futures)
+  ```
+- **⭐ Low-volume filter (the highest-value, most-testable item):** thin activity ⇒ uncertain
+  direction. **Require current volume > its recent average (e.g. 10-day) to confirm a trend / allow an
+  entry** (Saitta; Waxenberg used a +20–40% increase, optionally Bollinger-bands-on-volume). As a
+  *filter* it eliminates trades and **keeps you out of the market more (lowers risk, improves
+  execution).** ⇒ **only take a Turtle breakout if it fires on above-average volume** — a direct,
+  crypto-appropriate defense against thin-volume fakeouts.
+- **VWAP (execution):** *volume-weighted average price* — fill larger orders at the day's
+  volume-weighted average to avoid pushing price (TWAP = time-weighted alternative). **An executor
+  enhancement for larger `keel` orders** (split/pace to approximate VWAP) to cut slippage.
+- **Kaufman's caution:** volume indicators have **higher variance than price** → harder to turn into
+  a profitable rule; **must be backtested before trusting** — don't over-index. Use volume primarily
+  as a *filter/confirmation*, not a standalone signal.
+
+**Open interest & breadth — N/A to spot crypto:**
+- **Open interest** (net outstanding long/short *contracts*) is a **futures-only** concept → N/A (we
+  trade spot; perps have OI but we don't trade them). The volume indicators that require OI
+  (Herrick Payoff, Market Facilitation Index) are skipped.
+- **Breadth** (advance/decline of an index's constituents, new-highs/lows, TRIN/McClellan) needs a
+  **basket index** → N/A to a narrow BTC/ETH/PAXG allowlist (consistent with §25.6 TRIN exclusion).
+  *Possible future:* a crypto-universe breadth (# of coins above their MA / advancing-vs-declining) as
+  a market-regime input for the deferred LLM/insights feature — noted, not built.
+
+## §54.24 — Multiple time frames: Triple-Screen & the "higher TF overrules" law — *Ch 19*
+**Module: `strategy/engine.py` (multi-TF bias + entry timing), `execution/executor.py` (3-step stop)**
+
+Combine timeframes so each does one job: **long TF = the major trend (direction), middle TF = the
+tradable move, short TF = entry timing.** Trends are best identified on the longer TF; entries need a
+faster response. Each TF is typically **~5× apart** (weekly / daily / ~hourly).
+
+- **The governing law (Krausz):** **the higher timeframe OVERRULES the lower; the trend of the
+  next-higher period defines the tradable trend.** Multi-TF also surfaces support/resistance sooner and
+  strengthens a level when it aligns across TFs. (Krausz's 6 laws; his Gann/Fibonacci HiLo-Activator
+  specifics are **deferred** as subjective per the Ch 14 exclusion — the *laws* + the plain
+  "MA-of-highs as a buy-stop / MA-of-lows as a sell-stop" HiLo mechanic are adoptable.)
+- **Timing entry with a fast oscillator inside a slower trend** (= Raschke First-Cross, §54.16): trend
+  by a 60-day MA (up ⇒ longs only); **wait for a short (≤5-day) stochastic/RSI oversold within the
+  uptrend to enter** — a better price, entering against the short-term move (less slippage), fewer but
+  better trades. The timing period must be **≪** the trend period (a 14-day is too slow → misses/delays).
+- **⭐ Elder's Triple-Screen (clean, published, long-only-adaptable):**
+  - **Screen 1 — long TF (weekly): the tide.** Trend = slope of the **weekly MACD** (13-week EMA). Up ⇒
+    **longs only.**
+  - **Screen 2 — middle TF (daily): the wave.** A pullback oscillator says *when*: **Elder-Ray**
+    (`Bull Power = High − EMA13`, `Bear Power = Low − EMA13`) — buy setup = Screen-1 up **and** Bear
+    Power negative-but-rising (not positive); or the **2-day Force Index** dips below its center line
+    but not below the multi-week low.
+  - **Screen 3 — short TF (hourly): timing.** Enter on an **intraday breakout buy-stop above the prior
+    day's high.**
+  - **3-step stop-loss:** (1) below the low of the entry day (or prior day's low, whichever lower);
+    (2) move to **breakeven** ASAP; (3) **trail to protect 50% of peak profit**; take profits when the
+    oscillator > 70%.
+- **Pring's KST:** three rate-of-change periods (e.g. 6/12/24-week), smoothed and summed; confirm a
+  trend only when **all three ROCs align** — multi-TF momentum confirmation (overlaps our MACD/momentum).
+
+**Crypto-fit + action:** `keel`'s engine already carries a multi-TF bias + ADX/MACD confluence and the
+daily-Turtle/hourly split; Triple-Screen **formalizes the long-only version** (weekly-MACD tide →
+daily Elder-Ray/Force-Index pullback → hourly breakout entry + the 3-step stop), and the
+"higher-TF-overrules" law + fast-oscillator-in-slower-trend timing are cheap, testable refinements to
+entry quality. All long-only; short-side rules become exit/don't-buy.
+
 ## Halal / compliance lens applied
 - **Excluded (riba / not-spot):** all *leverage/margin/reserves-to-leverage* discussion (§54.7 —
   size from cash only); the **carry trade & spreads/arbitrage** (Ch 13, not extracted); interest-rate
@@ -730,8 +818,12 @@ mean-reversion partner rule for high-noise assets.
   rules) · Ch 8 (bands/channels, single-trend systems, Strategy Selection Indicator) · Ch 22 (extreme
   events / crisis management, theory of runs) · Ch 23-tail (ruin, compounding, optimal f) · Ch 24
   (diversification, rolling correlation, GASP insight).
-- **Remaining (optional part-3, medium value):** **Ch 12 Volume** (crypto has real volume) and
-  **Ch 19 Elder Triple-Screen** (clean mechanical multi-TF).
+- **Part 3 (extracted — this file, §54.23–§54.24):** Ch 12 (volume confirmation/spike, volume
+  indicators, the low-volume breakout filter, VWAP; OI/breadth = N/A) · Ch 19 (Elder Triple-Screen,
+  higher-TF-overrules law, fast-oscillator-in-slower-trend timing, Pring KST).
+- **Extraction COMPLETE** — all in-scope chapters covered. Remaining chapters are the deferred/excluded
+  set below (seasonality, cycles, spreads/carry, Elliott/Gann/astrology, ARIMA, black-box AI, charting
+  minutiae) — intentionally not extracted.
 
 **Deferred/subjective (consistent with prior KB judgment):** Ch 10 Seasonality, Ch 11 Cycle
 Analysis (maximum entropy / trig regression = prediction-oracle-adjacent, overfit), Ch 15 pattern
@@ -777,6 +869,13 @@ with no crypto analog.
   on the Turtle's intermittent mostly-cash returns; the drawdown/Sortino verdict is textbook-endorsed**
   (§54.22).
 
-Only **Ch 12 (Volume)** and **Ch 19 (Elder Triple-Screen)** remain as an optional part-3. More
-crypto-appropriate *technical* strategy books remain welcome; this one is the anchor for the next
-build phase. See [[halal-cb-autotrade-project]].
+**Part 3 (§54.23–§54.24) now completes the extraction:** the crypto-appropriate **volume** layer —
+volume confirms/leads price, the **volume-spike reversal warning**, hand-rollable volume indicators
+(Force Index, OBV, MFI, VW-MACD), and the ⭐**low-volume breakout filter** (only take a Turtle breakout
+on above-average volume → kills thin-volume fakeouts) + **VWAP** as an executor slippage tool; and the
+**multi-timeframe** layer — **Elder's Triple-Screen** (long-only: weekly-MACD tide → daily
+Elder-Ray/Force-Index pullback → hourly breakout entry + a 3-step stop), the *higher-TF-overrules* law,
+and fast-oscillator-in-slower-trend entry timing. (Open interest & breadth = N/A to spot crypto.)
+**The extraction is now COMPLETE** — every in-scope chapter has been covered; the remaining chapters
+are the intentionally deferred/excluded set. More crypto-appropriate *technical* strategy books remain
+welcome; this one is the anchor for the next build phase. See [[halal-cb-autotrade-project]].
