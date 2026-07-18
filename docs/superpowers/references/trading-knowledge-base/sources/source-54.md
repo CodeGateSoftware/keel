@@ -402,6 +402,307 @@ flat 55%-win bar; low-win/high-R:R is by design).
 
 ---
 
+# Part 2 — Ch 5 (Event-Driven Trends), Ch 8 (Trend Systems), Ch 22 (Extreme Events), Ch 23-tail (Ruin / Optimal f), Ch 24 (Diversification)
+
+## §54.12 — The swing filter: a time-independent trend-rule class — *Ch 5*
+**Module: `strategy/rules/` (NEW candidate), `analysis/levels.py` (swing pivots)**
+
+A *price swing* is a sustained move ≥ a threshold (the **swing filter**), expressed as a
+**percentage of price** (more robust across price regimes than a fixed amount). A swing chart
+**ignores time** — only new swing highs/lows matter; sideways action inside a swing produces no
+signal.
+```
+Minimum swing value:  MSV_t = p × price      (use the PRIOR day's MSV_{t-1} to avoid lookahead; p e.g. 0.25%–4%)
+Conservative entry:   buy when the current upswing high exceeds the prior upswing high
+Active entry:         buy as soon as a new upswing is recognized (first reversal > swing filter)
+```
+**Why this is a genuinely different rule class (the robustness insight):** a moving average "has an
+agenda" — price must keep advancing or the trend is lost; a **swing method lets price move sideways
+or stand still within a trend** and signals immediately on an event (no lag). Robust "at the cost of
+higher risk." Related: *Keltner's Minor Trend Rule* (buy when the daily trend trades above its
+recent high), *pivot points* (n-day high/low, inherent lag), and *Wilder's Swing Index* (`SI`,
+combines close-close / open / prior-strength scaled to ±1).
+
+**Crypto-fit + testability:** a percentage swing-filter rule is a new long-only candidate distinct
+from both the MA-trend and the Donchian-breakout families — worth backtesting on crypto where
+sideways consolidations inside trends are common. Percentage-based ⇒ scales across BTC's price eras.
+
+## §54.13 — N-Day breakout, Donchian 4-week / 40-20, adaptive-N — *Ch 5*
+**Module: `strategy/rules/turtle_breakout.py` (extends the built rule), `strategy/backtest.py`**
+
+```
+Aggressive:    Buy when today's HIGH  > highest high of the past N days
+Conservative:  Buy when today's CLOSE > highest high of the past N days   (confirms later; our close-based bias, §34.1/§54.8)
+```
+- **N < 5 = event-driven/fast; large N = much greater risk** (initial risk = the channel width =
+  entry − opposite N-day extreme). This is *why* the Turtle under-deploys and carries high per-trade
+  risk — inherent, matches §54.11.
+- **Donchian 4-Week Rule** (~20 trading days) and **Donchian 40/20 Channel Breakout** (40-day entry
+  / 20-day exit, asymmetric — the earliest recorded N-day breakout, "very much like the Turtles").
+- **Adaptive N** (shrink the window when volatility rises): `N_t = N_initial × (V_normal / V_current)`
+  — classified as an adaptive technique (ties to Ch 17, §54.5).
+- **Testing (Table 5.7):** all calc periods but one were profitable; **best N differs per market**;
+  **`% profitable tests`** varies enormously (crude 95%, BofA 100%, gold 21%, Amazon 26%) — the
+  robustness measure (§54.11). Don't pick N by max net profit (best-N jumps across sub-periods).
+- Weekly Price Channel = slower/higher-risk; Stridsman *Dynamic Breakout System* (std-dev-based,
+  orders placed one day ahead).
+
+**Crypto-fit:** confirms and extends the existing daily Turtle; adaptive-N and the 40/20 asymmetric
+variant are cheap sweeps to add to the harness.
+
+## §54.14 — The full ORIGINAL Turtle rules (authoritative spec) — *Ch 5*
+**Module: `strategy/rules/turtle_breakout.py`, `strategy/money_mgmt.py`, `execution/guards.py`**
+
+The canonical spec our Turtle is based on. Two systems, capital split equally:
+```
+System 1 (S1):  enter long when intraday HIGH > 20-day high;  exit when intraday LOW < 10-day low.
+   FILTER RULE:  SKIP the S1 entry if the PREVIOUS S1 entry was profitable (whether or not it was
+                 taken); take it only if the prior S1 trade LOST ≥ 2L.   ← nuance our build may lack
+System 2 (S2):  enter long when HIGH > 55-day high;  exit when LOW < 20-day low.   (no filter)
+
+L (= "N") = 20-day average-off true range:  L_t = (19·L_{t-1} + TR_t)/20 × BPV     (ATR in $ terms)
+```
+- **Risk control:** stop = **2L from entry**; exit on the stop, an S1/S2 reversal, or a **2% portfolio
+  loss** (2L is sized to equal 2% of the portfolio).
+- **Position size:** `1 unit = (1% investment)/(L × BPV)` — equalize `L×BPV` across markets
+  (**volatility parity**, §54.7).
+- **Position limits (correlation caps — the authoritative grounding of our correlation-sizing rail):**
+  single market **4 units**; closely-correlated markets **6 units**; less-correlated **10 units**; any
+  net direction **12 units**.
+- **Pyramiding (grounds §26.1):** add 1 unit (or ½ unit) per **½L** favorable move from the actual
+  entry; **max 5 units**; move all stops to 2L from the most recent entry (total risk ≈ 2L×contracts).
+- **Portfolio risk management:** for every **10% portfolio drawdown, cut position size 20%**; add 10%
+  back per 6⅔% recovery. (De-facto loss limit was 50%.) — grounds the account-DD breaker rail.
+- **Result (copper, 30yr):** the **slow S2 (55/20) = steady 30-year profits** (typical long-term
+  trend-following); the fast S1 = profits only early. **Slower = better** (matches §54.11).
+
+**Crypto-fit + action:** two concrete adds to the built Turtle — (1) the **S1 profitable-trade filter**
+(skip the next breakout if the last one won; take it only after a ≥2L loss — a shakeout catcher that
+cuts over-trading), and (2) the **correlation-based unit caps** as the principled form of the
+correlation-sizing rail. Both harness-testable. Long-only: keep long entries/exits only.
+
+## §54.15 — Bands & channels; reliability-vs-delay; entry timing — *Ch 8*
+**Module: `strategy/rules/` (band rules), `execution/executor.py` (entry/exit bands, timing)**
+
+A band around a trendline slows trading and cuts false signals at the point of greatest indecision
+(the trend change) *without* altering the trend profile.
+```
+Keltner Channel:  AP=(H+L+C)/3, MA=avg(C,10), UB=MA+AP, LB=MA−AP   (use ATR for AP today)
+Percentage band:  BU=(1+c)·MA,  BL=(1−c)·MA
+General volatility band (scalable by factor s):
+   B = MA ± s·c·MA   (% of trend)   |   ± s·c·price   |   ± s·ATR_{t-1}   |   ± s·stdev_{t-1}
+Bollinger Bands:  20-day MA ± 2σ(price)   (≈87% band since prices aren't normal)
+```
+- **Long-only rules for bands:** buy when the close crosses **above the upper band**; **exit when
+  price returns to the trendline (center)** → risk limited to half the band width. **Separate
+  entry/exit bands** (wide entry, narrow exit) = enter slow, exit fast.
+- **Bollinger's own use is MEAN-REVERTING** (fade the band), and he requires volume/breadth
+  confirmation — a downside penetration on **non-increasing volume + non-negative breadth** = a valid
+  buy. Very-low vol forecasts high vol and vice-versa (VIX-like).
+- **Reliability-vs-delay tradeoff (central):** wider band ⇒ more reliable, fewer signals, but delayed
+  entries, smaller average profit, greater per-trade risk (⇒ smaller size / more capital).
+- **Entry timing — DON'T "improve" naively:** delaying entry to the next open improved the fill ~75%
+  of the time **but LOWERED total profit** — because breakouts that never retrace = missed trades (the
+  fat tail). A safe contingent entry: **"buy after prices reverse by 0.50×ATR, or enter on the next
+  close."** The calculation *period* is the single most important choice — more than the method.
+
+**Crypto-fit:** the ATR/stdev **volatility band** is a clean long-only candidate (buy upper-band
+close, exit to center); Bollinger-as-mean-reversion is a candidate for the **high-noise/low-ER assets**
+where trend rules fail (§54.17). Crypto has real volume → the volume-confirmed Bollinger buy is viable.
+
+## §54.16 — More single-trend systems: Volatility System, TRIX, Raschke First Cross — *Ch 8*
+**Module: `strategy/rules/` (candidates), `analysis/indicators.py`**
+
+- **Volatility System (Bookstaber):** `Buy if close rises > k × ATR_{t-1} from the prior close`
+  (k ≈ 3). = the volatility-breakout of §54.3, independently confirmed.
+- **TRIX (triple exponential smoothing):** smooth ln(price) three times with the same constant
+  (≈6-day); buy when the TRIX trendline rises 2 consecutive days (or crosses its 3-day signal line);
+  smooth but low-lag. A candidate momentum-trend indicator.
+- **Raschke "First Cross" (buy the FIRST pullback in a new trend — long-only viable):**
+  ```
+  osc = fastMA − slowMA;  trend = MA(osc)
+  B1: osc_{t-1} > trend_t AND osc_t ≤ trend_t   (oscillator crosses its trend, turning down)
+  B2: low_t > low_{t-1}                          (current bar's low is rising)
+  B3: → BUY                                       (a pullback within an up-move, re-entering long)
+  ```
+  Selectivity: the start of a trend is a unique, strong event; this waits for the first impulse to
+  exhaust and enters the resumption. Pairs naturally with a longer trend filter.
+
+**Crypto-fit:** First-Cross is a *disciplined* pullback-in-uptrend entry (unlike the refuted
+dip-buyers, it requires an established trend first) — a candidate that could time Turtle entries.
+
+## §54.17 — Kaufman's Strategy Selection Indicator: ER vs profit factor — *Ch 8 / 23*
+**Module: `analysis/regime.py`, `strategy/engine.py`, allowlist/portfolio selection** — *the empirical backbone for §54.1/§54.9*
+
+Qualify each market by its **noise (Efficiency Ratio, §54.1)** to decide *which strategy* fits:
+**low noise (high ER) → trending strategies; high noise (low ER) → mean-reversion.**
+```
+ER_t = |C_t − C_{t−n}| / Σ|C_i − C_{i−1}|      (65-day window used for selection)
+```
+- **Empirical (Table 23.7 / Fig 23.12, 1990–2011, wide market set):** a **clear positive
+  relationship between average ER and profit factor.** Highest: Eurodollar (ER 0.18, PF 2.43), AAPL
+  (0.15, PF 2.28), Eurobund, crude (0.14, PF 2.12). Bottom (PF < 1, net losers on a trend system):
+  MRK 0.71, gold 0.94, wheat 0.99, MSFT 0.88, GE 0.88, **S&P 1.16**.
+- **Rule:** markets with **profit factor < 1.0 are NOT trend candidates → treat with mean-reversion,
+  or don't trade.** Farthest up-and-right = the best trend markets.
+
+**Crypto-fit (the concrete ETH answer, now empirically grounded):** compute each allowlist asset's
+65-day average ER and its trend-system profit factor on the cached 5yr data; **trade the Turtle only
+on assets whose ER/PF clears the bar, and route low-ER (noisy) assets to a mean-reversion rule (or
+stand aside).** This is Kaufman's own named method — the authoritative backbone under the §54.1 ER
+diagnostic, §54.9 market-ranking, and §54.11 `% profitable tests`.
+
+## §54.18 — Probability of ruin; required-gain asymmetry; optimal f — *Ch 23*
+**Module: `sim/metrics.py`, `sim/report.py`, `strategy/money_mgmt.py`, `strategy/promotion.py`**
+
+**Risk of ruin (equal wins/losses):** `R = [(1−A)/(1+A)]^c`, where `A = 2P−1` (trader's advantage,
+P = win rate) and `c` = capital in units. E.g. 60% win, $10k units: A=0.20, R=(1/3)^c → 1 unit = 33%,
+2 units = 11%. **More capital or more edge ⇒ lower ruin.** With a profit goal G the formula extends.
+
+**Risk of ruin — UNEQUAL wins/losses (the trend-follower case, spreadsheet-ready, Vince/Griffin):**
+```
+AvgWin% = |AvgWin/Investment|;  AvgLoss% = |AvgLoss/Investment|
+Z = (ProbWin·AvgWin%) − (ProbLoss·AvgLoss%)
+A = sqrt( (ProbWin·AvgWin%)² + (ProbLoss·AvgLoss%)² )
+P = 0.5·(1 + Z/A)
+Risk of Ruin = ((1−P)/P) ^ (MaxRisk / A)
+```
+(Table 23.8: 40% win, $400/$200, 25% max-risk ⇒ ROR 0.63%; halving capital ⇒ 7.9%→28%; ROR rises
+FASTER than capital falls, and jumps as avg-win shrinks or max-risk tightens.)
+
+**Required-gain asymmetry:** `Required gain = 1/(1−PercentLoss) − 1` — a 50% loss needs a **100% gain**
+to recover (the case for preservation-first, §33/Sortino).
+
+**Optimal f** = the optimal fixed fraction of the account to risk per trade (maximize capital at risk
+while avoiding ruin). Two levels: (1) % of portfolio at risk vs cash, (2) size per instrument. Optimal
+f is famously **too aggressive**; use **fractional f** in practice. Monte-Carlo (shuffling return
+blocks) is a severe robustness test, but for trend-following moving the end-of-trend loss elsewhere is
+"unfair" (the big loss is intrinsically tied to the prior trend via lag).
+
+**Crypto-fit + action:** add **risk-of-ruin** (unequal-wins form) as a `sim` metric alongside the
+verdict — a direct check the Turtle's 1%-risk sizing keeps ROR ≈ 0. Keep sizing at **fractional f /
+the 1% rail** (never full optimal f). The required-gain asymmetry is the math behind the preservation bar.
+
+## §54.19 — Entering & compounding a position — *Ch 23*
+**Module: `strategy/money_mgmt.py`, `execution/executor.py`, `execution/guards.py`**
+
+- **Averaging INTO a position** (spacing entries over a few days) generally **improves trend-following**
+  (replaces one uncertain entry with a stable average); on noisy markets, spacing ~2 days turned S&P
+  from negative to positive (Table 23.9). Total entry time should scale with the holding period (no
+  sense for a fast trend).
+- **Waiting for a better price (min-threshold + max-window):** wait for a pullback of a set threshold
+  after the signal, **but enter at market by the close of day N if no pullback occurs** (the window is
+  mandatory or you miss the fat tail). Cut trades ~40%, turned gold loss→profit; **noisy markets benefit
+  most** (Table 23.10). Ties to Raschke First Cross (§54.16).
+- **Compounding = pyramid on PROFITS ONLY** (scale in on new-high profits, min days between adds, max
+  ~5 units): improves total profit AND profit factor as spacing grows (Table 23.12). Structures
+  (Fig 23.14): upright pyramid (scaled-down adds, safest) / inverted pyramid (equal adds, max leverage,
+  fragile) / reflecting pyramid. **NEVER average down (add on losses)** — it helped only a persistent
+  uptrend (AAPL) and hurt everything else (Table 23.13). **Confirms the no-martingale rail + §26.1
+  pyramiding-on-winners.**
+- **Equity-trend / reserves management:** increasing size as equity rises leaves you fully invested at
+  the top when losses begin (a 100% gain then 50% loss nets flat — the volatility tax). Instead **hold
+  the investment constant and accumulate profits as reserves**, so proportionately more equity trades
+  during losing phases (counter-cyclical); periodically **redistribute back to the original
+  margin/reserve ratio**. Trading on the equity curve (exit when the equity MA turns down) is
+  inconsistent — hurts the most-trending market; hypothetical equity always flatters → caution.
+
+**Crypto-fit:** these are the money-mgmt levers for the Turtle's **under-deployment** (§54.14) —
+pyramid-on-profits (already scoped §26.1) and scale-in entries; keep the no-average-down rail absolute.
+
+## §54.20 — Extreme events / price shocks: crisis management — *Ch 22*
+**Module: `execution/guards.py` (NEW price-shock detector + crisis mode), `agent.py`, `strategy/backtest.py`**
+
+Price shocks are the most likely cause of catastrophic loss and the biggest gap between backtest and
+reality. Key word = **UNEXPECTED** (Lehman evolved over days = not a shock; 9/11 = a shock).
+- **During a shock, diversification FAILS — correlations go to 1** (money moves, not fundamentals;
+  flight to safety). Confirmed by 2008.
+- **Backtests can't identify shocks** and treat them as normal, so the "best" parameters are often the
+  **greatest beneficiaries of unpredictable shocks** → OOS/live is never as good as sim (humility,
+  reinforces §54.10).
+- **Shocks don't always hurt trend-followers** — a shock can favor the existing position (9/11 favored
+  existing shorts; 2008 = trend-followers' best year, already short). Against you ⇒ filled at the worst
+  price. **Prices reverse after the shock is absorbed** (extreme → longer reversal).
+- **Identify a price shock (mechanical):** a **1-day trading range ≥ ~5 × recent ATR**.
+- **Crisis-management override (well-defined rules, invoked on shock detection):**
+  1. **Windfall profit** from the shock → **exit / reduce** the position (take it; volatility always
+     rises after a shock).
+  2. **Large loss** from the shock → **HOLD, expecting the reversal** (may take days).
+  3. **Adequate reserves** → add on peak volume or once volatility declines.
+- **System disconnect:** after a shock, moving averages go **out of phase** with the market (catching up
+  to an event long past). Dogmatically following the trendline direction post-shock = out of phase with
+  reality → **crisis mode must override the main strategy; reinitialize trends at the new price level
+  once volatility drops.**
+
+**Crypto-fit (high value):** crypto has frequent shocks (flash crashes, exchange/de-peg events, 20%+
+days). A **price-shock detector (1-day range ≥ ~5×ATR) + a crisis-management mode** is a genuinely new
+rail/behavior for `keel` — pause new entries, take windfalls, hold-or-exit per rule, and re-baseline
+the trend after volatility subsides. Long-only: "hold shorts" → "take windfall / hold-for-reversal on longs."
+
+## §54.21 — Theory of runs: a trending-vs-mean-reverting diagnostic — *Ch 22*
+**Module: `analysis/regime.py` (per-market run profile), `sim/metrics.py` (information ratio)**
+
+Gambling theory (transaction costs = the house edge; only money management changes the odds). Run
+probabilities: `P(run of length n) = (1/2)^(n+2)`; average length of runs longer than n is `n+2`.
+- **Applied to markets (Table 22.2, 15 markets):** compare each market's **actual up/down run
+  distribution vs the random `(1/2)^(n+2)` expectation.** **DAX = far MORE 1-day reversals than random
+  (noisy, mean-reverting bias); Eurodollar = far FEWER short reversals + a fat tail (trending bias).**
+  ⇒ a **per-market run-distribution profile** classifies a market as trending or mean-reverting — a
+  cheap diagnostic that complements ER (§54.17) and CSI (§54.9). Application: **"after a signal, wait
+  for the noisy market to reverse before entering; enter the trending market immediately."**
+- **Martingale (double-down on losses)** worked spectacularly on trending Eurodollar (capped info
+  ratio 8.28) but failed on noisy S&P (1.04). **⛔ EXCLUDED regardless — doubling down = averaging into
+  a loser, which VIOLATES the no-martingale rail (§5.1) and the risk-only-increases-via-gate principle.
+  Logged as tested-and-rejected-by-rail.** Anti-Martingale (add on wins) = pyramiding, already
+  sanctioned (§26.1/§54.19).
+- **The information ratio (`Net P&L / annualized StDev of daily P&L`) is "the best measure of results"**
+  — used throughout; reinforces adding it to the sim (§54.10).
+
+**Crypto-fit:** add a per-asset run-distribution profile as a second, orthogonal trend/mean-revert
+classifier (with ER); it directly informs entry-timing (wait-for-reversal on noisy assets).
+
+## §54.22 — Diversification & portfolio allocation — *Ch 24*
+**Module: `strategy/money_mgmt.py`, `execution/guards.py` (correlation rail), `sim/*`** — *skip MPT (declined)*
+
+- **Diversification reduces *systematic* (not market) risk;** benefit is greatest across *unrelated*
+  groups with *unrelated* decision methods. Fig 24.1: risk falls fast from 1→4 assets then flattens;
+  ideal (independent) → 1/n, but **real markets hit a ~50% floor. ~4 assets captures most of the
+  benefit.** ⇒ a narrow **BTC/ETH/PAXG allowlist is already near the practical floor**; adding
+  correlated alts adds little (reinforces §51.1). **PAXG (gold-backed) is the genuine diversifier**
+  vs the highly-correlated BTC/ETH.
+- **Multiple-strategy diversification (less correlated by *functional attribute*):** trend-following /
+  mean-reverting / spreading / fundamental / carry. **All trend-followers are correlated** (they extract
+  from the same moves). ⇒ **pairing the Turtle with a mean-reversion rule (on high-noise/low-ER assets,
+  §54.17) = genuine strategy diversification.** (Spreading/carry = ⛔ riba/shorting.)
+- **Balanced (equal-risk) sizing — 3 ways:** equal-dollar / equal-risk by annualized StDev / equal-risk
+  by **ATR** (best when H/L/C available; StDev if only closes). Equal-dollar concentrates risk on
+  volatile names — avoid. Table 24.1: `shares = scaled(inverse-vol %) × investment / price` =
+  **volatility-parity sizing across the allowlist** (grounds §54.7).
+- **Changing correlations:** a single long-period (or rolling-average) correlation **hides short-term
+  extremes** — in 2008 everything → ±1. **Use a 60-day ROLLING correlation** (Fig 24.3). The only ways
+  to avoid the correlation-→1 risk: **(1) be out of the market as much as possible, (2) cap portfolio
+  leverage, (3) use uncorrelated strategies.** ⇒ the correlation-sizing rail should use a **rolling**
+  correlation, and the Turtle's **mostly-cash** profile is itself a crisis hedge (a feature, not only a bug).
+- **MPT / mean-variance:** `σ²_R = Σw_i²σ_i² + ΣΣw_i w_j·corr_ij·σ_iσ_j`; Excel-Solver maximizes the
+  info ratio s.t. `Σw=1, w≥0`. **⛔ DECLINED (spec §10 — CAPM/Rf = riba + quant-stack).** The
+  **long-only constraint (w≥0)** and the **info-ratio objective** are compatible and adoptable; the
+  optimizer is not.
+- **GASP (Kaufman's genetic-algorithm allocation) — the crucial insight for keel's sim (adopt the idea,
+  not the GA):** MPT/mean-variance **fails on active-trading returns because they are INTERMITTENT** —
+  zero on days with no position. A strategy in the market only 10–20% of the time shows an artificially
+  LOW StDev (half the days are zeros) ⇒ **looks less risky ⇒ gets over-allocated**, and covariance over
+  non-trading days is meaningless. **⇒ Do NOT compute whole-period Sharpe/StDev/covariance on the
+  Turtle's mostly-cash returns — it understates risk and distorts allocation.** GASP's objective is
+  `OF = AROR / σ_D`, where **σ_D = StDev of daily DRAWDOWNS (semivariance)** = σ(E_high − E_current),
+  counting only days not at a new equity high. **This is essentially keel's existing Sortino/drawdown
+  bar — so Ch 24 independently VALIDATES using drawdown/semivariance over Sharpe.** (Risk via
+  regression residuals is rejected — it penalizes prolonged *gains*.)
+
+**Crypto-fit + action:** (1) confirm the narrow allowlist + PAXG-as-diversifier; (2) make the
+correlation rail **rolling (60-day)**; (3) **do not report a whole-period Sharpe for the Turtle** — the
+mostly-cash days distort it; keep the drawdown/Sortino verdict (now textbook-endorsed) and consider a
+mean-reversion partner rule for high-noise assets.
+
 ## Halal / compliance lens applied
 - **Excluded (riba / not-spot):** all *leverage/margin/reserves-to-leverage* discussion (§54.7 —
   size from cash only); the **carry trade & spreads/arbitrage** (Ch 13, not extracted); interest-rate
@@ -412,21 +713,25 @@ flat 55%-win bar; low-win/high-R:R is by design).
 - **VIX / implied-volatility trading (§54.2 area, Ch 20):** no direct crypto analog in our data
   pipeline (a crypto DVOL exists but isn't wired), and VIX-index products are non-spot — kept as a
   **concept only** (volatility is mean-reverting; enter on low vol). Not a live method.
+- **Martingale / doubling-down / averaging-into-losers (§54.19, §54.21, Ch 22–23):** ⛔ EXCLUDED —
+  violates the no-averaging-into-losers & no-martingale rails (§5.1) and the "risk may only increase
+  via the gate" principle. It tested well *only* on a strongly-trending market; rejected regardless.
+  Anti-Martingale (adding on winners) = pyramiding, which IS sanctioned (§26.1/§54.19).
+- **MPT / mean-variance optimization (§54.22, Ch 24):** ⛔ DECLINED (spec §10 — CAPM/`Rf` = riba +
+  quant-stack). Adopt only its **long-only constraint (w≥0)** and **info-ratio / drawdown objective**;
+  not the optimizer. Genetic-algorithm allocation (GASP) itself = non-reproducible (excluded like the
+  Ch 20-tail black-box methods); only its *insight* about intermittent-return distortion is adopted.
 - **"Pips" → %/ticks/ATR** throughout, per KB convention.
 
-## Deferred to v2 / recommended part-2 pass (NOT yet extracted)
-High-value chapters worth a **part-2** extraction (crypto-appropriate, mechanical):
-- **Ch 5 Event-Driven Trends** — N-Day Breakout variations + **swing filter** (a noise-filtered
-  entry) + Point-and-Figure as a noise filter. *(Directly extends the Turtle.)*
-- **Ch 8 Trend Systems** — bands/channels, comparison of trend systems, **selecting the right trend
-  speed**, early exits.
-- **Ch 22 Practical Considerations** — **extreme events / price shocks**, gambling *theory of runs*.
-- **Ch 23 tail** — probability of success & **ruin**, compounding, equity trends, **optimal f**
-  (money-mgmt sizing).
-- **Ch 24 Diversification** — changing **correlations** + **volatility stabilization** (portfolio
-  rail; skip the MPT/mean-variance parts — declined as riba/quant-stack per spec §10).
-- **Ch 12 Volume** (crypto has real volume) and **Ch 19 Elder Triple-Screen** (clean mechanical
-  multi-TF) — medium value.
+## Extraction status by chapter
+- **Part 1 (extracted):** Ch 1 (noise/ER) · Ch 17 (adaptive/KAMA) · Ch 20 (volatility & stops) ·
+  Ch 21 (system testing) · Ch 23-core (risk/stops/market-ranking).
+- **Part 2 (extracted — this file, §54.12–§54.22):** Ch 5 (swing filter, N-day breakout, full Turtle
+  rules) · Ch 8 (bands/channels, single-trend systems, Strategy Selection Indicator) · Ch 22 (extreme
+  events / crisis management, theory of runs) · Ch 23-tail (ruin, compounding, optimal f) · Ch 24
+  (diversification, rolling correlation, GASP insight).
+- **Remaining (optional part-3, medium value):** **Ch 12 Volume** (crypto has real volume) and
+  **Ch 19 Elder Triple-Screen** (clean mechanical multi-TF).
 
 **Deferred/subjective (consistent with prior KB judgment):** Ch 10 Seasonality, Ch 11 Cycle
 Analysis (maximum entropy / trig regression = prediction-oracle-adjacent, overfit), Ch 15 pattern
@@ -451,11 +756,27 @@ mechanics, open-interest, margin/exchange-governor detail), and stock/commodity-
 with no crypto analog.
 
 ## Status / saturation
-**The opposite of saturated — this is a foundational, multi-session source.** Part 1 (this file)
-already delivers: an **ER trend-diagnostic** (§54.1), a **crypto volatility/stop model** (§54.2–4,
-§54.6, §54.8), **KAMA + linear-regression-slope + volatility-breakout** as new candidate rules
-(§54.3, §54.5, §54.11), a **market-ranking/CSI answer to the ETH question** (§54.9), and a concrete
-**harness-rigor upgrade** (§54.10) — plus independent **validation that trend-following works and
-the Turtle's low-frequency/high-risk profile is by design** (§54.11). Recommend a **part-2 pass**
-over Ch 5 / 8 / 22 / 23-tail / 24 (listed above). More crypto-appropriate *technical* strategy
-books remain welcome; this one is the anchor. See [[halal-cb-autotrade-project]].
+**The opposite of saturated — this is the foundational anchor source.** Parts 1 & 2 (this file,
+§54.1–§54.22) together deliver a coherent build agenda for the project's open problems:
+- **The ETH keep/drop/allocate answer (now triangulated three ways):** ER trend-diagnostic (§54.1),
+  Kaufman's **Strategy Selection Indicator** with the empirical ER→profit-factor relationship (§54.17),
+  market-ranking / CSI (§54.9), the `%-profitable-tests`≥~70% robustness bar (§54.11), and the
+  run-distribution classifier (§54.21) — **trade the Turtle only where trendiness clears the bar; route
+  low-ER/noisy assets to mean-reversion or stand aside.**
+- **The crypto stop/risk model:** ATR stops/targets, low-vol entry filter, high-vol exit/reset (§54.2–4),
+  three volatility-adaptive trailing stops (§54.6, §54.8), risk-of-ruin (§54.18), volatility-parity
+  sizing (§54.7, §54.22), and a **price-shock detector + crisis-management mode** (§54.20).
+- **New candidate rules:** KAMA adaptive-trend (§54.5), linear-regression-slope & volatility-breakout
+  (§54.3, §54.11, §54.16), the **swing filter** (§54.12), Raschke First-Cross pullback (§54.16), and a
+  **mean-reversion partner** for high-noise assets (§54.22).
+- **Authoritative Turtle spec** (§54.14) adds two concrete build items to the shipped rule: the **S1
+  profitable-trade filter** and **correlation-based unit caps**; §54.19 gives the **pyramiding /
+  scale-in** levers for its under-deployment.
+- **Harness rigor:** walk-forward + OOS/feedback firewall, robustness-plateau, drawdown-probability,
+  information ratio (§54.10); and Ch 24's key correction — **do NOT use whole-period Sharpe/covariance
+  on the Turtle's intermittent mostly-cash returns; the drawdown/Sortino verdict is textbook-endorsed**
+  (§54.22).
+
+Only **Ch 12 (Volume)** and **Ch 19 (Elder Triple-Screen)** remain as an optional part-3. More
+crypto-appropriate *technical* strategy books remain welcome; this one is the anchor for the next
+build phase. See [[halal-cb-autotrade-project]].
