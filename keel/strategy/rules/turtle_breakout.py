@@ -59,6 +59,11 @@ class TurtleBreakout(Rule):
 
     promotion_class = "trend_follow"
 
+    # How many completed daily bars back the S1 filter replays to find the most recent
+    # completed prior breakout trade (~16 months) -- generous enough to always contain it at
+    # these channel lengths, and it only runs on a bar that breaks out, so the cost is trivial.
+    _REPLAY_TAIL = 400
+
     def __init__(
         self,
         product_id: str,
@@ -69,6 +74,7 @@ class TurtleBreakout(Rule):
         atr_period: int = 20,  # 20 days = Turtle's "N"
         atr_stop_mult: Decimal = Decimal("2"),  # 2N stop (KB -- fixes 'stops too tight for crypto')
         use_macd_confirm: bool = False,  # optional MACD histogram>0 filter
+        s1_filter: bool = False,  # Turtle S1 profitable-trade filter (default off); see detect()
         target_rr: Decimal = Decimal("6"),  # distant nominal take-profit; see detect()
         name: str = "turtle_breakout",
     ) -> None:
@@ -92,8 +98,13 @@ class TurtleBreakout(Rule):
             "atr_period": atr_period,
             "atr_stop_mult": atr_stop_mult,
             "use_macd_confirm": use_macd_confirm,
+            "s1_filter": s1_filter,
             "target_rr": target_rr,
         }
+        # memoizes the S1-filter decision by the completed-history's last ts, so the account
+        # sim's repeated intraday calls on the same forming day don't re-replay (only ever
+        # computed on a bar that actually breaks out, so this is cheap regardless).
+        self._filter_cache: tuple[int, bool] | None = None
 
     # ------------------------------------------------------------------
     # Rule interface
@@ -158,6 +169,16 @@ class TurtleBreakout(Rule):
         risk = entry - stop
         target = entry + self.params["target_rr"] * risk
 
+        # Turtle S1 profitable-trade filter (default off): a winning breakout tends to be
+        # followed by a false one, a losing (shakeout) breakout by the real trend. So skip this
+        # entry if the most recent COMPLETED prior breakout trade would have won; take it only
+        # after a loss. Computed purely from price history (the prior breakout's hypothetical
+        # outcome "whether or not it was taken", per the canonical rule) -- no cross-loop state,
+        # so it behaves identically in the edge backtest, the account sim, and live. Runs only
+        # here, on a bar that actually breaks out, so the bounded replay is cheap.
+        if self.params["s1_filter"] and self._prior_breakout_won(daily):
+            return None
+
         context = {
             "rule_class": "trend_follow",
             "adx": adx_now,
@@ -203,3 +224,73 @@ class TurtleBreakout(Rule):
 
     def describe(self) -> dict:
         return {"name": self.name, "params": self.params}
+
+    # ------------------------------------------------------------------
+    # S1 profitable-trade filter (pure history; only called from detect() on a breakout bar)
+    # ------------------------------------------------------------------
+
+    def _prior_breakout_won(self, daily: list[Candle]) -> bool:
+        """Did the most recent COMPLETED prior breakout trade win?
+
+        `daily` is the (forming-bar-guarded) completed-day series whose last bar is the CURRENT
+        breakout being decided; we look strictly before it (`daily[:-1]`). Replays this rule's
+        own unfiltered entry/exit sequentially over a bounded tail and returns whether the most
+        recently completed hypothetical trade won (exit above entry). No prior completed trade ->
+        `False` (don't skip). Memoized by the completed-history's last ts for the account sim's
+        repeated intraday calls.
+        """
+        hist = daily[:-1]
+        if not hist:
+            return False
+        last_ts = hist[-1].ts
+        if self._filter_cache is not None and self._filter_cache[0] == last_ts:
+            return self._filter_cache[1]
+
+        entry_lookback = self.params["entry_lookback"]
+        exit_lookback = self.params["exit_lookback"]
+        adx_period = self.params["adx_period"]
+        atr_period = self.params["atr_period"]
+        adx_threshold = self.params["adx_threshold"]
+        stop_mult = self.params["atr_stop_mult"]
+        use_macd = self.params["use_macd_confirm"]
+
+        tail = hist[-self._REPLAY_TAIL :]
+        warmup = max(entry_lookback, adx_period, atr_period) + 1
+
+        won = False
+        pos_entry: Decimal | None = None
+        pos_stop: Decimal | None = None
+        for i in range(warmup, len(tail)):
+            c = tail[i]
+            if pos_entry is None:
+                # entry mirrors detect(): close > prior-entry_lookback Donchian high, ADX>thr,
+                # optional MACD>0, valid 2N stop.
+                if not float(c.close) > donchian_high(tail[:i], entry_lookback):
+                    continue
+                work = tail[max(0, i - 4 * adx_period) : i + 1]
+                if not adx(work, adx_period)[-1] > adx_threshold:
+                    continue
+                if use_macd:
+                    closes = [float(x.close) for x in work]
+                    if not macd(closes)[2][-1] > 0:
+                        continue
+                atr_work = tail[max(0, i - 4 * atr_period) : i + 1]
+                atr_i = Decimal(str(atr(atr_work, atr_period)[-1]))
+                if atr_i <= 0:
+                    continue
+                entry_px = c.close
+                stop_px = entry_px - stop_mult * atr_i
+                if stop_px >= entry_px:
+                    continue
+                pos_entry, pos_stop = entry_px, stop_px
+            else:
+                # manage: 2N stop first (protective), then the asymmetric channel-low exit.
+                if c.low <= pos_stop:
+                    won = False  # stopped out below entry
+                    pos_entry = pos_stop = None
+                elif float(c.close) <= donchian_low(tail[:i], exit_lookback):
+                    won = c.close > pos_entry
+                    pos_entry = pos_stop = None
+
+        self._filter_cache = (last_ts, won)
+        return won

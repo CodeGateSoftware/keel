@@ -383,3 +383,84 @@ class TestDailyEdgeBacktestProducesTrades:
 
         # The whole point of the daily move: the rule now actually fires and round-trips.
         assert result.n_trades >= 1
+
+
+# ---------------------------------------------------------------------------
+# S1 profitable-trade filter
+# ---------------------------------------------------------------------------
+
+
+def _impulse_pullback_cycle(price: float, ts: int, *, impulse: int = 8, pullback: int = 5,
+                            up: float = 3.0, down: float = 4.0, crash: bool = False):
+    """One impulse-up (breakout + ADX) then pullback-down (channel exit) cycle, à la
+    `_daily_uptrend_with_pullbacks`. `crash=True` makes the first pullback bar gap its LOW far
+    below (≈ -40) so the 2N stop is hit -> the cycle's trade is a LOSS rather than a channel-exit
+    win. Returns (candles, next_price, next_ts).
+    """
+    candles: list[Candle] = []
+    for _ in range(impulse):
+        price += up
+        candles.append(_candle(ts, price - up, price + 1, price - 4, price))
+        ts += 1
+    for k in range(pullback):
+        price -= down
+        low = price - (40.0 if crash and k == 0 else 1.0)
+        candles.append(_candle(ts, price + down, price + down, low, price))
+        ts += 1
+    return candles, price, ts
+
+
+# Empirically-tuned cycle shapes (verified via backtest): a long impulse + shallow pullback
+# exits well ABOVE entry (a WIN); a short impulse whose first pullback bar gaps its low through
+# the 2N stop exits BELOW entry (a LOSS).
+_WIN_CYCLE = dict(impulse=18, up=4.0, pullback=5, down=3.0)
+_LOSS_CYCLE = dict(impulse=8, up=4.0, pullback=5, down=4.0, crash=True)
+_DUMMY_CURRENT = _candle(9999, 300, 301, 299, 300)  # a trailing "current" bar (excluded by [:-1])
+
+
+def _chain(cycle_kwargs: list[dict]) -> list[Candle]:
+    candles: list[Candle] = []
+    price, ts = 100.0, 0
+    for kw in cycle_kwargs:
+        chunk, price, ts = _impulse_pullback_cycle(price, ts, **kw)
+        candles.extend(chunk)
+    return candles
+
+
+class TestS1Filter:
+    def test_default_off_still_detects_breakout(self) -> None:
+        # filter defaults off -> a clean breakout still yields a Setup (behavior unchanged)
+        assert _rule().detect({Granularity.ONE_DAY: _breakout_candles()}) is not None
+        assert _rule(s1_filter=False).detect(
+            {Granularity.ONE_DAY: _breakout_candles()}
+        ) is not None
+
+    def test_param_round_trips_through_agent(self) -> None:
+        described = _rule(s1_filter=True).describe()
+        assert described["params"]["s1_filter"] is True
+        # mirror `rules seed`: it stores product_id alongside describe()'s params
+        params = {**described["params"], "product_id": "BTC-USD"}
+        rebuilt = agent._build_rule({"kind": "turtle_breakout", "params": params})
+        assert rebuilt.params["s1_filter"] is True
+
+    def test_no_completed_prior_trade_does_not_skip(self) -> None:
+        # a single clean breakout series: the rising base enters and never exits (no COMPLETED
+        # prior trade) -> filter must not skip (returns False).
+        assert _rule(s1_filter=True)._prior_breakout_won(_breakout_candles()) is False
+
+    def test_prior_breakout_won_true_after_winning_cycle(self) -> None:
+        series = _chain([_WIN_CYCLE]) + [_DUMMY_CURRENT]
+        assert _rule(s1_filter=True)._prior_breakout_won(series) is True
+
+    def test_prior_breakout_won_false_after_losing_cycle(self) -> None:
+        series = _chain([_LOSS_CYCLE]) + [_DUMMY_CURRENT]
+        assert _rule(s1_filter=True)._prior_breakout_won(series) is False
+
+    def test_filter_removes_entries_after_wins(self) -> None:
+        # a run of WINNING cycles: the filter should skip some post-win breakouts -> strictly
+        # fewer trades than the unfiltered rule (and it confirms the unfiltered ones won).
+        series = _chain([_WIN_CYCLE] * 5)
+        off = backtest(_rule(s1_filter=False), series)
+        on = backtest(_rule(s1_filter=True), series)
+        assert off.n_trades >= 2
+        assert on.n_trades < off.n_trades
