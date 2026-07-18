@@ -12,8 +12,12 @@ from decimal import Decimal
 import pytest
 
 from keel.analysis.indicators import (
+    adx,
     atr,
     deceleration,
+    directional_indicators,
+    donchian_high,
+    donchian_low,
     ema,
     ema_fan,
     fan_aligned,
@@ -249,6 +253,89 @@ def test_atr_matches_hand_computed_reference():
 def test_atr_length_matches_candles():
     candles = [_candle(i, 1, 2, 0, 1) for i in range(5)]
     assert len(atr(candles, period=3)) == 5
+
+
+# ---------------------------------------------------------------------------
+# donchian_high / donchian_low
+# ---------------------------------------------------------------------------
+
+
+def test_donchian_high_returns_highest_high_over_period_window():
+    highs = [10, 12, 9, 15, 11, 13]
+    candles = [_candle(i, h, h, h, h) for i, h in enumerate(highs)]
+    # last 3 candles: highs 15, 11, 13 -> max 15
+    assert donchian_high(candles, period=3) == 15.0
+
+
+def test_donchian_low_returns_lowest_low_over_period_window():
+    lows = [10, 12, 9, 15, 11, 13]
+    candles = [_candle(i, low, low, low, low) for i, low in enumerate(lows)]
+    # last 3 candles: lows 15, 11, 13 -> min 11
+    assert donchian_low(candles, period=3) == 11.0
+
+
+def test_donchian_high_uses_all_candles_when_fewer_than_period():
+    highs = [10, 20, 5]
+    candles = [_candle(i, h, h, h, h) for i, h in enumerate(highs)]
+    assert donchian_high(candles, period=10) == 20.0
+
+
+def test_donchian_low_uses_all_candles_when_fewer_than_period():
+    lows = [10, 20, 5]
+    candles = [_candle(i, low, low, low, low) for i, low in enumerate(lows)]
+    assert donchian_low(candles, period=10) == 5.0
+
+
+def test_donchian_high_and_low_empty_candles_returns_zero():
+    assert donchian_high([], period=5) == 0.0
+    assert donchian_low([], period=5) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# adx / directional_indicators
+# ---------------------------------------------------------------------------
+
+
+def _choppy_then_uptrend_candles():
+    """10 choppy bars (mixed up/down moves -> low ADX), then a clean sustained uptrend
+    (-DM near zero, +DI dominant -> ADX rises well past 25).
+    """
+    choppy_prices = [100, 102, 99, 103, 98, 104, 97, 105, 101, 106]
+    candles = [_candle(i, p - 0.5, p + 1, p - 1.5, p) for i, p in enumerate(choppy_prices)]
+    price = choppy_prices[-1]
+    for i in range(len(choppy_prices), 40):
+        price += 1.0
+        candles.append(_candle(i, price - 0.5, price + 1, price - 1, price))
+    return candles
+
+
+def test_adx_same_length_as_candles():
+    candles = _choppy_then_uptrend_candles()
+    assert len(adx(candles, period=5)) == len(candles)
+
+
+def test_adx_bounded_0_to_100():
+    candles = _choppy_then_uptrend_candles()
+    assert all(0.0 <= v <= 100.0 for v in adx(candles, period=5))
+
+
+def test_adx_rises_above_threshold_once_uptrend_is_established():
+    candles = _choppy_then_uptrend_candles()
+    vals = adx(candles, period=5)
+    assert vals[9] < 25.0  # still in the choppy segment
+    assert vals[-1] > 25.0  # sustained uptrend has pushed ADX well past the trend gate
+    assert vals[-1] > vals[9]
+
+
+def test_directional_indicators_plus_di_dominates_in_uptrend():
+    candles = _choppy_then_uptrend_candles()
+    plus_di, minus_di = directional_indicators(candles, period=5)
+    assert len(plus_di) == len(minus_di) == len(candles)
+    assert plus_di[-1] > minus_di[-1]
+
+
+def test_adx_empty_candles_returns_empty_list():
+    assert adx([], period=5) == []
 
 
 # ---------------------------------------------------------------------------

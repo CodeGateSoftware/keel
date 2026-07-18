@@ -66,6 +66,7 @@ from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Granularity, Side
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     "pullback_continuation": PullbackContinuation,
     "rsi_meanrev": RsiMeanReversion,
     "dca": Dca,
+    "turtle_breakout": TurtleBreakout,
 }
 
 # Constructor kwargs that must be coerced back from JSON-plain (str) to `Decimal`, per kind.
@@ -89,6 +91,7 @@ _DECIMAL_PARAMS: dict[str, tuple[str, ...]] = {
         "support_proximity_pct",
     ),
     "dca": ("budget_usd", "dip_bonus_pct"),
+    "turtle_breakout": ("atr_stop_mult", "target_rr"),
 }
 
 # The constructor kwarg holding a `Granularity`, stored as its `.value` string, per kind.

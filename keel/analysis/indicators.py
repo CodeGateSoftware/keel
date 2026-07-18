@@ -1,4 +1,5 @@
-"""Technical indicators: EMA fan, RSI (+ divergence), MACD, ATR, Fibonacci, deceleration.
+"""Technical indicators: EMA fan, RSI (+ divergence), MACD, ATR, ADX/+DI/-DI, Donchian
+channel, Fibonacci, deceleration.
 
 Per the Global Constraints, indicator math uses plain `float` (never `Decimal` — that's
 reserved for money/prices elsewhere). The two exceptions are `fib_retracements` and
@@ -218,6 +219,123 @@ def atr(candles: list[Candle], period: int = 14) -> list[float]:
     for i in range(seed_len, n):
         result[i] = (result[i - 1] * (period - 1) + trs[i]) / period
     return result
+
+
+# ---------------------------------------------------------------------------
+# Donchian channel
+# ---------------------------------------------------------------------------
+
+
+def donchian_high(candles: list[Candle], period: int) -> float:
+    """Highest `high` over the last `period` candles (all candles if fewer than `period`)."""
+    if not candles:
+        return 0.0
+    window = candles[-period:]
+    return float(max(c.high for c in window))
+
+
+def donchian_low(candles: list[Candle], period: int) -> float:
+    """Lowest `low` over the last `period` candles (all candles if fewer than `period`)."""
+    if not candles:
+        return 0.0
+    window = candles[-period:]
+    return float(min(c.low for c in window))
+
+
+# ---------------------------------------------------------------------------
+# ADX / directional movement (Wilder)
+# ---------------------------------------------------------------------------
+
+
+def _wilder_smooth(values: list[float], period: int) -> list[float]:
+    """Wilder smoothing shared by `atr`/`adx`/`directional_indicators`: the seed is the
+    simple average of the first `period` samples, then each subsequent value blends in
+    the new sample at weight `1/period`. Mirrors `atr()`'s back-fill: every entry before
+    the seed is set to the seed value, so the result is always the same length as `values`
+    with no `None`/`NaN`.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    result = [0.0] * n
+    seed_len = min(period, n)
+    seed = sum(values[:seed_len]) / seed_len
+    for i in range(seed_len):
+        result[i] = seed
+    for i in range(seed_len, n):
+        result[i] = (result[i - 1] * (period - 1) + values[i]) / period
+    return result
+
+
+def directional_indicators(
+    candles: list[Candle], period: int = 14
+) -> tuple[list[float], list[float]]:
+    """Wilder's +DI/-DI, same length as `candles`. Factored out of `adx()` since it needs
+    these anyway; also usable standalone (e.g. a trend-direction filter).
+
+    Per-bar +DM/-DM/TR are only defined from the second candle onward (they compare
+    against the prior bar), so index 0 is back-filled with index 1's value -- the same
+    "back-fill before there's enough data" convention `atr()` uses.
+    """
+    n = len(candles)
+    if n == 0:
+        return [], []
+    if n == 1:
+        return [0.0], [0.0]
+
+    plus_dm_raw: list[float] = []
+    minus_dm_raw: list[float] = []
+    tr_raw: list[float] = []
+    for i in range(1, n):
+        high, low = float(candles[i].high), float(candles[i].low)
+        prev_high, prev_low = float(candles[i - 1].high), float(candles[i - 1].low)
+        prev_close = float(candles[i - 1].close)
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+        plus_dm_raw.append(plus_dm)
+        minus_dm_raw.append(minus_dm)
+        tr_raw.append(tr)
+
+    smoothed_plus = _wilder_smooth(plus_dm_raw, period)
+    smoothed_minus = _wilder_smooth(minus_dm_raw, period)
+    smoothed_tr = _wilder_smooth(tr_raw, period)
+
+    plus_di_tail: list[float] = []
+    minus_di_tail: list[float] = []
+    for pdm, mdm, tr in zip(smoothed_plus, smoothed_minus, smoothed_tr, strict=True):
+        if tr == 0:
+            plus_di_tail.append(0.0)
+            minus_di_tail.append(0.0)
+        else:
+            plus_di_tail.append(100.0 * pdm / tr)
+            minus_di_tail.append(100.0 * mdm / tr)
+
+    plus_di = [plus_di_tail[0], *plus_di_tail]
+    minus_di = [minus_di_tail[0], *minus_di_tail]
+    return plus_di, minus_di
+
+
+def adx(candles: list[Candle], period: int = 14) -> list[float]:
+    """Wilder's Average Directional Index, 0-100, same length as `candles`.
+
+    DX = 100*|+DI - -DI|/(+DI + -DI) (0.0 when +DI and -DI are both 0, avoiding a
+    divide-by-zero); ADX is DX Wilder-smoothed over `period`. Built on
+    `directional_indicators()`'s +DI/-DI so the shared DM/TR math isn't duplicated.
+    """
+    if not candles:
+        return []
+
+    plus_di, minus_di = directional_indicators(candles, period)
+    dx: list[float] = []
+    for plus, minus in zip(plus_di, minus_di, strict=True):
+        denom = plus + minus
+        dx.append(100.0 * abs(plus - minus) / denom if denom != 0 else 0.0)
+    return _wilder_smooth(dx, period)
 
 
 # ---------------------------------------------------------------------------
