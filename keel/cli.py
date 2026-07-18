@@ -1010,8 +1010,21 @@ def simulate(
         min_rr=config.promotion.min_rr,
         min_win_rate=float(config.promotion.min_win_rate),
     )
+    # G2 is checked per rule class (KB §25.5): each class's pooled edge sample is judged
+    # against its own floor, so a low-win/high-R:R trend-follower isn't rejected by the global
+    # 55%-win floor `promo_cfg` carries. Classes without a fixed floor fall back to `promo_cfg`.
+    pooled_by_class = report_mod.group_trades_by_class(edge, rules)
+    floors = {
+        cls: promotion_mod.floor_for_class(cls, promo_cfg) for cls in pooled_by_class
+    }
     verdict = report_mod.build_verdict(
-        edge[report_mod.POOLED_KEY], account_metrics, benchmark, sim.coverage, promo_cfg
+        edge[report_mod.POOLED_KEY],
+        account_metrics,
+        benchmark,
+        sim.coverage,
+        promo_cfg,
+        pooled_by_class=pooled_by_class,
+        floors=floors,
     )
     gaps = report_mod.analyze_gaps(
         sim.telemetry, sim.coverage, move_threshold_pct=portfolio_sim.MOVE_THRESHOLD_PCT

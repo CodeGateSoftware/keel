@@ -15,7 +15,16 @@ import pytest
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.backtest import BacktestResult
-from keel.strategy.promotion import PromotionConfig, can_promote, should_demote, transition
+from keel.strategy.promotion import (
+    DEFAULT_CLASS,
+    TREND_FOLLOW,
+    PromotionConfig,
+    can_promote,
+    floor_for_class,
+    promotion_class_of,
+    should_demote,
+    transition,
+)
 
 
 def _stats(
@@ -121,6 +130,57 @@ def test_can_promote_respects_custom_config_floors() -> None:
     ok, reasons = can_promote(stats, cfg)
     assert ok is True
     assert reasons == []
+
+
+# -- per-rule-class promotion floors (KB §25.5) ---------------------------------
+
+
+def test_trend_follow_floor_uses_low_win_high_rr_thresholds() -> None:
+    floor = floor_for_class(TREND_FOLLOW)
+    assert floor.min_trades == 30
+    assert floor.min_rr == Decimal("1.5")
+    assert floor.min_win_rate == 0.30
+    assert floor.min_expectancy == Decimal("0")
+
+
+def test_floor_for_default_class_falls_back_to_supplied_default() -> None:
+    default = PromotionConfig(min_trades=100, min_win_rate=0.55)
+    assert floor_for_class(DEFAULT_CLASS, default) is default
+
+
+def test_floor_for_unknown_class_falls_back_to_supplied_default() -> None:
+    default = PromotionConfig(min_trades=100)
+    assert floor_for_class("no-such-class", default) is default
+
+
+def test_floor_for_unknown_class_without_default_is_canonical() -> None:
+    assert floor_for_class("no-such-class") == PromotionConfig()
+
+
+def test_promotion_class_of_reads_rule_attribute() -> None:
+    class _Trend:
+        promotion_class = TREND_FOLLOW
+
+    class _Plain:
+        pass
+
+    assert promotion_class_of(_Trend()) == TREND_FOLLOW
+    assert promotion_class_of(_Plain()) == DEFAULT_CLASS
+
+
+def test_turtle_like_edge_passes_trend_floor_but_fails_canonical() -> None:
+    # The live turtle-only edge sample: 40 trades, 37.5% win, avg win 4343 / avg loss
+    # 1938 (R:R ~2.24), positive expectancy. Fails the global 100/0.55 floor by design,
+    # clears the low-win/high-R:R trend floor (KB §25.5).
+    turtle = _stats(
+        n_trades=40,
+        win_rate=0.375,
+        avg_win=Decimal("4343"),
+        avg_loss=Decimal("-1938"),
+        expectancy=Decimal("417"),
+    )
+    assert can_promote(turtle, PromotionConfig())[0] is False
+    assert can_promote(turtle, floor_for_class(TREND_FOLLOW))[0] is True
 
 
 # -- should_demote --------------------------------------------------------------

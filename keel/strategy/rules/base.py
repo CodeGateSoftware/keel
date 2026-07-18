@@ -88,10 +88,15 @@ class Rule(ABC):
     """A strategy rule: detects long entries and signals exits from held longs.
 
     Concrete rules set `name`/`params` and implement `detect`/`exit_signal`/`describe`.
+
+    `promotion_class` selects the rule's promotion floor (`strategy.promotion.floor_for_class`):
+    the default `"default"` uses the canonical 100/0.55 floor; trend-followers override it to
+    `"trend_follow"` for a low-win/high-R:R floor (KB §25.5).
     """
 
     name: str
     params: dict
+    promotion_class: str = "default"
 
     @abstractmethod
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:

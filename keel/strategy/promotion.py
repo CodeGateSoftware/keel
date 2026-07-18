@@ -46,6 +46,48 @@ class PromotionConfig:
     min_win_rate: float = 0.55
 
 
+# -- Per-rule-class promotion floors (KB §25.5) --------------------------------
+# A rule's promotion floor depends on its *class* of edge. The canonical floor (100 trades,
+# 55% win) suits mean-reversion/continuation rules that win most trades for small gains. A
+# trend-follower (Donchian/Turtle breakout) is the opposite: it wins well under half its
+# trades by design but pays off asymmetrically (avg win >> avg loss). Judging it by the
+# global 55%-win floor rejects a genuinely-positive-expectancy edge -- exactly the
+# "a good trade is not always a winning trade" principle (KB §25.5). So trend-follow rules
+# get a low-win / high-R:R floor instead. Classes not listed here fall back to the caller's
+# default floor (the config-supplied `PromotionConfig`).
+DEFAULT_CLASS = "default"
+TREND_FOLLOW = "trend_follow"
+
+_CLASS_FLOORS: dict[str, PromotionConfig] = {
+    TREND_FOLLOW: PromotionConfig(
+        min_trades=30,
+        min_expectancy=Decimal("0"),
+        min_rr=Decimal("1.5"),
+        min_win_rate=0.30,
+    ),
+}
+
+
+def floor_for_class(
+    class_name: str, default: PromotionConfig | None = None
+) -> PromotionConfig:
+    """The promotion floor for a rule's `class_name`.
+
+    A class with a fixed, code-defined floor (currently only `trend_follow`) returns that
+    floor; any other class -- including `default` -- returns `default` (the config-supplied
+    floor), or the canonical `PromotionConfig()` when `default` is omitted.
+    """
+    floor = _CLASS_FLOORS.get(class_name)
+    if floor is not None:
+        return floor
+    return default if default is not None else PromotionConfig()
+
+
+def promotion_class_of(rule: object) -> str:
+    """A rule's promotion class -- its `promotion_class` attribute, or `DEFAULT_CLASS`."""
+    return getattr(rule, "promotion_class", DEFAULT_CLASS)
+
+
 def _realized_rr(stats: BacktestResult) -> Decimal:
     """Realized reward:risk = avg win / avg loss magnitude.
 
