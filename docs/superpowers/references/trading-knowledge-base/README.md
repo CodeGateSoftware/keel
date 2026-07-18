@@ -73,6 +73,7 @@ reference valid across the split without rewriting them.
 | 40 | "Trading Cryptocurrencies 2: Chainlink, Tezos and more" (Swissquote primer, 13pp) | extracted (altcoin-profile catalog, no strategy; only bearing = allowlist-curation; Augur=haram_sector example) | [source-40](./sources/source-40.md) |
 | 41 | "Trading Cryptocurrencies 3: Cardano, Algorand and more" (Swissquote primer, 17pp) | extracted (altcoin/DeFi-profile catalog, no strategy; concrete riba/haram_sector rejects: Aave/Compound/Maker/yearn) | [source-41](./sources/source-41.md) |
 | 42 | "Introduction to Options" (Swissquote primer, 6pp) | ⛔ out of scope — options = excluded instrument (gharar/maisir/not-spot); reaffirms §27.4/§28.1, no action | [source-42](./sources/source-42.md) |
+| 43 | "Buying a Call to Open" (Swissquote options series pt.2, 7pp) | ⛔ out of scope — options how-to (excluded instrument); logged compactly under §42, no action | [source-43](./sources/source-43.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
