@@ -76,6 +76,7 @@ reference valid across the split without rewriting them.
 | 43 | "Buying a Call to Open" (Swissquote options series pt.2, 7pp) | ⛔ out of scope — options how-to (excluded instrument); logged compactly under §42, no action | [source-43](./sources/source-43.md) |
 | 44 | "Buying a Call to Open: Profit and Loss" (Swissquote options series pt.3, 6pp) | ⛔ out of scope — options P&L (excluded instrument); logged compactly under §42, no action | [source-44](./sources/source-44.md) |
 | 45 | "Selling a Naked Call to Open" (Swissquote options series pt.4) | ⛔ out of scope — options + short + premium-for-no-risk (triply excluded); logged compactly under §42, no action | [source-45](./sources/source-45.md) |
+| 46 | "Selling a Covered Call to Open" (Swissquote options series pt.5) | ⛔ out of scope — options-income (written-call leg excluded; hold spot, no option overlay); logged compactly under §42, no action | [source-46](./sources/source-46.md) |
 | — | "Trading Terminology Explained" (re-paste) | ⧉ duplicate of Source 4 | see [source-04](./sources/source-04.md) |
 
 ---
