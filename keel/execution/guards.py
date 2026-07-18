@@ -62,6 +62,7 @@ Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
 from __future__ import annotations
 
 import calendar
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -70,6 +71,8 @@ from typing import Any
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Side
+
+logger = logging.getLogger(__name__)
 
 # -- rail constants not (yet) carried by config.yaml -------------------------------------------
 
@@ -391,5 +394,10 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
                 f"{monthly_spend} + {intent.notional} = {projected_monthly} exceeds the "
                 f"allowance cap {effective_cap}{pacing_note} -- remaining allowance {remaining}"
             )
+
+    for violation in violations:
+        logger.info(
+            "guards.check: %s %s veto -- %s", intent.product_id, intent.side, violation
+        )
 
     return GuardResult(ok=not violations, violations=violations)

@@ -88,3 +88,14 @@ tiers:
 fees:
   taker_pct: 0.012
   maker_pct: 0.006
+
+# Engine-activity logging. verbose=false (default) means only errors/exceptions are ever logged
+# (the "keel" logger stays at ERROR level); set verbose: true (or `keel -v`) to also log major
+# operations/decisions (INFO level) -- cycle starts, signals, guard vetoes, order outcomes, etc.
+# file_count is the TOTAL number of files kept (the active log + rotated backups), each capped
+# at max_file_mb.
+logging:
+  verbose: false
+  file: logs/keel.log
+  max_file_mb: 25
+  file_count: 5

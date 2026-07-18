@@ -21,11 +21,14 @@ before calling it; `cb_client` stays a thin, dumb transport wrapper.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
 from keel.types import Candle, Granularity, Side
+
+logger = logging.getLogger(__name__)
 
 # `order_configuration` nests exactly one config-type key (e.g. "market_market_ioc",
 # "limit_limit_gtc", "stop_limit_stop_limit_gtc") whose value carries these size/price fields
@@ -121,12 +124,22 @@ class CoinbaseClient:
         self, product_id: str, granularity: Granularity, start: int, end: int
     ) -> list[Candle]:
         """Fetch candles for `product_id` between `start`/`end` (epoch seconds), ascending."""
-        response = self._transport.get_candles(
-            product_id=product_id,
-            start=str(start),
-            end=str(end),
-            granularity=granularity.value,
-        )
+        try:
+            response = self._transport.get_candles(
+                product_id=product_id,
+                start=str(start),
+                end=str(end),
+                granularity=granularity.value,
+            )
+        except Exception:
+            logger.exception(
+                "CoinbaseClient.get_candles: fetch failed for %s %s [%s, %s]",
+                product_id,
+                granularity,
+                start,
+                end,
+            )
+            raise
         raw_candles = _field(response, "candles", []) or []
         candles = [_candle_from_raw(raw) for raw in raw_candles]
         candles.sort(key=lambda c: c.ts)
@@ -134,7 +147,11 @@ class CoinbaseClient:
 
     def get_spot(self, product_id: str) -> Decimal:
         """Return the current spot price for `product_id`."""
-        response = self._transport.get_product(product_id=product_id)
+        try:
+            response = self._transport.get_product(product_id=product_id)
+        except Exception:
+            logger.exception("CoinbaseClient.get_spot: fetch failed for %s", product_id)
+            raise
         price = _field(response, "price")
         if price is None:
             raise ValueError(f"get_spot({product_id!r}): response has no 'price' field")
@@ -142,7 +159,11 @@ class CoinbaseClient:
 
     def get_accounts(self) -> list[dict]:
         """Return authenticated account balances, keyed by currency."""
-        response = self._transport.get_accounts()
+        try:
+            response = self._transport.get_accounts()
+        except Exception:
+            logger.exception("CoinbaseClient.get_accounts: fetch failed")
+            raise
         raw_accounts = _field(response, "accounts", []) or []
         accounts = []
         for raw in raw_accounts:

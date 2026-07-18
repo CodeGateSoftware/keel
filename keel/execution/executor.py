@@ -54,6 +54,7 @@ missing quote-currency account. SELL intents never fetch a balance (the rail exe
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,6 +67,8 @@ from keel.execution import guards, sizing
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Signal
 from keel.types import Side
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,10 @@ def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
     try:
         accounts = broker.get_accounts()
     except Exception:
+        logger.exception(
+            "executor._fetch_available_quote: broker.get_accounts() failed for %s",
+            quote_currency,
+        )
         return None
 
     for account in accounts or []:
@@ -266,6 +273,12 @@ def _run_order(
 ) -> ExecutionResult:
     guard_result = guards.check(intent, repo, config, now_ts)
     if not guard_result.ok:
+        logger.info(
+            "executor._run_order: %s %s vetoed by guards: %s",
+            intent.product_id,
+            intent.side.value if isinstance(intent.side, Side) else intent.side,
+            "; ".join(guard_result.violations),
+        )
         return ExecutionResult(
             placed=False,
             order_id=None,
@@ -276,11 +289,34 @@ def _run_order(
 
     if order_configuration is None:
         order_configuration = _order_configuration(intent)
-    preview = broker.preview_order(intent.product_id, intent.side, order_configuration)
+    try:
+        preview = broker.preview_order(intent.product_id, intent.side, order_configuration)
+    except Exception:
+        logger.exception(
+            "executor._run_order: broker.preview_order failed for %s %s",
+            intent.product_id,
+            intent.side,
+        )
+        raise
+    logger.info(
+        "executor._run_order: %s %s previewed notional=%s mode=%s",
+        intent.product_id,
+        intent.side.value if isinstance(intent.side, Side) else intent.side,
+        intent.notional,
+        mode,
+    )
 
     if mode == "confirm":
         approved = confirm_fn(preview) if confirm_fn is not None else False
         if not approved:
+            logger.info(
+                "executor._run_order: %s %s not placed -- confirm-mode fall-through "
+                "(confirm_fn=%s, approved=%s)",
+                intent.product_id,
+                intent.side,
+                confirm_fn is not None,
+                approved,
+            )
             return ExecutionResult(
                 placed=False,
                 order_id=None,
@@ -293,7 +329,16 @@ def _run_order(
 
     order_id = repo.insert_order(_order_row(intent, mode, now_ts))
 
-    place_result = broker.place_order(intent.product_id, intent.side, order_configuration)
+    try:
+        place_result = broker.place_order(intent.product_id, intent.side, order_configuration)
+    except Exception:
+        logger.exception(
+            "executor._run_order: broker.place_order failed for %s %s (order_id=%s)",
+            intent.product_id,
+            intent.side,
+            order_id,
+        )
+        raise
     success = bool(place_result.get("success"))
     status = _initial_status(order_configuration) if success else "rejected"
     repo.update_order(
@@ -305,6 +350,13 @@ def _run_order(
     )
 
     if not success:
+        logger.info(
+            "executor._run_order: %s %s order_id=%s skipped -- broker rejected: %s",
+            intent.product_id,
+            intent.side,
+            order_id,
+            place_result.get("error"),
+        )
         return ExecutionResult(
             placed=False,
             order_id=order_id,
@@ -316,6 +368,13 @@ def _run_order(
     if intent.stop is not None:
         repo.set_state(f"open_stop:{intent.product_id}", intent.stop)
 
+    logger.info(
+        "executor._run_order: %s %s order_id=%s placed status=%s",
+        intent.product_id,
+        intent.side,
+        order_id,
+        status,
+    )
     return ExecutionResult(
         placed=True, order_id=order_id, vetoed_by=[], preview=preview, reason="placed"
     )
@@ -456,6 +515,14 @@ def place_oco_bracket(
     if stop_order_id is not None:
         repo.set_state(f"open_stop:{product_id}", stop)
 
+    logger.info(
+        "executor.place_oco_bracket: %s stop_order_id=%s target_order_id=%s stop=%s target=%s",
+        product_id,
+        stop_order_id,
+        target_order_id,
+        stop,
+        target,
+    )
     return stop_order_id, target_order_id
 
 
@@ -484,6 +551,11 @@ def handle_oco_fill(broker: Any, repo: Repository, filled_order_id: int, now_ts:
             cancel(native_id)
 
     repo.update_order(sibling_id, status="canceled", updated_at=now_ts)
+    logger.info(
+        "executor.handle_oco_fill: order_id=%s filled -- canceled sibling order_id=%s",
+        filled_order_id,
+        sibling_id,
+    )
     return sibling_id
 
 
@@ -515,6 +587,13 @@ def scale_out(
         is_dca=False,
         rule_kind=rule_name,
     )
+    logger.info(
+        "executor.scale_out: %s qty=%s exit_price=%s rule=%s",
+        product_id,
+        qty,
+        exit_price,
+        rule_name,
+    )
     return _run_order(intent, broker, repo, config, "bypass", None, now_ts)
 
 
@@ -541,6 +620,12 @@ def _roll_stop(
     """
     prior_stop = repo.get_state(f"open_stop:{product_id}")
     if prior_stop is not None and new_stop < prior_stop:
+        logger.info(
+            "executor._roll_stop: %s refused -- new_stop %s would widen prior_stop %s",
+            product_id,
+            new_stop,
+            prior_stop,
+        )
         return None
 
     intent = OrderIntent(
@@ -581,6 +666,13 @@ def _roll_stop(
         repo.set_state(f"oco_sibling:{sibling_id}", result.order_id)
 
     repo.set_state(f"open_stop:{product_id}", new_stop)
+    logger.info(
+        "executor._roll_stop: %s rolled stop %s -> %s (new order_id=%s)",
+        product_id,
+        prior_stop,
+        new_stop,
+        result.order_id,
+    )
     return result.order_id
 
 

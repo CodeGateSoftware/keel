@@ -35,6 +35,7 @@ that's the paper trader's job (Task 8), which owns open-position state.
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +47,8 @@ from keel.types import Candle, Granularity, Side
 
 if TYPE_CHECKING:
     from keel.data.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 # The "≥1:1 band" kill-zone floor (spec §17.2). Distinct from -- and looser than -- the
 # promotion gate's stricter R:R >= 1.5-2 floor (spec §6.3), which judges a *rule's* backtested
@@ -79,6 +82,7 @@ def evaluate(
     for rule in rules:
         setup = rule.detect(candles_by_tf)
         if setup is None:
+            logger.info("engine.evaluate: %s -- no signal (detect() found nothing)", rule.name)
             continue
 
         trading_gran = _trading_granularity(rule, candles_by_tf)
@@ -86,10 +90,26 @@ def evaluate(
 
         if not _is_market_buy_class(setup):
             if not _choppy_gate_ok(trading_candles):
+                logger.info(
+                    "engine.evaluate: %s %s -- rejected by choppy-regime gate",
+                    rule.name,
+                    setup.product_id,
+                )
                 continue
             if not _higher_tf_bias_ok(trading_gran, candles_by_tf):
+                logger.info(
+                    "engine.evaluate: %s %s -- rejected by higher-TF bearish-bias gate",
+                    rule.name,
+                    setup.product_id,
+                )
                 continue
             if not _kill_zone_ok(setup, rr_floor):
+                logger.info(
+                    "engine.evaluate: %s %s -- rejected by kill-zone R:R floor gate (rr_floor=%s)",
+                    rule.name,
+                    setup.product_id,
+                    rr_floor,
+                )
                 continue
 
         context = _assemble_cts_context(setup, trading_candles)
@@ -107,6 +127,17 @@ def evaluate(
             ts=setup.ts,
         )
         signals.append(signal)
+        logger.info(
+            "engine.evaluate: %s %s -- ENTER signal emitted cts_score=%s entry_technique=%s "
+            "entry=%s stop=%s target=%s",
+            rule.name,
+            setup.product_id,
+            cts_result.total,
+            technique,
+            setup.entry,
+            setup.stop,
+            setup.target,
+        )
 
         if repo is not None:
             _persist_signal(repo, signal, cts_result)

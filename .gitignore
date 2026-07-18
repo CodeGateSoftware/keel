@@ -5,6 +5,10 @@ secrets.enc
 # databases
 *.db
 
+# logs (engine-activity logging, keel.config.LoggingConfig)
+logs/
+*.log
+
 # python
 __pycache__/
 *.pyc

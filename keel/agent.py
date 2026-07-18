@@ -298,7 +298,10 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
     staleness (`market_feed.is_fresh`) is checked after polling and only skips *that* product;
     the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
     """
+    logger.info("agent.run_once: cycle start ts=%s", now_ts)
+
     if repo.get_state("kill_switch", default=True):
+        logger.info("agent.run_once: kill_switch engaged -- cycle skipped, nothing evaluated")
         return LoopResult(
             ts=now_ts, skipped=True, skip_reason="kill_switch", mode=None, polled=0
         )
@@ -308,6 +311,12 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
     granularities = list(config.market_data.granularities)
 
     polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
+    logger.info(
+        "agent.run_once: polled %s new candle row(s) across %s live rule(s), %s product(s)",
+        polled,
+        len(rules),
+        products,
+    )
     # The feed-health heartbeat `guards.check`'s rail 12 reads -- nothing else in the system
     # sets this key, so the loop that actually calls `poll_once` each cycle is responsible for
     # recording that the check happened, independent of whether it found anything new.
@@ -316,6 +325,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
     mode, bypass_refused_reason = _confirm_or_bypass(config, repo, now_ts)
     if bypass_refused_reason is not None:
         logger.warning("agent.run_once: %s", bypass_refused_reason)
+    logger.info("agent.run_once: effective mode=%s", mode)
     max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
     finest = _finest_granularity(granularities)
 
@@ -329,23 +339,51 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
             repo, product_id, finest, now_ts, max_age_sec
         ):
             stale_products.append(product_id)
+            logger.info(
+                "agent.run_once: %s feed is stale (finest=%s, max_age_sec=%s) -- skipping",
+                product_id,
+                finest,
+                max_age_sec,
+            )
             continue
 
         product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
         candles_by_tf = {g: repo.get_candles(product_id, g) for g in granularities}
 
-        exit_results.extend(
-            _handle_exits(
-                product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts
-            )
+        product_exit_results = _handle_exits(
+            product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts
         )
+        for exit_result in product_exit_results:
+            logger.info(
+                "agent.run_once: %s EXIT placed=%s reason=%s",
+                product_id,
+                exit_result.placed,
+                exit_result.reason,
+            )
+        exit_results.extend(product_exit_results)
 
-        for signal in engine.evaluate(product_rules, candles_by_tf, repo=repo):
+        product_signals = engine.evaluate(product_rules, candles_by_tf, repo=repo)
+        logger.info(
+            "agent.run_once: %s evaluated %s rule(s) -> %s signal(s)",
+            product_id,
+            len(product_rules),
+            len(product_signals),
+        )
+        for signal in product_signals:
             enter_signals.append(signal)
             result = executor.execute(
                 signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
             )
             enter_results.append(result)
+            logger.info(
+                "agent.run_once: %s ENTER rule=%s technique=%s cts_score=%s placed=%s reason=%s",
+                product_id,
+                signal.rule_name,
+                signal.entry_technique,
+                signal.cts_score,
+                result.placed,
+                result.reason,
+            )
             if result.placed:
                 repo.set_state(f"position_rule:{product_id}", signal.rule_name)
 

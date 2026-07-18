@@ -135,6 +135,24 @@ class TierConfig:
 
 
 @dataclass(frozen=True)
+class LoggingConfig:
+    """Engine-activity logging settings.
+
+    `verbose=False` (the default) means only errors/exceptions are ever logged --
+    `logging_setup.configure_logging` sets the `"keel"` logger to `ERROR` level in that case, so
+    major-operation/decision `logger.info(...)` calls throughout the codebase are suppressed
+    while `logger.error`/`logger.exception` still always get through. `max_file_mb`/`file_count`
+    size the rotating file handler: `file_count` is the TOTAL number of files kept (the active
+    log plus its rotated backups), so `configure_logging` passes `backupCount=file_count - 1`.
+    """
+
+    verbose: bool = False
+    file: str = "logs/keel.log"
+    max_file_mb: int = 25
+    file_count: int = 5
+
+
+@dataclass(frozen=True)
 class FeesConfig:
     """Coinbase Advanced trading fees applied to volume beyond a tier's free allowance
     (Issue #86) -- the `<$1k-30d-volume` account tier's published rate. `taker_pct` is the sim's
@@ -178,6 +196,7 @@ class Config:
     tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
     fees: FeesConfig = field(default_factory=FeesConfig)
     quote_currency: str = "USDC"
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
 # Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
@@ -301,6 +320,44 @@ def _parse_fees(raw: dict[str, Any]) -> FeesConfig:
     )
 
 
+def _parse_logging(raw: dict[str, Any]) -> LoggingConfig:
+    """Parse `logging:` -- optional, falls back to `LoggingConfig`'s defaults (verbose OFF,
+    5 total 25MB rotated files) when absent."""
+    logging_raw = raw.get("logging") or {}
+
+    verbose = bool(logging_raw.get("verbose", False))
+
+    max_file_mb = logging_raw.get("max_file_mb", 25)
+    try:
+        max_file_mb = int(max_file_mb)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"logging.max_file_mb: expected a positive integer, got {max_file_mb!r}"
+        ) from exc
+    if max_file_mb <= 0:
+        raise ConfigError(
+            f"logging.max_file_mb: must be a positive integer, got {max_file_mb!r}"
+        )
+
+    file_count = logging_raw.get("file_count", 5)
+    try:
+        file_count = int(file_count)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"logging.file_count: expected an integer >= 1, got {file_count!r}"
+        ) from exc
+    if file_count < 1:
+        raise ConfigError(f"logging.file_count: must be an integer >= 1, got {file_count!r}")
+
+    file = logging_raw.get("file", "logs/keel.log")
+    if not isinstance(file, str) or not file:
+        raise ConfigError(f"logging.file: must be a non-empty string, got {file!r}")
+
+    return LoggingConfig(
+        verbose=verbose, file=file, max_file_mb=max_file_mb, file_count=file_count
+    )
+
+
 def load_config(path: str | Path) -> Config:
     """Parse and validate `config.yaml` at `path`, returning a typed `Config`.
 
@@ -390,6 +447,7 @@ def load_config(path: str | Path) -> Config:
         tiers=_parse_tiers(raw),
         fees=_parse_fees(raw),
         quote_currency=quote_currency,
+        logging=_parse_logging(raw),
     )
 
 
