@@ -22,13 +22,14 @@ from keel.sim.report import (
     analyze_gaps,
     build_verdict,
     edge_table,
+    group_trades_by_class,
     render_markdown,
 )
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, compute_tier_fee_result
-from keel.strategy.promotion import PromotionConfig
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.promotion import TREND_FOLLOW, PromotionConfig, floor_for_class
+from keel.strategy.rules.base import Rule, Setup, Trade
 from keel.strategy.stats import BacktestResult
-from keel.types import Candle, Granularity
+from keel.types import Candle, Granularity, Side
 
 _HOUR = 3600
 
@@ -417,6 +418,134 @@ def test_verdict_train_more_when_data_insufficient():
     assert v.status == "TRAIN MORE"
     assert v.data_sufficient is False
     assert any("BTC" in r for r in v.reasons)
+
+
+def _turtle_pooled() -> BacktestResult:
+    # The live turtle-only edge sample (KB §25.5): fails canonical 100/0.55 but clears the
+    # trend floor 30/0.30/1.5.
+    return _pooled_result(
+        n_trades=40, win_rate=0.375, avg_win=Decimal("4343"), avg_loss=Decimal("-1938")
+    )
+
+
+def test_verdict_go_live_when_trend_class_clears_its_own_floor():
+    v = build_verdict(
+        pooled=_turtle_pooled(),
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=_benchmark(),
+        coverage={},
+        promotion_cfg=CANONICAL,
+        pooled_by_class={TREND_FOLLOW: _turtle_pooled()},
+        floors={TREND_FOLLOW: floor_for_class(TREND_FOLLOW)},
+    )
+    assert v.status == "GO-LIVE candidate"
+    assert v.g2_pass
+    assert v.reasons == []
+
+
+def test_verdict_train_more_when_a_class_fails_its_floor():
+    losing = _pooled_result(win_rate=0.16, avg_win=Decimal("10"), avg_loss=Decimal("-90"))
+    v = build_verdict(
+        pooled=_turtle_pooled(),
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=_benchmark(),
+        coverage={},
+        promotion_cfg=CANONICAL,
+        pooled_by_class={
+            TREND_FOLLOW: _turtle_pooled(),
+            "mean_revert": losing,
+        },
+        floors={TREND_FOLLOW: floor_for_class(TREND_FOLLOW)},
+    )
+    assert v.status == "TRAIN MORE"
+    assert not v.g2_pass
+    # The failing class is named in the reason; the passing trend class is not.
+    assert any(r.startswith("[mean_revert]") for r in v.reasons)
+    assert not any(r.startswith(f"[{TREND_FOLLOW}]") for r in v.reasons)
+
+
+def test_verdict_per_class_unlisted_class_uses_default_floor():
+    # A class absent from `floors` is checked against the supplied default (canonical here),
+    # so the turtle sample -- which fails canonical -- fails G2 when treated as default.
+    v = build_verdict(
+        pooled=_turtle_pooled(),
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=_benchmark(),
+        coverage={},
+        promotion_cfg=CANONICAL,
+        pooled_by_class={TREND_FOLLOW: _turtle_pooled()},
+        floors={},  # trend class not listed -> canonical default applies
+    )
+    assert v.status == "TRAIN MORE"
+    assert not v.g2_pass
+
+
+def _trade(pnl: str, outcome: str) -> Trade:
+    return Trade(
+        entry_ts=0,
+        exit_ts=_HOUR,
+        entry=Decimal("100"),
+        exit=Decimal("110") if outcome == "win" else Decimal("95"),
+        qty=Decimal("1"),
+        side=Side.BUY,
+        pnl=Decimal(pnl),
+        r_multiple=Decimal("1"),
+        mfe=Decimal("1"),
+        mae=Decimal("1"),
+        outcome=outcome,  # type: ignore[arg-type]
+    )
+
+
+class _ClassedRule(Rule):
+    """Minimal rule carrying a `promotion_class`, for grouping tests."""
+
+    params: dict = {}
+
+    def __init__(self, name: str, product_id: str, promotion_class: str) -> None:
+        self.name = name
+        self.product_id = product_id
+        self.promotion_class = promotion_class
+
+    def detect(self, candles_by_tf):  # pragma: no cover - unused in grouping
+        return None
+
+    def exit_signal(self, held, candles_by_tf):  # pragma: no cover - unused
+        return False
+
+    def describe(self) -> dict:
+        return {"name": self.name, "params": self.params}
+
+
+def test_group_trades_by_class_pools_by_rule_promotion_class():
+    rules = [
+        _ClassedRule("turtle_breakout", "BTC-USD", TREND_FOLLOW),
+        _ClassedRule("turtle_breakout", "ETH-USD", TREND_FOLLOW),
+        _ClassedRule("rsi_meanrev", "BTC-USD", "default"),
+    ]
+    edge = {
+        "turtle_breakout:BTC": BacktestResult(
+            trades=[_trade("50", "win"), _trade("-20", "loss")],
+            n_trades=2, win_rate=0.5, avg_win=Decimal("50"), avg_loss=Decimal("-20"),
+            expectancy=Decimal("15"), profit_factor=Decimal("2.5"), max_drawdown=Decimal("20"),
+            max_losing_streak=1, avg_mfe=Decimal("1"), avg_mae=Decimal("1"),
+        ),
+        "turtle_breakout:ETH": BacktestResult(
+            trades=[_trade("30", "win")],
+            n_trades=1, win_rate=1.0, avg_win=Decimal("30"), avg_loss=Decimal("0"),
+            expectancy=Decimal("30"), profit_factor=Decimal("1"), max_drawdown=Decimal("0"),
+            max_losing_streak=0, avg_mfe=Decimal("1"), avg_mae=Decimal("1"),
+        ),
+        "rsi_meanrev:BTC": BacktestResult(
+            trades=[_trade("-5", "loss")],
+            n_trades=1, win_rate=0.0, avg_win=Decimal("0"), avg_loss=Decimal("-5"),
+            expectancy=Decimal("-5"), profit_factor=Decimal("0"), max_drawdown=Decimal("5"),
+            max_losing_streak=1, avg_mfe=Decimal("1"), avg_mae=Decimal("1"),
+        ),
+    }
+    by_class = group_trades_by_class(edge, rules)
+    assert set(by_class) == {TREND_FOLLOW, "default"}
+    assert by_class[TREND_FOLLOW].n_trades == 3  # BTC (2) + ETH (1) pooled
+    assert by_class["default"].n_trades == 1
 
 
 def test_verdict_dataclass_shape():

@@ -47,7 +47,13 @@ class TurtleBreakout(Rule):
 
     One instance trades a single `product_id` on `ONE_DAY` candles only (`self.granularity`,
     fixed -- not one of the tunable `params`).
+
+    `promotion_class = "trend_follow"` routes it to the low-win/high-R:R promotion floor
+    (`strategy.promotion.floor_for_class`): a breakout trend-follower wins under half its trades
+    by design and would fail the global 55%-win floor despite a positive expectancy (KB §25.5).
     """
+
+    promotion_class = "trend_follow"
 
     def __init__(
         self,

@@ -64,7 +64,7 @@ from keel.sim.portfolio_sim import SimResult, SimTelemetry
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
 from keel.strategy.backtest import _rule_trading_tf, backtest
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
-from keel.strategy.promotion import PromotionConfig, can_promote
+from keel.strategy.promotion import PromotionConfig, can_promote, promotion_class_of
 from keel.strategy.rules.base import Rule
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity
@@ -80,6 +80,7 @@ __all__ = [
     "analyze_gaps",
     "build_verdict",
     "edge_table",
+    "group_trades_by_class",
     "render_markdown",
 ]
 
@@ -175,6 +176,28 @@ def edge_table(
     return results
 
 
+def group_trades_by_class(
+    edge: dict[str, BacktestResult], rules: list[Rule]
+) -> dict[str, BacktestResult]:
+    """Pool each rule's edge-pass trades by promotion class -> summarized `BacktestResult`.
+
+    Keyed by `promotion.promotion_class_of(rule)`. This is the per-class sample
+    `build_verdict`'s G2 gate checks against each class's own floor (KB §25.5): a
+    low-win/high-R:R trend-follower is judged by the trend floor rather than the global one,
+    while other classes keep the canonical floor. `edge` is `edge_table`'s output; its
+    per-rule keys are `"{rule.name}:{asset}"` (the `POOLED_KEY` entry is ignored -- it pools
+    across *all* classes and so isn't meaningful per-class). A rule whose edge entry is
+    missing is skipped (absent data is a coverage gap, not a crash -- mirrors `edge_table`).
+    """
+    trades_by_class: dict[str, list] = {}
+    for rule in rules:
+        result = edge.get(f"{rule.name}:{_asset(rule.product_id)}")
+        if result is None:
+            continue
+        trades_by_class.setdefault(promotion_class_of(rule), []).extend(result.trades)
+    return {cls: summarize(trades) for cls, trades in trades_by_class.items()}
+
+
 # ---------------------------------------------------------------------------
 # Verdict (spec §6.2)
 # ---------------------------------------------------------------------------
@@ -208,12 +231,34 @@ def _g1_data_sufficiency(coverage: dict) -> tuple[bool, list[str]]:
     return sufficient_count > 0, reasons
 
 
+def _g2_per_class(
+    pooled_by_class: dict[str, BacktestResult],
+    floors: dict[str, PromotionConfig],
+    default_cfg: PromotionConfig,
+) -> tuple[bool, list[str]]:
+    """G2 evaluated per rule class (KB §25.5): each class's pooled sample must clear its own
+    floor. A class absent from `floors` falls back to `default_cfg`. Failing reasons are
+    prefixed with `[class]` so a mixed run makes clear which class fell short. An empty
+    grouping (no rules produced any trades to classify) fails rather than passing vacuously.
+    """
+    if not pooled_by_class:
+        return False, ["no rule classes with trades to evaluate against promotion floors"]
+    reasons: list[str] = []
+    for cls in sorted(pooled_by_class):
+        floor = floors.get(cls, default_cfg)
+        _ok, cls_reasons = can_promote(pooled_by_class[cls], floor)
+        reasons.extend(f"[{cls}] {reason}" for reason in cls_reasons)
+    return (len(reasons) == 0, reasons)
+
+
 def build_verdict(
     pooled: BacktestResult,
     account_metrics: dict,
     benchmark: BenchmarkResult,
     coverage: dict,
     promotion_cfg: PromotionConfig,
+    pooled_by_class: dict[str, BacktestResult] | None = None,
+    floors: dict[str, PromotionConfig] | None = None,
 ) -> Verdict:
     """The three-gate GO-LIVE/TRAIN-MORE call (spec §6.2). All failing reasons are surfaced.
 
@@ -222,6 +267,13 @@ def build_verdict(
     §5.2); this function reads `"return_per_drawdown"`, `"sortino"`, `"total_return_pct"`, and
     `"max_drawdown_pct"` from it (missing keys default to `Decimal(0)`, which fails G3
     conservatively rather than raising).
+
+    **G2 (promotion floors)** is evaluated per rule *class* when `pooled_by_class` is supplied
+    (from `group_trades_by_class`): each class's pooled trades must clear its own floor from
+    `floors` (falling back to `promotion_cfg` for any class not listed), so a low-win/high-R:R
+    trend-follower is judged by the trend floor, not the global one (KB §25.5). When
+    `pooled_by_class` is `None`, G2 falls back to checking the single all-rules `pooled` sample
+    against `promotion_cfg` -- the original behaviour, kept so existing callers are unaffected.
     """
     reasons: list[str] = []
 
@@ -231,7 +283,10 @@ def build_verdict(
             g1_reasons or ["no asset has sufficient ONE_HOUR bar coverage for a meaningful sample"]
         )
 
-    g2_pass, g2_reasons = can_promote(pooled, promotion_cfg)
+    if pooled_by_class is not None:
+        g2_pass, g2_reasons = _g2_per_class(pooled_by_class, floors or {}, promotion_cfg)
+    else:
+        g2_pass, g2_reasons = can_promote(pooled, promotion_cfg)
     if not g2_pass:
         reasons.extend(g2_reasons)
 
