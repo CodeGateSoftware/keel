@@ -464,3 +464,42 @@ class TestS1Filter:
         on = backtest(_rule(s1_filter=True), series)
         assert off.n_trades >= 2
         assert on.n_trades < off.n_trades
+
+
+def _with_breakout_volume(candles: list[Candle], breakout_vol: float,
+                          base_vol: float = 100.0) -> list[Candle]:
+    """Rebuild `candles` with a flat base volume and a chosen volume on the final (breakout) bar
+    (Candle is frozen, so construct new ones)."""
+    out: list[Candle] = []
+    for i, c in enumerate(candles):
+        v = breakout_vol if i == len(candles) - 1 else base_vol
+        out.append(Candle(ts=c.ts, open=c.open, high=c.high, low=c.low, close=c.close,
+                          volume=Decimal(str(v))))
+    return out
+
+
+class TestVolumeFilter:
+    def test_default_off_ignores_volume(self) -> None:
+        # filter off: even a thin-volume breakout is still taken (behavior unchanged)
+        thin = _with_breakout_volume(_breakout_candles(), breakout_vol=1.0)
+        assert _rule().detect({Granularity.ONE_DAY: thin}) is not None
+
+    def test_param_round_trips_through_agent(self) -> None:
+        described = _rule(min_volume_filter=True, volume_ma_period=30, volume_mult=1.5).describe()
+        assert described["params"]["min_volume_filter"] is True
+        assert described["params"]["volume_ma_period"] == 30
+        assert described["params"]["volume_mult"] == 1.5
+        params = {**described["params"], "product_id": "BTC-USD"}
+        rebuilt = agent._build_rule({"kind": "turtle_breakout", "params": params})
+        assert rebuilt.params["min_volume_filter"] is True
+
+    def test_high_volume_breakout_passes(self) -> None:
+        # breakout volume 150 > 1.2 x 100 avg -> filter passes, Setup emitted
+        series = _with_breakout_volume(_breakout_candles(), breakout_vol=150.0)
+        assert _rule(min_volume_filter=True).detect({Granularity.ONE_DAY: series}) is not None
+
+    def test_low_volume_breakout_skipped(self) -> None:
+        # breakout volume 110 < 1.2 x 100 = 120 -> filter skips it (None), but only with filter on
+        series = _with_breakout_volume(_breakout_candles(), breakout_vol=110.0)
+        assert _rule(min_volume_filter=True).detect({Granularity.ONE_DAY: series}) is None
+        assert _rule(min_volume_filter=False).detect({Granularity.ONE_DAY: series}) is not None
