@@ -1,4 +1,4 @@
-"""Rule: long-only Turtle-style Donchian breakout (KB source-27 §27.1, source-XX §25.1).
+"""Rule: long-only Turtle-style Donchian breakout (KB source-27 §27.1, source-25 §25.1).
 
 The canonical, decades-validated Turtle Trading system (Dennis/Eckhardt), long-only: enter
 on a confirmed close above the prior N-day Donchian high, gated by ADX>25 trend confirmation
@@ -12,11 +12,25 @@ Long-only spot, no shorts: this rule only ever emits a **long** `Setup` (a close
 high channel); the opposite side (a close below the low channel) is exit-only, wired through
 `exit_signal()`, never a short entry -- consistent with every other rule in this codebase.
 
-This rule is pinned to `ONE_HOUR` candles (`self.granularity`, a fixed attribute read by the
-evaluation engine via `getattr(rule, "granularity")` -- see `strategy.engine._trading_granularity`
--- not a persisted param): all the lookback constructor defaults are bar counts on that
-timeframe (480h/240h/336h/480h = 20/10/14/20 trading days), so the rule runs unchanged through
-both the edge-detection pass and the account-simulation pass of the backtester.
+**This is a DAILY rule** (`self.granularity = Granularity.ONE_DAY`, a fixed attribute read by
+the evaluation engine via `getattr(rule, "granularity")` -- see
+`strategy.engine._trading_granularity` -- not a persisted param). The classic Turtle system is
+a daily trend-follower, and that is not cosmetic: ADX is a *daily-scale* trend measure. On
+noisy hourly bars +DI/-DI cancel out and ADX stays structurally suppressed (measured ~7 median
+/ 18 max on real hourly BTC/ETH regardless of period), so an ADX>25 gate on hourly data never
+fires and the rule produces zero trades. On daily candles ADX(14) has a ~26 median and 20-day-
+high breakouts routinely coincide with ADX>25. So the lookback defaults are DAY counts (Turtle
+System-1 20/10 + ADX(14) + 20-day ATR "N").
+
+**Forming-bar lookahead guard.** The two backtest passes present the daily series differently:
+- The *edge* backtester (`strategy.backtest.backtest`) drives the rule on its native series
+  only -- no `ONE_HOUR` key -- and every daily bar in it is already closed.
+- The *account* simulator (`sim.portfolio_sim`) iterates hourly and hands the rule BOTH an
+  `ONE_HOUR` window AND the `ONE_DAY` series, where the last daily bar is the CURRENT, still-
+  forming day (its DB OHLC is the completed day = lookahead if consumed intraday).
+`detect()`/`exit_signal()` therefore drop the last daily bar iff an `ONE_HOUR` key is present,
+so decisions are made only on completed days in the account pass while using every (closed) bar
+in the edge pass.
 """
 
 from __future__ import annotations
@@ -31,18 +45,18 @@ from keel.types import Candle, Granularity
 class TurtleBreakout(Rule):
     """Donchian-breakout trend-follower: ADX-gated entry, asymmetric channel exit, 2xATR stop.
 
-    One instance trades a single `product_id` on `ONE_HOUR` candles only (`self.granularity`,
+    One instance trades a single `product_id` on `ONE_DAY` candles only (`self.granularity`,
     fixed -- not one of the tunable `params`).
     """
 
     def __init__(
         self,
         product_id: str,
-        entry_lookback: int = 480,  # 20 trading days on hourly bars (Donchian high, entry)
-        exit_lookback: int = 240,  # 10 days (Donchian low, asymmetric channel exit)
-        adx_period: int = 336,  # 14 days
+        entry_lookback: int = 20,  # 20 trading days (Donchian high, entry) -- Turtle System-1
+        exit_lookback: int = 10,  # 10 days (Donchian low, asymmetric channel exit)
+        adx_period: int = 14,  # 14 days -- classic ADX
         adx_threshold: float = 25.0,  # ADX>25 trend confirmation (KB §25.1)
-        atr_period: int = 480,  # 20 days = Turtle's "N"
+        atr_period: int = 20,  # 20 days = Turtle's "N"
         atr_stop_mult: Decimal = Decimal("2"),  # 2N stop (KB -- fixes 'stops too tight for crypto')
         use_macd_confirm: bool = False,  # optional MACD histogram>0 filter
         target_rr: Decimal = Decimal("6"),  # distant nominal take-profit; see detect()
@@ -59,7 +73,7 @@ class TurtleBreakout(Rule):
 
         self.name = name
         self.product_id = product_id
-        self.granularity = Granularity.ONE_HOUR
+        self.granularity = Granularity.ONE_DAY
         self.params: dict = {
             "entry_lookback": entry_lookback,
             "exit_lookback": exit_lookback,
@@ -82,14 +96,21 @@ class TurtleBreakout(Rule):
         this target; it only exists to clear the evaluation engine's rr>=1 kill-zone gate and
         let winners run past a fixed 1:1/2:1 cap).
         """
-        candles = candles_by_tf.get(Granularity.ONE_HOUR, [])
+        daily = candles_by_tf.get(Granularity.ONE_DAY, [])
+        # Account sim (portfolio_sim) includes the current *forming* daily bar alongside an
+        # ONE_HOUR window -> drop it to decide only on completed days (no lookahead). The
+        # daily-only edge backtest has no ONE_HOUR key and every daily bar is already closed,
+        # so use them all.
+        if candles_by_tf.get(Granularity.ONE_HOUR):
+            daily = daily[:-1]
+
         entry_lookback = self.params["entry_lookback"]
         exit_lookback = self.params["exit_lookback"]
         adx_period = self.params["adx_period"]
         atr_period = self.params["atr_period"]
 
         min_needed = max(entry_lookback, adx_period, atr_period) + 2
-        if len(candles) < min_needed:
+        if len(daily) < min_needed:
             return None
 
         # PERFORMANCE: this rule runs every bar over long series (O(N^2) in a naive sim).
@@ -98,10 +119,10 @@ class TurtleBreakout(Rule):
         # converge, so a 4*period tail gives an accurate current value without recomputing the
         # full history each bar.
         needed = max(entry_lookback + 1, exit_lookback + 1, adx_period * 4, atr_period * 4)
-        work = candles[-needed:]
+        work = daily[-needed:]
         current = work[-1]
 
-        entry_level = donchian_high(candles[:-1], entry_lookback)
+        entry_level = donchian_high(daily[:-1], entry_lookback)
         if not float(current.close) > entry_level:
             return None
 
@@ -157,13 +178,18 @@ class TurtleBreakout(Rule):
         nominal target are the backtester/account-sim's job to enforce separately.
         """
         del held
-        candles = candles_by_tf.get(Granularity.ONE_HOUR, [])
+        daily = candles_by_tf.get(Granularity.ONE_DAY, [])
+        # Same forming-bar guard as detect(): the account sim carries the current forming daily
+        # bar alongside an ONE_HOUR window -> decide on completed days only.
+        if candles_by_tf.get(Granularity.ONE_HOUR):
+            daily = daily[:-1]
+
         exit_lookback = self.params["exit_lookback"]
-        if len(candles) <= exit_lookback + 1:
+        if len(daily) <= exit_lookback + 1:
             return False
 
-        exit_level = donchian_low(candles[:-1], exit_lookback)
-        return float(candles[-1].close) <= exit_level
+        exit_level = donchian_low(daily[:-1], exit_lookback)
+        return float(daily[-1].close) <= exit_level
 
     def describe(self) -> dict:
         return {"name": self.name, "params": self.params}
