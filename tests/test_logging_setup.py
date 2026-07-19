@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 
@@ -100,9 +101,12 @@ def test_configure_logging_verbose_false_suppresses_info_but_logs_error(tmp_path
     for handler in logger.handlers:
         handler.flush()
 
-    content = log_path.read_text()
-    assert "an info message" not in content
-    assert "an error message that should appear" in content
+    lines = [line for line in log_path.read_text().splitlines() if line]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["level"] == "ERROR"
+    assert payload["event"] == "an error message that should appear"
+    assert payload["logger"] == "keel.somemodule"
 
 
 def test_configure_logging_verbose_true_logs_info_and_error(tmp_path):
@@ -117,6 +121,9 @@ def test_configure_logging_verbose_true_logs_info_and_error(tmp_path):
     for handler in logger.handlers:
         handler.flush()
 
-    content = log_path.read_text()
-    assert "an info message that should appear" in content
-    assert "an error message that should appear too" in content
+    lines = [line for line in log_path.read_text().splitlines() if line]
+    assert len(lines) == 2
+    payloads = [json.loads(line) for line in lines]
+    assert [p["level"] for p in payloads] == ["INFO", "ERROR"]
+    assert payloads[0]["event"] == "an info message that should appear"
+    assert payloads[1]["event"] == "an error message that should appear too"

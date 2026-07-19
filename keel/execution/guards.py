@@ -68,6 +68,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from keel_core.telemetry import log_event
+
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Side
@@ -396,8 +398,13 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
             )
 
     for violation in violations:
-        logger.info(
-            "guards.check: %s %s veto -- %s", intent.product_id, intent.side, violation
+        log_event(
+            logger,
+            logging.INFO,
+            "guards.check_failed",
+            product=intent.product_id,
+            side=intent.side,
+            violation=violation,
         )
 
     return GuardResult(ok=not violations, violations=violations)

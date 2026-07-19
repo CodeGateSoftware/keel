@@ -39,6 +39,8 @@ import logging
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
+from keel_core.telemetry import log_event
+
 from keel.analysis import candles as candle_lib
 from keel.analysis import indicators, levels, regime
 from keel.strategy import indicators_cts
@@ -82,7 +84,7 @@ def evaluate(
     for rule in rules:
         setup = rule.detect(candles_by_tf)
         if setup is None:
-            logger.info("engine.evaluate: %s -- no signal (detect() found nothing)", rule.name)
+            log_event(logger, logging.INFO, "engine.no_signal", rule=rule.name)
             continue
 
         trading_gran = _trading_granularity(rule, candles_by_tf)
@@ -90,25 +92,34 @@ def evaluate(
 
         if not _is_market_buy_class(setup):
             if not _choppy_gate_ok(trading_candles):
-                logger.info(
-                    "engine.evaluate: %s %s -- rejected by choppy-regime gate",
-                    rule.name,
-                    setup.product_id,
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "engine.setup_rejected",
+                    rule=rule.name,
+                    product=setup.product_id,
+                    gate="choppy_regime",
                 )
                 continue
             if not _higher_tf_bias_ok(trading_gran, candles_by_tf):
-                logger.info(
-                    "engine.evaluate: %s %s -- rejected by higher-TF bearish-bias gate",
-                    rule.name,
-                    setup.product_id,
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "engine.setup_rejected",
+                    rule=rule.name,
+                    product=setup.product_id,
+                    gate="higher_tf_bias",
                 )
                 continue
             if not _kill_zone_ok(setup, rr_floor):
-                logger.info(
-                    "engine.evaluate: %s %s -- rejected by kill-zone R:R floor gate (rr_floor=%s)",
-                    rule.name,
-                    setup.product_id,
-                    rr_floor,
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "engine.setup_rejected",
+                    rule=rule.name,
+                    product=setup.product_id,
+                    gate="kill_zone_rr",
+                    rr_floor=rr_floor,
                 )
                 continue
 
@@ -127,16 +138,17 @@ def evaluate(
             ts=setup.ts,
         )
         signals.append(signal)
-        logger.info(
-            "engine.evaluate: %s %s -- ENTER signal emitted cts_score=%s entry_technique=%s "
-            "entry=%s stop=%s target=%s",
-            rule.name,
-            setup.product_id,
-            cts_result.total,
-            technique,
-            setup.entry,
-            setup.stop,
-            setup.target,
+        log_event(
+            logger,
+            logging.INFO,
+            "engine.setup_detected",
+            rule=rule.name,
+            product=setup.product_id,
+            cts_score=cts_result.total,
+            technique=technique,
+            entry=setup.entry,
+            stop=setup.stop,
+            target=setup.target,
         )
 
         if repo is not None:
