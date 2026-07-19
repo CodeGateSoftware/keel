@@ -8,6 +8,12 @@ cannot be aggregated, and fixing that later means rewriting every call site.
 `cycle_id` correlates every event emitted during one engine loop. Once apps are separate
 processes it becomes the trace ID, so it is carried in a `ContextVar` rather than threaded
 through call signatures.
+
+The stable payload keys (`ts`, `level`, `logger`, `event`, `cycle_id`, `exc`) are reserved: a
+caller-supplied field with one of those names is never dropped and never allowed to overwrite the
+real value. It is renamed to a `field_`-prefixed key instead (`ts` -> `field_ts`). Raising on
+collision was rejected -- a logging call must never take down the trade loop, so a rare
+caller/library naming clash degrades to a renamed field rather than an exception.
 """
 
 from __future__ import annotations
@@ -23,10 +29,9 @@ _cycle_id: ContextVar[str | None] = ContextVar("keel_cycle_id", default=None)
 # Attribute name under which `log_event` stashes structured fields on a LogRecord.
 _FIELDS_ATTR = "keel_fields"
 
-# LogRecord attributes that are never structured fields.
-_RESERVED = frozenset(
-    {"args", "exc_info", "exc_text", "msg", "message", "stack_info", _FIELDS_ATTR}
-)
+# Stable payload keys written directly by `JsonFormatter.format`. A caller field with one of
+# these names is renamed (not dropped, not allowed to overwrite) -- see module docstring.
+_RESERVED = frozenset({"ts", "level", "logger", "event", "cycle_id", "exc"})
 
 
 def new_cycle_id() -> str:
@@ -44,12 +49,18 @@ def current_cycle() -> str | None:
     return _cycle_id.get()
 
 
-def log_event(logger: logging.Logger, level: int, event: str, **fields: Any) -> None:
+def log_event(logger: logging.Logger, level: int, event: str, /, **fields: Any) -> None:
     """Emit a structured `event` with arbitrary `fields` attached.
 
-    `event` must be a stable identifier. `fields` values must be JSON-serialisable or have a
-    useful `str()` -- `JsonFormatter` falls back to `str()` rather than raising, because a
+    `logger`, `level`, and `event` are positional-only so a caller field of the same name
+    (e.g. `event="x"`) can never collide with these parameters and raise `TypeError` -- a
     logging call must never take down the trade loop.
+
+    `event` must be a stable identifier. `fields` values must be JSON-serialisable or have a
+    useful `str()` -- `JsonFormatter` falls back to `str()` rather than raising, for the same
+    reason. A field whose name collides with a reserved payload key (`ts`, `level`, `logger`,
+    `event`, `cycle_id`, `exc`) is renamed to `field_<name>` by `JsonFormatter`, never dropped
+    and never allowed to overwrite the real value.
     """
     logger.log(level, event, extra={_FIELDS_ATTR: fields})
 
@@ -72,8 +83,9 @@ class JsonFormatter(logging.Formatter):
         fields = getattr(record, _FIELDS_ATTR, None)
         if isinstance(fields, dict):
             for key, value in fields.items():
-                if key not in _RESERVED:
-                    payload[key] = value
+                # Reserved keys are renamed rather than dropped or allowed to overwrite the
+                # stable payload key -- see module docstring.
+                payload[f"field_{key}" if key in _RESERVED else key] = value
 
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)

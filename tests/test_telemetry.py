@@ -57,3 +57,46 @@ def test_output_is_one_json_object_per_line(caplog) -> None:
 
 def test_new_cycle_id_is_unique() -> None:
     assert telemetry.new_cycle_id() != telemetry.new_cycle_id()
+
+
+def test_reserved_key_collision_is_renamed_not_dropped(caplog) -> None:
+    payload = _capture(
+        caplog,
+        lambda log: telemetry.log_event(
+            log, logging.INFO, "order.rejected", ts="not-a-timestamp", cycle_id="spoofed"
+        ),
+    )
+    # The stable `ts` key still holds the record's real numeric timestamp.
+    assert isinstance(payload["ts"], float)
+    # The caller's colliding value is preserved under a `field_`-prefixed key.
+    assert payload["field_ts"] == "not-a-timestamp"
+    assert payload["field_cycle_id"] == "spoofed"
+
+
+def test_event_level_logger_fields_do_not_raise(caplog) -> None:
+    payload = _capture(
+        caplog,
+        lambda log: telemetry.log_event(
+            log, logging.INFO, "order.rejected", event="x", level="y", logger="z"
+        ),
+    )
+    assert payload["event"] == "order.rejected"
+    assert payload["level"] == "INFO"
+    assert payload["logger"] == "keel.test"
+    assert payload["field_event"] == "x"
+    assert payload["field_level"] == "y"
+    assert payload["field_logger"] == "z"
+
+
+def test_non_serialisable_field_falls_back_to_str(caplog) -> None:
+    class Weird:
+        def __str__(self) -> str:
+            return "weird-repr"
+
+    payload = _capture(
+        caplog,
+        lambda log: telemetry.log_event(
+            log, logging.INFO, "agent.cycle_start", obj=Weird()
+        ),
+    )
+    assert payload["obj"] == "weird-repr"
