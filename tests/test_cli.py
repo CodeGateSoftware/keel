@@ -985,3 +985,26 @@ def test_insights_stub(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "not yet implemented" in result.output
+
+
+def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
+    """Spec 10.2's `venue` field arrives from ONE binding at the CLI entry point.
+
+    It is deliberately not passed into the ~26 `log_event` call sites: the engine is
+    single-venue today, so threading a constant through every payload would mean revisiting
+    all of them again the moment it isn't. This asserts the single binding actually happens on
+    the real command path -- without it, every event silently loses `venue` and no unit test
+    of `telemetry` would notice.
+    """
+    from keel_core import telemetry
+
+    from keel.execution.guards import DEFAULT_VENUE
+
+    assert telemetry.current_venue() is None
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "keel.db"), "subscription", "show"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert telemetry.current_venue() == DEFAULT_VENUE

@@ -56,6 +56,7 @@ from typing import Any
 
 import click
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.telemetry import bind_venue
 
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
@@ -166,6 +167,12 @@ def _load_cfg(ctx: click.Context) -> Config:
     if ctx.obj.get("verbose"):
         config = replace(config, logging=replace(config.logging, verbose=True))
     configure_logging(config.logging)
+    # Spec §10.2 names `venue` a stable field on every event. Bound once here, at the one
+    # process entry point, rather than passed into ~26 `log_event` call sites -- the engine is
+    # single-venue today, so threading a constant through every payload would mean revisiting
+    # all of them again the moment it stops being one. A process driving several venues rebinds
+    # per cycle instead; nothing else changes.
+    bind_venue(DEFAULT_VENUE)
     return config
 
 

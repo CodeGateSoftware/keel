@@ -72,9 +72,21 @@ Deferred to later plans (agreed with final reviewer) — status as of 2026-07-19
 - [x] bind_cycle clobbers rather than restores — DONE (2057bf2). Now returns a ContextVar
       token; `unbind_cycle` resets it. Two tests pin the nesting, both verified to fail
       against the old clobbering behaviour by mutation.
-- [ ] `venue` absent from event payloads — STILL OPEN, needs a decision. `guards.py` gained
-      `venue=DEFAULT_VENUE` incidentally during the subscription work, but that is one event.
-      Doing it properly means deciding WHICH events carry it, which is step-4 plan scope.
+- [x] `venue` absent from event payloads — DONE. The spec deferred this to step 4 to avoid
+      "revisiting 31 call sites twice", but that reasoning assumed venue had to be a
+      per-payload field. It doesn't: `cycle_id` already showed the pattern, so `venue` is now
+      a ContextVar injected by `JsonFormatter`, bound once at the CLI entry point. One call
+      site, not 26 (the real count); step 4 rebinds per cycle rather than rewriting payloads.
+      A caller-supplied `venue=` overrides the ambient one, because an event may report on a
+      venue other than the one the process drives (`subscription.attestation_overdue` does).
+      Verified end-to-end: a real event through the real formatter to a real log file carries
+      `"venue": "coinbase"`. Mutation-tested by deleting the binding.
+
+      **Found while doing it:** the binding is process-lifetime by design, so it leaked across
+      tests sharing one interpreter — `test_venue_absent_when_unbound` passed or failed
+      depending on whether a CLI test ran first. An autouse fixture in `tests/conftest.py` now
+      clears both telemetry ContextVars between tests. The leak was test-only; production
+      binds once per process, which is correct.
 - [ ] keel-core version specifier — NOT YET APPLICABLE. Condition is "when first published";
       it is still a workspace dep (`keel-core = { workspace = true }`).
 - [x] load_config golden fixture (PREREQUISITE for step 4) — DONE (2f8e09e). Two goldens:

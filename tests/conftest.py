@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from keel_core import telemetry
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 if TYPE_CHECKING:
@@ -106,6 +107,21 @@ subscription:
   unsubscribed_allowance_usd: 0
   pacing: opportunistic
 """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry_context():
+    """Clear the telemetry ContextVars between tests.
+
+    `venue` and `cycle_id` are process-lifetime bindings by design -- the CLI binds venue once
+    in `_load_cfg` and never unbinds, which is right for a real process but leaks across tests
+    sharing one interpreter. Without this, whether `test_venue_absent_when_unbound` passes
+    depends on whether a CLI test ran first, which is exactly the kind of order-dependence that
+    makes a suite untrustworthy.
+    """
+    yield
+    telemetry.bind_venue(None)
+    telemetry.bind_cycle(None)
 
 
 @pytest.fixture

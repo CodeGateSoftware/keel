@@ -26,6 +26,13 @@ from typing import Any
 
 _cycle_id: ContextVar[str | None] = ContextVar("keel_cycle_id", default=None)
 
+# The venue this process is trading (spec §10.2 names `venue` a stable field). Carried in a
+# ContextVar for the same reason `cycle_id` is: threading it through every `log_event` call
+# would mean touching every call site now, and touching them all again when the engine stops
+# being single-venue -- which is exactly the double revisit §10.2 warns about. Bound once at
+# app startup today; bound per-cycle when a process drives more than one venue.
+_venue: ContextVar[str | None] = ContextVar("keel_venue", default=None)
+
 # Attribute name under which `log_event` stashes structured fields on a LogRecord.
 _FIELDS_ATTR = "keel_fields"
 
@@ -53,6 +60,28 @@ def bind_cycle(cycle_id: str | None) -> Token[str | None]:
 def unbind_cycle(token: Token[str | None]) -> None:
     """Restore the cycle id bound before the matching `bind_cycle`."""
     _cycle_id.reset(token)
+
+
+def bind_venue(venue: str | None) -> Token[str | None]:
+    """Bind (or clear, with `None`) the venue attached to subsequent events.
+
+    Returns a token for `unbind_venue`, same contract as `bind_cycle`.
+
+    This is a *default*, not a computed field: a caller that passes `venue=` to `log_event`
+    overrides it for that event. That is deliberate -- `subscription.attestation_overdue`
+    reports on a specific venue's record, which need not be the one the process is driving.
+    """
+    return _venue.set(venue)
+
+
+def unbind_venue(token: Token[str | None]) -> None:
+    """Restore the venue bound before the matching `bind_venue`."""
+    _venue.reset(token)
+
+
+def current_venue() -> str | None:
+    """The currently bound venue, if any."""
+    return _venue.get()
 
 
 def current_cycle() -> str | None:
@@ -99,6 +128,14 @@ class JsonFormatter(logging.Formatter):
         cycle = _cycle_id.get()
         if cycle is not None:
             payload["cycle_id"] = cycle
+
+        # Written BEFORE caller fields, and deliberately not in `_RESERVED`: the bound venue is
+        # an ambient default that an explicit `venue=` on the call site overrides. Contrast
+        # `cycle_id`, which is computed and must not be forgeable -- a caller field named
+        # `cycle_id` is renamed rather than allowed to win.
+        venue = _venue.get()
+        if venue is not None:
+            payload["venue"] = venue
 
         fields = getattr(record, _FIELDS_ATTR, None)
         if isinstance(fields, dict):

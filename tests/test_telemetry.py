@@ -198,3 +198,70 @@ def test_run_once_style_unwind_preserves_an_enclosing_trace(caplog) -> None:
         assert payload["cycle_id"] == "outer-trace"
     finally:
         telemetry.unbind_cycle(outer)
+
+
+def test_bound_venue_is_attached_to_every_event(caplog) -> None:
+    """Spec 10.2 names `venue` a stable field. It is bound once, not passed per call site."""
+    token = telemetry.bind_venue("coinbase")
+    try:
+        payload = _capture(
+            caplog, lambda log: telemetry.log_event(log, logging.INFO, "agent.cycle_start")
+        )
+        assert payload["venue"] == "coinbase"
+    finally:
+        telemetry.unbind_venue(token)
+
+
+def test_venue_absent_when_unbound(caplog) -> None:
+    payload = _capture(
+        caplog, lambda log: telemetry.log_event(log, logging.INFO, "agent.cycle_start")
+    )
+    assert "venue" not in payload
+
+
+def test_an_explicit_venue_overrides_the_bound_one(caplog) -> None:
+    """`venue` is an ambient DEFAULT, not a computed field.
+
+    `subscription.attestation_overdue` reports on a specific venue's record, which need not be
+    the venue the process is driving -- so a call site that names one must win. Contrast
+    `cycle_id` below, which is computed and must not be forgeable.
+    """
+    token = telemetry.bind_venue("coinbase")
+    try:
+        payload = _capture(
+            caplog,
+            lambda log: telemetry.log_event(
+                log, logging.WARNING, "subscription.attestation_overdue", venue="kraken"
+            ),
+        )
+        assert payload["venue"] == "kraken"
+    finally:
+        telemetry.unbind_venue(token)
+
+
+def test_an_explicit_cycle_id_is_still_renamed_not_honoured(caplog) -> None:
+    """The contrast that makes the venue rule deliberate rather than an oversight."""
+    token = telemetry.bind_cycle("real-cycle")
+    try:
+        payload = _capture(
+            caplog,
+            lambda log: telemetry.log_event(
+                log, logging.INFO, "agent.cycle_start", cycle_id="forged"
+            ),
+        )
+        assert payload["cycle_id"] == "real-cycle"
+        assert payload["field_cycle_id"] == "forged"
+    finally:
+        telemetry.unbind_cycle(token)
+
+
+def test_unbind_venue_restores_the_outer_venue() -> None:
+    outer = telemetry.bind_venue("coinbase")
+    try:
+        inner = telemetry.bind_venue("kraken")
+        assert telemetry.current_venue() == "kraken"
+        telemetry.unbind_venue(inner)
+        assert telemetry.current_venue() == "coinbase"
+    finally:
+        telemetry.unbind_venue(outer)
+    assert telemetry.current_venue() is None

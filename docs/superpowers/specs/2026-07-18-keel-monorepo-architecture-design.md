@@ -481,6 +481,18 @@ own, but all are cheap where listed and progressively more annoying if they drif
 | 6 | `keel-core` is declared with no version specifier in the root `pyproject.toml` | first publish | Correct under `[tool.uv.sources] workspace = true`; only matters if a non-workspace install could resolve it from PyPI |
 | 7 | `mode=str(mode)` (`keel/agent.py`) is a redundant cast — `_confirm_or_bypass` is annotated `-> tuple[str, str | None]` | any time | Cosmetic; provably a no-op |
 
+**Status as of 2026-07-19** (see `docs/superpowers/reports/2026-07-18-keel-monorepo-foundation-execution.md`):
+
+| # | Status |
+|---|---|
+| 1 | **Done.** Removed from root `pyproject.toml`; verified by grep that `keel/` imports neither. |
+| 2 | Still open, still assigned to step 3 — `cb_client.py` is rewritten there, so normalising now is throwaway work. |
+| 3 | Still open, still step 4. |
+| 4 | **Done, ahead of schedule, by a different mechanism than this table assumed.** The deferral reasoning was "avoids revisiting 31 call sites twice" — but `venue` need not be a per-payload field at all. It is now a `ContextVar` injected by `JsonFormatter`, exactly like `cycle_id`, bound once at the CLI entry point. That is **1** call site, not 26 (the real count), and step 4 rebinds per cycle rather than rewriting payloads. The double-revisit this table warned about never applies. A caller-supplied `venue=` still overrides the ambient one, because an event may report on a venue other than the one the process drives. |
+| 5 | **Done, ahead of schedule.** `bind_cycle` now returns a token and `unbind_cycle` resets it; two tests pin the nesting, both verified against the old behaviour by mutation. |
+| 6 | Not yet applicable — still a workspace dep, never published. |
+| 7 | **Done.** |
+
 Items 3 and 4 are the two worth watching. Both are *cheap now and expensive later* in the same
 way §10.2 describes: each additional app that lands before they are fixed multiplies the call
 sites that must change.
