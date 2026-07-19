@@ -1087,3 +1087,81 @@ def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path):
     after = _repo_at(db_path)
     assert after.get_state("equity_high_water_mark") is None
     assert after.get_state("drawdown_total_pct") == Decimal("0")
+
+
+def test_record_flow_rebases_the_high_water_mark(tmp_path):
+    """A deposit is not profit and a withdrawal is not a loss, but equity is cash + positions so
+    both move it. Declaring the flow keeps rail 11's drawdown measuring TRADING performance."""
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "record-flow", "--amount", "5000", "--passphrase", PASSPHRASE],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("15000")
+
+
+def test_record_flow_accepts_a_negative_amount_for_a_withdrawal(tmp_path):
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("equity_high_water_mark", Decimal("15000"))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "record-flow", "--amount", "-5000", "--passphrase", PASSPHRASE],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("10000")
+
+
+def test_record_flow_is_passphrase_gated(tmp_path):
+    """Lowering the HWM relaxes a live-money breaker, so this is a dangerous action: an
+    unauthenticated caller must not be able to shrink a measured drawdown."""
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("equity_high_water_mark", Decimal("15000"))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "record-flow", "--amount", "-5000", "--passphrase", "wrong-passphrase"],
+    )
+
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("15000")
+
+
+def test_record_flow_rejects_a_non_finite_amount(tmp_path):
+    """`Decimal("nan")` parses without raising. Written into the high-water mark it poisons it
+    permanently: every later `equity > hwm` is False, so the HWM can never re-seed."""
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "record-flow", "--amount", "nan", "--passphrase", PASSPHRASE],
+    )
+
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("10000")
