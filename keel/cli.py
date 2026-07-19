@@ -177,7 +177,7 @@ def _ensure_subscription_seeded(repo: Repository, config: Config, now_ts: int) -
     """
     if repo.get_state("subscription") is None:
         repo.set_subscription(
-            config.subscription.monthly_allowance_usd, config.subscription.pacing, now_ts
+            config.subscription.assumed_free_volume_usd, config.subscription.pacing, now_ts
         )
 
 

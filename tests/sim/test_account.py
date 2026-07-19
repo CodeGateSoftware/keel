@@ -46,7 +46,7 @@ def _config(
     max_per_day_usd: Decimal = Decimal("1000000"),
     max_exposure_usd: Decimal = Decimal("1000000"),
     max_per_asset_pct: Decimal = Decimal("1"),
-    monthly_allowance_usd: Decimal = Decimal("500"),
+    assumed_free_volume_usd: Decimal = Decimal("500"),
     pacing: str = "opportunistic",
 ) -> Config:
     return Config(
@@ -61,7 +61,7 @@ def _config(
         ),
         market_data=MarketDataConfig(granularities=[], history_days=365),
         subscription=SubscriptionConfig(
-            monthly_allowance_usd=monthly_allowance_usd, pacing=pacing
+            assumed_free_volume_usd=assumed_free_volume_usd, pacing=pacing
         ),
     )
 
@@ -249,7 +249,7 @@ def test_usdc_funding_passes_when_cash_exactly_covers_notional(sim_config):
 
 
 def test_monthly_allowance_caps_cumulative_buys(sim_config):
-    # sim_config.subscription.monthly_allowance_usd == 500
+    # sim_config.subscription.assumed_free_volume_usd == 500
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)  # plenty of cash; allowance is the binding cap
     acc.open(_intent(notional=Decimal("450")), fill_price=Decimal("10"), now_ts=DAY0)
@@ -278,7 +278,7 @@ def test_monthly_allowance_even_daily_pacing_vetoes_a_burst_within_the_flat_cap(
     acc.deposit(Decimal("100000"), JAN15)
     # 2024-01-15 (Monday) is business day 10 of 23 in Jan 2024 -> paced cap = 220/23*10 ~ 95.65,
     # tighter than the 220 flat monthly cap.
-    config = _config(monthly_allowance_usd=Decimal("220"), pacing="even_daily")
+    config = _config(assumed_free_volume_usd=Decimal("220"), pacing="even_daily")
 
     ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, JAN15)
 
@@ -289,7 +289,7 @@ def test_monthly_allowance_even_daily_pacing_vetoes_a_burst_within_the_flat_cap(
 def test_monthly_allowance_opportunistic_pacing_ignores_the_business_day_pace():
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), JAN15)
-    config = _config(monthly_allowance_usd=Decimal("220"), pacing="opportunistic")
+    config = _config(assumed_free_volume_usd=Decimal("220"), pacing="opportunistic")
 
     ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, JAN15)
 
@@ -315,7 +315,7 @@ def test_month_volume_includes_sell_notional_unlike_guards_buy_only_spend():
     )
     acc.close("BTC", fill_price=Decimal("100"), now_ts=DAY0)  # +200 volume: 400 total this month
 
-    config = _config(monthly_allowance_usd=Decimal("350"))  # buy-only spend (200) fits; volume
+    config = _config(assumed_free_volume_usd=Decimal("350"))  # buy-only spend (200) fits; volume
     # (400) doesn't.
 
     ok, reasons = acc.can_open(_intent(notional=Decimal("1")), config, DAY0)
@@ -375,7 +375,7 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
     )
     account.close("BTC", fill_price=Decimal("100"), now_ts=now_ts - 30)
 
-    config = _config(monthly_allowance_usd=Decimal("200"))  # guards: 150 buy-spend, room for 50
+    config = _config(assumed_free_volume_usd=Decimal("200"))  # guards: 150 buy-spend, room for 50
     # more; sim: 300 volume already exceeds 200 outright.
     order_intent = OrderIntent(
         product_id="BTC-USD", side=Side.BUY, qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
@@ -400,7 +400,7 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
 def test_max_affordable_notional_bound_by_cash_when_it_is_the_tightest_cap():
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("500"), DAY0)
-    config = _config(monthly_allowance_usd=Decimal("1000000"))
+    config = _config(assumed_free_volume_usd=Decimal("1000000"))
 
     headroom = acc.max_affordable_notional("BTC", config, DAY0)
 
@@ -413,7 +413,7 @@ def test_max_affordable_notional_bound_by_per_asset_concentration():
     config = _config(
         max_exposure_usd=Decimal("1000"),
         max_per_asset_pct=Decimal("0.1"),
-        monthly_allowance_usd=Decimal("1000000"),
+        assumed_free_volume_usd=Decimal("1000000"),
     )
 
     headroom = acc.max_affordable_notional("BTC", config, DAY0)
@@ -424,7 +424,7 @@ def test_max_affordable_notional_bound_by_per_asset_concentration():
 def test_max_affordable_notional_bound_by_total_exposure():
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)
-    config = _config(max_exposure_usd=Decimal("500"), monthly_allowance_usd=Decimal("1000000"))
+    config = _config(max_exposure_usd=Decimal("500"), assumed_free_volume_usd=Decimal("1000000"))
     acc.open(_intent(asset="ETH", notional=Decimal("300")), Decimal("100"), DAY0)
 
     headroom = acc.max_affordable_notional("BTC", config, DAY0)
@@ -435,7 +435,7 @@ def test_max_affordable_notional_bound_by_total_exposure():
 def test_max_affordable_notional_bound_by_monthly_allowance():
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)
-    config = _config(monthly_allowance_usd=Decimal("75"))
+    config = _config(assumed_free_volume_usd=Decimal("75"))
 
     headroom = acc.max_affordable_notional("BTC", config, DAY0)
 
@@ -448,7 +448,7 @@ def test_max_affordable_notional_combines_rule_and_dca_notional_for_the_same_ass
     config = _config(
         max_exposure_usd=Decimal("1000"),
         max_per_asset_pct=Decimal("0.5"),
-        monthly_allowance_usd=Decimal("1000000"),
+        assumed_free_volume_usd=Decimal("1000000"),
     )
     acc.open(_intent(asset="BTC", notional=Decimal("100")), Decimal("100"), DAY0, dca=True)
 
@@ -460,7 +460,7 @@ def test_max_affordable_notional_combines_rule_and_dca_notional_for_the_same_ass
 def test_max_affordable_notional_never_goes_negative():
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)
-    config = _config(monthly_allowance_usd=Decimal("100"))
+    config = _config(assumed_free_volume_usd=Decimal("100"))
     acc.open(_intent(asset="BTC", notional=Decimal("100000")), Decimal("100"), DAY0)  # blows
     # every cap except the ones already-open exposure doesn't touch
 
@@ -491,7 +491,7 @@ def test_dca_is_not_exempt_from_the_per_order_cap():
 def test_can_open_collects_multiple_violations_without_short_circuiting(sim_config):
     acc = SimAccount(Decimal("0"), Decimal("0"))
     # no deposit -- cash_usdc stays 0, so usdc_funding always trips too
-    config = _config(max_per_order_usd=Decimal("10"), monthly_allowance_usd=Decimal("5"))
+    config = _config(max_per_order_usd=Decimal("10"), assumed_free_volume_usd=Decimal("5"))
 
     ok, reasons = acc.can_open(_intent(notional=Decimal("50")), config, DAY0)
 
@@ -889,7 +889,7 @@ def test_parity_with_guards_check_opportunistic_pacing():
         max_per_day_usd=Decimal("280"),
         max_exposure_usd=Decimal("1000"),
         max_per_asset_pct=Decimal("0.55"),
-        monthly_allowance_usd=Decimal("500"),
+        assumed_free_volume_usd=Decimal("500"),
         pacing="opportunistic",
     )
 
@@ -915,7 +915,7 @@ def test_parity_with_guards_check_even_daily_pacing():
         max_per_day_usd=Decimal("280"),
         max_exposure_usd=Decimal("1000"),
         max_per_asset_pct=Decimal("0.55"),
-        monthly_allowance_usd=Decimal("2000"),
+        assumed_free_volume_usd=Decimal("2000"),
         pacing="even_daily",
     )
 

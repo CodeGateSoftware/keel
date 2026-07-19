@@ -62,7 +62,12 @@ dca:
 quote_currency: USDC
 
 subscription:
-  monthly_allowance_usd: 500
+  # The SIMULATOR's assumed fee-free monthly volume. The LIVE rail-14 cap is not set here --
+  # it comes from the attested record: `keel subscription attest --venue coinbase --tier <t>`.
+  assumed_free_volume_usd: 500
+  # What rail 14 permits on a venue that is unattested, suspect, lapsed, or overdue.
+  # 0 means such a venue cannot buy at all until it is attested.
+  unsubscribed_allowance_usd: 0
   pacing: opportunistic  # opportunistic (monthly cap only) | even_daily (also paces per business day)
 
 # Coinbase One subscription tiers (Issue #86) -- fee-free monthly TRADING VOLUME (buys + sells)

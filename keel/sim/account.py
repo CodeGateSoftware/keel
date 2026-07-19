@@ -165,7 +165,10 @@ class SimAccount:
         )
 
     def _monthly_allowance_cap(self, config: Config, now_ts: int) -> Decimal:
-        allowance = config.subscription.monthly_allowance_usd
+        # The SIMULATOR's assumed allowance, deliberately from config and never from the
+        # attested `broker_subscriptions` record: reading live state here would make backtests
+        # non-reproducible. See the subscription design spec §6.1.
+        allowance = config.subscription.assumed_free_volume_usd
         if config.subscription.pacing != "even_daily":
             return allowance
 
