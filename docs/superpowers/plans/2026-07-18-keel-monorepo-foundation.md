@@ -606,10 +606,9 @@ _cycle_id: ContextVar[str | None] = ContextVar("keel_cycle_id", default=None)
 # Attribute name under which `log_event` stashes structured fields on a LogRecord.
 _FIELDS_ATTR = "keel_fields"
 
-# LogRecord attributes that are never structured fields.
-_RESERVED = frozenset(
-    {"args", "exc_info", "exc_text", "msg", "message", "stack_info", _FIELDS_ATTR}
-)
+# Payload keys `JsonFormatter` owns. A caller field with one of these names is emitted under a
+# `field_`-prefixed key rather than overwriting the stable one -- never dropped, never raised.
+_RESERVED = frozenset({"ts", "level", "logger", "event", "cycle_id", "exc"})
 
 
 def new_cycle_id() -> str:
@@ -627,7 +626,7 @@ def current_cycle() -> str | None:
     return _cycle_id.get()
 
 
-def log_event(logger: logging.Logger, level: int, event: str, **fields: Any) -> None:
+def log_event(logger: logging.Logger, level: int, event: str, /, **fields: Any) -> None:
     """Emit a structured `event` with arbitrary `fields` attached.
 
     `event` must be a stable identifier. `fields` values must be JSON-serialisable or have a
