@@ -65,6 +65,15 @@ def log_event(logger: logging.Logger, level: int, event: str, /, **fields: Any) 
     logger.log(level, event, extra={_FIELDS_ATTR: fields})
 
 
+def log_exception(logger: logging.Logger, event: str, /, **fields: Any) -> None:
+    """Emit a structured `event` at ERROR with the active exception's traceback attached.
+
+    Use inside an `except` block. Equivalent to `log_event` at ERROR level plus `exc_info`,
+    which `JsonFormatter` renders into the payload's `exc` key.
+    """
+    logger.log(logging.ERROR, event, exc_info=True, extra={_FIELDS_ATTR: fields})
+
+
 class JsonFormatter(logging.Formatter):
     """Render a LogRecord as a single-line JSON object."""
 

@@ -26,6 +26,8 @@ import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
+from keel_core.telemetry import log_exception
+
 from keel.types import Candle, Granularity, Side
 
 logger = logging.getLogger(__name__)
@@ -132,18 +134,13 @@ class CoinbaseClient:
                 granularity=granularity.value,
             )
         except Exception:
-            logger.log(
-                logging.ERROR,
+            log_exception(
+                logger,
                 "cb_client.candles_fetch_failed",
-                exc_info=True,
-                extra={
-                    "keel_fields": {
-                        "product": product_id,
-                        "granularity": granularity,
-                        "start": start,
-                        "end": end,
-                    }
-                },
+                product=product_id,
+                granularity=granularity,
+                start=start,
+                end=end,
             )
             raise
         raw_candles = _field(response, "candles", []) or []
@@ -156,12 +153,7 @@ class CoinbaseClient:
         try:
             response = self._transport.get_product(product_id=product_id)
         except Exception:
-            logger.log(
-                logging.ERROR,
-                "cb_client.spot_fetch_failed",
-                exc_info=True,
-                extra={"keel_fields": {"product": product_id}},
-            )
+            log_exception(logger, "cb_client.spot_fetch_failed", product=product_id)
             raise
         price = _field(response, "price")
         if price is None:
@@ -173,7 +165,7 @@ class CoinbaseClient:
         try:
             response = self._transport.get_accounts()
         except Exception:
-            logger.log(logging.ERROR, "cb_client.accounts_fetch_failed", exc_info=True)
+            log_exception(logger, "cb_client.accounts_fetch_failed")
             raise
         raw_accounts = _field(response, "accounts", []) or []
         accounts = []

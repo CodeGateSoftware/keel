@@ -61,7 +61,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
-from keel_core.telemetry import log_event
+from keel_core.telemetry import log_event, log_exception
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -167,12 +167,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
     try:
         accounts = broker.get_accounts()
     except Exception:
-        logger.log(
-            logging.ERROR,
-            "executor.quote_fetch_failed",
-            exc_info=True,
-            extra={"keel_fields": {"quote_currency": quote_currency}},
-        )
+        log_exception(logger, "executor.quote_fetch_failed", quote_currency=quote_currency)
         return None
 
     for account in accounts or []:
@@ -298,11 +293,8 @@ def _run_order(
     try:
         preview = broker.preview_order(intent.product_id, intent.side, order_configuration)
     except Exception:
-        logger.log(
-            logging.ERROR,
-            "executor.preview_failed",
-            exc_info=True,
-            extra={"keel_fields": {"product": intent.product_id, "side": intent.side}},
+        log_exception(
+            logger, "executor.preview_failed", product=intent.product_id, side=intent.side
         )
         raise
     log_event(
@@ -342,17 +334,12 @@ def _run_order(
     try:
         place_result = broker.place_order(intent.product_id, intent.side, order_configuration)
     except Exception:
-        logger.log(
-            logging.ERROR,
+        log_exception(
+            logger,
             "executor.place_failed",
-            exc_info=True,
-            extra={
-                "keel_fields": {
-                    "product": intent.product_id,
-                    "side": intent.side,
-                    "order_id": order_id,
-                }
-            },
+            product=intent.product_id,
+            side=intent.side,
+            order_id=order_id,
         )
         raise
     success = bool(place_result.get("success"))

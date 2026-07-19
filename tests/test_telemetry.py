@@ -100,3 +100,65 @@ def test_non_serialisable_field_falls_back_to_str(caplog) -> None:
         ),
     )
     assert payload["obj"] == "weird-repr"
+
+
+# -- exception path (`log_exception` / `exc_info`) -------------------------------------------
+
+
+def _capture_exception(caplog, fn) -> dict:
+    """Like `_capture`, but formats the record while the exception is still live and captures
+    at ERROR level -- `log_exception` always logs at ERROR."""
+    formatter = telemetry.JsonFormatter()
+    with caplog.at_level(logging.ERROR, logger="keel.test"):
+        fn(logging.getLogger("keel.test"))
+    assert len(caplog.records) == 1
+    return json.loads(formatter.format(caplog.records[0]))
+
+
+def test_log_exception_populates_exc_with_traceback_text(caplog) -> None:
+    def fn(log: logging.Logger) -> None:
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            telemetry.log_exception(log, "executor.place_failed", product="BTC-USD")
+
+    payload = _capture_exception(caplog, fn)
+    assert payload["event"] == "executor.place_failed"
+    assert payload["level"] == "ERROR"
+    assert payload["product"] == "BTC-USD"
+    assert "exc" in payload
+    assert "ValueError: boom" in payload["exc"]
+    assert "Traceback (most recent call last)" in payload["exc"]
+
+
+def test_log_exception_payload_is_one_line_despite_traceback_newlines(caplog) -> None:
+    def fn(log: logging.Logger) -> None:
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            telemetry.log_exception(log, "executor.place_failed")
+
+    payload = _capture_exception(caplog, fn)
+    # `formatException` output is guaranteed to contain newlines (frame + traceback lines);
+    # confirm that's actually true of this payload, not a vacuously-passing assertion.
+    assert "\n" in payload["exc"]
+    # ... but once serialised into the single-line JSON payload, those newlines must be
+    # JSON-escaped (`\n`), not raw -- `JsonFormatter`'s whole contract is one object per line.
+    serialised = json.dumps(payload)
+    assert "\n" not in serialised
+
+
+def test_log_exception_field_named_exc_is_renamed_and_does_not_overwrite_traceback(
+    caplog,
+) -> None:
+    def fn(log: logging.Logger) -> None:
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            telemetry.log_exception(log, "executor.place_failed", exc="not-a-traceback")
+
+    payload = _capture_exception(caplog, fn)
+    # The real traceback still lands under the reserved `exc` key.
+    assert "ValueError: boom" in payload["exc"]
+    # The caller's colliding `exc` field is preserved, renamed, not dropped.
+    assert payload["field_exc"] == "not-a-traceback"

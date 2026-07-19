@@ -471,6 +471,7 @@ def load_secrets(env_path: str | Path = ".env") -> dict:
 
 __all__ = [
     "ConfigError",
+    "NON_BINDING_CAP_USD",
     "Caps",
     "MarketDataConfig",
     "AutoTradeConfig",
