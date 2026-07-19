@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel.config import (
     Caps,
@@ -355,7 +356,9 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
     repo = Repository(conn)
     repo.set_state("kill_switch", False)
     repo.set_state("last_feed_ts", now_ts)
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=now_ts)
+    # Subscription is attested below, once `config` (and its assumed_free_volume_usd) exists --
+    # guards.check derives its cap from the attested record, so it must match what `config`
+    # gives the sim side for this to be a genuine guards-vs-sim comparison.
     _seed_filled_buy(
         repo, product_id="BTC-USD", qty=Decimal("1.5"), price=Decimal("100"), created_at=now_ts - 60
     )
@@ -377,6 +380,12 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
 
     config = _config(assumed_free_volume_usd=Decimal("200"))  # guards: 150 buy-spend, room for 50
     # more; sim: 300 volume already exceeds 200 outright.
+    _attest(
+        repo,
+        free_volume_usd=config.subscription.assumed_free_volume_usd,
+        pacing=config.subscription.pacing,
+        now_ts=now_ts,
+    )
     order_intent = OrderIntent(
         product_id="BTC-USD", side=Side.BUY, qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
         notional=Decimal("50"), is_dca=True, rule_kind="dca", available_quote=account.cash_usdc,
@@ -740,6 +749,30 @@ def test_open_position_and_open_intent_are_plain_dataclasses():
 # -- parity with execution.guards.check ------------------------------------------------------------
 
 
+def _attest(
+    repo: Repository,
+    *,
+    free_volume_usd: Decimal | None,
+    pacing: str = "opportunistic",
+    now_ts: int,
+) -> None:
+    """Attest a coinbase subscription -- rail 14 (`guards.check`) now derives its cap from this
+    record rather than from `config.subscription`, so a guards/sim parity comparison must attest
+    a record matching whatever `config.subscription` the sim side reads."""
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=free_volume_usd,
+            pacing=pacing,
+            subscription_usd_month=Decimal("29.99"),
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=now_ts,
+            attest_due_ts=now_ts + 31_536_000,
+        )
+    )
+
+
 def _seed_filled_buy(
     repo: Repository, *, product_id: str, qty: Decimal, price: Decimal, created_at: int
 ) -> None:
@@ -813,7 +846,10 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     repo = Repository(conn)
     repo.set_state("kill_switch", False)
     repo.set_state("last_feed_ts", now_ts)
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=now_ts)
+    # No subscription attestation here -- each caller attests a record matching its own
+    # `config.subscription` (see `_attest`), since guards.check now derives its cap from the
+    # attested record while SimAccount reads `config.subscription` directly; parity requires
+    # them to agree, as an explicit setup step rather than an ambient coincidence.
 
     _seed_filled_buy(
         repo, product_id="BTC-USD", qty=Decimal("2"), price=Decimal("100"),
@@ -892,6 +928,15 @@ def test_parity_with_guards_check_opportunistic_pacing():
         assumed_free_volume_usd=Decimal("500"),
         pacing="opportunistic",
     )
+    # Attest a record matching config.subscription exactly -- guards.check derives its cap from
+    # the attested record while SimAccount reads config.subscription directly, so parity requires
+    # an explicit attestation here rather than an ambient coincidence.
+    _attest(
+        repo,
+        free_volume_usd=config.subscription.assumed_free_volume_usd,
+        pacing=config.subscription.pacing,
+        now_ts=now_ts,
+    )
 
     # boundaries: per_order=120, per_day=130 (280-150), monthly=150 (500-350) -- coincides with
     # usdc=150 (cash=150) here, per_asset=350 (0.55*1000-200), exposure=650 (1000-350, since ETH
@@ -917,6 +962,15 @@ def test_parity_with_guards_check_even_daily_pacing():
         max_per_asset_pct=Decimal("0.55"),
         assumed_free_volume_usd=Decimal("2000"),
         pacing="even_daily",
+    )
+    # Attest a record matching config.subscription exactly -- guards.check derives its cap (and
+    # its pacing) from the attested record while SimAccount reads config.subscription directly,
+    # so parity requires an explicit attestation here rather than an ambient coincidence.
+    _attest(
+        repo,
+        free_volume_usd=config.subscription.assumed_free_volume_usd,
+        pacing=config.subscription.pacing,
+        now_ts=now_ts,
     )
 
     # derive the paced boundary from the same helpers the implementation is required to reuse,

@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel.config import (
     AutoTradeConfig,
@@ -129,6 +130,32 @@ class NoNetworkBroker:
 # -- fixtures / builders ----------------------------------------------------------------------
 
 
+def _attest(
+    repo: Repository,
+    *,
+    free_volume_usd: Decimal | None,
+    status: SubscriptionStatus = SubscriptionStatus.ACTIVE,
+    pacing: str = "opportunistic",
+    attested_at: int = NOW_TS,
+    attest_due_ts: int | None = None,
+) -> None:
+    """Attest a coinbase subscription -- rail 14 now derives its cap from this record."""
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=free_volume_usd,
+            pacing=pacing,
+            subscription_usd_month=Decimal("29.99"),
+            status=status,
+            attested_at=attested_at,
+            attest_due_ts=(
+                attest_due_ts if attest_due_ts is not None else attested_at + 31_536_000
+            ),
+        )
+    )
+
+
 @pytest.fixture
 def repo() -> Repository:
     conn = connect(":memory:")
@@ -136,9 +163,9 @@ def repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
-    # A very large monthly allowance so pre-existing (non-rail-14) tests aren't incidentally
-    # tripped by it; rail-14-specific tests below override with `repo.set_subscription(...)`.
-    r.set_subscription(Decimal("10000000"), "opportunistic", now_ts=NOW_TS)
+    # A very large, attested monthly allowance so pre-existing (non-rail-14) tests aren't
+    # incidentally tripped by it; rail-14-specific tests below override with `_attest(...)`.
+    _attest(r, free_volume_usd=Decimal("10000000"))
     return r
 
 
@@ -457,7 +484,7 @@ def test_broker_place_failure_is_logged_but_not_placed(repo):
 
 
 def test_monthly_allowance_vetoes_a_buy_over_the_live_subscription_cap(repo):
-    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("100"))
     broker = FakeBroker()
     signal = _enter_signal()
 
@@ -470,16 +497,16 @@ def test_monthly_allowance_vetoes_a_buy_over_the_live_subscription_cap(repo):
 
 def test_monthly_allowance_updated_subscription_takes_effect_on_the_next_order(repo):
     """No snapshot, no restart, no config edit -- the executor doesn't cache the allowance
-    anywhere; it always flows straight through to `guards.check`'s live `repo.get_subscription()`
-    read."""
-    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    anywhere; it always flows straight through to `guards.check`'s live
+    `repo.get_broker_subscription()` read."""
+    _attest(repo, free_volume_usd=Decimal("100"))
     broker = FakeBroker()
     signal = _enter_signal()
 
     first = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
     assert first.placed is False
 
-    repo.set_subscription(Decimal("10000000"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("10000000"))
     second = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
     assert second.placed is True
 

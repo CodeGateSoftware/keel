@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel import agent
 from keel.agent import LoopResult, _build_rule, loop, run_once
@@ -150,6 +151,21 @@ def repo() -> Repository:
     # specifically exercising the arm/disarm/expiry gate itself (those call
     # `repo.disarm_bypass()` or a short ttl explicitly).
     r.arm_bypass(now_ts=0, ttl_sec=10**12)
+    # rail 14 now derives its cap from the attested subscription record rather than a config
+    # default; attest a very large allowance so pre-existing tests here (none of which exercise
+    # rail 14) aren't incidentally tripped by it.
+    r.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=Decimal("10000000"),
+            pacing="opportunistic",
+            subscription_usd_month=Decimal("29.99"),
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=0,
+            attest_due_ts=31_536_000,  # ~1 year past epoch 0, well past any `now_ts` used here
+        )
+    )
     return r
 
 

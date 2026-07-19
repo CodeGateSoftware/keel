@@ -48,14 +48,17 @@ Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
   produces USDC, it doesn't consume it).
 - Rail 14 (monthly subscription-allowance) caps this calendar month's live BUY notional (own
   spend, from the orders audit log, `_monthly_buy_spend_usd`) plus this order's notional against
-  a **live, DB-backed** subscription (`repo.get_subscription()`/`repo.set_subscription()`,
-  `data/repository.py`) -- read fresh on every `check()` call, never cached or snapshotted, so
-  updating the subscription (e.g. via `keel subscription set`) changes the enforced cap on the
-  very next order with no restart or config edit. `config.yaml`'s `subscription:` block is only
-  ever a one-time *seed* for that DB row (see `cli.py`'s `_ensure_subscription_seeded`) -- once
-  set, the DB row is authoritative. Optional `pacing="even_daily"` additionally caps cumulative
-  month-to-date spend to `monthly_allowance_usd / business_days_in_month * business_days_elapsed`
-  (Mon-Fri, no holiday calendar) so the flat monthly cap can't be blown in one early-month burst;
+  the allowance derived from the venue's **attested subscription record**
+  (`repo.get_broker_subscription`, `data/repository.py`) -- read fresh on every `check()` call,
+  never cached, so `keel subscription attest` takes effect on the very next order. The cap is
+  `free_volume_usd` from that record, so upgrading a tier changes exactly one place; it is NOT
+  typed into config. **Fails closed** like rails 12/13: an unattested venue, a `suspect` or
+  `lapsed` record, or one whose `attest_due_ts` has passed all fall back to
+  `config.subscription.unsubscribed_allowance_usd` (default 0, i.e. no spending) -- silence is
+  not consent to spend. A record with `free_volume_usd IS NULL` (Premium, unlimited and in
+  force) has no cap and the rail does not apply. Optional `pacing="even_daily"`, read from the
+  record, additionally caps cumulative month-to-date spend to
+  `allowance / business_days_in_month * business_days_elapsed` (Mon-Fri, no holiday calendar);
   `pacing="opportunistic"` (default) skips that extra check.
 """
 
@@ -68,6 +71,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import log_event
 
 from keel.config import Config
@@ -82,6 +86,12 @@ MIN_MOVE_PCT = Decimal("0.005")  # rail 7: conservative spread+fees clearance fl
 CORRELATED_SIZE_SCALE = Decimal("0.5")  # rail 5: half-size when correlated exposure is open
 UNCORRELATED_ASSETS = frozenset({"PAXG"})  # gold-backed; not "long crypto beta" (§4.1)
 FEED_STALENESS_CYCLES = 3  # rail 12: 3 missed polling cycles = stale feed
+
+# Rail 14: the engine is single-venue until the broker port lands. `OrderIntent` carries no
+# venue to key on, and inventing one before then would be a guess -- but `broker_subscriptions`
+# is venue-keyed from birth because that costs nothing and is the right shape. This constant is
+# the one line the multi-venue migration deletes (monorepo design spec §8).
+DEFAULT_VENUE = "coinbase"
 
 _ACTIVE_ORDER_STATUSES = ("pending", "filled")
 
@@ -364,38 +374,77 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
             )
 
     # 14. Monthly subscription-allowance — month-to-date live BUY spend + this order must not
-    #     exceed the *live* subscription (`repo.get_subscription()`, DB-authoritative, read fresh
-    #     on every call so a `subscription set` update takes effect immediately). DCA is NOT
-    #     exempt -- it's exactly the recurring spend this rail exists to cap (Issue #59).
+    #     exceed the allowance derived from the venue's *attested* subscription record
+    #     (`repo.get_broker_subscription`), read fresh on every call so an attestation takes
+    #     effect on the very next order. Fails closed: unattested, suspect, lapsed, or overdue
+    #     all fall back to `unsubscribed_allowance_usd` (default 0). DCA is NOT exempt -- it is
+    #     exactly the recurring spend this rail exists to cap (Issue #59).
     if is_buy:
-        subscription = repo.get_subscription()
-        allowance = subscription["monthly_allowance_usd"]
-        pacing = subscription["pacing"]
-        monthly_spend = _monthly_buy_spend_usd(repo, now_ts)
-        projected_monthly = monthly_spend + intent.notional
+        record = repo.get_broker_subscription(DEFAULT_VENUE)
+        unsubscribed = config.subscription.unsubscribed_allowance_usd
 
-        effective_cap = allowance
-        pacing_note = ""
-        if pacing == "even_daily":
-            dt = datetime.fromtimestamp(now_ts, tz=UTC)
-            biz_days_in_month = _business_days_in_month(dt.year, dt.month)
-            biz_days_elapsed = _business_days_elapsed(dt.year, dt.month, dt.day)
-            if biz_days_in_month > 0:
-                paced_cap = (allowance / biz_days_in_month) * biz_days_elapsed
-                if paced_cap < effective_cap:
-                    effective_cap = paced_cap
-                    pacing_note = (
-                        f" (even_daily pacing: {biz_days_elapsed}/{biz_days_in_month} business "
-                        f"days elapsed -> paced cap {paced_cap})"
+        if record is None:
+            allowance: Decimal | None = unsubscribed
+            degraded_reason = "no subscription has been attested"
+            pacing = "opportunistic"
+        else:
+            allowance = record.allowance_usd(now_ts, unsubscribed)
+            pacing = record.pacing
+            effective = record.effective_status(now_ts)
+            if effective is SubscriptionStatus.ACTIVE:
+                degraded_reason = ""
+            elif record.attest_due_ts <= now_ts:
+                degraded_reason = "its attestation is overdue"
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "subscription.attestation_overdue",
+                    venue=DEFAULT_VENUE,
+                    attested_at=record.attested_at,
+                    attest_due_ts=record.attest_due_ts,
+                )
+            else:
+                degraded_reason = f"its subscription is {effective.value}"
+
+        # An unlimited allowance (Premium, in force) has no cap to exceed, and pacing a cap that
+        # does not exist is meaningless -- the rail simply does not apply.
+        if allowance is not None:
+            monthly_spend = _monthly_buy_spend_usd(repo, now_ts)
+            projected_monthly = monthly_spend + intent.notional
+
+            effective_cap = allowance
+            pacing_note = ""
+            if pacing == "even_daily":
+                dt = datetime.fromtimestamp(now_ts, tz=UTC)
+                biz_days_in_month = _business_days_in_month(dt.year, dt.month)
+                biz_days_elapsed = _business_days_elapsed(dt.year, dt.month, dt.day)
+                if biz_days_in_month > 0:
+                    paced_cap = (allowance / biz_days_in_month) * biz_days_elapsed
+                    if paced_cap < effective_cap:
+                        effective_cap = paced_cap
+                        pacing_note = (
+                            f" (even_daily pacing: {biz_days_elapsed}/{biz_days_in_month} "
+                            f"business days elapsed -> paced cap {paced_cap})"
+                        )
+
+            if projected_monthly > effective_cap:
+                if degraded_reason:
+                    # A user in this state is not over budget -- they have no budget. Telling
+                    # them "0 exceeds 0" would be true and useless.
+                    violations.append(
+                        f"subscription_unattested: {DEFAULT_VENUE} cannot spend because "
+                        f"{degraded_reason}, so its allowance is the unsubscribed default "
+                        f"{unsubscribed}. Run `keel subscription attest --venue "
+                        f"{DEFAULT_VENUE} --tier <tier>` to restore it."
                     )
-
-        if projected_monthly > effective_cap:
-            remaining = max(effective_cap - monthly_spend, Decimal("0"))
-            violations.append(
-                "monthly_subscription_allowance: month-to-date BUY spend "
-                f"{monthly_spend} + {intent.notional} = {projected_monthly} exceeds the "
-                f"allowance cap {effective_cap}{pacing_note} -- remaining allowance {remaining}"
-            )
+                else:
+                    remaining = max(effective_cap - monthly_spend, Decimal("0"))
+                    violations.append(
+                        "monthly_subscription_allowance: month-to-date BUY spend "
+                        f"{monthly_spend} + {intent.notional} = {projected_monthly} exceeds the "
+                        f"allowance cap {effective_cap}{pacing_note} -- remaining allowance "
+                        f"{remaining}"
+                    )
 
     for violation in violations:
         log_event(
