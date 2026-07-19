@@ -53,6 +53,16 @@ rail 11, which already exempts DCA (§12.6).
 → Candidate **rail 16**, `config.money_mgmt`-driven (`max_consecutive_losses`, `cooloff_*`), swept by
 the backtester. **Unvalidated** — the source offers no evidence, only a practice.
 
+**Where the threshold comes from.** `stats.max_losing_streak` (`strategy/stats.py:41`) is currently a
+statistic with **no consumer** — this rail is its consumer. The breaker's threshold should be set
+*above* the strategy's own historically-tested max losing streak, or it will fire on normal variance and
+stand the system down during runs it was designed to survive. A separate coaching source (tier1trading,
+not extracted — psychology saturated per §26) independently names *"the largest losing streak you've
+tested"* as one of four numbers a trader must know before risking money, alongside win rate, average
+R:R and expectancy — all four of which `BacktestResult` already computes (`stats.py:35–41`). So the
+sizing input already exists and is already produced by the backtester; it simply has nothing reading it
+yet.
+
 ### 57.2 Two exit parameters we have no equivalent for (T3 list)
 
 The article's Table 3 lists 11 exit strategies. Nine are saturated (retest of swing high/low, fixed
