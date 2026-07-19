@@ -541,3 +541,74 @@ def test_loop_stops_immediately_when_stop_flag_is_already_true(repo):
     results = loop(broker, repo, _config(), interval_sec=0, stop_flag=lambda: True)
 
     assert results == []
+
+
+# -- rail 11: the equity/drawdown producer must run as part of the CYCLE ----------------------
+
+
+def test_run_once_writes_the_drawdown_scalars(repo: Repository) -> None:
+    """Rail 11's inputs must be produced by the CYCLE, not only by a directly-called helper.
+
+    Without this, `tests/execution/test_equity.py` passes in full while `run_once` never calls
+    the producer -- exactly the state that left rail 11 unable to trip for the whole life of the
+    project. The unit tests there cannot catch it; only this one can.
+    """
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("drawdown_total_pct") is not None
+    assert repo.get_state("equity_high_water_mark") is not None
+
+
+def test_run_once_skips_the_drawdown_update_when_the_quote_balance_is_unreadable(
+    repo: Repository,
+) -> None:
+    """Equity is unknowable without the quote balance, and a wrong equity corrupts the
+    high-water mark PERMANENTLY -- an HWM cannot be walked back, so an under-read arms the
+    breaker on a phantom drawdown forever after. Skip and keep last cycle's scalars instead."""
+
+    class _BrokenAccountsBroker(FakeBroker):
+        def get_accounts(self) -> list[dict[str, Any]]:
+            raise RuntimeError("broker down")
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = _BrokenAccountsBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("equity_high_water_mark") is None
+    assert repo.get_state("drawdown_total_pct") is None
+
+
+def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) -> None:
+    """Pins the VALUE, not just the presence, of the scalars.
+
+    `test_run_once_writes_the_drawdown_scalars` only asserts the keys are non-None, so a
+    `_mark_to_market_equity` that returned a constant would satisfy it while leaving the breaker
+    permanently at 0% in production. Drop the quote balance 30% between two cycles and require
+    the drawdown to track it.
+    """
+
+    class _DecliningBroker(FakeBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.balance = Decimal("10000")
+
+        def get_accounts(self) -> list[dict[str, Any]]:
+            return [{"currency": "USDC", "available_balance": self.balance}]
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = _DecliningBroker(series=series)
+    now = 1_000 + 29 * 86_400
+
+    run_once(broker, repo, _config(), now_ts=now)
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000")
+    assert repo.get_state("drawdown_total_pct") == Decimal("0")
+
+    broker.balance = Decimal("7000")
+    run_once(broker, repo, _config(), now_ts=now + 86_400)
+
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000")  # never falls
+    assert repo.get_state("drawdown_total_pct") == Decimal("0.3")

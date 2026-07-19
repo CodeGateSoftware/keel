@@ -60,8 +60,9 @@ from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycl
 from keel.config import Config
 from keel.data import market_feed
 from keel.data.repository import Repository
+from keel.execution import equity as equity_mod
 from keel.execution import executor, streak
-from keel.execution.executor import ExecutionResult
+from keel.execution.executor import ExecutionResult, _fetch_available_quote
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
@@ -194,6 +195,47 @@ def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
     if isinstance(raw, str):
         return {"rule_name": raw, "opened_at": None, "entry_fill": None, "qty": None}
     return raw
+
+
+def _mark_to_market_equity(
+    repo: Repository,
+    broker: Any,
+    products: list[str],
+    price_by_product: dict[str, Decimal],
+    quote_currency: str,
+) -> Decimal | None:
+    """Quote balance + mark-to-market value of every open position, or `None` if the quote
+    balance could not be read.
+
+    Unrealized P&L is included on purpose: a breaker that saw only realized P&L would read 0%
+    while a position bled and would notice only after the loss was booked -- backwards for a
+    circuit breaker, which has to fire WHILE you are losing.
+
+    A held product with no fresh price this cycle is valued at its ENTRY fill rather than
+    dropped: dropping it would understate equity and could trip rail 11 on a data gap rather
+    than on a loss. That is why this iterates `products` and not `price_by_product` -- a product
+    missing from the price map is exactly the case the fallback exists for.
+
+    `None`, rather than a partial total, when the quote balance is unavailable: equity is simply
+    unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM never
+    falls, so an under-read arms the breaker on a phantom drawdown from then on).
+    """
+    quote = _fetch_available_quote(broker, quote_currency)
+    if quote is None:
+        return None
+
+    total = quote
+    for product_id in products:
+        position = _position_state(repo, product_id)
+        if position is None or position.get("qty") is None:
+            continue
+        mark = price_by_product.get(product_id) or position.get("entry_fill")
+        if mark is None:
+            # No price and no entry context (a legacy bare-string position) -- cannot value it.
+            # Same posture as the outcome producer: skip rather than fabricate a number.
+            continue
+        total += position["qty"] * mark
+    return total
 
 
 def _handle_exits(
@@ -372,6 +414,27 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
         enter_results: list[ExecutionResult] = []
         exit_results: list[ExecutionResult] = []
         stale_products: list[str] = []
+
+        # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
+        # written the candles, so every product's latest price is readable here -- and it has to
+        # be done now, not after the loop: `guards.check` reads these scalars from inside
+        # `executor.execute`, which runs *within* the loop, so producing them afterwards would
+        # let through exactly the entries the breaker exists to veto and fire a cycle late.
+        latest_price_by_product: dict[str, Decimal] = {}
+        if finest is not None:
+            for product_id in products:
+                product_candles = repo.get_candles(product_id, finest)
+                if product_candles:
+                    latest_price_by_product[product_id] = product_candles[-1].close
+
+        equity_now = _mark_to_market_equity(
+            repo, broker, products, latest_price_by_product, config.quote_currency
+        )
+        if equity_now is None:
+            # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
+            log_event(logger, logging.WARNING, "agent.equity_unavailable")
+        else:
+            equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
 
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
