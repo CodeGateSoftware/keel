@@ -3,12 +3,20 @@
 `SimAccount` is a self-contained, read-only-of-the-broker stand-in for a live keel account: it
 tracks cash, open positions, and cumulative contributions, and enforces the *spend-cap subset* of
 `execution.guards.check` -- per-order, per-day, total-exposure, per-asset%, USDC-funding (rail 13),
-and monthly-allowance (rail 14) -- before a candidate order is allowed to open. It never touches
-the live engine/executor/rails/ledger modules and is never imported by them; the two are kept in
-parity by a dedicated test (`tests/sim/test_account.py::test_parity_with_guards_check_*`) that
-builds equivalent `Repository`/`Config` state and asserts `can_open` agrees with `guards.check`
-across a grid of notionals spanning every cap boundary -- see the "sim/live divergence" note below
-for the one rail where the two are now intentionally NOT compared.
+and monthly-allowance (rail 14), plus rail 16 (the consecutive-loss circuit breaker, Task 4) --
+before a candidate order is allowed to open. It never touches the live engine/executor/rails/
+ledger modules and is never imported by them; the two are kept in parity by a dedicated test
+(`tests/sim/test_account.py::test_parity_with_guards_check_*`) that builds equivalent
+`Repository`/`Config` state and asserts `can_open` agrees with `guards.check` across a grid of
+notionals spanning every cap boundary -- see the "sim/live divergence" note below for the one rail
+where the two are now intentionally NOT compared.
+
+Rail 16 parity: `SimAccount` has no `Repository`/`agent_state` of its own (by design -- it's a
+pure ledger, not a state store), so it carries `self.streak_halt_until` as a plain settable
+instance attribute mirroring the live `agent_state["streak_halt_until"]` key `guards.check` reads.
+Nothing in this module computes it (that's `execution/streak.py`'s job, live-side only, per the
+Task 4 plan) -- a caller sets it directly, exactly as a test seeds `repo.set_state`. Defaults to
+`0`, matching the fail-inert-by-default posture: `now_ts < 0` is never true for a real timestamp.
 
 Deliberately NOT enforced here (outside the spend-cap subset, per the plan): the halal allowlist,
 min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule, the
@@ -112,6 +120,11 @@ class SimAccount:
         self.dca_positions: dict[str, OpenPosition] = {}
         self.contributed: Decimal = Decimal("0")
         self.realized_pnl: Decimal = Decimal("0")
+
+        # Rail 16 (consecutive-loss circuit breaker) parity: mirrors the live
+        # `agent_state["streak_halt_until"]` key `guards.check` reads. Not computed here -- see
+        # the module docstring's "Rail 16 parity" note.
+        self.streak_halt_until: int = 0
 
         # Cap-arithmetic bookkeeping: an append-only log of every opened AND closed order's
         # *candidate* notional (for day/month VOLUME -- buys and sells both count, see module
@@ -243,6 +256,16 @@ class SimAccount:
                 "monthly_subscription_allowance: month-to-date volume "
                 f"{month_volume} + {intent.notional} = {projected_month} exceeds the "
                 f"allowance cap {effective_cap}"
+            )
+
+        # consecutive-loss circuit breaker (rail 16) -- ENTRIES ONLY, DCA exempt, matching
+        # `guards.check`'s `is_buy and not intent.is_dca` gate (every `can_open` candidate is
+        # itself an entry, so `is_buy` is implicit here).
+        if not intent.is_dca and now_ts < self.streak_halt_until:
+            reasons.append(
+                "consecutive_loss_breaker: new entries are halted for another "
+                f"{self.streak_halt_until - now_ts}s (consecutive-loss circuit breaker); "
+                "DCA is unaffected"
             )
 
         return (not reasons, reasons)

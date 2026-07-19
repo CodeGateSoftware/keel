@@ -1,11 +1,11 @@
 """THE HARD RAILS (§14) — enforced before every order, un-overridable.
 
-`check()` runs the twelve safety rails from the main spec's §14, plus two later, equally
-un-overridable safety-critical rails added by Issue #59 (USDC-funding + monthly-allowance),
-before any order is placed, in every `auto_trade` mode (confirm *and* bypass) and for both
-rule-trading and DCA order classes. It never short-circuits: every violated rail is collected
-and reported so an operator (or the executor, Task 4) sees the full picture, not just the first
-trip-wire.
+`check()` runs the twelve safety rails from the main spec's §14, plus three later, equally
+un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
+and 16, the consecutive-loss circuit breaker (Task 4), before any order is placed, in every
+`auto_trade` mode (confirm *and* bypass) and for both rule-trading and DCA order classes. It never
+short-circuits: every violated rail is collected and reported so an operator (or the executor,
+Task 4) sees the full picture, not just the first trip-wire.
 
 Design notes on rails that need state this repo doesn't compute anywhere else yet (Task 3 lands
 before the executor/money_mgmt modules that would normally produce some of these numbers):
@@ -60,6 +60,15 @@ Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
   record, additionally caps cumulative month-to-date spend to
   `allowance / business_days_in_month * business_days_elapsed` (Mon-Fri, no holiday calendar);
   `pacing="opportunistic"` (default) skips that extra check.
+
+Rail 16 (consecutive-loss circuit breaker, Task 4, safety-critical, un-overridable): a SEQUENCE
+breaker where rail 11 is a MAGNITUDE breaker -- it detects that the edge may have stopped working
+BEFORE the drawdown accumulates. It reads exactly one precomputed `agent_state` key,
+`streak_halt_until` (owned by the producer, `execution/streak.py`), and never the
+`consecutive_losses` counter itself, so the "is the threshold reached" decision lives in one place
+and cannot disagree with itself. ENTRIES ONLY, and DCA-exempt like rail 11 (§12.6) -- a breaker
+that blocked exits would trap capital in a losing position, inverting its own purpose. Ships
+DISABLED (`config.money_mgmt.max_consecutive_losses` defaults to 0).
 """
 
 from __future__ import annotations
@@ -117,7 +126,7 @@ class OrderIntent:
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all fourteen rails: `ok` iff `violations` is empty."""
+    """The outcome of running all fifteen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -210,7 +219,7 @@ def _business_days_elapsed(year: int, month: int, day: int) -> int:
 
 
 def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) -> GuardResult:
-    """Run all fourteen §14 (+ Issue #59) hard rails against `intent`. Never short-circuits.
+    """Run all fifteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* bypass) — un-overridable.
     """
@@ -456,6 +465,23 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
                         f"allowance cap {effective_cap}{pacing_note} -- remaining allowance "
                         f"{remaining}"
                     )
+
+    # 16. Consecutive-loss circuit breaker — a SEQUENCE breaker where rail 11 is a MAGNITUDE
+    #     breaker: it detects that the edge may have stopped working BEFORE the drawdown
+    #     accumulates, which is a cheap regime-degradation proxy needing no regime classifier.
+    #     ENTRIES ONLY — a breaker that blocked exits would trap capital in a losing position,
+    #     inverting its own purpose. DCA exempt (§12.6). The counter lives in the producer
+    #     (`execution/streak.py`); this rail reads only the halt timestamp, so the
+    #     threshold decision exists in exactly one place.
+    if is_buy and not intent.is_dca:
+        halt_until = int(repo.get_state("streak_halt_until", default=0) or 0)
+        if now_ts < halt_until:
+            violations.append(
+                f"consecutive_loss_breaker: {config.money_mgmt.max_consecutive_losses} "
+                f"consecutive losing trades tripped the breaker; new entries are halted for "
+                f"another {halt_until - now_ts}s. Exits, stop-outs and DCA are unaffected. "
+                f"Clear it early with `keel resume-entries`."
+            )
 
     for violation in violations:
         log_event(

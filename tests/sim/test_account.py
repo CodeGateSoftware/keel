@@ -984,3 +984,74 @@ def test_parity_with_guards_check_even_daily_pacing():
     )
 
     _assert_parity(repo, account, config, now_ts, notionals)
+
+
+# -- rail 16 parity: consecutive-loss circuit breaker -----------------------------------------
+
+
+def test_parity_with_guards_check_streak_halt_active():
+    """`SimAccount.can_open` and `guards.check` must agree while the consecutive-loss halt is
+    active, and agree once it clears -- each side told about the same `streak_halt_until` value
+    (repo state for guards, the mirrored instance attribute for the sim, per the module
+    docstring's "Rail 16 parity" note). Every other cap is kept roomy so only rail 16 can trip.
+    """
+    now_ts = JAN15
+
+    conn = connect(":memory:")
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", now_ts)
+    repo.set_state("streak_halt_until", now_ts + 3600)
+
+    config = _config()  # roomy on every spend cap ($500 monthly allowance is the only real cap)
+    _attest(
+        repo,
+        free_volume_usd=config.subscription.assumed_free_volume_usd,
+        pacing=config.subscription.pacing,
+        now_ts=now_ts,
+    )
+
+    account = SimAccount(fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+    account.deposit(Decimal("100000"), now_ts=now_ts)
+    account.streak_halt_until = now_ts + 3600
+
+    order_intent = OrderIntent(
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        entry=Decimal("100"),
+        stop=None,
+        notional=Decimal("100"),
+        is_dca=False,
+        rule_kind="pullback_continuation",
+        available_quote=account.cash_usdc,
+    )
+    sim_intent = OpenIntent(
+        asset="BTC",
+        qty=Decimal("1"),
+        entry=Decimal("100"),
+        stop=None,
+        notional=Decimal("100"),
+        is_dca=False,
+        rule_kind="pullback_continuation",
+    )
+
+    guard_result = guards.check(order_intent, repo, config, now_ts)
+    sim_ok, sim_reasons = account.can_open(sim_intent, config, now_ts)
+
+    assert guard_result.ok is False
+    assert {v.split(":", 1)[0] for v in guard_result.violations} == {"consecutive_loss_breaker"}
+    assert sim_ok is False
+    assert {r.split(":", 1)[0] for r in sim_reasons} == {"consecutive_loss_breaker"}
+
+    # negative control: same repo/account/config, halt cleared -- both must now agree it's OK.
+    repo.set_state("streak_halt_until", now_ts - 1)
+    account.streak_halt_until = now_ts - 1
+
+    guard_result_cleared = guards.check(order_intent, repo, config, now_ts)
+    sim_ok_cleared, sim_reasons_cleared = account.can_open(sim_intent, config, now_ts)
+
+    assert guard_result_cleared.ok is True
+    assert sim_ok_cleared is True
+    assert sim_reasons_cleared == []
