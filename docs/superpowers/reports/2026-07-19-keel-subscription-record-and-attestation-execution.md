@@ -5,7 +5,7 @@
 byte-unchanged throughout.
 
 Plan: `docs/superpowers/plans/2026-07-19-keel-subscription-record-and-attestation.md`
-Spec: `docs/superpowers/specs/` (commit 215f396)
+Spec: `docs/superpowers/specs/2026-07-19-keel-subscription-record-and-attestation-design.md`
 Branch: `feat/subscription-record-attestation` (merged and deleted)
 Base commit: `a34ae9a`
 
