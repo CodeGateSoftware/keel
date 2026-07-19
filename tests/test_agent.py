@@ -269,8 +269,14 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     # dca_size(config.dca.budget_usd=50, entry=100) = 0.5
     assert orders[0]["qty"] == Decimal("0.5")
 
-    # the loop records which rule owns the freshly opened position, for future exit checks.
-    assert repo.get_state(f"position_rule:{PRODUCT}") == "dca"
+    # the loop records which rule owns the freshly opened position, for future exit checks,
+    # plus the entry context (opened_at/entry_fill/qty) a `trade_outcomes` row will need.
+    position = agent._position_state(repo, PRODUCT)
+    assert position is not None
+    assert position["rule_name"] == "dca"
+    assert position["opened_at"] == 90_000
+    assert position["entry_fill"] == Decimal("100")
+    assert position["qty"] == Decimal("0.5")
     # and records that the feed was checked this cycle (guards rail 12 reads this).
     assert repo.get_state("last_feed_ts") == 90_000
 
@@ -393,6 +399,53 @@ def test_no_held_position_skips_exit_check_entirely(repo):
     result = run_once(broker, repo, _config(), now_ts=90_000)
 
     assert result.exit_results == []
+
+
+# -- _position_state: entry context -------------------------------------------------------------
+
+
+def test_opening_a_position_records_entry_context(repo, monkeypatch) -> None:
+    """An outcome row later needs opened_at/entry_fill/qty, so the ENTER path must record them."""
+    from keel.agent import _position_state
+
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=1_000)
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "turtle_breakout",
+            "opened_at": 1_000,
+            "entry_fill": Decimal("100"),
+            "qty": Decimal("0.5"),
+        },
+    )
+
+    state = _position_state(repo, PRODUCT)
+    assert state is not None
+    assert state["rule_name"] == "turtle_breakout"
+    assert state["opened_at"] == 1_000
+    assert state["entry_fill"] == Decimal("100")
+    assert isinstance(state["entry_fill"], Decimal)
+    assert state["qty"] == Decimal("0.5")
+
+
+def test_position_state_tolerates_the_legacy_bare_string(repo) -> None:
+    """Existing DBs hold a bare rule-name string; reading one must not crash mid-upgrade."""
+    from keel.agent import _position_state
+
+    repo.set_state(f"position_rule:{PRODUCT}", "turtle_breakout")
+
+    state = _position_state(repo, PRODUCT)
+    assert state is not None
+    assert state["rule_name"] == "turtle_breakout"
+    assert state["opened_at"] is None
+    assert state["entry_fill"] is None
+
+
+def test_position_state_is_none_when_unset(repo) -> None:
+    """The negative: no tracked position must read as None, not as an empty dict."""
+    from keel.agent import _position_state
+
+    assert _position_state(repo, PRODUCT) is None
 
 
 # -- run_once: stale feed ----------------------------------------------------------------------

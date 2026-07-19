@@ -179,6 +179,23 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     return (net_qty if net_qty > 0 else Decimal("0")), avg_cost
 
 
+def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
+    """The tracked position for `product_id`, or `None` if nothing is held.
+
+    `agent_state["position_rule:<product>"]` used to be a bare rule-name string and is now a dict
+    carrying the entry context a `trade_outcomes` row needs. A database written by the previous
+    version still holds the string form, so it is normalised here rather than migrated: the entry
+    fields read back as `None`, which the outcome producer treats as "cannot attribute this trade"
+    rather than guessing a price.
+    """
+    raw = repo.get_state(f"position_rule:{product_id}")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return {"rule_name": raw, "opened_at": None, "entry_fill": None, "qty": None}
+    return raw
+
+
 def _handle_exits(
     product_id: str,
     product_rules: list[Rule],
@@ -197,7 +214,8 @@ def _handle_exits(
     if qty <= 0:
         return []
 
-    owning_rule_name = repo.get_state(f"position_rule:{product_id}")
+    position = _position_state(repo, product_id)
+    owning_rule_name = None if position is None else position["rule_name"]
     if not owning_rule_name:
         return []
 
@@ -401,7 +419,18 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                     reason=result.reason,
                 )
                 if result.placed:
-                    repo.set_state(f"position_rule:{product_id}", signal.rule_name)
+                    order = (
+                        repo.get_order(result.order_id) if result.order_id is not None else None
+                    )
+                    repo.set_state(
+                        f"position_rule:{product_id}",
+                        {
+                            "rule_name": signal.rule_name,
+                            "opened_at": now_ts,
+                            "entry_fill": None if order is None else order["actual_fill"],
+                            "qty": None if order is None else order["qty"],
+                        },
+                    )
 
         return LoopResult(
             ts=now_ts,
