@@ -416,6 +416,64 @@ class Repository:
         ).fetchall()
         return [_subscription_from_row(row) for row in rows]
 
+    # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
+
+    def insert_trade_outcome(self, outcome: dict[str, Any]) -> int:
+        """Append one CLOSED trade. `pnl_net` is realized and NET OF FEES — its sign is what
+        rail 16 counts, so a fee-dominated "winner" must arrive here already negative.
+        """
+        cursor = self._conn.execute(
+            """
+            INSERT INTO trade_outcomes (
+                product_id, rule_name, is_dca, opened_at, closed_at,
+                qty, entry_fill, exit_fill, fees, pnl_net
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outcome["product_id"],
+                outcome["rule_name"],
+                1 if outcome["is_dca"] else 0,
+                int(outcome["opened_at"]),
+                int(outcome["closed_at"]),
+                _dec_to_text(outcome["qty"]),
+                _dec_to_text(outcome["entry_fill"]),
+                _dec_to_text(outcome["exit_fill"]),
+                _dec_to_text(outcome["fees"]),
+                _dec_to_text(outcome["pnl_net"]),
+            ),
+        )
+        self._conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    def get_trade_outcomes(self, since_ts: int | None = None) -> list[dict[str, Any]]:
+        """Closed trades, OLDEST FIRST -- streak logic depends on that order."""
+        if since_ts is None:
+            rows = self._conn.execute(
+                "SELECT * FROM trade_outcomes ORDER BY closed_at, id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trade_outcomes WHERE closed_at >= ? ORDER BY closed_at, id",
+                (since_ts,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "product_id": row["product_id"],
+                "rule_name": row["rule_name"],
+                "is_dca": bool(row["is_dca"]),
+                "opened_at": int(row["opened_at"]),
+                "closed_at": int(row["closed_at"]),
+                "qty": Decimal(row["qty"]),
+                "entry_fill": Decimal(row["entry_fill"]),
+                "exit_fill": Decimal(row["exit_fill"]),
+                "fees": Decimal(row["fees"]),
+                "pnl_net": Decimal(row["pnl_net"]),
+            }
+            for row in rows
+        ]
+
     # -- bypass arm token (Issue #60, in-process bypass hardening) ---------
 
     def arm_bypass(self, now_ts: int, ttl_sec: int) -> None:

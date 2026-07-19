@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 2
+    assert version == db.SCHEMA_VERSION == 3
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -82,7 +82,7 @@ def test_the_migrated_row_forces_an_explicit_attestation() -> None:
 def test_migration_bumps_the_stored_version() -> None:
     conn = _v1_database()
     db.migrate(conn)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 2
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 3
 
 
 def test_migration_is_idempotent() -> None:
@@ -127,7 +127,7 @@ def test_v1_database_without_a_subscription_migrates_to_no_row() -> None:
     db.migrate(conn)
 
     assert _subscription_rows(conn) == []
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 2
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 3
 
 
 @pytest.mark.parametrize("stored", ["750.25", 750.25])
