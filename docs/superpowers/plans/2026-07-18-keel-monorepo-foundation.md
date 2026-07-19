@@ -13,7 +13,9 @@
 - Python `>=3.12`; `line-length = 100`; ruff `select = ["E", "F", "I", "UP"]`, `ignore = ["UP042"]`.
 - **No strategy behaviour may change in this plan.** The Task 1 baseline test must pass unmodified at the end of every subsequent task.
 - Package distribution names use hyphens (`keel-core`); import names use underscores (`keel_core`).
-- `keel-core` takes **no third-party dependencies**.
+- `keel-core` takes **no third-party dependencies beyond `pyyaml` and `python-dotenv`** —
+  `config.py` needs both (`yaml.safe_load` for `config.yaml`, `dotenv_values` at `config.py:464`
+  for `load_secrets`). The intent is to keep broker SDKs and other heavy deps out of core.
 - Log `event` values are stable identifiers (`agent.cycle_start`), never interpolated sentences.
 - Existing behaviour of `LoggingConfig` is preserved: `verbose=False` → `ERROR` level, `verbose=True` → `INFO`.
 - Commit after every task. Never commit `keel.db`, `*.log`, or `transactions/` (all gitignored).
