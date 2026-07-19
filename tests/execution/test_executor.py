@@ -12,6 +12,7 @@ transport underneath `CoinbaseClient`.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +30,7 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution.executor import (
+    CancelUnavailable,
     ExecutionResult,
     execute,
     handle_oco_fill,
@@ -883,3 +885,98 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
     order = repo.get_order(result.order_id)
     assert order["status"] == "filled"
     assert order["fee"] == Decimal("0.30")
+
+
+# -- a cancel that cannot actually reach the exchange must be LOUD ------------------------------
+
+
+class _NoCancelBroker(FakeBroker):
+    """The REAL broker's shape: `cb_client`, the Coinbase adapter and the `Transport` protocol
+    have no `cancel_order` at all -- only the test fakes ever had one."""
+
+    cancel_order = None
+
+
+def test_a_broker_without_cancel_order_raises_instead_of_silently_marking_canceled(repo):
+    """`getattr(broker, "cancel_order", None)` skipped the cancel and marked the sibling
+    `canceled` in the DB anyway. Against the real broker that leaves a LIVE resting SELL on the
+    exchange while our records say it is gone -- so after a stop fills, the target leg can still
+    sell inventory we no longer hold.
+
+    The tests only passed because the fakes supply a method the real client lacks: the same
+    reads-as-enforced-but-isn't pattern this branch exists to kill, sitting on the cancel path.
+    A cancel that cannot reach the exchange must fail loudly and must NOT rewrite our state.
+    """
+    broker = _NoCancelBroker()
+    stop_id, target_id = place_oco_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with pytest.raises(CancelUnavailable, match="cancel_order"):
+        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
+
+    # the sibling must still read as live -- our state may not claim a cancel that never happened
+    assert repo.get_order(stop_id)["status"] == "pending"
+
+
+def test_a_failing_cancel_call_does_not_mark_the_sibling_canceled(repo):
+    """Same invariant when the broker HAS the method but the call fails (network, rejection).
+    Marking it canceled would leave the DB disagreeing with the exchange in the dangerous
+    direction: we would believe no sell is resting when one is."""
+
+    class _RaisingCancelBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> None:
+            raise RuntimeError("broker refused the cancel")
+
+    broker = _RaisingCancelBroker()
+    stop_id, target_id = place_oco_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with pytest.raises(RuntimeError, match="refused the cancel"):
+        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
+
+    assert repo.get_order(stop_id)["status"] == "pending"
+
+
+def test_a_leg_with_no_broker_side_id_cannot_be_cancelled_and_says_so(repo):
+    """`_native_order_id` returns None when the placement response carried no id. There is then
+    nothing to cancel AT the exchange, so the same rule applies: raise, do not rewrite state."""
+    broker = FakeBroker()
+    stop_id, target_id = place_oco_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+    repo.update_order(stop_id, raw_response=json.dumps({"success": True}))  # no order_id
+
+    with pytest.raises(CancelUnavailable, match="broker-side id"):
+        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
+
+    assert repo.get_order(stop_id)["status"] == "pending"
+
+
+def test_roll_to_break_even_raises_rather_than_leaving_two_live_stops(repo):
+    """The more urgent of the two cancel sites. `roll_to_break_even` places the REPLACEMENT stop
+    first, then cancels the old one -- so a silently-skipped cancel leaves TWO live stops resting
+    on a single position, and whichever one does not fire first would sell inventory the other
+    already sold. It must raise instead."""
+    broker = _NoCancelBroker()
+    stop_id, _target_id = place_oco_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with pytest.raises(CancelUnavailable, match="cancel_order"):
+        roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
+
+    assert repo.get_order(stop_id)["status"] == "pending"

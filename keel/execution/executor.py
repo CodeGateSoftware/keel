@@ -446,6 +446,48 @@ def _target_leg_order_configuration(qty: Decimal, target: Decimal) -> dict[str, 
     return {"limit_limit_gtc": {"base_size": str(qty), "limit_price": str(target)}}
 
 
+class CancelUnavailable(RuntimeError):
+    """Raised when a resting order cannot be cancelled AT THE EXCHANGE.
+
+    Never downgrade this to a no-op. Both cancel sites used to do
+    `cancel = getattr(broker, "cancel_order", None)` and skip when absent -- and the real broker
+    (`cb_client`, the Coinbase adapter, the `Transport` protocol) has no `cancel_order` at all,
+    only the test fakes do. So in production the cancel was always skipped while the row was
+    still marked `canceled`, leaving a LIVE resting SELL on the exchange that our own records
+    said was gone. After a stop filled, the target leg could still sell inventory we no longer
+    held.
+
+    Failing loudly is the safe direction: our state must never claim a cancel that did not
+    happen. A caller that cannot tolerate the raise must reconcile with the exchange, not
+    swallow it.
+    """
+
+
+def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]) -> None:
+    """Cancel `order_row` at the exchange, or raise. Never marks local state on failure.
+
+    The order of operations is the whole point: the exchange is the source of truth, so the
+    cancel must SUCCEED before any caller records it. Every failure mode -- no `cancel_order` on
+    the broker, no broker-side id to name, or the call itself raising -- propagates.
+    """
+    native_id = _native_order_id(order_row)
+    if native_id is None:
+        raise CancelUnavailable(
+            f"order {order_row.get('id')} has no broker-side id in its placement response, so "
+            "it cannot be cancelled at the exchange -- refusing to record it as canceled"
+        )
+
+    cancel = getattr(broker, "cancel_order", None)
+    if cancel is None:
+        raise CancelUnavailable(
+            f"broker {type(broker).__name__} exposes no cancel_order, so resting order "
+            f"{native_id} cannot be cancelled -- refusing to record it as canceled while it is "
+            "still live at the exchange"
+        )
+
+    cancel(native_id)
+
+
 def _native_order_id(order_row: dict[str, Any]) -> str | None:
     """The broker-native order id for a repo order row, read back out of the `place_order`
     response JSON stashed in `raw_response` -- used to cancel a specific broker order."""
@@ -564,11 +606,9 @@ def handle_oco_fill(broker: Any, repo: Repository, filled_order_id: int, now_ts:
     if sibling is None or sibling["status"] != "pending":
         return None
 
-    cancel = getattr(broker, "cancel_order", None)
-    if cancel is not None:
-        native_id = _native_order_id(sibling)
-        if native_id is not None:
-            cancel(native_id)
+    # Cancel FIRST, record second: if this raises, the sibling stays `pending` in our records,
+    # which is the truthful state -- it is still live at the exchange. See `CancelUnavailable`.
+    _cancel_at_exchange(broker, repo, sibling)
 
     repo.update_order(sibling_id, status="canceled", updated_at=now_ts)
     log_event(
@@ -679,11 +719,10 @@ def _roll_stop(
 
     old_order = repo.get_order(old_stop_order_id)
     if old_order is not None and old_order["status"] == "pending":
-        cancel = getattr(broker, "cancel_order", None)
-        if cancel is not None:
-            native_id = _native_order_id(old_order)
-            if native_id is not None:
-                cancel(native_id)
+        # Same invariant as the OCO sibling cancel, and MORE urgent here: the replacement stop
+        # is already resting, so a silently-skipped cancel leaves TWO live stops on one position
+        # and the second would sell inventory the first already sold.
+        _cancel_at_exchange(broker, repo, old_order)
         repo.update_order(old_stop_order_id, status="canceled", updated_at=now_ts)
 
     sibling_id = repo.get_state(f"oco_sibling:{old_stop_order_id}")
