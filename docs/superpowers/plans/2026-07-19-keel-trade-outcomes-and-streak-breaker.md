@@ -499,12 +499,21 @@ def _repo() -> Repository:
 
 
 def _config(max_consecutive_losses: int = 3, streak_cooloff_days: int = 2):
-    from keel.config import Config, MoneyMgmtConfig
+    # NOTE: `caps` and `market_data` have NO defaults on `Config` -- omitting them raises
+    # `TypeError: missing 2 required positional arguments`. Verified against config.py:206.
+    from keel.config import Caps, Config, MarketDataConfig, MoneyMgmtConfig
 
     return Config(
         allowlist=["BTC"],
         target_weights={},
         risk_pct=Decimal("0.01"),
+        caps=Caps(
+            max_per_order_usd=Decimal("100000"),
+            max_per_day_usd=Decimal("300000"),
+            max_exposure_usd=Decimal("1000000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+        market_data=MarketDataConfig(granularities=[], history_days=365),
         money_mgmt=MoneyMgmtConfig(
             max_consecutive_losses=max_consecutive_losses,
             streak_cooloff_days=streak_cooloff_days,
@@ -1251,11 +1260,37 @@ Expected: 7 passed, including `test_rail11_actually_trips_once_the_producer_runs
 
 - [ ] **Step 6: Prove the regression test discriminates**
 
-In a scratch worktree, comment out the `equity_mod.update_drawdown(...)` call in `agent.py` and
-re-run `tests/execution/test_equity.py`. The unit tests still pass (they call the producer directly),
-which is why the agent-level wiring needs its own check: add a test that runs `run_once` with a fake
-broker and asserts `drawdown_total_pct` is written afterwards, then confirm **that** test fails with
-the call removed.
+The unit tests above call the producer directly, so they would all still pass if the agent never
+invoked it — which is precisely how rail 11 came to be dormant. The wiring needs its own test.
+
+Add to `tests/test_agent.py` (it already provides a `repo` fixture, `FakeBroker`, `_config` and
+`_candle`):
+
+```python
+def test_run_once_writes_the_drawdown_scalars(repo) -> None:
+    """Rail 11's inputs must be produced by the CYCLE, not only by a directly-called helper.
+
+    Without this, `test_equity.py` passes while `run_once` never calls the producer -- exactly the
+    state that left rail 11 unable to trip for the whole life of the project.
+    """
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("drawdown_total_pct") is not None
+    assert repo.get_state("equity_high_water_mark") is not None
+```
+
+Then, in a scratch worktree, comment out the `equity_mod.update_drawdown(...)` call in `agent.py`
+and re-run:
+
+```bash
+uv run pytest tests/test_agent.py -k run_once_writes_the_drawdown -q
+```
+
+Expected: **FAIL**. If it passes, the producer is not actually wired into the cycle and rail 11 is
+still dormant regardless of what `test_equity.py` says.
 
 - [ ] **Step 7: Verify**
 
