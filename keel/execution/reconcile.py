@@ -253,6 +253,7 @@ def _record_fill(
     repo.set_state(f"position_rule:{product_id}", None)
     repo.set_state(f"open_stop:{product_id}", None)
     repo.set_state(f"open_target:{product_id}", None)
+    repo.set_state(f"bracket_order:{product_id}", None)
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:

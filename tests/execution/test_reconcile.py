@@ -123,6 +123,22 @@ def test_a_filled_bracket_marks_the_order_and_releases_the_position(repo):
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
 
 
+def test_a_terminal_bracket_clears_the_bracket_order_key(repo):
+    """A stale `bracket_order` would have a later roll or re-bracket cancel an order that is
+    already gone -- and `_cancel_at_exchange` now RAISES on an unconfirmable cancel, so a stale
+    key turns into a refused exit rather than a silent no-op."""
+    _seed_bracket(repo)
+    repo.set_state("bracket_order:BTC-USD", 2)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_state("bracket_order:BTC-USD") is None
+
+
 def test_a_still_resting_bracket_changes_nothing(repo):
     """The negative control: an OPEN order must not be recorded, released, or counted."""
     bracket_id = _seed_bracket(repo)

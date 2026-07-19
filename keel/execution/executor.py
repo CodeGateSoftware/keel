@@ -200,6 +200,7 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
             )
             return False
         repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+        repo.set_state(f"bracket_order:{product_id}", None)
         log_event(
             logger,
             logging.INFO,
@@ -686,6 +687,10 @@ def place_bracket(
 
     repo.set_state(f"open_stop:{product_id}", stop)
     repo.set_state(f"open_target:{product_id}", target)
+    # The resting bracket's local order id. `open_stop`/`open_target` describe the PRICES; this
+    # names the ORDER, which is what a stop roll must cancel and what a re-bracket must replace.
+    # Written by the same single writer as its price partners so the three cannot disagree.
+    repo.set_state(f"bracket_order:{product_id}", result.order_id)
     log_event(
         logger,
         logging.INFO,

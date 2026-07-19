@@ -993,6 +993,22 @@ def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo
     assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
 
 
+def test_place_bracket_records_the_bracket_order_id(repo):
+    """`roll_to_break_even`/`trail_stop_atr` take an `old_stop_order_id` and there is no
+    production lookup that can produce one -- `execute` discards `place_bracket`'s return, so
+    they are unreachable by construction rather than merely uncalled. Persisting the id is the
+    prerequisite for wiring them, and for re-bracketing a position whose bracket died."""
+    broker = FakeBroker()
+
+    order_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert repo.get_state("bracket_order:BTC-USD") == order_id
+
+
 def test_a_vetoed_bracket_places_nothing_and_returns_none(repo):
     """Guards are un-overridable for the bracket exactly as for any other order."""
     repo.set_state("kill_switch", True)
