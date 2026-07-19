@@ -1,0 +1,72 @@
+{
+  "allowlist": [
+    "BTC"
+  ],
+  "auto_trade": {
+    "bypass_arm_ttl_sec": 3600,
+    "enabled": false,
+    "interval_sec": 900,
+    "mode": "paper"
+  },
+  "caps": {
+    "max_exposure_usd": "1000",
+    "max_per_asset_pct": "0.5",
+    "max_per_day_usd": "300",
+    "max_per_order_usd": "100"
+  },
+  "dca": {
+    "budget_usd": "0",
+    "cadence_days": 7
+  },
+  "fees": {
+    "maker_pct": "0.006",
+    "taker_pct": "0.012"
+  },
+  "logging": {
+    "file": "logs/keel.log",
+    "file_count": 5,
+    "max_file_mb": 25,
+    "verbose": false
+  },
+  "market_data": {
+    "granularities": [],
+    "history_days": 365
+  },
+  "money_mgmt": {
+    "acceleration_pct": "0.05",
+    "max_total_dd_pct": "0.2",
+    "max_weekly_dd_pct": "0.08",
+    "profit_trigger_pct": "0.1"
+  },
+  "promotion": {
+    "min_expectancy": "0",
+    "min_rr": "1.5",
+    "min_trades": 100,
+    "min_win_rate": "0.55"
+  },
+  "quote_currency": "USDC",
+  "risk_pct": "0.01",
+  "subscription": {
+    "assumed_free_volume_usd": "500",
+    "pacing": "opportunistic",
+    "unsubscribed_allowance_usd": "0"
+  },
+  "target_weights": {},
+  "tiers": [
+    {
+      "free_volume_usd": "500",
+      "name": "Basic",
+      "subscription_usd_month": "4.99"
+    },
+    {
+      "free_volume_usd": "10000",
+      "name": "Preferred",
+      "subscription_usd_month": "29.99"
+    },
+    {
+      "free_volume_usd": null,
+      "name": "Premium",
+      "subscription_usd_month": "299.99"
+    }
+  ]
+}

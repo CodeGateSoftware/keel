@@ -1,0 +1,81 @@
+{
+  "allowlist": [
+    "BTC",
+    "ETH",
+    "PAXG"
+  ],
+  "auto_trade": {
+    "bypass_arm_ttl_sec": 7200,
+    "enabled": true,
+    "interval_sec": 1800,
+    "mode": "confirm"
+  },
+  "caps": {
+    "max_exposure_usd": "4444.44",
+    "max_per_asset_pct": "0.55",
+    "max_per_day_usd": "333.33",
+    "max_per_order_usd": "111.11"
+  },
+  "dca": {
+    "budget_usd": "75.5",
+    "cadence_days": 14
+  },
+  "fees": {
+    "maker_pct": "0.0035",
+    "taker_pct": "0.0075"
+  },
+  "logging": {
+    "file": "keel-golden.log",
+    "file_count": 7,
+    "max_file_mb": 25,
+    "verbose": true
+  },
+  "market_data": {
+    "granularities": [
+      "ONE_HOUR",
+      "ONE_DAY"
+    ],
+    "history_days": 730
+  },
+  "money_mgmt": {
+    "acceleration_pct": "0.11",
+    "max_total_dd_pct": "0.18",
+    "max_weekly_dd_pct": "0.07",
+    "profit_trigger_pct": "0.22"
+  },
+  "promotion": {
+    "min_expectancy": "0.21",
+    "min_rr": "1.75",
+    "min_trades": 42,
+    "min_win_rate": "0.45"
+  },
+  "quote_currency": "USD",
+  "risk_pct": "0.0125",
+  "subscription": {
+    "assumed_free_volume_usd": "1234.5",
+    "pacing": "even_daily",
+    "unsubscribed_allowance_usd": "25"
+  },
+  "target_weights": {
+    "BTC": "0.4",
+    "ETH": "0.3",
+    "PAXG": "0.3"
+  },
+  "tiers": [
+    {
+      "free_volume_usd": "250",
+      "name": "Bronze",
+      "subscription_usd_month": "1.99"
+    },
+    {
+      "free_volume_usd": "7500",
+      "name": "Silver",
+      "subscription_usd_month": "19.99"
+    },
+    {
+      "free_volume_usd": null,
+      "name": "Unlimited",
+      "subscription_usd_month": "199.99"
+    }
+  ]
+}

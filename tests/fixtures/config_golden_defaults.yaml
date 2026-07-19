@@ -1,0 +1,15 @@
+# The MINIMAL legal config: only what `load_config` refuses to default.
+#
+# Its golden (`config_golden_defaults.json`) is the more valuable of the two, because every
+# other value in it is a DEFAULT. Defaults are what a refactor silently changes -- nothing
+# else in the suite pins them all at once, so a moved module that alters one would otherwise
+# ship green. Keep this document minimal on purpose: every key added here is one default the
+# golden stops covering.
+allowlist:
+  - BTC
+
+caps:
+  max_per_order_usd: 100
+  max_per_day_usd: 300
+  max_exposure_usd: 1000
+  max_per_asset_pct: 0.5

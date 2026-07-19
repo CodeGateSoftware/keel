@@ -1,0 +1,85 @@
+# Every `load_config` field set EXPLICITLY, and deliberately to non-default values.
+#
+# Paired with `config_golden_defaults.yaml`, this pins both halves of the parser's behaviour:
+# this file proves supplied values are read and coerced correctly, that file proves the
+# defaults. Values here are chosen to differ from the defaults so a parser that silently
+# ignored a key (returning its default) would fail rather than coincidentally match.
+#
+# Regenerate the golden deliberately:
+#     uv run python tests/baseline/regenerate_config_golden.py
+allowlist:
+  - BTC
+  - ETH
+  - PAXG
+
+target_weights:
+  BTC: 0.4
+  ETH: 0.3
+  PAXG: 0.3
+
+risk_pct: 0.0125
+
+caps:
+  max_per_order_usd: 111.11
+  max_per_day_usd: 333.33
+  max_exposure_usd: 4444.44
+  max_per_asset_pct: 0.55
+
+market_data:
+  granularities:
+    - ONE_HOUR
+    - ONE_DAY
+  history_days: 730
+
+auto_trade:
+  mode: confirm
+  enabled: true
+  interval_sec: 1800
+  bypass_arm_ttl_sec: 7200
+
+promotion:
+  min_trades: 42
+  min_expectancy: 0.21
+  min_rr: 1.75
+  min_win_rate: 0.45
+
+money_mgmt:
+  profit_trigger_pct: 0.22
+  acceleration_pct: 0.11
+  max_total_dd_pct: 0.18
+  max_weekly_dd_pct: 0.07
+
+dca:
+  budget_usd: 75.5
+  cadence_days: 14
+
+subscription:
+  assumed_free_volume_usd: 1234.5
+  unsubscribed_allowance_usd: 25
+  pacing: even_daily
+
+# Deliberately NOT the real Coinbase One tiers: identical-to-default values here would make
+# this section prove nothing, since a parser that ignored `tiers:` entirely would still match.
+tiers:
+  - name: Bronze
+    free_volume_usd: 250
+    subscription_usd_month: 1.99
+  - name: Silver
+    free_volume_usd: 7500
+    subscription_usd_month: 19.99
+  # free_volume_usd omitted entirely -> unlimited (None), which is deliberately NOT 0.
+  - name: Unlimited
+    subscription_usd_month: 199.99
+
+fees:
+  taker_pct: 0.0075
+  maker_pct: 0.0035
+
+# Non-default on purpose (the default is USDC) -- see the `tiers` note above.
+quote_currency: USD
+
+logging:
+  verbose: true
+  file: keel-golden.log
+  max_file_mb: 25
+  file_count: 7
