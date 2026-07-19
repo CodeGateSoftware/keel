@@ -77,9 +77,19 @@ rejecting a 150 order. Every existing assertion stays byte-identical.
   against the opposite mutation. Hardcoding `pacing = "even_daily"` in the unattested
   branch fails the new control while the positive test still passes: the pair is now
   two-directional, and neither test alone catches both failure modes.
-- Deferred cluster, unchanged: `_attest` triplicated across 3 test files with subtly
-  different signatures; duplicate-key YAML in test_unsubscribed_allowance_parses;
-  `subscription_usd_month` is write-only today.
+- [x] DONE (19af3cd): deferred cluster closed. `_attest` was triplicated across three test
+  files — plus a FOURTH inline copy in `tests/test_agent.py` the original finding missed —
+  all now delegating to `attest_subscription` in `tests/conftest.py`. Each module keeps its
+  own `_attest` wrapper since their call conventions genuinely differ. The two remaining
+  direct `BrokerSubscription(...)` constructions build the record UNDER TEST
+  (test_subscription_record, test_repository_subscriptions) and correctly stay.
+  Duplicate-key YAML in `test_unsubscribed_allowance_parses` fixed by replacing the
+  fixture's existing key instead of appending a second one.
+- [x] DONE (19af3cd): the unlimited-BUT-degraded composition is now pinned at the rail, not
+  only in the policy function. Verified by mutation — short-circuiting `allowance_usd` on
+  `free_volume_usd is None` fails both new unlimited cases while both finite cases pass.
+- `subscription_usd_month` write-only: still true, still not a defect. It has an explanatory
+  comment at the `set` call site; no reader exists yet.
 
 Verdict was "with fixes". Reviewer traced every path and found NO route by which an
 unattested/suspect/lapsed/overdue record yields spending authority. All 8 Done criteria

@@ -60,12 +60,31 @@ Fixed: cycle_id binding now pinned by a test that fails if bind_cycle is removed
 added so 6 live-money sites stop hardcoding telemetry._FIELDS_ATTR; exc_info path tested;
 NON_BINDING_CAP_USD in __all__; py.typed shipped. Docs corrected re: baseline coverage (e7bd9a6).
 
-Deferred to later plans (agreed with final reviewer):
-- root pyproject pyyaml/python-dotenv now redundant -> clean up in spec step 3
-- cb_client per-operation failure event granularity -> normalise in spec step 3 (rewritten there)
-- mode=str(mode) redundant cast -> cosmetic
-- bind_cycle clobbers rather than restores (no ContextVar token) -> matters once ingest/LLM
-  wrap an outer trace; two-line fix then
-- `venue` absent from event payloads though spec 10.2 names it stable -> add in step 4 plan
-- keel-core has no version specifier -> add when first published
-- load_config golden fixture REQUIRED before step 4 moves keel-data
+Deferred to later plans (agreed with final reviewer) — status as of 2026-07-19:
+
+- [x] root pyproject pyyaml/python-dotenv redundant — DONE (2057bf2). Verified by grep that
+      nothing under `keel/` imports either before removing; they arrive transitively via
+      keel-core. A comment records when to re-add them.
+- [ ] cb_client per-operation failure event granularity — DEFERRED ON PURPOSE. Spec step 3
+      rewrites that module, so normalising now is throwaway work.
+- [x] mode=str(mode) redundant cast — DONE (2057bf2). Confirmed `_confirm_or_bypass` is
+      annotated `-> tuple[str, str | None]`, so the cast really was a no-op.
+- [x] bind_cycle clobbers rather than restores — DONE (2057bf2). Now returns a ContextVar
+      token; `unbind_cycle` resets it. Two tests pin the nesting, both verified to fail
+      against the old clobbering behaviour by mutation.
+- [ ] `venue` absent from event payloads — STILL OPEN, needs a decision. `guards.py` gained
+      `venue=DEFAULT_VENUE` incidentally during the subscription work, but that is one event.
+      Doing it properly means deciding WHICH events carry it, which is step-4 plan scope.
+- [ ] keel-core version specifier — NOT YET APPLICABLE. Condition is "when first published";
+      it is still a workspace dep (`keel-core = { workspace = true }`).
+- [x] load_config golden fixture (PREREQUISITE for step 4) — DONE (2f8e09e). Two goldens:
+      a fully-specified config and the minimal document whose golden is entirely defaults.
+      Read-only, regeneration in `tests/baseline/regenerate_config_golden.py`.
+
+      **Found while mutation-testing that golden:** every config section has TWO defaults —
+      the dataclass field default (used by direct construction) and a separate parser default
+      in the `raw.get(key, default)` call (the only one `load_config` consults). They can
+      drift apart silently: mutating the dataclass default for `unsubscribed_allowance_usd`
+      left the ENTIRE baseline suite green. `test_dataclass_defaults_agree_with_the_parser_
+      defaults` now compares a defaults-only parse against a default-constructed `Config` and
+      closes it for every section at once. They agree today.
