@@ -19,6 +19,7 @@ from keel.config import (
     Config,
     DcaConfig,
     MarketDataConfig,
+    MoneyMgmtConfig,
     SubscriptionConfig,
 )
 from keel.sim.portfolio_sim import MOVE_THRESHOLD_PCT, run
@@ -677,3 +678,65 @@ def test_monthly_volume_aggregates_by_utc_month():
     expected_volume = trade.qty * Decimal("100")  # only the entry leg has filled so far
     total_bucketed = sum(result.monthly_volume.values(), Decimal("0"))
     assert total_bucketed == expected_volume
+
+
+# ---------------------------------------------------------------------------
+# Rail 16: sweeping max_consecutive_losses must actually CHANGE the backtest
+# ---------------------------------------------------------------------------
+
+
+def _streak_backtest(threshold: int, cooloff_days: int = 1):
+    """The same candles and the same rule every time -- only `max_consecutive_losses` varies.
+    `_AlwaysOnRule` on the rising zigzag round-trips a position every other bar, producing a
+    mix of wins and losses, so a low threshold has real losing streaks to bite on."""
+    hourly = [_zigzag_candle(i) for i in range(60)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(
+        money_mgmt=MoneyMgmtConfig(
+            max_consecutive_losses=threshold, streak_cooloff_days=cooloff_days
+        )
+    )
+    return run(
+        [_AlwaysOnRule("BTC-USD")],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+
+def test_sweeping_max_consecutive_losses_changes_the_backtest():
+    """THE point of the sim-side producer. Rail 16 ships DISABLED so that a sweep can set its
+    threshold -- but a sweep is only meaningful if the sim actually HALTS. Before the producer
+    was wired, `streak_halt_until` was initialised to 0 and never written by anything outside a
+    test, so every threshold produced byte-identical results and the sweep was a provable no-op.
+
+    Asserting on `trades` (not just some scalar) keeps this behavioural: a halt must suppress
+    real entries, not merely flip a flag."""
+    disabled = _streak_backtest(threshold=0)
+    tripwire = _streak_backtest(threshold=1)
+
+    assert len(disabled.trades) > len(tripwire.trades), (
+        "max_consecutive_losses had no effect on the backtest -- the sim-side streak producer "
+        "is not wired, so sweeping the threshold is a no-op"
+    )
+
+
+def test_disabled_threshold_never_halts_the_simulator():
+    """Negative control for the test above: with the SHIPPED default of 0 the producer must be
+    completely inert, so the result must match a run where rail 16 does not exist at all."""
+    shipped_default = _streak_backtest(threshold=0)
+
+    hourly = [_zigzag_candle(i) for i in range(60)]
+    baseline = run(
+        [_AlwaysOnRule("BTC-USD")],
+        {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}},
+        _config(),  # no money_mgmt override at all
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert len(shipped_default.trades) == len(baseline.trades)
+    assert [t.pnl for t in shipped_default.trades] == [t.pnl for t in baseline.trades]

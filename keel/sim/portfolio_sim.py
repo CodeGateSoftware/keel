@@ -303,7 +303,8 @@ def run(
             was_held = asset in held
             if was_held:
                 _process_held(
-                    asset, idx, hourly, current, candles_by_tf, held, account, trades, telemetry
+                    asset, idx, hourly, current, candles_by_tf, held, account, config,
+                    trades, telemetry,
                 )
 
             asset_rules = rules_by_asset.get(asset)
@@ -380,6 +381,7 @@ def _process_held(
     candles_by_tf: dict[Granularity, list[Candle]],
     held: dict[str, _Held],
     account: SimAccount,
+    config: Config,
     trades: list[SimTrade],
     telemetry: SimTelemetry,
 ) -> None:
@@ -416,6 +418,12 @@ def _process_held(
 
     pnl = account.close(asset, exit_price, current.ts)
     exit_fill = exit_price * (Decimal(1) - account.slippage_pct)
+
+    # Rail 16: feed the closed trade to the sim-side streak producer, so a `keel simulate` sweep
+    # over `max_consecutive_losses` actually changes the backtest. `held` is RULE-slot only (DCA
+    # never exits here, Issue #85), so `is_dca` is always False -- passed explicitly anyway to
+    # keep the call site honest against `execution.streak.record_closed_trade`'s signature.
+    account.record_trade_outcome(pnl, config, current.ts, is_dca=False)
 
     risk = (h.entry_fill - setup.stop) * h.qty
     r_multiple = pnl / risk if risk != 0 else None
