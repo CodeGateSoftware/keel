@@ -809,6 +809,26 @@ def test_rail14_unattested_uses_configured_pacing_not_a_hardcoded_default() -> N
     assert "even_daily pacing" in violation
 
 
+def test_rail14_unattested_opportunistic_pacing_ignores_the_business_day_pace() -> None:
+    """Negative control for the test above, mirroring the attested pair at
+    `test_rail14_opportunistic_pacing_ignores_the_business_day_pace`.
+
+    Same repo, same allowance, same notional -- only `pacing` differs. Without this, nothing
+    pins that the veto above comes from the *pacing* rather than from the flat 220 cap or from
+    being unattested at all, and the pair would still pass if the unattested branch ignored
+    pacing entirely."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("220"),
+        pacing="opportunistic",
+    )
+    result = guards.check(_intent(notional=Decimal("150")), _unattested_repo(), config, NOW_TS)
+    assert result.ok is True
+    assert result.violations == []
+
+
 def test_rail14_reads_pacing_from_the_record_not_config(repo: Repository) -> None:
     """even_daily paces the attested allowance across elapsed business days."""
     _attest(repo, free_volume_usd=Decimal("10000"), pacing="even_daily")
