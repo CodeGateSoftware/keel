@@ -132,12 +132,18 @@ class CoinbaseClient:
                 granularity=granularity.value,
             )
         except Exception:
-            logger.exception(
-                "CoinbaseClient.get_candles: fetch failed for %s %s [%s, %s]",
-                product_id,
-                granularity,
-                start,
-                end,
+            logger.log(
+                logging.ERROR,
+                "cb_client.candles_fetch_failed",
+                exc_info=True,
+                extra={
+                    "keel_fields": {
+                        "product": product_id,
+                        "granularity": granularity,
+                        "start": start,
+                        "end": end,
+                    }
+                },
             )
             raise
         raw_candles = _field(response, "candles", []) or []
@@ -150,7 +156,12 @@ class CoinbaseClient:
         try:
             response = self._transport.get_product(product_id=product_id)
         except Exception:
-            logger.exception("CoinbaseClient.get_spot: fetch failed for %s", product_id)
+            logger.log(
+                logging.ERROR,
+                "cb_client.spot_fetch_failed",
+                exc_info=True,
+                extra={"keel_fields": {"product": product_id}},
+            )
             raise
         price = _field(response, "price")
         if price is None:
@@ -162,7 +173,7 @@ class CoinbaseClient:
         try:
             response = self._transport.get_accounts()
         except Exception:
-            logger.exception("CoinbaseClient.get_accounts: fetch failed")
+            logger.log(logging.ERROR, "cb_client.accounts_fetch_failed", exc_info=True)
             raise
         raw_accounts = _field(response, "accounts", []) or []
         accounts = []
