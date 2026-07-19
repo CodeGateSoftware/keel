@@ -63,6 +63,36 @@ class _Broker:
         return self._orders[order_id]
 
 
+class _RebracketingBroker(_Broker):
+    """`_Broker` plus the order-placement surface `place_bracket` needs."""
+
+    def __init__(self, orders: dict[str, dict[str, Any]] | None = None) -> None:
+        super().__init__(orders)
+        self.placed: list[dict[str, Any]] = []
+
+    def get_accounts(self) -> list[dict[str, Any]]:
+        return [{"currency": "USDC", "available_balance": Decimal("1000000")}]
+
+    def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+        return {"order_total": Decimal("50"), "commission_total": Decimal("0"),
+                "errs": [], "warning": []}
+
+    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+        self.placed.append({"product_id": product_id, "side": side,
+                            "order_configuration": order_configuration})
+        return {"success": True, "order_id": f"cb-re-{len(self.placed)}"}
+
+
+def _allow_orders(repo: Repository) -> None:
+    """Satisfy the rails that fail closed on unseeded state.
+
+    Most tests in this module never place an order, so the fixture leaves these unset and the
+    rails correctly veto. A test that expects reconcile to PLACE something must opt in.
+    """
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", NOW)
+
+
 def _seed_bracket(repo: Repository, *, native_id: str = "cb-1") -> int:
     """A held position plus a resting SELL bracket, as `execute` would leave them."""
     repo.insert_order(
@@ -321,10 +351,11 @@ def test_a_failure_recording_one_outcome_does_not_abandon_the_other_orders(repo)
 def test_a_dead_bracket_on_a_still_held_position_escalates_loudly(repo, caplog):
     """A cancelled bracket on a position we still hold means the stop is GONE.
 
-    Coinbase cancels resting orders for reasons outside our control (product status changes,
-    self-trade prevention, an operator tapping cancel in the mobile app). The row stops being
-    `pending`, so reconcile never revisits it and nothing re-brackets the position -- it sits
-    unprotected indefinitely. INFO is not the right level for "your stop is gone".
+    Reconcile now tries to RE-PLACE the bracket rather than only warn, so this covers the first
+    fallback: `_seed_bracket` records an `open_stop` but no `open_target`, and a bracket needs
+    both prices. Re-placing on an invented target would silently re-risk the position on a level
+    no rule produced, so it escalates instead. INFO is not the right level for "your stop is
+    gone". The vetoed-placement fallback is covered separately below.
     """
     _seed_bracket(repo)
     broker = _Broker({"cb-1": {
@@ -335,6 +366,78 @@ def test_a_dead_bracket_on_a_still_held_position_escalates_loudly(repo, caplog):
     with caplog.at_level(logging.CRITICAL):
         reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
 
+    assert "reconcile.position_unprotected" in caplog.text
+
+
+def test_a_dead_bracket_on_a_held_position_is_replaced(repo):
+    """Coinbase cancels resting orders for reasons outside our control -- product status
+    changes, self-trade prevention, an operator tapping cancel in the mobile app. Logging
+    CRITICAL and leaving the position naked is not a resting state a trading agent should sit in
+    for an unbounded time. Re-place from the recorded stop/target."""
+    _seed_bracket(repo)
+    repo.set_state("open_target:BTC-USD", Decimal("53000"))
+    # The replacement runs through `guards.check` like any other order (un-overridable), so the
+    # rails that fail closed on unseeded state -- kill-switch and feed staleness -- have to be
+    # satisfied here or the re-bracket is vetoed and we only ever see the escalation.
+    _allow_orders(repo)
+    broker = _RebracketingBroker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert broker.placed, "no replacement bracket was placed"
+    leg = broker.placed[-1]["order_configuration"]["trigger_bracket_gtc"]
+    assert leg["stop_trigger_price"] == "49000"
+    assert leg["limit_price"] == "53000"
+    assert repo.get_state("bracket_order:BTC-USD") is not None
+
+
+def test_a_vetoed_replacement_bracket_escalates_instead_of_going_quiet(repo, caplog):
+    """The second fallback, and the one that must never be silent: both prices ARE recorded, so
+    re-placing is attempted, but `guards.check` vetoes it (here: the kill-switch). Guards stay
+    un-overridable even for a protective order, so the position is left naked -- and a naked
+    position that nobody is told about is strictly worse than the old warn-only behaviour."""
+    _seed_bracket(repo)
+    repo.set_state("open_target:BTC-USD", Decimal("53000"))
+    _allow_orders(repo)
+    repo.set_state("kill_switch", True)
+    broker = _RebracketingBroker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert not broker.placed, "a kill-switched agent must not place a replacement"
+    assert "reconcile.position_unprotected" in caplog.text
+
+
+def test_a_broker_error_while_re_bracketing_does_not_abandon_the_rest_of_the_pass(repo, caplog):
+    """Re-bracketing reaches the network, and reconcile runs at the TOP of `run_once`. An
+    exception escaping here aborted the whole cycle over one unreachable product -- every other
+    pending order left unreconciled -- and swallowed the escalation too, leaving the position
+    naked and silent. Same isolation contract the status fetch and `_record_fill` already have.
+    """
+    _seed_bracket(repo)
+    repo.set_state("open_target:BTC-USD", Decimal("53000"))
+    _allow_orders(repo)
+
+    class _ExplodingBroker(_RebracketingBroker):
+        def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+            raise RuntimeError("exchange unreachable")
+
+    broker = _ExplodingBroker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    with caplog.at_level(logging.CRITICAL):
+        changed = reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert changed, "the dead order was still reconciled"
     assert "reconcile.position_unprotected" in caplog.text
 
 

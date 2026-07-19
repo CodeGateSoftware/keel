@@ -26,7 +26,7 @@ from keel_core.telemetry import log_event, log_exception
 
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.execution import streak
+from keel.execution import executor, streak
 from keel.execution.executor import _held_position
 from keel.types import Side
 
@@ -95,7 +95,7 @@ def reconcile_open_orders(
                     product=row["product_id"],
                     status=status,
                 )
-                _warn_if_position_left_unprotected(repo, row, status)
+                _rebracket_or_escalate(broker, repo, config, row, now_ts)
             changed.append(row["id"])
             continue
 
@@ -113,34 +113,87 @@ def reconcile_open_orders(
 
 
 
-def _warn_if_position_left_unprotected(
-    repo: Repository, row: dict[str, Any], status: str
+def _rebracket_or_escalate(
+    broker: Any, repo: Repository, config: Config, row: dict[str, Any], now_ts: int
 ) -> None:
-    """Escalate when a dead SELL leaves a still-held position with no exchange-side stop.
+    """Re-place the exit bracket for a still-held position whose bracket died, or escalate.
 
-    Coinbase cancels resting orders for reasons outside our control -- a product status change,
-    self-trade prevention, an operator cancelling in the mobile app. Once the row stops being
-    `pending` reconcile never revisits it, and nothing re-places the bracket, so the position
-    sits unprotected indefinitely. CRITICAL rather than INFO because "your stop is gone" is not
-    routine, and because re-bracketing automatically is not obviously safe: the original
-    stop/target may be far from the current price, so an operator decides.
+    Leaving a naked position and logging CRITICAL is right at the instant of detection but wrong
+    as a resting state: nothing else revisits the order (it is no longer `pending`), so without
+    this the position stays unprotected until a human notices.
+
+    The recorded `open_stop`/`open_target` are reused deliberately rather than recomputed: they
+    are the levels the ORIGINAL trade was risk-sized against, and inventing new ones here would
+    silently re-risk the position on a level no rule produced.
     """
     if str(row["side"]).upper() != Side.SELL.value.upper():
         return
-    qty, _avg_cost = _held_position(repo, row["product_id"])
+    product_id = row["product_id"]
+    qty, _avg_cost = _held_position(repo, product_id)
     if qty <= 0:
         return
+
+    stop = repo.get_state(f"open_stop:{product_id}")
+    target = repo.get_state(f"open_target:{product_id}")
+    position = repo.get_state(f"position_rule:{product_id}") or {}
+    if stop is None or target is None:
+        _escalate_unprotected(repo, row, qty, "no recorded stop/target to re-place from")
+        return
+
+    # The SAME per-order isolation the status fetch and `_record_fill` get. Placing an order
+    # reaches the network, and an exception here propagated out of `reconcile_open_orders` and
+    # out of `run_once` -- abandoning every remaining pending order, at the top of the cycle,
+    # over one unreachable product. It also swallowed the escalation below, so the position was
+    # left naked AND silent, which is worse than the warn-only behaviour this replaced.
+    try:
+        new_id = executor.place_bracket(
+            broker,
+            repo,
+            config,
+            product_id=product_id,
+            qty=qty,
+            stop=stop,
+            target=target,
+            rule_name=position.get("rule_name") or "rebracket",
+            now_ts=now_ts,
+        )
+    except Exception:
+        log_exception(
+            logger,
+            "reconcile.rebracket_failed",
+            order_id=row["id"],
+            product=product_id,
+        )
+        new_id = None
+
+    if new_id is None:
+        _escalate_unprotected(repo, row, qty, "replacement bracket was vetoed or rejected")
+        return
+
+    log_event(
+        logger,
+        logging.WARNING,
+        "reconcile.bracket_replaced",
+        product=product_id,
+        dead_order_id=row["id"],
+        new_order_id=new_id,
+    )
+
+
+def _escalate_unprotected(
+    repo: Repository, row: dict[str, Any], qty: Decimal, why: str
+) -> None:
     log_event(
         logger,
         logging.CRITICAL,
         "reconcile.position_unprotected",
         product=row["product_id"],
         order_id=row["id"],
-        status=status,
         held_qty=str(qty),
+        reason=why,
         detail=(
-            "the exit bracket is gone from the exchange but the position is still held -- it "
-            "has NO protective stop. Re-place one (or close the position) before trading on."
+            "the exit bracket is gone from the exchange and could not be replaced -- this "
+            "position has NO protective stop. Re-place one or close it before trading on."
         ),
     )
 
