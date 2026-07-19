@@ -747,3 +747,29 @@ def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
     assert len(outcomes) == 1
     assert outcomes[0]["is_dca"] is True          # recorded as DCA...
     assert repo.get_state("consecutive_losses", default=0) == 0   # ...and exempt from the streak
+
+
+def test_the_enter_path_records_the_entry_fee_onto_the_position(repo: Repository) -> None:
+    """Holds the WIRING of the entry-fee half of the "pnl_net was GROSS" fix.
+
+    `record_closed_trade` does `position.get("entry_fee") or Decimal("0")`, so if the ENTER path
+    stops writing it, `pnl_net` silently reverts to net-of-EXIT-fee-only -- restoring the exact
+    Critical this branch fixed, where a fee-dominated loser is recorded as a WIN and RESETS the
+    loss counter.
+
+    Every other test that touches `entry_fee` hand-seeds it into a `position_rule` fixture, which
+    makes them vacuous with respect to the producer. This one exercises the real ENTER path and
+    asserts the value ARRIVES -- the difference between testing arithmetic and testing wiring.
+    """
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    position = repo.get_state(f"position_rule:{PRODUCT}")
+    assert position is not None, "no entry was placed -- the fixture no longer exercises ENTER"
+    assert "entry_fee" in position
+    assert position["entry_fee"] is not None, (
+        "the ENTER path stopped recording the entry fee; pnl_net will silently revert to "
+        "net-of-exit-fee-only"
+    )
