@@ -337,23 +337,33 @@ boundary.
 
 Each step leaves the system working and the monorepo spec's baseline green.
 
+**Phase A — build and validate the port (purely additive; nothing consumes it yet).**
+
 1. `keel-broker-api`: domain types, `OrderSpec` variants, `BrokerCapabilities`, the `Broker`
-   Protocol. No behaviour change — nothing consumes it yet.
+   Protocol.
 2. Add `mypy` with the §10 configuration; make `keel-broker-api` pass strict.
 3. `keel-broker-coinbase`: port today's `cb_client.py`, own the translation, register the entry
    point. Drop `coinbase-advanced-py` from root dependencies.
-4. Retire the leaks in `executor.py`: `_order_configuration` and the two leg builders emit
+4. `keel-broker-fake` as a second distribution; verify two-plugin entry-point discovery.
+5. The conformance suite; both adapters pass it.
+
+**Phase B — migrate the engine onto the validated port (carries the behavioural risk).**
+
+6. Retire the leaks in `executor.py`: `_order_configuration` and the two leg builders emit
    `OrderSpec` variants; `_initial_status` becomes a variant property; `get_balances`/`PlaceResult`
    replace dict probing. Type `agent.py`'s broker parameter as `Broker`.
-5. `keel-broker-fake` as a second distribution; verify two-plugin entry-point discovery.
-6. The conformance suite; both adapters pass it.
 7. Capability gating in `engine.evaluate` + `Rule.required_order_kinds` + the `dca.py` override.
 8. The §7 preview/confirm gate.
 9. Carried work from monorepo spec §14: item 1 (prune redundant root deps) and item 2 (normalise
    `cb_client` failure-event granularity).
 
-Steps 1–3 are additive. Step 4 is the first with real behavioural risk on the order path and
-warrants the closest review.
+**The phase boundary is load-bearing.** The fake adapter and conformance suite exist to prove the
+port is not secretly Coinbase-shaped. If they landed *after* the engine was rewritten against the
+port, discovering a Coinbase-ism would mean redoing the engine work — so all validation completes
+before anything consumes the port.
+
+Phase A cannot change behaviour: no existing code path calls into it. Phase B step 6 is the first
+change on the live order path and warrants the closest review.
 
 ---
 
