@@ -36,6 +36,7 @@ keel-broker-api = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "mypy>=1.18.0",
     "pytest>=9.1.1",
     "ruff>=0.15.21",
 ]
@@ -48,3 +49,28 @@ target-version = "py312"
 select = ["E", "F", "I", "UP"]
 # UP042: the design spec pins `class X(str, Enum)` explicitly (not `StrEnum`) for these types.
 ignore = ["UP042"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["packages", "keel", "tests"]
+
+# New packages are strict from birth.
+[[tool.mypy.overrides]]
+module = [
+    "keel_broker_api.*",
+    "keel_broker_coinbase.*",
+    "keel_broker_fake.*",
+]
+strict = true
+
+# Legacy code and the existing suite are exempt until their modules move out
+# (monorepo spec steps 4-7). Tighten one package at a time, never all at once.
+[[tool.mypy.overrides]]
+module = ["keel.*", "tests.*"]
+ignore_errors = true
+
+# keel-core moved in the previous plan but predates strict mode; it is tightened
+# when its remaining consumers migrate.
+[[tool.mypy.overrides]]
+module = "keel_core.*"
+ignore_errors = true
