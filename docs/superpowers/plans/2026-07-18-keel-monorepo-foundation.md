@@ -30,9 +30,15 @@ The migration's core risk is silently changing strategy output while moving file
 - Create: `tests/baseline/__init__.py`
 - Create: `tests/baseline/export_baseline.py`
 - Create: `tests/baseline/serialize.py`
+- Create: `tests/baseline/regenerate_golden.py`
 - Create: `tests/baseline/test_backtest_baseline.py`
 - Create (generated, committed): `tests/fixtures/baseline_candles.json`
 - Create (generated, committed): `tests/fixtures/baseline_backtest.json`
+
+**Design constraint:** the test is **read-only**. Regeneration lives in the two scripts, never in
+the test. This baseline is the only thing proving the migration does not change strategy output,
+so a test that can overwrite its own expected values could silently launder a real behaviour
+change into the fixture, after which every later task validates against corrupted truth.
 
 **Interfaces:**
 - Consumes: `keel.strategy.backtest.backtest(rule, candles) -> BacktestResult`; `keel.strategy.rules.turtle_breakout.TurtleBreakout(product_id=...)`; `keel.types.Candle(ts, open, high, low, close, volume)`.
@@ -194,75 +200,116 @@ def serialize_result(result: BacktestResult) -> dict[str, Any]:
     }
 ```
 
-- [ ] **Step 5: Write the failing golden test**
+- [ ] **Step 5: Write the shared backtest builder and the golden regeneration script**
+
+Both the test and the regeneration script must run the *identical* backtest, or the golden file
+would not describe what the test checks. Put the construction in one place.
+
+Append to `tests/baseline/serialize.py`:
+
+```python
+def run_baseline_backtest() -> dict[str, Any]:
+    """The one canonical baseline backtest, shared by the test and the regeneration script."""
+    from keel.strategy.backtest import backtest
+    from keel.strategy.rules.turtle_breakout import TurtleBreakout
+
+    rule = TurtleBreakout(product_id="BTC-USD")
+    return serialize_result(backtest(rule, load_baseline_candles()))
+
+
+GOLDEN = FIXTURES / "baseline_backtest.json"
+```
+
+Create `tests/baseline/regenerate_golden.py`:
+
+```python
+"""Dev script: regenerate the committed backtest golden file.
+
+Deliberately separate from the test, which is read-only. This baseline is the only thing
+proving the monorepo migration does not change strategy output, so a test able to rewrite its
+own expected values could silently launder a real behaviour change into the fixture.
+
+Run this only when a strategy change is intended, and review the resulting diff:
+
+    uv run python tests/baseline/regenerate_golden.py
+
+Needs no database -- it reads the committed candle fixture.
+"""
+
+from __future__ import annotations
+
+import json
+
+from tests.baseline.serialize import GOLDEN, run_baseline_backtest
+
+
+def main() -> None:
+    payload = run_baseline_backtest()
+    GOLDEN.write_text(json.dumps(payload, indent=1) + "\n")
+    print(f"wrote {GOLDEN} ({payload['n_trades']} trades)")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 6: Write the read-only golden test**
 
 Create `tests/baseline/test_backtest_baseline.py`:
 
 ```python
 """Regression baseline: `backtest()` output must not change during the monorepo migration.
 
-Regenerate deliberately (and review the diff) with:
+Read-only by design. Regenerate deliberately with:
 
-    KEEL_UPDATE_BASELINE=1 uv run pytest tests/baseline/ -v
+    uv run python tests/baseline/regenerate_golden.py
 """
 
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 
-from keel.strategy.backtest import backtest
-from keel.strategy.rules.turtle_breakout import TurtleBreakout
-
-from tests.baseline.serialize import FIXTURES, load_baseline_candles, serialize_result
-
-GOLDEN = FIXTURES / "baseline_backtest.json"
+from tests.baseline.serialize import GOLDEN, load_baseline_candles, run_baseline_backtest
 
 
 def test_turtle_breakout_backtest_matches_baseline() -> None:
-    candles = load_baseline_candles()
-    rule = TurtleBreakout(product_id="BTC-USD")
-
-    actual = serialize_result(backtest(rule, candles))
-
-    if os.environ.get("KEEL_UPDATE_BASELINE"):
-        Path(GOLDEN).write_text(json.dumps(actual, indent=1) + "\n")
-
-    expected = json.loads(GOLDEN.read_text())
-    assert actual == expected
+    assert run_baseline_backtest() == json.loads(GOLDEN.read_text())
 
 
 def test_baseline_corpus_is_non_trivial() -> None:
     """Guard against an empty fixture silently making the golden test vacuous."""
     assert len(load_baseline_candles()) > 1000
+
+
+def test_baseline_records_trades() -> None:
+    """A zero-trade baseline would pass forever while proving nothing."""
+    assert json.loads(GOLDEN.read_text())["n_trades"] > 0
 ```
 
-- [ ] **Step 6: Run the test to verify it fails**
+- [ ] **Step 7: Run the test to verify it fails**
 
 Run: `uv run pytest tests/baseline/ -v`
 Expected: FAIL — `FileNotFoundError: .../tests/fixtures/baseline_backtest.json`
 
-- [ ] **Step 7: Generate the golden file**
+- [ ] **Step 8: Generate the golden file**
 
-Run: `KEEL_UPDATE_BASELINE=1 uv run pytest tests/baseline/ -v`
-Expected: PASS, and `tests/fixtures/baseline_backtest.json` now exists.
+Run: `uv run python tests/baseline/regenerate_golden.py`
+Expected: `wrote .../tests/fixtures/baseline_backtest.json (N trades)` with N greater than zero.
 
-Inspect it before committing — confirm `n_trades` is greater than zero. A zero-trade baseline would pass forever while proving nothing.
+If N is zero, stop — the rule found no trades over this corpus and the baseline would be
+vacuous. Report it rather than proceeding.
 
-Run: `uv run python -c "import json;print(json.load(open('tests/fixtures/baseline_backtest.json'))['n_trades'])"`
-
-- [ ] **Step 8: Verify it passes without the update flag**
+- [ ] **Step 9: Verify the test passes against the generated golden**
 
 Run: `uv run pytest tests/baseline/ -v`
-Expected: 2 passed
+Expected: 3 passed
 
-- [ ] **Step 9: Verify the full suite still passes**
+- [ ] **Step 10: Verify the full suite still passes**
 
 Run: `uv run pytest -q`
-Expected: 719 passed (717 existing + 2 new)
+Expected: 720 passed (717 existing + 3 new)
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add tests/baseline tests/fixtures/baseline_candles.json tests/fixtures/baseline_backtest.json
@@ -428,10 +475,10 @@ Expected: `True`
 - [ ] **Step 9: Verify the baseline and full suite**
 
 Run: `uv run pytest tests/baseline/ -v`
-Expected: 2 passed — **the golden file must match byte-for-byte.** A failure here means the move changed behaviour; stop and investigate rather than regenerating the baseline.
+Expected: 3 passed — **the golden file must match byte-for-byte.** A failure here means the move changed behaviour; stop and investigate rather than regenerating the baseline.
 
 Run: `uv run pytest -q && uv run ruff check .`
-Expected: 719 passed; ruff clean.
+Expected: 720 passed; ruff clean.
 
 - [ ] **Step 10: Commit**
 
@@ -694,7 +741,7 @@ Run: `uv run pytest -q && uv run ruff check .`
 Expected: all pass; ruff clean.
 
 Run: `uv run pytest tests/baseline/ -v`
-Expected: 2 passed — unchanged golden file.
+Expected: 3 passed — unchanged golden file.
 
 - [ ] **Step 8: Commit**
 
@@ -828,7 +875,7 @@ Run: `uv run pytest -q`
 Expected: all pass. Any test asserting on old plaintext log content must be updated to parse JSON and assert on `event` plus fields — not deleted.
 
 Run: `uv run pytest tests/baseline/ -v`
-Expected: 2 passed — unchanged golden file.
+Expected: 3 passed — unchanged golden file.
 
 Run: `uv run ruff check .`
 Expected: clean.
