@@ -135,6 +135,15 @@ def test_set_rejects_a_negative_allowance(db_path: Path, valid_config_path: Path
     result = _run(db_path, valid_config_path,
                   "subscription", "set", "--venue", "coinbase", "--free-volume-usd", "-1")
     assert result.exit_code != 0
+    assert _repo_at(db_path).get_broker_subscription("coinbase") is None
+
+
+def test_set_rejects_a_non_numeric_allowance(db_path: Path, valid_config_path: Path) -> None:
+    result = _run(db_path, valid_config_path,
+                  "subscription", "set", "--venue", "coinbase",
+                  "--free-volume-usd", "not-a-number")
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_broker_subscription("coinbase") is None
 
 
 def test_show_reports_nothing_attested_on_a_fresh_database(
@@ -152,6 +161,7 @@ def test_show_surfaces_effective_status_and_cap(
          "subscription", "attest", "--venue", "coinbase", "--tier", "Preferred")
 
     result = _run(db_path, valid_config_path, "subscription", "show")
+    assert result.exit_code == 0, result.output
     assert "coinbase" in result.output
     assert "Preferred" in result.output
     assert "10000" in result.output

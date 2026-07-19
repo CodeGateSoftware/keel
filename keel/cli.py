@@ -1127,7 +1127,8 @@ def _resolve_pacing(
 def subscription_attest(
     ctx: click.Context, venue: str, tier_name: str, pacing: str | None
 ) -> None:
-    """Assert which subscription tier this venue is on -- the only thing that clears `suspect`."""
+    """Assert which subscription tier this venue is on -- clears `suspect` by asserting a named
+    tier (`subscription set` also clears it, but names no tier)."""
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
 
@@ -1205,6 +1206,8 @@ def subscription_set(
             tier_name="unknown",
             free_volume_usd=free_volume_usd,
             pacing=_resolve_pacing(repo, config, venue, pacing),
+            # Placeholder: `set` names no tier, so there is no real subscription price to
+            # record here. Must not be read as an actual (free) subscription cost.
             subscription_usd_month=Decimal("0"),
             status=SubscriptionStatus.ACTIVE,
             attested_at=now_ts,
