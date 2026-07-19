@@ -13,6 +13,7 @@ transport underneath `CoinbaseClient`.
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -33,8 +34,7 @@ from keel.execution.executor import (
     CancelUnavailable,
     ExecutionResult,
     execute,
-    handle_oco_fill,
-    place_oco_bracket,
+    place_bracket,
     roll_to_break_even,
     scale_out,
     trail_stop_atr,
@@ -267,9 +267,10 @@ def test_confirm_mode_compliant_signal_approved_is_placed_and_logged(repo):
     assert order["side"] == "BUY"
     assert order["mode"] == "live"
 
-    # entry order + the auto-attached OCO stop/target legs (signal's setup carries both).
-    assert len(broker.preview_calls) == 3
-    assert len(broker.place_calls) == 3
+    # entry order + the auto-attached native exit bracket (signal's setup carries stop+target).
+    # Was 3 calls under the old two-leg design: entry + stop leg + target leg.
+    assert len(broker.preview_calls) == 2
+    assert len(broker.place_calls) == 2
 
 
 def test_confirm_mode_calls_confirm_fn_with_the_preview(repo):
@@ -617,70 +618,21 @@ def test_execute_attaches_oco_bracket_after_a_stop_target_entry_fills(repo):
     result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
 
     assert result.placed is True
-    # entry + stop leg + target leg = 3 place_order calls
-    assert len(broker.place_calls) == 3
+    # entry + ONE native bracket = 2 place_order calls (was 3: entry + stop leg + target leg)
+    assert len(broker.place_calls) == 2
     orders = repo.get_orders(product_id="BTC-USD")
     sell_orders = [o for o in orders if o["side"] == "SELL"]
-    assert len(sell_orders) == 2
+    assert len(sell_orders) == 1
+    assert "trigger_bracket_gtc" in broker.place_calls[-1]["order_configuration"]
     assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
+    assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
 
 
-def test_oco_fill_of_target_cancels_the_stop_leg(repo):
-    broker = FakeBroker()
-
-    stop_id, target_id = place_oco_bracket(
-        broker,
-        repo,
-        _config(),
-        product_id="BTC-USD",
-        qty=Decimal("0.01"),
-        stop=Decimal("49000"),
-        target=Decimal("53000"),
-        rule_name="pullback_continuation",
-        now_ts=NOW_TS,
-    )
-    assert stop_id is not None
-    assert target_id is not None
-
-    cancelled = handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
-
-    assert cancelled == stop_id
-    target_order = repo.get_order(target_id)
-    stop_order = repo.get_order(stop_id)
-    assert target_order["status"] == "filled"
-    assert stop_order["status"] == "canceled"
-    assert len(broker.cancel_calls) == 1
-
-
-def test_oco_fill_with_no_sibling_recorded_is_a_no_op(repo):
-    broker = FakeBroker()
-    order_id = repo.insert_order(
-        dict(
-            mode="live",
-            product_id="BTC-USD",
-            side="SELL",
-            order_type="stop",
-            qty=Decimal("0.01"),
-            limit_price=Decimal("49000"),
-            status="pending",
-            fee=None,
-            expected_fill=Decimal("49000"),
-            actual_fill=None,
-            raw_response=None,
-            confirmation="oco",
-            rule_id=None,
-            created_at=NOW_TS,
-            updated_at=NOW_TS,
-        )
-    )
-
-    cancelled = handle_oco_fill(broker, repo, order_id, now_ts=NOW_TS)
-
-    assert cancelled is None
-    assert len(broker.cancel_calls) == 0
-
-
-# -- partial scale-out ---------------------------------------------------------------------------
+# NOTE: `test_oco_fill_of_target_cancels_the_stop_leg` and
+# `test_oco_fill_with_no_sibling_recorded_is_a_no_op` were DELETED with `handle_oco_fill`, not
+# weakened. They covered client-side sibling cancellation, which the native trigger bracket makes
+# impossible to get wrong: there is one order, so there is no sibling to cancel. The invariant
+# they protected (never sell an already-closed position twice) is now the exchange's to enforce.
 
 
 def test_scale_out_places_a_partial_sell_and_logs_it(repo):
@@ -709,7 +661,7 @@ def test_scale_out_places_a_partial_sell_and_logs_it(repo):
 
 def test_roll_to_break_even_replaces_the_stop_leg(repo):
     broker = FakeBroker()
-    stop_id, _target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker,
         repo,
         _config(),
@@ -741,7 +693,7 @@ def test_roll_to_break_even_replaces_the_stop_leg(repo):
 
 def test_roll_to_break_even_never_widens_the_stop(repo):
     broker = FakeBroker()
-    stop_id, _target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker,
         repo,
         _config(),
@@ -776,7 +728,7 @@ def test_roll_to_break_even_never_widens_the_stop(repo):
 
 def test_trail_stop_atr_ratchets_the_stop_up(repo):
     broker = FakeBroker()
-    stop_id, _target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker,
         repo,
         _config(),
@@ -809,7 +761,7 @@ def test_trail_stop_atr_ratchets_the_stop_up(repo):
 
 def test_trail_stop_atr_never_widens_the_stop(repo):
     broker = FakeBroker()
-    stop_id, _target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker,
         repo,
         _config(),
@@ -908,16 +860,20 @@ def test_a_broker_without_cancel_order_raises_instead_of_silently_marking_cancel
     A cancel that cannot reach the exchange must fail loudly and must NOT rewrite our state.
     """
     broker = _NoCancelBroker()
-    stop_id, target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
         stop=Decimal("49000"), target=Decimal("53000"),
         rule_name="pullback_continuation", now_ts=NOW_TS,
     )
 
     with pytest.raises(CancelUnavailable, match="cancel_order"):
-        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
+        roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
 
-    # the sibling must still read as live -- our state may not claim a cancel that never happened
+    # the bracket must still read as live -- our state may not claim a cancel that never happened
     assert repo.get_order(stop_id)["status"] == "pending"
 
 
@@ -931,14 +887,18 @@ def test_a_failing_cancel_call_does_not_mark_the_sibling_canceled(repo):
             raise RuntimeError("broker refused the cancel")
 
     broker = _RaisingCancelBroker()
-    stop_id, target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
         stop=Decimal("49000"), target=Decimal("53000"),
         rule_name="pullback_continuation", now_ts=NOW_TS,
     )
 
     with pytest.raises(RuntimeError, match="refused the cancel"):
-        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
+        roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
 
     assert repo.get_order(stop_id)["status"] == "pending"
 
@@ -947,7 +907,7 @@ def test_a_leg_with_no_broker_side_id_cannot_be_cancelled_and_says_so(repo):
     """`_native_order_id` returns None when the placement response carried no id. There is then
     nothing to cancel AT the exchange, so the same rule applies: raise, do not rewrite state."""
     broker = FakeBroker()
-    stop_id, target_id = place_oco_bracket(
+    stop_id = place_bracket(
         broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
         stop=Decimal("49000"), target=Decimal("53000"),
         rule_name="pullback_continuation", now_ts=NOW_TS,
@@ -955,24 +915,6 @@ def test_a_leg_with_no_broker_side_id_cannot_be_cancelled_and_says_so(repo):
     repo.update_order(stop_id, raw_response=json.dumps({"success": True}))  # no order_id
 
     with pytest.raises(CancelUnavailable, match="broker-side id"):
-        handle_oco_fill(broker, repo, target_id, now_ts=NOW_TS + 10)
-
-    assert repo.get_order(stop_id)["status"] == "pending"
-
-
-def test_roll_to_break_even_raises_rather_than_leaving_two_live_stops(repo):
-    """The more urgent of the two cancel sites. `roll_to_break_even` places the REPLACEMENT stop
-    first, then cancels the old one -- so a silently-skipped cancel leaves TWO live stops resting
-    on a single position, and whichever one does not fire first would sell inventory the other
-    already sold. It must raise instead."""
-    broker = _NoCancelBroker()
-    stop_id, _target_id = place_oco_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
-    )
-
-    with pytest.raises(CancelUnavailable, match="cancel_order"):
         roll_to_break_even(
             broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
             entry_price=Decimal("50000"), qty=Decimal("0.01"),
@@ -980,3 +922,143 @@ def test_roll_to_break_even_raises_rather_than_leaving_two_live_stops(repo):
         )
 
     assert repo.get_order(stop_id)["status"] == "pending"
+
+
+# NOTE: `test_roll_to_break_even_raises_rather_than_leaving_two_live_stops` was DELETED, not
+# weakened. It covered a hazard specific to the old place-then-cancel ordering: the replacement
+# stop rested alongside the old one, so a skipped cancel left TWO live stops on one position.
+# `_roll_stop` now cancels BEFORE placing (it has to -- the native bracket commits the whole
+# position, so a second one would be rejected for insufficient funds), which makes that state
+# unreachable by construction. The raise-on-unavailable-cancel behaviour it also asserted is
+# still covered, on this same code path, by
+# `test_a_broker_without_cancel_order_raises_instead_of_silently_marking_canceled`.
+# The NEW risk created by cancel-first -- a cancelled bracket whose replacement is rejected,
+# leaving the position naked -- is covered by
+# `test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_naked`.
+
+
+# -- native exchange-side bracket ---------------------------------------------------------------
+
+
+def test_bracket_places_exactly_one_order_committing_the_position_once(repo):
+    """The two-leg design placed a stop SELL for the full qty AND a target SELL for the full
+    qty -- 2x the inventory actually held. On spot the second leg should be rejected for
+    insufficient funds, and if it were not, the position would be oversold.
+
+    Coinbase's native trigger bracket is ONE order carrying both prices, so the position is
+    committed exactly once and the exchange owns the stop-vs-target race.
+    """
+    broker = FakeBroker()
+
+    order_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert order_id is not None
+    sells = [o for o in repo.get_orders(product_id="BTC-USD") if o["side"] == "SELL"]
+    assert len(sells) == 1
+    assert len(broker.place_calls) == 1
+
+    config = broker.place_calls[0]["order_configuration"]
+    assert "trigger_bracket_gtc" in config
+    leg = config["trigger_bracket_gtc"]
+    assert leg["base_size"] == "0.01"
+    assert leg["limit_price"] == "53000"          # take-profit
+    assert leg["stop_trigger_price"] == "49000"   # stop-loss
+
+
+def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo):
+    """`open_stop` is rail 9's no-widening reference. `open_target` is new: with one order
+    carrying both prices, rolling the stop means re-placing the bracket, which needs the target
+    that is no longer recoverable from a separate leg."""
+    broker = FakeBroker()
+
+    place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
+    assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
+
+
+def test_a_vetoed_bracket_places_nothing_and_returns_none(repo):
+    """Guards are un-overridable for the bracket exactly as for any other order."""
+    repo.set_state("kill_switch", True)
+    broker = FakeBroker()
+
+    order_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert order_id is None
+    assert broker.place_calls == []
+
+
+def test_rolling_the_stop_carries_the_original_target_forward(repo):
+    """Order of operations INVERTS versus the old two-leg path, and it has to.
+
+    The old code placed the replacement first so the position was never unprotected. With a
+    native bracket the resting order already commits the whole position, so placing a second
+    one would be rejected for insufficient funds. Cancel must come first -- which means a brief
+    unprotected window the old design did not have. `edit_order` cannot avoid it: it accepts
+    only limit-GTC orders and edits only size/price, never `stop_trigger_price`.
+    """
+    broker = FakeBroker()
+    old_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    new_id = roll_to_break_even(
+        broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=old_id,
+        entry_price=Decimal("50000"), qty=Decimal("0.01"),
+        rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+    )
+
+    assert new_id is not None and new_id != old_id
+    assert repo.get_order(old_id)["status"] == "canceled"
+    assert repo.get_state("open_stop:BTC-USD") == Decimal("50000")
+    assert broker.cancel_calls, "the old bracket was never cancelled at the exchange"
+    replacement = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
+    assert replacement["limit_price"] == "53000"        # original target preserved
+    assert replacement["stop_trigger_price"] == "50000"  # stop moved to break-even
+
+
+def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_naked(repo, caplog):
+    """The cost of cancel-first. If the cancel succeeds and the replacement is then rejected,
+    the position is left with NO protective stop. That must never pass quietly."""
+
+    class _RejectingBroker(FakeBroker):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.calls = 0
+
+        def place_order(self, product_id, side, order_configuration):
+            self.calls += 1
+            if self.calls > 1:          # the original bracket places; the replacement fails
+                return {"success": False, "error": "INSUFFICIENT_FUND"}
+            return super().place_order(product_id, side, order_configuration)
+
+    broker = _RejectingBroker()
+    old_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        new_id = roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=old_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
+
+    assert new_id is None
+    assert "executor.position_unprotected" in caplog.text
