@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=49.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "keel-core",
 ]
 
 [project.scripts]
@@ -24,6 +25,12 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+keel-core = { workspace = true }
 
 [dependency-groups]
 dev = [
