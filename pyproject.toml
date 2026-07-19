@@ -9,12 +9,14 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.4.2",
-    "coinbase-advanced-py>=1.8.4",
     "cryptography>=49.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
     "keel-core",
     "keel-broker-api",
+    # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
+    # on the adapter keeps it available transitively. Phase B deletes those imports and this.
+    "keel-broker-coinbase",
 ]
 
 [project.scripts]
@@ -33,6 +35,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 keel-core = { workspace = true }
 keel-broker-api = { workspace = true }
+keel-broker-coinbase = { workspace = true }
 
 [dependency-groups]
 dev = [

@@ -1,0 +1,21 @@
+{
+  "total_volume": 12480.55,
+  "total_fees": 74.88,
+  "fee_tier": {
+    "pricing_tier": "Advanced 1",
+    "usd_from": "1000",
+    "usd_to": "10000",
+    "taker_fee_rate": "0.0075",
+    "maker_fee_rate": "0.0035",
+    "aop_from": "",
+    "aop_to": ""
+  },
+  "margin_rate": null,
+  "goods_and_services_tax": null,
+  "advanced_trade_only_volume": 12480.55,
+  "advanced_trade_only_fees": 74.88,
+  "coinbase_pro_volume": 0,
+  "coinbase_pro_fees": 0,
+  "total_balance": "3921.44",
+  "has_promo_fee": false
+}
