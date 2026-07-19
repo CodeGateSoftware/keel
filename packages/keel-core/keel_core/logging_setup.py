@@ -13,6 +13,9 @@ suppressed at the logger itself (never even reach the handler), while `logger.er
 **Rotation.** `RotatingFileHandler(maxBytes=cfg.max_file_mb * 1024 * 1024, backupCount=...)`
 caps each file at `cfg.max_file_mb` and keeps `cfg.file_count` files TOTAL (the active file plus
 its rotated backups) -- hence `backupCount = cfg.file_count - 1`.
+
+**Format.** Log lines are single-line JSON objects (see `keel_core.telemetry.JsonFormatter`), not
+plaintext `%(asctime)s ...` text -- this lets events be aggregated and queried across processes.
 """
 
 from __future__ import annotations
@@ -22,8 +25,7 @@ import logging.handlers
 from pathlib import Path
 
 from keel_core.config import LoggingConfig
-
-_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+from keel_core.telemetry import JsonFormatter
 
 
 def configure_logging(cfg: LoggingConfig) -> logging.Logger:
@@ -47,7 +49,7 @@ def configure_logging(cfg: LoggingConfig) -> logging.Logger:
         maxBytes=cfg.max_file_mb * 1024 * 1024,
         backupCount=cfg.file_count - 1,
     )
-    handler.setFormatter(logging.Formatter(_FORMAT))
+    handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
 
     logger.setLevel(logging.INFO if cfg.verbose else logging.ERROR)
