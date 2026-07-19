@@ -452,8 +452,11 @@ real behavioural risk and deserves its own plan.
 ## 13. Open questions
 
 - **Baseline equality harness.** Steps 1–7 must not change strategy output. A pinned
-  backtest-output fixture compared before and after each step is the cheapest guard, but it does
-  not yet exist and should be built as part of step 1.
+  backtest-output fixture (built in step 1, `tests/baseline/`) is the cheapest guard, but its
+  reach is narrower than it looks: the backtest path imports `keel.types` only, so it does not
+  exercise `config.py`, and it covers one product/granularity with the optional rule filters off.
+  Before step 4 moves `keel-data`, add a `load_config`-output golden — config parsing decides
+  caps, `risk_pct`, and the product allowlist, and a silent change there is a money bug.
 - **`apps/cli` versus `apps/tui` convergence.** The CLI is today's entry point and the TUI is
   intended to become it. Whether the CLI survives long-term as a scripting surface or is absorbed
   is deferred until the TUI exists.

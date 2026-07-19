@@ -38,9 +38,16 @@ The migration's core risk is silently changing strategy output while moving file
 - Create (generated, committed): `tests/fixtures/baseline_backtest.json`
 
 **Design constraint:** the test is **read-only**. Regeneration lives in the two scripts, never in
-the test. This baseline is the only thing proving the migration does not change strategy output,
-so a test that can overwrite its own expected values could silently launder a real behaviour
-change into the fixture, after which every later task validates against corrupted truth.
+the test. A test that can overwrite its own expected values could silently launder a real
+behaviour change into the fixture, after which every later task validates against corrupted truth.
+
+**What this baseline does and does not cover.** The backtest path imports `keel.types` only
+(`keel/strategy/backtest.py:36-38`, `turtle_breakout.py:44-46`) — so of the three modules Task 2
+extracts, it guards `types.py` and neither `config.py` nor `logging_setup.py`. Those are guarded
+by `tests/test_config.py` (341 lines) and `tests/test_logging_setup.py` respectively, which is
+adequate for this plan. Later steps must not lean on the backtest baseline alone: before spec
+step 4 moves `keel-data`, add a `load_config`-output golden fixture, since config parsing decides
+caps, `risk_pct`, and the product allowlist.
 
 **Interfaces:**
 - Consumes: `keel.strategy.backtest.backtest(rule, candles) -> BacktestResult`; `keel.strategy.rules.turtle_breakout.TurtleBreakout(product_id=...)`; `keel.types.Candle(ts, open, high, low, close, volume)`.
