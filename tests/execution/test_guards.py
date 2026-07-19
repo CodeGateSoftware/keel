@@ -74,6 +74,7 @@ def _config(
     max_weekly_dd_pct: Decimal = Decimal("0.08"),
     interval_sec: int = 900,
     unsubscribed_allowance_usd: Decimal = Decimal("0"),
+    pacing: str = "opportunistic",
 ) -> Config:
     return Config(
         allowlist=list(allowlist),
@@ -91,7 +92,8 @@ def _config(
             max_total_dd_pct=max_total_dd_pct, max_weekly_dd_pct=max_weekly_dd_pct
         ),
         subscription=SubscriptionConfig(
-            unsubscribed_allowance_usd=unsubscribed_allowance_usd
+            unsubscribed_allowance_usd=unsubscribed_allowance_usd,
+            pacing=pacing,
         ),
     )
 
@@ -747,6 +749,21 @@ def test_rail14_fails_closed_on_an_overdue_attestation(repo: Repository) -> None
     assert "overdue" in violation
 
 
+def test_rail14_reports_lapsed_over_overdue_when_a_record_is_both(repo: Repository) -> None:
+    """LAPSED is a definite statement the subscription ended; overdue is merely an unrefreshed
+    assertion -- when a record is both, the message must name the more serious one."""
+    _attest(
+        repo,
+        free_volume_usd=Decimal("10000"),
+        status=SubscriptionStatus.LAPSED,
+        attested_at=NOW_TS - 40_000_000,
+        attest_due_ts=NOW_TS - 1,
+    )
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "lapsed" in violation
+
+
 def test_rail14_honours_a_raised_unsubscribed_allowance() -> None:
     """A user content to pay fees may raise it -- deliberately, not by accident."""
     config = _config(
@@ -757,6 +774,39 @@ def test_rail14_honours_a_raised_unsubscribed_allowance() -> None:
     )
     result = guards.check(_intent(notional=Decimal("50")), _unattested_repo(), config, NOW_TS)
     assert "subscription_unattested" not in _keys(result)
+
+
+def test_rail14_raised_unsubscribed_allowance_still_binds() -> None:
+    """The raised allowance is a ceiling, not an escape hatch -- it must still veto once
+    exceeded. Otherwise a refactor that made the unattested branch skip the cap comparison
+    entirely would pass every existing test."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("200"),
+    )
+    result = guards.check(_intent(notional=Decimal("250")), _unattested_repo(), config, NOW_TS)
+    assert "subscription_unattested" in _keys(result)
+
+
+def test_rail14_unattested_uses_configured_pacing_not_a_hardcoded_default() -> None:
+    """No record means no record-level pacing to read -- the configured pacing is the best
+    available statement of intent, so a raised unsubscribed_allowance_usd is still paced when
+    the user configured pacing="even_daily", not silently given a flat, unpaced cap."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("220"),
+        pacing="even_daily",
+    )
+    # Same numbers as the attested even_daily pacing test: NOW_TS is business day 10 of 22 in
+    # November -> paced cap = 220 / 22 * 10 = 100. 150 is inside the flat 220 cap but outside it.
+    result = guards.check(_intent(notional=Decimal("150")), _unattested_repo(), config, NOW_TS)
+    assert not result.ok
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "even_daily pacing" in violation
 
 
 def test_rail14_reads_pacing_from_the_record_not_config(repo: Repository) -> None:

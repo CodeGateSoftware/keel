@@ -128,6 +128,22 @@ def test_unsubscribed_allowance_parses(write_config) -> None:
     assert load_config(path).subscription.unsubscribed_allowance_usd == Decimal("25")
 
 
+def test_unsubscribed_allowance_infinite_raises_configerror(write_config) -> None:
+    """`.inf` would turn the fail-closed fallback itself into an unbounded live spend cap --
+    exactly the inversion this subscription-allowance work exists to prevent. YAML's `.inf` is a
+    plausible "I want unlimited" typo, but unlimited is expressed elsewhere in this system as
+    `free_volume_usd is None` (see `TierConfig`), never as `Infinity`."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace(
+            "unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: .inf"
+        )
+    )
+    with pytest.raises(ConfigError, match="unsubscribed_allowance_usd"):
+        load_config(path)
+
+
 def test_the_old_monthly_allowance_key_is_rejected(write_config) -> None:
     """Silently ignoring a hand-set spend number is the exact defect this work fixes."""
     from tests.conftest import VALID_CONFIG_YAML

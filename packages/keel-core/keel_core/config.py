@@ -32,6 +32,13 @@ def _to_decimal(value: Any, key: str) -> Decimal:
 
 def _non_negative_decimal(value: Any, key: str) -> Decimal:
     amount = _to_decimal(value, key)
+    # `Decimal.is_finite()` is False for inf/-inf/nan. Reject before the `< 0` comparison below:
+    # a NaN comparison raises InvalidOperation (uncaught by any handler here), and `.inf` would
+    # otherwise pass this check and become an unbounded cap wherever this field is used as one
+    # (e.g. `subscription.unsubscribed_allowance_usd`) -- "unlimited" is expressed elsewhere in
+    # this system as `None` (see `TierConfig.free_volume_usd`), never as `Infinity`.
+    if not amount.is_finite():
+        raise ConfigError(f"{key}: must be a finite number, got {value!r}")
     if amount < 0:
         raise ConfigError(f"{key}: must be a non-negative number, got {value!r}")
     return amount

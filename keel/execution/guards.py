@@ -386,15 +386,17 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
         if record is None:
             allowance: Decimal | None = unsubscribed
             degraded_reason = "no subscription has been attested"
-            pacing = "opportunistic"
+            # No record means there is no record-level pacing to read -- the user's configured
+            # pacing is the best available statement of intent (e.g. a raised
+            # unsubscribed_allowance_usd paired with pacing="even_daily" should still be paced,
+            # not given a flat, unpaced cap).
+            pacing = config.subscription.pacing
         else:
             allowance = record.allowance_usd(now_ts, unsubscribed)
             pacing = record.pacing
             effective = record.effective_status(now_ts)
-            if effective is SubscriptionStatus.ACTIVE:
-                degraded_reason = ""
-            elif record.attest_due_ts <= now_ts:
-                degraded_reason = "its attestation is overdue"
+            overdue = record.attest_due_ts <= now_ts
+            if overdue:
                 log_event(
                     logger,
                     logging.WARNING,
@@ -403,6 +405,15 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
                     attested_at=record.attested_at,
                     attest_due_ts=record.attest_due_ts,
                 )
+            if effective is SubscriptionStatus.ACTIVE:
+                degraded_reason = ""
+            elif record.status is SubscriptionStatus.LAPSED:
+                # Report the more serious condition when a record is both LAPSED and overdue:
+                # LAPSED is a definite statement the subscription ended, while overdue is merely
+                # an unrefreshed assertion -- checked ahead of the (less serious) overdue branch.
+                degraded_reason = "its subscription is lapsed"
+            elif overdue:
+                degraded_reason = "its attestation is overdue"
             else:
                 degraded_reason = f"its subscription is {effective.value}"
 
@@ -434,7 +445,7 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
                     violations.append(
                         f"subscription_unattested: {DEFAULT_VENUE} cannot spend because "
                         f"{degraded_reason}, so its allowance is the unsubscribed default "
-                        f"{unsubscribed}. Run `keel subscription attest --venue "
+                        f"{unsubscribed}{pacing_note}. Run `keel subscription attest --venue "
                         f"{DEFAULT_VENUE} --tier <tier>` to restore it."
                     )
                 else:

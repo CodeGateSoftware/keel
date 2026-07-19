@@ -146,6 +146,28 @@ def test_set_rejects_a_non_numeric_allowance(db_path: Path, valid_config_path: P
     assert _repo_at(db_path).get_broker_subscription("coinbase") is None
 
 
+def test_set_rejects_an_infinite_allowance(db_path: Path, valid_config_path: Path) -> None:
+    """`inf` would become an unbounded live spend cap -- unlimited is expressed elsewhere in
+    this system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never
+    as `Infinity` via this raw-number escape hatch."""
+    result = _run(db_path, valid_config_path,
+                  "subscription", "set", "--venue", "coinbase",
+                  "--free-volume-usd", "inf")
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_broker_subscription("coinbase") is None
+
+
+def test_set_rejects_a_nan_allowance(db_path: Path, valid_config_path: Path) -> None:
+    """`Decimal("nan")` parses without raising `InvalidOperation`, so without an explicit
+    finiteness check the subsequent `< 0` comparison would itself raise an uncaught
+    `InvalidOperation` -- a stack trace instead of the intended clean error message."""
+    result = _run(db_path, valid_config_path,
+                  "subscription", "set", "--venue", "coinbase",
+                  "--free-volume-usd", "nan")
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_broker_subscription("coinbase") is None
+
+
 def test_show_reports_nothing_attested_on_a_fresh_database(
     db_path: Path, valid_config_path: Path
 ) -> None:

@@ -1195,6 +1195,17 @@ def subscription_set(
             f"Error: --free-volume-usd must be a number, got {free_volume_raw!r}", err=True
         )
         ctx.exit(1)
+    # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
+    # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
+    # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
+    # "unlimited" has no representation via this command; it is expressed elsewhere in this
+    # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
+    if not free_volume_usd.is_finite():
+        click.echo(
+            f"Error: --free-volume-usd must be a finite number, got {free_volume_raw!r}",
+            err=True,
+        )
+        ctx.exit(1)
     if free_volume_usd < 0:
         click.echo("Error: --free-volume-usd must be non-negative", err=True)
         ctx.exit(1)
@@ -1209,6 +1220,11 @@ def subscription_set(
             # Placeholder: `set` names no tier, so there is no real subscription price to
             # record here. Must not be read as an actual (free) subscription cost.
             subscription_usd_month=Decimal("0"),
+            # ACTIVE (full spend authority), even though `tier_name='unknown'` -- the same shape
+            # the v2 migration backfill deliberately marks `suspect` instead. Not a contradiction:
+            # the migration distrusts a *stale* hand-tuned number of unknown provenance, whereas
+            # this is a *fresh, explicit* user assertion made right now, by name, via this
+            # command. Provenance differs even though the resulting record looks identical.
             status=SubscriptionStatus.ACTIVE,
             attested_at=now_ts,
             attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,

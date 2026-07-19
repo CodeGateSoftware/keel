@@ -2,9 +2,9 @@
 
 Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` returns a
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
-enabled. `migrate()` idempotently creates the eight §6 tables (`transactions`, `candles`,
-`orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `journal`) plus their
-indexes and a `schema_version` marker table.
+enabled. `migrate()` idempotently creates the ten §6 tables (`transactions`, `candles`,
+`orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
+`journal`) plus their indexes and a `schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -208,7 +208,13 @@ def _migrate_v2_broker_subscriptions(conn: sqlite3.Connection) -> None:
     attested is never reset. The `agent_state` row is deliberately left in place as the only
     copy of the pre-migration value.
     """
-    if conn.execute("SELECT 1 FROM broker_subscriptions LIMIT 1").fetchone() is not None:
+    # Venue-scoped, not table-wide: the engine is single-venue today so this is behaviourally
+    # identical either way, but a table-wide guard would skip a *second* venue's backfill once
+    # one exists, just because some other venue already has a row.
+    already_migrated = conn.execute(
+        "SELECT 1 FROM broker_subscriptions WHERE venue = 'coinbase' LIMIT 1"
+    ).fetchone()
+    if already_migrated is not None:
         return
 
     row = conn.execute(
@@ -266,6 +272,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     Safe to call repeatedly: every DDL statement is `IF NOT EXISTS`, and each migration step
     runs only while the stored version is below its target. A fresh database is stamped at
     `SCHEMA_VERSION` and runs no steps -- correct, since it has nothing to migrate.
+
+    Requires `conn.row_factory` to be `sqlite3.Row` (as `connect()` returns) -- this function
+    subscripts rows by column name (`row["value"]`, `version_row["version"]`).
     """
     for statement in _SCHEMA_STATEMENTS:
         conn.execute(statement)
