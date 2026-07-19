@@ -11,6 +11,7 @@ members = [
     "keel",
     "keel-broker-api",
     "keel-broker-coinbase",
+    "keel-broker-fake",
     "keel-core",
 ]
 
@@ -340,6 +341,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "keel-broker-fake" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -358,6 +360,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "keel-broker-fake", editable = "packages/keel-broker-fake" },
     { name = "mypy", specifier = ">=1.18.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.21" },
@@ -396,6 +399,21 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "coinbase-advanced-py", specifier = ">=1.8.4" },
+    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
+    { name = "keel-core", editable = "packages/keel-core" },
+]
+
+[[package]]
+name = "keel-broker-fake"
+version = "0.1.0"
+source = { editable = "packages/keel-broker-fake" }
+dependencies = [
+    { name = "keel-broker-api" },
+    { name = "keel-core" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "keel-broker-api", editable = "packages/keel-broker-api" },
     { name = "keel-core", editable = "packages/keel-core" },
 ]

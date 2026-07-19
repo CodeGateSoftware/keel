@@ -36,12 +36,16 @@ members = ["packages/*"]
 keel-core = { workspace = true }
 keel-broker-api = { workspace = true }
 keel-broker-coinbase = { workspace = true }
+keel-broker-fake = { workspace = true }
 
 [dependency-groups]
 dev = [
     "mypy>=1.18.0",
     "pytest>=9.1.1",
     "ruff>=0.15.21",
+    # Dev-only on purpose: the fake venue exists to exert design pressure on the port and to
+    # prove two-plugin discovery. A production engine must never have it installed.
+    "keel-broker-fake",
 ]
 
 [tool.ruff]
