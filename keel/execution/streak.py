@@ -53,7 +53,14 @@ def record_closed_trade(
         )
         return
 
-    pnl_net = (exit_fill - entry_fill) * exit_qty - fees
+    # BOTH legs' fees, matching `SimAccount.close`. Counting only the exit leg would make live's
+    # loss definition strictly looser than the sim's -- and rail 16's threshold is meant to come
+    # from a sim sweep, so the breaker would fire later on real money than the sweep predicted.
+    # A position with no `entry_fee` (legacy/degraded state) contributes 0 rather than skipping
+    # the record: unlike a missing entry PRICE, which would fabricate the P&L's sign, a missing
+    # fee only understates cost, and dropping the row would hide the trade from rail 16 entirely.
+    entry_fee = position.get("entry_fee") or Decimal("0")
+    pnl_net = (exit_fill - entry_fill) * exit_qty - fees - entry_fee
 
     repo.insert_trade_outcome(
         {

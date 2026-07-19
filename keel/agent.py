@@ -13,11 +13,17 @@ only ever emits ENTER signals (rules + read-only market data, no notion of what'
 held). Something has to own position state and ask each rule's `exit_signal(held, candles_by_tf)`
 whether to close it -- in Phase 2 that was deferred to "the paper trader's job"; in live trading
 it's this module's job. Position ownership is tracked in `agent_state` under
-`position_rule:<product_id>` (the rule name that opened the currently-held position) -- the
+`position_rule:<product_id>` (a dict carrying the owning rule's name plus the entry context a
+`trade_outcomes` row needs: `opened_at`, `entry_fill`, `qty`, `entry_fee`) -- the
 `orders` table has no column for it (live fills leave `rule_id` NULL, per `executor.py`'s own
 docstring: paper mode encodes `rule_name` in `raw_response`, but live orders don't), so this
 loop is the one place that source of truth lives, set the moment an ENTER places
 (`ExecutionResult.placed`) and cleared the moment the matching EXIT places.
+
+It is exit-rule OWNERSHIP state, not a position ledger: it is overwritten on every placed entry
+rather than accumulated, so its `qty` is the last tranche's, not the position's. Anything needing
+a true holding must use `_held_position` (the filled-orders audit log) instead -- see
+`_mark_to_market_equity`, where valuing equity from this key manufactured a phantom drawdown.
 
 **Rule reconstruction.** `rules.kind`/`rules.params` (P3 Task 1's `Repository.get_rules`) round-
 trip through `json.dumps`/`json.loads`, so `params` on the way back out is JSON-plain (strings/
@@ -193,7 +199,13 @@ def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
     if raw is None:
         return None
     if isinstance(raw, str):
-        return {"rule_name": raw, "opened_at": None, "entry_fill": None, "qty": None}
+        return {
+            "rule_name": raw,
+            "opened_at": None,
+            "entry_fill": None,
+            "qty": None,
+            "entry_fee": None,
+        }
     return raw
 
 
@@ -224,17 +236,36 @@ def _mark_to_market_equity(
     if quote is None:
         return None
 
+    # Quantities come from `_held_position` (the filled-orders audit log), NEVER from
+    # `position_rule:<product>`. That key is exit-rule OWNERSHIP state: it is overwritten on
+    # every placed entry rather than accumulated, so it holds the last tranche's qty, not the
+    # position. Valuing equity from it undercounts every accumulated position -- and because the
+    # high-water mark is monotonic, that undercount becomes a permanent phantom drawdown that
+    # arms rail 11 on a flat account. See `test_equity_counts_the_net_held_qty_across_...`.
+    #
+    # The product set is the UNION of the live-rule products and every product with a non-zero
+    # holding: `products` derives from the live rule set, so retiring a rule while its position
+    # is still open would otherwise drop that holding out of equity in a single step.
+    valued: set[str] = set()
     total = quote
-    for product_id in products:
-        position = _position_state(repo, product_id)
-        if position is None or position.get("qty") is None:
+    for product_id in (*products, *repo.held_products()):
+        if product_id in valued:
             continue
-        mark = price_by_product.get(product_id) or position.get("entry_fill")
+        valued.add(product_id)
+
+        qty, avg_cost = _held_position(repo, product_id)
+        if qty <= 0:
+            continue
+
+        # A held product with no fresh price is valued at its cost basis rather than dropped:
+        # dropping it understates equity and would trip rail 11 on a DATA GAP rather than on a
+        # loss. `avg_cost` comes from the same audit log as `qty`, so the two always agree.
+        mark = price_by_product.get(product_id)
         if mark is None:
-            # No price and no entry context (a legacy bare-string position) -- cannot value it.
-            # Same posture as the outcome producer: skip rather than fabricate a number.
+            mark = avg_cost
+        if mark <= 0:
             continue
-        total += position["qty"] * mark
+        total += qty * mark
     return total
 
 
@@ -293,7 +324,15 @@ def _handle_exits(
     )
     if result.placed:
         exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
-        if position is not None and exit_order is not None:
+        if (
+            position is not None
+            and exit_order is not None
+            # An exit with no observed fill price cannot be valued. Unreachable today (exits are
+            # always market orders, so `_initial_status` is `filled`), but a limit exit would
+            # otherwise raise TypeError on `(None - entry_fill)` from inside `run_once` -- and
+            # the producer already refuses to guess a missing ENTRY price for the same reason.
+            and exit_order["actual_fill"] is not None
+        ):
             streak.record_closed_trade(
                 repo,
                 config,
@@ -302,7 +341,12 @@ def _handle_exits(
                 exit_fill=exit_order["actual_fill"],
                 exit_qty=exit_order["qty"],
                 fees=exit_order["fee"] or Decimal("0"),
-                is_dca=False,
+                # DERIVED, never asserted: §12.6 exempts DCA from the streak, and the owning
+                # rule is what decides. Hardcoding False was safe only while `Dca.exit_signal`
+                # returned False unconditionally -- an invariant held by an unrelated module
+                # with nothing asserting it. `sim/portfolio_sim.py` passes this explicitly for
+                # the same reason; the live path must match.
+                is_dca=owning_rule.name == "dca",
                 now_ts=now_ts,
             )
         repo.set_state(f"position_rule:{product_id}", None)
@@ -505,6 +549,10 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                             "opened_at": now_ts,
                             "entry_fill": None if order is None else order["actual_fill"],
                             "qty": None if order is None else order["qty"],
+                            # The entry leg's fee, carried so `record_closed_trade` can net BOTH
+                            # legs (the sim does). Nothing else preserves it: the exit's order
+                            # row knows only its own fee.
+                            "entry_fee": None if order is None else order["fee"],
                         },
                     )
 

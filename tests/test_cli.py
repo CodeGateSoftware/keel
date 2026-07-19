@@ -1008,3 +1008,82 @@ def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert telemetry.current_venue() == DEFAULT_VENUE
+
+
+# -- operator overrides for the two circuit breakers ------------------------------------------
+
+
+def _repo_at(db_path):
+    conn = connect(str(db_path))
+    migrate(conn)
+    return Repository(conn)
+
+
+def test_resume_entries_clears_an_armed_streak_halt(tmp_path):
+    """Rail 16's violation message tells the operator to run `keel resume-entries`. Until now
+    that command did not exist, and a test merely asserted the message MENTIONED it -- pinning a
+    promise nothing implemented.
+
+    It is the only escape hatch: rail 16 reads `streak_halt_until` and never the threshold, so
+    setting `max_consecutive_losses: 0` does NOT release an armed halt. Without this, an
+    operator who mis-set the cooloff waits it out or edits sqlite by hand.
+    """
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("streak_halt_until", 2_000_000_000)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "resume-entries", "--passphrase", PASSPHRASE],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db_path).get_state("streak_halt_until") == 0
+
+
+def test_resume_entries_is_passphrase_gated(tmp_path):
+    """Negative control: clearing a live-money breaker is a dangerous action, gated like
+    `resume` -- not something a stray shell command can do."""
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("streak_halt_until", 2_000_000_000)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "resume-entries", "--passphrase", "wrong-passphrase"],
+    )
+
+    assert result.exit_code != 0
+    assert _repo_at(db_path).get_state("streak_halt_until") == 2_000_000_000
+
+
+def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path):
+    """Rail 11's high-water mark is MONOTONIC, so any bad equity write is permanent: a deposit
+    ratchets it up and a later withdrawal then reads as a drawdown that never recovers. Without
+    this command the only remedy is hand-editing sqlite."""
+    db_path = tmp_path / "test.db"
+    authz_path = tmp_path / "authz.json"
+    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
+    repo = _repo_at(db_path)
+    repo.set_state("equity_high_water_mark", Decimal("15000"))
+    repo.set_state("drawdown_total_pct", Decimal("0.33"))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--authz-path", str(authz_path),
+         "reset-hwm", "--passphrase", PASSPHRASE],
+    )
+
+    assert result.exit_code == 0, result.output
+    after = _repo_at(db_path)
+    assert after.get_state("equity_high_water_mark") is None
+    assert after.get_state("drawdown_total_pct") == Decimal("0")

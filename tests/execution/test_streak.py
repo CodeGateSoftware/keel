@@ -170,3 +170,54 @@ def test_a_position_with_no_entry_context_is_skipped_not_guessed() -> None:
     )
     assert repo.get_trade_outcomes() == []
     assert repo.get_state("consecutive_losses", default=0) == 0
+
+
+def test_pnl_net_subtracts_the_entry_fee_as_well_as_the_exit_fee() -> None:
+    """BOTH legs' fees, matching `SimAccount.close`, which nets `entry_fee` and `exit_fee`.
+
+    Rail 16's threshold is meant to be set from a `keel simulate` sweep. If live subtracted only
+    the exit leg, live's loss definition would be strictly looser than the sim's, and a
+    threshold tuned on sim streaks would be systematically loose in production -- the breaker
+    would fire later than the sweep predicted, on real money.
+    """
+    repo = _repo()
+    streak.record_closed_trade(
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        position={
+            "rule_name": "turtle_breakout",
+            "opened_at": NOW - DAY,
+            "entry_fill": Decimal("100"),
+            "qty": Decimal("1"),
+            "entry_fee": Decimal("0.30"),
+        },
+        exit_fill=Decimal("100.50"),   # +0.50 gross
+        exit_qty=Decimal("1"),
+        fees=Decimal("0.30"),          # -0.10 net once BOTH legs are counted
+        is_dca=False,
+        now_ts=NOW,
+    )
+    assert repo.get_trade_outcomes()[0]["pnl_net"] == Decimal("-0.10")
+    assert repo.get_state("consecutive_losses") == 1
+
+
+def test_a_position_without_entry_fee_context_still_records() -> None:
+    """Legacy/degraded positions carry no `entry_fee`. Treat it as 0 rather than skipping the
+    whole outcome: unlike a missing entry PRICE (which would fabricate the P&L's sign), a
+    missing fee only understates the cost, and dropping the record would hide the trade from
+    rail 16 entirely."""
+    repo = _repo()
+    streak.record_closed_trade(
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        position={"rule_name": "turtle_breakout", "opened_at": NOW - DAY,
+                  "entry_fill": Decimal("100"), "qty": Decimal("1")},
+        exit_fill=Decimal("99"),
+        exit_qty=Decimal("1"),
+        fees=Decimal("0"),
+        is_dca=False,
+        now_ts=NOW,
+    )
+    assert repo.get_trade_outcomes()[0]["pnl_net"] == Decimal("-1")

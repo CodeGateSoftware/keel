@@ -48,6 +48,8 @@ money_mgmt:
   acceleration_pct: 0.11
   max_total_dd_pct: 0.18
   max_weekly_dd_pct: 0.07
+  max_consecutive_losses: 6
+  streak_cooloff_days: 2
 
 dca:
   budget_usd: 75.5

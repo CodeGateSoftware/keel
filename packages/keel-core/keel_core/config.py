@@ -452,6 +452,26 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(quote_currency, str) or not quote_currency:
         raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
 
+    # Rail 16's two knobs are only meaningful together. The breaker arms
+    # `halt_until = now_ts + streak_cooloff_days * 86400` and the rail tests `now_ts < halt_until`,
+    # so a cooloff of 0 makes them equal: the breaker logs `streak.breaker_tripped` at WARNING,
+    # writes the halt key, and vetoes nothing. Since `streak_cooloff_days` SHIPS at 0, an operator
+    # who sets only `max_consecutive_losses` from a sweep gets a silently inert rail -- exactly the
+    # reads-as-enforced-but-cannot-fire failure this codebase keeps having. Fail closed at load.
+    _max_losses = _non_negative_int(
+        money_mgmt_raw.get("max_consecutive_losses", 0), "money_mgmt.max_consecutive_losses"
+    )
+    _cooloff_days = _non_negative_int(
+        money_mgmt_raw.get("streak_cooloff_days", 0), "money_mgmt.streak_cooloff_days"
+    )
+    if _max_losses > 0 and _cooloff_days <= 0:
+        raise ConfigError(
+            "money_mgmt.streak_cooloff_days: must be > 0 when max_consecutive_losses is "
+            f"enabled (got max_consecutive_losses={_max_losses}, streak_cooloff_days="
+            f"{_cooloff_days}). A cooloff of 0 arms the consecutive-loss breaker to expire at "
+            "the very instant it trips, so it would log as tripped and veto nothing."
+        )
+
     return Config(
         allowlist=allowlist,
         target_weights=target_weights,
@@ -487,13 +507,8 @@ def load_config(path: str | Path) -> Config:
             max_weekly_dd_pct=_to_decimal(
                 money_mgmt_raw.get("max_weekly_dd_pct", "0.08"), "money_mgmt.max_weekly_dd_pct"
             ),
-            max_consecutive_losses=_non_negative_int(
-                money_mgmt_raw.get("max_consecutive_losses", 0),
-                "money_mgmt.max_consecutive_losses",
-            ),
-            streak_cooloff_days=_non_negative_int(
-                money_mgmt_raw.get("streak_cooloff_days", 0), "money_mgmt.streak_cooloff_days"
-            ),
+            max_consecutive_losses=_max_losses,
+            streak_cooloff_days=_cooloff_days,
         ),
         dca=DcaConfig(
             budget_usd=_to_decimal(dca_raw.get("budget_usd", "0"), "dca.budget_usd"),

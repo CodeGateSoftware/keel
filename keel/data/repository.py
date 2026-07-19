@@ -250,6 +250,21 @@ class Repository:
             return None
         return self._order_row_to_dict(row)
 
+    def held_products(self) -> list[str]:
+        """Every `live` product with at least one filled order, ascending.
+
+        Feeds `agent._mark_to_market_equity`'s product union. That caller cannot iterate the
+        live rule set alone: retiring or disabling a rule while its position is still open would
+        drop the holding out of equity in one step, and against a monotonic high-water mark that
+        cliff registers as a permanent drawdown. Filled-only and live-only -- a `pending` order
+        is not a holding, and paper fills must never reach live equity.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT product_id FROM orders WHERE mode = 'live' AND status = 'filled' "
+            "ORDER BY product_id"
+        ).fetchall()
+        return [row["product_id"] for row in rows]
+
     def get_orders(
         self,
         mode: str | None = None,

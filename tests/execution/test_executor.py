@@ -853,3 +853,33 @@ def test_no_network_ever_touched_for_a_vetoed_intent(repo):
     )
 
     assert result.placed is False
+
+
+def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
+    """`orders.fee` was inserted as NULL and never updated, so `record_closed_trade` always
+    received `fees=0` and `pnl_net` was GROSS on every live trade.
+
+    That silently defeats the thing rail 16 exists for: fees dominate small moves, so a trade
+    up +$0.60 gross and -$11.40 after two legs of 0.6% taker fee was recorded as a WIN and RESET
+    the loss counter. The producer's arithmetic was right; the caller fed it a zero.
+
+    The previewed `commission_total` is an ESTIMATE, not the observed fill fee -- see
+    `_run_order`'s note. It is the best figure available until post-fill reconciliation exists,
+    and it is enormously closer to the truth than zero.
+    """
+    broker = FakeBroker(
+        preview={
+            "order_total": Decimal("50.00"),
+            "commission_total": Decimal("0.30"),
+            "errs": [],
+            "warning": [],
+        }
+    )
+    signal = _enter_signal()
+
+    result = execute(signal, broker, repo, _config(), "bypass", confirm_fn=None, now_ts=NOW_TS)
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["status"] == "filled"
+    assert order["fee"] == Decimal("0.30")

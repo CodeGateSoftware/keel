@@ -1302,6 +1302,53 @@ def resume(ctx: click.Context, passphrase: str | None) -> None:
     click.echo("kill-switch disengaged: trading resumed.")
 
 
+@cli.command(name="resume-entries")
+@click.option("--passphrase", default=None, help="Required to clear the breaker.")
+@click.pass_context
+@with_disclaimer
+def resume_entries(ctx: click.Context, passphrase: str | None) -> None:
+    """Clear an armed consecutive-loss halt (rail 16), re-permitting new entries.
+
+    This is the ONLY way to release the halt early: rail 16 reads `streak_halt_until` and never
+    the threshold, so setting `money_mgmt.max_consecutive_losses: 0` disables future trips but
+    does NOT clear one already armed. The rail's own violation message names this command.
+
+    The loss counter is reset alongside the halt -- leaving it at or above the threshold would
+    re-arm the breaker on the very next loss, which is not what an operator clearing a halt
+    means. Exits, sells and DCA are never affected by rail 16 and are unaffected here.
+    """
+    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    repo = _open_repo(ctx)
+    repo.set_state("streak_halt_until", 0)
+    repo.set_state("consecutive_losses", 0)
+    click.echo("consecutive-loss breaker cleared: new entries permitted.")
+
+
+@cli.command(name="reset-hwm")
+@click.option("--passphrase", default=None, help="Required to reset the high-water mark.")
+@click.pass_context
+@with_disclaimer
+def reset_hwm(ctx: click.Context, passphrase: str | None) -> None:
+    """Reset rail 11's equity high-water mark, clearing a stuck drawdown halt.
+
+    The HWM is MONOTONIC by design -- it never falls -- so any equity reading that was wrong or
+    is no longer comparable is permanent. The common cause is not a loss at all: depositing
+    ratchets the HWM up, and a later withdrawal then reads as a drawdown that never recovers.
+    Without this, the only remedy is editing sqlite by hand.
+
+    Clearing the key (rather than writing a number) lets the next cycle re-seed it from observed
+    equity, which is the same path a fresh install takes. `drawdown_total_pct` is zeroed so the
+    rail is not left vetoing on a stale scalar in the window before that next cycle runs.
+    """
+    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    repo = _open_repo(ctx)
+    repo.set_state("equity_high_water_mark", None)
+    repo.set_state("drawdown_total_pct", Decimal("0"))
+    repo.set_state("drawdown_weekly_pct", Decimal("0"))
+    repo.set_state("equity_history", [])
+    click.echo("equity high-water mark reset: it will re-seed from the next cycle's equity.")
+
+
 # -- insights (Phase 4 stub) ---------------------------------------------------------------------
 
 

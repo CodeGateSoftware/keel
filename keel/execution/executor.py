@@ -344,10 +344,21 @@ def _run_order(
         raise
     success = bool(place_result.get("success"))
     status = _initial_status(order_configuration) if success else "rejected"
+    # `fee` was previously left NULL forever: nothing else in the live path ever wrote it, so
+    # `streak.record_closed_trade` was always handed `fees=0` and every `pnl_net` was GROSS.
+    # That defeats rail 16 precisely where it matters -- fees dominate small moves, so a trade
+    # that is up gross and down net was recorded as a WIN and reset the loss counter.
+    #
+    # This is the PREVIEWED commission, an estimate, not the observed fill fee: `_run_order`
+    # never re-reads the order from the broker (there is no post-fill reconciliation yet, which
+    # is also why `actual_fill` is the expected price). It is the best figure available here and
+    # far closer than zero. Replace it with the observed fee when reconciliation lands.
+    fee = preview.get("commission_total") if isinstance(preview, dict) else None
     repo.update_order(
         order_id,
         status=status,
         actual_fill=intent.entry if status == "filled" else None,
+        fee=fee if status == "filled" else None,
         raw_response=json.dumps(place_result, default=str),
         updated_at=now_ts,
     )

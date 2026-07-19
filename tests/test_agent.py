@@ -31,6 +31,7 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.types import Candle, Granularity, Side
 from tests.conftest import attest_subscription
@@ -612,3 +613,137 @@ def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) ->
 
     assert repo.get_state("equity_high_water_mark") == Decimal("10000")  # never falls
     assert repo.get_state("drawdown_total_pct") == Decimal("0.3")
+
+
+# -- rail 11: equity must be valued from the ORDERS LOG, not from position_rule ----------------
+
+
+def test_equity_counts_the_net_held_qty_across_multiple_buys(repo: Repository) -> None:
+    """`position_rule["qty"]` is OVERWRITTEN on every placed entry, never accumulated, so it
+    holds the LAST tranche's qty -- not the position. Valuing equity from it undercounts every
+    accumulated position (DCA is the acute case: it buys the same product every cycle).
+
+    That matters far more than an ordinary rounding error because the high-water mark is
+    MONOTONIC: the undercount manufactures a drawdown that only ever grows, and at
+    `max_total_dd_pct` rail 11 vetoes every rule entry permanently on a flat account.
+    """
+    for i in range(5):
+        _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=1_000 + i)
+    # what the ENTER path actually writes -- the last leg only
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {"rule_name": "dca", "opened_at": 1_000, "entry_fill": Decimal("100"),
+         "qty": Decimal("0.5")},
+    )
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USDC"
+    )
+
+    # 2.5 BTC held, not 0.5 -- cash is FakeBroker's 1_000_000
+    assert equity == Decimal("1000000") + Decimal("2.5") * Decimal("100")
+
+
+def test_equity_counts_a_held_position_whose_rule_is_no_longer_live(repo: Repository) -> None:
+    """`products` comes from the LIVE rule set. Retire a rule while its position is still open
+    and the holding would vanish from equity in one step -- a cliff-edge phantom drawdown."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(
+        repo, broker, [], {PRODUCT: Decimal("100")}, "USDC"
+    )
+
+    assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
+
+
+def test_equity_falls_back_to_avg_cost_when_a_held_product_has_no_price(
+    repo: Repository,
+) -> None:
+    """Pre-flight fix (C): a held product missing from the price map is valued at its cost
+    basis, never dropped -- dropping it understates equity and would trip rail 11 on a DATA GAP
+    rather than on a loss. This is the assertion that fix was missing."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USDC")
+
+    assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
+
+
+def test_exit_records_a_trade_outcome(repo: Repository) -> None:
+    """The LIVE rail-16 producer must be invoked BY THE CYCLE, not only by a directly-called
+    helper. Every test in tests/execution/test_streak.py calls `record_closed_trade` itself, so
+    all of them would pass while `_handle_exits` never invoked it -- which is precisely how rail
+    11 became dormant, and the guard this branch built for the equity and sim producers but not
+    for the one that gates real money.
+
+    The pre-existing exit test cannot serve as this guard: it seeds `position_rule` as a legacy
+    BARE STRING, which `_position_state` normalises to `entry_fill=None`, which the producer
+    deliberately SKIPS. The one integration test reaching this call site takes the branch where
+    the producer does nothing.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "fake_exit",
+            "opened_at": 1_000,
+            "entry_fill": Decimal("50000"),
+            "qty": Decimal("0.1"),
+        },
+    )
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0]["rule_name"] == "fake_exit"
+
+
+def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
+    repo: Repository,
+) -> None:
+    """§12.6 exempts DCA from the STREAK, and `_handle_exits` must derive that from the owning
+    rule rather than asserting it. Today the exemption holds only because `Dca.exit_signal`
+    returns False unconditionally -- a load-bearing invariant in an unrelated module with
+    nothing asserting it. If DCA ever gains an exit condition, hardcoding `is_dca=False` would
+    silently start counting DCA losses toward a live-money breaker.
+    """
+
+    class _ExitingDca(Rule):
+        name = "dca"
+        params: dict = {}
+        product_id = PRODUCT
+
+        def detect(self, candles_by_tf):
+            return None
+
+        def exit_signal(self, held, candles_by_tf):
+            return True
+
+        def describe(self):
+            return {"name": self.name, "params": self.params}
+
+    agent.RULE_REGISTRY["dca"] = lambda **kw: _ExitingDca()
+    try:
+        repo.insert_rule("dca", {}, status="live")
+        _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+        repo.set_state(
+            f"position_rule:{PRODUCT}",
+            {"rule_name": "dca", "opened_at": 1_000,
+             "entry_fill": Decimal("50000"), "qty": Decimal("0.1")},
+        )
+        broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+        run_once(broker, repo, _config(), now_ts=90_000)
+    finally:
+        agent.RULE_REGISTRY["dca"] = Dca
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0]["is_dca"] is True          # recorded as DCA...
+    assert repo.get_state("consecutive_losses", default=0) == 0   # ...and exempt from the streak

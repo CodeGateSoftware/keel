@@ -409,3 +409,71 @@ def test_types_importable_with_correct_field_types():
     with pytest.raises(Exception):
         # frozen dataclass: mutation must fail
         candle.close = Dec("1")  # type: ignore[misc]
+
+
+# -- rail 16: the two knobs are only meaningful together -------------------------------------
+
+
+def test_enabling_the_streak_breaker_without_a_cooloff_is_rejected(write_config):
+    """`halt_until = now_ts + cooloff_days * 86400`, and rail 16 tests `now_ts < halt_until`.
+    With a cooloff of 0 those are equal, so the breaker logs `streak.breaker_tripped` at WARNING,
+    writes the halt key, and vetoes NOTHING.
+
+    That is the branch's own defect class -- a rail that reads as enforced and cannot fire -- and
+    it is the DEFAULT trap: `streak_cooloff_days` ships at 0, so an operator who sets only
+    `max_consecutive_losses` from a sweep gets a silently inert breaker. Fail closed at load.
+    """
+    text = VALID_CONFIG_YAML + (
+        "\nmoney_mgmt:\n  max_consecutive_losses: 3\n  streak_cooloff_days: 0\n"
+    )
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="streak_cooloff_days"):
+        load_config(path)
+
+
+def test_the_shipped_all_zero_default_is_still_valid(write_config):
+    """The negative control: rail 16 DISABLED (both knobs 0) is the shipped posture and must
+    keep loading -- the validation above must reject only the half-configured case."""
+    text = VALID_CONFIG_YAML + (
+        "\nmoney_mgmt:\n  max_consecutive_losses: 0\n  streak_cooloff_days: 0\n"
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.money_mgmt.max_consecutive_losses == 0
+    assert config.money_mgmt.streak_cooloff_days == 0
+
+
+def test_both_knobs_round_trip_from_yaml(write_config):
+    """The ONLY path by which rail 16 can ever be enabled. Nothing else pins it: the golden
+    fixture omits both keys, so a broken parse would leave the rail disabled forever, silently,
+    with a fully green suite."""
+    text = VALID_CONFIG_YAML + (
+        "\nmoney_mgmt:\n  max_consecutive_losses: 6\n  streak_cooloff_days: 2\n"
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.money_mgmt.max_consecutive_losses == 6
+    assert config.money_mgmt.streak_cooloff_days == 2
+
+
+def test_non_negative_int_rejects_a_boolean(write_config):
+    """`isinstance(True, int)` is True in Python, so `max_consecutive_losses: true` would
+    otherwise parse as a threshold of 1 -- arming a live-money breaker off a typo."""
+    text = VALID_CONFIG_YAML + (
+        "\nmoney_mgmt:\n  max_consecutive_losses: true\n  streak_cooloff_days: 2\n"
+    )
+    with pytest.raises(ConfigError, match="boolean"):
+        load_config(write_config(text))
+
+
+def test_non_negative_int_rejects_a_negative_threshold(write_config):
+    text = VALID_CONFIG_YAML + (
+        "\nmoney_mgmt:\n  max_consecutive_losses: -1\n  streak_cooloff_days: 2\n"
+    )
+    with pytest.raises(ConfigError, match="max_consecutive_losses"):
+        load_config(write_config(text))
