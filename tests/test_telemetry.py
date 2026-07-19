@@ -162,3 +162,39 @@ def test_log_exception_field_named_exc_is_renamed_and_does_not_overwrite_traceba
     assert "ValueError: boom" in payload["exc"]
     # The caller's colliding `exc` field is preserved, renamed, not dropped.
     assert payload["field_exc"] == "not-a-traceback"
+
+
+def test_unbind_cycle_restores_the_outer_id_rather_than_clearing_it() -> None:
+    """A nested cycle must not clobber the trace it was nested inside.
+
+    `bind_cycle` used to `set()` without keeping the token, and `run_once` unwound with
+    `bind_cycle(None)`. That is indistinguishable from this test's arrangement while nothing
+    nests -- but the moment an ingest or LLM span wraps a cycle, clearing to `None` on the way
+    out silently drops the outer correlation id and every subsequent event goes uncorrelated.
+    Under the old behaviour the `== "outer"` assertion below fails with `None`.
+    """
+    outer = telemetry.bind_cycle("outer")
+    try:
+        inner = telemetry.bind_cycle("inner")
+        assert telemetry.current_cycle() == "inner"
+
+        telemetry.unbind_cycle(inner)
+        assert telemetry.current_cycle() == "outer"
+    finally:
+        telemetry.unbind_cycle(outer)
+    assert telemetry.current_cycle() is None
+
+
+def test_run_once_style_unwind_preserves_an_enclosing_trace(caplog) -> None:
+    """The same property observed through the emitted payload, not just the ContextVar."""
+    outer = telemetry.bind_cycle("outer-trace")
+    try:
+        inner = telemetry.bind_cycle(telemetry.new_cycle_id())
+        telemetry.unbind_cycle(inner)
+
+        payload = _capture(
+            caplog, lambda log: telemetry.log_event(log, logging.INFO, "ingest.batch_done")
+        )
+        assert payload["cycle_id"] == "outer-trace"
+    finally:
+        telemetry.unbind_cycle(outer)

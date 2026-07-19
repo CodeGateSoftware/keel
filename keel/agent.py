@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from keel_core.telemetry import bind_cycle, log_event, new_cycle_id
+from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
 from keel.config import Config
 from keel.data import market_feed
@@ -300,7 +300,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
     staleness (`market_feed.is_fresh`) is checked after polling and only skips *that* product;
     the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
     """
-    bind_cycle(new_cycle_id())
+    cycle_token = bind_cycle(new_cycle_id())
     try:
         log_event(logger, logging.INFO, "agent.cycle_start", now_ts=now_ts)
 
@@ -333,7 +333,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
             log_event(
                 logger, logging.WARNING, "agent.bypass_refused", reason=bypass_refused_reason
             )
-        log_event(logger, logging.INFO, "agent.mode_resolved", mode=str(mode))
+        log_event(logger, logging.INFO, "agent.mode_resolved", mode=mode)
         max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
         finest = _finest_granularity(granularities)
 
@@ -417,7 +417,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
             bypass_refused_reason=bypass_refused_reason,
         )
     finally:
-        bind_cycle(None)
+        unbind_cycle(cycle_token)
 
 
 # -- scheduled wrapper -----------------------------------------------------------------------

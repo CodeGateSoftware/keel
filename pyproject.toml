@@ -10,8 +10,10 @@ requires-python = ">=3.12"
 dependencies = [
     "click>=8.4.2",
     "cryptography>=49.0.0",
-    "python-dotenv>=1.2.2",
-    "pyyaml>=6.0.3",
+    # pyyaml/python-dotenv are deliberately NOT listed here: nothing under `keel/` imports
+    # them any more (config parsing and secret loading both moved into keel-core), so they
+    # arrive transitively via the `keel-core` dependency below. Re-add them here only if
+    # `keel/` starts importing them directly again.
     "keel-core",
     "keel-broker-api",
     # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending

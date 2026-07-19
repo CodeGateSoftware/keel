@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 _cycle_id: ContextVar[str | None] = ContextVar("keel_cycle_id", default=None)
@@ -39,9 +39,20 @@ def new_cycle_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
-def bind_cycle(cycle_id: str | None) -> None:
-    """Bind (or clear, with `None`) the cycle id attached to subsequent events."""
-    _cycle_id.set(cycle_id)
+def bind_cycle(cycle_id: str | None) -> Token[str | None]:
+    """Bind (or clear, with `None`) the cycle id attached to subsequent events.
+
+    Returns a token: pass it to `unbind_cycle` to restore whatever was bound before, rather
+    than clobbering it. That matters as soon as anything wraps an outer trace around a cycle
+    (an ingest or LLM span, say) -- clearing to `None` on the way out would silently drop the
+    outer correlation id, and every event after the inner cycle would go uncorrelated.
+    """
+    return _cycle_id.set(cycle_id)
+
+
+def unbind_cycle(token: Token[str | None]) -> None:
+    """Restore the cycle id bound before the matching `bind_cycle`."""
+    _cycle_id.reset(token)
 
 
 def current_cycle() -> str | None:
