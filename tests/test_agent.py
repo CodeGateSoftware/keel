@@ -94,8 +94,8 @@ class FakeBroker:
             "error": None,
         }
 
-    def cancel_order(self, order_id: str) -> None:
-        pass
+    def cancel_order(self, order_id: str) -> bool:
+        return True        # a CONFIRMED cancel -- see `_cancel_at_exchange`
 
 
 class _AlwaysExitRule(Rule):
@@ -811,3 +811,29 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     assert repo.get_order(bracket_id)["status"] == "filled"
     assert len(repo.get_trade_outcomes()) == 1
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
+
+
+def test_a_rule_exit_clears_the_stop_and_target_state(repo: Repository) -> None:
+    """`open_stop`/`open_target` describe a bracket that no longer exists once the position is
+    exited. Left behind they poison the NEXT trade in that product: rail 9 (no stop widening)
+    vetoes a legitimate entry whose stop sits below the previous, closed trade's stop, and
+    `_handle_exits` builds its held setup from a dead trade's stop.
+
+    They were cleared on the reconcile path only -- the rule-exit path cleared `position_rule`
+    and left them.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "fake_exit", "opened_at": 1_000,
+        "entry_fill": Decimal("50000"), "qty": Decimal("0.1"), "entry_fee": Decimal("3"),
+    })
+    repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
+    repo.set_state(f"open_target:{PRODUCT}", Decimal("53000"))
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state(f"position_rule:{PRODUCT}") is None
+    assert repo.get_state(f"open_stop:{PRODUCT}") is None
+    assert repo.get_state(f"open_target:{PRODUCT}") is None

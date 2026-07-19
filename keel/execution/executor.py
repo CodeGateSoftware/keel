@@ -23,7 +23,7 @@ EXIT/NONE) -- the position being closed is reconstructed from the orders audit l
 signal for a product with no recorded open position is a deliberate no-op (`ExecutionResult`
 with `placed=False`, `vetoed_by=[]` -- there is nothing to veto, just nothing to sell).
 
-**OCO bracket.** A filled entry that carries a stop *and* target (i.e. not DCA) automatically
+**Exit bracket.** A filled entry that carries a stop *and* target (i.e. not DCA) automatically
 gets an exchange-side exit bracket (`place_bracket`): ONE native Coinbase trigger-bracket
 order carrying both the take-profit (`limit_price`) and the stop (`stop_trigger_price`), so the
 exchange itself owns the race between them. An earlier design placed two independent SELL legs
@@ -127,6 +127,21 @@ def execute(
             reason=f"no open {signal.product_id} position to exit",
         )
 
+    if intent.side == Side.SELL and not _clear_resting_bracket(
+        broker, repo, intent.product_id, now_ts
+    ):
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=(
+                f"could not cancel the resting exit bracket for {intent.product_id} -- "
+                "refusing to place a SELL that would be rejected for insufficient funds, or "
+                "would fill and leave a live bracket able to sell inventory we no longer hold"
+            ),
+        )
+
     result = _run_order(intent, broker, repo, config, mode, confirm_fn, now_ts)
 
     if (
@@ -152,6 +167,47 @@ def execute(
 
 
 # -- intent construction ---------------------------------------------------------------------
+
+
+
+def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_ts: int) -> bool:
+    """Cancel any resting exchange-side exit bracket for `product_id`. `False` if one could not
+    be cleared, in which case the caller MUST NOT place its SELL.
+
+    `place_bracket` leaves a native trigger bracket committing the ENTIRE base position, so a
+    voluntary rule exit selling the same inventory collides with it: on spot the base is locked
+    and the SELL is rejected, so `position_rule` is never cleared, no outcome is recorded, and
+    the agent retries the same doomed sell every cycle while the position rides a stale stop. If
+    it DID fill, the still-live bracket could later sell inventory we no longer hold.
+
+    This lives in `execute` rather than in `agent._handle_exits` so every SELL path -- the rule
+    exit today, `scale_out` or any future one -- gets it by construction rather than by each
+    caller remembering. Failing closed (refuse the exit) is right: an uncancellable bracket means
+    we do not know what the exchange will do with that inventory, and adding a second order to
+    that uncertainty is strictly worse than waiting a cycle.
+    """
+    for row in repo.get_orders(mode="live", product_id=product_id, status="pending"):
+        if str(row["side"]).upper() != Side.SELL.value.upper():
+            continue
+        try:
+            _cancel_at_exchange(broker, repo, row)
+        except CancelUnavailable:
+            log_exception(
+                logger,
+                "executor.bracket_cancel_failed",
+                product=product_id,
+                order_id=row["id"],
+            )
+            return False
+        repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+        log_event(
+            logger,
+            logging.INFO,
+            "executor.resting_bracket_cleared",
+            product=product_id,
+            order_id=row["id"],
+        )
+    return True
 
 
 def _is_dca_setup(context: dict[str, Any]) -> bool:
@@ -351,10 +407,11 @@ def _run_order(
     # That defeats rail 16 precisely where it matters -- fees dominate small moves, so a trade
     # that is up gross and down net was recorded as a WIN and reset the loss counter.
     #
-    # This is the PREVIEWED commission, an estimate, not the observed fill fee: `_run_order`
-    # never re-reads the order from the broker (there is no post-fill reconciliation yet, which
-    # is also why `actual_fill` is the expected price). It is the best figure available here and
-    # far closer than zero. Replace it with the observed fee when reconciliation lands.
+    # The PREVIEWED commission, and `actual_fill` the EXPECTED price -- the only figures
+    # available at placement time. Both are upgraded to the exchange's observed values a few
+    # lines below (`_upgrade_to_observed_economics`) for an immediate fill, and by
+    # `execution.reconcile` for an order that fills later. These remain the fallback when the
+    # status endpoint is unavailable.
     fee = preview.get("commission_total") if isinstance(preview, dict) else None
     repo.update_order(
         order_id,
@@ -364,6 +421,9 @@ def _run_order(
         raw_response=json.dumps(place_result, default=str),
         updated_at=now_ts,
     )
+
+    if success and status == "filled":
+        _upgrade_to_observed_economics(broker, repo, order_id, place_result, now_ts)
 
     if not success:
         log_event(
@@ -383,8 +443,11 @@ def _run_order(
             reason=f"broker rejected order: {place_result.get('error')}",
         )
 
-    if intent.stop is not None:
-        repo.set_state(f"open_stop:{intent.product_id}", intent.stop)
+    # `open_stop`/`open_target` are written by `place_bracket` ONLY, once the exchange has
+    # actually accepted the bracket that establishes them. Writing `open_stop` here (before the
+    # bracket is placed, and regardless of whether it is then vetoed) asserted a protective stop
+    # that might not exist, and never wrote its `open_target` partner -- which later made
+    # `_roll_stop` refuse with "no open_target recorded". The two are a pair; one writer.
 
     log_event(
         logger,
@@ -398,6 +461,42 @@ def _run_order(
     return ExecutionResult(
         placed=True, order_id=order_id, vetoed_by=[], preview=preview, reason="placed"
     )
+
+
+
+def _upgrade_to_observed_economics(
+    broker: Any, repo: Repository, order_id: int, place_result: dict[str, Any], now_ts: int
+) -> None:
+    """Replace an immediately-filled order's ESTIMATED economics with the exchange's observed ones.
+
+    A market order is marked `filled` at placement, so it never appears in
+    `get_orders(status="pending")` and `execution.reconcile` never sees it. Without this, rail 16
+    would count two different kinds of number: a bracket exit carrying the observed
+    `average_filled_price`/`total_fees`, and a voluntary rule exit carrying the expected price
+    and the PREVIEWED commission. A breaker swept on one definition and enforced on the other is
+    miscalibrated by construction.
+
+    Fails SOFT, unlike the cancel path: the order is already placed and we already hold a usable
+    estimate, so a missing or broken status endpoint keeps the estimate rather than aborting the
+    cycle. This is a refinement of a number, not a safety gate.
+    """
+    get_order = getattr(broker, "get_order", None)
+    if get_order is None:
+        return
+    native_id = place_result.get("order_id")
+    if not native_id:
+        return
+    try:
+        observed = get_order(native_id)
+    except Exception:
+        log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
+        return
+
+    fill = observed.get("average_filled_price")
+    fees = observed.get("total_fees")
+    if not fill or fill <= 0:
+        return
+    repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
 
 
 def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
@@ -428,7 +527,8 @@ def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
 
 def _initial_status(order_configuration: dict[str, Any]) -> str:
     """A market (IOC) order fills immediately; a limit/stop-limit order rests as `pending` on
-    the exchange until a later fill event (`handle_oco_fill`/monitoring) marks it `filled`."""
+    the exchange until a later fill event. `execution.reconcile`, run at the top of every
+    cycle, observes that fill and marks it `filled` with the observed price and fees."""
     config_type = next(iter(order_configuration), "")
     return "filled" if config_type.startswith("market_") else "pending"
 
@@ -437,12 +537,15 @@ class CancelUnavailable(RuntimeError):
     """Raised when a resting order cannot be cancelled AT THE EXCHANGE.
 
     Never downgrade this to a no-op. Both cancel sites used to do
-    `cancel = getattr(broker, "cancel_order", None)` and skip when absent -- and the real broker
-    (`cb_client`, the Coinbase adapter, the `Transport` protocol) has no `cancel_order` at all,
-    only the test fakes do. So in production the cancel was always skipped while the row was
-    still marked `canceled`, leaving a LIVE resting SELL on the exchange that our own records
-    said was gone. After a stop filled, the target leg could still sell inventory we no longer
-    held.
+    `cancel = getattr(broker, "cancel_order", None)` and skip when absent -- and at the time the
+    real client had no `cancel_order` at all, only the test fakes did, so in production the
+    cancel was always skipped while the row was still marked `canceled`, leaving a LIVE resting
+    SELL on the exchange that our own records said was gone.
+
+    `CoinbaseClient.cancel_order` exists now, but the guard still matters and now covers a
+    second case: it returns `False` when the exchange REFUSES a cancel (already filled, unknown
+    id), and a refusal recorded as a success is the same lie by a different route. The
+    `keel-broker-api` port and the Coinbase adapter still have no cancel method.
 
     Failing loudly is the safe direction: our state must never claim a cancel that did not
     happen. A caller that cannot tolerate the raise must reconcile with the exchange, not
@@ -472,7 +575,16 @@ def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]
             "still live at the exchange"
         )
 
-    cancel(native_id)
+    # The RETURN VALUE is the confirmation, not the absence of an exception. Coinbase's
+    # batch_cancel answers per order, so a refused cancel (already filled, unknown id) comes back
+    # `success: false` on a 200. Discarding it recorded a cancel that never happened -- the exact
+    # failure this module exists to prevent. `is not True` so a fake/broker returning None (no
+    # confirmation) also fails closed.
+    if cancel(native_id) is not True:
+        raise CancelUnavailable(
+            f"exchange did not confirm cancellation of {native_id} -- refusing to record it as "
+            "canceled while it may still be live"
+        )
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:
@@ -516,7 +628,7 @@ def _bracket_order_configuration(
     }
 
 
-# -- OCO bracket ------------------------------------------------------------------------------
+# -- exit bracket ------------------------------------------------------------------------------
 
 
 def place_bracket(

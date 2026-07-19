@@ -10,6 +10,7 @@ category.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -206,3 +207,225 @@ def test_a_partial_fill_is_left_alone_rather_than_recorded_as_a_full_exit(repo):
 
     assert repo.get_trade_outcomes() == []
     assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_a_partially_filled_then_cancelled_bracket_records_the_part_that_sold(repo):
+    """Coinbase returns CANCELLED with `filled_size > 0` for an order that partly filled before
+    being cancelled (thin book, self-trade prevention). The dead-order branch marked the row
+    canceled without reading `filled_size`, so:
+
+      - `_held_position` (which sums only `filled` rows) still reported the FULL position held,
+        so the next exit would size a sell for coins we no longer own -- rejected, forever;
+      - the realized loss on the sold portion never reached `trade_outcomes`, so rails 11 and 16
+        never saw it.
+
+    Observed fill quantity must never be dropped on the floor.
+    """
+    bracket_id = _seed_bracket(repo)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0.006"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.76"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    row = repo.get_order(bracket_id)
+    assert row["status"] == "filled"          # it DID sell -- partially
+    assert row["qty"] == Decimal("0.006")     # only what actually sold
+    assert row["actual_fill"] == Decimal("48900")
+    assert row["fee"] == Decimal("1.76")
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0]["qty"] == Decimal("0.006")
+
+
+def test_a_cancelled_bracket_with_no_fill_still_records_nothing(repo):
+    """Negative control for the above: filled_size == 0 means nothing sold, so recording a P&L
+    would fabricate a trade."""
+    bracket_id = _seed_bracket(repo)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    assert repo.get_trade_outcomes() == []
+
+
+def test_a_filled_order_with_no_observed_price_is_not_turned_into_a_phantom_loss(repo):
+    """`get_order` defaults a missing `average_filled_price` to 0. Feeding that to the producer
+    computes (0 - entry) * qty -- a full-notional phantom loss written to trade_outcomes, which
+    could trip rail 16 on a number nobody observed. `record_closed_trade` already refuses to
+    guess a missing ENTRY price; the exit side must be just as strict."""
+    bracket_id = _seed_bracket(repo)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_order(bracket_id)["status"] == "filled"   # it did fill
+    assert repo.get_trade_outcomes() == []                    # but we will not invent a P&L
+    assert repo.get_state("consecutive_losses", default=0) == 0
+
+
+def test_a_failure_recording_one_outcome_does_not_abandon_the_other_orders(repo):
+    """`_record_fill` sat outside the per-order try/except, so a raise there propagated out of
+    `run_once` and left every remaining pending order unreconciled -- defeating the stated
+    'one bad order must not blind the agent' contract, which was only tested for `get_order`."""
+    _seed_bracket(repo, native_id="cb-1")
+    second = repo.insert_order(
+        dict(mode="live", product_id="ETH-USD", side=Side.SELL.value, order_type="market",
+             qty=Decimal("1"), limit_price=None, status="pending", fee=None,
+             expected_fill=Decimal("3000"), actual_fill=None,
+             raw_response='{"order_id": "cb-2"}', created_at=NOW, updated_at=NOW)
+    )
+    broker = _Broker({
+        "cb-1": {"order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+                 "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93")},
+        "cb-2": {"order_id": "cb-2", "status": "FILLED", "filled_size": Decimal("1"),
+                 "average_filled_price": Decimal("2900"), "total_fees": Decimal("1")},
+    })
+
+    def _boom(*a, **k):
+        raise RuntimeError("db is locked")
+
+    repo.insert_trade_outcome = _boom   # type: ignore[method-assign]
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    # the second order still got reconciled despite the first one blowing up
+    assert repo.get_order(second)["status"] == "filled"
+
+
+def test_a_dead_bracket_on_a_still_held_position_escalates_loudly(repo, caplog):
+    """A cancelled bracket on a position we still hold means the stop is GONE.
+
+    Coinbase cancels resting orders for reasons outside our control (product status changes,
+    self-trade prevention, an operator tapping cancel in the mobile app). The row stops being
+    `pending`, so reconcile never revisits it and nothing re-brackets the position -- it sits
+    unprotected indefinitely. INFO is not the right level for "your stop is gone".
+    """
+    _seed_bracket(repo)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert "reconcile.position_unprotected" in caplog.text
+
+
+def test_a_dead_bracket_on_a_position_already_gone_does_not_escalate(repo, caplog):
+    """Negative control: no holding means nothing to protect, so this must stay quiet."""
+    bracket_id = repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=None, status="pending", fee=None,
+             expected_fill=Decimal("49000"), actual_fill=None,
+             raw_response='{"order_id": "cb-9"}', created_at=NOW, updated_at=NOW)
+    )
+    broker = _Broker({"cb-9": {
+        "order_id": "cb-9", "status": "CANCELLED", "filled_size": Decimal("0"),
+        "average_filled_price": Decimal("0"), "total_fees": Decimal("0"),
+    }})
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert "reconcile.position_unprotected" not in caplog.text
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+
+
+def test_a_dca_owned_position_stopping_out_stays_exempt_from_the_streak(repo):
+    """§12.6 exempts DCA from the consecutive-loss streak. The VOLUNTARY exit path derives
+    `is_dca` from the owning rule and has a test; the reconcile path derived it too but nothing
+    held it, so a DCA position stopping out would have counted toward a live-money breaker."""
+    _seed_bracket(repo)
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "dca", "opened_at": NOW - 1000,
+        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
+    })
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_trade_outcomes()[0]["is_dca"] is True
+    assert repo.get_state("consecutive_losses", default=0) == 0
+
+
+def test_a_reconciled_BUY_never_records_an_outcome_or_releases_the_position(repo):
+    """Only a SELL closes a position. A filled BUY reconciled here would otherwise book a
+    `trade_outcomes` row, feed the streak, and clear `position_rule` -- releasing the very
+    position it just opened."""
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "turtle_breakout", "opened_at": NOW - 1000,
+        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
+    })
+    buy_id = repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.BUY.value, order_type="limit",
+             qty=Decimal("0.01"), limit_price=Decimal("50000"), status="pending", fee=None,
+             expected_fill=Decimal("50000"), actual_fill=None,
+             raw_response='{"order_id": "cb-buy"}', created_at=NOW, updated_at=NOW)
+    )
+    broker = _Broker({"cb-buy": {
+        "order_id": "cb-buy", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("50010"), "total_fees": Decimal("3.1"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_order(buy_id)["status"] == "filled"      # economics still corrected
+    assert repo.get_order(buy_id)["actual_fill"] == Decimal("50010")
+    assert repo.get_trade_outcomes() == []                   # ...but no trade closed
+    assert repo.get_state(f"position_rule:{PRODUCT}") is not None
+
+
+def test_an_exit_with_no_entry_context_is_skipped_rather_than_invented(repo, caplog):
+    """The guard that stops a fabricated P&L. With no `position_rule` there is no observed entry
+    price, and `record_closed_trade` refuses to guess one -- so must this path."""
+    bracket_id = _seed_bracket(repo)
+    repo.set_state(f"position_rule:{PRODUCT}", None)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+    }})
+
+    with caplog.at_level(logging.WARNING):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert repo.get_order(bracket_id)["status"] == "filled"
+    assert repo.get_trade_outcomes() == []
+    assert repo.get_state("consecutive_losses", default=0) == 0
+    # Assert the SKIP, not just the absence of an outcome. Without the guard the producer is
+    # called with position=None and raises, which `_try_record_fill`'s isolation swallows --
+    # producing an identical empty-outcome result. Only the log distinguishes deliberate skip
+    # from swallowed crash.
+    assert "reconcile.exit_without_position_context" in caplog.text
+    assert "reconcile.record_fill_failed" not in caplog.text
+
+
+def test_the_outcome_uses_the_OBSERVED_filled_size_not_the_orders_original_qty(repo):
+    """`exit_qty` drives `pnl_net`. Every other fixture sets `filled_size == row qty`, which
+    makes the distinction untestable -- so a variant reading the order's original size would
+    pass. Here they DIFFER, which pins which one is used."""
+    _seed_bracket(repo)   # row qty is 0.01
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.008"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.34"),
+    }})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    outcome = repo.get_trade_outcomes()[0]
+    assert outcome["qty"] == Decimal("0.008")
+    # (48900 - 50000) * 0.008 - 2.34 exit - 3 entry
+    assert outcome["pnl_net"] == Decimal("-14.14")

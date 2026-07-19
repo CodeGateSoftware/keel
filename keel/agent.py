@@ -349,7 +349,13 @@ def _handle_exits(
                 is_dca=owning_rule.name == "dca",
                 now_ts=now_ts,
             )
+        # Clear the bracket's state alongside the position. These describe an exchange-side
+        # bracket that no longer exists once the position is out; left behind they poison the
+        # NEXT trade in this product -- rail 9 would veto a legitimate entry whose stop sits
+        # below this closed trade's stop, and the held-setup above would be built from it.
         repo.set_state(f"position_rule:{product_id}", None)
+        repo.set_state(f"open_stop:{product_id}", None)
+        repo.set_state(f"open_target:{product_id}", None)
     return [result]
 
 

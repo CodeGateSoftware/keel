@@ -67,8 +67,8 @@ class FakeBroker:
             "error": None,
         }
 
-    def cancel_order(self, order_id: str) -> None:
-        pass
+    def cancel_order(self, order_id: str) -> bool:
+        return True        # a CONFIRMED cancel -- see `_cancel_at_exchange`
 
 
 # -- db import ------------------------------------------------------------------------------

@@ -27,6 +27,8 @@ from keel_core.telemetry import log_event, log_exception
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.execution import streak
+from keel.execution.executor import _held_position
+from keel.types import Side
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +77,26 @@ def reconcile_open_orders(
         status = (observed.get("status") or "").upper()
 
         if status in _DEAD:
-            repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+            # A CANCELLED/EXPIRED order can still have SOLD something: Coinbase reports
+            # `filled_size > 0` for an order that partly filled before being cancelled (thin
+            # book, self-trade prevention). Marking it merely `canceled` drops that fill on the
+            # floor -- `_held_position` sums only `filled` rows, so it would keep reporting the
+            # FULL position held, and the realized P&L on the sold portion would never reach
+            # rails 11 or 16. Record what actually sold, then stop tracking the order.
+            if (observed.get("filled_size") or Decimal("0")) > 0:
+                _try_record_fill(broker, repo, config, row, observed, now_ts)
+            else:
+                repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "reconcile.order_closed_unfilled",
+                    order_id=row["id"],
+                    product=row["product_id"],
+                    status=status,
+                )
+                _warn_if_position_left_unprotected(repo, row, status)
             changed.append(row["id"])
-            log_event(
-                logger,
-                logging.INFO,
-                "reconcile.order_closed_unfilled",
-                order_id=row["id"],
-                product=row["product_id"],
-                status=status,
-            )
             continue
 
         if status != _FILLED:
@@ -93,10 +105,70 @@ def reconcile_open_orders(
             # release a position still partly held. Left for a later cycle.
             continue
 
-        _record_fill(broker, repo, config, row, observed, now_ts)
+        _try_record_fill(broker, repo, config, row, observed, now_ts)
         changed.append(row["id"])
 
     return changed
+
+
+
+
+def _warn_if_position_left_unprotected(
+    repo: Repository, row: dict[str, Any], status: str
+) -> None:
+    """Escalate when a dead SELL leaves a still-held position with no exchange-side stop.
+
+    Coinbase cancels resting orders for reasons outside our control -- a product status change,
+    self-trade prevention, an operator cancelling in the mobile app. Once the row stops being
+    `pending` reconcile never revisits it, and nothing re-places the bracket, so the position
+    sits unprotected indefinitely. CRITICAL rather than INFO because "your stop is gone" is not
+    routine, and because re-bracketing automatically is not obviously safe: the original
+    stop/target may be far from the current price, so an operator decides.
+    """
+    if str(row["side"]).upper() != Side.SELL.value.upper():
+        return
+    qty, _avg_cost = _held_position(repo, row["product_id"])
+    if qty <= 0:
+        return
+    log_event(
+        logger,
+        logging.CRITICAL,
+        "reconcile.position_unprotected",
+        product=row["product_id"],
+        order_id=row["id"],
+        status=status,
+        held_qty=str(qty),
+        detail=(
+            "the exit bracket is gone from the exchange but the position is still held -- it "
+            "has NO protective stop. Re-place one (or close the position) before trading on."
+        ),
+    )
+
+
+def _try_record_fill(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    row: dict[str, Any],
+    observed: dict[str, Any],
+    now_ts: int,
+) -> None:
+    """`_record_fill` with the SAME per-order isolation the status fetch gets.
+
+    Without this a raise inside recording (a locked DB, a bad decimal) propagated out of
+    `reconcile_open_orders` and out of `run_once`, leaving every REMAINING pending order
+    unreconciled -- which defeats the "one bad order must not blind the agent" contract that was
+    only ever enforced for the `get_order` call.
+    """
+    try:
+        _record_fill(broker, repo, config, row, observed, now_ts)
+    except Exception:
+        log_exception(
+            logger,
+            "reconcile.record_fill_failed",
+            order_id=row["id"],
+            product=row["product_id"],
+        )
 
 
 def _record_fill(
@@ -112,11 +184,29 @@ def _record_fill(
     fees = observed.get("total_fees") or Decimal("0")
     filled_qty = observed.get("filled_size") or row["qty"]
 
+    if exit_fill <= 0:
+        # A FILLED order that reports no price. Feeding 0 to the producer computes
+        # (0 - entry_fill) * qty -- a full-notional PHANTOM loss that would be written to
+        # `trade_outcomes` and could trip rail 16 on a number nobody observed.
+        # `record_closed_trade` already refuses to guess a missing ENTRY price; the exit side is
+        # held to the same standard. The row is still marked filled (it did fill) so the order is
+        # not re-processed forever -- only the P&L is withheld.
+        repo.update_order(row["id"], status="filled", updated_at=now_ts)
+        log_event(
+            logger,
+            logging.WARNING,
+            "reconcile.fill_without_observed_price",
+            order_id=row["id"],
+            product=row["product_id"],
+        )
+        return
+
     repo.update_order(
         row["id"],
         status="filled",
         actual_fill=exit_fill,
         fee=fees,
+        qty=filled_qty,
         updated_at=now_ts,
     )
     log_event(

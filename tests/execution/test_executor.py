@@ -76,6 +76,9 @@ class FakeBroker:
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[str] = []
+        # Ordered log of exchange interactions -- lets a test assert SEQUENCE, not just that a
+        # call happened. `_roll_stop` must cancel before it places.
+        self.events: list[str] = []
         self.get_accounts_calls = 0
 
     def get_accounts(self) -> list[dict[str, Any]]:
@@ -93,6 +96,7 @@ class FakeBroker:
     def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
         self._place_order_id_seq += 1
         order_id = f"{self._place_order_id_prefix}-{self._place_order_id_seq}"
+        self.events.append("place")
         self.place_calls.append(
             {"product_id": product_id, "side": side, "order_configuration": order_configuration}
         )
@@ -116,8 +120,12 @@ class FakeBroker:
             "error": {"error": "INSUFFICIENT_FUND", "message": "no funds"},
         }
 
-    def cancel_order(self, order_id: str) -> None:
+    def cancel_order(self, order_id: str) -> bool:
+        # Returns True: a CONFIRMED cancel. The real client returns bool and
+        # `_cancel_at_exchange` treats anything else as a refusal.
         self.cancel_calls.append(order_id)
+        self.events.append("cancel")
+        return True
 
 
 class NoNetworkBroker:
@@ -1025,7 +1033,11 @@ def test_rolling_the_stop_carries_the_original_target_forward(repo):
     assert new_id is not None and new_id != old_id
     assert repo.get_order(old_id)["status"] == "canceled"
     assert repo.get_state("open_stop:BTC-USD") == Decimal("50000")
-    assert broker.cancel_calls, "the old bracket was never cancelled at the exchange"
+    # ORDERING, not presence. `assert broker.cancel_calls` passed under place-then-cancel too,
+    # so it did not hold the one regression this design deliberately accepted. The replacement
+    # bracket must be placed only AFTER the old one is cancelled, or the exchange would reject
+    # it for insufficient funds (the resting bracket commits the whole position).
+    assert broker.events == ["place", "cancel", "place"], broker.events
     replacement = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
     assert replacement["limit_price"] == "53000"        # original target preserved
     assert replacement["stop_trigger_price"] == "50000"  # stop moved to break-even
@@ -1062,3 +1074,194 @@ def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_nak
 
     assert new_id is None
     assert "executor.position_unprotected" in caplog.text
+
+
+def test_a_cancel_the_exchange_REFUSES_is_not_recorded_as_a_cancel(repo):
+    """`cancel_order` returns bool -- False when the exchange refuses (e.g. the order already
+    filled). `_cancel_at_exchange` discarded it, so a refused cancel was recorded as a
+    successful one: exactly the "our state claims a cancel that did not happen" failure this
+    module exists to prevent, reintroduced one layer up.
+
+    No existing test could catch it because every fake `cancel_order` returns None.
+    """
+
+    class _RefusingBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> bool:
+            self.cancel_calls.append(order_id)
+            return False        # the exchange says: no
+
+    broker = _RefusingBroker()
+    stop_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with pytest.raises(CancelUnavailable, match="did not confirm"):
+        roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
+
+    assert repo.get_order(stop_id)["status"] == "pending"
+
+
+
+def _exit_signal() -> Signal:
+    return Signal(
+        rule_name="target_harvest",
+        product_id="BTC-USD",
+        action=Action.EXIT,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+
+
+def _seed_filled_buy(repo, *, qty, price) -> None:
+    _seed_open_position(repo, "BTC-USD", qty, price)
+
+
+# -- a voluntary exit must clear the resting bracket first --------------------------------------
+
+
+def test_an_exit_cancels_the_resting_bracket_before_selling(repo):
+    """THE defect the native-bracket rewrite introduced.
+
+    `place_bracket` leaves a trigger bracket resting that commits the ENTIRE base position. A
+    rule-driven exit then issues a full-size market SELL for the same inventory. On spot the
+    base is locked by the bracket, so the sell is rejected: `result.placed` is False,
+    `position_rule` is never cleared, no outcome is recorded, and the agent retries the same
+    doomed sell every cycle forever while the position rides a stale stop.
+
+    The rewrite was validated against the path it changed (bracket fills) and not against the
+    path it left behind (rule exits) -- the same reads-as-enforced-but-isn't pattern this branch
+    exists to eliminate.
+    """
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = FakeBroker()
+    bracket_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    result = execute(_exit_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS + 10)
+
+    assert result.placed is True
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    assert bracket_id in [int(c) if str(c).isdigit() else c for c in broker.cancel_calls] or \
+        broker.cancel_calls, "the resting bracket was never cancelled at the exchange"
+
+
+def test_an_exit_is_refused_when_the_resting_bracket_cannot_be_cancelled(repo):
+    """If the bracket cannot be cleared, the SELL must NOT be attempted: it would either be
+    rejected for insufficient funds, or -- worse -- fill and leave a live bracket able to sell
+    inventory we no longer hold. Refusing loudly is the only safe branch."""
+
+    class _RefusingBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> bool:
+            self.cancel_calls.append(order_id)
+            return False
+
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = _RefusingBroker()
+    place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+    placed_before = len(broker.place_calls)
+
+    result = execute(_exit_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS + 10)
+
+    assert result.placed is False
+    assert "bracket" in (result.reason or "").lower()
+    assert len(broker.place_calls) == placed_before, "a SELL was attempted anyway"
+
+
+def test_an_entry_does_not_try_to_cancel_anything(repo):
+    """Negative control: the bracket-clearing step is EXIT-only. An entry must not touch it."""
+    broker = FakeBroker()
+
+    execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+
+    assert broker.cancel_calls == []
+
+
+def test_an_immediately_filled_order_upgrades_to_the_OBSERVED_fill_and_fee(repo):
+    """Market orders are marked `filled` at placement, so they never appear in
+    `get_orders(status="pending")` and reconciliation never sees them. That left rail 16
+    counting two DIFFERENT kinds of number: bracket exits carried the exchange's observed price
+    and fee, while voluntary rule exits carried the expected price and the PREVIEWED commission.
+
+    A breaker whose threshold is swept on one definition and enforced on the other is
+    miscalibrated by construction, so the immediate path fetches its observed economics too.
+    """
+
+    class _ObservingBroker(FakeBroker):
+        def get_order(self, order_id: str) -> dict:
+            return {
+                "order_id": order_id, "status": "FILLED", "filled_size": Decimal("0.001"),
+                "average_filled_price": Decimal("50123.45"),   # not the expected 50000
+                "total_fees": Decimal("0.42"),                 # not the previewed 0.30
+            }
+
+    broker = _ObservingBroker()
+
+    result = execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+
+    order = repo.get_order(result.order_id)
+    assert order["actual_fill"] == Decimal("50123.45")
+    assert order["fee"] == Decimal("0.42")
+
+
+def test_an_unobservable_immediate_fill_keeps_the_estimate_rather_than_failing(repo):
+    """Fail SOFT here, unlike the cancel path. We already hold a usable estimate, the order is
+    already placed, and raising would abort a cycle over a refinement. The estimate is what
+    shipped before this upgrade existed."""
+
+    class _BlindBroker(FakeBroker):
+        def get_order(self, order_id: str) -> dict:
+            raise RuntimeError("status endpoint down")
+
+    broker = _BlindBroker()
+
+    result = execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["actual_fill"] == Decimal("50000")   # the expected price, as before
+    assert order["fee"] == Decimal("0.30")            # the previewed commission, as before
+
+
+def test_scale_out_has_no_production_caller(repo):
+    """A TRIPWIRE, not a style check. `scale_out` is unreachable today, and in the
+    single-bracket world it is actively wrong if wired: a partial SELL runs against a bracket
+    committing the FULL position (so it is rejected, or fills and leaves an oversized bracket
+    able to sell more than is held), it never resizes or re-places the bracket, and it records
+    no `trade_outcomes` row -- so a scaled-out winner's profit is dropped and rail 16 can count
+    a net winner as a loss.
+
+    The ledger adjudicated this as "accept and document", which is only safe while it stays
+    unreachable. This test fails the moment someone wires it, which is the point: fix the three
+    problems above first.
+    """
+    import pathlib
+    import re
+
+    keel_root = pathlib.Path(__file__).resolve().parents[2] / "keel"
+    callers: list[str] = []
+    for path in keel_root.rglob("*.py"):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if re.search(r"\bscale_out\s*\(", line) and "def scale_out" not in line:
+                callers.append(f"{path.relative_to(keel_root.parent)}:{lineno}")
+
+    assert callers == [], (
+        "scale_out has gained a production caller. Before wiring it: cancel/resize the resting "
+        "bracket, and record a trade outcome for the partial exit -- otherwise rail 16 will "
+        f"count net winners as losses. Call sites: {callers}"
+    )
