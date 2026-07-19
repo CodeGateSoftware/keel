@@ -18,3 +18,14 @@ for any live (network) commands. `.env` is git-ignored and never committed. Offl
 
 Runtime settings (allowlist, target weights, risk caps, market data granularities, etc.) live in
 `config.yaml` at the repo root — see `keel/config.py` for the schema and validation rules.
+
+## Before trading live
+
+Read `docs/operator-runbook.md`. It lists the compliance obligations **no rail can enforce** — chiefly
+that **interest/rewards on idle balances must be disabled** (Coinbase pays USDC rewards, and buys are
+routed through USDC, so riba can accrue with no order placed). Every guard in `keel/execution/guards.py`
+inspects an order, so account-level obligations are invisible to all of them and are yours to verify.
+
+Note keel ships **inert**: rail 14 refuses live BUYs until a subscription is attested with
+`keel subscription attest --venue coinbase --tier <tier>`. That one is enforced in code and needs no
+checklist.

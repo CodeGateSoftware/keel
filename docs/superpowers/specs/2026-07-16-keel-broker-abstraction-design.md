@@ -69,6 +69,40 @@ default": a **CFD/spread-betting broker (e.g. Trade Nation) is rejected by `Hala
 at the policy layer — no special-casing. The **halal agent** and a hypothetical **generic-policy agent** are
 thus *two products sharing one core*.
 
+### 3.1 The policy's scope is NOT only per-order — it must also carry account-level obligations
+
+The framing above ("the engine asks the policy before every setup/order") is necessary but **not
+sufficient**, and taking it as the whole scope would build the interface wrong. Some compliance
+obligations attach to **account state**, not to any order — there is no `OrderIntent` to gate, so no rail
+in `execution/guards.py` can ever catch them (every rail inspects an intent). They are invisible to the
+entire order path by construction.
+
+Two are known today, and they differ in kind:
+
+| Obligation | Kind | KB |
+|---|---|---|
+| **Interest/rewards on idle balances must be disabled** — Coinbase pays **USDC rewards** on idle balances, and rail 13 routes buys through USDC, so **riba can accrue on our own cash with no order ever placed** | **prohibitive** | §56.3 |
+| Zakat estimate (~2.5% of market value per lunar year), report-only | positive | §33.1 |
+
+**Design consequence for `CompliancePolicy`:** the interface needs a second surface alongside the
+per-order allow-check — something like `account_obligations() -> list[Obligation]`, where each obligation
+declares whether it is **machine-verifiable** or **operator-attested**. That distinction is load-bearing
+rather than decorative:
+
+> ⚠️ **The USDC-rewards obligation is NOT machine-verifiable today.** USDC Rewards is a Coinbase
+> *consumer-account* product; the **Advanced Trade API does not expose enrolment status** (no
+> `reward`/`interest`/`earn`/`yield` endpoint exists in the SDK), and the broker port (§2) surfaces only
+> capabilities / candles / balances / preview / place / fee-summary — no account-settings surface. A
+> check written today could only return `True` unconditionally or read an operator-set config flag,
+> **neither of which asserts anything about the real account**. A green check that verifies nothing is
+> worse than an honest manual obligation, because it converts an open risk into a false assurance.
+
+So: model it as **operator-attested** with a documented verification step (see the operator runbook), and
+promote it to machine-verified **only** if an API surface appears. If `CompliancePolicy` ever grows a
+config flag for this, the flag must be named as an *attestation* (what the operator asserts) and never as
+a *check* (what the system verified) — the same distinction rail 14 draws between an attested
+subscription record and an observed one.
+
 ## 4. Independent deterministic order-validator (the "reviewer")
 
 Before any live order, a **second, independently-implemented code path** re-derives the proposed order
