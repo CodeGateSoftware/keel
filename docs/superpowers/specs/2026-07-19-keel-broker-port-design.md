@@ -77,6 +77,7 @@ class Broker(Protocol):
     def get_balances(self) -> list[Balance]: ...
     def preview_order(self, spec: OrderSpec) -> Preview: ...
     def place_order(self, spec: OrderSpec) -> PlaceResult: ...
+    def get_fee_summary(self) -> FeeSummary: ...      # capability-gated; see §4.2
 ```
 
 **No broker-native type and no raw `dict` crosses this boundary.** `Candle`, `Side`, and
@@ -114,13 +115,41 @@ as port metadata. Both are omitted here, along with `get_spot`:
 |---|---|---|
 | `get_spot(product_id)` | Stays on the Coinbase adapter, off the port | Implemented and tested (`cb_client.py:148`), but has **zero production callers** — only `tests/data/test_cb_client.py` exercises it. §7's synthesised preview would need it, but no adapter synthesises yet. |
 | `list_products()` | Not implemented | Products come from `config.yaml`'s allowlist, not from the venue. Nothing needs venue-side discovery. |
-| `fee_schedule()` | Not implemented | `config.FeesConfig` currently supplies fees. See §13. |
+| `fee_schedule()` | **Superseded** — landed as `get_fee_summary()`, §4.2 | It now has a real consumer: subscription lapse detection. |
 
 The rule applied: **a port method with no consumer is a guess about a future caller's needs.**
 Each of these is trivial to add when something actually needs it, and each would otherwise be an
 unverified constraint every future adapter must satisfy. `get_spot` in particular is likely to
 return in step 5 or later — that is the right time, when the synthesising adapter defines what it
 actually needs.
+
+### 4.2 `get_fee_summary`
+
+```python
+@dataclass(frozen=True)
+class FeeSummary:
+    venue: str
+    taker_rate: Decimal
+    maker_rate: Decimal
+    volume_usd: Decimal
+    fees_usd: Decimal
+    volume_window: str      # "trailing_30d" | "calendar_month" | "unknown"
+    fetched_at: int
+```
+
+Gated by `BrokerCapabilities.supports_fee_summary`; an adapter without it raises.
+
+Its consumer is subscription lapse detection — see
+`2026-07-19-keel-broker-subscription-design.md`. Coinbase exposes no subscription endpoint at
+all, so the engine cannot read a user's tier; what it *can* read is the fee actually charged,
+which contradicts a claimed fee-free allowance when one is charged unexpectedly.
+
+`volume_window` is explicit because Coinbase's window could not be determined from the
+documentation. Requiring the adapter to declare it means the engine can never silently compare a
+trailing-30-day figure against a calendar-month cap. `"unknown"` is legal, and reconciliation
+then uses only `fees_usd`.
+
+This is the one method admitted past §4.1's rule, and only because it has a named consumer.
 
 ---
 
@@ -182,6 +211,7 @@ class BrokerCapabilities:
     supported_orders: frozenset[str]        # OrderSpec.kind values
     supports_native_preview: bool
     synthesizes_preview: bool
+    supports_fee_summary: bool
     quote_currencies: frozenset[str]
     asset_classes: frozenset[str]
 ```
@@ -369,9 +399,11 @@ change on the live order path and warrants the closest review.
 
 ## 13. Open questions
 
-- **Fee schedule.** `Preview.est_fee` needs one, and `config.FeesConfig` currently hardcodes
-  Coinbase's `<$1k-30d-volume` tier. Whether `fee_schedule()` joins the port or stays
-  configuration is deferred until the fake adapter forces the question in step 5.
+- **Fee schedule — RESOLVED.** It joins the port as `get_fee_summary()` (§4.2), because
+  subscription lapse detection needs it. See `2026-07-19-keel-broker-subscription-design.md`.
+  Whether the *simulator* should switch from `FeesConfig`'s pinned rates to the account's live
+  rates remains open there — live rates are more accurate but make backtests non-reproducible
+  across runs.
 - **Synthesised preview accuracy.** No adapter synthesises one yet. When the first does, it needs
   a stated accuracy bound and a rule for when the estimate is too stale to approve.
 - **Multi-venue rule routing.** With one venue, "which venue does this rule trade?" is not a

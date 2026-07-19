@@ -50,12 +50,13 @@ The port and its domain types. Nothing consumes it yet, so this task is pure add
 - Create: `packages/keel-broker-api/keel_broker_api/registry.py`
 - Create: `tests/broker_api/__init__.py`
 - Create: `tests/broker_api/test_orders.py`
+- Create: `tests/broker_api/test_results.py`
 - Create: `tests/broker_api/test_registry.py`
 - Modify: `pyproject.toml` (workspace member + dependency)
 
 **Interfaces:**
 - Consumes: `keel_core.types.{Side, Candle, Granularity}`.
-- Produces: `keel_broker_api.orders.{MarketIOCByQuote, MarketIOCByBase, LimitGTC, StopLimitGTC, OrderSpec, ORDER_KINDS}`; `keel_broker_api.results.{Balance, Preview, PlaceResult}`; `keel_broker_api.capabilities.BrokerCapabilities`; `keel_broker_api.port.Broker`; `keel_broker_api.registry.{discover_brokers, load_broker}`. Tasks 3–5 implement and consume these exact names.
+- Produces: `keel_broker_api.orders.{MarketIOCByQuote, MarketIOCByBase, LimitGTC, StopLimitGTC, OrderSpec, ORDER_KINDS}`; `keel_broker_api.results.{Balance, Preview, PlaceResult, FeeSummary}`; `keel_broker_api.capabilities.BrokerCapabilities`; `keel_broker_api.port.Broker`; `keel_broker_api.registry.{discover_brokers, load_broker}`. Tasks 3–5 implement and consume these exact names.
 
 - [ ] **Step 1: Create the package skeleton**
 
@@ -353,8 +354,85 @@ class PlaceResult:
     reason: str | None = None
 
 
-__all__ = ["Balance", "PlaceResult", "Preview"]
+@dataclass(frozen=True)
+class FeeSummary:
+    """Fees and volume the venue reports for this account.
+
+    Its consumer is subscription lapse detection: Coinbase exposes no subscription endpoint, so
+    the engine cannot read a user's tier -- but a fee charged while the user claims a fee-free
+    allowance contradicts the claim. See the subscription design spec.
+
+    `volume_window` is explicit because Coinbase's window could not be determined from their
+    docs. An adapter that does not know says "unknown", and reconciliation then uses only
+    `fees_usd` -- which is window-independent for that test. This field exists so the engine can
+    never silently compare a trailing-30-day figure against a calendar-month cap.
+    """
+
+    venue: str
+    taker_rate: Decimal
+    maker_rate: Decimal
+    volume_usd: Decimal
+    fees_usd: Decimal
+    volume_window: str
+    fetched_at: int
+
+    def __post_init__(self) -> None:
+        allowed = {"trailing_30d", "calendar_month", "unknown"}
+        if self.volume_window not in allowed:
+            raise ValueError(f"volume_window must be one of {sorted(allowed)}")
+
+
+__all__ = ["Balance", "FeeSummary", "PlaceResult", "Preview"]
 ```
+
+- [ ] **Step 6b: Test `FeeSummary`'s window validation**
+
+`Balance`, `Preview`, and `PlaceResult` are pure data and need no tests. `FeeSummary.__post_init__`
+is real logic and does need one — it is the guard stopping an adapter declaring a window the
+engine cannot interpret.
+
+Create `tests/broker_api/test_results.py`:
+
+```python
+from __future__ import annotations
+
+from decimal import Decimal
+
+import pytest
+
+from keel_broker_api.results import FeeSummary
+
+
+def _summary(window: str) -> FeeSummary:
+    return FeeSummary(
+        venue="coinbase",
+        taker_rate=Decimal("0.012"),
+        maker_rate=Decimal("0.006"),
+        volume_usd=Decimal("1234.56"),
+        fees_usd=Decimal("0"),
+        volume_window=window,
+        fetched_at=1_700_000_000,
+    )
+
+
+@pytest.mark.parametrize("window", ["trailing_30d", "calendar_month", "unknown"])
+def test_accepts_every_legal_window(window: str) -> None:
+    assert _summary(window).volume_window == window
+
+
+def test_rejects_an_unknown_window() -> None:
+    """An undeclarable window would let the engine compare mismatched periods silently."""
+    with pytest.raises(ValueError, match="volume_window must be one of"):
+        _summary("monthly")
+
+
+def test_unknown_is_a_legal_declaration_not_an_error() -> None:
+    """Coinbase's window is undocumented; "unknown" must be sayable, not a failure."""
+    assert _summary("unknown").volume_window == "unknown"
+```
+
+Run: `uv run pytest tests/broker_api/test_results.py -v`
+Expected: 5 passed
 
 - [ ] **Step 7: Implement capabilities and the port Protocol**
 
@@ -378,6 +456,7 @@ class BrokerCapabilities:
     supported_orders: frozenset[str]
     supports_native_preview: bool
     synthesizes_preview: bool
+    supports_fee_summary: bool
     quote_currencies: frozenset[str]
     asset_classes: frozenset[str]
 
@@ -408,7 +487,7 @@ from keel_core.types import Candle, Granularity
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.results import Balance, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
 
 
 class UnsupportedOrder(Exception):
@@ -432,6 +511,8 @@ class Broker(Protocol):
     def preview_order(self, spec: OrderSpec) -> Preview: ...
 
     def place_order(self, spec: OrderSpec) -> PlaceResult: ...
+
+    def get_fee_summary(self) -> FeeSummary: ...
 
 
 __all__ = ["Broker", "UnsupportedOrder"]
@@ -516,7 +597,7 @@ Run: `uv sync`
 Expected: resolves; `keel-broker-api` appears as a workspace member.
 
 Run: `uv run pytest tests/broker_api/ -v`
-Expected: 8 passed
+Expected: 13 passed
 
 Run: `uv run pytest tests/baseline/ -v`
 Expected: 3 passed, golden file unchanged.
@@ -809,6 +890,16 @@ Create `packages/keel-broker-coinbase/keel_broker_coinbase/adapter.py` implement
 - `preview_order(spec)` calls `to_order_configuration(spec)`, hits the transport, and maps the response to `Preview(..., synthetic=False)` with `errors` from the response's `errs`.
 - `place_order(spec)` generates a fresh `client_order_id` per call for idempotency (as `cb_client.py:218` does), and maps the response to `PlaceResult(success, broker_order_id, reason)`.
 - Both `preview_order` and `place_order` raise `UnsupportedOrder` if `spec.kind not in self.capabilities().supported_orders`.
+- `get_fee_summary()` calls the transport's `get_transaction_summary` and maps the response to
+  `FeeSummary`: `taker_rate`/`maker_rate` from `fee_tier.taker_fee_rate`/`maker_fee_rate`,
+  `volume_usd` from `advanced_trade_only_volume`, `fees_usd` from `advanced_trade_only_fees`.
+  **Set `volume_window="unknown"`.** Coinbase's documentation does not state whether
+  `advanced_trade_only_volume` is trailing-30-day or calendar-month, and the honest declaration
+  is the one that stops a caller comparing it against a calendar-month cap. Do not guess; the
+  subscription spec's §10 tracks confirming it against a live account.
+- `capabilities()` sets `supports_fee_summary=True`.
+
+Add `get_transaction_summary` to the copied `Transport` Protocol in `transport.py`.
 
 Export `CoinbaseAdapter` from `keel_broker_coinbase/__init__.py` so the entry point resolves.
 
@@ -816,7 +907,9 @@ Export `CoinbaseAdapter` from `keel_broker_coinbase/__init__.py` so the entry po
 
 Create `tests/broker_coinbase/test_adapter.py`, following the fake-transport pattern already established in `tests/data/test_cb_client.py` and reusing the existing JSON fixtures in `tests/fixtures/cb_*.json`.
 
-Cover: `get_candles` returns ascending `Candle`s; `get_balances` returns `Balance` objects and no dicts; `preview_order` returns `synthetic=False`; `place_order` maps success and failure responses to `PlaceResult`; an unsupported kind raises `UnsupportedOrder`.
+Cover: `get_candles` returns ascending `Candle`s; `get_balances` returns `Balance` objects and no dicts; `preview_order` returns `synthetic=False`; `place_order` maps success and failure responses to `PlaceResult`; an unsupported kind raises `UnsupportedOrder`; `get_fee_summary` maps a canned `transaction_summary` response to `FeeSummary` with `volume_window="unknown"` and exact `Decimal` rates.
+
+You will need a new fixture `tests/fixtures/cb_transaction_summary.json`. Build it from the documented response shape — `total_fees`, `fee_tier` (with `pricing_tier`, `taker_fee_rate`, `maker_fee_rate`), `advanced_trade_only_volume`, `advanced_trade_only_fees` — matching the style of the existing `cb_*.json` fixtures.
 
 - [ ] **Step 7: Move `coinbase-advanced-py` out of the root dependencies**
 
@@ -895,8 +988,9 @@ Its four deliberate disagreements with Coinbase, each of which exists to break a
 | Base-size only | `supported_orders` omits `"market_ioc_quote"`; that kind raises `UnsupportedOrder` | That every venue can size a market order in quote currency |
 | Stops are separate objects | Internally stores a `StopLimitGTC` as a resting order plus a distinct trigger record, returning one `PlaceResult` | That "a stop is an order type" is universal |
 | Different granularities and page size | Supports only `ONE_HOUR` and `ONE_DAY`; `get_candles` returns at most 50 per call | Coinbase's granularity set and pagination limits |
+| No fee summary | `supports_fee_summary=False`; `get_fee_summary` raises `NotImplementedError` | That every venue reports fees and volume — subscription lapse detection must degrade to attestation alone |
 
-`capabilities()`: `venue="fake"`, `supported_orders=frozenset({"market_ioc_base", "limit_gtc", "stop_limit_gtc"})`, `quote_currencies=frozenset({"USD"})`, `asset_classes=frozenset({"spot"})`.
+`capabilities()`: `venue="fake"`, `supported_orders=frozenset({"market_ioc_base", "limit_gtc", "stop_limit_gtc"})`, `supports_fee_summary=False`, `quote_currencies=frozenset({"USD"})`, `asset_classes=frozenset({"spot"})`.
 
 `get_candles` raises `ValueError` for a granularity it does not support, naming the supported set — a venue that cannot serve a timeframe must say so, not return empty.
 
@@ -990,6 +1084,9 @@ The contract it enforces:
 3. **No dicts cross the port.** `get_balances()` returns only `Balance` instances; `place_order` returns `PlaceResult`; `preview_order` returns `Preview`.
 4. **`get_candles` returns ascending candles** and never exceeds any page limit the adapter declares.
 5. **`supported_orders` is a subset of `ORDER_KINDS`** — an adapter cannot invent kinds.
+6. **`capabilities()` cannot lie about fee summaries.** If `supports_fee_summary` is false,
+   `get_fee_summary` raises. If true, it returns a `FeeSummary` whose `volume_window` is one of
+   the three legal values and whose rates are `Decimal`.
 
 Where a check needs to place a real order, the suite requires the adapter to be constructed in a sandbox or in-memory mode; the suite never places live orders. Document that requirement in the module docstring.
 
