@@ -17,6 +17,36 @@ Plus a pattern/Fib-inversion/ABCD entry as a 5th route (deferred, §9.3).
 → **This is the menu §8.1's CTS score picks from:** higher confluence score → can take the more
 aggressive technique; lower score → demand more confirmation. Ties the two sources together.
 
+#### 17.1a Refinement — how to actually DRAW the entry zones (from a later re-paste of this method)
+
+§17.1 names the techniques but not the geometry. A worked GBP/JPY walkthrough by the same author
+supplies the missing construction, which is the implementable half:
+
+- **Shallow ("first chance") zone = highest high → highest close** of the structure being pulled back
+  into. Entry is a **retest of that band on a lower TF**, stop just below the retest.
+- **Deep ("last chance") zone = lowest low → lowest close** of the most recent pullback. Same
+  retest-on-lower-TF treatment; this is §17.1 #4's double-bottom.
+- The **middle zone** is entered on the HH+HC candle (§17.1 #2) **at market**, because by then price
+  is deeper in and the extra confirmation buys back the aggressiveness.
+- ⭐ **The zones are not fixed — they are shifted so each one still clears the R:R floor.** In the
+  walkthrough the author explicitly moves a zone boundary down *"because we want a minimum of a one
+  reward-to-risk profile."* That makes the kill zone (§17.2) the **constraint that positions the
+  zones**, not merely a validity check applied afterwards.
+- Probability and R:R run **inversely** across the three, for a stated structural reason: a pullback
+  deep enough to reach the last-chance zone means *"the whole trend is running out of steam, which
+  means we could see another reversal"* — i.e. the best R:R is available exactly where trend-continuation
+  is least likely. Same conclusion §17.1 already records; the walkthrough supplies the *why*.
+
+#### 17.1b Refinement — RSI extreme as a "don't chase" ENTRY-TIMING veto (not a reversal signal)
+
+Distinct from RSI-as-confluence (§4.4): with a **bullish** bias established top-down, RSI **> 80** on the
+trading timeframe is used to **veto entering now** and force waiting for the pullback — *"it doesn't make
+sense to just buy this up now… you're going to have a lot of pain when price starts dipping."* The signal
+is not "reverse", it is "**do not chase; the entry you want has not arrived**".
+→ Maps cleanly onto our existing `indicators.is_overbought(thr=80.0)` (already the same threshold) as an
+**entry-timing gate** in `strategy/engine.py`, complementing the kill-zone check rather than duplicating
+it: the kill zone says *where* an entry is valid, this says *when* not to take an otherwise-valid one.
+
 ### 17.2 NEW — the "kill zone" (entry-validity band) → `strategy/engine.py`
 The **kill zone** is the price band where an entry still yields at least the minimum R:R (≥1:1,
 ideally toward 2:1). It's bounded by the target (top) and the price where R:R drops below the floor
