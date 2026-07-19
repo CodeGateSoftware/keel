@@ -2,9 +2,54 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+
+if TYPE_CHECKING:
+    from keel.data.repository import Repository
+
+ATTESTATION_PERIOD_SEC = 365 * 24 * 3600
+
+
+def attest_subscription(
+    repo: Repository,
+    *,
+    now_ts: int,
+    free_volume_usd: Decimal | None,
+    status: SubscriptionStatus = SubscriptionStatus.ACTIVE,
+    pacing: str = "opportunistic",
+    attest_due_ts: int | None = None,
+    venue: str = "coinbase",
+    tier_name: str = "Preferred",
+) -> None:
+    """Write an attested subscription record -- the single source of truth for its shape.
+
+    Three test modules each built this record inline with near-identical bodies, so any change
+    to `BrokerSubscription`'s fields had to land in three places or the copies drifted apart
+    silently. Their `_attest` wrappers survive (each module's call convention differs) but now
+    delegate here rather than re-constructing the record.
+
+    `now_ts` is required rather than defaulted: each caller module defines its own `NOW_TS`,
+    and a default here would silently bind the wrong clock into one of them.
+    """
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue=venue,
+            tier_name=tier_name,
+            free_volume_usd=free_volume_usd,
+            pacing=pacing,
+            subscription_usd_month=Decimal("29.99"),
+            status=status,
+            attested_at=now_ts,
+            attest_due_ts=(
+                attest_due_ts if attest_due_ts is not None else now_ts + ATTESTATION_PERIOD_SEC
+            ),
+        )
+    )
 
 VALID_CONFIG_YAML = """
 allowlist:

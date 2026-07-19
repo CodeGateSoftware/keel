@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel.config import (
     Caps,
@@ -29,6 +28,7 @@ from keel.execution import guards
 from keel.execution.guards import OrderIntent
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.types import Side
+from tests.conftest import attest_subscription
 
 
 def _ts(year: int, month: int, day: int, hour: int = 12) -> int:
@@ -759,17 +759,8 @@ def _attest(
     """Attest a coinbase subscription -- rail 14 (`guards.check`) now derives its cap from this
     record rather than from `config.subscription`, so a guards/sim parity comparison must attest
     a record matching whatever `config.subscription` the sim side reads."""
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue="coinbase",
-            tier_name="Preferred",
-            free_volume_usd=free_volume_usd,
-            pacing=pacing,
-            subscription_usd_month=Decimal("29.99"),
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=now_ts,
-            attest_due_ts=now_ts + 31_536_000,
-        )
+    attest_subscription(
+        repo, now_ts=now_ts, free_volume_usd=free_volume_usd, pacing=pacing
     )
 
 

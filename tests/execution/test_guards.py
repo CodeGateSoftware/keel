@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
     AutoTradeConfig,
@@ -28,6 +28,7 @@ from keel.data.repository import Repository
 from keel.execution import guards
 from keel.execution.guards import GuardResult, OrderIntent, check
 from keel.types import Side
+from tests.conftest import attest_subscription
 
 NOW_TS = 1_700_000_000  # 2023-11-14T22:13:20Z -- well inside its UTC day for boundary tests
 
@@ -48,18 +49,7 @@ def repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
-    r.upsert_broker_subscription(
-        BrokerSubscription(
-            venue="coinbase",
-            tier_name="Preferred",
-            free_volume_usd=_LARGE_ALLOWANCE,
-            pacing="opportunistic",
-            subscription_usd_month=Decimal("29.99"),
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=NOW_TS,
-            attest_due_ts=NOW_TS + 31_536_000,
-        )
-    )
+    attest_subscription(r, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE)
     return r
 
 
@@ -667,19 +657,13 @@ def _attest(
     attest_due_ts: int | None = None,
 ) -> None:
     """Attest a coinbase subscription -- the setup every rail-14 test now needs."""
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue="coinbase",
-            tier_name="Preferred",
-            free_volume_usd=free_volume_usd,
-            pacing=pacing,
-            subscription_usd_month=Decimal("29.99"),
-            status=status,
-            attested_at=attested_at,
-            attest_due_ts=(
-                attest_due_ts if attest_due_ts is not None else attested_at + 31_536_000
-            ),
-        )
+    attest_subscription(
+        repo,
+        now_ts=attested_at,
+        free_volume_usd=free_volume_usd,
+        status=status,
+        pacing=pacing,
+        attest_due_ts=attest_due_ts,
     )
 
 
@@ -729,10 +713,23 @@ def test_rail14_passes_unconditionally_for_an_unlimited_tier(repo: Repository) -
 
 
 @pytest.mark.parametrize("status", [SubscriptionStatus.SUSPECT, SubscriptionStatus.LAPSED])
+@pytest.mark.parametrize(
+    "free_volume_usd",
+    [Decimal("10000"), None],
+    ids=["finite_allowance", "unlimited_allowance"],
+)
 def test_rail14_fails_closed_on_a_degraded_subscription(
-    repo: Repository, status: SubscriptionStatus
+    repo: Repository, status: SubscriptionStatus, free_volume_usd: Decimal | None
 ) -> None:
-    _attest(repo, free_volume_usd=Decimal("10000"), status=status)
+    """The `None` case is the one that would be an actual real-money hole.
+
+    `free_volume_usd is None` means unlimited, and rail 14 skips the cap entirely when the
+    allowance is `None` -- so a degraded record whose stored allowance is unlimited must NOT
+    reach that branch. The policy closes it in `BrokerSubscription.allowance_usd`, but until
+    now that was only pinned upstream in `tests/test_subscription_record.py`; nothing pinned
+    the composition at the rail, which is where the spending actually happens.
+    """
+    _attest(repo, free_volume_usd=free_volume_usd, status=status)
     result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
     assert "subscription_unattested" in _keys(result)
 

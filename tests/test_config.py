@@ -120,9 +120,13 @@ def test_unsubscribed_allowance_defaults_to_zero(valid_config_path) -> None:
 def test_unsubscribed_allowance_parses(write_config) -> None:
     from tests.conftest import VALID_CONFIG_YAML
 
+    # Replace the fixture's existing key rather than appending a second one. Appending built a
+    # duplicate-key YAML document that only parsed to 25 because PyYAML's safe_load happens to
+    # take the last occurrence -- the test would have kept passing while asserting nothing about
+    # a document any stricter loader would reject.
     path = write_config(
         VALID_CONFIG_YAML.replace(
-            "pacing: opportunistic", "pacing: opportunistic\n  unsubscribed_allowance_usd: 25"
+            "unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: 25"
         )
     )
     assert load_config(path).subscription.unsubscribed_allowance_usd == Decimal("25")

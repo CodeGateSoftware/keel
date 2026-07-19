@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
     AutoTradeConfig,
@@ -39,6 +39,7 @@ from keel.execution.executor import (
 )
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
+from tests.conftest import attest_subscription
 
 NOW_TS = 1_700_000_000
 
@@ -140,19 +141,13 @@ def _attest(
     attest_due_ts: int | None = None,
 ) -> None:
     """Attest a coinbase subscription -- rail 14 now derives its cap from this record."""
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue="coinbase",
-            tier_name="Preferred",
-            free_volume_usd=free_volume_usd,
-            pacing=pacing,
-            subscription_usd_month=Decimal("29.99"),
-            status=status,
-            attested_at=attested_at,
-            attest_due_ts=(
-                attest_due_ts if attest_due_ts is not None else attested_at + 31_536_000
-            ),
-        )
+    attest_subscription(
+        repo,
+        now_ts=attested_at,
+        free_volume_usd=free_volume_usd,
+        status=status,
+        pacing=pacing,
+        attest_due_ts=attest_due_ts,
     )
 
 
