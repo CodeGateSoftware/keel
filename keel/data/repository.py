@@ -13,6 +13,8 @@ import time
 from decimal import Decimal
 from typing import Any
 
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+
 from keel.types import Candle, Granularity
 
 _TRANSACTION_COLUMNS = (
@@ -67,6 +69,24 @@ def _text_to_dec(value: str | None) -> Decimal | None:
     if value is None:
         return None
     return Decimal(value)
+
+
+def _subscription_from_row(row: sqlite3.Row) -> BrokerSubscription:
+    """Map a `broker_subscriptions` row to the domain record.
+
+    `free_volume_usd` is the one nullable money column: NULL means unlimited (Premium), which is
+    deliberately not the same as `'0'`.
+    """
+    return BrokerSubscription(
+        venue=row["venue"],
+        tier_name=row["tier_name"],
+        free_volume_usd=_text_to_dec(row["free_volume_usd"]),
+        pacing=row["pacing"],
+        subscription_usd_month=Decimal(row["subscription_usd_month"]),
+        status=SubscriptionStatus(row["status"]),
+        attested_at=int(row["attested_at"]),
+        attest_due_ts=int(row["attest_due_ts"]),
+    )
 
 
 def _json_default(obj: Any) -> Any:
@@ -375,6 +395,57 @@ class Repository:
                 "updated_at": now_ts,
             },
         )
+
+    # -- broker subscriptions (per-venue, rail 14) -------------------------
+
+    def get_broker_subscription(self, venue: str) -> BrokerSubscription | None:
+        """Return `venue`'s attested subscription, or `None` if it has never been attested.
+
+        `None` is meaningful, not an error: the design spec §7 treats a missing row as unknown
+        and therefore closed. Callers must not substitute a default allowance of their own.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM broker_subscriptions WHERE venue = ?", (venue,)
+        ).fetchone()
+        return None if row is None else _subscription_from_row(row)
+
+    def upsert_broker_subscription(self, record: BrokerSubscription) -> None:
+        """Insert or replace `record`, keyed on venue. One subscription per venue."""
+        self._conn.execute(
+            """
+            INSERT INTO broker_subscriptions (
+                venue, tier_name, free_volume_usd, pacing,
+                subscription_usd_month, status, attested_at, attest_due_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(venue) DO UPDATE SET
+                tier_name = excluded.tier_name,
+                free_volume_usd = excluded.free_volume_usd,
+                pacing = excluded.pacing,
+                subscription_usd_month = excluded.subscription_usd_month,
+                status = excluded.status,
+                attested_at = excluded.attested_at,
+                attest_due_ts = excluded.attest_due_ts
+            """,
+            (
+                record.venue,
+                record.tier_name,
+                _dec_to_text(record.free_volume_usd),
+                record.pacing,
+                _dec_to_text(record.subscription_usd_month),
+                record.status.value,
+                record.attested_at,
+                record.attest_due_ts,
+            ),
+        )
+        self._conn.commit()
+
+    def list_broker_subscriptions(self) -> list[BrokerSubscription]:
+        """Every attested subscription, ordered by venue -- what `keel subscription show`
+        renders."""
+        rows = self._conn.execute(
+            "SELECT * FROM broker_subscriptions ORDER BY venue"
+        ).fetchall()
+        return [_subscription_from_row(row) for row in rows]
 
     # -- bypass arm token (Issue #60, in-process bypass hardening) ---------
 
