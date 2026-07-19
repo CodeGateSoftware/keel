@@ -15,7 +15,8 @@ settles *how* it lands in this codebase, against the code as it actually stands.
 
 **In scope:** the `broker_subscriptions` table, versioned migration machinery, the record type
 and its policy methods, rail 14 deriving its cap from the record, the `subscription attest` CLI,
-and the config changes that follow.
+and the config changes that follow — including keeping the simulator's parallel cap working
+(§6.1).
 
 **Out of scope:** the reconciliation job and `suspect` transitions driven by `get_fee_summary`
 (monorepo spec §12 step 6); `subscription.lapse_suspected`; automatic subscription purchase.
@@ -215,16 +216,41 @@ reconciliation job lands (monorepo §12 step 6); emitting it now would be a dead
 `keel_core.config.SubscriptionConfig`:
 
 - **Adds** `unsubscribed_allowance_usd: Decimal = Decimal("0")`.
-- **Keeps** `pacing`, now serving as the default pacing for new attestations.
-- **Removes** `monthly_allowance_usd`.
+- **Keeps** `pacing`, now serving as the default pacing for new attestations (and still read by
+  the simulator — see §6.1).
+- **Renames** `monthly_allowance_usd` to `assumed_free_volume_usd`.
 
-Removal is enforced, not silent: parsing a `subscription:` block containing
-`monthly_allowance_usd` raises, with a message pointing at `keel subscription attest`. A number
-the user set by hand that silently stops having any effect is precisely the disconnect §2 of the
+The rename is enforced, not silent: parsing a `subscription:` block containing
+`monthly_allowance_usd` raises, naming the new field and pointing at `keel subscription attest`.
+A number the user set by hand that silently changes meaning is precisely the disconnect §2 of the
 parent spec exists to fix — reproducing it in the fix would be perverse.
 
 `config.yaml`'s `subscription:` block is updated accordingly. The `tiers:` block is unchanged and
 becomes the source `attest` derives from.
+
+### 6.1 Why the field is renamed rather than removed
+
+`keel/sim/account.py:167` `_monthly_allowance_cap` is a **second implementation of rail 14**,
+reading `config.subscription.monthly_allowance_usd` directly. It is not incidental: `SimAccount`
+is documented as enforcing "the spend-cap subset of `execution.guards.check`", and the two are
+held in explicit parity by `tests/sim/test_account.py::test_parity_with_guards_check_*`.
+
+Deleting the field outright would leave the simulator with no allowance source. Pointing the
+simulator at the live DB record instead would make backtests non-reproducible — a trade-off the
+parent spec's §10 already flags, and non-reproducible backtests are worse than one restated
+number.
+
+So the two numbers are kept, but **named for their different roles**: the live cap is an
+attested record, and `assumed_free_volume_usd` is the simulator's stated assumption. The old
+name is what made two unrelated quantities look like one concept; the rename is what stops this
+from re-becoming the §2 defect.
+
+The parity tests attest a record whose `free_volume_usd` matches `assumed_free_volume_usd`,
+making the parity an explicit setup step rather than an ambient coincidence.
+
+**Not changed here:** the simulator counts buys *and* sells as volume while rail 14 counts BUY
+notional only. `sim/account.py`'s docstring calls that divergence intentional; it is out of
+scope.
 
 ---
 
@@ -296,7 +322,10 @@ replaced, and leaving them would leave a second way to read a live spend cap.
 - **CLI (§7).** `attest` derives tier fields and clears `suspect`; an unknown tier is rejected
   listing valid names; `set` leaves `tier_name='unknown'`; `show` renders effective status and
   cap.
-- **Config (§6).** `monthly_allowance_usd` in a config file raises with a useful message.
+- **Config (§6).** `monthly_allowance_usd` in a config file raises a message naming
+  `assumed_free_volume_usd`; the new field parses and defaults correctly.
+- **Sim parity (§6.1).** `test_parity_with_guards_check_*` keeps passing, with the parity record
+  attested explicitly in setup. The simulator's cap still comes from config, never from the DB.
 - **Regression.** `tests/baseline/` stays green with `baseline_backtest.json` byte-unchanged —
   which §2's finding predicts, since backtesting never runs the rails.
 
