@@ -8,7 +8,7 @@ network, no live broker, matching `tests/test_cli.py`.
 from __future__ import annotations
 
 import dataclasses
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
@@ -165,6 +165,12 @@ def test_set_rejects_a_nan_allowance(db_path: Path, valid_config_path: Path) -> 
                   "subscription", "set", "--venue", "coinbase",
                   "--free-volume-usd", "nan")
     assert result.exit_code != 0
+    # Exit code and non-persistence alone do NOT discriminate this fix: before the finiteness
+    # check existed, the uncaught `InvalidOperation` also exited non-zero and also wrote nothing
+    # (it fired before the upsert). Only the absence of the exception and the presence of the
+    # intended message tell the two apart.
+    assert not isinstance(result.exception, InvalidOperation), result.exception
+    assert "must be a finite number" in result.output
     assert _repo_at(db_path).get_broker_subscription("coinbase") is None
 
 
