@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 [manifest]
 members = [
     "keel",
+    "keel-broker-api",
     "keel-core",
 ]
 
@@ -285,6 +286,7 @@ dependencies = [
     { name = "click" },
     { name = "coinbase-advanced-py" },
     { name = "cryptography" },
+    { name = "keel-broker-api" },
     { name = "keel-core" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -301,6 +303,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.4.2" },
     { name = "coinbase-advanced-py", specifier = ">=1.8.4" },
     { name = "cryptography", specifier = ">=49.0.0" },
+    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
     { name = "keel-core", editable = "packages/keel-core" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
@@ -311,6 +314,26 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.21" },
 ]
+
+[[package]]
+name = "keel-broker-api"
+version = "0.1.0"
+source = { editable = "packages/keel-broker-api" }
+dependencies = [
+    { name = "keel-core" },
+]
+
+[package.optional-dependencies]
+conformance = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "keel-core", editable = "packages/keel-core" },
+    { name = "pytest", marker = "extra == 'conformance'", specifier = ">=9.1.1" },
+]
+provides-extras = ["conformance"]
 
 [[package]]
 name = "keel-core"

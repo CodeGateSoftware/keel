@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
     "keel-core",
+    "keel-broker-api",
 ]
 
 [project.scripts]
@@ -31,6 +32,7 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 keel-core = { workspace = true }
+keel-broker-api = { workspace = true }
 
 [dependency-groups]
 dev = [
