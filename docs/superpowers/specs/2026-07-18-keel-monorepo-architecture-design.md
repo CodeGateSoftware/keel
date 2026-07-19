@@ -462,3 +462,25 @@ real behavioural risk and deserves its own plan.
   is deferred until the TUI exists.
 - **Sim invocation from the web app.** Noted in §3 as a job queue rather than an HTTP service;
   the queue technology is out of scope until the web app is specified.
+
+---
+
+## 14. Carried work
+
+Findings from step 1–2 implementation and review that were deliberately deferred rather than
+fixed in place. Each is assigned to the step that naturally retires it — none is urgent on its
+own, but all are cheap where listed and progressively more annoying if they drift.
+
+| # | Item | Retire in | Why there |
+|---|---|---|---|
+| 1 | Root `pyproject.toml` still declares `pyyaml` and `python-dotenv` directly; `keel/` no longer imports either (now transitive via `keel-core`) | step 3 | Step 3 already reworks root dependencies to drop `coinbase-advanced-py` |
+| 2 | `cb_client.py` emits three per-operation failure events (`candles_fetch_failed`, `spot_fetch_failed`, `accounts_fetch_failed`) where `guards.py`/`engine.py` use one event plus a discriminating field | step 3 | `cb_client.py` is rewritten wholesale as the Coinbase adapter; normalise the granularity then |
+| 3 | `security/secrets.py:111` delegates *up* to `keel_core.config.load_secrets` — an inverted dependency; §4.1 puts secrets in `keel-security` | step 4 | The `keel-security` extraction is where `load_secrets` finds its right home |
+| 4 | `venue` is absent from all 31 structured event payloads, though §10.2 names it a stable field | step 4 | Adding it with the `venue` column avoids revisiting 31 call sites twice — which is precisely the cost §10.2 warns about |
+| 5 | `keel_core.telemetry.bind_cycle` uses `ContextVar.set` without retaining the token, so it clobbers rather than restores an outer binding | step 6 | Harmless while `agent.run_once` is the only binder; the moment `ingest` wraps a cycle in an outer trace, that binding is silently lost. Two-line fix with `ContextVar.reset` |
+| 6 | `keel-core` is declared with no version specifier in the root `pyproject.toml` | first publish | Correct under `[tool.uv.sources] workspace = true`; only matters if a non-workspace install could resolve it from PyPI |
+| 7 | `mode=str(mode)` (`keel/agent.py`) is a redundant cast — `_confirm_or_bypass` is annotated `-> tuple[str, str | None]` | any time | Cosmetic; provably a no-op |
+
+Items 3 and 4 are the two worth watching. Both are *cheap now and expensive later* in the same
+way §10.2 describes: each additional app that lands before they are fixed multiplies the call
+sites that must change.
