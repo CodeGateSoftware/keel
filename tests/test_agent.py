@@ -185,8 +185,23 @@ def _candle(ts: int, price: str = "100") -> Candle:
 
 
 def _seed_open_position(
-    repo: Repository, product_id: str, qty: Decimal, price: Decimal, ts: int
+    repo: Repository,
+    product_id: str,
+    qty: Decimal,
+    price: Decimal,
+    ts: int,
+    *,
+    rule_name: str | None = None,
+    entry_fee: Decimal = Decimal("0"),
+    bracket_order_id: int | None = None,
 ) -> None:
+    """Held inventory in the orders log, and -- when `rule_name` is given -- the matching
+    `positions` tranche a real entry would have opened alongside it.
+
+    Callers that only need inventory (equity/rail-11 tests) omit `rule_name`; callers that
+    exercise an EXIT need the tranche, because the entry context P&L is attributed against lives
+    there now rather than in `position_rule:<product>`.
+    """
     repo.insert_order(
         dict(
             mode="live",
@@ -206,6 +221,11 @@ def _seed_open_position(
             updated_at=ts,
         )
     )
+    if rule_name is not None:
+        repo.open_position(
+            product_id=product_id, rule_name=rule_name, opened_at=ts, qty=qty,
+            entry_fill=price, entry_fee=entry_fee, bracket_order_id=bracket_order_id,
+        )
 
 
 # -- run_once: kill-switch --------------------------------------------------------------------
@@ -270,14 +290,20 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     # dca_size(config.dca.budget_usd=50, entry=100) = 0.5
     assert orders[0]["qty"] == Decimal("0.5")
 
-    # the loop records which rule owns the freshly opened position, for future exit checks,
-    # plus the entry context (opened_at/entry_fill/qty) a `trade_outcomes` row will need.
+    # the loop records which rule owns the freshly opened position, for future exit checks.
     position = agent._position_state(repo, PRODUCT)
     assert position is not None
     assert position["rule_name"] == "dca"
     assert position["opened_at"] == 90_000
-    assert position["entry_fill"] == Decimal("100")
-    assert position["qty"] == Decimal("0.5")
+
+    # ...and the entry context a `trade_outcomes` row will need now lands in the per-tranche
+    # ledger rather than in that per-product blob, which was last-write-wins across entries.
+    tranches = repo.get_open_positions(PRODUCT)
+    assert len(tranches) == 1
+    assert tranches[0]["rule_name"] == "dca"
+    assert tranches[0]["opened_at"] == 90_000
+    assert tranches[0]["entry_fill"] == Decimal("100")
+    assert tranches[0]["qty"] == Decimal("0.5")
     # and records that the feed was checked this cycle (guards rail 12 reads this).
     assert repo.get_state("last_feed_ts") == 90_000
 
@@ -685,16 +711,9 @@ def test_exit_records_a_trade_outcome(repo: Repository) -> None:
     the producer does nothing.
     """
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
-    repo.set_state(
-        f"position_rule:{PRODUCT}",
-        {
-            "rule_name": "fake_exit",
-            "opened_at": 1_000,
-            "entry_fill": Decimal("50000"),
-            "qty": Decimal("0.1"),
-        },
-    )
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
+                        rule_name="fake_exit")
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
     run_once(broker, repo, _config(), now_ts=90_000)
@@ -731,11 +750,10 @@ def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
     agent.RULE_REGISTRY["dca"] = lambda **kw: _ExitingDca()
     try:
         repo.insert_rule("dca", {}, status="live")
-        _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+        _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
+                            rule_name="dca")
         repo.set_state(
-            f"position_rule:{PRODUCT}",
-            {"rule_name": "dca", "opened_at": 1_000,
-             "entry_fill": Decimal("50000"), "qty": Decimal("0.1")},
+            f"position_rule:{PRODUCT}", {"rule_name": "dca", "opened_at": 1_000},
         )
         broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
@@ -757,19 +775,20 @@ def test_the_enter_path_records_the_entry_fee_onto_the_position(repo: Repository
     Critical this branch fixed, where a fee-dominated loser is recorded as a WIN and RESETS the
     loss counter.
 
-    Every other test that touches `entry_fee` hand-seeds it into a `position_rule` fixture, which
-    makes them vacuous with respect to the producer. This one exercises the real ENTER path and
-    asserts the value ARRIVES -- the difference between testing arithmetic and testing wiring.
+    Every other test that touches `entry_fee` hand-seeds it into a fixture, which makes them
+    vacuous with respect to the producer. This one exercises the real ENTER path and asserts the
+    value ARRIVES -- the difference between testing arithmetic and testing wiring. It now reads
+    the `positions` ledger, which is where the entry context moved; the guard is relocated, not
+    weakened.
     """
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
     run_once(broker, repo, _config(), now_ts=90_000)
 
-    position = repo.get_state(f"position_rule:{PRODUCT}")
-    assert position is not None, "no entry was placed -- the fixture no longer exercises ENTER"
-    assert "entry_fee" in position
-    assert position["entry_fee"] is not None, (
+    tranches = repo.get_open_positions(PRODUCT)
+    assert tranches, "no entry was placed -- the fixture no longer exercises ENTER"
+    assert tranches[0]["entry_fee"] is not None, (
         "the ENTER path stopped recording the entry fee; pnl_net will silently revert to "
         "net-of-exit-fee-only"
     )
@@ -792,8 +811,11 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     )
     repo.set_state(f"position_rule:{PRODUCT}", {
         "rule_name": "turtle_breakout", "opened_at": 1_000,
-        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
     })
+    repo.open_position(
+        product_id=PRODUCT, rule_name="turtle_breakout", opened_at=1_000, qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"), entry_fee=Decimal("3"), bracket_order_id=bracket_id,
+    )
 
     class _ReconcilingBroker(FakeBroker):
         def get_order(self, order_id: str) -> dict[str, Any]:
@@ -813,6 +835,63 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
 
 
+def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:
+    """The other half of the per-tranche ledger, and the half the plan originally left behind.
+
+    A rule exit sells the WHOLE held position, so it closes every open tranche. Booking one
+    aggregate outcome against a single blob of entry context is the same mis-attribution the
+    reconcile path had: here tranche 1 (50000) is a WINNER and tranche 2 (52000) a LOSER at the
+    51000 average exit, and collapsing them to one outcome against the average reports a flat
+    trade -- hiding a loss rail 16 is supposed to count.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
+                        rule_name="fake_exit")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("52000"), ts=2_000,
+                        rule_name="fake_exit")
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 2, "the tranches were collapsed into one aggregate outcome"
+    assert [o["entry_fill"] for o in outcomes] == [Decimal("50000"), Decimal("52000")]
+    # exit is the 51000 average cost basis: +100 on the first tranche, -100 on the second.
+    assert [o["pnl_net"] for o in outcomes] == [Decimal("100.0"), Decimal("-100.0")]
+    # the LOSER must reach the streak; an aggregate flat outcome would have counted nothing.
+    assert repo.get_state("consecutive_losses", default=0) == 1
+    assert repo.get_open_positions(PRODUCT) == []
+
+
+def test_a_rule_exit_apportions_the_exit_fee_across_tranches(repo: Repository) -> None:
+    """One exit order carries ONE fee for the whole sale. Charging it to every tranche would
+    multiply the cost by the tranche count; charging it to none would make `pnl_net` gross on
+    the exit leg -- and its SIGN is what rail 16 counts. The shares must sum to the whole."""
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
+                        rule_name="fake_exit")
+    _seed_open_position(repo, PRODUCT, Decimal("0.3"), Decimal("50000"), ts=2_000,
+                        rule_name="fake_exit")
+
+    class _FeeBroker(FakeBroker):
+        def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+            preview = super().preview_order(product_id, side, order_configuration)
+            preview["commission_total"] = Decimal("4.00")
+            return preview
+
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
+    broker = _FeeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 2
+    # 0.1 and 0.3 of a 0.4 position -> a 1:3 split of the 4.00 fee.
+    assert [o["fees"] for o in outcomes] == [Decimal("1.00000000"), Decimal("3.00000000")]
+    assert sum(o["fees"] for o in outcomes) == Decimal("4.00")
+
+
 def test_a_rule_exit_clears_the_stop_and_target_state(repo: Repository) -> None:
     """`open_stop`/`open_target` describe a bracket that no longer exists once the position is
     exited. Left behind they poison the NEXT trade in that product: rail 9 (no stop widening)
@@ -823,11 +902,9 @@ def test_a_rule_exit_clears_the_stop_and_target_state(repo: Repository) -> None:
     and left them.
     """
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
-    repo.set_state(f"position_rule:{PRODUCT}", {
-        "rule_name": "fake_exit", "opened_at": 1_000,
-        "entry_fill": Decimal("50000"), "qty": Decimal("0.1"), "entry_fee": Decimal("3"),
-    })
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
+                        rule_name="fake_exit", entry_fee=Decimal("3"))
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
     repo.set_state(f"open_target:{PRODUCT}", Decimal("53000"))
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})

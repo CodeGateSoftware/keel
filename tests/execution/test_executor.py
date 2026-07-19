@@ -993,20 +993,38 @@ def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo
     assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
 
 
-def test_place_bracket_records_the_bracket_order_id(repo):
-    """`roll_to_break_even`/`trail_stop_atr` take an `old_stop_order_id` and there is no
-    production lookup that can produce one -- `execute` discards `place_bracket`'s return, so
-    they are unreachable by construction rather than merely uncalled. Persisting the id is the
-    prerequisite for wiring them, and for re-bracketing a position whose bracket died."""
+def test_execute_surfaces_the_bracket_order_id_it_placed(repo):
+    """`execute` places the bracket ITSELF, so its return is the only way a caller can learn the
+    id. Discarding it left the resting bracket unnameable: `agent.run_once` could not point the
+    new `positions` tranche at it, and `roll_to_break_even`/`trail_stop_atr` -- which take an
+    `old_stop_order_id` -- were unreachable by construction rather than merely uncalled.
+    """
     broker = FakeBroker()
 
-    order_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+    result = execute(_enter_signal(), broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+
+    assert result.bracket_order_id is not None, "execute discarded the bracket's order id again"
+    bracket = repo.get_order(result.bracket_order_id)
+    assert bracket["side"] == "SELL"
+    assert bracket["status"] == "pending"
+    assert result.bracket_order_id != result.order_id      # the bracket, not the entry
+
+
+def test_a_vetoed_bracket_leaves_no_bracket_order_id(repo):
+    """`None` must mean "there is no resting bracket", never "there is one but we lost its id" --
+    `run_once` would otherwise skip `set_position_bracket` on a tranche that does have a bracket,
+    or name one that was never placed."""
+    broker = FakeBroker()
+
+    # DCA carries no stop, so no bracket is ever placed for it.
+    result = execute(
+        _enter_signal(setup=_setup(context={"order_class": "dca"})),
+        broker, repo, _config(), mode="bypass", now_ts=NOW_TS,
     )
 
-    assert repo.get_state("bracket_order:BTC-USD") == order_id
+    assert result.placed is True
+    assert result.bracket_order_id is None
+    assert [o for o in repo.get_orders(product_id="BTC-USD") if o["side"] == "SELL"] == []
 
 
 def test_a_vetoed_bracket_places_nothing_and_returns_none(repo):

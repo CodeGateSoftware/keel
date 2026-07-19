@@ -365,6 +365,32 @@ git commit -m "feat: re-place a dead exit bracket instead of leaving the positio
 
 **Why a table and not another `agent_state` key:** entry context is per-tranche and multi-valued (`opened_at`, `entry_fill`, `qty`, `entry_fee`, `rule_name`, `bracket_order_id`). A single JSON blob keyed by product is what produced every attribution bug on this branch — last-write-wins on a second entry, and a bracket filling after a newer entry attributes its P&L to the wrong tranche.
 
+#### ⚠️ REVISED after review — five conflicts with Tasks 1–2 as landed
+
+Assessed before execution against `b294f0e` and `789e36b`. The steps below are corrected in place; this block records *why*, since the original wording is the thing a reviewer would otherwise check against.
+
+1. **Step 10 was not implementable.** It had `run_once` call `place_bracket` and thread its return into `set_position_bracket`. `run_once` never calls `place_bracket` — `executor.execute` does, internally, and discards the return (`executor.py:154`). That is Task 1's own stated premise, so the plan contradicted itself. **Fix:** `ExecutionResult` gains `bracket_order_id`, so `execute` surfaces what it already knows. ENTER becomes `execute` → `open_position` → `set_position_bracket`.
+
+2. **Task 2's re-bracket orphaned the tranche — the dangerous one.** `_rebracket_or_escalate` re-places via `place_bracket`, but nothing re-pointed `positions.bracket_order_id`, so the tranche still named the dead order. When the replacement filled, `get_position_for_bracket` returned `None`, the "exit without position context" skip fired, and **no `trade_outcomes` row was written** — rail 16 blind to that loss. Exactly the failure class this branch exists to close. **Fix:** `_rebracket_or_escalate` resolves its tranche via `get_position_for_bracket(dead_row["id"])` and re-points it after a successful replace.
+
+3. **Dual source of truth.** Task 1 made `agent_state["bracket_order:<product>"]` the pointer; this task calls `positions.bracket_order_id` "the ONE linkage direction". Both would be live, per-product vs per-tranche. Confirmed the agent_state key is **write-only — nothing in `keel/` reads it**. **Fix:** drop it. Per-tranche subsumes per-product. Task 1 keeps its value as the step that proved the id was obtainable and reachable; this task relocates it to the right home.
+
+4. **The migration test could never pass.** It asserted `PRAGMA user_version == 4`; this codebase stamps a `schema_version` **table** and never writes the pragma (always `0`). **Fix:** assert the table, matching `test_migrations.py:48`. The rest of Step 3 is sound — `_SCHEMA_STATEMENTS` genuinely runs before the version check (`db.py:306-309`), so the additive-DDL claim holds.
+
+5. **The rule-exit path was left behind.** The task declared `position_rule` no longer carries `entry_fill`/`qty`/`entry_fee`, but `agent.py:344` still hands that blob to `record_closed_trade`, which **skips the outcome when `entry_fill` is missing** — so voluntary rule exits would silently stop producing outcomes, with `tests/test_agent.py:750` as the tripwire. Rewiring only `reconcile._record_fill` would have made this a fourth dormant-rail instance. **Fix:** `_handle_exits` closes every open tranche FIFO and records one outcome per tranche, apportioning the exit order's single fee pro-rata by qty. Its wiring guard moves to the `positions` table rather than being weakened.
+
+Also corrected: `_rebracket_or_escalate` sized the replacement from `_held_position` (the whole **product**), which over-commits once a product holds more than one tranche. It now sizes from the owning tranche's `qty`.
+
+Found by a second adversarial pass, and worse than the above because they would have produced a *green* task:
+
+6. **Step 9's red step was fake — the test passes against unmodified code.** `_seed_bracket` seeds `position_rule` with `entry_fill: 50000`, and the test asserts `entry_fill == 50000` / `pnl_net == -15.94` — exactly what today's `_record_fill` already computes from that blob. `open_position` never touches `position_rule`, so the second tranche never enters the calculation and the "watch it fail" step could not fail. A test that cannot fail is not holding the attribution it names. **Fix:** seed the blob with the *newest* tranche's `52000` — which is what the last-write-wins bug actually leaves behind — so the old path yields `-35.94` and only correct per-tranche attribution yields `-15.94`. Also seed a second filled BUY so `_held_position` agrees with the two-tranche ledger.
+
+7. **Step 9's closing assertion was vacuous.** `[r["id"] for r in get_open_positions(...)] != [first]` is already true with both tranches open (`[first, second] != [first]`), so it cannot detect a missing `close_position` — the very wiring Step 10.3 adds. **Fix:** assert `== [second]`.
+
+8. **`_position_row_to_dict` is called three times and never defined,** and it cannot be a blanket money-decode: `qty`/`entry_fill`/`entry_fee` are TEXT needing `_text_to_dec`, while `id`/`bracket_order_id`/`opened_at` are INTEGER and must stay `int` (Step 5 asserts `== [11, 12]`).
+
+9. **A partially-filled dead bracket would close a tranche that is still partly held.** `reconcile.py` routes `filled_size > 0` to `_record_fill`, which has no full-vs-partial distinction. **Fix:** record the outcome for what sold, but only `close_position` when the fill covers the tranche's qty; otherwise leave it open and log.
+
 - [ ] **Step 1: Write the failing migration test**
 
 ```python

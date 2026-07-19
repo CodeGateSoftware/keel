@@ -129,13 +129,22 @@ def _rebracket_or_escalate(
     if str(row["side"]).upper() != Side.SELL.value.upper():
         return
     product_id = row["product_id"]
-    qty, _avg_cost = _held_position(repo, product_id)
-    if qty <= 0:
+    if _held_position(repo, product_id)[0] <= 0:
         return
+
+    # Size from the TRANCHE that owned this bracket, not from `_held_position` (the whole
+    # product). With two tranches open, re-placing at the aggregate would commit inventory a
+    # sibling's bracket already holds -- rejected on spot for insufficient funds, turning a
+    # recoverable single-bracket death into a CRITICAL and a genuinely naked position.
+    position = repo.get_position_for_bracket(row["id"])
+    if position is None:
+        qty, _avg_cost = _held_position(repo, product_id)
+        _escalate_unprotected(repo, row, qty, "no ledger tranche owns this bracket")
+        return
+    qty = position["qty"]
 
     stop = repo.get_state(f"open_stop:{product_id}")
     target = repo.get_state(f"open_target:{product_id}")
-    position = repo.get_state(f"position_rule:{product_id}") or {}
     if stop is None or target is None:
         _escalate_unprotected(repo, row, qty, "no recorded stop/target to re-place from")
         return
@@ -169,6 +178,13 @@ def _rebracket_or_escalate(
     if new_id is None:
         _escalate_unprotected(repo, row, qty, "replacement bracket was vetoed or rejected")
         return
+
+    # Re-point the tranche at its NEW bracket. Without this the tranche still names the dead
+    # order, so when the replacement fills `get_position_for_bracket` finds nothing, `_record_fill`
+    # takes the "exit without position context" skip, and the position closes with NO
+    # `trade_outcomes` row -- rail 16 blind to the stop-out, which is the exact failure this
+    # module was built to end.
+    repo.set_position_bracket(position["id"], new_id)
 
     log_event(
         logger,
@@ -279,10 +295,15 @@ def _record_fill(
         return
 
     product_id = row["product_id"]
-    position = repo.get_state(f"position_rule:{product_id}")
+    # The TRANCHE that owns this bracket -- not `position_rule:<product>`, which held at most one
+    # tranche per product and, after averaging up, held the NEWEST one's entry price against the
+    # whole holding. An older tranche's bracket filling then booked its P&L against a price it
+    # never paid.
+    position = repo.get_position_for_bracket(row["id"])
     if position is None:
         # An exit we have no entry context for -- the same case `record_closed_trade` refuses to
         # guess at. Recording it would fabricate a P&L against an entry price nobody observed.
+        # Also the resting state for a position opened before the v4 ledger existed.
         log_event(
             logger,
             logging.WARNING,
@@ -303,10 +324,33 @@ def _record_fill(
         is_dca=position.get("rule_name") == "dca",
         now_ts=now_ts,
     )
-    repo.set_state(f"position_rule:{product_id}", None)
-    repo.set_state(f"open_stop:{product_id}", None)
-    repo.set_state(f"open_target:{product_id}", None)
-    repo.set_state(f"bracket_order:{product_id}", None)
+
+    # Close the tranche only when the fill actually covers it. A bracket CANCELLED after a
+    # partial sale routes here too (`filled_size > 0`), and marking that tranche closed would
+    # drop the still-held remainder out of the ledger while `_held_position` -- which reads the
+    # orders log, not this table -- kept reporting it. The outcome for what did sell is recorded
+    # either way; only the release is withheld.
+    if filled_qty >= position["qty"]:
+        repo.close_position(position["id"], closed_at=now_ts)
+    else:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reconcile.tranche_partially_closed",
+            order_id=row["id"],
+            product=product_id,
+            position_id=position["id"],
+            sold=str(filled_qty),
+            tranche_qty=str(position["qty"]),
+        )
+
+    # `position_rule` survives only as the exit-rule OWNERSHIP marker its docstring always
+    # described; the entry context it used to carry now lives in `positions`. Cleared here only
+    # once no tranche of this product remains open, since it names the rule that owns them all.
+    if not repo.get_open_positions(product_id):
+        repo.set_state(f"position_rule:{product_id}", None)
+        repo.set_state(f"open_stop:{product_id}", None)
+        repo.set_state(f"open_target:{product_id}", None)
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:

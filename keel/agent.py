@@ -186,6 +186,57 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     return (net_qty if net_qty > 0 else Decimal("0")), avg_cost
 
 
+def _open_tranche(
+    repo: Repository,
+    product_id: str,
+    rule_name: str,
+    order: dict[str, Any] | None,
+    result: ExecutionResult,
+    now_ts: int,
+) -> None:
+    """Record the newly opened tranche in the `positions` ledger and point it at its bracket.
+
+    The ledger is what a later exit attributes P&L against, so a tranche whose entry price or qty
+    could not be read is NOT recorded: `record_closed_trade` already refuses to guess a missing
+    entry price, and a ledger row carrying `None` would either crash the arithmetic or fabricate
+    a number nobody observed. The order still stands and `_held_position` still sees it; only the
+    attribution is withheld, and loudly.
+
+    `result.bracket_order_id` is `None` for DCA (no stop, so no bracket) and for a bracket the
+    rails vetoed. Neither is an error here -- the tranche is real either way, and reconciliation
+    simply has no bracket to resolve back to it until one is placed.
+    """
+    entry_fill = None if order is None else order["actual_fill"]
+    qty = None if order is None else order["qty"]
+    if entry_fill is None or qty is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.tranche_not_recorded",
+            product=product_id,
+            rule=rule_name,
+            order_id=result.order_id,
+            detail=(
+                "the entry order reported no fill price or qty, so this tranche has no entry "
+                "context -- its exit will be recorded with no P&L rather than a guessed one"
+            ),
+        )
+        return
+
+    position_id = repo.open_position(
+        product_id=product_id,
+        rule_name=rule_name,
+        opened_at=now_ts,
+        qty=qty,
+        # The entry leg's fee, carried so `record_closed_trade` can net BOTH legs (the sim does).
+        # Nothing else preserves it: the exit's order row knows only its own fee.
+        entry_fee=order["fee"] or Decimal("0"),
+        entry_fill=entry_fill,
+    )
+    if result.bracket_order_id is not None:
+        repo.set_position_bracket(position_id, result.bracket_order_id)
+
+
 def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
     """The tracked position for `product_id`, or `None` if nothing is held.
 
@@ -325,22 +376,18 @@ def _handle_exits(
     if result.placed:
         exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
         if (
-            position is not None
-            and exit_order is not None
+            exit_order is not None
             # An exit with no observed fill price cannot be valued. Unreachable today (exits are
             # always market orders, so `_initial_status` is `filled`), but a limit exit would
             # otherwise raise TypeError on `(None - entry_fill)` from inside `run_once` -- and
             # the producer already refuses to guess a missing ENTRY price for the same reason.
             and exit_order["actual_fill"] is not None
         ):
-            streak.record_closed_trade(
+            _close_tranches(
                 repo,
                 config,
                 product_id=product_id,
-                position=position,
-                exit_fill=exit_order["actual_fill"],
-                exit_qty=exit_order["qty"],
-                fees=exit_order["fee"] or Decimal("0"),
+                exit_order=exit_order,
                 # DERIVED, never asserted: §12.6 exempts DCA from the streak, and the owning
                 # rule is what decides. Hardcoding False was safe only while `Dca.exit_signal`
                 # returned False unconditionally -- an invariant held by an unrelated module
@@ -357,6 +404,68 @@ def _handle_exits(
         repo.set_state(f"open_stop:{product_id}", None)
         repo.set_state(f"open_target:{product_id}", None)
     return [result]
+
+
+def _close_tranches(
+    repo: Repository,
+    config: Config,
+    *,
+    product_id: str,
+    exit_order: dict[str, Any],
+    is_dca: bool,
+    now_ts: int,
+) -> None:
+    """Record ONE outcome per open tranche and close them all, oldest first.
+
+    A rule exit sells the whole held position (`_build_intent` sizes from `_held_position`), so
+    every open tranche of this product is closed by it. Booking a single aggregate outcome
+    against one blob of entry context is precisely the mis-attribution the `positions` ledger
+    exists to end: with two tranches, the older one's P&L would be computed against the newer
+    one's entry price.
+
+    The exit order carries ONE fee for the whole sale, so it is apportioned pro-rata by qty. The
+    last tranche takes the rounding remainder rather than letting the parts fail to sum to the
+    whole -- understating total cost would flatter `pnl_net`, whose SIGN is what rail 16 counts.
+
+    A product with no ledger rows (opened before the v4 ledger, or a tranche whose entry context
+    was unreadable) records nothing rather than guessing an entry price.
+    """
+    positions = repo.get_open_positions(product_id)
+    if not positions:
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.exit_without_ledger_tranche",
+            product=product_id,
+            order_id=exit_order["id"],
+        )
+        return
+
+    exit_fill = exit_order["actual_fill"]
+    total_fee = exit_order["fee"] or Decimal("0")
+    total_qty = sum((p["qty"] for p in positions), Decimal("0"))
+    apportioned = Decimal("0")
+
+    for index, position in enumerate(positions):
+        is_last = index == len(positions) - 1
+        if is_last or total_qty <= 0:
+            fee_share = total_fee - apportioned
+        else:
+            fee_share = (total_fee * position["qty"] / total_qty).quantize(Decimal("0.00000001"))
+            apportioned += fee_share
+
+        streak.record_closed_trade(
+            repo,
+            config,
+            product_id=product_id,
+            position=position,
+            exit_fill=exit_fill,
+            exit_qty=position["qty"],
+            fees=fee_share,
+            is_dca=is_dca,
+            now_ts=now_ts,
+        )
+        repo.close_position(position["id"], closed_at=now_ts)
 
 
 # -- one cycle -----------------------------------------------------------------------------
@@ -554,19 +663,16 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                     order = (
                         repo.get_order(result.order_id) if result.order_id is not None else None
                     )
+                    # `position_rule` is now ONLY the exit-rule ownership marker its docstring
+                    # always described. The entry context it used to carry (`entry_fill`, `qty`,
+                    # `entry_fee`) moved to the `positions` ledger: this key is per-PRODUCT, so a
+                    # second entry overwrote the first's and an older tranche's exit booked P&L
+                    # against a price it never paid.
                     repo.set_state(
                         f"position_rule:{product_id}",
-                        {
-                            "rule_name": signal.rule_name,
-                            "opened_at": now_ts,
-                            "entry_fill": None if order is None else order["actual_fill"],
-                            "qty": None if order is None else order["qty"],
-                            # The entry leg's fee, carried so `record_closed_trade` can net BOTH
-                            # legs (the sim does). Nothing else preserves it: the exit's order
-                            # row knows only its own fee.
-                            "entry_fee": None if order is None else order["fee"],
-                        },
+                        {"rule_name": signal.rule_name, "opened_at": now_ts},
                     )
+                    _open_tranche(repo, product_id, signal.rule_name, order, result, now_ts)
 
         return LoopResult(
             ts=now_ts,

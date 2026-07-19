@@ -59,7 +59,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -89,6 +89,13 @@ class ExecutionResult:
     vetoed_by: list[str]
     preview: dict[str, Any] | None
     reason: str
+    # The local `orders.id` of the exit bracket this entry left resting, when one was placed.
+    # `execute` places the bracket itself, so this is the ONLY way a caller can learn its id --
+    # and `agent.run_once` needs it to point the new `positions` row at its bracket. Discarding
+    # it (as this did until Task 3) left the tranche with no way to name its own protective
+    # order, which is what made `roll_to_break_even`/`trail_stop_atr` unreachable by
+    # construction. `None` when no bracket was placed OR when it was vetoed.
+    bracket_order_id: int | None = None
 
 
 ConfirmFn = Callable[[dict[str, Any]], bool]
@@ -151,7 +158,7 @@ def execute(
         and intent.stop is not None
         and signal.setup is not None
     ):
-        place_bracket(
+        bracket_order_id = place_bracket(
             broker,
             repo,
             config,
@@ -162,6 +169,9 @@ def execute(
             rule_name=signal.rule_name,
             now_ts=now_ts,
         )
+        # Surfaced rather than discarded so `run_once` can point the tranche at its bracket.
+        # See `ExecutionResult.bracket_order_id`.
+        result = replace(result, bracket_order_id=bracket_order_id)
 
     return result
 
@@ -200,7 +210,6 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
             )
             return False
         repo.update_order(row["id"], status="canceled", updated_at=now_ts)
-        repo.set_state(f"bracket_order:{product_id}", None)
         log_event(
             logger,
             logging.INFO,
@@ -687,10 +696,6 @@ def place_bracket(
 
     repo.set_state(f"open_stop:{product_id}", stop)
     repo.set_state(f"open_target:{product_id}", target)
-    # The resting bracket's local order id. `open_stop`/`open_target` describe the PRICES; this
-    # names the ORDER, which is what a stop roll must cancel and what a re-bracket must replace.
-    # Written by the same single writer as its price partners so the three cannot disagree.
-    repo.set_state(f"bracket_order:{product_id}", result.order_id)
     log_event(
         logger,
         logging.INFO,

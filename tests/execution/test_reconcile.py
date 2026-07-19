@@ -93,7 +93,14 @@ def _allow_orders(repo: Repository) -> None:
     repo.set_state("last_feed_ts", NOW)
 
 
-def _seed_bracket(repo: Repository, *, native_id: str = "cb-1") -> int:
+def _seed_bracket(
+    repo: Repository,
+    *,
+    native_id: str = "cb-1",
+    rule_name: str = "turtle_breakout",
+    return_position: bool = False,
+    with_ledger: bool = True,
+) -> int:
     """A held position plus a resting SELL bracket, as `execute` would leave them."""
     repo.insert_order(
         dict(mode="live", product_id=PRODUCT, side=Side.BUY.value, order_type="market",
@@ -108,12 +115,20 @@ def _seed_bracket(repo: Repository, *, native_id: str = "cb-1") -> int:
              raw_response=f'{{"order_id": "{native_id}"}}',
              created_at=NOW - 1000, updated_at=NOW - 1000)
     )
+    # `position_rule` is now ONLY the exit-rule ownership marker; the entry context a
+    # `trade_outcomes` row needs lives in the `positions` ledger, one row per TRANCHE.
     repo.set_state(f"position_rule:{PRODUCT}", {
-        "rule_name": "turtle_breakout", "opened_at": NOW - 1000,
-        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
+        "rule_name": rule_name, "opened_at": NOW - 1000,
     })
+    position_id = None
+    if with_ledger:
+        position_id = repo.open_position(
+            product_id=PRODUCT, rule_name=rule_name, opened_at=NOW - 1000,
+            qty=Decimal("0.01"), entry_fill=Decimal("50000"), entry_fee=Decimal("3"),
+            bracket_order_id=bracket_id,
+        )
     repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
-    return bracket_id
+    return bracket_id if not return_position else position_id
 
 
 def test_a_filled_bracket_records_the_trade_with_OBSERVED_price_and_fees(repo):
@@ -153,12 +168,11 @@ def test_a_filled_bracket_marks_the_order_and_releases_the_position(repo):
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
 
 
-def test_a_terminal_bracket_clears_the_bracket_order_key(repo):
-    """A stale `bracket_order` would have a later roll or re-bracket cancel an order that is
-    already gone -- and `_cancel_at_exchange` now RAISES on an unconfirmable cancel, so a stale
-    key turns into a refused exit rather than a silent no-op."""
-    _seed_bracket(repo)
-    repo.set_state("bracket_order:BTC-USD", 2)
+def test_a_terminal_bracket_closes_its_tranche(repo):
+    """A tranche left `open` after its bracket filled is a position the ledger still thinks we
+    hold: the next exit would attribute P&L to it a second time, and `get_position_for_bracket`
+    would keep answering for an order that is already gone."""
+    position_id = _seed_bracket(repo, return_position=True)
     broker = _Broker({"cb-1": {
         "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
         "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
@@ -166,7 +180,57 @@ def test_a_terminal_bracket_clears_the_bracket_order_key(repo):
 
     reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
 
-    assert repo.get_state("bracket_order:BTC-USD") is None
+    assert repo.get_open_positions(PRODUCT) == []
+    assert repo.get_position_for_bracket(position_id) is None
+
+
+def test_an_older_tranches_bracket_filling_attributes_to_THAT_tranche(repo):
+    """The bug this whole task exists to kill. Tranche 1 at 50000, tranche 2 at 52000, then
+    tranche 1's bracket fills at 49000. P&L must be computed against 50000 -- against 52000 it
+    books a loss that never happened and feeds it to a live-money breaker.
+
+    `position_rule` is deliberately seeded with the SECOND tranche's entry, because that is what
+    the last-write-wins blob actually held after averaging up. Reading it yields -35.94; only
+    per-tranche attribution yields -15.94. Seeding it with 50000 instead would make this test
+    pass against the old code too, which is exactly how a green task hides a live bug.
+    """
+    for entry in (Decimal("50000"), Decimal("52000")):
+        repo.insert_order(
+            dict(mode="live", product_id=PRODUCT, side=Side.BUY.value, order_type="market",
+                 qty=Decimal("0.01"), limit_price=entry, status="filled", fee=Decimal("3"),
+                 expected_fill=entry, actual_fill=entry,
+                 created_at=NOW - 1000, updated_at=NOW - 1000)
+        )
+    bracket_id = repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=None, status="pending", fee=None,
+             expected_fill=Decimal("49000"), actual_fill=None,
+             raw_response='{"order_id": "cb-1"}', created_at=NOW - 1000, updated_at=NOW - 1000)
+    )
+    first = repo.open_position(product_id=PRODUCT, rule_name="turtle_breakout", opened_at=1_000,
+                               qty=Decimal("0.01"), entry_fill=Decimal("50000"),
+                               entry_fee=Decimal("3"), bracket_order_id=bracket_id)
+    second = repo.open_position(product_id=PRODUCT, rule_name="turtle_breakout", opened_at=2_000,
+                                qty=Decimal("0.01"), entry_fill=Decimal("52000"),
+                                entry_fee=Decimal("3.1"))
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "turtle_breakout", "opened_at": 2_000,
+        "entry_fill": Decimal("52000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3.1"),
+    })
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("49000"), "total_fees": Decimal("2.94")}})
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    outcome = repo.get_trade_outcomes()[0]
+    assert outcome["entry_fill"] == Decimal("50000"), "attributed to the wrong tranche"
+    # (49000 - 50000) * 0.01 - 2.94 exit - 3 entry.  Against tranche 2 this would be -35.94.
+    assert outcome["pnl_net"] == Decimal("-15.94")
+    # ONLY the filled tranche closes; the survivor must still be open and still be addressable.
+    assert [r["id"] for r in repo.get_open_positions(PRODUCT)] == [second]
+    assert repo.get_position_for_bracket(bracket_id) is None
+    assert first != second
 
 
 def test_a_still_resting_bracket_changes_nothing(repo):
@@ -374,7 +438,7 @@ def test_a_dead_bracket_on_a_held_position_is_replaced(repo):
     changes, self-trade prevention, an operator tapping cancel in the mobile app. Logging
     CRITICAL and leaving the position naked is not a resting state a trading agent should sit in
     for an unbounded time. Re-place from the recorded stop/target."""
-    _seed_bracket(repo)
+    position_id = _seed_bracket(repo, return_position=True)
     repo.set_state("open_target:BTC-USD", Decimal("53000"))
     # The replacement runs through `guards.check` like any other order (un-overridable), so the
     # rails that fail closed on unseeded state -- kill-switch and feed staleness -- have to be
@@ -391,7 +455,13 @@ def test_a_dead_bracket_on_a_held_position_is_replaced(repo):
     leg = broker.placed[-1]["order_configuration"]["trigger_bracket_gtc"]
     assert leg["stop_trigger_price"] == "49000"
     assert leg["limit_price"] == "53000"
-    assert repo.get_state("bracket_order:BTC-USD") is not None
+    # The tranche must now name the REPLACEMENT. Leaving it on the dead order is silent data
+    # loss: the replacement's eventual fill would resolve to no tranche, take the
+    # "exit without position context" skip, and close the position with no `trade_outcomes` row.
+    replacement_id = repo.get_orders(mode="live", product_id=PRODUCT, status="pending")[-1]["id"]
+    owner = repo.get_position_for_bracket(replacement_id)
+    assert owner is not None, "the tranche still points at the dead bracket"
+    assert owner["id"] == position_id
 
 
 def test_a_vetoed_replacement_bracket_escalates_instead_of_going_quiet(repo, caplog):
@@ -465,11 +535,7 @@ def test_a_dca_owned_position_stopping_out_stays_exempt_from_the_streak(repo):
     """§12.6 exempts DCA from the consecutive-loss streak. The VOLUNTARY exit path derives
     `is_dca` from the owning rule and has a test; the reconcile path derived it too but nothing
     held it, so a DCA position stopping out would have counted toward a live-money breaker."""
-    _seed_bracket(repo)
-    repo.set_state(f"position_rule:{PRODUCT}", {
-        "rule_name": "dca", "opened_at": NOW - 1000,
-        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
-    })
+    _seed_bracket(repo, rule_name="dca")
     broker = _Broker({"cb-1": {
         "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
         "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
@@ -509,10 +575,10 @@ def test_a_reconciled_BUY_never_records_an_outcome_or_releases_the_position(repo
 
 
 def test_an_exit_with_no_entry_context_is_skipped_rather_than_invented(repo, caplog):
-    """The guard that stops a fabricated P&L. With no `position_rule` there is no observed entry
-    price, and `record_closed_trade` refuses to guess one -- so must this path."""
-    bracket_id = _seed_bracket(repo)
-    repo.set_state(f"position_rule:{PRODUCT}", None)
+    """The guard that stops a fabricated P&L. With no ledger tranche owning this bracket there is
+    no observed entry price, and `record_closed_trade` refuses to guess one -- so must this path.
+    This is also the resting state for a position opened before the v4 ledger existed."""
+    bracket_id = _seed_bracket(repo, with_ledger=False)
     broker = _Broker({"cb-1": {
         "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
         "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),

@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 3
+    assert version == db.SCHEMA_VERSION == 4
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -82,7 +82,7 @@ def test_the_migrated_row_forces_an_explicit_attestation() -> None:
 def test_migration_bumps_the_stored_version() -> None:
     conn = _v1_database()
     db.migrate(conn)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 3
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
 
 
 def test_migration_is_idempotent() -> None:
@@ -127,7 +127,7 @@ def test_v1_database_without_a_subscription_migrates_to_no_row() -> None:
     db.migrate(conn)
 
     assert _subscription_rows(conn) == []
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 3
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
 
 
 @pytest.mark.parametrize("stored", ["750.25", 750.25])
@@ -143,3 +143,28 @@ def test_backfill_accepts_both_decimal_encodings(stored: object) -> None:
     db.migrate(conn)
 
     assert _subscription_rows(conn)[0]["free_volume_usd"] == "750.25"
+
+
+def test_migration_to_v4_creates_the_positions_table() -> None:
+    """The per-tranche ledger. Asserted against the `schema_version` TABLE, not
+    `PRAGMA user_version` -- keel never writes the pragma, so a pragma assertion would read 0
+    forever and pass/fail independently of the migration it claims to check."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
+    assert cols >= {
+        "id", "product_id", "rule_name", "opened_at", "closed_at",
+        "qty", "entry_fill", "entry_fee", "bracket_order_id", "status",
+    }
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
+
+
+def test_an_existing_v1_database_picks_up_the_positions_table() -> None:
+    """The additive-DDL path: `_SCHEMA_STATEMENTS` runs BEFORE the version check, so an
+    already-stamped database gets the new table from `CREATE TABLE IF NOT EXISTS` and the
+    migration step only advances the stamp. Same pattern `trade_outcomes` used at v3."""
+    conn = _v1_database()
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
+    assert "bracket_order_id" in cols
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
