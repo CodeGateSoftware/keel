@@ -1,0 +1,20 @@
+[project]
+name = "keel-broker-fake"
+version = "0.1.0"
+description = "A deliberately divergent second broker adapter, to keep the port honest"
+requires-python = ">=3.12"
+dependencies = ["keel-core", "keel-broker-api"]
+
+[project.entry-points."keel.brokers"]
+fake = "keel_broker_fake:FakeAdapter"
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv.sources]
+keel-core = { workspace = true }
+keel-broker-api = { workspace = true }

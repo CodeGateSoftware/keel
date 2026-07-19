@@ -9,11 +9,14 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.4.2",
-    "coinbase-advanced-py>=1.8.4",
     "cryptography>=49.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
     "keel-core",
+    "keel-broker-api",
+    # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
+    # on the adapter keeps it available transitively. Phase B deletes those imports and this.
+    "keel-broker-coinbase",
 ]
 
 [project.scripts]
@@ -31,11 +34,18 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 keel-core = { workspace = true }
+keel-broker-api = { workspace = true }
+keel-broker-coinbase = { workspace = true }
+keel-broker-fake = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "mypy>=1.18.0",
     "pytest>=9.1.1",
     "ruff>=0.15.21",
+    # Dev-only on purpose: the fake venue exists to exert design pressure on the port and to
+    # prove two-plugin discovery. A production engine must never have it installed.
+    "keel-broker-fake",
 ]
 
 [tool.ruff]
@@ -46,3 +56,28 @@ target-version = "py312"
 select = ["E", "F", "I", "UP"]
 # UP042: the design spec pins `class X(str, Enum)` explicitly (not `StrEnum`) for these types.
 ignore = ["UP042"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["packages", "keel", "tests"]
+
+# New packages are strict from birth.
+[[tool.mypy.overrides]]
+module = [
+    "keel_broker_api.*",
+    "keel_broker_coinbase.*",
+    "keel_broker_fake.*",
+]
+strict = true
+
+# Legacy code and the existing suite are exempt until their modules move out
+# (monorepo spec steps 4-7). Tighten one package at a time, never all at once.
+[[tool.mypy.overrides]]
+module = ["keel.*", "tests.*"]
+ignore_errors = true
+
+# keel-core moved in the previous plan but predates strict mode; it is tightened
+# when its remaining consumers migrate.
+[[tool.mypy.overrides]]
+module = "keel_core.*"
+ignore_errors = true
