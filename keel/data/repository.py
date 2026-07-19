@@ -365,37 +365,6 @@ class Repository:
         )
         self._conn.commit()
 
-    # -- subscription (rail 14, monthly-allowance) -------------------------
-
-    def get_subscription(self) -> dict[str, Any]:
-        """Return the live subscription -- the authoritative source `execution.guards`'
-        monthly-allowance rail reads at *every* `check()` call, so `set_subscription` takes
-        effect on the very next order, with no restart or config edit required.
-
-        Defaults to `{"monthly_allowance_usd": 500, "pacing": "opportunistic", "updated_at":
-        None}` (matching `config.yaml`'s seed values) if never explicitly set.
-        """
-        stored = self.get_state("subscription")
-        if stored is None:
-            return {
-                "monthly_allowance_usd": Decimal("500"),
-                "pacing": "opportunistic",
-                "updated_at": None,
-            }
-        return stored
-
-    def set_subscription(self, monthly_allowance_usd: Decimal, pacing: str, now_ts: int) -> None:
-        """Update the live subscription in place. The next `guards.check` call immediately
-        enforces the new `monthly_allowance_usd`/`pacing` -- the DB row is authoritative."""
-        self.set_state(
-            "subscription",
-            {
-                "monthly_allowance_usd": monthly_allowance_usd,
-                "pacing": pacing,
-                "updated_at": now_ts,
-            },
-        )
-
     # -- broker subscriptions (per-venue, rail 14) -------------------------
 
     def get_broker_subscription(self, venue: str) -> BrokerSubscription | None:

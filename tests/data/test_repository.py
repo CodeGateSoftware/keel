@@ -218,42 +218,6 @@ def test_set_state_overwrites_existing_key(repo):
     assert repo.get_state("kill_switch") is True
 
 
-# -- subscription (rail 14, monthly-allowance) --------------------------------
-
-
-def test_get_subscription_defaults_to_500_opportunistic_when_never_set(repo):
-    sub = repo.get_subscription()
-
-    assert sub == {
-        "monthly_allowance_usd": Decimal("500"),
-        "pacing": "opportunistic",
-        "updated_at": None,
-    }
-
-
-def test_set_subscription_then_get_subscription_round_trips(repo):
-    repo.set_subscription(Decimal("1000"), "even_daily", now_ts=1_700_000_000)
-
-    sub = repo.get_subscription()
-
-    assert sub == {
-        "monthly_allowance_usd": Decimal("1000"),
-        "pacing": "even_daily",
-        "updated_at": 1_700_000_000,
-    }
-
-
-def test_set_subscription_overwrites_the_previous_value(repo):
-    repo.set_subscription(Decimal("1000"), "even_daily", now_ts=1_700_000_000)
-    repo.set_subscription(Decimal("250"), "opportunistic", now_ts=1_700_001_000)
-
-    sub = repo.get_subscription()
-
-    assert sub["monthly_allowance_usd"] == Decimal("250")
-    assert sub["pacing"] == "opportunistic"
-    assert sub["updated_at"] == 1_700_001_000
-
-
 # -- bypass arm token (Issue #60, in-process bypass hardening) ---------------
 
 
