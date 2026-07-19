@@ -44,6 +44,23 @@ def _non_negative_decimal(value: Any, key: str) -> Decimal:
     return amount
 
 
+def _non_negative_int(value: Any, key: str) -> int:
+    """Parse a non-negative integer config value, rejecting bools and negatives.
+
+    `isinstance(True, int)` is True in Python, so a bare int() would silently accept `yes`/`true`
+    from YAML as 1 -- for a rail threshold that would turn a typo into a live setting.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f"{key}: must be an integer, got a boolean")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key}: must be an integer, got {value!r}") from exc
+    if parsed < 0:
+        raise ConfigError(f"{key}: must be non-negative, got {parsed}")
+    return parsed
+
+
 # Issue #85: `max_per_order_usd`/`max_per_day_usd` were Phase-1 PLACEHOLDER guesses ($100/$300),
 # never real Coinbase limits -- Coinbase One's only subscription constraint is monthly fee-free
 # trading VOLUME (`SubscriptionConfig.assumed_free_volume_usd`), not a per-order or per-day $ cap.
@@ -100,6 +117,15 @@ class MoneyMgmtConfig:
     acceleration_pct: Decimal = Decimal("0.05")
     max_total_dd_pct: Decimal = Decimal("0.2")
     max_weekly_dd_pct: Decimal = Decimal("0.08")
+    # Rail 16 (consecutive-loss breaker). SHIPS DISABLED: 0 means off.
+    #
+    # A live default would be actively harmful here. `turtle_breakout`'s own simulation shows a
+    # max losing streak of 5, so the source's suggested threshold of 3 would have fired repeatedly
+    # on a strategy that was working. The threshold must sit ABOVE the strategy's tested max streak
+    # (`strategy/stats.py:max_losing_streak`) or the breaker fires on normal variance and stands the
+    # system down during exactly the runs it was designed to survive. Set it from a sweep.
+    max_consecutive_losses: int = 0
+    streak_cooloff_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -460,6 +486,13 @@ def load_config(path: str | Path) -> Config:
             ),
             max_weekly_dd_pct=_to_decimal(
                 money_mgmt_raw.get("max_weekly_dd_pct", "0.08"), "money_mgmt.max_weekly_dd_pct"
+            ),
+            max_consecutive_losses=_non_negative_int(
+                money_mgmt_raw.get("max_consecutive_losses", 0),
+                "money_mgmt.max_consecutive_losses",
+            ),
+            streak_cooloff_days=_non_negative_int(
+                money_mgmt_raw.get("streak_cooloff_days", 0), "money_mgmt.streak_cooloff_days"
             ),
         ),
         dca=DcaConfig(

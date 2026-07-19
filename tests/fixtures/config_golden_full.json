@@ -39,9 +39,11 @@
   },
   "money_mgmt": {
     "acceleration_pct": "0.11",
+    "max_consecutive_losses": 0,
     "max_total_dd_pct": "0.18",
     "max_weekly_dd_pct": "0.07",
-    "profit_trigger_pct": "0.22"
+    "profit_trigger_pct": "0.22",
+    "streak_cooloff_days": 0
   },
   "promotion": {
     "min_expectancy": "0.21",

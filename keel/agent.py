@@ -60,7 +60,7 @@ from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycl
 from keel.config import Config
 from keel.data import market_feed
 from keel.data.repository import Repository
-from keel.execution import executor
+from keel.execution import executor, streak
 from keel.execution.executor import ExecutionResult
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
@@ -250,6 +250,19 @@ def _handle_exits(
         exit_signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
     )
     if result.placed:
+        exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
+        if position is not None and exit_order is not None:
+            streak.record_closed_trade(
+                repo,
+                config,
+                product_id=product_id,
+                position=position,
+                exit_fill=exit_order["actual_fill"],
+                exit_qty=exit_order["qty"],
+                fees=exit_order["fee"] or Decimal("0"),
+                is_dca=False,
+                now_ts=now_ts,
+            )
         repo.set_state(f"position_rule:{product_id}", None)
     return [result]
 
