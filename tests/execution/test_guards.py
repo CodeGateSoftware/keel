@@ -65,6 +65,7 @@ def _config(
     interval_sec: int = 900,
     unsubscribed_allowance_usd: Decimal = Decimal("0"),
     pacing: str = "opportunistic",
+    max_consecutive_losses: int = 0,
 ) -> Config:
     return Config(
         allowlist=list(allowlist),
@@ -79,7 +80,9 @@ def _config(
         market_data=MarketDataConfig(granularities=[], history_days=365),
         auto_trade=AutoTradeConfig(interval_sec=interval_sec),
         money_mgmt=MoneyMgmtConfig(
-            max_total_dd_pct=max_total_dd_pct, max_weekly_dd_pct=max_weekly_dd_pct
+            max_total_dd_pct=max_total_dd_pct,
+            max_weekly_dd_pct=max_weekly_dd_pct,
+            max_consecutive_losses=max_consecutive_losses,
         ),
         subscription=SubscriptionConfig(
             unsubscribed_allowance_usd=unsubscribed_allowance_usd,
@@ -858,3 +861,64 @@ def test_check_collects_multiple_violations_without_short_circuiting(repo):
     keys = _keys(result)
     assert {"halal_allowlist", "per_order_cap", "kill_switch"} <= keys
     assert len(result.violations) == 3
+
+
+# -- rail 16: consecutive-loss circuit breaker -------------------------------------------------
+
+
+def test_rail16_vetoes_a_buy_while_the_streak_halt_is_active(repo: Repository) -> None:
+    repo.set_state("streak_halt_until", NOW_TS + 3600)
+    config = _config(max_consecutive_losses=3)
+
+    result = check(_intent(), repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"consecutive_loss_breaker"}
+
+
+def test_rail16_does_not_veto_once_the_halt_has_expired(repo: Repository) -> None:
+    """The negative control: same repo, same config, halt one second in the past."""
+    repo.set_state("streak_halt_until", NOW_TS - 1)
+    config = _config(max_consecutive_losses=3)
+
+    result = check(_intent(), repo, config, NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail16_boundary_halt_expires_exactly_at_now(repo: Repository) -> None:
+    """`now_ts < halt_until` -- due-at is the moment it expires, matching rail 14's convention."""
+    repo.set_state("streak_halt_until", NOW_TS)
+    result = check(_intent(), repo, _config(max_consecutive_losses=3), NOW_TS)
+    assert result.ok is True
+
+
+def test_rail16_never_vetoes_a_sell(repo: Repository) -> None:
+    """A breaker that blocked EXITS would trap capital in a losing position, inverting its
+    own purpose. Entries only."""
+    repo.set_state("streak_halt_until", NOW_TS + 3600)
+    result = check(_intent(side=Side.SELL), repo, _config(max_consecutive_losses=3), NOW_TS)
+    assert "consecutive_loss_breaker" not in _keys(result)
+
+
+def test_rail16_never_vetoes_dca(repo: Repository) -> None:
+    repo.set_state("streak_halt_until", NOW_TS + 3600)
+    result = check(_intent(is_dca=True), repo, _config(max_consecutive_losses=3), NOW_TS)
+    assert "consecutive_loss_breaker" not in _keys(result)
+
+
+def test_rail16_is_inert_when_no_halt_was_ever_set(repo: Repository) -> None:
+    """The shipped default: nothing set, nothing vetoed."""
+    result = check(_intent(), repo, _config(), NOW_TS)
+    assert "consecutive_loss_breaker" not in _keys(result)
+
+
+def test_rail16_violation_message_names_the_cause_and_the_override(repo: Repository) -> None:
+    """A bare veto is arithmetically true and operationally useless (the rail-14 lesson)."""
+    repo.set_state("streak_halt_until", NOW_TS + 3600)
+    result = check(_intent(), repo, _config(max_consecutive_losses=3), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("consecutive_loss_breaker"))
+    assert "consecutive" in violation
+    assert "Exits" in violation
+    assert "resume-entries" in violation

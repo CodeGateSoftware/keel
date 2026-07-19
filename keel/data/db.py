@@ -2,9 +2,9 @@
 
 Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` returns a
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
-enabled. `migrate()` idempotently creates the ten §6 tables (`transactions`, `candles`,
+enabled. `migrate()` idempotently creates the §6 tables (`transactions`, `candles`,
 `orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
-`journal`) plus their indexes and a `schema_version` marker table.
+`trade_outcomes`, `journal`) plus their indexes and a `schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -164,6 +164,22 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS trade_outcomes (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id    TEXT NOT NULL,
+        rule_name     TEXT,
+        is_dca        INTEGER NOT NULL,
+        opened_at     INTEGER NOT NULL,
+        closed_at     INTEGER NOT NULL,
+        qty           TEXT NOT NULL,
+        entry_fill    TEXT NOT NULL,
+        exit_fill     TEXT NOT NULL,
+        fees          TEXT NOT NULL,
+        pnl_net       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trade_outcomes_closed_at ON trade_outcomes(closed_at)",
+    """
     CREATE TABLE IF NOT EXISTS journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -249,8 +265,19 @@ def _migrate_v2_broker_subscriptions(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v3_trade_outcomes(conn: sqlite3.Connection) -> None:
+    """v3 adds `trade_outcomes`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill.
+
+    Historical `orders` rows cannot be reliably paired into round-trips (partial fills, scale-outs,
+    positions opened before entry context was tracked). Rail 16's threshold is derived from streak
+    statistics, so seeding it with guessed history would be worse than starting empty.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
+    3: _migrate_v3_trade_outcomes,
 }
 
 

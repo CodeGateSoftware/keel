@@ -13,11 +13,17 @@ only ever emits ENTER signals (rules + read-only market data, no notion of what'
 held). Something has to own position state and ask each rule's `exit_signal(held, candles_by_tf)`
 whether to close it -- in Phase 2 that was deferred to "the paper trader's job"; in live trading
 it's this module's job. Position ownership is tracked in `agent_state` under
-`position_rule:<product_id>` (the rule name that opened the currently-held position) -- the
+`position_rule:<product_id>` (a dict carrying the owning rule's name plus the entry context a
+`trade_outcomes` row needs: `opened_at`, `entry_fill`, `qty`, `entry_fee`) -- the
 `orders` table has no column for it (live fills leave `rule_id` NULL, per `executor.py`'s own
 docstring: paper mode encodes `rule_name` in `raw_response`, but live orders don't), so this
 loop is the one place that source of truth lives, set the moment an ENTER places
 (`ExecutionResult.placed`) and cleared the moment the matching EXIT places.
+
+It is exit-rule OWNERSHIP state, not a position ledger: it is overwritten on every placed entry
+rather than accumulated, so its `qty` is the last tranche's, not the position's. Anything needing
+a true holding must use `_held_position` (the filled-orders audit log) instead -- see
+`_mark_to_market_equity`, where valuing equity from this key manufactured a phantom drawdown.
 
 **Rule reconstruction.** `rules.kind`/`rules.params` (P3 Task 1's `Repository.get_rules`) round-
 trip through `json.dumps`/`json.loads`, so `params` on the way back out is JSON-plain (strings/
@@ -60,8 +66,9 @@ from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycl
 from keel.config import Config
 from keel.data import market_feed
 from keel.data.repository import Repository
-from keel.execution import executor
-from keel.execution.executor import ExecutionResult
+from keel.execution import equity as equity_mod
+from keel.execution import executor, streak
+from keel.execution.executor import ExecutionResult, _fetch_available_quote
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
@@ -179,6 +186,89 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     return (net_qty if net_qty > 0 else Decimal("0")), avg_cost
 
 
+def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
+    """The tracked position for `product_id`, or `None` if nothing is held.
+
+    `agent_state["position_rule:<product>"]` used to be a bare rule-name string and is now a dict
+    carrying the entry context a `trade_outcomes` row needs. A database written by the previous
+    version still holds the string form, so it is normalised here rather than migrated: the entry
+    fields read back as `None`, which the outcome producer treats as "cannot attribute this trade"
+    rather than guessing a price.
+    """
+    raw = repo.get_state(f"position_rule:{product_id}")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return {
+            "rule_name": raw,
+            "opened_at": None,
+            "entry_fill": None,
+            "qty": None,
+            "entry_fee": None,
+        }
+    return raw
+
+
+def _mark_to_market_equity(
+    repo: Repository,
+    broker: Any,
+    products: list[str],
+    price_by_product: dict[str, Decimal],
+    quote_currency: str,
+) -> Decimal | None:
+    """Quote balance + mark-to-market value of every open position, or `None` if the quote
+    balance could not be read.
+
+    Unrealized P&L is included on purpose: a breaker that saw only realized P&L would read 0%
+    while a position bled and would notice only after the loss was booked -- backwards for a
+    circuit breaker, which has to fire WHILE you are losing.
+
+    A held product with no fresh price this cycle is valued at its ENTRY fill rather than
+    dropped: dropping it would understate equity and could trip rail 11 on a data gap rather
+    than on a loss. That is why this iterates `products` and not `price_by_product` -- a product
+    missing from the price map is exactly the case the fallback exists for.
+
+    `None`, rather than a partial total, when the quote balance is unavailable: equity is simply
+    unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM never
+    falls, so an under-read arms the breaker on a phantom drawdown from then on).
+    """
+    quote = _fetch_available_quote(broker, quote_currency)
+    if quote is None:
+        return None
+
+    # Quantities come from `_held_position` (the filled-orders audit log), NEVER from
+    # `position_rule:<product>`. That key is exit-rule OWNERSHIP state: it is overwritten on
+    # every placed entry rather than accumulated, so it holds the last tranche's qty, not the
+    # position. Valuing equity from it undercounts every accumulated position -- and because the
+    # high-water mark is monotonic, that undercount becomes a permanent phantom drawdown that
+    # arms rail 11 on a flat account. See `test_equity_counts_the_net_held_qty_across_...`.
+    #
+    # The product set is the UNION of the live-rule products and every product with a non-zero
+    # holding: `products` derives from the live rule set, so retiring a rule while its position
+    # is still open would otherwise drop that holding out of equity in a single step.
+    valued: set[str] = set()
+    total = quote
+    for product_id in (*products, *repo.held_products()):
+        if product_id in valued:
+            continue
+        valued.add(product_id)
+
+        qty, avg_cost = _held_position(repo, product_id)
+        if qty <= 0:
+            continue
+
+        # A held product with no fresh price is valued at its cost basis rather than dropped:
+        # dropping it understates equity and would trip rail 11 on a DATA GAP rather than on a
+        # loss. `avg_cost` comes from the same audit log as `qty`, so the two always agree.
+        mark = price_by_product.get(product_id)
+        if mark is None:
+            mark = avg_cost
+        if mark <= 0:
+            continue
+        total += qty * mark
+    return total
+
+
 def _handle_exits(
     product_id: str,
     product_rules: list[Rule],
@@ -197,7 +287,8 @@ def _handle_exits(
     if qty <= 0:
         return []
 
-    owning_rule_name = repo.get_state(f"position_rule:{product_id}")
+    position = _position_state(repo, product_id)
+    owning_rule_name = None if position is None else position["rule_name"]
     if not owning_rule_name:
         return []
 
@@ -232,6 +323,32 @@ def _handle_exits(
         exit_signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
     )
     if result.placed:
+        exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
+        if (
+            position is not None
+            and exit_order is not None
+            # An exit with no observed fill price cannot be valued. Unreachable today (exits are
+            # always market orders, so `_initial_status` is `filled`), but a limit exit would
+            # otherwise raise TypeError on `(None - entry_fill)` from inside `run_once` -- and
+            # the producer already refuses to guess a missing ENTRY price for the same reason.
+            and exit_order["actual_fill"] is not None
+        ):
+            streak.record_closed_trade(
+                repo,
+                config,
+                product_id=product_id,
+                position=position,
+                exit_fill=exit_order["actual_fill"],
+                exit_qty=exit_order["qty"],
+                fees=exit_order["fee"] or Decimal("0"),
+                # DERIVED, never asserted: §12.6 exempts DCA from the streak, and the owning
+                # rule is what decides. Hardcoding False was safe only while `Dca.exit_signal`
+                # returned False unconditionally -- an invariant held by an unrelated module
+                # with nothing asserting it. `sim/portfolio_sim.py` passes this explicitly for
+                # the same reason; the live path must match.
+                is_dca=owning_rule.name == "dca",
+                now_ts=now_ts,
+            )
         repo.set_state(f"position_rule:{product_id}", None)
     return [result]
 
@@ -342,6 +459,27 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
         exit_results: list[ExecutionResult] = []
         stale_products: list[str] = []
 
+        # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
+        # written the candles, so every product's latest price is readable here -- and it has to
+        # be done now, not after the loop: `guards.check` reads these scalars from inside
+        # `executor.execute`, which runs *within* the loop, so producing them afterwards would
+        # let through exactly the entries the breaker exists to veto and fire a cycle late.
+        latest_price_by_product: dict[str, Decimal] = {}
+        if finest is not None:
+            for product_id in products:
+                product_candles = repo.get_candles(product_id, finest)
+                if product_candles:
+                    latest_price_by_product[product_id] = product_candles[-1].close
+
+        equity_now = _mark_to_market_equity(
+            repo, broker, products, latest_price_by_product, config.quote_currency
+        )
+        if equity_now is None:
+            # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
+            log_event(logger, logging.WARNING, "agent.equity_unavailable")
+        else:
+            equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
+
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
                 repo, product_id, finest, now_ts, max_age_sec
@@ -401,7 +539,22 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                     reason=result.reason,
                 )
                 if result.placed:
-                    repo.set_state(f"position_rule:{product_id}", signal.rule_name)
+                    order = (
+                        repo.get_order(result.order_id) if result.order_id is not None else None
+                    )
+                    repo.set_state(
+                        f"position_rule:{product_id}",
+                        {
+                            "rule_name": signal.rule_name,
+                            "opened_at": now_ts,
+                            "entry_fill": None if order is None else order["actual_fill"],
+                            "qty": None if order is None else order["qty"],
+                            # The entry leg's fee, carried so `record_closed_trade` can net BOTH
+                            # legs (the sim does). Nothing else preserves it: the exit's order
+                            # row knows only its own fee.
+                            "entry_fee": None if order is None else order["fee"],
+                        },
+                    )
 
         return LoopResult(
             ts=now_ts,

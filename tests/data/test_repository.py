@@ -9,7 +9,7 @@ import pytest
 
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.types import Candle, Granularity
+from keel.types import Candle, Granularity, Side
 
 
 @pytest.fixture
@@ -400,3 +400,34 @@ def test_insert_signal_ids_increment(repo):
     id2 = repo.insert_signal(_signal())
 
     assert id2 > id1
+
+
+def test_held_products_lists_products_with_filled_live_orders(repo: Repository) -> None:
+    """Feeds `agent._mark_to_market_equity`'s product union: a holding whose rule is no longer
+    in the live set must still be valued, or retiring a rule manufactures a phantom drawdown."""
+    for product_id in ("BTC-USD", "ETH-USD"):
+        repo.insert_order(
+            dict(
+                mode="live", product_id=product_id, side=Side.BUY.value, order_type="market",
+                qty=Decimal("1"), limit_price=Decimal("100"), status="filled",
+                fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=Decimal("100"),
+            )
+        )
+    # a paper-mode order must NOT leak into the live equity calculation
+    repo.insert_order(
+        dict(
+            mode="paper", product_id="SOL-USD", side=Side.BUY.value, order_type="market",
+            qty=Decimal("1"), limit_price=Decimal("100"), status="filled",
+            fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=Decimal("100"),
+        )
+    )
+    # an unfilled order is not a holding
+    repo.insert_order(
+        dict(
+            mode="live", product_id="DOGE-USD", side=Side.BUY.value, order_type="market",
+            qty=Decimal("1"), limit_price=Decimal("100"), status="pending",
+            fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=None,
+        )
+    )
+
+    assert repo.held_products() == ["BTC-USD", "ETH-USD"]

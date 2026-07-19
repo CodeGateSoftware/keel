@@ -31,6 +31,7 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.types import Candle, Granularity, Side
 from tests.conftest import attest_subscription
@@ -269,8 +270,14 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     # dca_size(config.dca.budget_usd=50, entry=100) = 0.5
     assert orders[0]["qty"] == Decimal("0.5")
 
-    # the loop records which rule owns the freshly opened position, for future exit checks.
-    assert repo.get_state(f"position_rule:{PRODUCT}") == "dca"
+    # the loop records which rule owns the freshly opened position, for future exit checks,
+    # plus the entry context (opened_at/entry_fill/qty) a `trade_outcomes` row will need.
+    position = agent._position_state(repo, PRODUCT)
+    assert position is not None
+    assert position["rule_name"] == "dca"
+    assert position["opened_at"] == 90_000
+    assert position["entry_fill"] == Decimal("100")
+    assert position["qty"] == Decimal("0.5")
     # and records that the feed was checked this cycle (guards rail 12 reads this).
     assert repo.get_state("last_feed_ts") == 90_000
 
@@ -395,6 +402,53 @@ def test_no_held_position_skips_exit_check_entirely(repo):
     assert result.exit_results == []
 
 
+# -- _position_state: entry context -------------------------------------------------------------
+
+
+def test_opening_a_position_records_entry_context(repo, monkeypatch) -> None:
+    """An outcome row later needs opened_at/entry_fill/qty, so the ENTER path must record them."""
+    from keel.agent import _position_state
+
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=1_000)
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "turtle_breakout",
+            "opened_at": 1_000,
+            "entry_fill": Decimal("100"),
+            "qty": Decimal("0.5"),
+        },
+    )
+
+    state = _position_state(repo, PRODUCT)
+    assert state is not None
+    assert state["rule_name"] == "turtle_breakout"
+    assert state["opened_at"] == 1_000
+    assert state["entry_fill"] == Decimal("100")
+    assert isinstance(state["entry_fill"], Decimal)
+    assert state["qty"] == Decimal("0.5")
+
+
+def test_position_state_tolerates_the_legacy_bare_string(repo) -> None:
+    """Existing DBs hold a bare rule-name string; reading one must not crash mid-upgrade."""
+    from keel.agent import _position_state
+
+    repo.set_state(f"position_rule:{PRODUCT}", "turtle_breakout")
+
+    state = _position_state(repo, PRODUCT)
+    assert state is not None
+    assert state["rule_name"] == "turtle_breakout"
+    assert state["opened_at"] is None
+    assert state["entry_fill"] is None
+
+
+def test_position_state_is_none_when_unset(repo) -> None:
+    """The negative: no tracked position must read as None, not as an empty dict."""
+    from keel.agent import _position_state
+
+    assert _position_state(repo, PRODUCT) is None
+
+
 # -- run_once: stale feed ----------------------------------------------------------------------
 
 
@@ -488,3 +542,234 @@ def test_loop_stops_immediately_when_stop_flag_is_already_true(repo):
     results = loop(broker, repo, _config(), interval_sec=0, stop_flag=lambda: True)
 
     assert results == []
+
+
+# -- rail 11: the equity/drawdown producer must run as part of the CYCLE ----------------------
+
+
+def test_run_once_writes_the_drawdown_scalars(repo: Repository) -> None:
+    """Rail 11's inputs must be produced by the CYCLE, not only by a directly-called helper.
+
+    Without this, `tests/execution/test_equity.py` passes in full while `run_once` never calls
+    the producer -- exactly the state that left rail 11 unable to trip for the whole life of the
+    project. The unit tests there cannot catch it; only this one can.
+    """
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("drawdown_total_pct") is not None
+    assert repo.get_state("equity_high_water_mark") is not None
+
+
+def test_run_once_skips_the_drawdown_update_when_the_quote_balance_is_unreadable(
+    repo: Repository,
+) -> None:
+    """Equity is unknowable without the quote balance, and a wrong equity corrupts the
+    high-water mark PERMANENTLY -- an HWM cannot be walked back, so an under-read arms the
+    breaker on a phantom drawdown forever after. Skip and keep last cycle's scalars instead."""
+
+    class _BrokenAccountsBroker(FakeBroker):
+        def get_accounts(self) -> list[dict[str, Any]]:
+            raise RuntimeError("broker down")
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = _BrokenAccountsBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("equity_high_water_mark") is None
+    assert repo.get_state("drawdown_total_pct") is None
+
+
+def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) -> None:
+    """Pins the VALUE, not just the presence, of the scalars.
+
+    `test_run_once_writes_the_drawdown_scalars` only asserts the keys are non-None, so a
+    `_mark_to_market_equity` that returned a constant would satisfy it while leaving the breaker
+    permanently at 0% in production. Drop the quote balance 30% between two cycles and require
+    the drawdown to track it.
+    """
+
+    class _DecliningBroker(FakeBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.balance = Decimal("10000")
+
+        def get_accounts(self) -> list[dict[str, Any]]:
+            return [{"currency": "USDC", "available_balance": self.balance}]
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = _DecliningBroker(series=series)
+    now = 1_000 + 29 * 86_400
+
+    run_once(broker, repo, _config(), now_ts=now)
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000")
+    assert repo.get_state("drawdown_total_pct") == Decimal("0")
+
+    broker.balance = Decimal("7000")
+    run_once(broker, repo, _config(), now_ts=now + 86_400)
+
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000")  # never falls
+    assert repo.get_state("drawdown_total_pct") == Decimal("0.3")
+
+
+# -- rail 11: equity must be valued from the ORDERS LOG, not from position_rule ----------------
+
+
+def test_equity_counts_the_net_held_qty_across_multiple_buys(repo: Repository) -> None:
+    """`position_rule["qty"]` is OVERWRITTEN on every placed entry, never accumulated, so it
+    holds the LAST tranche's qty -- not the position. Valuing equity from it undercounts every
+    accumulated position (DCA is the acute case: it buys the same product every cycle).
+
+    That matters far more than an ordinary rounding error because the high-water mark is
+    MONOTONIC: the undercount manufactures a drawdown that only ever grows, and at
+    `max_total_dd_pct` rail 11 vetoes every rule entry permanently on a flat account.
+    """
+    for i in range(5):
+        _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=1_000 + i)
+    # what the ENTER path actually writes -- the last leg only
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {"rule_name": "dca", "opened_at": 1_000, "entry_fill": Decimal("100"),
+         "qty": Decimal("0.5")},
+    )
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USDC"
+    )
+
+    # 2.5 BTC held, not 0.5 -- cash is FakeBroker's 1_000_000
+    assert equity == Decimal("1000000") + Decimal("2.5") * Decimal("100")
+
+
+def test_equity_counts_a_held_position_whose_rule_is_no_longer_live(repo: Repository) -> None:
+    """`products` comes from the LIVE rule set. Retire a rule while its position is still open
+    and the holding would vanish from equity in one step -- a cliff-edge phantom drawdown."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(
+        repo, broker, [], {PRODUCT: Decimal("100")}, "USDC"
+    )
+
+    assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
+
+
+def test_equity_falls_back_to_avg_cost_when_a_held_product_has_no_price(
+    repo: Repository,
+) -> None:
+    """Pre-flight fix (C): a held product missing from the price map is valued at its cost
+    basis, never dropped -- dropping it understates equity and would trip rail 11 on a DATA GAP
+    rather than on a loss. This is the assertion that fix was missing."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    broker = FakeBroker()
+
+    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USDC")
+
+    assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
+
+
+def test_exit_records_a_trade_outcome(repo: Repository) -> None:
+    """The LIVE rail-16 producer must be invoked BY THE CYCLE, not only by a directly-called
+    helper. Every test in tests/execution/test_streak.py calls `record_closed_trade` itself, so
+    all of them would pass while `_handle_exits` never invoked it -- which is precisely how rail
+    11 became dormant, and the guard this branch built for the equity and sim producers but not
+    for the one that gates real money.
+
+    The pre-existing exit test cannot serve as this guard: it seeds `position_rule` as a legacy
+    BARE STRING, which `_position_state` normalises to `entry_fill=None`, which the producer
+    deliberately SKIPS. The one integration test reaching this call site takes the branch where
+    the producer does nothing.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "fake_exit",
+            "opened_at": 1_000,
+            "entry_fill": Decimal("50000"),
+            "qty": Decimal("0.1"),
+        },
+    )
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0]["rule_name"] == "fake_exit"
+
+
+def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
+    repo: Repository,
+) -> None:
+    """§12.6 exempts DCA from the STREAK, and `_handle_exits` must derive that from the owning
+    rule rather than asserting it. Today the exemption holds only because `Dca.exit_signal`
+    returns False unconditionally -- a load-bearing invariant in an unrelated module with
+    nothing asserting it. If DCA ever gains an exit condition, hardcoding `is_dca=False` would
+    silently start counting DCA losses toward a live-money breaker.
+    """
+
+    class _ExitingDca(Rule):
+        name = "dca"
+        params: dict = {}
+        product_id = PRODUCT
+
+        def detect(self, candles_by_tf):
+            return None
+
+        def exit_signal(self, held, candles_by_tf):
+            return True
+
+        def describe(self):
+            return {"name": self.name, "params": self.params}
+
+    agent.RULE_REGISTRY["dca"] = lambda **kw: _ExitingDca()
+    try:
+        repo.insert_rule("dca", {}, status="live")
+        _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+        repo.set_state(
+            f"position_rule:{PRODUCT}",
+            {"rule_name": "dca", "opened_at": 1_000,
+             "entry_fill": Decimal("50000"), "qty": Decimal("0.1")},
+        )
+        broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+        run_once(broker, repo, _config(), now_ts=90_000)
+    finally:
+        agent.RULE_REGISTRY["dca"] = Dca
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0]["is_dca"] is True          # recorded as DCA...
+    assert repo.get_state("consecutive_losses", default=0) == 0   # ...and exempt from the streak
+
+
+def test_the_enter_path_records_the_entry_fee_onto_the_position(repo: Repository) -> None:
+    """Holds the WIRING of the entry-fee half of the "pnl_net was GROSS" fix.
+
+    `record_closed_trade` does `position.get("entry_fee") or Decimal("0")`, so if the ENTER path
+    stops writing it, `pnl_net` silently reverts to net-of-EXIT-fee-only -- restoring the exact
+    Critical this branch fixed, where a fee-dominated loser is recorded as a WIN and RESETS the
+    loss counter.
+
+    Every other test that touches `entry_fee` hand-seeds it into a `position_rule` fixture, which
+    makes them vacuous with respect to the producer. This one exercises the real ENTER path and
+    asserts the value ARRIVES -- the difference between testing arithmetic and testing wiring.
+    """
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    position = repo.get_state(f"position_rule:{PRODUCT}")
+    assert position is not None, "no entry was placed -- the fixture no longer exercises ENTER"
+    assert "entry_fee" in position
+    assert position["entry_fee"] is not None, (
+        "the ENTER path stopped recording the entry fee; pnl_net will silently revert to "
+        "net-of-exit-fee-only"
+    )

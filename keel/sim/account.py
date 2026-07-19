@@ -3,12 +3,29 @@
 `SimAccount` is a self-contained, read-only-of-the-broker stand-in for a live keel account: it
 tracks cash, open positions, and cumulative contributions, and enforces the *spend-cap subset* of
 `execution.guards.check` -- per-order, per-day, total-exposure, per-asset%, USDC-funding (rail 13),
-and monthly-allowance (rail 14) -- before a candidate order is allowed to open. It never touches
-the live engine/executor/rails/ledger modules and is never imported by them; the two are kept in
-parity by a dedicated test (`tests/sim/test_account.py::test_parity_with_guards_check_*`) that
-builds equivalent `Repository`/`Config` state and asserts `can_open` agrees with `guards.check`
-across a grid of notionals spanning every cap boundary -- see the "sim/live divergence" note below
-for the one rail where the two are now intentionally NOT compared.
+and monthly-allowance (rail 14), plus rail 16 (the consecutive-loss circuit breaker, Task 4) --
+before a candidate order is allowed to open. It never touches the live engine/executor/rails/
+ledger modules and is never imported by them; the two are kept in parity by a dedicated test
+(`tests/sim/test_account.py::test_parity_with_guards_check_*`) that builds equivalent
+`Repository`/`Config` state and asserts `can_open` agrees with `guards.check` across a grid of
+notionals spanning every cap boundary -- see the "sim/live divergence" note below for the one rail
+where the two are now intentionally NOT compared.
+
+Rail 16 parity: `SimAccount` has no `Repository`/`agent_state` of its own (by design -- it's a
+pure ledger, not a state store), so it carries `streak_halt_until` and `consecutive_losses` as
+plain instance attributes mirroring the live `agent_state` keys of the same names. `guards.check`
+reads the live `streak_halt_until`; `can_open` reads this one. Both default to `0`, matching the
+fail-inert-by-default posture: `now_ts < 0` is never true for a real timestamp.
+
+`record_trade_outcome` is this module's PRODUCER for those attributes -- the sim-side twin of
+`execution/streak.py`, which is live-side only (it writes through a `Repository`). It exists
+because rail 16 ships DISABLED so its threshold can be set from a `keel simulate` sweep, and
+without a producer here the sim could never halt: every `max_consecutive_losses` value returned a
+byte-identical backtest, making the sweep a provable no-op. `sim/portfolio_sim.py` calls it on
+every closed RULE position; `tests/sim/test_portfolio_sim.py::
+test_sweeping_max_consecutive_losses_changes_the_backtest` is the test that holds that wiring in
+place -- the `can_open`/`guards.check` parity test below is structural and would NOT catch its
+loss (it proves the two agree when both are told the same thing, not that anything tells the sim).
 
 Deliberately NOT enforced here (outside the spend-cap subset, per the plan): the halal allowlist,
 min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule, the
@@ -70,6 +87,8 @@ from keel.execution.guards import (
     _utc_month_bounds,
 )
 
+SECONDS_PER_DAY = 86_400
+
 
 @dataclass
 class OpenPosition:
@@ -112,6 +131,12 @@ class SimAccount:
         self.dca_positions: dict[str, OpenPosition] = {}
         self.contributed: Decimal = Decimal("0")
         self.realized_pnl: Decimal = Decimal("0")
+
+        # Rail 16 (consecutive-loss circuit breaker): the sim-side mirror of the live
+        # `agent_state["streak_halt_until"]`/`["consecutive_losses"]` keys. Written by
+        # `record_trade_outcome` -- see the module docstring's "Rail 16 parity" note.
+        self.streak_halt_until: int = 0
+        self.consecutive_losses: int = 0
 
         # Cap-arithmetic bookkeeping: an append-only log of every opened AND closed order's
         # *candidate* notional (for day/month VOLUME -- buys and sells both count, see module
@@ -243,6 +268,16 @@ class SimAccount:
                 "monthly_subscription_allowance: month-to-date volume "
                 f"{month_volume} + {intent.notional} = {projected_month} exceeds the "
                 f"allowance cap {effective_cap}"
+            )
+
+        # consecutive-loss circuit breaker (rail 16) -- ENTRIES ONLY, DCA exempt, matching
+        # `guards.check`'s `is_buy and not intent.is_dca` gate (every `can_open` candidate is
+        # itself an entry, so `is_buy` is implicit here).
+        if not intent.is_dca and now_ts < self.streak_halt_until:
+            reasons.append(
+                "consecutive_loss_breaker: new entries are halted for another "
+                f"{self.streak_halt_until - now_ts}s (consecutive-loss circuit breaker); "
+                "DCA is unaffected"
             )
 
         return (not reasons, reasons)
@@ -377,6 +412,42 @@ class SimAccount:
         self.realized_pnl += pnl
         self._volume_log.append((now_ts, fill_price * position.qty))
         return pnl
+
+    # -- rail 16: the streak producer -----------------------------------------------------------
+
+    def record_trade_outcome(
+        self, pnl_net: Decimal, config: Config, now_ts: int, *, is_dca: bool
+    ) -> None:
+        """Fold one closed trade's realized, fee-net P&L into the consecutive-loss streak,
+        arming `streak_halt_until` once the threshold is reached.
+
+        The sim-side twin of `execution.streak.record_closed_trade`, and deliberately identical
+        to it in every decision it makes -- `pnl_net >= 0` resets (so an exactly-flat scratch is
+        NOT a loss), DCA is exempt in both directions (§12.6: it buys through drawdowns on a
+        fixed budget, so neither its losses nor its wins may move a rule-trade streak), and the
+        halt is armed only when `max_consecutive_losses > 0`. Where the live producer persists
+        both counters through `Repository.set_state`, this keeps them as plain instance
+        attributes: `SimAccount` has no `agent_state` by design (it's a ledger, not a state
+        store), and a backtest's streak must not outlive its run.
+
+        With the SHIPPED default of `max_consecutive_losses = 0` this is completely inert, which
+        is the point -- the threshold is meant to be set from a sweep, and a sweep is only
+        meaningful because this producer makes the sim actually halt.
+        """
+        if is_dca:
+            return
+
+        if pnl_net >= 0:
+            self.consecutive_losses = 0
+            return
+
+        self.consecutive_losses += 1
+
+        threshold = config.money_mgmt.max_consecutive_losses
+        if threshold > 0 and self.consecutive_losses >= threshold:
+            self.streak_halt_until = (
+                now_ts + config.money_mgmt.streak_cooloff_days * SECONDS_PER_DAY
+            )
 
     # -- reporting --------------------------------------------------------------------------------
 

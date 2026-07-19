@@ -66,6 +66,7 @@ from keel.data import market_feed
 from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution import equity as equity_mod
 from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 from keel.security import authz
@@ -1300,6 +1301,105 @@ def resume(ctx: click.Context, passphrase: str | None) -> None:
     repo = _open_repo(ctx)
     repo.set_state("kill_switch", False)
     click.echo("kill-switch disengaged: trading resumed.")
+
+
+@cli.command(name="resume-entries")
+@click.option("--passphrase", default=None, help="Required to clear the breaker.")
+@click.pass_context
+@with_disclaimer
+def resume_entries(ctx: click.Context, passphrase: str | None) -> None:
+    """Clear an armed consecutive-loss halt (rail 16), re-permitting new entries.
+
+    This is the ONLY way to release the halt early: rail 16 reads `streak_halt_until` and never
+    the threshold, so setting `money_mgmt.max_consecutive_losses: 0` disables future trips but
+    does NOT clear one already armed. The rail's own violation message names this command.
+
+    The loss counter is reset alongside the halt -- leaving it at or above the threshold would
+    re-arm the breaker on the very next loss, which is not what an operator clearing a halt
+    means. Exits, sells and DCA are never affected by rail 16 and are unaffected here.
+    """
+    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    repo = _open_repo(ctx)
+    repo.set_state("streak_halt_until", 0)
+    repo.set_state("consecutive_losses", 0)
+    click.echo("consecutive-loss breaker cleared: new entries permitted.")
+
+
+@cli.command(name="record-flow")
+@click.option(
+    "--amount",
+    required=True,
+    help="Signed flow in quote currency: positive for a deposit, negative for a withdrawal.",
+)
+@click.option("--passphrase", default=None, help="Required to rebase the high-water mark.")
+@click.pass_context
+@with_disclaimer
+def record_flow(ctx: click.Context, amount: str, passphrase: str | None) -> None:
+    """Declare an external deposit or withdrawal so rail 11 does not mistake it for P&L.
+
+    Equity is `cash + positions`, so money moving in or out shifts it -- but neither is a
+    trading result. Because the high-water mark never falls, an unrecorded deposit ratchets it
+    up and a later withdrawal of the same money then reads as a drawdown that never recovers:
+    rail 11 vetoes every entry on an account that lost nothing. Declaring the flow shifts the
+    HWM (and the rolling weekly peak) by the same amount, so the drawdown keeps measuring
+    trading performance.
+
+    Run it whenever you move money, with the signed amount:
+
+        keel record-flow --amount 500        # deposited 500
+        keel record-flow --amount -250       # withdrew 250
+
+    The agent WARNS (`equity.unexplained_jump`) when equity moves sharply between cycles, but it
+    will never infer a flow on its own: guessing a withdrawal would lower the HWM and silently
+    mask a real trading drawdown, which is the one direction a circuit breaker must not fail in.
+    """
+    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    try:
+        parsed = Decimal(amount)
+    except InvalidOperation:
+        raise click.BadParameter(f"--amount must be a number, got {amount!r}") from None
+    # `Decimal("nan")`/`Decimal("inf")` parse without raising above (same trap `subscription
+    # attest` documents). Either would be written straight into the high-water mark, and NaN
+    # poisons it permanently: every subsequent `equity > hwm` comparison is False, so the HWM
+    # can never re-seed and every drawdown comparison silently misbehaves.
+    if not parsed.is_finite():
+        raise click.BadParameter(f"--amount must be a finite number, got {amount!r}")
+
+    repo = _open_repo(ctx)
+    equity_mod.record_external_flow(repo, amount=parsed)
+    hwm = repo.get_state("equity_high_water_mark")
+    if hwm is None:
+        click.echo(
+            f"flow of {parsed} recorded. No high-water mark yet -- the next cycle will seed it "
+            "from observed equity, which already includes this flow."
+        )
+    else:
+        click.echo(f"flow of {parsed} recorded. High-water mark rebased to {hwm}.")
+
+
+@cli.command(name="reset-hwm")
+@click.option("--passphrase", default=None, help="Required to reset the high-water mark.")
+@click.pass_context
+@with_disclaimer
+def reset_hwm(ctx: click.Context, passphrase: str | None) -> None:
+    """Reset rail 11's equity high-water mark, clearing a stuck drawdown halt.
+
+    The HWM is MONOTONIC by design -- it never falls -- so any equity reading that was wrong or
+    is no longer comparable is permanent. The common cause is not a loss at all: depositing
+    ratchets the HWM up, and a later withdrawal then reads as a drawdown that never recovers.
+    Without this, the only remedy is editing sqlite by hand.
+
+    Clearing the key (rather than writing a number) lets the next cycle re-seed it from observed
+    equity, which is the same path a fresh install takes. `drawdown_total_pct` is zeroed so the
+    rail is not left vetoing on a stale scalar in the window before that next cycle runs.
+    """
+    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    repo = _open_repo(ctx)
+    repo.set_state("equity_high_water_mark", None)
+    repo.set_state("drawdown_total_pct", Decimal("0"))
+    repo.set_state("drawdown_weekly_pct", Decimal("0"))
+    repo.set_state("equity_history", [])
+    click.echo("equity high-water mark reset: it will re-seed from the next cycle's equity.")
 
 
 # -- insights (Phase 4 stub) ---------------------------------------------------------------------

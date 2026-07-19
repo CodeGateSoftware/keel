@@ -53,6 +53,11 @@ money_mgmt:
   acceleration_pct: 0.05
   max_total_dd_pct: 0.20
   max_weekly_dd_pct: 0.08
+  # Rail 16 (consecutive-loss breaker) — DISABLED by default (0 = off).
+  # Set from a backtest sweep, and set it ABOVE the strategy's tested max losing streak:
+  # turtle_breakout's max streak is 5, so a threshold of 3 would fire on normal variance.
+  max_consecutive_losses: 0
+  streak_cooloff_days: 0
 
 dca:
   budget_usd: 50
