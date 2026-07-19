@@ -773,3 +773,41 @@ def test_the_enter_path_records_the_entry_fee_onto_the_position(repo: Repository
         "the ENTER path stopped recording the entry fee; pnl_net will silently revert to "
         "net-of-exit-fee-only"
     )
+
+
+def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
+    """The reconciliation pass must run as part of the CYCLE, not only when called directly.
+
+    Same guard as the equity and streak producers, for the same reason: every test in
+    tests/execution/test_reconcile.py calls `reconcile_open_orders` itself and would pass in
+    full while `run_once` never invoked it -- leaving stop-outs invisible to rails 11 and 16
+    exactly as before.
+    """
+    _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=1_000)
+    bracket_id = repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=None, status="pending", fee=None,
+             expected_fill=Decimal("49000"), actual_fill=None,
+             raw_response='{"order_id": "cb-1"}', created_at=1_000, updated_at=1_000)
+    )
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "turtle_breakout", "opened_at": 1_000,
+        "entry_fill": Decimal("50000"), "qty": Decimal("0.01"), "entry_fee": Decimal("3"),
+    })
+
+    class _ReconcilingBroker(FakeBroker):
+        def get_order(self, order_id: str) -> dict[str, Any]:
+            return {
+                "order_id": order_id, "status": "FILLED", "filled_size": Decimal("0.01"),
+                "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+            }
+
+    broker = _ReconcilingBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    )
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_order(bracket_id)["status"] == "filled"
+    assert len(repo.get_trade_outcomes()) == 1
+    assert repo.get_state(f"position_rule:{PRODUCT}") is None

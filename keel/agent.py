@@ -67,7 +67,7 @@ from keel.config import Config
 from keel.data import market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
-from keel.execution import executor, streak
+from keel.execution import executor, reconcile, streak
 from keel.execution.executor import ExecutionResult, _fetch_available_quote
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
@@ -458,6 +458,12 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
         enter_results: list[ExecutionResult] = []
         exit_results: list[ExecutionResult] = []
         stale_products: list[str] = []
+
+        # Reconcile FIRST, before equity and before any entry. A bracket that filled since the
+        # last cycle has already changed the position and the cash balance; reading equity or
+        # sizing a new entry against stale `pending` state would mark sold inventory as still
+        # held and compute rail 11's drawdown off a position that no longer exists.
+        reconcile.reconcile_open_orders(broker, repo, config, now_ts)
 
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to
