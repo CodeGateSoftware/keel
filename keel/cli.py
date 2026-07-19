@@ -6,7 +6,7 @@ Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_im
 `rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
 `promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
 Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
-`subscription show|set` (the DB-backed monthly-allowance rail 14 reads live, Issue #59), and a
+`subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live), and a
 Phase-4 `insights` stub.
 
 **Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
@@ -64,6 +65,7 @@ from keel.data import market_feed
 from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 from keel.security import authz
 from keel.sim import artifact as artifact_mod
@@ -165,20 +167,6 @@ def _load_cfg(ctx: click.Context) -> Config:
         config = replace(config, logging=replace(config.logging, verbose=True))
     configure_logging(config.logging)
     return config
-
-
-def _ensure_subscription_seeded(repo: Repository, config: Config, now_ts: int) -> None:
-    """Persist `config.yaml`'s `subscription:` block into the DB the *first* time it's touched.
-
-    Once a subscription row exists, the DB is authoritative (`execution.guards`' rail 14 reads
-    it live on every `check()` call) -- this never clobbers a value an operator already set via
-    `subscription set`, it only seeds the initial default from config.yaml if the DB has never
-    been given one.
-    """
-    if repo.get_state("subscription") is None:
-        repo.set_subscription(
-            config.subscription.monthly_allowance_usd, config.subscription.pacing, now_ts
-        )
 
 
 def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only against fakes
@@ -357,7 +345,6 @@ def agent_cmd(
     config = _load_cfg(ctx)
     config = replace(config, auto_trade=replace(config.auto_trade, mode=mode))
     repo = _open_repo(ctx)
-    _ensure_subscription_seeded(repo, config, int(time.time()))
     broker = _build_broker(config)
 
     if not loop:
@@ -1095,78 +1082,192 @@ def simulate(
         click.echo(f"artifact written to {html_path}")
 
 
-# -- subscription (rail 14, monthly-allowance) ---------------------------------------------------
+# -- subscription (rail 14, per-venue attested allowance) ----------------------------------------
+
+ATTESTATION_PERIOD_SEC = 365 * 24 * 3600
 
 
 @cli.group("subscription")
 def subscription_group() -> None:
-    """View or update the live monthly-allowance subscription (execution.guards rail 14).
+    """View or attest a venue's subscription (the allowance execution.guards rail 14 enforces).
 
-    This is a config-level change (adjusting a spending allowance), not a dangerous trade
-    action -- unlike `agent --bypass`/`resume` it requires no passphrase gate. The DB row it
-    writes is authoritative: `guards.check` reads it fresh on every order, so an update here
-    takes effect on the very next order, with no restart.
+    Coinbase exposes no subscription endpoint, so a subscription is *asserted* by the user, not
+    fetched. `attest` is that assertion. Rail 14 reads the resulting record fresh on every order,
+    so an attestation takes effect on the very next one, with no restart.
+
+    Until a venue is attested, rail 14 caps it at `subscription.unsubscribed_allowance_usd`
+    (default 0) -- keel ships unable to place a live BUY, deliberately.
     """
+
+
+def _resolve_pacing(
+    repo: Repository, config: Config, venue: str, pacing: str | None
+) -> str:
+    """Explicit `--pacing` wins; otherwise keep the venue's existing choice, else config's.
+
+    Re-attesting must not silently reset a pacing mode the user set earlier.
+    """
+    if pacing is not None:
+        return pacing
+    existing = repo.get_broker_subscription(venue)
+    return existing.pacing if existing is not None else config.subscription.pacing
+
+
+@subscription_group.command("attest")
+@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to attest.")
+@click.option("--tier", "tier_name", required=True, help="Tier name from config.yaml's `tiers`.")
+@click.option(
+    "--pacing",
+    type=click.Choice(["opportunistic", "even_daily"]),
+    default=None,
+    help="Pacing mode (default: keep the venue's current value).",
+)
+@click.pass_context
+@with_disclaimer
+def subscription_attest(
+    ctx: click.Context, venue: str, tier_name: str, pacing: str | None
+) -> None:
+    """Assert which subscription tier this venue is on -- clears `suspect` by asserting a named
+    tier (`subscription set` also clears it, but names no tier)."""
+    repo = _open_repo(ctx)
+    config = _load_cfg(ctx)
+
+    tier = next((t for t in config.tiers if t.name == tier_name), None)
+    if tier is None:
+        valid = ", ".join(t.name for t in config.tiers)
+        click.echo(
+            f"Error: unknown tier {tier_name!r}. Configured tiers: {valid}",
+            err=True,
+        )
+        ctx.exit(1)
+
+    now_ts = int(time.time())
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue=venue,
+            tier_name=tier.name,
+            free_volume_usd=tier.free_volume_usd,
+            pacing=_resolve_pacing(repo, config, venue, pacing),
+            subscription_usd_month=tier.subscription_usd_month,
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=now_ts,
+            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
+        )
+    )
+    volume = "unlimited" if tier.free_volume_usd is None else str(tier.free_volume_usd)
+    click.echo(
+        f"attested {venue}: tier={tier.name} free_volume_usd={volume} "
+        f"status=active due in 365 days"
+    )
+
+
+@subscription_group.command("set")
+@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to update.")
+@click.option(
+    "--free-volume-usd",
+    "free_volume_raw",
+    required=True,
+    help="Raw fee-free monthly volume in USD, e.g. 500.",
+)
+@click.option(
+    "--pacing",
+    type=click.Choice(["opportunistic", "even_daily"]),
+    default=None,
+    help="Pacing mode (default: keep the venue's current value).",
+)
+@click.pass_context
+@with_disclaimer
+def subscription_set(
+    ctx: click.Context, venue: str, free_volume_raw: str, pacing: str | None
+) -> None:
+    """Set a raw allowance without naming a tier -- an escape hatch, not an attestation.
+
+    Leaves `tier_name='unknown'`, which `show` surfaces: the record is visibly a hand-set number
+    rather than a stated tier. Prefer `attest`.
+    """
+    repo = _open_repo(ctx)
+    config = _load_cfg(ctx)
+
+    try:
+        free_volume_usd = Decimal(free_volume_raw)
+    except InvalidOperation:
+        click.echo(
+            f"Error: --free-volume-usd must be a number, got {free_volume_raw!r}", err=True
+        )
+        ctx.exit(1)
+    # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
+    # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
+    # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
+    # "unlimited" has no representation via this command; it is expressed elsewhere in this
+    # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
+    if not free_volume_usd.is_finite():
+        click.echo(
+            f"Error: --free-volume-usd must be a finite number, got {free_volume_raw!r}",
+            err=True,
+        )
+        ctx.exit(1)
+    if free_volume_usd < 0:
+        click.echo("Error: --free-volume-usd must be non-negative", err=True)
+        ctx.exit(1)
+
+    now_ts = int(time.time())
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue=venue,
+            tier_name="unknown",
+            free_volume_usd=free_volume_usd,
+            pacing=_resolve_pacing(repo, config, venue, pacing),
+            # Placeholder: `set` names no tier, so there is no real subscription price to
+            # record here. Must not be read as an actual (free) subscription cost.
+            subscription_usd_month=Decimal("0"),
+            # ACTIVE (full spend authority), even though `tier_name='unknown'` -- the same shape
+            # the v2 migration backfill deliberately marks `suspect` instead. Not a contradiction:
+            # the migration distrusts a *stale* hand-tuned number of unknown provenance, whereas
+            # this is a *fresh, explicit* user assertion made right now, by name, via this
+            # command. Provenance differs even though the resulting record looks identical.
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=now_ts,
+            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
+        )
+    )
+    click.echo(
+        f"set {venue}: free_volume_usd={free_volume_usd} tier=unknown "
+        f"(not an attestation -- prefer `subscription attest`)"
+    )
 
 
 @subscription_group.command("show")
 @click.pass_context
 @with_disclaimer
 def subscription_show(ctx: click.Context) -> None:
-    """Show the live subscription (config.yaml only ever seeds it once, on first use)."""
+    """Show every venue's subscription, with the status and cap actually in force."""
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    _ensure_subscription_seeded(repo, config, int(time.time()))
-    sub = repo.get_subscription()
-    click.echo(
-        f"monthly_allowance_usd={sub['monthly_allowance_usd']} pacing={sub['pacing']} "
-        f"updated_at={sub['updated_at']}"
-    )
+    records = repo.list_broker_subscriptions()
 
-
-@subscription_group.command("set")
-@click.option(
-    "--monthly-allowance",
-    "monthly_allowance_raw",
-    required=True,
-    help="New monthly BUY allowance in USD, e.g. 500.",
-)
-@click.option(
-    "--pacing",
-    type=click.Choice(["opportunistic", "even_daily"]),
-    default=None,
-    help="Pacing mode (default: keep the current value).",
-)
-@click.pass_context
-@with_disclaimer
-def subscription_set(
-    ctx: click.Context, monthly_allowance_raw: str, pacing: str | None
-) -> None:
-    """Update the live subscription -- enforced by rail 14 starting with the very next order."""
-    repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
-    _ensure_subscription_seeded(repo, config, int(time.time()))
-
-    try:
-        monthly_allowance_usd = Decimal(monthly_allowance_raw)
-    except InvalidOperation:
+    if not records:
         click.echo(
-            f"Error: --monthly-allowance must be a number, got {monthly_allowance_raw!r}",
-            err=True,
+            "no subscription attested for any venue -- rail 14 caps live BUYs at the "
+            f"unsubscribed allowance {config.subscription.unsubscribed_allowance_usd}. "
+            "Run `keel subscription attest --venue coinbase --tier <tier>`."
         )
-        ctx.exit(1)
-        return
-    if monthly_allowance_usd < 0:
-        click.echo("Error: --monthly-allowance must be non-negative", err=True)
-        ctx.exit(1)
         return
 
-    new_pacing = pacing if pacing is not None else repo.get_subscription()["pacing"]
-    repo.set_subscription(monthly_allowance_usd, new_pacing, int(time.time()))
-    click.echo(
-        f"subscription updated: monthly_allowance_usd={monthly_allowance_usd} "
-        f"pacing={new_pacing}"
-    )
+    now_ts = int(time.time())
+    unsubscribed = config.subscription.unsubscribed_allowance_usd
+    for record in records:
+        allowance = record.allowance_usd(now_ts, unsubscribed)
+        cap = "unlimited" if allowance is None else str(allowance)
+        volume = (
+            "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
+        )
+        click.echo(
+            f"{record.venue}: tier={record.tier_name} free_volume_usd={volume} "
+            f"pacing={record.pacing} stored_status={record.status.value} "
+            f"effective_status={record.effective_status(now_ts).value} "
+            f"effective_cap={cap} attested_at={record.attested_at} "
+            f"attest_due_ts={record.attest_due_ts}"
+        )
 
 
 # -- kill / resume ------------------------------------------------------------------------------

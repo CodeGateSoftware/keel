@@ -59,7 +59,7 @@ def test_load_config_subscription_and_quote_currency_defaults(valid_config_path)
     config = load_config(valid_config_path)
 
     assert config.quote_currency == "USDC"
-    assert config.subscription.monthly_allowance_usd == Decimal("500")
+    assert config.subscription.assumed_free_volume_usd == Decimal("500")
     assert config.subscription.pacing == "opportunistic"
 
 
@@ -68,7 +68,8 @@ def test_load_config_subscription_and_quote_currency_absent_falls_back_to_defaul
         """quote_currency: USDC
 
 subscription:
-  monthly_allowance_usd: 500
+  assumed_free_volume_usd: 500
+  unsubscribed_allowance_usd: 0
   pacing: opportunistic
 """,
         "",
@@ -78,7 +79,7 @@ subscription:
     config = load_config(path)
 
     assert config.quote_currency == "USDC"
-    assert config.subscription.monthly_allowance_usd == Decimal("500")
+    assert config.subscription.assumed_free_volume_usd == Decimal("500")
     assert config.subscription.pacing == "opportunistic"
 
 
@@ -96,6 +97,71 @@ def test_load_config_subscription_invalid_pacing_raises_configerror(write_config
     path = write_config(text)
 
     with pytest.raises(ConfigError, match="subscription.pacing"):
+        load_config(path)
+
+
+def test_assumed_free_volume_usd_parses(write_config) -> None:
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace(
+            "assumed_free_volume_usd: 500", "assumed_free_volume_usd: 1234.5"
+        )
+    )
+    config = load_config(path)
+    assert config.subscription.assumed_free_volume_usd == Decimal("1234.5")
+
+
+def test_unsubscribed_allowance_defaults_to_zero(valid_config_path) -> None:
+    """Fail-closed: an unattested venue may spend nothing unless the user says otherwise."""
+    assert load_config(valid_config_path).subscription.unsubscribed_allowance_usd == Decimal("0")
+
+
+def test_unsubscribed_allowance_parses(write_config) -> None:
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace(
+            "pacing: opportunistic", "pacing: opportunistic\n  unsubscribed_allowance_usd: 25"
+        )
+    )
+    assert load_config(path).subscription.unsubscribed_allowance_usd == Decimal("25")
+
+
+def test_unsubscribed_allowance_infinite_raises_configerror(write_config) -> None:
+    """`.inf` would turn the fail-closed fallback itself into an unbounded live spend cap --
+    exactly the inversion this subscription-allowance work exists to prevent. YAML's `.inf` is a
+    plausible "I want unlimited" typo, but unlimited is expressed elsewhere in this system as
+    `free_volume_usd is None` (see `TierConfig`), never as `Infinity`."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace(
+            "unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: .inf"
+        )
+    )
+    with pytest.raises(ConfigError, match="unsubscribed_allowance_usd"):
+        load_config(path)
+
+
+def test_the_old_monthly_allowance_key_is_rejected(write_config) -> None:
+    """Silently ignoring a hand-set spend number is the exact defect this work fixes."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace("assumed_free_volume_usd: 500", "monthly_allowance_usd: 500")
+    )
+    with pytest.raises(ConfigError, match="assumed_free_volume_usd"):
+        load_config(path)
+
+
+def test_the_rejection_message_points_at_attest(write_config) -> None:
+    from tests.conftest import VALID_CONFIG_YAML
+
+    path = write_config(
+        VALID_CONFIG_YAML.replace("assumed_free_volume_usd: 500", "monthly_allowance_usd: 500")
+    )
+    with pytest.raises(ConfigError, match="subscription attest"):
         load_config(path)
 
 

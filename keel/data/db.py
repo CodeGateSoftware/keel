@@ -2,9 +2,9 @@
 
 Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` returns a
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
-enabled. `migrate()` idempotently creates the eight §6 tables (`transactions`, `candles`,
-`orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `journal`) plus their
-indexes and a `schema_version` marker table.
+enabled. `migrate()` idempotently creates the ten §6 tables (`transactions`, `candles`,
+`orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
+`journal`) plus their indexes and a `schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -12,10 +12,14 @@ they round-trip without floating-point error; `repository.py` owns that conversi
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -148,6 +152,18 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS broker_subscriptions (
+        venue                   TEXT PRIMARY KEY,
+        tier_name               TEXT NOT NULL,
+        free_volume_usd         TEXT,
+        pacing                  TEXT NOT NULL,
+        subscription_usd_month  TEXT NOT NULL,
+        status                  TEXT NOT NULL,
+        attested_at             INTEGER NOT NULL,
+        attest_due_ts           INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -163,6 +179,81 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+def _decode_stored_decimal(value: Any) -> str | None:
+    """Read a money value out of an `agent_state` JSON blob as an exact string.
+
+    `repository.py` encodes `Decimal` as `{"__decimal__": "..."}`; older rows may hold a bare
+    number. Decoded here rather than imported from `repository` so the migration keeps working
+    regardless of what that module does later -- a migration must be frozen against the shape of
+    the data it was written for.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        tagged = value.get("__decimal__")
+        return None if tagged is None else str(tagged)
+    return str(value)
+
+
+def _migrate_v2_broker_subscriptions(conn: sqlite3.Connection) -> None:
+    """Move the singleton `agent_state['subscription']` onto a venue-keyed row.
+
+    The old blob carries a `monthly_allowance_usd` the user has possibly tuned by hand. It
+    becomes `venue='coinbase'`'s `free_volume_usd` with `tier_name='unknown'` and
+    `status='suspect'`, forcing one explicit attestation rather than silently guessing which
+    tier the number corresponded to -- guessing here would set a live spend cap from an
+    inference.
+
+    Idempotent by construction: it skips when a row already exists, so a user who has since
+    attested is never reset. The `agent_state` row is deliberately left in place as the only
+    copy of the pre-migration value.
+    """
+    # Venue-scoped, not table-wide: the engine is single-venue today so this is behaviourally
+    # identical either way, but a table-wide guard would skip a *second* venue's backfill once
+    # one exists, just because some other venue already has a row.
+    already_migrated = conn.execute(
+        "SELECT 1 FROM broker_subscriptions WHERE venue = 'coinbase' LIMIT 1"
+    ).fetchone()
+    if already_migrated is not None:
+        return
+
+    row = conn.execute(
+        "SELECT value FROM agent_state WHERE key = 'subscription'"
+    ).fetchone()
+    if row is None:
+        return
+
+    stored = json.loads(row["value"])
+    free_volume = _decode_stored_decimal(stored.get("monthly_allowance_usd"))
+    if free_volume is None:
+        return
+
+    attested_at = int(stored.get("updated_at") or int(time.time()))
+    conn.execute(
+        """
+        INSERT INTO broker_subscriptions (
+            venue, tier_name, free_volume_usd, pacing,
+            subscription_usd_month, status, attested_at, attest_due_ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "coinbase",
+            "unknown",
+            free_volume,
+            stored.get("pacing") or "opportunistic",
+            "0",
+            "suspect",
+            attested_at,
+            attested_at,  # already due: forces an attestation before the next live BUY
+        ),
+    )
+
+
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    2: _migrate_v2_broker_subscriptions,
+}
+
+
 def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
     """Open a `sqlite3.Connection` to `path` (or an in-memory DB for `":memory:"`).
 
@@ -176,10 +267,14 @@ def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create all §6 tables + indexes if absent, and record `schema_version`.
+    """Create all tables + indexes if absent, then run any outstanding migration steps.
 
-    Safe to call repeatedly: every statement is `IF NOT EXISTS`, and the version row is only
-    inserted the first time.
+    Safe to call repeatedly: every DDL statement is `IF NOT EXISTS`, and each migration step
+    runs only while the stored version is below its target. A fresh database is stamped at
+    `SCHEMA_VERSION` and runs no steps -- correct, since it has nothing to migrate.
+
+    Requires `conn.row_factory` to be `sqlite3.Row` (as `connect()` returns) -- this function
+    subscripts rows by column name (`row["value"]`, `version_row["version"]`).
     """
     for statement in _SCHEMA_STATEMENTS:
         conn.execute(statement)
@@ -187,5 +282,13 @@ def migrate(conn: sqlite3.Connection) -> None:
     version_row = conn.execute("SELECT version FROM schema_version").fetchone()
     if version_row is None:
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+        conn.commit()
+        return
 
+    current = int(version_row["version"])
+    for target in sorted(_MIGRATIONS):
+        if current < target:
+            _MIGRATIONS[target](conn)
+            conn.execute("UPDATE schema_version SET version = ?", (target,))
+            current = target
     conn.commit()

@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
 from keel.config import (
     AutoTradeConfig,
@@ -20,9 +21,11 @@ from keel.config import (
     Config,
     MarketDataConfig,
     MoneyMgmtConfig,
+    SubscriptionConfig,
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution import guards
 from keel.execution.guards import GuardResult, OrderIntent, check
 from keel.types import Side
 
@@ -36,16 +39,27 @@ _LARGE_ALLOWANCE = Decimal("10000000")
 def repo() -> Repository:
     """A freshly migrated repo, pre-seeded with a fully compliant `agent_state`.
 
-    The subscription is seeded with a very large allowance so pre-existing rail tests (which
-    don't exercise rail 14) aren't incidentally tripped by it; rail-14-specific tests below
-    override it with `repo.set_subscription(...)` to exercise realistic caps.
+    The subscription is seeded with a very large, attested allowance so pre-existing rail tests
+    (which don't exercise rail 14) aren't incidentally tripped by it; rail-14-specific tests below
+    override it with `_attest(...)` to exercise realistic caps.
     """
     conn = connect(":memory:")
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
-    r.set_subscription(_LARGE_ALLOWANCE, "opportunistic", now_ts=NOW_TS)
+    r.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=_LARGE_ALLOWANCE,
+            pacing="opportunistic",
+            subscription_usd_month=Decimal("29.99"),
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=NOW_TS,
+            attest_due_ts=NOW_TS + 31_536_000,
+        )
+    )
     return r
 
 
@@ -59,6 +73,8 @@ def _config(
     max_total_dd_pct: Decimal = Decimal("0.20"),
     max_weekly_dd_pct: Decimal = Decimal("0.08"),
     interval_sec: int = 900,
+    unsubscribed_allowance_usd: Decimal = Decimal("0"),
+    pacing: str = "opportunistic",
 ) -> Config:
     return Config(
         allowlist=list(allowlist),
@@ -74,6 +90,10 @@ def _config(
         auto_trade=AutoTradeConfig(interval_sec=interval_sec),
         money_mgmt=MoneyMgmtConfig(
             max_total_dd_pct=max_total_dd_pct, max_weekly_dd_pct=max_weekly_dd_pct
+        ),
+        subscription=SubscriptionConfig(
+            unsubscribed_allowance_usd=unsubscribed_allowance_usd,
+            pacing=pacing,
         ),
     )
 
@@ -445,6 +465,8 @@ def test_rail12_missing_feed_timestamp_treated_as_stale(repo):
     fresh_repo = Repository(conn)
     fresh_repo.set_state("kill_switch", False)
     # last_feed_ts intentionally never recorded
+    # attested so only rail 12 (not rail 14's unattested-fallback) trips
+    _attest(fresh_repo, free_volume_usd=_LARGE_ALLOWANCE)
 
     result = check(_intent(), fresh_repo, _config(), NOW_TS)
 
@@ -519,7 +541,7 @@ def _roomy_config() -> Config:
 
 
 def test_rail14_monthly_allowance_passes_under_cap(repo):
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("500"))
     intent = _intent(notional=Decimal("100"))
 
     result = check(intent, repo, _roomy_config(), NOW_TS)
@@ -529,7 +551,7 @@ def test_rail14_monthly_allowance_passes_under_cap(repo):
 
 
 def test_rail14_monthly_allowance_rejects_over_cap(repo):
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("500"))
     _seed_filled_order(
         repo,
         product_id="BTC-USD",
@@ -547,7 +569,7 @@ def test_rail14_monthly_allowance_rejects_over_cap(repo):
 
 
 def test_rail14_monthly_allowance_ignores_spend_from_a_prior_month(repo):
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("500"))
     _seed_filled_order(
         repo,
         product_id="BTC-USD",
@@ -565,21 +587,21 @@ def test_rail14_monthly_allowance_ignores_spend_from_a_prior_month(repo):
 
 
 def test_rail14_updated_subscription_is_read_live_at_the_next_check(repo):
-    """The allowance is read fresh from `repo.get_subscription()` on every call -- no snapshot,
-    no restart, no config edit needed for an update to take effect."""
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    """The allowance is read fresh from `repo.get_broker_subscription()` on every call -- no
+    snapshot, no restart, no config edit needed for a re-attestation to take effect."""
+    _attest(repo, free_volume_usd=Decimal("500"))
     intent = _intent(notional=Decimal("150"))
     config = _roomy_config()
 
     before = check(intent, repo, config, NOW_TS)
     assert before.ok is True
 
-    repo.set_subscription(Decimal("100"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("100"))
     after_lowered = check(intent, repo, config, NOW_TS)
     assert after_lowered.ok is False
     assert _keys(after_lowered) == {"monthly_subscription_allowance"}
 
-    repo.set_subscription(Decimal("1000"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("1000"))
     after_raised = check(intent, repo, config, NOW_TS)
     assert after_raised.ok is True
 
@@ -587,7 +609,7 @@ def test_rail14_updated_subscription_is_read_live_at_the_next_check(repo):
 def test_rail14_even_daily_pacing_vetoes_a_burst_within_the_monthly_cap(repo):
     # NOW_TS (2023-11-14, a Tuesday) is business day 10 of 22 in November -> paced cap =
     # 220 / 22 * 10 = 100, tighter than the 220 flat monthly cap.
-    repo.set_subscription(Decimal("220"), "even_daily", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("220"), pacing="even_daily")
     intent = _intent(notional=Decimal("150"))  # under the 220 monthly cap, over the paced 100
 
     result = check(intent, repo, _roomy_config(), NOW_TS)
@@ -597,7 +619,7 @@ def test_rail14_even_daily_pacing_vetoes_a_burst_within_the_monthly_cap(repo):
 
 
 def test_rail14_even_daily_pacing_allows_spend_within_the_paced_cap(repo):
-    repo.set_subscription(Decimal("220"), "even_daily", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("220"), pacing="even_daily")
     intent = _intent(notional=Decimal("100"))  # exactly at the paced cap (220/22*10 = 100)
 
     result = check(intent, repo, _roomy_config(), NOW_TS)
@@ -609,7 +631,7 @@ def test_rail14_even_daily_pacing_allows_spend_within_the_paced_cap(repo):
 def test_rail14_opportunistic_pacing_ignores_the_business_day_pace(repo):
     # Same numbers as the pacing-burst test above, but pacing="opportunistic" -- only the flat
     # monthly cap applies, so the same burst that trips even_daily passes here.
-    repo.set_subscription(Decimal("220"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("220"), pacing="opportunistic")
     intent = _intent(notional=Decimal("150"))
 
     result = check(intent, repo, _roomy_config(), NOW_TS)
@@ -621,7 +643,7 @@ def test_rail14_opportunistic_pacing_ignores_the_business_day_pace(repo):
 def test_rail14_dca_is_bound_by_the_monthly_allowance(repo):
     """Unlike rails 8/11, DCA is NOT exempt from the subscription allowance -- DCA orders are
     exactly the recurring "subscription" spend the rail exists to cap."""
-    repo.set_subscription(Decimal("500"), "opportunistic", now_ts=NOW_TS)
+    _attest(repo, free_volume_usd=Decimal("500"))
     intent = _intent(
         notional=Decimal("600"), is_dca=True, rule_kind="dca", stop=None
     )  # 600 > 500
@@ -630,6 +652,180 @@ def test_rail14_dca_is_bound_by_the_monthly_allowance(repo):
 
     assert result.ok is False
     assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+# -- rail 14: derives its cap from the attested subscription record --------------------------------
+
+
+def _attest(
+    repo: Repository,
+    *,
+    free_volume_usd: Decimal | None,
+    status: SubscriptionStatus = SubscriptionStatus.ACTIVE,
+    pacing: str = "opportunistic",
+    attested_at: int = NOW_TS,
+    attest_due_ts: int | None = None,
+) -> None:
+    """Attest a coinbase subscription -- the setup every rail-14 test now needs."""
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=free_volume_usd,
+            pacing=pacing,
+            subscription_usd_month=Decimal("29.99"),
+            status=status,
+            attested_at=attested_at,
+            attest_due_ts=(
+                attest_due_ts if attest_due_ts is not None else attested_at + 31_536_000
+            ),
+        )
+    )
+
+
+def _unattested_repo() -> Repository:
+    """A compliant repo with NO subscription -- a fresh install, before any attestation."""
+    conn = connect(":memory:")
+    migrate(conn)
+    r = Repository(conn)
+    r.set_state("kill_switch", False)
+    r.set_state("last_feed_ts", NOW_TS)
+    return r
+
+
+def test_rail14_refuses_a_buy_when_nothing_has_been_attested() -> None:
+    """keel ships inert: no record means no live BUY."""
+    result = guards.check(_intent(), _unattested_repo(), _roomy_config(), NOW_TS)
+    assert not result.ok
+    assert "subscription_unattested" in _keys(result)
+
+
+def test_rail14_inert_message_tells_the_user_to_attest() -> None:
+    """A bare "0 exceeds cap 0" is arithmetically true and practically useless."""
+    result = guards.check(_intent(), _unattested_repo(), _roomy_config(), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "attest" in violation
+    assert "coinbase" in violation
+
+
+def test_rail14_allows_a_buy_inside_an_attested_allowance(repo: Repository) -> None:
+    _attest(repo, free_volume_usd=Decimal("10000"))
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    assert result.ok
+
+
+def test_rail14_still_caps_at_the_attested_allowance(repo: Repository) -> None:
+    _attest(repo, free_volume_usd=Decimal("40"))
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    assert "monthly_subscription_allowance" in _keys(result)
+
+
+def test_rail14_passes_unconditionally_for_an_unlimited_tier(repo: Repository) -> None:
+    """Premium has no cap, and pacing a cap that does not exist is meaningless."""
+    _attest(repo, free_volume_usd=None, pacing="even_daily")
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    assert "monthly_subscription_allowance" not in _keys(result)
+    assert "subscription_unattested" not in _keys(result)
+
+
+@pytest.mark.parametrize("status", [SubscriptionStatus.SUSPECT, SubscriptionStatus.LAPSED])
+def test_rail14_fails_closed_on_a_degraded_subscription(
+    repo: Repository, status: SubscriptionStatus
+) -> None:
+    _attest(repo, free_volume_usd=Decimal("10000"), status=status)
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    assert "subscription_unattested" in _keys(result)
+
+
+def test_rail14_fails_closed_on_an_overdue_attestation(repo: Repository) -> None:
+    _attest(
+        repo,
+        free_volume_usd=Decimal("10000"),
+        attested_at=NOW_TS - 40_000_000,
+        attest_due_ts=NOW_TS - 1,
+    )
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "overdue" in violation
+
+
+def test_rail14_reports_lapsed_over_overdue_when_a_record_is_both(repo: Repository) -> None:
+    """LAPSED is a definite statement the subscription ended; overdue is merely an unrefreshed
+    assertion -- when a record is both, the message must name the more serious one."""
+    _attest(
+        repo,
+        free_volume_usd=Decimal("10000"),
+        status=SubscriptionStatus.LAPSED,
+        attested_at=NOW_TS - 40_000_000,
+        attest_due_ts=NOW_TS - 1,
+    )
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "lapsed" in violation
+
+
+def test_rail14_honours_a_raised_unsubscribed_allowance() -> None:
+    """A user content to pay fees may raise it -- deliberately, not by accident."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("200"),
+    )
+    result = guards.check(_intent(notional=Decimal("50")), _unattested_repo(), config, NOW_TS)
+    assert "subscription_unattested" not in _keys(result)
+
+
+def test_rail14_raised_unsubscribed_allowance_still_binds() -> None:
+    """The raised allowance is a ceiling, not an escape hatch -- it must still veto once
+    exceeded. Otherwise a refactor that made the unattested branch skip the cap comparison
+    entirely would pass every existing test."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("200"),
+    )
+    result = guards.check(_intent(notional=Decimal("250")), _unattested_repo(), config, NOW_TS)
+    assert "subscription_unattested" in _keys(result)
+
+
+def test_rail14_unattested_uses_configured_pacing_not_a_hardcoded_default() -> None:
+    """No record means no record-level pacing to read -- the configured pacing is the best
+    available statement of intent, so a raised unsubscribed_allowance_usd is still paced when
+    the user configured pacing="even_daily", not silently given a flat, unpaced cap."""
+    config = _config(
+        max_per_order_usd=Decimal("10000"),
+        max_per_day_usd=Decimal("10000"),
+        max_exposure_usd=Decimal("100000"),
+        unsubscribed_allowance_usd=Decimal("220"),
+        pacing="even_daily",
+    )
+    # Same numbers as the attested even_daily pacing test: NOW_TS is business day 10 of 22 in
+    # November -> paced cap = 220 / 22 * 10 = 100. 150 is inside the flat 220 cap but outside it.
+    result = guards.check(_intent(notional=Decimal("150")), _unattested_repo(), config, NOW_TS)
+    assert not result.ok
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "even_daily pacing" in violation
+
+
+def test_rail14_reads_pacing_from_the_record_not_config(repo: Repository) -> None:
+    """even_daily paces the attested allowance across elapsed business days."""
+    _attest(repo, free_volume_usd=Decimal("10000"), pacing="even_daily")
+    result = guards.check(_intent(notional=Decimal("9000")), repo, _roomy_config(), NOW_TS)
+    violation = next(
+        v for v in result.violations if v.startswith("monthly_subscription_allowance")
+    )
+    assert "even_daily pacing" in violation
+
+
+def test_rail14_does_not_gate_sells() -> None:
+    """SELL produces quote currency; the rail exists to cap spend, so it must not fire."""
+    result = guards.check(
+        _intent(side=Side.SELL), _unattested_repo(), _roomy_config(), NOW_TS
+    )
+    assert "subscription_unattested" not in _keys(result)
+    assert "monthly_subscription_allowance" not in _keys(result)
 
 
 # -- collects every violation, never short-circuits ------------------------------------------------

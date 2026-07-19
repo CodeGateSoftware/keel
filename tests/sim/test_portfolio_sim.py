@@ -52,7 +52,7 @@ def _config(**overrides) -> Config:
         ),
         market_data=MarketDataConfig(granularities=[], history_days=365),
         subscription=SubscriptionConfig(
-            monthly_allowance_usd=Decimal("1000000"), pacing="opportunistic"
+            assumed_free_volume_usd=Decimal("1000000"), pacing="opportunistic"
         ),
         dca=DcaConfig(budget_usd=Decimal("50")),
     )

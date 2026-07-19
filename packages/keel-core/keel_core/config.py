@@ -32,6 +32,13 @@ def _to_decimal(value: Any, key: str) -> Decimal:
 
 def _non_negative_decimal(value: Any, key: str) -> Decimal:
     amount = _to_decimal(value, key)
+    # `Decimal.is_finite()` is False for inf/-inf/nan. Reject before the `< 0` comparison below:
+    # a NaN comparison raises InvalidOperation (uncaught by any handler here), and `.inf` would
+    # otherwise pass this check and become an unbounded cap wherever this field is used as one
+    # (e.g. `subscription.unsubscribed_allowance_usd`) -- "unlimited" is expressed elsewhere in
+    # this system as `None` (see `TierConfig.free_volume_usd`), never as `Infinity`.
+    if not amount.is_finite():
+        raise ConfigError(f"{key}: must be a finite number, got {value!r}")
     if amount < 0:
         raise ConfigError(f"{key}: must be a non-negative number, got {value!r}")
     return amount
@@ -39,7 +46,7 @@ def _non_negative_decimal(value: Any, key: str) -> Decimal:
 
 # Issue #85: `max_per_order_usd`/`max_per_day_usd` were Phase-1 PLACEHOLDER guesses ($100/$300),
 # never real Coinbase limits -- Coinbase One's only subscription constraint is monthly fee-free
-# trading VOLUME (`SubscriptionConfig.monthly_allowance_usd`), not a per-order or per-day $ cap.
+# trading VOLUME (`SubscriptionConfig.assumed_free_volume_usd`), not a per-order or per-day $ cap.
 # Risk-sized rule orders routinely land in the $400-24k range, so a $100/$300 default silently
 # rejected 100% of them. These two fields are now OPTIONAL internal risk knobs -- a user MAY
 # still tighten them in `config.yaml` -- but absent an explicit value they default to this
@@ -106,15 +113,29 @@ _VALID_PACING_MODES = ("opportunistic", "even_daily")
 
 @dataclass(frozen=True)
 class SubscriptionConfig:
-    """Rail 14 (monthly subscription-allowance) settings — see `execution/guards.py`.
+    """Subscription-related settings. Three fields, three distinct roles — do not conflate them.
 
-    `pacing="opportunistic"` (default) only enforces the flat monthly cap. `pacing="even_daily"`
+    `assumed_free_volume_usd` is the **simulator's** assumed fee-free monthly volume
+    (`sim/account.py`'s `_monthly_allowance_cap`). It is a pinned, reproducible assumption for
+    backtests. It is NOT the live cap: rail 14 derives that from the attested
+    `broker_subscriptions` record, so that upgrading a tier changes one place. This field was
+    called `monthly_allowance_usd` when it meant both, which is exactly the defect the
+    subscription design spec §2 describes.
+
+    `unsubscribed_allowance_usd` is what rail 14 permits on a venue whose subscription is
+    unattested, suspect, lapsed, or overdue. The default `0` stops trading on that venue. A user
+    content to pay fees may raise it deliberately — the point is that continuing to spend is an
+    explicit choice rather than the consequence of a stale row.
+
+    `pacing="opportunistic"` (default) enforces only the flat monthly cap. `pacing="even_daily"`
     additionally caps cumulative month-to-date spend to
-    `monthly_allowance_usd / business_days_in_month * business_days_elapsed`, so the allowance
-    can't be blown in one burst early in the month.
+    `allowance / business_days_in_month * business_days_elapsed`, so the allowance cannot be
+    blown in one burst early in the month. It is the default pacing for new attestations, and
+    the simulator reads it directly.
     """
 
-    monthly_allowance_usd: Decimal = Decimal("500")
+    assumed_free_volume_usd: Decimal = Decimal("500")
+    unsubscribed_allowance_usd: Decimal = Decimal("0")
     pacing: str = "opportunistic"
 
 
@@ -393,6 +414,14 @@ def load_config(path: str | Path) -> Config:
             f"{_VALID_PACING_MODES!r}"
         )
 
+    if "monthly_allowance_usd" in subscription_raw:
+        raise ConfigError(
+            "subscription.monthly_allowance_usd was renamed to "
+            "subscription.assumed_free_volume_usd, which is now the SIMULATOR's assumed "
+            "allowance only. The live rail-14 cap comes from the attested subscription record "
+            "-- set it with `keel subscription attest --venue coinbase --tier <tier>`."
+        )
+
     quote_currency = raw.get("quote_currency", "USDC")
     if not isinstance(quote_currency, str) or not quote_currency:
         raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
@@ -438,9 +467,13 @@ def load_config(path: str | Path) -> Config:
             cadence_days=int(dca_raw.get("cadence_days", 7)),
         ),
         subscription=SubscriptionConfig(
-            monthly_allowance_usd=_non_negative_decimal(
-                subscription_raw.get("monthly_allowance_usd", "500"),
-                "subscription.monthly_allowance_usd",
+            assumed_free_volume_usd=_non_negative_decimal(
+                subscription_raw.get("assumed_free_volume_usd", "500"),
+                "subscription.assumed_free_volume_usd",
+            ),
+            unsubscribed_allowance_usd=_non_negative_decimal(
+                subscription_raw.get("unsubscribed_allowance_usd", "0"),
+                "subscription.unsubscribed_allowance_usd",
             ),
             pacing=pacing,
         ),

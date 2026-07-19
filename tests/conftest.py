@@ -57,7 +57,8 @@ dca:
 quote_currency: USDC
 
 subscription:
-  monthly_allowance_usd: 500
+  assumed_free_volume_usd: 500
+  unsubscribed_allowance_usd: 0
   pacing: opportunistic
 """
 
