@@ -679,5 +679,6 @@ filters: After countertrend activity is detected (triggering an entry signal), b
 occur, the market must demonstrate reversal by moving in the direction of the trade."* So the
 rule is not "always limit"; it is **limit for trend-following entries** (which already contain
 their own confirmation), **stop for counter-trend entries** (which need confirmation added).
+PLACEHOLDER_TAIL_ANCHOR
 Our Turtle is trend-following ⇒ limit.
 
