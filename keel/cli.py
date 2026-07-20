@@ -77,6 +77,7 @@ from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
+from keel.execution import executor
 from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 from keel.research import cscv as cscv_mod
@@ -658,6 +659,63 @@ def assets_list(ctx: click.Context) -> None:
             f"{row['asset']:<8} sector={row['sector']:<16} backing={row['backing']:<8} "
             f"pays_yield={bool(row['pays_yield'])!s:<5} by={row['attested_by']}"
         )
+
+
+@cli.group("withdrawals")
+def withdrawals_group() -> None:
+    """Withdrawal-capability attestation -- rail 17's input (KB §65.4 qabd/possession)."""
+
+
+@withdrawals_group.command("attest")
+@click.option(
+    "--enabled/--suspended",
+    "enabled",
+    required=True,
+    help="Are BTC/ETH/PAXG/USDC balances withdrawable on demand right now?",
+)
+@click.pass_context
+@with_disclaimer
+def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
+    """Attest the account's current withdrawal state.
+
+    Under §65.4 possession (`qabd`) holds only while "there is nothing to prevent the buyer from
+    taking physical possession whenever he desires". An asset we cannot withdraw is an asset we
+    may not validly possess -- so rail 17 halts new ENTRIES when this is suspended or unknown.
+
+    Not passphrase-gated in either direction. `--suspended` only ever REDUCES capability, and
+    `--enabled` cannot itself place an order: it restores a precondition that every other rail,
+    the confirm gate and the bypass-arm token still sit in front of.
+    """
+    repo = _open_repo(ctx)
+    now_ts = int(time.time())
+    repo.set_state("withdrawals_enabled", bool(enabled))
+    repo.set_state("withdrawals_attested_at", now_ts)
+    ttl_days = executor.WITHDRAWAL_ATTESTATION_TTL_SEC // 86400
+    state = "ENABLED" if enabled else "SUSPENDED"
+    click.echo(f"withdrawals attested {state}; expires in {ttl_days} days")
+    if not enabled:
+        click.echo("new ENTRIES are now halted (rail 17). Exits are deliberately unaffected.")
+
+
+@withdrawals_group.command("show")
+@click.pass_context
+def withdrawals_show(ctx: click.Context) -> None:
+    """Show the current attestation and whether it is still fresh."""
+    repo = _open_repo(ctx)
+    now_ts = int(time.time())
+    resolved = executor._withdrawals_enabled(repo, now_ts)
+    attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
+
+    if resolved is None and not attested_at:
+        click.echo("withdrawals: UNKNOWN (never attested) -- rail 17 blocks new entries")
+        return
+    age_days = (now_ts - attested_at) / 86400 if attested_at else 0
+    stale = resolved is None and attested_at
+    label = {True: "ENABLED", False: "SUSPENDED", None: "UNKNOWN (attestation STALE)"}[resolved]
+    click.echo(f"withdrawals: {label}")
+    click.echo(f"attested {age_days:.1f} days ago")
+    if stale or resolved is False:
+        click.echo("rail 17 is blocking new entries; exits are unaffected")
 
 
 @cli.command("purification")

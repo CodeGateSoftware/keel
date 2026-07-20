@@ -124,7 +124,7 @@ def execute(
     if now_ts is None:
         now_ts = int(time.time())
 
-    intent = _build_intent(signal, broker, repo, config)
+    intent = _build_intent(signal, broker, repo, config, now_ts)
     if intent is None:
         return ExecutionResult(
             placed=False,
@@ -224,6 +224,38 @@ def _is_dca_setup(context: dict[str, Any]) -> bool:
     return bool(context.get("no_stop")) or context.get("order_class") == "dca"
 
 
+#: How long a withdrawal-capability attestation stays fresh (§65.4). Deliberately short: the
+#: attestation is about the account's CURRENT state, and a freeze can appear at any time, so a
+#: stale attestation is no better than none. 7 days.
+WITHDRAWAL_ATTESTATION_TTL_SEC = 7 * 24 * 3600
+
+
+def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
+    """Rail 17's input: is the account currently in a withdrawable state (§65.4)?
+
+    Read LIVE from the operator's attestation on every intent -- never cached -- so
+    `keel withdrawals attest` (or a revocation) takes effect on the very next order, the same
+    posture rail 14 takes with the subscription record.
+
+    Returns `None` when there is no attestation or it has gone stale, which fails rail 17 closed.
+    An expired attestation is treated as UNKNOWN rather than as `False`: the difference matters
+    in the message the operator sees, and "nobody has checked recently" is not the same claim as
+    "the broker says withdrawals are suspended".
+    """
+    try:
+        attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
+        enabled = repo.get_state("withdrawals_enabled", default=None)
+    except Exception:
+        log_exception(logger, "executor.withdrawal_attestation_read_failed")
+        return None
+
+    if not attested_at or enabled is None:
+        return None
+    if now_ts - attested_at > WITHDRAWAL_ATTESTATION_TTL_SEC:
+        return None
+    return bool(enabled)
+
+
 def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
     """Live available `quote_currency` (default USDC) balance from `broker.get_accounts()`.
 
@@ -255,7 +287,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
 
 
 def _build_intent(
-    signal: Signal, broker: Any, repo: Repository, config: Config
+    signal: Signal, broker: Any, repo: Repository, config: Config, now_ts: int
 ) -> OrderIntent | None:
     """Size `signal` into an `OrderIntent`, or `None` for an EXIT with nothing open to sell."""
     if signal.action == Action.ENTER:
@@ -273,6 +305,7 @@ def _build_intent(
             stop = setup.stop
 
         available_quote = _fetch_available_quote(broker, config.quote_currency)
+        withdrawals = _withdrawals_enabled(repo, now_ts)
 
         return OrderIntent(
             product_id=signal.product_id,
@@ -284,6 +317,7 @@ def _build_intent(
             is_dca=is_dca,
             rule_kind=signal.rule_name,
             available_quote=available_quote,
+            withdrawals_enabled=withdrawals,
         )
 
     # EXIT: sell the currently held position, reconstructed from the orders audit log.

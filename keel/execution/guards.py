@@ -123,6 +123,12 @@ class OrderIntent:
     # account or a broker error while fetching it.
     available_quote: Decimal | None = None
 
+    # Rail 17 (§65.4 qabd/possession). Whether the account is currently in a state where the
+    # asset could be withdrawn on demand. Supplied by the caller (the executor) from the
+    # operator's attestation and any broker-reported restriction -- guards has no broker or
+    # clock access of its own. `None` means "unknown" and fails the BUY closed.
+    withdrawals_enabled: bool | None = None
+
 
 @dataclass(frozen=True)
 class GuardResult:
@@ -492,6 +498,30 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
                 f"consecutive losing trades tripped the breaker; new entries are halted for "
                 f"another {halt_until - now_ts}s. Exits, stop-outs and DCA are unaffected. "
                 f"Clear it early with `keel resume-entries`."
+            )
+
+    # 17. Withdrawal capability — a COMPLIANCE rail, not an operational one (§65.4).
+    #     Ayub's constructive-possession test (`qabd`) has a live condition attached: possession
+    #     holds only while "there is nothing to prevent the buyer from taking physical possession
+    #     whenever he desires". An asset we cannot withdraw is an asset we may not validly
+    #     POSSESS — so acquiring more of it is the thing to stop.
+    #     ENTRIES ONLY, exactly like rails 11/16: existing holdings are already ours, and forcing
+    #     a sale to "fix" a withdrawal freeze would be strictly worse than holding through it.
+    #     Fails CLOSED on None, like rails 12/13 — silence is not evidence of possession.
+    if is_buy:
+        if intent.withdrawals_enabled is None:
+            violations.append(
+                "withdrawal_capability: UNKNOWN (no fresh attestation, or the broker did not "
+                "report). Under §65.4 possession requires that nothing prevents withdrawal on "
+                "demand; an unverified state is not evidence that it holds. Attest with "
+                "`keel withdrawals attest` (exits and DCA-exempt paths are unaffected)."
+            )
+        elif intent.withdrawals_enabled is False:
+            violations.append(
+                "withdrawal_capability: withdrawals are suspended/restricted for this account. "
+                "Under §65.4 an asset that cannot be withdrawn may not have been validly "
+                "possessed, so new ENTRIES are halted. Existing holdings and exits are "
+                "deliberately unaffected."
             )
 
     for violation in violations:

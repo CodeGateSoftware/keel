@@ -392,6 +392,9 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
     order_intent = OrderIntent(
         product_id="BTC-USD", side=Side.BUY, qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
         notional=Decimal("50"), is_dca=True, rule_kind="dca", available_quote=account.cash_usdc,
+        # Rail 17 is a COMPLIANCE rail (§65.4), not a spend cap, so `SimAccount` deliberately
+        # does not model it. Supplied so the spend-cap parity under test is what diverges.
+        withdrawals_enabled=True,
     )
     sim_intent = OpenIntent(
         asset="BTC", qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
@@ -890,6 +893,7 @@ def _assert_parity(repo, account, config, now_ts, notionals):
             is_dca=True,
             rule_kind="dca",
             available_quote=account.cash_usdc,
+            withdrawals_enabled=True,  # compliance rail, not a spend cap -- see above
         )
         sim_intent = OpenIntent(
             asset="BTC",
@@ -1029,6 +1033,9 @@ def test_parity_with_guards_check_streak_halt_active():
         is_dca=False,
         rule_kind="pullback_continuation",
         available_quote=account.cash_usdc,
+        # Rail 17 is a COMPLIANCE rail (§65.4), not a spend cap, so `SimAccount` deliberately
+        # does not model it. Supplied so the spend-cap parity under test is what diverges.
+        withdrawals_enabled=True,
     )
     sim_intent = OpenIntent(
         asset="BTC",
