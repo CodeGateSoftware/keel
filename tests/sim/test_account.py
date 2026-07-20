@@ -529,8 +529,8 @@ def test_open_debits_cash_including_fee_and_slippage():
     entry_fee = entry_fill * Decimal("1") * Decimal("0.01")  # 1.01
     expected_cash = Decimal("1000") - entry_fill - entry_fee
     assert acc.cash_usdc == expected_cash
-    assert "BTC" in acc.positions
-    position = acc.positions["BTC"]
+    assert acc.position("BTC") is not None
+    position = acc.position("BTC")
     assert position.entry_fill == entry_fill
     assert position.qty == Decimal("1")
 
@@ -547,7 +547,7 @@ def test_open_then_close_realizes_pnl_net_of_fees():
     pnl = acc.close("BTC", fill_price=Decimal("120"), now_ts=DAY0)
 
     assert pnl > 0
-    assert "BTC" not in acc.positions
+    assert acc.position("BTC") is None
     assert acc.realized_pnl == pnl
 
 
@@ -631,7 +631,7 @@ def test_open_with_dca_true_lands_in_dca_positions_not_positions():
         dca=True,
     )
 
-    assert "BTC" not in acc.positions
+    assert acc.position("BTC") is None
     assert "BTC" in acc.dca_positions
     assert acc.dca_positions["BTC"].qty == Decimal("1")
 
@@ -675,12 +675,12 @@ def test_dca_position_and_rule_position_coexist_on_the_same_asset():
     )
 
     assert "BTC" in acc.dca_positions
-    assert "BTC" in acc.positions
+    assert acc.position("BTC") is not None
 
     pnl = acc.close("BTC", fill_price=Decimal("110"), now_ts=DAY0)  # closes the RULE slot only
 
     assert pnl > 0
-    assert "BTC" not in acc.positions
+    assert acc.position("BTC") is None
     assert "BTC" in acc.dca_positions  # the DCA lot is untouched by closing the rule slot
 
 
@@ -1155,3 +1155,95 @@ def test_dca_win_does_not_reset_a_live_rule_streak():
     account.record_trade_outcome(Decimal("100"), config, JAN15, is_dca=True)
 
     assert account.consecutive_losses == 1
+
+
+# -- concurrent RULE slots on one asset ----------------------------------------
+
+
+def test_two_rules_hold_concurrent_positions_in_the_same_asset():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), 0)
+
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("1000")),
+        Decimal("1000"), 0, slot="turtle_s1",
+    )
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
+        Decimal("1000"), 0, slot="turtle_s2",
+    )
+
+    assert acc.position("BTC", "turtle_s1").qty == Decimal("1")
+    assert acc.position("BTC", "turtle_s2").qty == Decimal("2")
+    assert len(acc.positions_for("BTC")) == 2
+
+
+def test_closing_one_slot_leaves_the_other_open():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), 0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("1000")),
+        Decimal("1000"), 0, slot="a",
+    )
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
+        Decimal("1000"), 0, slot="b",
+    )
+
+    acc.close("BTC", Decimal("1100"), 100, slot="a")
+
+    assert acc.position("BTC", "a") is None
+    assert acc.position("BTC", "b") is not None
+    assert len(acc.positions_for("BTC")) == 1
+
+
+def test_concurrent_slots_BOTH_count_toward_the_per_asset_cap():
+    """⚠️ The rail-weakening risk of this change, pinned.
+
+    `_position_notional` used to be keyed by asset alone, so a second concurrent position would
+    have REPLACED the first's notional and the per-asset concentration cap would have seen only
+    the newer one. Two $2k positions must read as $4k of exposure, not $2k.
+    """
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), 0)
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
+        Decimal("1000"), 0, slot="a",
+    )
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
+        Decimal("1000"), 0, slot="b",
+    )
+
+    assert acc._asset_notional("BTC") == Decimal("4000")
+    assert acc._total_notional() == Decimal("4000")
+
+
+def test_a_second_slot_is_refused_when_it_would_breach_the_per_asset_cap():
+    """End-to-end: the cap must bind across slots, not per slot."""
+    # Everything else roomy so the PER-ASSET cap is the binding constraint under test.
+    config = _config(
+        max_exposure_usd=Decimal("10000"),
+        max_per_asset_pct=Decimal("0.30"),
+        assumed_free_volume_usd=Decimal("1000000"),
+    )
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), 0)
+
+    # 30% of 10000 = 3000 of per-asset headroom.
+    acc.open(
+        _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2500")),
+        Decimal("1250"), 0, slot="a",
+    )
+    headroom = acc.max_affordable_notional("BTC", config, 0)
+    assert headroom == Decimal("500")
+
+
+def test_the_default_slot_preserves_single_position_behaviour():
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), 0)
+    acc.open(_intent(asset="BTC", qty=Decimal("1"), notional=Decimal("1000")), Decimal("1000"), 0)
+    acc.open(_intent(asset="BTC", qty=Decimal("3"), notional=Decimal("3000")), Decimal("1000"), 0)
+    # No slot given -> the second open REPLACES the first, exactly as before.
+    assert len(acc.positions_for("BTC")) == 1
+    assert acc.position("BTC").qty == Decimal("3")
