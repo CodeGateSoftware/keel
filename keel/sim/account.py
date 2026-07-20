@@ -27,11 +27,34 @@ test_sweeping_max_consecutive_losses_changes_the_backtest` is the test that hold
 place -- the `can_open`/`guards.check` parity test below is structural and would NOT catch its
 loss (it proves the two agree when both are told the same thing, not that anything tells the sim).
 
+Rail 11 parity: the same shape as rail 16, but for `equity_high_water_mark`/`drawdown_total_pct`/
+`drawdown_weekly_pct` -- plain instance attributes mirroring the live `agent_state` keys of the
+same names, all defaulting to a fresh/never-drawn-down state (`None`/`0`/`0`) so a run that never
+calls `update_equity` reads exactly as if the rail didn't exist. `update_equity` is this module's
+PRODUCER, the sim-side twin of `execution.equity.update_drawdown` -- mirrored arithmetic exactly
+(same HWM ratchet, same `hwm <= 0`/`weekly_peak <= 0` guards, same `Decimal("0")` floor, same
+7-day rolling window). Unlike rail 16, rail 11 ships ENABLED (`max_total_dd_pct=0.2`,
+`max_weekly_dd_pct=0.08` by default) with no `threshold > 0` off-switch, so before this producer
+existed every threshold in a sweep was silently a no-op for a different reason than rail 16's:
+not because the rail was gated off, but because nothing ever moved `drawdown_total_pct`/
+`drawdown_weekly_pct` off their `0` defaults, so `0 >= max_total_dd_pct` (a positive default) was
+never true regardless of what the sweep varied it to.
+`sim/portfolio_sim.py` calls `update_equity` once per bar, before any signal evaluation (see its
+module docstring's no-lookahead note); `tests/sim/test_portfolio_sim.py::
+test_sweeping_max_total_dd_pct_changes_the_backtest` and `test_sweeping_max_weekly_dd_pct_
+changes_the_backtest` hold that wiring in place, the same way rail 16's sweep test does.
+Two deliberate divergences from the live producer, both documented on `update_equity`/`deposit`
+themselves rather than repeated here: (1) `execution.equity._warn_on_unexplained_jump` is not
+ported -- the sim has no undeclared flows to warn about, every flow is a known `deposit` call;
+(2) the HWM/history rebase that live's `record_external_flow` does as a separate, operator-
+invoked step is folded directly into `deposit` here, since a backtest has no operator to remember
+to call it.
+
 Deliberately NOT enforced here (outside the spend-cap subset, per the plan): the halal allowlist,
-min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule, the
-account-drawdown breaker, correlation-adjusted sizing, and stale-data/kill-switch -- those rails
-need state (an audit log, `agent_state`, a live feed) this pure ledger doesn't model. DCA is NOT
-exempt from any cap enforced here, matching rail 14's explicit non-exemption for DCA spend.
+min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule,
+correlation-adjusted sizing, and stale-data/kill-switch -- those rails need state (an audit log,
+`agent_state`, a live feed) this pure ledger doesn't model. DCA is NOT exempt from any cap
+enforced here, matching rail 14's explicit non-exemption for DCA spend.
 
 Two separate position slots (Issue #85): a single per-asset RULE-trade slot (`positions`, one
 open/close position per asset -- risk-defined entries from `pullback_continuation`,
@@ -89,6 +112,11 @@ from keel.execution.guards import (
 
 SECONDS_PER_DAY = 86_400
 
+# Rolling weekly-peak window for `drawdown_weekly_pct` -- matches `execution.equity.WEEK_SECONDS`
+# exactly; the two producers must agree on what "this week" means or a sweep of
+# `max_weekly_dd_pct` would tune the sim against a different window than the live rail reads.
+WEEK_SECONDS = 7 * 86_400
+
 
 @dataclass
 class OpenPosition:
@@ -138,6 +166,21 @@ class SimAccount:
         self.streak_halt_until: int = 0
         self.consecutive_losses: int = 0
 
+        # Rail 11 (account-drawdown circuit breaker): the sim-side mirror of the live
+        # `agent_state["equity_high_water_mark"]`/`["drawdown_total_pct"]`/
+        # `["drawdown_weekly_pct"]` keys. Written by `update_equity` -- see the module
+        # docstring's "Rail 11 parity" note. `equity_high_water_mark` is `None` until the first
+        # `update_equity` call (mirroring live's unset-state default), after which it only ever
+        # ratchets up (via `update_equity`) or shifts by a deposit (via `deposit` -- see there).
+        self.equity_high_water_mark: Decimal | None = None
+        self.drawdown_total_pct: Decimal = Decimal("0")
+        self.drawdown_weekly_pct: Decimal = Decimal("0")
+        # Rolling 7-day (`WEEK_SECONDS`) window of `(ts, equity)` points backing
+        # `drawdown_weekly_pct`'s peak -- the sim-side twin of live's `agent_state["equity_
+        # history"]`, kept as a plain list for the same reason the streak counters above are
+        # plain attributes rather than `Repository` state.
+        self._equity_history: list[tuple[int, Decimal]] = []
+
         # Cap-arithmetic bookkeeping: an append-only log of every opened AND closed order's
         # *candidate* notional (for day/month VOLUME -- buys and sells both count, see module
         # docstring) and the at-open notional of each currently open position (for
@@ -152,14 +195,37 @@ class SimAccount:
     # -- deposits -----------------------------------------------------------------------------
 
     def deposit(self, amount: Decimal, now_ts: int) -> None:
-        """Add `amount` to both cash and lifetime contributions.
+        """Add `amount` to both cash and lifetime contributions, and REBASE rail 11's
+        high-water mark and rolling equity history by the same amount.
 
         Day/month volume are always computed fresh against `now_ts` from `_volume_log` (see
         module docstring), so a UTC day/month rollover is already handled correctly without any
         explicit counter reset here.
+
+        The rebase is the sim-side twin of `execution.equity.record_external_flow`: a monthly
+        contribution is not P&L, but it raises `cash_usdc` and therefore marked-to-market
+        equity. Left unaccounted, it would ratchet the MONOTONIC `equity_high_water_mark` up on
+        the very next `update_equity` call, and every later bar would read a phantom drawdown
+        against a peak the account never actually earned by trading -- vetoing entries on an
+        account that never lost anything (see `record_external_flow`'s docstring for the live
+        version of this exact failure). Doing the rebase HERE, inside the single method that
+        ever moves cash by an external flow, makes it a single writer that cannot be forgotten
+        by a future call site -- unlike live, where the operator must remember to invoke
+        `keel record-flow` separately from the deposit itself.
+
+        No-op on the HWM/history when `equity_high_water_mark` is still `None`: with no prior
+        `update_equity` call there is nothing to rebase, and the first `update_equity` seeds the
+        HWM from observed equity, which already includes this deposit -- exactly matching
+        `record_external_flow`'s same guard.
         """
         self.cash_usdc += amount
         self.contributed += amount
+
+        if self.equity_high_water_mark is not None:
+            self.equity_high_water_mark += amount
+            self._equity_history = [
+                (ts, equity + amount) for ts, equity in self._equity_history
+            ]
 
     # -- combined (rule + DCA) notional, for cap purposes --------------------------------------
 
@@ -279,6 +345,22 @@ class SimAccount:
                 f"{self.streak_halt_until - now_ts}s (consecutive-loss circuit breaker); "
                 "DCA is unaffected"
             )
+
+        # account-drawdown circuit breaker (rail 11) -- total AND weekly; ENTRIES ONLY, DCA
+        # exempt, matching `guards.check`'s `is_buy and not intent.is_dca` gate for the same
+        # reason (§12.6: DCA buys through drawdowns on a fixed budget by design). `>=`, matching
+        # the live rail exactly -- reads `update_equity`'s scalars, never recomputes them.
+        if not intent.is_dca:
+            if self.drawdown_total_pct >= config.money_mgmt.max_total_dd_pct:
+                reasons.append(
+                    f"account_dd_breaker_total: drawdown {self.drawdown_total_pct} >= "
+                    f"max_total_dd_pct {config.money_mgmt.max_total_dd_pct}"
+                )
+            if self.drawdown_weekly_pct >= config.money_mgmt.max_weekly_dd_pct:
+                reasons.append(
+                    f"account_dd_breaker_weekly: drawdown {self.drawdown_weekly_pct} >= "
+                    f"max_weekly_dd_pct {config.money_mgmt.max_weekly_dd_pct}"
+                )
 
         return (not reasons, reasons)
 
@@ -448,6 +530,56 @@ class SimAccount:
             self.streak_halt_until = (
                 now_ts + config.money_mgmt.streak_cooloff_days * SECONDS_PER_DAY
             )
+
+    # -- rail 11: the drawdown producer ----------------------------------------------------------
+
+    def update_equity(self, prices: dict[str, Decimal], now_ts: int) -> None:
+        """Mark the account to `prices`, ratchet the high-water mark, and refresh
+        `drawdown_total_pct`/`drawdown_weekly_pct` -- the sim-side twin of
+        `execution.equity.update_drawdown`, kept identical to it in every arithmetic step.
+
+        Unrealized P&L is INCLUDED (via `mark_to_market`, not `realized_pnl`), for the same
+        reason the live producer includes it: a drawdown breaker that only saw booked P&L would
+        read 0% while a position bled and would notice the loss only after it was closed --
+        backwards for a circuit breaker, which must fire WHILE the account is losing, not after.
+
+        Both scalars use the SAME floor and empty-history guards as `update_drawdown`: `hwm <= 0`
+        (or an empty/exhausted weekly window whose peak is `<= 0`) reads as 0% drawdown rather
+        than dividing by a non-positive number, and both are floored at `Decimal("0")` so a new
+        high (equity above every prior observation) never reads as a *negative* drawdown.
+
+        Deliberately NOT ported: `execution.equity._warn_on_unexplained_jump`. That helper exists
+        live because external cash flows are *inferred* from an otherwise-unexplained equity
+        jump -- the operator might forget to run `keel record-flow`, so live logs a loud warning
+        as a safety net. In the sim every flow is known exactly: `deposit` is the only path that
+        ever moves cash outside of a fill, and it rebases the HWM/history itself (see `deposit`'s
+        docstring) the instant it happens. There is no "unrecorded" flow to ever warn about here,
+        so porting the detector would just add dead code that can never fire -- a deliberate
+        sim/live divergence, not an oversight.
+        """
+        equity = self.mark_to_market(prices)
+
+        if self.equity_high_water_mark is None or equity > self.equity_high_water_mark:
+            self.equity_high_water_mark = equity
+
+        hwm = self.equity_high_water_mark
+        self.drawdown_total_pct = (
+            Decimal("0") if hwm <= 0 else max((hwm - equity) / hwm, Decimal("0"))
+        )
+
+        self._equity_history = [
+            (ts, point_equity)
+            for ts, point_equity in self._equity_history
+            if ts >= now_ts - WEEK_SECONDS
+        ]
+        self._equity_history.append((now_ts, equity))
+
+        weekly_peak = max(point_equity for _, point_equity in self._equity_history)
+        self.drawdown_weekly_pct = (
+            Decimal("0")
+            if weekly_peak <= 0
+            else max((weekly_peak - equity) / weekly_peak, Decimal("0"))
+        )
 
     # -- reporting --------------------------------------------------------------------------------
 
