@@ -80,6 +80,25 @@ demonstrably does not beat random selection, so spending trials budget on it wou
 ⛔ **Do not respond to this by searching the grid for a better lookback.** That is the
 Strathern misuse (§78.7), and `PBOResult` structurally refuses to tell you which column won.
 
+## Re-verified on repaired data (same day)
+
+This run was computed over daily series carrying 6 internal gaps per major asset, which
+`keel fetch --repair-gaps` subsequently filled (1,819 → 1,825 bars). The grid was re-run on the
+repaired data as a robustness check — ledger session `pbo-grid-repaired-2026-07-20`:
+
+| | original | repaired |
+|---|---:|---:|
+| PBO (φ) | 0.8812 | **0.8926** |
+| Degradation slope | −0.0006 | **−0.0001** |
+| Prob[OOS < 0] | 0.2420 | **0.2423** |
+| Dominance 1st / 2nd | False / False | **False / False** |
+| G4 | PASS | **PASS** |
+| rows used / dropped | 1808 / 11 | 1824 / 4 |
+
+**Every conclusion below survives unchanged.** The missing bars were ~0.33% of the series and
+moved nothing that matters. Recorded because the earlier version of this document flagged the
+gaps as an untested assumption — this is that assumption being tested rather than waved through.
+
 ## Caveats
 
 - **In-sample, one axis.** Only `entry_lookback` varies; interactions with `exit_lookback`,

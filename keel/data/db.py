@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -215,6 +215,18 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(ts)",
+    """
+    CREATE TABLE IF NOT EXISTS candle_gap_probes (
+        product      TEXT NOT NULL,
+        granularity  TEXT NOT NULL,
+        start_ts     INTEGER NOT NULL,
+        end_ts       INTEGER NOT NULL,
+        n_missing    INTEGER NOT NULL,
+        probed_at    INTEGER NOT NULL,
+        PRIMARY KEY (product, granularity, start_ts, end_ts)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_gap_probes_product ON candle_gap_probes(product, granularity)",
 )
 
 
@@ -311,10 +323,22 @@ def _migrate_v4_positions(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v5_candle_gap_probes(conn: sqlite3.Connection) -> None:
+    """v5 adds `candle_gap_probes`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill.
+
+    A row here asserts "we asked the venue for this window and it had nothing", which is a
+    claim about an observation we have not made for any pre-existing gap. Seeding it would
+    silently suppress holes that were never probed -- the one failure mode this table exists to
+    prevent. An empty table simply means every gap is still unproven, which is true.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
     4: _migrate_v4_positions,
+    5: _migrate_v5_candle_gap_probes,
 }
 
 
