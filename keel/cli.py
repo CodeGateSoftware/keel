@@ -79,6 +79,7 @@ from keel.execution import equity as equity_mod
 from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 from keel.research import cscv as cscv_mod
+from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
 from keel.security import authz
@@ -679,6 +680,82 @@ def trials_verify(ledger: Path | None) -> None:
     for error in errors:
         click.echo(error, err=True)
     raise click.ClickException(f"{len(errors)} chain error(s)")
+
+
+@trials_group.command("deflate")
+@_LEDGER_OPTION
+@click.option("--sharpe", required=True, type=float, help="Observed ANNUALISED Sharpe.")
+@click.option(
+    "--trades-per-year", default=6.0, show_default=True, type=float,
+    help="Realised trade frequency, used to express MinBTL in trades.",
+)
+@click.option(
+    "--rho", default=None, type=float,
+    help="Assumed correlation between trials (§78.2). Omit to report an assumption BAND.",
+)
+@click.option("--skew", default=0.0, show_default=True, type=float)
+@click.option("--kurtosis", default=3.0, show_default=True, type=float, help="Non-excess.")
+@click.option(
+    "--trial-sharpe-variance", default=None, type=float,
+    help="V[{SR_n}] across trials. Omit if the ledger cannot supply it -- DSR is then skipped "
+    "rather than computed from a guess.",
+)
+def trials_deflate(
+    ledger: Path | None,
+    sharpe: float,
+    trades_per_year: float,
+    rho: float | None,
+    skew: float,
+    kurtosis: float,
+    trial_sharpe_variance: float | None,
+) -> None:
+    """Expected-max Sharpe, MinBTL and (where computable) DSR, from the ledger's trial counts.
+
+    ⛔ REPORTING ONLY (§78.7's Strathern rail). Every input is itemised, and anything the ledger
+    cannot supply is reported as MISSING rather than filled in with a plausible default.
+    """
+    trials = trials_ledger.read_trials(_ledger_path(ledger))
+    m_total, n_decisions = trials_ledger.trial_counts(trials)
+    if n_decisions < 2:
+        raise click.ClickException(f"only {n_decisions} decision trials -- need >= 2")
+
+    click.echo("inputs")
+    click.echo(f"  M (all ledger rows)      : {m_total}")
+    click.echo(f"  N decisions (excl. diag) : {n_decisions}")
+    click.echo(f"  observed annualised SR   : {sharpe}")
+    click.echo(f"  trades/year              : {trades_per_year}")
+    click.echo(f"  skew / kurtosis          : {skew} / {kurtosis}")
+
+    bands = [rho] if rho is not None else [0.0, 0.5, 0.9]
+    click.echo("\nMinBTL by assumed trial correlation (§78.2 N̂ = ρ̂ + (1−ρ̂)·M)")
+    click.echo(f"  {'rho':>5} {'N_hat':>8} {'E[max]':>8} {'MinBTL yr':>10} {'MinBTL trades':>14}")
+    for assumed in bands:
+        n_hat = deflate_mod.implied_independent_trials(assumed, n_decisions)
+        effective = max(2, int(round(n_hat)))
+        emax = deflate_mod.expected_max_sharpe(effective)
+        years = deflate_mod.min_backtest_length_years(effective, sharpe)
+        trades = deflate_mod.min_trades(effective, sharpe, trades_per_year)
+        click.echo(
+            f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}"
+        )
+
+    if trial_sharpe_variance is None:
+        click.echo(
+            "\nDSR: NOT COMPUTED. V[{SR_n}] requires a per-trial Sharpe on every ledger row, "
+            "and the backfilled rows are series_missing (§78.4). Supply "
+            "--trial-sharpe-variance to compute it under an explicit assumption."
+        )
+        return
+
+    n_hat = deflate_mod.implied_independent_trials(rho if rho is not None else 0.0, n_decisions)
+    effective = max(2, int(round(n_hat)))
+    sr0 = deflate_mod.sharpe_rejection_threshold(effective, trial_sharpe_variance)
+    observations = int(round(trades_per_year * deflate_mod.min_backtest_length_years(
+        effective, sharpe
+    ))) if sharpe > 0 else 0
+    dsr = deflate_mod.deflated_sharpe(sharpe, sr0, max(2, observations), skew, kurtosis)
+    click.echo(f"\nSR_0 (rejection bar)      : {sr0:.4f}")
+    click.echo(f"DSR                       : {dsr:.4f}")
 
 
 @trials_group.command("pbo")
