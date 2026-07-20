@@ -1,6 +1,6 @@
 [← Knowledge Base index](../README.md)
 
-# Source 63 — "Trading Strategies with Position Limits" (Valerii Salov, arXiv:1712.07649v1, 19 Dec 2017, 64pp)
+## Source 63 — "Trading Strategies with Position Limits" (Valerii Salov, arXiv:1712.07649v1, 19 Dec 2017, 64pp)
 
 **Type:** academic **combinatorics / abstract-algebra** paper on futures trading, illustrated with
 E-mini S&P 500 (ES) tick data. Author is a chemist-turned-quant (Wiley 2007, *Modeling Maximum
