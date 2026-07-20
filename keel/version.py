@@ -34,6 +34,18 @@ class BuildInfo:
     source: str  # "release" | "checkout" | "unknown"
 
     @property
+    def full_version(self) -> str:
+        """Version bound to the build hash as semver build metadata: `0.1.0+<commit>`.
+
+        This is the canonical "which build is this" string -- the version alone is ambiguous
+        (many commits share a version between bumps), the commit alone omits the human-facing
+        number. `+` is the semver / PEP 440 local-version separator, so tooling recognises it.
+        """
+        if self.commit == "unknown":
+            return self.version
+        return f"{self.version}+{self.commit}"
+
+    @property
     def is_reproducible(self) -> bool:
         """False when the running code corresponds to no commit -- a dirty tree, or no idea.
 
@@ -43,9 +55,9 @@ class BuildInfo:
         return self.source in {"release", "checkout"} and not self.dirty
 
     def describe(self) -> str:
-        parts = [f"keel {self.version}"]
-        if self.commit != "unknown":
-            parts.append(f"({self.commit}{', DIRTY' if self.dirty else ''})")
+        parts = [f"keel {self.full_version}"]
+        if self.dirty:
+            parts.append("(DIRTY)")
         parts.append(f"[{self.source}]")
         return " ".join(parts)
 

@@ -1,0 +1,24 @@
+# Shapes the auto-generated release notes (the GitHub "generate release notes" API, which the
+# release workflow calls). Merged PRs since the previous tag are grouped by their LABELS. This is
+# why the process going forward is "label every PR": an unlabelled PR falls into "Other" and the
+# notes get less useful, not wrong.
+changelog:
+  exclude:
+    labels:
+      - norelease
+  categories:
+    - title: ⚠️ Breaking changes
+      labels: [breaking]
+    - title: Features
+      labels: [feature, enhancement]
+    - title: Fixes
+      labels: [bug, fix]
+    - title: Compliance & rails
+      labels: [compliance, rails]
+    - title: Research & validation
+      labels: [research, experiment]
+    - title: Docs, CI & tooling
+      labels: [docs, ci, tooling]
+    # Catch-all LAST so a labelled PR never lands here by accident.
+    - title: Other changes
+      labels: ["*"]

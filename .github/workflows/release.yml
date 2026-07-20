@@ -106,28 +106,49 @@ jobs:
           git tag -a "v${{ inputs.version }}" -m "keel v${{ inputs.version }}"
           git push origin "v${{ inputs.version }}"
 
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Auto-generate the change list from merged PRs since the previous tag, categorised by
+          # .github/release.yml. The tag already exists (previous step), so the API can range on it.
+          PREV="$(git describe --tags --abbrev=0 "v${{ inputs.version }}^" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then
+            GENERATED="$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="v${{ inputs.version }}" -f previous_tag_name="$PREV" -q .body)"
+          else
+            # First release: no previous tag, generate from the start of history.
+            GENERATED="$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="v${{ inputs.version }}" -q .body)"
+          fi
+          {
+            echo "Built from $(git rev-parse --short=12 HEAD). Version binds to this hash:"
+            echo "\`keel --version\` reports \`keel ${{ inputs.version }}+$(git rev-parse --short=12 HEAD) [release]\`."
+            echo
+            echo "## Install"
+            echo
+            echo "Download **all** wheels from this release into one directory, then install the"
+            echo "\`keel_trader\` wheel **by path**:"
+            echo
+            echo '    pip install --find-links . ./keel_trader-${{ inputs.version }}-py3-none-any.whl'
+            echo "    keel --version"
+            echo
+            echo "⚠️ **Never install by bare name.** The distribution is \`keel-trader\`; the name"
+            echo "\`keel\` on PyPI belongs to an unrelated project, so \`pip install keel\` fetches"
+            echo "someone else's package. A build reporting **DIRTY** or **[checkout]** is not this"
+            echo "release and must not be run against live funds."
+            echo
+            echo "$GENERATED"
+          } > /tmp/release-notes.md
+          echo "composed $(wc -l < /tmp/release-notes.md) lines of notes"
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "v${{ inputs.version }}" dist/* \
             --title "keel v${{ inputs.version }}" \
-            --notes "Built from $(git rev-parse --short=12 HEAD). Tests and ruff green at build time.
+            --notes-file /tmp/release-notes.md
+          echo "published v${{ inputs.version }}"
 
-          ## Install
-
-          Download **all** wheels from this release into one directory, then install the \`keel_trader\`
-          wheel **by path**:
-
-              pip install --find-links . ./keel_trader-${{ inputs.version }}-py3-none-any.whl
-              keel --version
-
-          ⚠️ **Never install by bare name.** The distribution is \`keel-trader\`; the name
-          \`keel\` on PyPI belongs to an unrelated project, so \`pip install keel\` fetches
-          someone else's package. The import package and the CLI command are both still \`keel\`.
-
-          ## Verifying what you are running
-
-          \`keel --version\` on this artifact reports \`[release]\` with the commit above. A build
-          reporting **DIRTY** or **[checkout]** is not this release and must not be run against
-          live funds."
