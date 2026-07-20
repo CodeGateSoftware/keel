@@ -1,6 +1,6 @@
 [← Knowledge Base index](../README.md)
 
-# Source 58 — "The Encyclopedia of Trading Strategies" (Jeffrey Owen Katz, Ph.D. & Donna L. McCormick, McGraw-Hill, 2000, 386pp)
+## Source 58 — "The Encyclopedia of Trading Strategies" (Jeffrey Owen Katz, Ph.D. & Donna L. McCormick, McGraw-Hill, 2000, 386pp)
 
 **Type:** systematic **back-testing study**. This is *not* a technique catalog — it is a
 **controlled experimental report**. Katz & McCormick take the standard menu of entry and exit
@@ -679,6 +679,520 @@ filters: After countertrend activity is detected (triggering an entry signal), b
 occur, the market must demonstrate reversal by moving in the direction of the trade."* So the
 rule is not "always limit"; it is **limit for trend-following entries** (which already contain
 their own confirmation), **stop for counter-trend entries** (which need confirmation added).
-PLACEHOLDER_TAIL_ANCHOR
+
+---
+
+## §58.11 ⭐⭐ The book's central result: most entries were no better than RANDOM — *Ch 13*
+**Module: `strategy/promotion.py`, `strategy/backtest.py`**
+
+Part III inverts the experiment. Instead of a fixed exit and varying entries, they fix a
+**random entry** and vary the exit. The random entry model is exactly what it sounds like:
+
+```
+On each bar, draw u ~ Uniform(0,1) from a high-quality RNG (ran2, Numerical Recipes):
+    u > 0.975 → long entry at next open
+    u < 0.025 → short entry at next open
+    otherwise → no signal
+⇒ a signal roughly every 20 bars, direction random.
+Run 10 independent seeds; use the mean and standard deviation as the benchmark distribution.
+```
+
+The random-entry + standard-exit portfolio produced **−$2,243 per trade, 36.91% wins**, with a
+standard deviation across seeds of only **$304 and 0.70 percentage points** — i.e. a *tight,
+well-characterized null distribution*.
+
+Then the punchline:
+
+> *"The results clearly demonstrate that **many of the entry strategies tested in earlier
+> chapters using the SES were no better than random entries. Sometimes they were worse.**"*
+>
+> *"The performance figures in Tables 13-1 through 13-3 provide a **baseline** (in the form of
+> means and standard deviations) that can serve as a **yardstick** when evaluating the entries
+> studied in Part II. For this purpose the $TRD and WIN% figures are the best ones to use since
+> they are not influenced by the number of trades taken by a system."*
+
+Check it against §58.10: the oscillator models averaged **−$2,220/trade in-sample** against a
+random-entry benchmark of **−$2,243**. They were, to within noise, **exactly random**. And the
+Conclusion states outright that *"the RSI overbought/oversold model was the worst of them all.
+In both samples, it provided staggering losses that were (statistically) significantly **worse
+than those that would have been achieved with a random entry**."*
+
+### ⭐ This is a concrete, high-value harness upgrade we do not have
+
+`promotion.py` currently gates on **absolute** thresholds (expectancy, R:R ≥ 1.5–2, win-rate
+floors, `min_trades: 100`). §54.10 adds walk-forward and OOS discipline. **Neither answers the
+question "is this rule better than entering at random?"** — and Katz & McCormick show that is
+the question most published entry models fail.
+
+**Proposed: a random-entry control arm in `keel simulate`.**
+
+```
+For a candidate rule R with exit E:
+  1. Run R+E → observe avg_return_per_trade, win_rate, expectancy.
+  2. Generate N ≥ 20 random-entry sequences matched to R's TRADE FREQUENCY
+     (long-only: draw a long signal with p = R's historical signals-per-bar).
+  3. Run each random sequence through the SAME exit E, same costs, same period.
+  4. Report R's percentile against that null distribution.
+  5. Promotion requires R to beat the random-entry mean by ≥ 2 standard deviations
+     on per-trade expectancy.
+```
+
+**Why this is worth building for `keel` specifically:**
+- It is the **cleanest possible test of whether the entry signal carries information**, and it
+  is *robust to the small-sample problem that plagues us*. Our Turtle has ~23 trades in 5 years,
+  far under the `min_trades: 100` bar — meaning the current promotion gate cannot really be
+  satisfied. A random-entry control with matched trade frequency gives a **valid significance
+  test at low trade counts**, because the null is simulated rather than assumed.
+- It **separates entry edge from exit edge** — the §58.0 attribution problem. If the Turtle
+  beats random entries with the same exit, the Donchian signal is real. If it doesn't, our
+  1.4% return is coming from the ATR stop and the trend of the underlying, not from the signal.
+  That is a question we currently cannot answer and should be able to.
+- Long-only adaptation is trivial and necessary: draw **only long** signals (a random-direction
+  benchmark is meaningless when we can only go one way), and match trade frequency so the
+  comparison isn't confounded by cost drag.
+
+### ⚠️ And the corollary — the exit may be doing more work than the entry
+
+> *"A good exit strategy is extremely important. **It can even pull profits from randomly
+> entered trades!** Think of what it could do for trades entered on the basis of something
+> better than the toss of the die."*
+
+With the best exit found in Ch 14, *"the Swiss Franc, Light Crude, Heating Oil, COMEX Gold, and
+Live Cattle had positive returns both in- and out-of-sample"* — **profitable systems built on
+random entries** — and Feeder Cattle / Live Hogs returned 10.9% / 15.5% in-sample and 43.1% /
+31.9% out-of-sample **on random entries**. The overall improvement:
+
+> *"When compared with the standard exit strategy used in the tests of entry methods, which lost
+> an average of $2,243 per trade… the best exit strategy thus far developed reduced the loss per
+> trade to $1,236, representing a **reduction in loss per trade of over 44%**. The reduction is
+> substantial enough that **many of the better (albeit losing) entry models would probably show
+> overall profitability if they were combined with the best exit strategy.**"*
+
+→ **Strategic implication for the project: our next build cycle should probably target EXITS,
+not a new entry rule.** The KB has accumulated a long queue of candidate *entries*
+(§54.3, §54.5, §54.11, §54.12, §54.15, §54.16, §54.22, §58.10c). This book argues that is the
+lower-yield half of the problem. Combined with defect (b) — "stops historically too tight for
+crypto ATR" — the highest-expected-value work is the exit sweep in §58.12–§58.14 below.
+
+---
+
+## §58.12 ⭐⭐ Optimal stop width — a measured INTERIOR optimum at ~1.5 ATR — *Ch 14*
+**Module: `execution/executor.py`, `strategy/rules/turtle_breakout` — open defect (b)**
+
+This is the most directly useful table in the book for us. The money-management stop (`mmstp`,
+in ATR(50) units) was stepped 0.5 → 3.5 against the profit target (`ptlim`) stepped 0.5 → 5.0,
+**on random entries** so that the result is attributable to the exit alone.
+
+Selected cells from Table 14-1 (ARRR / WIN% / avg-$-per-trade), profit target held at 4.5:
+
+| Stop width (ATR units) | 0.5 | 1.0 | **1.5** | 2.0 | 2.5 | 3.0 | 3.5 |
+|---|---|---|---|---|---|---|---|
+| ARRR | −2.54 | −1.66 | **−1.46** | −1.48 | −1.60 | −1.68 | −1.67 |
+| WIN% | 19 | 32 | **39** | 43 | 44 | 46 | 45 |
+| Avg $/trade | −1,824 | −1,590 | **−1,581** | −1,714 | −1,933 | −2,077 | −2,109 |
+
+The authors' conclusion:
+
+> *"There appears to be an **optimal placement for a fixed money management stop. Too wide a
+> stop increases the percentage of wins. However, it also increases the overall loss. Too tight
+> a stop keeps the individual losses small, but drastically cuts the percentage of winning
+> trades**, again resulting in worse overall performance. An optimal value provides a moderate
+> percentage of winning trades and the best performance. In this case, **the optimal distance to
+> place the money management stop away from the entry price was 1.5 average true range units.**
+> With some entry systems, the optimal placement might be much closer."*
+>
+> *"For most of the profit target limits, there was an optimal placement for the money
+> management stop, **between a value of 1.0 and 2.0 average true range units** away from the
+> entry price."*
+
+**Four things to extract carefully:**
+
+1. ⭐ **The optimum is INTERIOR, and both failure modes are real.** This is the most important
+   structural point and it refines defect (b). The KB's framing has been one-directional —
+   "stops are too tight for crypto, widen them" (§22.1, §34.1, §54.6, §36). Katz & McCormick
+   measured the other side: **past ~2 ATR the win rate keeps climbing while every other metric
+   deteriorates**, because the losses you do take grow faster than the trades you save. A
+   widening sweep scored on win-rate will walk straight past the optimum. **The sweep must be
+   scored on expectancy/ARRR, not win rate**, and must bracket the optimum from both sides.
+2. ⚠️ **1.5 is NOT our number and must not be copied.** Three reasons: (a) their ATR is
+   **ATR(50)** and ours is ATR(20) — a shorter, more reactive ATR yields systematically
+   different multiples; (b) their entry is **random**, and they say explicitly *"with some entry
+   systems, the optimal placement might be much closer"*; (c) crypto's return distribution is
+   fatter-tailed than 1990s futures. What transfers is **the shape of the curve and the method**,
+   not the constant. Our Turtle's 2N (2·ATR(20)) sits inside their 1.0–2.0 optimal band, which
+   is mild reassurance that we are in the right neighborhood — not evidence we are optimal.
+3. **Testable directly:** sweep `stop_atr_mult ∈ {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0}` ×
+   `atr_period ∈ {20, 50}`, score on expectancy, and look for the **robustness plateau**
+   (§54.11) — expecting a genuine maximum rather than a monotone "wider is better" curve.
+4. ⚠️ **Their stop is close-confirmed in the SES but intrabar in the MSES**, and the MSES was
+   materially better: *"The MSES, which simply lifts the restriction of the exit to the close,
+   performed much better."* This **cuts against §34.1's close-based stop confirmation** — a
+   tension worth flagging honestly. The likely resolution is that their gain came from *faster
+   escape from bad trades* (*"the ability of the MSES to more quickly escape from bad trades,
+   cutting losses short. The more rapid and frequent escapes also explain the decline in the
+   percentage of winning trades"* — wins fell 39% → 31.7%), which is a different trade-off from
+   crypto whipsaw. **Both belong in the sweep**: `stop_trigger ∈ {close, intraday}` should be
+   swept jointly with `stop_atr_mult`, not fixed by prior belief.
+
+---
+
+## §58.13 ⭐ The dynamic-stop ladder, ranked by test — and §55.3's 2-bar trail is confirmed to fail
+**Module: `execution/executor.py`**
+
+Four stop designs, all on random entries with the optimal profit target, so the ranking is a
+clean comparison. Ranked best → worst by annualized risk-to-reward ratio:
+
+| Rank | Stop design | ARRR | WIN% | Avg $/trade |
+|---|---|---|---|---|
+| 1 | **MEMA (modified-EMA ratchet) stop** — init 2.5 ATR, ATR offset 1.0, adapt coeff 0.30 | **−1.36** | 37% | **−1,407** |
+| 2 | **Dynamic ATR trailing stop** — first-bar 2.0 ATR, later-bar 2.5 ATR from current close | −1.40 | 42% | ~−1,450 |
+| 3 | **Optimal fixed stop** — 1.5 ATR from entry (§58.12) | −1.46 | 39% | −1,581 |
+| 4 | ⛔ **2-bar highest-high/lowest-low trailing stop** | **−2.52** | **28%** | **−1,864** |
+
+### §58.13a ⭐ The 2-bar channel trail failed — exactly as the KB predicted
+
+The README's module map lists §55.3's **2-bar channel trail** as *"the TIGHT LOWER BOUND of the
+trail sweep — **expected to lose on crypto** (it is the shakeout stop §34.1 exists to fix)."*
+**Katz & McCormick tested it and it lost, for precisely the predicted reason:**
+
+> *"This stop appears to have been **consistently too tight**, as evidenced by a decreased
+> percentage of winning trades when compared with the baseline MSES model… the best solution has
+> only **28% of the trades winning** in-sample and 29% out-of-sample. **Many potentially
+> profitable trades (some of them trades that would have been profitable with the basic MSES,
+> using an optimal fixed stop) were converted to small losses.** The tightness of this stop is
+> also demonstrated by the total number of bars the average trade was held (4), compared with
+> the usual 6 to 8 bars… **The 2-bar HHLL stop is obviously no great shakes, and one would be
+> better served using a fixed, optimally placed stop.**"*
+
+→ The KB's prediction is **confirmed by an independent controlled test**. This lets us
+**deprioritize** the 2-bar trail from the sweep rather than spend cycles on it, and it
+strengthens the §34.1 / §54.6 "stops too tight" thesis with a measured mechanism: a too-tight
+trail does not merely lose a bit — it **halves the holding period and converts winners into
+losers**, dropping the win rate by 11 points versus a well-placed fixed stop.
+
+### §58.13b The MEMA stop — a NEW trailing-stop design with no KB equivalent
+
+The winner is a design the KB does not have. §54.6/§54.8 give us the Kase Dev-Stop, an
+ER-adaptive ATR stop and Parabolic SAR; §23.2 gives a channel-low trail; §26.2 a 20-SMA
+close-below. The MEMA stop is structurally different — **an exponential moving average of price
+that is only ever allowed to move toward the market, never away**:
+
+```
+# long position; atr = ATR(50)
+on entry bar:
+    stop = entry − mmstp × atr                      # mmstp ≈ 2.5
+on each later bar:
+    tmp = (High_t − stpa × atr) − stop              # stpa ≈ 1.0  (ATR offset)
+    if tmp > 0:  stop = stop + stpb × tmp           # stpb ≈ 0.30 (adaptation rate ≈ 5-bar EMA)
+    # if tmp <= 0 the stop is unchanged — it can never move down
+```
+
+> *"This method involves nothing more than a kind of offset exponential moving average (EMA),
+> except that the moving average is initialized in a special way on entry to the trade and is
+> only allowed to move in one direction; i.e., **the stop is never polled further away from the
+> market, only closer**… `stpb` determines the effective length of an exponential moving average
+> that can only move in one direction, in toward the prices."*
+
+**Why it is interesting for crypto:** it is a **smoothly accelerating** trail. It starts wide
+(2.5 ATR, respecting defect (b)) and tightens *gradually and proportionally to how far price has
+run*, rather than snapping to a recent extreme the way a channel-low or N-bar trail does. That
+is exactly the profile a fat-tailed, high-noise asset wants: wide enough early to survive the
+shakeout, progressively protective as the fat tail develops. It is also **three parameters, all
+continuous and well-behaved** — the authors note *"the model was well behaved with respect to
+variations in the parameters"*, which is the robustness-plateau property §54.11 asks for. And it
+never widens, so it composes with the **no-stop-widening rail** (§5.1) by construction.
+
+→ **Testable candidate `trail_method=mema`** with `(mmstp, stpa, stpb)` swept around
+`(2.5, 1.0, 0.30)`. Cheap to implement (three lines), long-only by construction, and it ranked
+first in the only head-to-head test of trailing stops anywhere in the KB.
+
+---
+
+## §58.14 Profit targets: looser is better, and none may beat a tight one — *Ch 14*
+**Module: `execution/executor.py`**
+
+> *"As the profit target limit got tighter, the percentage of winning trades increased; this was
+> expected… **However, the increased percentage of winning trades with tighter profit targets was
+> not sufficient to overcome the effects of cutting short on trades that had the potential to
+> yield greater profits. Looser profit targets performed better than tight ones.**"*
+>
+> *"Profits should not be cut short even though a higher percentage of winning trades might be
+> gained… **This clearly shows the importance of letting profits run.**"*
+>
+> *"The results indicate that care has to be taken with profit targets: They tend to prematurely
+> close trades that have large profit potential… **Sometimes it is better to have no profit
+> target at all than to have an excessively tight one.**"*
+
+The optimal fixed target was **4.5 ATR against a 1.5 ATR stop** — a **3:1 target-to-stop ratio**
+at a **39% win rate**. That is squarely consistent with the KB's breakeven-winrate floor
+(§23.1/§25.5/§35.2: `win_rate > 1/(1+R:R)`; at R:R 3, 25% suffices — 39% clears it comfortably)
+and with our live `turtle_breakout` at 38.7% win / R:R ≈ 2.5. It is also a clean rebuttal of
+§57.4's "70%+ win ratio" goal, from tested data.
+
+→ **Reinforces §54.3's trend-follower caveat** ("for long-term trends a profit target *hurts* —
+you forfeit the rare fat-tail move") with an independent measurement, and supports running the
+Turtle with **no fixed profit target**, exiting on the channel/trail instead.
+
+**One new mechanism worth a sweep slot — the "shrinking profit target"**, designed for exactly
+the dead-position problem §57.2 raises:
+
+```
+limit = entry + ptlim × atr                                  # ptlim ≈ 5.5 (start FAR away)
+each later bar:  limit = limit − ptga × (limit − Close_t)    # ptga ≈ 0.10 (creep toward price)
+```
+
+It starts too far away to be hit and creeps toward the market, so a **languishing** trade
+eventually exits *"with a limit order on market noise, while not cutting profits short early in
+the course of favorably disposed trades."* Result: ARRR improved −1.36 → −1.32 and average loss
+$1,407 → $1,325 over the fixed target. It is a **profit-side analogue of the time stop** — and,
+being a limit, it exits as a **maker with no slippage**. Modest but real, and it composes with
+`max_hold` rather than competing with it.
+
+---
+
+## §58.15 The time exit: extending `maxhold` 10 → 30 days helped, mildly — *Ch 14*
+**Module: `execution/executor.py` — the §57.2 `max_hold` candidate**
+
+> *"Extension of the time limit improved results, but not dramatically. **Most trades were closed
+> out well before the time limit expired; i.e., the average trade only lasted between 6 and 10
+> bars.**"* (ARRR −1.32 → −1.22; average loss per trade $1,325 → $1,236.)
+
+**Three readings for us:**
+1. **Confirms `max_hold` belongs in the exit set** (§57.2's candidate, and part of this book's
+   baseline per §58.0.3) — a standard component, not an exotic one. Second independent
+   endorsement.
+2. **But it is a backstop, not a driver.** The time limit rarely binds; loosening it produced a
+   ~7% improvement in per-trade loss. Do not expect `max_hold` alone to fix defect (a).
+3. ⚠️ **Their whole time-scale is ~10× faster than ours** — 6–10 bar average holds vs our ~24
+   days. A `max_hold` calibrated from this book would be far too short. Sweep it against **our**
+   observed hold distribution (the sim's 575-hour average), exactly as §57.1 warns for the
+   streak breaker. A sensible bracket: `max_hold ∈ {30, 60, 90, 120 days, none}`.
+
+---
+
+## §58.16 Chapters covered by skim — headline results only
+**Module: mostly none (recorded so no one re-mines them)**
+
+Summarized from each chapter's *Conclusion* plus the book's closing chapter, which aggregates
+all model families:
+
+- **Ch 8 Seasonality (pp. 153–178).** The best-performing *conventional* family in the book.
+  *"The seasonal models, on the whole, were **clearly better than chance**… two of them were
+  profitable out-of-sample."* The **seasonal crossover with confirmation, entry on stop** was
+  profitable in **both** samples ($846/trade, 7.4% in-sample; $1,677/trade, 9.5% out-of-sample).
+  ⚠️ **Not adopted.** Their seasonality is a *calendar* effect on physical commodities (crop
+  cycles, heating demand) with a real economic mechanism. Crypto has no crop cycle; §14.3
+  already places BTC halving-cycle seasonality as a **low-weight** CTS factor and §6.4 forbids
+  calendar prediction as an oracle. Logged as: *the seasonal result does not port — it was
+  structural to physical commodities.*
+- **Ch 9 Lunar & Solar Rhythms (pp. 179–202).** *"The basic lunar model had mixed findings. Most
+  of the in-sample results were slightly positive when compared with chance… but not
+  profitable."* Solar/sunspot models *"performed slightly better than chance in-sample, [but]
+  were mixed and variable out-of-sample."* ⛔ **Excluded under no-oracle (§6.4)**, alongside the
+  KB's standing Elliott/Gann/astrology exclusion. Recorded only because the result is
+  *negative*, which retires the topic rather than leaving it open.
+- **Ch 10 Cycle-Based Entries (pp. 203–226).** Butterworth / wavelet filter-bank cycle
+  extraction — theoretically the most elegant models in the book, and among the worst:
+  *"the cycle models, when using entry at open or on limit, actually performed **significantly
+  worse in recent years than a random entry**."* ⛔ Not adopted — negative result, plus the
+  implementation (maximum-entropy spectral analysis, filter banks) is not reproducible in
+  `keel`'s Decimal/hand-rolled indicator stack.
+- **Ch 11 Neural Networks (pp. 227–256) & Ch 12 Genetic Algorithms (pp. 257–280).** Ironically
+  the *best* out-of-sample performers (*"the out-of-sample performance was, by far, the best for
+  the long-side genetic models… 64.2% in-sample and 41.0% out-of-sample"*), and the authors flag
+  that *"significant curve-fitting was only detected with the genetic and neural network
+  models."* ⛔ **Excluded**, consistent with §54's exclusion of neural/genetic/fuzzy methods as
+  **non-reproducible black boxes**, and with §6.4 / §35.1 (AI may explain, never decide). Note
+  this is a **cost we are knowingly accepting**: the book's best OOS numbers sit inside the box
+  we deliberately closed. The KB's reasoning stands — a model we cannot inspect, reproduce or
+  audit cannot pass a promotion harness or a rail.
+- **Ch 1–2 Data & Simulators (pp. 3–28).** 1990s data vendors (Pinnacle, DTN, Bonneville),
+  contract back-adjustment, and C-Trader/TradeStation mechanics. Skimmed; **obsolete**. One
+  durable nugget: their **data-checking utility** flags prices implausible relative to recent
+  range — the same idea as our **data-spike guard (§24.3)**. No action.
+- **Ch 3–4 Optimizers & Statistics (pp. 29–70).** Brute-force / genetic / annealing optimizers,
+  and significance testing of trading results. Skimmed because **§54.10 covers this ground more
+  usefully for us**. Two points survive as reinforcement: (a) they apply an explicit
+  **multiple-comparison correction** when reporting the probability a result is chance (e.g.
+  *"8.7% uncorrected; 99.9% corrected"*) — a discipline our sweep reports should adopt, since
+  sweeping 7 stop widths × 6 look-backs is 42 comparisons; (b) the repeated finding that *"the
+  optimization of one or two parameters… had minimal curve-fitting effect"* while
+  many-parameter models curve-fit badly — reinforcing **few parameters + robustness plateau**
+  (§54.10/§54.11).
+
+---
+
+## §58.17 ⚠️ NEGATIVE EXEMPLAR — the book's own final "625% annualized" portfolio
+**Module: `strategy/promotion.py` — a selection-bias trap to guard against**
+
+The book closes by assembling a portfolio: for each of the 36 markets they pick the
+model-and-order combination that performed best **on in-sample statistical significance**, then
+report that portfolio's results — *"544% annualized in-sample"* and *"625% annualized"*
+out-of-sample, framed as *"A manifestation of the Holy Grail?"*
+
+**Treat this as a cautionary exemplar, not a result.** The authors defend it (*"no out-of-sample
+optimization took place"*), and the per-market model choice was indeed made on in-sample data
+only — but the *portfolio construction step*, choosing which 36 model-market pairs to include,
+is itself a selection made with knowledge of what worked, and the reported figure is the
+performance of the survivors. It is the **same class of error §54.10's OOS/feedback firewall
+exists to prevent**, dressed in a legitimate-looking procedure. Two tells: the same chapter notes
+that for the genetically-evolved models *"in-sample markets that performed well… there were
+generally no out-of-sample trades. The profitable out-of-sample behavior was achieved on almost a
+totally different set of markets"* — i.e. the selection did not transfer — and the headline claim
+is wildly out of scale with every individual result in the book's preceding 350 pages, nearly all
+of which were negative or single-digit.
+
+→ **Logged for `promotion.py`:** when we run per-asset rule selection (which §58.4 recommends!),
+the *selection step itself must sit inside the walk-forward loop*, and the reported OOS number
+must come from a window never used to choose the rule. Also a reminder to weight this source's
+**methodology** highly and its **headline conclusions** soberly.
+
+---
+
+## §58.18 Reconciliation against prior sources
+
+| Prior KB item | This source |
+|---|---|
+| §25.1 **ADX > 25 trend gate** (shipped) | ⚠️ **CONTESTED** — §58.2: the ADX filter helped in-sample, gave **no OOS benefit**, and was among the worst OOS results in the book; *"do not rely on indicators like the ADX for trendiness determination."* Ablation-test it. |
+| §54.1/§54.9/§54.17 **ER / trendiness market ranking** | ⭐ **STRONGLY REINFORCED** — §58.4: market selection beat every model tweak; the only combination profitable in both samples was a *market restriction*, not a model change. §58.2 adds: filter the **asset**, not the **bar**. |
+| §54.3 **volatility-breakout candidate** | ⚠️ **DEPRIORITIZED** — §58.6: HHLL/support-resistance breakouts *"held up better in the tests than other models"*; *"stay away from popular volatility breakouts."* Keeps our Donchian primary. |
+| §54.5 **KAMA adaptive-trend candidate** | ⚠️ **DOWNGRADED** — §58.9: the adaptive MA was *"one of the worst"* performers and the authors' biggest surprise. Test before building. |
+| §54.6/§54.8 **volatility-adaptive trailing stops** | ⭐ **EXTENDED** — §58.13 adds the **MEMA one-way-EMA stop**, ranked #1 in a controlled 4-way comparison; §58.12 supplies the missing **interior-optimum** finding (too loose is also bad). |
+| §54.10 **testing rigor** | ⭐ **COMPLEMENTED, not duplicated** — §58.0 adds *component isolation* (fix the exit, vary the entry); §58.11 adds the *random-entry null benchmark*. §54.10 asks "is it real?"; §58 asks "which part, and is it better than chance?" |
+| §54.15 **entry timing / "don't naively delay"** | ⚖️ **PARTIALLY CONTESTED, reconciled** — §58.1 finds the *limit* entry the single biggest improvement across ~80 tests, with *"the limit order did not seriously reduce the number of trades or cause many profitable trades to be missed."* Both are passive entries differing only in offset; sweep as one family. |
+| §54.19 **pyramid on profits / never average down** | ⚖️ Untouched — the book does not test position scaling. No conflict. |
+| §54.22 **equal-risk-by-ATR allocation** | ⧉ **DUPLICATE** — their "dollar volatility equalization" (size every market to the volatility of 2 S&P contracts) is the identical idea. Not re-extracted. |
+| §55.1 **RSI-divergence strength ladder** (unvalidated source) | ⚠️ **CONTESTED** — §58.10b: RSI divergence tested poorly; *"its poor showing in these tests is noteworthy."* §58.10c supplies a fully-specified detector and says use **MACD**, not RSI. Keep the ordinal grade, switch the indicator, lower the CTS weight. |
+| §55.2 **MACD-histogram slope confluence** | ⭐ **REINFORCED** — §58.10c: MACD divergence was the *only* profitable oscillator model, in both samples. |
+| §55.3 **2-bar channel trail** ("expected to lose") | ⭐ **PREDICTION CONFIRMED** — §58.13a: tested, *"consistently too tight"*, 28% wins, holding period halved, worse than a fixed stop. Deprioritize from the sweep. |
+| §57.2 **`max_hold` time exit** | ⭐ **REINFORCED and PROMOTED** — §58.0.3: a time exit is part of this book's *baseline*, not an option; §58.15 measures that extending it helps mildly. Second independent endorsement. |
+| §57.2 **close-strength exit** | ⚖️ Untested here. Unchanged. |
+| §57.4 **"70%+ win-ratio" negative exemplar** | ⭐ **REINFORCED with data** — §58.14: the optimal configuration ran at **39% wins**; tighter targets raised the win rate while worsening every other metric. |
+| §34.1 **close-based stop confirmation** | ⚖️ **MIXED** — §58.0.2 supports it on *simulation-determinacy* grounds (one intrabar order, or the sim is untrustworthy); §58.12.4 finds the *intrabar* MSES outperformed the close-only SES. Sweep `stop_trigger`; don't assume. |
+| §35.3 **liquidity-sweep / require a close** | ⭐ **REINFORCED** — §58.1: entry stops at breakout thresholds get filled into *"the flurry of orders"*; §58.6: both channel models require a **close** beyond the level. |
+| §27.1 **Turtle 20-day channel** | ⚠️ **look-back CONTESTED** — §58.6: their optimum was **80–95 days**. Not portable (their exit is far faster), but a strong argument to sweep the look-back rather than inherit 20. |
+| §26 **KISS** | ⭐ **REINFORCED** — §58.9: the *simple* MA beat all sophisticated variants; §58.16: few-parameter models showed *"minimal curve-fitting effect."* |
+| §4.1 **anti-scalping / min-move rail** | ⭐ **REINFORCED** — §58.5: a +76%/yr edge was annihilated by transaction costs alone. |
+| §5.1 **no-stop-widening rail** | ⭐ **REINFORCED** — §58.13b's MEMA stop is one-way by construction: *"the stop is never polled further away from the market, only closer."* |
+| §28.1–28.2 **long-only as compliance cost** | ⭐ **REFRAMED** — §58.3: long-only *improved* the tested breakout system in both samples. The constraint and the best configuration coincided. |
+| §6.4/§35.1 **no-oracle; AI never decides** | ⚖️ **COSTED** — §58.16: the book's best OOS results were the neural/genetic models we exclude. We keep the exclusion; this records what it costs. |
+| §24.3 **data-spike guard** | ⧉ Duplicate (their data-checking utility). No action. |
+| §14.3 **BTC seasonality, low weight** | ⚖️ Unchanged — §58.16: their seasonal edge was structural to physical commodities and does not port. |
+
+---
+
+## §58.19 ⛔ Halal exclusions and long-only reinterpretations
+
+The entire book is **futures-based, dual-direction and leveraged by construction**. Excluded:
+
+- ⛔ **Futures contracts as the instrument** — the whole 36-market portfolio (S&P, T-Bonds,
+  Eurodollars, currencies, grains, livestock, softs) is non-spot derivatives: **gharar**, no
+  ownership, deferred settlement (§27.4, §28.1). Nothing about the *instrument* is adopted; only
+  the *methods*, re-applied to spot crypto.
+- ⛔ **Short selling**, assumed on every page (*"the sells are the exact opposite"*). Per the
+  standing rule, short results become **exit / don't-buy filters**:
+  - the bearish branch of the MACD-divergence detector (§58.10c) → an **exit signal** for a held
+    position, never a short entry;
+  - Ch 7's finding that oscillators give *"many false reversal signals"* in sustained trends →
+    a **don't-exit-on-an-oscillator-alone** caution;
+  - **all short-side P&L in every table is discarded**, which materially changes some readings:
+    §58.10c's MACD divergence had a variant where *"only shorts were profitable"* — worthless to
+    us, and part of why that rule is logged as a candidate rather than a finding.
+- ⛔ **Margin, contract multipliers and "number of contracts"** — `ncontracts = 5673.0 / dlrv`
+  sizes positions by dollar-volatility on margin. Riba. We take only the *ratio* idea
+  (equal-risk-by-ATR), which we already have from §54.22, funded with actual cash.
+- ⛔ **Eurodollar and T-Bond / T-Note / T-Bill markets** in the test portfolio — interest-rate
+  instruments; riba (§25.6). Their per-market results are read as noise, not signal, for us.
+- ⛔ **Ch 9 Lunar & Solar Rhythms** — excluded under no-oracle (§6.4) *and* as astrology-adjacent,
+  matching the KB's standing Elliott/Gann/astrology exclusion. The negative result is recorded so
+  the topic can be retired rather than revisited.
+- ⛔ **"Gunning" and the catastrophe-stop workaround** (p. 288) — their advice to keep the real
+  stop *"in the system on the computer"* and phone the broker when it triggers, leaving only a
+  far-away catastrophe stop with the broker. Not halal-excluded, but **rejected on rail
+  grounds**: a stop that exists only in the agent's memory is a stop a crash or restart deletes.
+  Our design deliberately does the opposite — the resting bracket is **persisted and reconciled**
+  with the broker. (The underlying *concern* — a visible tight stop invites a sweep — is already
+  handled by §34.1/§35.3 close-confirmation.)
+- ⚠️ **"Contrarian trading" — exit into liquidity** (p. 289): *"exit long trades when most
+  traders are buying."* Not excluded and mechanically sound (a limit exit into a buying frenzy
+  gets a good fill), but **already covered** by §54.3's "take profits on the intraday spike" and
+  §54.20's price-shock windfall-taking. No action.
+
+---
+
+## §58.20 Discarded (no agent value)
+
+- **All C++ source listings** (~60 pages of `x19mod02.c`, `x20mod01.c`, TRDSIM class calls,
+  `ts.buylimit()` / `ts.exitlongstop()`). The *rules* are extracted above; the code is bound to
+  their C-Trader toolkit. Also all **TradeStation/EasyLanguage** commentary, including their bug
+  report about TradeStation's Slow %K using an EMA instead of a 3-bar SMA.
+- **Ch 1 data-vendor comparisons** (Pinnacle, DTN, Bonneville, Data Broadcasting Corp), contract
+  **back-adjustment** methodology and continuous-contract construction — futures-specific and
+  25 years obsolete.
+- **Ch 3 optimizer implementations** (brute-force stepping, simulated annealing, differential
+  evolution, the OptEvolve genetic optimizer) — §54.22 already excludes the GASP genetic
+  optimizer on the same reasoning, and our sweeps are small enough for grid search.
+- **The 36-market futures portfolio composition** and every market-by-market table
+  (Tables 5-1/5-2, 6-4/6-5, 7-1/7-2, 13-4/13-6, 14-7) — pork bellies, feeder cattle, orange juice
+  and lumber have no crypto analogue. Only the *portfolio-level* summary tables were used.
+- **The companion CD-ROM / order form / `scientific-consultants.com`** (p. 364) — a 1999
+  mail-order form.
+- **The appendix bibliography** (pp. 365–368) — 1990s *Technical Analysis of Stocks & Commodities*
+  articles, largely unobtainable and superseded by §54.
+- **Neural-network architecture details** (18-14-4-1 nets, middle-layer neuron counts,
+  training/shrinkage discussion) and **genetic rule-template encoding** — excluded per §58.16;
+  not actionable under our no-black-box constraint.
+- **Chapter 15 (Adding AI to Exits)** beyond its headline — it bolts the Ch 11 neural forecaster
+  and Ch 12 evolved rules onto the MSES as signal exits. Same exclusion; and the authors
+  themselves temper it (*"great improvement in exit performance should not be expected"*, since
+  the rules fire on rare events).
+- **The "Points of Light" per-market model assignments** — retained only as the §58.17 negative
+  exemplar, not as recommendations.
+
+---
+
+## Net assessment (saturation-honest)
+
+**This is the second-most valuable source in the KB after §54, and it is valuable for a reason no
+other source is: it is the only one that tells us what FAILED.** The KB's problem is no longer a
+shortage of candidate techniques — §54 alone left ~8 unbuilt entry candidates queued. The problem
+is knowing which deserve a build cycle. This book prunes that queue with controlled experiments
+rather than assertion.
+
+**Genuinely new (no KB equivalent):**
+- ⭐⭐ **The random-entry null benchmark** (§58.11) — a significance test that works at our low
+  trade counts, and the only clean way to ask whether the Donchian signal beats chance.
+- ⭐⭐ **The limit-entry finding** (§58.1) — replicated across three chapters and ~80 tests, and
+  close to free money under Coinbase's maker/taker fee structure.
+- ⭐ **The interior stop optimum** (§58.12) — the KB's stop discussion was one-directional
+  ("wider"); this measures that too wide is also bad, and that the sweep must be scored on
+  expectancy rather than win rate.
+- ⭐ **The MEMA one-way-EMA trailing stop** (§58.13b) — a new stop design that won a controlled
+  4-way comparison and satisfies the no-stop-widening rail by construction.
+- ⭐ **Component-isolation testing** (§58.0) — fix the exit, vary the entry; then the reverse.
+- **The shrinking profit target** (§58.14) and the **fully-specified divergence detector**
+  (§58.10c).
+
+**Contests things we already shipped or adopted** — the honest headline of this extraction: the
+**ADX gate** (§58.2), the **20-day look-back** (§58.6) and **RSI-divergence grading** (§58.10b)
+all take hits. None is refuted *for crypto*; each now has a specific, cheap test attached.
+
+**Reinforces (with independent test evidence):** trend-following over counter-trend; long-only;
+support/resistance-based breakouts over formula bands; KISS; realistic transaction costs; letting
+profits run / no tight profit target; `max_hold`; market selection over model tuning; the
+no-stop-widening rail; the breakeven-winrate floor over a 70% win-rate goal; and — pleasingly —
+the KB's own *prediction* that a 2-bar trail would fail.
+
+**Excluded:** the entire futures/short/margin frame; lunar-solar; cycle filter banks; neural and
+genetic models (knowingly forgoing the book's best OOS numbers, per our no-black-box rule);
+seasonality (a real result that does not port); and ~60pp of 1999 C++ and platform minutiae.
+
+**Recommendation:** this book argues our next build cycle should be the **exit sweep**
+(§58.12–§58.15) plus the **limit entry** (§58.1) and the **random-entry control** (§58.11) — all
+three are changes to existing machinery rather than new rules, all three are directly testable
+through `keel simulate`, and all three land on open defects (a) and (b). The ADX ablation
+(§58.2) should ride along in the same sweep, since it is a one-flag change with a plausible
+2–3× effect on trade count.
+
 Our Turtle is trend-following ⇒ limit.
 
