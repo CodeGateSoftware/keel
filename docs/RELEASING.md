@@ -31,10 +31,15 @@ against live funds**; `keel --version` warns loudly when so.
    `[release]` → tags `v<version>` → composes release notes → publishes the GitHub Release with all
    wheels attached.
 
-## Release notes come from PRs — so label every PR
+## Release notes come from PRs
 
-The change list in each release is **auto-generated from the PRs merged since the previous tag**,
-grouped by label (`.github/release.yml`). This only produces useful notes if PRs are labelled:
+The change list in each release is **auto-generated from the PRs merged since the previous tag**
+(`.github/release.yml`). The unit is the **pull request** — a clear PR title is all that is needed
+for a useful entry. Issues and issue↔commit linking are **not** required and are not enforced:
+good PRs are the source.
+
+Labels are **optional** and only affect grouping. Without them the notes are a flat "What's
+Changed" list of PR titles, which is fine. With them, PRs are grouped into sections:
 
 | label | section |
 |---|---|
@@ -46,19 +51,4 @@ grouped by label (`.github/release.yml`). This only produces useful notes if PRs
 | `breaking` | ⚠️ Breaking changes |
 | `norelease` | *excluded from notes* |
 
-An unlabelled PR lands in "Other changes" — not wrong, just less useful. **Label PRs before merge.**
-
-## Issues, and linking commits to them (adopt from the next cycle)
-
-Until now this project worked PR-per-change with no issue tracker. Going forward, work should be
-tracked as **issues**, and PRs/commits should **reference the issue they close**:
-
-- Open an issue for each unit of planned work (`gh issue create`).
-- In the PR body or a commit, write `Closes #N` (or `Refs #N` for partial progress). GitHub then
-  links the commit and closes the issue on merge, and the reference shows up in the release notes.
-- This gives three things the current flow lacks: a backlog that outlives a chat session, a
-  durable "why" behind each change, and richer auto-generated release notes.
-
-⚠️ This is a process commitment, not code. It only works if it is actually followed from the next
-change onward — the mechanics (labels, `release.yml`, `Closes #N` linking) are in place; the
-discipline is the part that has to be adopted.
+Apply a label when you want the grouping; skip it when you don't. Either way the PR appears.
