@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -227,6 +227,17 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_gap_probes_product ON candle_gap_probes(product, granularity)",
+    """
+    CREATE TABLE IF NOT EXISTS asset_attestations (
+        asset        TEXT PRIMARY KEY,
+        sector       TEXT NOT NULL,
+        backing      TEXT NOT NULL,
+        pays_yield   INTEGER NOT NULL,
+        source       TEXT NOT NULL,
+        attested_by  TEXT NOT NULL,
+        attested_at  INTEGER NOT NULL
+    )
+    """,
 )
 
 
@@ -334,11 +345,24 @@ def _migrate_v5_candle_gap_probes(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v6_asset_attestations(conn: sqlite3.Connection) -> None:
+    """v6 adds `asset_attestations`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill.
+
+    A row asserts that a human established this asset's sector and backing against a named
+    source. Seeding one for BTC/ETH/PAXG because they happen to be in the current allowlist would
+    fabricate exactly the attestation the screen exists to demand -- and would do it for the three
+    assets the project is most likely to stop questioning. An empty table correctly says nothing
+    has been attested yet.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
     4: _migrate_v4_positions,
     5: _migrate_v5_candle_gap_probes,
+    6: _migrate_v6_asset_attestations,
 }
 
 

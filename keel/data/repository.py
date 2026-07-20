@@ -671,3 +671,44 @@ class Repository:
             )
         self._conn.commit()
         return cursor.rowcount
+
+    # -- asset attestations ---------------------------------------------------
+    # Human-recorded shariah classification for allowlist admission (KB §28.4/§65.5). Absent =
+    # unknown = rejected; see `keel/compliance/screen.py`.
+
+    def upsert_asset_attestation(
+        self,
+        asset: str,
+        sector: str,
+        backing: str,
+        pays_yield: bool,
+        source: str,
+        attested_by: str,
+        attested_at: int,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO asset_attestations
+                (asset, sector, backing, pays_yield, source, attested_by, attested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset) DO UPDATE SET
+                sector = excluded.sector,
+                backing = excluded.backing,
+                pays_yield = excluded.pays_yield,
+                source = excluded.source,
+                attested_by = excluded.attested_by,
+                attested_at = excluded.attested_at
+            """,
+            (asset, sector, backing, int(pays_yield), source, attested_by, attested_at),
+        )
+        self._conn.commit()
+
+    def get_asset_attestation(self, asset: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM asset_attestations WHERE asset = ?", (asset,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_asset_attestations(self) -> list[dict]:
+        rows = self._conn.execute("SELECT * FROM asset_attestations ORDER BY asset").fetchall()
+        return [dict(row) for row in rows]

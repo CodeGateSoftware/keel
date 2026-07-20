@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 5
+    assert version == db.SCHEMA_VERSION == 6
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -194,3 +194,18 @@ def test_an_existing_v1_database_picks_up_the_gap_probes_table_EMPTY() -> None:
     assert count == 0
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert stamped == db.SCHEMA_VERSION
+
+
+def test_migration_to_v6_creates_the_asset_attestations_table_EMPTY() -> None:
+    """Additive DDL, and deliberately NO backfill.
+
+    A row asserts a human established this asset's sector and backing against a named source.
+    Seeding one for the current allowlist would fabricate exactly the attestation the screen
+    exists to demand -- for the three assets the project is most likely to stop questioning.
+    """
+    conn = _v1_database()
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(asset_attestations)")}
+    assert cols >= {"asset", "sector", "backing", "pays_yield", "source", "attested_by"}
+    (count,) = conn.execute("SELECT COUNT(*) FROM asset_attestations").fetchone()
+    assert count == 0
