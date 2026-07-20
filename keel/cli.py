@@ -66,6 +66,7 @@ from keel_core.telemetry import bind_venue
 
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
+from keel.compliance import screen as screen_mod
 from keel.config import Config, load_config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
@@ -454,6 +455,132 @@ def fetch(
         click.echo(
             "\nsome series are still short. Common and usually benign: an asset younger than "
             "the requested window (PAXG-USD), or a bar the venue has not published yet."
+        )
+
+
+# -- assets (allowlist admission screening) -------------------------------------------------
+
+
+@cli.group("assets")
+def assets_group() -> None:
+    """Allowlist admission screening (KB §28.4/§65.5) -- a CURATION gate, not a per-trade rail."""
+
+
+def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.MarketFacts:
+    """Everything the screen can compute for itself from data we already hold."""
+    asset = product.split("-")[0]
+    candles = repo.get_candles(product, Granularity.ONE_DAY)
+    volumes = sorted(c.volume * c.close for c in candles)
+    median = volumes[len(volumes) // 2] if volumes else Decimal(0)
+    return screen_mod.MarketFacts(
+        asset=asset,
+        daily_bars=len(candles),
+        median_daily_volume=median,
+        quotable_in_settlement_currency=product.endswith(f"-{quote}") or bool(candles),
+    )
+
+
+@assets_group.command("screen")
+@click.option("--products", default=None, help="Comma-separated product ids (default: allowlist).")
+@click.pass_context
+@with_disclaimer
+def assets_screen(ctx: click.Context, products: str | None) -> None:
+    """Screen assets for allowlist admission. Unattested assets FAIL CLOSED.
+
+    Sector and backing cannot be derived from price data, so an asset nobody has classified is
+    unknown -- and unknown is a rejection, not a default pass.
+    """
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+    product_list = _parse_products_option(products, config)
+
+    admitted = 0
+    for product in product_list:
+        asset = product.split("-")[0]
+        facts = _market_facts(repo, product, config.quote_currency)
+        raw = repo.get_asset_attestation(asset)
+        attestation = (
+            screen_mod.AssetAttestation(
+                asset=raw["asset"],
+                sector=raw["sector"],
+                backing=raw["backing"],
+                pays_yield=bool(raw["pays_yield"]),
+                source=raw["source"],
+                attested_by=raw["attested_by"],
+                attested_at=raw["attested_at"],
+            )
+            if raw is not None
+            else None
+        )
+        result = screen_mod.screen_asset(facts, attestation)
+        admitted += int(result.admitted)
+
+        click.echo(
+            f"\n{result.summary:<7} {asset:<8} bars={facts.daily_bars} "
+            f"median_daily_volume={facts.median_daily_volume:.0f}"
+        )
+        for failure in result.failures:
+            click.echo(f"    ✗ {failure}")
+        for warning in result.warnings:
+            click.echo(f"    ! {warning}")
+
+    click.echo(f"\n{admitted}/{len(product_list)} admitted")
+
+
+@assets_group.command("attest")
+@click.option("--asset", required=True, help="Asset code, e.g. BTC.")
+@click.option("--sector", required=True, help="Core business line / purpose of the token.")
+@click.option(
+    "--backing",
+    required=True,
+    type=click.Choice(sorted(screen_mod.KNOWN_BACKINGS)),
+    help="'ayn (an owned thing), dayn (a claim on an issuer), or native (a base-layer coin).",
+)
+@click.option("--pays-yield", is_flag=True, default=False, help="Holding it earns a return.")
+@click.option("--source", required=True, help="Where this was established: URL, standard, ruling.")
+@click.option("--attested-by", required=True, help="Who established it.")
+@click.pass_context
+@with_disclaimer
+def assets_attest(
+    ctx: click.Context,
+    asset: str,
+    sector: str,
+    backing: str,
+    pays_yield: bool,
+    source: str,
+    attested_by: str,
+) -> None:
+    """Record an asset's shariah classification. These are facts about the world, not defaults.
+
+    Not passphrase-gated: an attestation cannot itself place an order or raise a cap, and the
+    screen it feeds only ever ADMITS to a list that `guards.py` rail 1 still enforces per-trade.
+    """
+    repo = _open_repo(ctx)
+    repo.upsert_asset_attestation(
+        asset=asset,
+        sector=sector,
+        backing=backing,
+        pays_yield=pays_yield,
+        source=source,
+        attested_by=attested_by,
+        attested_at=int(time.time()),
+    )
+    click.echo(f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield}")
+
+
+@assets_group.command("list")
+@click.pass_context
+def assets_list(ctx: click.Context) -> None:
+    """List recorded attestations."""
+    repo = _open_repo(ctx)
+    rows = repo.get_asset_attestations()
+    if not rows:
+        click.echo("no attestations recorded")
+        return
+    for row in rows:
+        click.echo(
+            f"{row['asset']:<8} sector={row['sector']:<16} backing={row['backing']:<8} "
+            f"pays_yield={bool(row['pays_yield'])!s:<5} by={row['attested_by']}"
         )
 
 
