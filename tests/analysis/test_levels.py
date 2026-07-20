@@ -113,7 +113,12 @@ def test_swing_highs_detects_pivot_indices():
 def test_find_levels_three_bounces_yields_support_level_with_min_three_touches():
     candles = _three_touch_support_series()
 
-    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3)
+    # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
+    # touch separation would collapse every cluster to one touch. They are testing PRICE
+    # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
+    levels = find_levels(
+        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
+    )
 
     support_levels = [lvl for lvl in levels if lvl.kind == "support"]
     assert len(support_levels) == 1
@@ -126,7 +131,12 @@ def test_find_levels_three_bounces_yields_support_level_with_min_three_touches()
 def test_find_levels_three_bounces_yields_resistance_level_with_min_three_touches():
     candles = _three_touch_resistance_series()
 
-    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3)
+    # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
+    # touch separation would collapse every cluster to one touch. They are testing PRICE
+    # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
+    levels = find_levels(
+        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
+    )
 
     resistance_levels = [lvl for lvl in levels if lvl.kind == "resistance"]
     assert len(resistance_levels) == 1
@@ -138,7 +148,12 @@ def test_find_levels_three_bounces_yields_resistance_level_with_min_three_touche
 def test_find_levels_excludes_level_touched_only_twice_at_min_touches_three():
     candles = _two_touch_series()
 
-    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3)
+    # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
+    # touch separation would collapse every cluster to one touch. They are testing PRICE
+    # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
+    levels = find_levels(
+        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
+    )
 
     prices = [lvl.price for lvl in levels]
     assert Decimal("200") not in prices
@@ -147,7 +162,12 @@ def test_find_levels_excludes_level_touched_only_twice_at_min_touches_three():
 def test_find_levels_includes_level_touched_twice_when_min_touches_two():
     candles = _two_touch_series()
 
-    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=2)
+    # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
+    # touch separation would collapse every cluster to one touch. They are testing PRICE
+    # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
+    levels = find_levels(
+        candles, tolerance=Decimal("0.002"), min_touches=2, min_separation_sec=0
+    )
 
     support_levels = [lvl for lvl in levels if lvl.kind == "support"]
     assert len(support_levels) == 1
@@ -221,3 +241,52 @@ def test_nearest_level_returns_none_when_no_levels_of_kind():
     levels = [Level(price=Decimal("99"), kind="resistance", touches=3, angular=False)]
 
     assert nearest_level(Decimal("100"), levels, kind="support") is None
+
+
+# -- minimum touch separation (KB §81.5) ---------------------------------------
+
+
+def _pivot_series(pivot_indices: list[int], step_sec: int) -> list[Candle]:
+    """Bars at `i * step_sec`, dipping to 100 at each pivot index and 104 elsewhere.
+
+    `swing_lows(lookback=2)` needs a pivot strictly lower than every bar within two on each
+    side, so pivot indices must be at least 3 apart and at least 2 from either end.
+    """
+    length = max(pivot_indices) + 3
+    marks = set(pivot_indices)
+    return [
+        _c(i * step_sec, "105", "106", "100" if i in marks else "104", "105")
+        for i in range(length)
+    ]
+
+
+def test_touches_within_the_window_collapse_to_one():
+    """Three pivots inside half a day are ONE visit to the level, not three."""
+    candles = _pivot_series([3, 7, 11], step_sec=3600)
+
+    counted = find_levels(candles, min_touches=1, min_separation_sec=0)
+    separated = find_levels(candles, min_touches=1)
+
+    assert max(level.touches for level in counted) == 3
+    assert max(level.touches for level in separated) == 1
+
+
+def test_touches_two_weeks_apart_count_separately():
+    # 5-day bars, pivots 4 bars apart -> 20 days between touches, clear of the 14-day floor.
+    candles = _pivot_series([3, 7, 11], step_sec=5 * 24 * 3600)
+    separated = find_levels(candles, min_touches=1)
+    assert max(level.touches for level in separated) == 3
+
+
+def test_a_compressed_cluster_no_longer_reaches_min_touches():
+    """The point of the change: tight chop must stop manufacturing 'strong' levels."""
+    candles = _pivot_series([3, 7, 11], step_sec=3600)
+    assert find_levels(candles, min_touches=3, min_separation_sec=0)
+    assert find_levels(candles, min_touches=3) == []
+
+
+def test_separation_is_greedy_from_the_earliest_touch():
+    # 4-day bars at indices 3, 5(+8d: too close), 7(+16d from the first: counts), 11(counts).
+    candles = _pivot_series([3, 7, 11, 15], step_sec=4 * 24 * 3600)
+    levels = find_levels(candles, min_touches=1)
+    assert max(level.touches for level in levels) == 4

@@ -19,6 +19,20 @@ from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
 from keel.types import Candle, Granularity
 
 
+def _rule(**kwargs) -> RsiMeanReversion:
+    """Construct the rule with level TIME-separation disabled.
+
+    These fixtures are ~30 bars stamped at ts 0..29 -- the whole series spans half a minute --
+    so KB §81.5's two-week separation between touches (the shipped default) would collapse
+    every level to a single touch and these tests would be exercising nothing. Each test should
+    control the variable it is not testing; the separation policy has its own tests in
+    `tests/analysis/test_levels.py`, and `test_default_separation_suppresses_compressed_touches`
+    below proves the default is live rather than inert.
+    """
+    kwargs.setdefault("level_min_separation_sec", 0)
+    return RsiMeanReversion(**kwargs)
+
+
 def _c(ts: int, o: str, h: str, low: str, c: str, v: str = "1") -> Candle:
     return Candle(
         ts=ts,
@@ -147,7 +161,7 @@ def _held_setup() -> Setup:
 
 class TestDetectOversoldAtSupport:
     def test_oversold_bounce_at_support_returns_long_setup(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _oversold_at_support_series()
         setup = rule.detect({Granularity.ONE_HOUR: candles})
 
@@ -161,7 +175,7 @@ class TestDetectOversoldAtSupport:
         assert setup.ts == candles[-1].ts
 
     def test_setup_context_carries_indicator_values(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _oversold_at_support_series()
         setup = rule.detect({Granularity.ONE_HOUR: candles})
 
@@ -171,47 +185,47 @@ class TestDetectOversoldAtSupport:
         assert setup.context["support_touches"] >= 3
 
     def test_missing_timeframe_returns_none(self) -> None:
-        rule = RsiMeanReversion(timeframe=Granularity.ONE_HOUR)
+        rule = _rule(timeframe=Granularity.ONE_HOUR)
         candles = _oversold_at_support_series()
         assert rule.detect({Granularity.FIFTEEN_MINUTE: candles}) is None
 
     def test_too_few_candles_returns_none(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _oversold_at_support_series()[:5]
         assert rule.detect({Granularity.ONE_HOUR: candles}) is None
 
 
 class TestDetectMidRsiNoSignal:
     def test_mid_rsi_returns_none(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _mid_rsi_series()
         assert rule.detect({Granularity.ONE_HOUR: candles}) is None
 
 
 class TestDivergenceGate:
     def test_require_divergence_false_ignores_absence_of_divergence(self) -> None:
-        rule = RsiMeanReversion(require_divergence=False, level_min_touches=2)
+        rule = _rule(require_divergence=False, level_min_touches=2)
         candles = _divergence_series(new_low=False)
         setup = rule.detect({Granularity.ONE_HOUR: candles})
         assert setup is not None
         assert setup.context["divergence"] is None
 
     def test_require_divergence_true_with_divergence_present_returns_setup(self) -> None:
-        rule = RsiMeanReversion(require_divergence=True, level_min_touches=2)
+        rule = _rule(require_divergence=True, level_min_touches=2)
         candles = _divergence_series(new_low=True)
         setup = rule.detect({Granularity.ONE_HOUR: candles})
         assert setup is not None
         assert setup.context["divergence"] == "bullish"
 
     def test_require_divergence_true_without_divergence_returns_none(self) -> None:
-        rule = RsiMeanReversion(require_divergence=True, level_min_touches=2)
+        rule = _rule(require_divergence=True, level_min_touches=2)
         candles = _divergence_series(new_low=False)
         assert rule.detect({Granularity.ONE_HOUR: candles}) is None
 
 
 class TestStopAndTargetMethods:
     def test_fixed_stop_method_uses_fixed_pct_below_entry(self) -> None:
-        rule = RsiMeanReversion(
+        rule = _rule(
             stop_method="fixed",
             fixed_stop_pct=Decimal("0.10"),
             target_method="fixed_rr",
@@ -224,7 +238,7 @@ class TestStopAndTargetMethods:
         assert setup.rr == Decimal("2")
 
     def test_nearest_resistance_falls_back_to_fixed_rr_when_no_resistance(self) -> None:
-        rule = RsiMeanReversion(target_method="nearest_resistance", fixed_rr=Decimal("2"))
+        rule = _rule(target_method="nearest_resistance", fixed_rr=Decimal("2"))
         candles = _oversold_at_support_series()
         setup = rule.detect({Granularity.ONE_HOUR: candles})
         assert setup is not None
@@ -233,37 +247,55 @@ class TestStopAndTargetMethods:
 
 class TestExitSignalOverbought:
     def test_overbought_rsi_triggers_exit(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _overbought_series()
         held = _held_setup()
         assert rule.exit_signal(held, {Granularity.ONE_HOUR: candles}) is True
 
     def test_mid_rsi_does_not_trigger_exit(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _mid_rsi_series()
         held = _held_setup()
         assert rule.exit_signal(held, {Granularity.ONE_HOUR: candles}) is False
 
     def test_oversold_does_not_trigger_exit(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         candles = _oversold_at_support_series()
         held = _held_setup()
         assert rule.exit_signal(held, {Granularity.ONE_HOUR: candles}) is False
 
     def test_missing_timeframe_does_not_trigger_exit(self) -> None:
-        rule = RsiMeanReversion(timeframe=Granularity.ONE_HOUR)
+        rule = _rule(timeframe=Granularity.ONE_HOUR)
         held = _held_setup()
         assert rule.exit_signal(held, {Granularity.FIFTEEN_MINUTE: []}) is False
 
 
 class TestDescribe:
     def test_describe_returns_name_and_params(self) -> None:
-        rule = RsiMeanReversion(oversold=25.0, overbought=75.0)
+        rule = _rule(oversold=25.0, overbought=75.0)
         described = rule.describe()
         assert described["name"] == "rsi_meanrev"
         assert described["params"]["oversold"] == 25.0
         assert described["params"]["overbought"] == 75.0
 
     def test_name_attribute(self) -> None:
-        rule = RsiMeanReversion()
+        rule = _rule()
         assert rule.name == "rsi_meanrev"
+
+
+def test_default_separation_suppresses_compressed_touches() -> None:
+    """Proves KB §81.5's default is LIVE, not inert.
+
+    The same series that produces a setup with separation disabled produces none at the shipped
+    default, because its three "touches" all fall inside half a minute and are therefore one
+    visit to the level, not three independent tests of it.
+    """
+    candles = _oversold_at_support_series()
+    assert _rule().detect({Granularity.ONE_HOUR: candles}) is not None
+    assert RsiMeanReversion().detect({Granularity.ONE_HOUR: candles}) is None
+
+
+def test_separation_is_reported_in_params() -> None:
+    from keel.analysis.levels import MIN_TOUCH_SEPARATION_SEC
+
+    assert RsiMeanReversion().params["level_min_separation_sec"] == MIN_TOUCH_SEPARATION_SEC

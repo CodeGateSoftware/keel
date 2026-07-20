@@ -16,6 +16,7 @@ No third-party numeric dependencies (no numpy/pandas) — everything below is ha
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from typing import Literal
 
@@ -367,3 +368,92 @@ def deceleration(candles: list[Candle], n: int = 3) -> bool:
     recent = candles[-n:]
     bodies = [abs(float(c.close - c.open)) for c in recent]
     return all(bodies[i] > bodies[i + 1] for i in range(len(bodies) - 1))
+
+
+# -- Yang-Zhang volatility (KB §79.9) ------------------------------------------
+# Trading periods per year. The source uses 261 (equity trading days); 24/7 spot crypto has
+# no closed days, so 365 is the correct analogue. Stated rather than inherited, because
+# swapping this constant rescales every annualised sigma this function returns.
+YZ_PERIODS_PER_YEAR = 365
+
+
+def yang_zhang_volatility(
+    candles: list[Candle], window: int = 60, periods_per_year: int = YZ_PERIODS_PER_YEAR
+) -> float | None:
+    """Annualised Yang-Zhang volatility over the last `window` bars (KB §79.9).
+
+    Yang & Zhang (2000): the first unbiased estimator independent of both the opening jump and
+    the drift, and the most efficient of the range estimators. It extracts more information
+    about volatility from the SAME OHLC data we already store -- a pure estimation improvement,
+    not a parameter choice, so it does NOT increment the trials budget (§73.12).
+
+        sigma^2_YZ = sigma^2_OPEN + k*sigma^2_STDEV + (1-k)*sigma^2_RS
+        k = 0.34 / (1.34 + (D+1)/(D-1))
+
+    ⚠️ **The overnight term degenerates on 24/7 spot.** `sigma^2_OPEN` measures the gap between
+    one close and the next open; a continuous market has `O(t) ~= C(t-1)`, so that term tends to
+    zero and the estimator reduces to `k*STDEV + (1-k)*RS`. That is not a defect -- it stays
+    well defined via the Rogers-Satchell component -- but the source's "~8x more efficient than
+    close-to-close" figure is derived for GAPPING markets. **Do not quote 8x for crypto without
+    measuring it on our own candles**; see `docs/experiments/2026-07-20-yang-zhang-efficiency.md`
+    for the measurement actually performed here.
+
+    ⛔ **MEASURED AND NOT ADOPTED FOR CRYPTO.** The re-verification the KB asked for was run
+    (`docs/experiments/2026-07-20-yang-zhang-efficiency.md`): against a high-frequency realized-
+    volatility benchmark the efficiency is **1.01x on BTC, 0.81x on ETH, 0.45x on PAXG** -- no
+    gain, and worse on two of three -- and Yang-Zhang is biased UPWARD by +0.03..+0.055
+    annualised where close-to-close is near-unbiased. So it is deliberately **not** wired into
+    ATR sizing, the 2N stop, the correlation rail or the shock detector: a systematically high
+    sigma would widen stops and shrink sizes across the board. Kept because the measurement must
+    stay reproducible, and because a gapping venue (equities, futures) is where it would pay.
+
+    Returns `None` when there are too few bars (needs `window + 1`, since the overnight and
+    close-to-close terms both look back one bar).
+    """
+    if window < 2 or len(candles) < window + 1:
+        return None
+
+    recent = candles[-(window + 1) :]
+    opens, closes = [], []
+    rs_terms = []
+    for previous, current in zip(recent, recent[1:]):
+        prev_close = math.log(float(previous.close))
+        o = math.log(float(current.open))
+        h = math.log(float(current.high))
+        low = math.log(float(current.low))
+        c = math.log(float(current.close))
+
+        opens.append(o - prev_close)  # overnight jump
+        closes.append(c - prev_close)  # close-to-close
+        # Rogers-Satchell, drift-independent, measured from the bar's own open.
+        rs_terms.append((h - o) * (h - c) + (low - o) * (low - c))
+
+    count = len(closes)
+    scale = periods_per_year / count
+
+    mean_close = sum(closes) / count
+    mean_open = sum(opens) / count
+    var_stdev = scale * sum((r - mean_close) ** 2 for r in closes)
+    var_open = scale * sum((o - mean_open) ** 2 for o in opens)
+    var_rs = scale * sum(rs_terms)
+
+    k = 0.34 / (1.34 + (count + 1) / (count - 1))
+    variance = var_open + k * var_stdev + (1 - k) * var_rs
+    return math.sqrt(variance) if variance > 0 else 0.0
+
+
+def close_to_close_volatility(
+    candles: list[Candle], window: int = 60, periods_per_year: int = YZ_PERIODS_PER_YEAR
+) -> float | None:
+    """Annualised close-to-close volatility -- the baseline Yang-Zhang is compared against."""
+    if window < 2 or len(candles) < window + 1:
+        return None
+    recent = candles[-(window + 1) :]
+    returns = [
+        math.log(float(current.close)) - math.log(float(previous.close))
+        for previous, current in zip(recent, recent[1:])
+    ]
+    count = len(returns)
+    mean = sum(returns) / count
+    variance = (periods_per_year / count) * sum((r - mean) ** 2 for r in returns)
+    return math.sqrt(variance) if variance > 0 else 0.0

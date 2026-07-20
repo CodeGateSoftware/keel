@@ -17,7 +17,12 @@ from decimal import Decimal
 from typing import Literal
 
 from keel.analysis.indicators import atr, rsi, rsi_divergence
-from keel.analysis.levels import Level, find_levels, nearest_level
+from keel.analysis.levels import (
+    MIN_TOUCH_SEPARATION_SEC,
+    Level,
+    find_levels,
+    nearest_level,
+)
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
 
@@ -43,6 +48,8 @@ class RsiMeanReversion(Rule):
     fixed_rr: Decimal = Decimal("2")
     level_tolerance: Decimal = Decimal("0.002")
     level_min_touches: int = 3
+    # KB §81.5: pivots inside one consolidation are one visit to a level, not several.
+    level_min_separation_sec: int = MIN_TOUCH_SEPARATION_SEC
     support_proximity_pct: Decimal = Decimal("0.005")
     divergence_lookback: int = 20
     timeframe: Granularity = Granularity.ONE_HOUR
@@ -65,6 +72,7 @@ class RsiMeanReversion(Rule):
             "fixed_rr": self.fixed_rr,
             "level_tolerance": self.level_tolerance,
             "level_min_touches": self.level_min_touches,
+            "level_min_separation_sec": self.level_min_separation_sec,
             "support_proximity_pct": self.support_proximity_pct,
             "divergence_lookback": self.divergence_lookback,
             "timeframe": self.timeframe.value,
@@ -87,7 +95,10 @@ class RsiMeanReversion(Rule):
             return None
 
         levels = find_levels(
-            candles[:-1], tolerance=self.level_tolerance, min_touches=self.level_min_touches
+            candles[:-1],
+            tolerance=self.level_tolerance,
+            min_touches=self.level_min_touches,
+            min_separation_sec=self.level_min_separation_sec,
         )
         support = nearest_level(candles[-1].low, levels, kind="support")
         if support is None:
