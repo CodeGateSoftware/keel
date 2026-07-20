@@ -66,6 +66,7 @@ from keel_core.telemetry import bind_venue
 
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
+from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
 from keel.config import Config, load_config
 from keel.data import freshness as freshness_mod
@@ -656,6 +657,50 @@ def assets_list(ctx: click.Context) -> None:
         click.echo(
             f"{row['asset']:<8} sector={row['sector']:<16} backing={row['backing']:<8} "
             f"pays_yield={bool(row['pays_yield'])!s:<5} by={row['attested_by']}"
+        )
+
+
+@cli.command("purification")
+@click.pass_context
+@with_disclaimer
+def purification(ctx: click.Context) -> None:
+    """Report non-compliant income owed to charity (KB §65.9).
+
+    ⛔ REPORT-ONLY. The agent never disposes of funds -- it computes an amount owed and says so,
+    exactly as the zakat estimate does. Moving it is the operator's act.
+
+    Any credit that is not sale proceeds, an own deposit, or an asset transfer -- interest,
+    rewards, staking, rebates, promotional yield -- is segregated here, excluded from realised
+    P&L, and reported as owed. Unrecognised types are surfaced for review rather than silently
+    treated either way.
+    """
+    repo = _open_repo(ctx)
+    report = purification_mod.build_report(repo.get_transactions())
+
+    if not report.entries and not report.needs_review:
+        click.echo("no non-compliant credits found")
+        return
+
+    if report.entries:
+        click.echo(f"non-compliant credits: {len(report.entries)}")
+        click.echo(f"\n{'asset':<8} {'units received':>20} {'owed (USD)':>14}")
+        qty_by_asset = report.qty_by_asset
+        for asset, owed in report.owed_by_asset.items():
+            click.echo(f"{asset:<8} {qty_by_asset.get(asset, Decimal(0)):>20} {owed:>14.2f}")
+        click.echo(f"\nTOTAL OWED TO CHARITY: ${report.total_owed_usd:.2f}")
+        click.echo(
+            "\nThis is excluded from realised P&L and from the equity base sizing computes "
+            "from -- otherwise riba would compound into position size (§65.9). Zakat, if "
+            "estimated, is on purified wealth, so this runs first."
+        )
+
+    if report.needs_review:
+        click.echo(f"\n⚠️  {len(report.needs_review)} credit(s) of UNRECOGNISED type need review:")
+        for entry in report.needs_review[:20]:
+            click.echo(f"    {entry.tx_type!r} {entry.asset} qty={entry.qty} ${entry.amount_usd}")
+        click.echo(
+            "    Classified neither way on purpose: calling them clean would let riba into "
+            "P&L, calling them non-compliant would state an obligation as fact."
         )
 
 
