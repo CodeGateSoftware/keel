@@ -26,7 +26,7 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import guards
-from keel.execution.guards import GuardResult, OrderIntent, check
+from keel.execution.guards import LIVE_STATE_RAILS, GuardResult, OrderIntent, check
 from keel.types import Side
 from tests.conftest import attest_subscription
 
@@ -953,3 +953,48 @@ def test_rail17_is_ENTRIES_ONLY_sells_are_never_blocked(repo: Repository) -> Non
         intent = _intent(side=Side.SELL, withdrawals_enabled=state)
         result = check(intent, repo, _config(), NOW_TS)
         assert "withdrawal_capability" not in _keys(result), state
+
+
+# -- offline mode (paper trading only) -----------------------------------------
+
+
+def test_offline_skips_ONLY_the_live_state_rails_and_records_them(repo: Repository) -> None:
+    """Paper has no live account, so rails 13/17 cannot be evaluated -- but the skip is RECORDED.
+
+    A paper track record that silently omitted checks would promote a strategy on evidence of
+    trades live trading would have vetoed. That is what the proving gate exists to prevent.
+    """
+    intent = _intent(available_quote=None, withdrawals_enabled=None)
+
+    live = check(intent, repo, _config(), NOW_TS)
+    assert "usdc_funding" in _keys(live)
+    assert "withdrawal_capability" in _keys(live)
+    assert live.skipped_rails == []
+
+    offline = check(intent, repo, _config(), NOW_TS, offline=True)
+    assert "usdc_funding" not in _keys(offline)
+    assert "withdrawal_capability" not in _keys(offline)
+    assert set(offline.skipped_rails) == set(LIVE_STATE_RAILS)
+
+
+def test_offline_still_enforces_every_other_rail(repo: Repository) -> None:
+    """The whole point: offline is not "rails off"."""
+    intent = _intent(product_id="DOGE-USD", available_quote=None, withdrawals_enabled=None)
+    offline = check(intent, repo, _config(), NOW_TS, offline=True)
+    assert "halal_allowlist" in _keys(offline)
+    assert offline.ok is False
+
+
+def test_offline_still_honours_the_kill_switch(repo: Repository) -> None:
+    """Killing the agent must stop paper too, or the kill-switch means less than it says."""
+    repo.set_state("kill_switch", True)
+    offline = check(
+        _intent(available_quote=None, withdrawals_enabled=None), repo, _config(), NOW_TS,
+        offline=True,
+    )
+    assert offline.ok is False
+
+
+def test_a_clean_intent_passes_offline_without_live_state(repo: Repository) -> None:
+    intent = _intent(available_quote=None, withdrawals_enabled=None)
+    assert check(intent, repo, _config(), NOW_TS, offline=True).ok is True

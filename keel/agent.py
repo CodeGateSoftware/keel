@@ -67,10 +67,11 @@ from keel.config import Config
 from keel.data import market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
-from keel.execution import executor, reconcile, streak
+from keel.execution import executor, guards, reconcile, streak
 from keel.execution.executor import ExecutionResult, _fetch_available_quote
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
+from keel.strategy.paper import PaperTrader
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
@@ -320,6 +321,73 @@ def _mark_to_market_equity(
     return total
 
 
+def _paper_resolve_bars(
+    trader: PaperTrader,
+    product_id: str,
+    candles_by_tf: dict,
+    granularities: list,
+) -> None:
+    """Advance the paper position on the newest bar so stops and targets can fire.
+
+    Live trading resolves stops at the broker; paper has to be walked forward explicitly, or
+    positions would only ever close on an explicit rule exit and the track record would be all
+    winners-that-never-stopped-out.
+
+    Uses the FINEST available timeframe -- a stop is touched intrabar, and a daily bar would
+    miss touches a shorter bar sees.
+    """
+    for granularity in granularities:
+        candles = candles_by_tf.get(granularity) or []
+        if candles:
+            trader.on_candle(product_id, candles[-1])
+            return
+
+
+def _paper_enter(
+    trader: PaperTrader,
+    signal: Signal,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
+) -> executor.ExecutionResult:
+    """Run the offline-computable rails, then record a paper fill if they pass.
+
+    Paper runs the rails DELIBERATELY (see `guards.check`'s `offline` docstring): the promotion
+    gate is scored on this track record, so a rehearsal that skipped them would promote a
+    strategy on evidence of trades live trading would have vetoed.
+
+    `broker=None` is passed to `_build_intent` on purpose: `_fetch_available_quote` returns
+    `None` for a null broker without logging, and rail 13 -- the rail that would have consumed
+    that balance -- is one of the two `offline=True` skips anyway, because paper has no live
+    account to read a balance from.
+    """
+    def _result(placed, order_id=None, vetoed_by=None, reason=""):
+        return ExecutionResult(
+            placed=placed,
+            order_id=order_id,
+            vetoed_by=list(vetoed_by or []),
+            preview=None,
+            reason=reason,
+        )
+
+    intent = executor._build_intent(signal, None, repo, config, now_ts)
+    if intent is None:
+        return _result(False, reason="paper: nothing to size")
+
+    verdict = guards.check(intent, repo, config, now_ts, offline=True)
+    if not verdict.ok:
+        return _result(False, vetoed_by=verdict.violations, reason="paper: vetoed by rails")
+
+    order_id = trader.on_signal(signal)
+    if order_id is None:
+        return _result(False, reason="paper: no fill (position already open)")
+    return _result(
+        True,
+        order_id=order_id,
+        reason=f"paper: filled (skipped rails: {', '.join(verdict.skipped_rails)})",
+    )
+
+
 def _handle_exits(
     product_id: str,
     product_rules: list[Rule],
@@ -542,7 +610,13 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                 ts=now_ts, skipped=True, skip_reason="kill_switch", mode=None, polled=0
             )
 
-        rules = [_build_rule(row) for row in repo.get_rules("live")]
+        # Which rules run depends on the MODE, because the lifecycle is
+        # candidate -> paper -> live (`promotion._PROMOTE_NEXT`). Paper mode exists to prove
+        # `paper`-status rules FORWARD before they earn real money; loading `live` rules there
+        # would rehearse what is already trading and never advance a candidate, which is the
+        # opposite of what the proving gate is for.
+        rule_status = "paper" if config.auto_trade.mode == "paper" else "live"
+        rules = [_build_rule(row) for row in repo.get_rules(rule_status)]
         products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
         granularities = list(config.market_data.granularities)
 
@@ -561,6 +635,10 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
         repo.set_state("last_feed_ts", now_ts)
 
         mode, bypass_refused_reason = _confirm_or_bypass(config, repo, now_ts)
+        # `mode: paper` is not an executor mode (see `_confirm_or_bypass`); it routes to the
+        # PAPER path instead, which never touches the broker. Constructed once per cycle and
+        # rehydrated from the orders table, so a per-cycle agent resumes its open positions.
+        paper_trader = PaperTrader(repo) if config.auto_trade.mode == "paper" else None
         if bypass_refused_reason is not None:
             log_event(
                 logger, logging.WARNING, "agent.bypass_refused", reason=bypass_refused_reason
@@ -592,12 +670,26 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                 if product_candles:
                     latest_price_by_product[product_id] = product_candles[-1].close
 
-        equity_now = _mark_to_market_equity(
-            repo, broker, products, latest_price_by_product, config.quote_currency
+        # Paper never touches the broker. Mark-to-market needs the live quote balance, which a
+        # rehearsal has no claim on -- so rail 11's scalars simply do not advance in paper, the
+        # same "leave the previous cycle's values in place" behaviour as an unavailable broker.
+        # Stated explicitly rather than relying on the fetch failing and being logged as an
+        # error, which is what happened before: paper looked broker-free only by accident.
+        equity_now = (
+            None
+            if paper_trader is not None
+            else _mark_to_market_equity(
+                repo, broker, products, latest_price_by_product, config.quote_currency
+            )
         )
         if equity_now is None:
             # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
-            log_event(logger, logging.WARNING, "agent.equity_unavailable")
+            log_event(
+                logger,
+                logging.INFO if paper_trader is not None else logging.WARNING,
+                "agent.equity_unavailable",
+                paper=paper_trader is not None,
+            )
         else:
             equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
 
@@ -618,6 +710,9 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
 
             product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
             candles_by_tf = {g: repo.get_candles(product_id, g) for g in granularities}
+
+            if paper_trader is not None:
+                _paper_resolve_bars(paper_trader, product_id, candles_by_tf, granularities)
 
             product_exit_results = _handle_exits(
                 product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts
@@ -644,9 +739,12 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
             )
             for signal in product_signals:
                 enter_signals.append(signal)
-                result = executor.execute(
-                    signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
-                )
+                if paper_trader is not None:
+                    result = _paper_enter(paper_trader, signal, repo, config, now_ts)
+                else:
+                    result = executor.execute(
+                        signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
+                    )
                 enter_results.append(result)
                 log_event(
                     logger,

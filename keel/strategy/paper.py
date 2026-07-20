@@ -74,6 +74,58 @@ class PaperTrader:
         self._fee_pct = fee_pct
         self._slippage_pct = slippage_pct
         self._open: dict[str, _OpenPaperPosition] = {}
+        self._load_open_positions()
+
+    def _load_open_positions(self) -> None:
+        """Rebuild open paper positions from the orders table.
+
+        ⚠️ **Required for scheduled operation, not a nicety.** Open positions used to live only
+        in this object's memory, so a per-cycle agent (a cron/launchd run, or any process
+        restart) would construct a fresh trader that had forgotten every open position: it would
+        never exit them, and would re-enter the same instrument on the next signal. The paper
+        track record -- which the promotion gate is scored on -- would have been silently full
+        of unclosed entries.
+
+        Pairing is exact rather than heuristic: every exit payload carries the
+        `entry_order_id` it closed, so an entry whose id never appears in an exit is open.
+        """
+        orders = self._repo.get_orders(mode="paper")
+        closed_entry_ids: set[int] = set()
+        entries: list[tuple[int, dict, dict]] = []
+
+        for order in orders:
+            try:
+                payload = json.loads(order.get("raw_response") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("role") == "exit":
+                entry_id = payload.get("entry_order_id")
+                if entry_id is not None:
+                    closed_entry_ids.add(int(entry_id))
+            elif payload.get("role") == "entry":
+                entries.append((int(order["id"]), order, payload))
+
+        for order_id, order, payload in entries:
+            if order_id in closed_entry_ids:
+                continue
+            product_id = order["product_id"]
+            setup = Setup(
+                product_id=product_id,
+                direction="long",
+                entry=Decimal(payload["entry"]),
+                stop=Decimal(payload["stop"]),
+                target=Decimal(payload["target"]),
+                context={},
+                ts=int(payload.get("ts") or order.get("created_at") or 0),
+            )
+            self._open[product_id] = _OpenPaperPosition(
+                rule_name=payload.get("rule_name") or "",
+                product_id=product_id,
+                setup=setup,
+                entry_order_id=order_id,
+                entry_fill=Decimal(payload["entry"]),
+                entry_ts=setup.ts,
+            )
 
     def has_open_position(self, product_id: str) -> bool:
         return product_id in self._open

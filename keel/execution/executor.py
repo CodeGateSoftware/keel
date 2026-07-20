@@ -264,6 +264,11 @@ def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
     the one broker call `execute()` makes *before* `guards.check` runs: it's an input the rail
     needs, not itself something the guard gate protects (no funds move, no order is placed).
     """
+    if broker is None:
+        # Paper mode passes no broker. That is not an error and must not be logged as one --
+        # an ERROR per paper entry would fill the operator's log with noise about a condition
+        # that is expected and already handled (rail 13 is skipped offline).
+        return None
     try:
         accounts = broker.get_accounts()
     except Exception:

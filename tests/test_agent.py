@@ -13,6 +13,7 @@ it's modeled on -- against an in-memory `Repository` (`connect(":memory:")`).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -920,3 +921,142 @@ def test_a_rule_exit_clears_the_stop_and_target_state(repo: Repository) -> None:
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
     assert repo.get_state(f"open_stop:{PRODUCT}") is None
     assert repo.get_state(f"open_target:{PRODUCT}") is None
+
+
+# -- paper mode (KB: the proving gate's evidence source) ------------------------
+
+
+class _MarketDataOnlyBroker(FakeBroker):
+    """Paper's real contract: it may read MARKET DATA, but must never place an order or read
+    ACCOUNT state.
+
+    Polling fresh candles legitimately needs the venue -- the same read-only market-data access
+    `keel fetch` uses. What paper must not do is place orders or touch balances/positions, so
+    those explode.
+    """
+
+    def place_order(self, *a, **k):
+        raise AssertionError("paper mode placed an order")
+
+    def preview_order(self, *a, **k):
+        raise AssertionError("paper mode previewed an order")
+
+    def get_accounts(self, *a, **k):
+        raise AssertionError("paper mode read account state")
+
+
+class _AlwaysEnterRule(Rule):
+    """Fires an ENTER on every bar, so one cycle is enough to exercise the paper fill path."""
+
+    def __init__(
+        self, product_id: str, name: str = "fake_enter", stop_mult: str = "0.95"
+    ) -> None:
+        self.name = name
+        self.product_id = product_id
+        self.stop_mult = Decimal(stop_mult)
+        self.params: dict = {"product_id": product_id}
+
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        candles = next((c for c in candles_by_tf.values() if c), [])
+        if not candles:
+            return None
+        last = candles[-1]
+        return Setup(
+            product_id=self.product_id,
+            direction="long",
+            entry=last.close,
+            stop=last.close * self.stop_mult,
+            target=last.close * Decimal("1.15"),
+            context={},
+            ts=last.ts,
+        )
+
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
+        return False
+
+    def describe(self) -> dict:
+        return {"name": self.name, "params": self.params}
+
+
+def _paper_config(**over):
+    # Roomy caps: these tests are about the PAPER ROUTING, not about rails 2/6, which have their
+    # own coverage in test_guards. The allowlist rail is left binding on purpose -- one test
+    # below relies on it to prove paper still enforces the offline rails.
+    over.setdefault(
+        "caps",
+        Caps(
+            max_per_order_usd=Decimal("10000000"),
+            max_per_day_usd=Decimal("10000000"),
+            max_exposure_usd=Decimal("10000000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+    )
+    cfg = _config(**over)
+    return replace(cfg, auto_trade=replace(cfg.auto_trade, mode="paper"))
+
+
+def _seed_rule(repo, monkeypatch, rule, status="paper"):
+    """Paper mode loads `paper`-status rules -- the proving gate's middle stage, not `live`."""
+    repo.insert_rule(rule.name, {"product_id": rule.product_id}, status=status)
+    monkeypatch.setattr(agent, "_build_rule", lambda row: rule)
+
+
+def test_paper_mode_records_a_fill_and_never_places_or_reads_account_state(repo, monkeypatch):
+    from keel.strategy.paper import track_record
+
+    """The end-to-end that was missing entirely: mode=paper now actually trades on paper.
+
+    Before this, `mode: paper` silently degraded to confirm-with-no-callback -- the loop polled,
+    evaluated, and recorded NOTHING, while looking like it was paper trading.
+    """
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert result.skipped is False
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    assert orders[0]["side"] == Side.BUY.value
+    assert track_record(repo, "fake_enter").n_trades >= 0
+
+
+def test_paper_mode_still_enforces_the_offline_rails(repo, monkeypatch):
+    """Paper runs the rails deliberately -- the promotion gate is scored on this record."""
+    # A 0.01% entry-to-stop move trips rail 7 (min-move / anti-scalping) -- an OFFLINE-computable
+    # rail, so paper must still enforce it. (An out-of-allowlist product would not prove this:
+    # the product loop filters on the allowlist before any rail is reached.)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT, stop_mult="0.9999"))
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_orders(mode="paper") == []
+    assert any("vetoed by rails" in (r.reason or "") for r in result.enter_results)
+    vetoes = [v for r in result.enter_results for v in r.vetoed_by]
+    assert any("min_move_anti_scalping" in v for v in vetoes), vetoes
+
+
+def test_paper_mode_obeys_the_kill_switch(repo, monkeypatch):
+    repo.set_state("kill_switch", True)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert repo.get_orders(mode="paper") == []
+
+
+def test_paper_mode_loads_PAPER_status_rules_not_live_ones(repo, monkeypatch):
+    """The proving gate is candidate -> paper -> live.
+
+    Loading `live` rules in paper mode would rehearse what is already trading and never advance
+    a candidate -- the opposite of what paper trading is for.
+    """
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_orders(mode="paper") == [], "a LIVE rule must not trade in paper mode"
