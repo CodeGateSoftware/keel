@@ -33,6 +33,47 @@ changes is permanently unavailable to all three tools, and §78.4 showed `V` alo
 - **Pausing deployment.** §78.12 rule 2: the ledger must land before the next *sweep*, but not before
   the next *trade*. Running the shipped 40/20 rule increments `T` and increments nothing else.
 
+## 2.1 Three things called "ledger" — and why they must not converge
+
+The word is overloaded in this project. Three distinct records exist or are planned, and conflating
+them is the most likely way a future reader misreads this spec.
+
+| | what it records | store | in git? |
+|---|---|---|---|
+| **Trials ledger** *(this spec)* | experiments: configurations tried, provenance, outcome | JSONL, hash-chained | **yes** |
+| **Trade record** *(already built)* | live orders, fills, positions, realised P&L | `keel.db` — `orders`, `positions`, `transactions`, `trade_outcomes`, `pnl_daily`, `journal` | **never** |
+| **Purification ledger** *(§65.9, queued)* | interest/reward/yield requiring purification | TBD, compliance-owned | **never** |
+
+**This spec covers only the first.** It records experiments, not money. A row is *"swept
+`donchian_entry_n` over {20,40,55}, selected 40, provenance `fitted`"* — never a fill, a balance, or a
+position.
+
+⚠️ **The git-tracking decision in §4.1 is safe only because of that boundary.** The trials ledger holds
+parameter dicts and P&L series derived from simulations over public candle data — no personal or
+financial information. The trade record holds the opposite, and **this repository has already had a PII
+incident on exactly that data**: `transactions/` was purged from all history with `git-filter-repo` and
+force-pushed. Routing live trades into a git-tracked file would walk directly back into it.
+
+The two also differ on every operational axis: the trials ledger is small (hundreds of rows over years),
+reviewed by humans in diffs, must survive `keel.db` being deleted, and its adversary is motivated
+self-deception. The trade record is high-volume, machine-consumed, private, and its adversary is data
+loss. Different threat models, different stores.
+
+### Scoping: per research program, not per user
+
+The trials ledger is **not per-user**. A trials budget is spent by whoever develops the rule library, so
+the ledger is a property of **the shipped rule library** — closer to a nutrition label than to user
+data. Anyone trading the Turtle inherits the same `M`, the same MinBTL and the same PBO, because they
+are trading the same searched-for parameters. Trade records, by contrast, are per-user by definition.
+
+⚠️ **Recorded for the future, not scoped here:** if end users were ever allowed to sweep their own
+parameters, per-user ledgers would *systematically understate* the problem. A thousand users each
+keeping an individually-correct ledger yields a population-level `M` a thousand times larger than any
+single ledger shows, while the winners are selected across the whole population. That is §78.7's
+file-drawer problem at platform scale, hidden by construction rather than revealed. ⇒ **"let users tune
+their own parameters" carries a hidden statistical cost** and must not be adopted as an obvious feature
+without addressing it. (SaaS remains unscheduled and gated on legal/licensing/broker-ToS.)
+
 ## 3. Module layout
 
 A new package `keel/research/` — validation *of the research process*, distinct from `keel/sim/`
@@ -40,8 +81,12 @@ A new package `keel/research/` — validation *of the research process*, distinc
 rail forbids these statistics from reaching the selection path, and a package boundary makes that
 dependency direction visible.
 
+`ledger.py`'s API is deliberately narrow — `append()`, `read()`, `verify_chain()` — so the JSONL store
+can be replaced without touching `cscv.py` or `promotion.py`. That is the whole of the concession to a
+possible future multi-tenant backend (§2.1); nothing further is built for it.
+
 ```
-keel/research/ledger.py    TrialRecord, append(), read(), verify_chain()
+keel/research/ledger.py    TrialRecord, append(), read(), verify_chain()   ← narrow API on purpose
 keel/research/cscv.py      pbo() + the three §78.8 companions
 keel/research/matrix.py    builds the (T × N) matrix from a declared candidate grid
 ```
