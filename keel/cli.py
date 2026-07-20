@@ -6,13 +6,18 @@ Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_im
 `rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
 `promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
 Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
+`resume-entries` (clear an armed rail-16 consecutive-loss halt), `record-flow`
+(declare a deposit/withdrawal so rail 11 does not read it as P&L) and `reset-hwm`
+(reset rail 11's high-water mark),
 `subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live), and a
 Phase-4 `insights` stub.
 
 **Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
 `{arm_bypass, raise_caps, disable_killswitch, unlock_vault}` require the passphrase gate. In this
 CLI's surface that's `agent --bypass` and `arm-bypass` (both map to the `arm_bypass` action) and
-`resume` (`disable_killswitch`) -- `kill` (engaging the kill-switch) and `disarm-bypass` are
+`resume`, `resume-entries`, `record-flow` and `reset-hwm` (all `disable_killswitch` --
+each either releases a tripped breaker or rebases the state one reads) -- `kill`
+(engaging the kill-switch) and `disarm-bypass` are
 *safe* actions (they only ever reduce capability) and are always allowed; every other command
 here is read-only or a local rules-table/DB mutation with no live-trading blast radius, so per
 the plan ("read-only commands require no passphrase") they are not gated. There is no CLI surface

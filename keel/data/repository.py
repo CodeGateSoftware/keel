@@ -489,6 +489,97 @@ class Repository:
             for row in rows
         ]
 
+    # -- positions: the per-tranche ledger ---------------------------------
+
+    def open_position(
+        self,
+        *,
+        product_id: str,
+        rule_name: str,
+        opened_at: int,
+        qty: Decimal,
+        entry_fill: Decimal,
+        entry_fee: Decimal,
+        bracket_order_id: int | None = None,
+    ) -> int:
+        """Record a newly opened tranche and return its id."""
+        cursor = self._conn.execute(
+            """
+            INSERT INTO positions
+                (product_id, rule_name, opened_at, qty, entry_fill, entry_fee,
+                 bracket_order_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            """,
+            (
+                product_id,
+                rule_name,
+                int(opened_at),
+                _dec_to_text(qty),
+                _dec_to_text(entry_fill),
+                _dec_to_text(entry_fee),
+                bracket_order_id,
+            ),
+        )
+        self._conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    def get_open_positions(self, product_id: str | None = None) -> list[dict[str, Any]]:
+        """Open tranches, OLDEST FIRST. FIFO is the attribution order a later exit uses, so the
+        ordering is part of the contract, not an incidental detail of the query."""
+        sql = "SELECT * FROM positions WHERE status = 'open'"
+        params: list[Any] = []
+        if product_id is not None:
+            sql += " AND product_id = ?"
+            params.append(product_id)
+        sql += " ORDER BY opened_at, id"
+        return [self._position_row_to_dict(row) for row in self._conn.execute(sql, params)]
+
+    def get_position_for_bracket(self, bracket_order_id: int) -> dict[str, Any] | None:
+        """The OPEN tranche whose bracket is `bracket_order_id`, or `None`.
+
+        This is the ONE linkage direction: a position points at its bracket, never the reverse.
+        Reconciliation starts from a filled order row and needs the tranche that owns it, so this
+        is the lookup it uses instead of reading `position_rule:<product>`.
+
+        Restricted to open tranches on purpose: a closed one's bracket id is history, and letting
+        it answer would attribute a new fill to a trade already booked.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM positions WHERE bracket_order_id = ? AND status = 'open'",
+            (bracket_order_id,),
+        ).fetchone()
+        return None if row is None else self._position_row_to_dict(row)
+
+    def set_position_bracket(self, position_id: int, bracket_order_id: int | None) -> None:
+        """Attach a (re-placed) bracket to an open tranche.
+
+        Called both when the entry's bracket is first placed and when reconciliation replaces a
+        dead one. Skipping the second case leaves the tranche naming an order that no longer
+        exists, so the replacement's fill resolves to no tranche and its outcome is dropped.
+        """
+        self._conn.execute(
+            "UPDATE positions SET bracket_order_id = ? WHERE id = ?",
+            (bracket_order_id, position_id),
+        )
+        self._conn.commit()
+
+    def close_position(self, position_id: int, *, closed_at: int) -> None:
+        self._conn.execute(
+            "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ?",
+            (int(closed_at), position_id),
+        )
+        self._conn.commit()
+
+    def _position_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Money columns are TEXT and decode to `Decimal`; ids and timestamps are INTEGER and
+        must NOT go through the money decoder -- a `Decimal("11")` `bracket_order_id` compares
+        unequal to the `orders.id` it names, which would silently orphan every tranche."""
+        d = dict(row)
+        for field in ("qty", "entry_fill", "entry_fee"):
+            d[field] = _text_to_dec(d[field])
+        return d
+
     # -- bypass arm token (Issue #60, in-process bypass hardening) ---------
 
     def arm_bypass(self, now_ts: int, ttl_sec: int) -> None:

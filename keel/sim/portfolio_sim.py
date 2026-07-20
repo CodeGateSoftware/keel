@@ -284,6 +284,19 @@ def run(
             contributions.append((t, monthly_contribution))
             last_month_start = month_start
 
+        # Rail 11's inputs, refreshed BEFORE any signal evaluation this bar -- mirrors
+        # `agent.run_once`'s reconcile -> equity -> entries ordering (there is no reconcile step
+        # here; the sim has no broker to reconcile against). `latest_price` at this point in the
+        # loop still holds the PREVIOUS bar's closes (it is only updated for an asset further
+        # down, inside this same iteration's per-asset loop) -- that is deliberate, not an
+        # off-by-one: marking to market against bar `t`'s own not-yet-seen close would be
+        # lookahead, letting `can_open`'s drawdown check see price information this bar's signals
+        # haven't been evaluated against yet. `latest_price` is empty on the very first bar (no
+        # asset has been priced yet); `mark_to_market` sums over `positions`/`dca_positions`,
+        # both empty at that point too (nothing can have opened before the first bar's signals
+        # are even evaluated), so an empty `latest_price` is safe here, not merely assumed to be.
+        account.update_equity(latest_price, t)
+
         for asset, hourly in hourly_by_asset.items():
             idx = hourly_index[asset].get(t)
             if idx is None:

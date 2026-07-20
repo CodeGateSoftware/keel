@@ -4,7 +4,7 @@ Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` re
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
 enabled. `migrate()` idempotently creates the §6 tables (`transactions`, `candles`,
 `orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
-`trade_outcomes`, `journal`) plus their indexes and a `schema_version` marker table.
+`trade_outcomes`, `positions`, `journal`) plus their indexes and a `schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -64,6 +64,29 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
     "CREATE INDEX IF NOT EXISTS idx_orders_rule_id ON orders(rule_id)",
+    # One row per TRANCHE, not per product. `agent_state["position_rule:<product>"]` was a single
+    # JSON blob keyed by product, so a second entry overwrote the first's entry price and qty --
+    # and a bracket from the FIRST tranche filling later computed its P&L against the SECOND
+    # tranche's entry, feeding an inflated loss to `trade_outcomes` and rail 16's counter.
+    # `bracket_order_id` is the ONE linkage direction: a position names its bracket, never the
+    # reverse, so reconciliation starts from a filled order row and finds the tranche that owns it.
+    """
+    CREATE TABLE IF NOT EXISTS positions (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        TEXT    NOT NULL,
+        rule_name         TEXT    NOT NULL,
+        opened_at         INTEGER NOT NULL,
+        closed_at         INTEGER,
+        qty               TEXT    NOT NULL,
+        entry_fill        TEXT    NOT NULL,
+        entry_fee         TEXT    NOT NULL,
+        bracket_order_id  INTEGER,
+        status            TEXT    NOT NULL DEFAULT 'open',
+        FOREIGN KEY (bracket_order_id) REFERENCES orders(id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_positions_open ON positions (product_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_positions_bracket ON positions (bracket_order_id)",
     """
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,9 +298,23 @@ def _migrate_v3_trade_outcomes(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v4_positions(conn: sqlite3.Connection) -> None:
+    """v4 adds `positions`, the per-tranche ledger. Table creation is handled by
+    `_SCHEMA_STATEMENTS`; there is deliberately NO backfill.
+
+    The pre-v4 carrier was `agent_state["position_rule:<product>"]`, a last-write-wins blob that
+    holds at most ONE tranche per product and, on a database that averaged up, holds the newest
+    one's entry against the whole holding. Synthesising tranches from it would manufacture exactly
+    the mis-attribution this table exists to end. An open position from before the upgrade simply
+    has no ledger row: `_record_fill` then skips its outcome rather than inventing an entry price,
+    the same standard `record_closed_trade` already applies.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
+    4: _migrate_v4_positions,
 }
 
 

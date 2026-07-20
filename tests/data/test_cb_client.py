@@ -37,12 +37,16 @@ class FakeTransport:
         accounts: dict | None = None,
         preview: dict | None = None,
         placed: dict | None = None,
+        order: dict | None = None,
+        cancel: dict | None = None,
     ) -> None:
         self._candles = candles
         self._product = product
         self._accounts = accounts
         self._preview = preview
         self._placed = placed
+        self._order = order
+        self._cancel = cancel
         self.calls: dict[str, dict[str, Any]] = {}
 
     def get_candles(
@@ -55,6 +59,14 @@ class FakeTransport:
             "granularity": granularity,
         }
         return self._candles
+
+    def get_order(self, order_id: str, **kwargs: Any) -> dict:
+        self.calls["get_order"] = {"order_id": order_id}
+        return self._order
+
+    def cancel_orders(self, order_ids: list[str], **kwargs: Any) -> dict:
+        self.calls["cancel_orders"] = {"order_ids": order_ids}
+        return self._cancel
 
     def get_product(self, product_id: str, **kwargs: Any) -> dict:
         self.calls["get_product"] = {"product_id": product_id}
@@ -436,3 +448,87 @@ def test_get_candles_works_with_real_response_wrapper_types() -> None:
 
     assert len(candles) == 3
     assert candles[0].open == Decimal("63980.20")
+
+
+# -- order status + cancellation ----------------------------------------------------------------
+
+
+def test_get_order_normalizes_status_fill_price_and_fees():
+    """The reconciliation pass needs three things a placement response cannot give: whether the
+    order actually filled, at what price, and for how much in fees. `average_filled_price` and
+    `total_fees` are OBSERVED, replacing the expected-price and previewed-commission estimates
+    the executor records at placement time."""
+    transport = FakeTransport(
+        order={
+            "order": {
+                "order_id": "abc-123",
+                "product_id": "BTC-USD",
+                "side": "SELL",
+                "status": "FILLED",
+                "filled_size": "0.01",
+                "average_filled_price": "49875.42",
+                "total_fees": "2.9925",
+                "completion_percentage": "100",
+            }
+        }
+    )
+    client = CoinbaseClient(transport)
+
+    order = client.get_order("abc-123")
+
+    assert transport.calls["get_order"] == {"order_id": "abc-123"}
+    assert order["order_id"] == "abc-123"
+    assert order["status"] == "FILLED"
+    assert order["filled_size"] == Decimal("0.01")
+    assert order["average_filled_price"] == Decimal("49875.42")
+    assert order["total_fees"] == Decimal("2.9925")
+
+
+def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none():
+    """An OPEN bracket has no fills yet. Money fields must still come back as Decimals so
+    callers never have to special-case None in arithmetic."""
+    transport = FakeTransport(
+        order={"order": {"order_id": "abc-123", "status": "OPEN", "filled_size": "0"}}
+    )
+    client = CoinbaseClient(transport)
+
+    order = client.get_order("abc-123")
+
+    assert order["status"] == "OPEN"
+    assert order["filled_size"] == Decimal("0")
+    assert order["average_filled_price"] == Decimal("0")
+    assert order["total_fees"] == Decimal("0")
+
+
+def test_cancel_order_returns_true_when_the_exchange_confirms():
+    transport = FakeTransport(
+        cancel={"results": [{"success": True, "order_id": "abc-123"}]}
+    )
+    client = CoinbaseClient(transport)
+
+    assert client.cancel_order("abc-123") is True
+    assert transport.calls["cancel_orders"] == {"order_ids": ["abc-123"]}
+
+
+def test_cancel_order_returns_false_when_the_exchange_refuses():
+    """Coinbase's batch_cancel reports per-order success -- a 200 response does NOT mean the
+    order was cancelled. Reading only the HTTP status would let `_cancel_at_exchange` record a
+    cancel that never happened, which is the exact failure it exists to prevent."""
+    transport = FakeTransport(
+        cancel={
+            "results": [
+                {"success": False, "failure_reason": "UNKNOWN_CANCEL_ORDER", "order_id": "abc"}
+            ]
+        }
+    )
+    client = CoinbaseClient(transport)
+
+    assert client.cancel_order("abc") is False
+
+
+def test_cancel_order_returns_false_on_an_empty_result_set():
+    """No result for the id we asked about means we have no confirmation. Absence of a refusal
+    is not a confirmation -- fail closed."""
+    client = CoinbaseClient(FakeTransport(cancel={"results": []}))
+
+    assert client.cancel_order("abc") is False

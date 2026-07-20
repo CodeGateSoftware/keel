@@ -19,7 +19,7 @@ from decimal import Decimal
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
 from keel_core.types import Candle, Granularity
 
 from keel_broker_coinbase.translate import to_order_configuration
@@ -167,6 +167,50 @@ class CoinbaseAdapter:
             volume_window="unknown",
             fetched_at=int(time.time()),
         )
+
+    def get_order(self, order_id: str) -> OrderStatus:
+        """Observed state of a previously placed order, normalized to `Decimal` money fields.
+
+        This is what makes exit reconciliation possible at all. A placement response only says
+        the order was ACCEPTED; nothing in it reveals that a resting bracket later filled, at
+        what price, or for what fee. Without this the executor has to record the *expected*
+        price and the *previewed* commission, so realized P&L is modelled rather than observed --
+        and a stop-out closes a position the loop never notices.
+
+        `filled_size`/`average_filled_price`/`total_fees` are absent (not zero) on an order with
+        no fills yet, so they are defaulted to `Decimal("0")`: callers do arithmetic on these and
+        should never have to special-case `None`. `status` is passed through verbatim -- see
+        `execution.reconcile` for the values that matter.
+        """
+        response = self._require_transport().get_order(order_id=order_id)
+        order = _field(response, "order") or {}
+        return OrderStatus(
+            order_id=_field(order, "order_id", order_id),
+            status=_field(order, "status"),
+            filled_size=Decimal(_field(order, "filled_size", "0") or "0"),
+            average_filled_price=Decimal(_field(order, "average_filled_price", "0") or "0"),
+            total_fees=Decimal(_field(order, "total_fees", "0") or "0"),
+        )
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel one resting order. `True` only if the exchange CONFIRMS the cancellation.
+
+        Coinbase's `batch_cancel` reports success per order, so a 200 response does not mean the
+        order is gone -- it can come back `{"success": false, "failure_reason": ...}` for an
+        order that already filled or does not exist. Reading only the HTTP status would let
+        `executor._cancel_at_exchange` record a cancel that never happened, which is precisely
+        the failure it was written to prevent. No confirmation, including an empty result set,
+        is treated as failure: absence of a refusal is not a confirmation.
+        """
+        response = self._require_transport().cancel_orders(order_ids=[order_id])
+        results = list(_field(response, "results", []) or [])
+        for result in results:
+            if _field(result, "order_id") == order_id:
+                return bool(_field(result, "success", False))
+        # Some responses omit the echoed id; a single result for a single-id request is it.
+        if len(results) == 1:
+            return bool(_field(results[0], "success", False))
+        return False
 
 
 __all__ = ["CoinbaseAdapter"]

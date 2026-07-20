@@ -8,7 +8,7 @@ from keel_core.types import Candle, Granularity
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
 
 
 class UnsupportedOrder(Exception):
@@ -34,6 +34,17 @@ class Broker(Protocol):
     def place_order(self, spec: OrderSpec) -> PlaceResult: ...
 
     def get_fee_summary(self) -> FeeSummary: ...
+
+    def get_order(self, order_id: str) -> OrderStatus: ...
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel one resting order. Return `True` ONLY when the venue CONFIRMS the
+        cancellation for THIS order id -- absence of a refusal is not a confirmation. A caller
+        (`executor._cancel_at_exchange`) records local state on the strength of this boolean, so
+        a `True` that the venue never actually confirmed would record a cancel that never
+        happened.
+        """
+        ...
 
 
 __all__ = ["Broker", "UnsupportedOrder"]

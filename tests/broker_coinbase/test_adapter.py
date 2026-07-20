@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote
-from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
 from keel_broker_coinbase import CoinbaseAdapter
 from keel_core.types import Candle, Granularity, Side
 
@@ -37,13 +37,19 @@ class FakeTransport:
         preview: dict[str, Any] | None = None,
         placed: dict[str, Any] | None = None,
         summary: dict[str, Any] | None = None,
+        order: dict[str, Any] | None = None,
     ) -> None:
         self._candles = candles
         self._accounts = accounts
         self._preview = preview
         self._placed = placed
         self._summary = summary
+        self._order = order
         self.calls: dict[str, dict[str, Any]] = {}
+        # Ids this transport has actually issued via `create_order`, so `cancel_orders` can tell
+        # a genuine order apart from one the suite's unknown-id test made up -- the same
+        # distinction the real venue draws, and the whole point of that assertion.
+        self._issued_order_ids: set[str] = set()
 
     def get_candles(
         self, product_id: str, start: str, end: str, granularity: str, **kwargs: Any
@@ -87,11 +93,38 @@ class FakeTransport:
             "side": side,
             "order_configuration": order_configuration,
         }
+        if self._placed is not None:
+            issued_id = (self._placed.get("success_response") or {}).get("order_id")
+            if issued_id is not None:
+                self._issued_order_ids.add(issued_id)
         return self._placed
 
     def get_transaction_summary(self, **kwargs: Any) -> Any:
         self.calls["get_transaction_summary"] = {}
         return self._summary
+
+    def get_order(self, order_id: str, **kwargs: Any) -> Any:
+        self.calls["get_order"] = {"order_id": order_id}
+        if self._order is not None:
+            return self._order
+        return {
+            "order": {
+                "order_id": order_id,
+                "product_id": "BTC-USD",
+                "side": "BUY",
+                "status": "OPEN",
+                "filled_size": "0",
+            }
+        }
+
+    def cancel_orders(self, order_ids: list[str], **kwargs: Any) -> Any:
+        self.calls["cancel_orders"] = {"order_ids": order_ids}
+        return {
+            "results": [
+                {"order_id": order_id, "success": order_id in self._issued_order_ids}
+                for order_id in order_ids
+            ]
+        }
 
 
 def test_capabilities_declare_coinbase() -> None:
@@ -218,3 +251,88 @@ def test_a_transportless_adapter_refuses_network_calls_clearly() -> None:
     assert adapter.capabilities().venue == "coinbase"
     with pytest.raises(RuntimeError, match="without a transport"):
         adapter.get_balances()
+
+
+# --- order status + cancellation -----------------------------------------------------------
+
+
+def test_get_order_normalizes_status_fill_price_and_fees() -> None:
+    """The reconciliation pass needs three things a placement response cannot give: whether the
+    order actually filled, at what price, and for how much in fees. `average_filled_price` and
+    `total_fees` are OBSERVED, replacing the expected-price and previewed-commission estimates
+    the executor records at placement time."""
+    transport = FakeTransport(
+        order={
+            "order": {
+                "order_id": "abc-123",
+                "product_id": "BTC-USD",
+                "side": "SELL",
+                "status": "FILLED",
+                "filled_size": "0.01",
+                "average_filled_price": "49875.42",
+                "total_fees": "2.9925",
+                "completion_percentage": "100",
+            }
+        }
+    )
+    adapter = CoinbaseAdapter(transport)
+
+    order = adapter.get_order("abc-123")
+
+    assert transport.calls["get_order"] == {"order_id": "abc-123"}
+    assert isinstance(order, OrderStatus)
+    assert order.order_id == "abc-123"
+    assert order.status == "FILLED"
+    assert order.filled_size == Decimal("0.01")
+    assert order.average_filled_price == Decimal("49875.42")
+    assert order.total_fees == Decimal("2.9925")
+
+
+def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none() -> None:
+    """An OPEN bracket has no fills yet. Money fields must still come back as Decimals so
+    callers never have to special-case None in arithmetic."""
+    transport = FakeTransport(
+        order={"order": {"order_id": "abc-123", "status": "OPEN", "filled_size": "0"}}
+    )
+    adapter = CoinbaseAdapter(transport)
+
+    order = adapter.get_order("abc-123")
+
+    assert order.status == "OPEN"
+    assert order.filled_size == Decimal("0")
+    assert order.average_filled_price == Decimal("0")
+    assert order.total_fees == Decimal("0")
+
+
+def test_cancel_order_returns_true_when_the_exchange_confirms() -> None:
+    transport = FakeTransport()
+    # Bypass the normal create_order plumbing: issue the id directly so the fake transport
+    # treats it as one it has actually seen.
+    transport._issued_order_ids.add("abc-123")
+    adapter = CoinbaseAdapter(transport)
+
+    assert adapter.cancel_order("abc-123") is True
+    assert transport.calls["cancel_orders"] == {"order_ids": ["abc-123"]}
+
+
+def test_cancel_order_returns_false_when_the_exchange_refuses() -> None:
+    """Coinbase's batch_cancel reports per-order success -- a 200 response does NOT mean the
+    order was cancelled. Reading only the HTTP status would let `_cancel_at_exchange` record a
+    cancel that never happened, which is the exact failure it exists to prevent."""
+    adapter = CoinbaseAdapter(FakeTransport())
+
+    assert adapter.cancel_order("never-issued") is False
+
+
+def test_cancel_order_returns_false_on_an_empty_result_set() -> None:
+    """No result for the id we asked about means we have no confirmation. Absence of a refusal
+    is not a confirmation -- fail closed."""
+
+    class EmptyCancelTransport(FakeTransport):
+        def cancel_orders(self, order_ids: list[str], **kwargs: Any) -> Any:
+            self.calls["cancel_orders"] = {"order_ids": order_ids}
+            return {"results": []}
+
+    adapter = CoinbaseAdapter(EmptyCancelTransport())
+
+    assert adapter.cancel_order("abc") is False

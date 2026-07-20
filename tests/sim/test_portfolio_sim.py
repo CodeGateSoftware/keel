@@ -740,3 +740,105 @@ def test_disabled_threshold_never_halts_the_simulator():
 
     assert len(shipped_default.trades) == len(baseline.trades)
     assert [t.pnl for t in shipped_default.trades] == [t.pnl for t in baseline.trades]
+
+
+# ---------------------------------------------------------------------------
+# Rail 11: sweeping max_total_dd_pct / max_weekly_dd_pct must actually CHANGE the backtest
+# ---------------------------------------------------------------------------
+
+
+def _drawdown_candle(i: int) -> Candle:
+    """One bar of a REAL, sustained decline: every bar closes well below its open (a genuine
+    intrabar loss for a round trip landing on either parity, unlike `_zigzag_candle`'s shallow
+    ~2-unit swings, which only ever produce fee-drag-sized losses too small to move a drawdown
+    scalar meaningfully within a short series). The alternating wick depth still gives
+    `analysis.regime.detect_condition` real swing structure (BEARISH, not CHOPPY -- `_AlwaysOnRule`
+    needs a tradeable regime to keep firing every bar it's flat)."""
+    if i % 2 == 0:
+        o, h, lo, c = Decimal(1000), Decimal(1010), Decimal(940), Decimal(950)
+    else:
+        o, h, lo, c = Decimal(1000), Decimal(1005), Decimal(900), Decimal(920)
+    return _candle(i * _HOUR, str(o), str(h), str(lo), str(c))
+
+
+def _drawdown_backtest(
+    max_total_dd_pct: Decimal = Decimal("0.90"),
+    max_weekly_dd_pct: Decimal = Decimal("0.90"),
+    bars: int = 150,
+):
+    """The same declining candles and the same always-on rule every time -- only the rail 11
+    thresholds vary. 150 hourly bars (~6.25 days, inside rail 11's 7-day weekly window, so
+    `drawdown_weekly_pct` and `drawdown_total_pct` track identically here -- no equity has yet
+    aged out of the rolling window) of `_drawdown_candle` round-trip a losing position roughly
+    every other bar, driving realized, cumulative loss from 0% towards ~9-10% of the account's
+    initial equity by the end of the run if nothing ever halts it -- see
+    `test_sweeping_max_total_dd_pct_changes_the_backtest`'s docstring for why that range was
+    chosen (it straddles a 5% tight threshold with room on both sides for the halt to bind
+    partway through and still leave a materially different trade count from an unhalted run)."""
+    hourly = [_drawdown_candle(i) for i in range(bars)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(
+        money_mgmt=MoneyMgmtConfig(
+            max_total_dd_pct=max_total_dd_pct, max_weekly_dd_pct=max_weekly_dd_pct
+        )
+    )
+    return run(
+        [_AlwaysOnRule("BTC-USD")],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+
+def test_sweeping_max_total_dd_pct_changes_the_backtest():
+    """Rail 11 must be sweepable in the sim for the same reason rail 16 had to be: a threshold
+    you cannot vary is a threshold you cannot choose. `_drawdown_backtest`'s losing pattern
+    carries the account from 0% towards roughly 9-10% cumulative drawdown over the full run
+    (unhalted); a 5% threshold must therefore bind partway through and block every entry after
+    that point, while 90% never binds at all. If these are equal, the producer is not wired and
+    the sweep is a no-op."""
+    loose = _drawdown_backtest(max_total_dd_pct=Decimal("0.90"))
+    tight = _drawdown_backtest(max_total_dd_pct=Decimal("0.05"))
+
+    assert len(loose.trades) > len(tight.trades), (
+        "max_total_dd_pct had no effect -- the sim-side equity/drawdown producer is not wired"
+    )
+
+
+def test_sweeping_max_weekly_dd_pct_changes_the_backtest():
+    """The weekly leg, in isolation (total left at the loose 90% default so only the weekly rail
+    can bind): the same losing pattern stays entirely inside rail 11's 7-day rolling window for
+    this backtest's ~6.25-day span, so `drawdown_weekly_pct` tracks `drawdown_total_pct`
+    identically here and a tight weekly threshold must suppress entries the same way the total
+    leg does above. Arming only the total leg and leaving this one dormant is exactly the defect
+    class this task exists to close (see the plan's SCOPE DECISION)."""
+    loose = _drawdown_backtest(max_weekly_dd_pct=Decimal("0.90"))
+    tight = _drawdown_backtest(max_weekly_dd_pct=Decimal("0.05"))
+
+    assert len(loose.trades) > len(tight.trades), (
+        "max_weekly_dd_pct had no effect -- the sim-side equity/drawdown producer is not wired "
+        "for the weekly leg"
+    )
+
+
+def test_permissive_dd_thresholds_never_suppress_entries():
+    """Negative control for the two tests above, mirroring
+    `test_disabled_threshold_never_halts_the_simulator`: rail 11 has no `threshold > 0`-style
+    off-switch (unlike rail 16) -- both `max_total_dd_pct`/`max_weekly_dd_pct` ship ENABLED, so
+    there is no config that fully disables the check. The equivalent proof of inertness is that
+    two thresholds on the permissive side of this scenario's actual drawdown ceiling
+    (~9-10%, see `_drawdown_backtest`) -- one merely generous (90%) and one mathematically
+    unreachable (equity would have to hit exactly zero) -- must produce byte-identical results.
+    Any difference would mean the producer is spuriously reacting somewhere it has no real
+    drawdown to react to."""
+    generous = _drawdown_backtest(
+        max_total_dd_pct=Decimal("0.90"), max_weekly_dd_pct=Decimal("0.90")
+    )
+    unreachable = _drawdown_backtest(
+        max_total_dd_pct=Decimal("1"), max_weekly_dd_pct=Decimal("1")
+    )
+
+    assert len(generous.trades) == len(unreachable.trades)
+    assert [t.pnl for t in generous.trades] == [t.pnl for t in unreachable.trades]

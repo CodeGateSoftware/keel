@@ -52,6 +52,18 @@ class PlaceResult:
 
 
 @dataclass(frozen=True)
+class OrderStatus:
+    """Observed state of a previously placed order. Money fields default to `Decimal("0")`
+    rather than `None` -- callers do arithmetic on them and must never special-case."""
+
+    order_id: str
+    status: str
+    filled_size: Decimal
+    average_filled_price: Decimal
+    total_fees: Decimal
+
+
+@dataclass(frozen=True)
 class FeeSummary:
     """Fees and volume the venue reports for this account.
 
@@ -79,4 +91,4 @@ class FeeSummary:
             raise ValueError(f"volume_window must be one of {sorted(allowed)}")
 
 
-__all__ = ["Balance", "FeeSummary", "PlaceResult", "Preview"]
+__all__ = ["Balance", "FeeSummary", "OrderStatus", "PlaceResult", "Preview"]

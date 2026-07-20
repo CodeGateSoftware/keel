@@ -23,13 +23,15 @@ EXIT/NONE) -- the position being closed is reconstructed from the orders audit l
 signal for a product with no recorded open position is a deliberate no-op (`ExecutionResult`
 with `placed=False`, `vetoed_by=[]` -- there is nothing to veto, just nothing to sell).
 
-**OCO bracket.** A filled entry that carries a stop *and* target (i.e. not DCA) automatically
-gets a linked stop+target exit bracket (`place_oco_bracket`): two SELL legs, each recorded as
-the other's sibling in `agent_state` (`oco_sibling:<order_id>`) so that once monitoring code
-(the Task 8 agent loop) observes one leg fill, `handle_oco_fill` cancels the other -- a filled
-position must never be sold twice. Both bracket legs run through `guards.check` too (every order,
-no exceptions); a vetoed leg is simply never placed (`place_oco_bracket` returns `None` for that
-leg's id).
+**Exit bracket.** A filled entry that carries a stop *and* target (i.e. not DCA) automatically
+gets an exchange-side exit bracket (`place_bracket`): ONE native Coinbase trigger-bracket
+order carrying both the take-profit (`limit_price`) and the stop (`stop_trigger_price`), so the
+exchange itself owns the race between them. An earlier design placed two independent SELL legs
+and paired them client-side in `agent_state`; that required us to observe a fill and cancel the
+survivor, and a missed fill left a live order able to sell an already-closed position. It also
+committed a 1x position 2x, since both legs carried the full qty. The native bracket removes
+both problems by construction. It still runs through `guards.check` like any other order
+(un-overridable); a vetoed bracket is simply never placed and `place_bracket` returns `None`.
 
 **Stop management** (`roll_to_break_even` / `trail_stop_atr`) cancels the existing protective
 stop leg and replaces it at a new price, but never widens it: both delegate to `_roll_stop`,
@@ -57,7 +59,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -87,6 +89,13 @@ class ExecutionResult:
     vetoed_by: list[str]
     preview: dict[str, Any] | None
     reason: str
+    # The local `orders.id` of the exit bracket this entry left resting, when one was placed.
+    # `execute` places the bracket itself, so this is the ONLY way a caller can learn its id --
+    # and `agent.run_once` needs it to point the new `positions` row at its bracket. Discarding
+    # it (as this did until Task 3) left the tranche with no way to name its own protective
+    # order, which is what made `roll_to_break_even`/`trail_stop_atr` unreachable by
+    # construction. `None` when no bracket was placed OR when it was vetoed.
+    bracket_order_id: int | None = None
 
 
 ConfirmFn = Callable[[dict[str, Any]], bool]
@@ -125,6 +134,21 @@ def execute(
             reason=f"no open {signal.product_id} position to exit",
         )
 
+    if intent.side == Side.SELL and not _clear_resting_bracket(
+        broker, repo, intent.product_id, now_ts
+    ):
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=(
+                f"could not cancel the resting exit bracket for {intent.product_id} -- "
+                "refusing to place a SELL that would be rejected for insufficient funds, or "
+                "would fill and leave a live bracket able to sell inventory we no longer hold"
+            ),
+        )
+
     result = _run_order(intent, broker, repo, config, mode, confirm_fn, now_ts)
 
     if (
@@ -134,7 +158,7 @@ def execute(
         and intent.stop is not None
         and signal.setup is not None
     ):
-        place_oco_bracket(
+        bracket_order_id = place_bracket(
             broker,
             repo,
             config,
@@ -145,11 +169,55 @@ def execute(
             rule_name=signal.rule_name,
             now_ts=now_ts,
         )
+        # Surfaced rather than discarded so `run_once` can point the tranche at its bracket.
+        # See `ExecutionResult.bracket_order_id`.
+        result = replace(result, bracket_order_id=bracket_order_id)
 
     return result
 
 
 # -- intent construction ---------------------------------------------------------------------
+
+
+
+def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_ts: int) -> bool:
+    """Cancel any resting exchange-side exit bracket for `product_id`. `False` if one could not
+    be cleared, in which case the caller MUST NOT place its SELL.
+
+    `place_bracket` leaves a native trigger bracket committing the ENTIRE base position, so a
+    voluntary rule exit selling the same inventory collides with it: on spot the base is locked
+    and the SELL is rejected, so `position_rule` is never cleared, no outcome is recorded, and
+    the agent retries the same doomed sell every cycle while the position rides a stale stop. If
+    it DID fill, the still-live bracket could later sell inventory we no longer hold.
+
+    This lives in `execute` rather than in `agent._handle_exits` so every SELL path -- the rule
+    exit today, `scale_out` or any future one -- gets it by construction rather than by each
+    caller remembering. Failing closed (refuse the exit) is right: an uncancellable bracket means
+    we do not know what the exchange will do with that inventory, and adding a second order to
+    that uncertainty is strictly worse than waiting a cycle.
+    """
+    for row in repo.get_orders(mode="live", product_id=product_id, status="pending"):
+        if str(row["side"]).upper() != Side.SELL.value.upper():
+            continue
+        try:
+            _cancel_at_exchange(broker, repo, row)
+        except CancelUnavailable:
+            log_exception(
+                logger,
+                "executor.bracket_cancel_failed",
+                product=product_id,
+                order_id=row["id"],
+            )
+            return False
+        repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+        log_event(
+            logger,
+            logging.INFO,
+            "executor.resting_bracket_cleared",
+            product=product_id,
+            order_id=row["id"],
+        )
+    return True
 
 
 def _is_dca_setup(context: dict[str, Any]) -> bool:
@@ -349,10 +417,11 @@ def _run_order(
     # That defeats rail 16 precisely where it matters -- fees dominate small moves, so a trade
     # that is up gross and down net was recorded as a WIN and reset the loss counter.
     #
-    # This is the PREVIEWED commission, an estimate, not the observed fill fee: `_run_order`
-    # never re-reads the order from the broker (there is no post-fill reconciliation yet, which
-    # is also why `actual_fill` is the expected price). It is the best figure available here and
-    # far closer than zero. Replace it with the observed fee when reconciliation lands.
+    # The PREVIEWED commission, and `actual_fill` the EXPECTED price -- the only figures
+    # available at placement time. Both are upgraded to the exchange's observed values a few
+    # lines below (`_upgrade_to_observed_economics`) for an immediate fill, and by
+    # `execution.reconcile` for an order that fills later. These remain the fallback when the
+    # status endpoint is unavailable.
     fee = preview.get("commission_total") if isinstance(preview, dict) else None
     repo.update_order(
         order_id,
@@ -362,6 +431,9 @@ def _run_order(
         raw_response=json.dumps(place_result, default=str),
         updated_at=now_ts,
     )
+
+    if success and status == "filled":
+        _upgrade_to_observed_economics(broker, repo, order_id, place_result, now_ts)
 
     if not success:
         log_event(
@@ -381,8 +453,11 @@ def _run_order(
             reason=f"broker rejected order: {place_result.get('error')}",
         )
 
-    if intent.stop is not None:
-        repo.set_state(f"open_stop:{intent.product_id}", intent.stop)
+    # `open_stop`/`open_target` are written by `place_bracket` ONLY, once the exchange has
+    # actually accepted the bracket that establishes them. Writing `open_stop` here (before the
+    # bracket is placed, and regardless of whether it is then vetoed) asserted a protective stop
+    # that might not exist, and never wrote its `open_target` partner -- which later made
+    # `_roll_stop` refuse with "no open_target recorded". The two are a pair; one writer.
 
     log_event(
         logger,
@@ -396,6 +471,42 @@ def _run_order(
     return ExecutionResult(
         placed=True, order_id=order_id, vetoed_by=[], preview=preview, reason="placed"
     )
+
+
+
+def _upgrade_to_observed_economics(
+    broker: Any, repo: Repository, order_id: int, place_result: dict[str, Any], now_ts: int
+) -> None:
+    """Replace an immediately-filled order's ESTIMATED economics with the exchange's observed ones.
+
+    A market order is marked `filled` at placement, so it never appears in
+    `get_orders(status="pending")` and `execution.reconcile` never sees it. Without this, rail 16
+    would count two different kinds of number: a bracket exit carrying the observed
+    `average_filled_price`/`total_fees`, and a voluntary rule exit carrying the expected price
+    and the PREVIEWED commission. A breaker swept on one definition and enforced on the other is
+    miscalibrated by construction.
+
+    Fails SOFT, unlike the cancel path: the order is already placed and we already hold a usable
+    estimate, so a missing or broken status endpoint keeps the estimate rather than aborting the
+    cycle. This is a refinement of a number, not a safety gate.
+    """
+    get_order = getattr(broker, "get_order", None)
+    if get_order is None:
+        return
+    native_id = place_result.get("order_id")
+    if not native_id:
+        return
+    try:
+        observed = get_order(native_id)
+    except Exception:
+        log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
+        return
+
+    fill = observed.get("average_filled_price")
+    fees = observed.get("total_fees")
+    if not fill or fill <= 0:
+        return
+    repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
 
 
 def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
@@ -426,24 +537,64 @@ def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
 
 def _initial_status(order_configuration: dict[str, Any]) -> str:
     """A market (IOC) order fills immediately; a limit/stop-limit order rests as `pending` on
-    the exchange until a later fill event (`handle_oco_fill`/monitoring) marks it `filled`."""
+    the exchange until a later fill event. `execution.reconcile`, run at the top of every
+    cycle, observes that fill and marks it `filled` with the observed price and fees."""
     config_type = next(iter(order_configuration), "")
     return "filled" if config_type.startswith("market_") else "pending"
 
 
-def _stop_leg_order_configuration(qty: Decimal, stop: Decimal) -> dict[str, dict[str, str]]:
-    return {
-        "stop_limit_stop_limit_gtc": {
-            "base_size": str(qty),
-            "limit_price": str(stop),
-            "stop_price": str(stop),
-            "stop_direction": "STOP_DIRECTION_STOP_DOWN",
-        }
-    }
+class CancelUnavailable(RuntimeError):
+    """Raised when a resting order cannot be cancelled AT THE EXCHANGE.
+
+    Never downgrade this to a no-op. Both cancel sites used to do
+    `cancel = getattr(broker, "cancel_order", None)` and skip when absent -- and at the time the
+    real client had no `cancel_order` at all, only the test fakes did, so in production the
+    cancel was always skipped while the row was still marked `canceled`, leaving a LIVE resting
+    SELL on the exchange that our own records said was gone.
+
+    `CoinbaseClient.cancel_order` exists now, but the guard still matters and now covers a
+    second case: it returns `False` when the exchange REFUSES a cancel (already filled, unknown
+    id), and a refusal recorded as a success is the same lie by a different route. The
+    `keel-broker-api` port and the Coinbase adapter still have no cancel method.
+
+    Failing loudly is the safe direction: our state must never claim a cancel that did not
+    happen. A caller that cannot tolerate the raise must reconcile with the exchange, not
+    swallow it.
+    """
 
 
-def _target_leg_order_configuration(qty: Decimal, target: Decimal) -> dict[str, dict[str, str]]:
-    return {"limit_limit_gtc": {"base_size": str(qty), "limit_price": str(target)}}
+def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]) -> None:
+    """Cancel `order_row` at the exchange, or raise. Never marks local state on failure.
+
+    The order of operations is the whole point: the exchange is the source of truth, so the
+    cancel must SUCCEED before any caller records it. Every failure mode -- no `cancel_order` on
+    the broker, no broker-side id to name, or the call itself raising -- propagates.
+    """
+    native_id = _native_order_id(order_row)
+    if native_id is None:
+        raise CancelUnavailable(
+            f"order {order_row.get('id')} has no broker-side id in its placement response, so "
+            "it cannot be cancelled at the exchange -- refusing to record it as canceled"
+        )
+
+    cancel = getattr(broker, "cancel_order", None)
+    if cancel is None:
+        raise CancelUnavailable(
+            f"broker {type(broker).__name__} exposes no cancel_order, so resting order "
+            f"{native_id} cannot be cancelled -- refusing to record it as canceled while it is "
+            "still live at the exchange"
+        )
+
+    # The RETURN VALUE is the confirmation, not the absence of an exception. Coinbase's
+    # batch_cancel answers per order, so a refused cancel (already filled, unknown id) comes back
+    # `success: false` on a 200. Discarding it recorded a cancel that never happened -- the exact
+    # failure this module exists to prevent. `is not True` so a fake/broker returning None (no
+    # confirmation) also fails closed.
+    if cancel(native_id) is not True:
+        raise CancelUnavailable(
+            f"exchange did not confirm cancellation of {native_id} -- refusing to record it as "
+            "canceled while it may still be live"
+        )
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:
@@ -459,10 +610,38 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
     return data.get("order_id")
 
 
-# -- OCO bracket ------------------------------------------------------------------------------
+def _bracket_order_configuration(
+    qty: Decimal, target: Decimal, stop: Decimal
+) -> dict[str, dict[str, str]]:
+    """Coinbase's NATIVE trigger bracket: ONE order carrying both exit prices.
+
+    `limit_price` is the take-profit and `stop_trigger_price` the stop-loss. The exchange owns
+    the race between them, which is the entire reason for using it: the previous design placed
+    two independent SELL legs and paired them client-side via `oco_sibling:` state, so a fill we
+    failed to observe left the other leg live and able to sell an already-closed position. That
+    whole failure mode does not exist here -- there is no sibling to cancel.
+
+    It also fixes an inventory bug in that design: both legs were sized at the FULL qty, so a
+    1x position was committed 2x. On spot the second leg should simply be rejected for
+    insufficient funds.
+
+    `trigger_bracket_gtc` is exactly what `RESTClient.trigger_bracket_order_gtc` builds, so this
+    reaches it through the `place_order`/`create_order` path we already use -- no new broker API
+    surface, no new transport method.
+    """
+    return {
+        "trigger_bracket_gtc": {
+            "base_size": str(qty),
+            "limit_price": str(target),
+            "stop_trigger_price": str(stop),
+        }
+    }
 
 
-def place_oco_bracket(
+# -- exit bracket ------------------------------------------------------------------------------
+
+
+def place_bracket(
     broker: Any,
     repo: Repository,
     config: Config,
@@ -472,16 +651,19 @@ def place_oco_bracket(
     target: Decimal,
     rule_name: str,
     now_ts: int,
-) -> tuple[int | None, int | None]:
-    """Place a linked stop+target exit bracket for an open long position.
+) -> int | None:
+    """Place the exchange-side exit bracket for an open long position, or `None` if vetoed.
 
-    Both legs run through `guards.check` like any other order (un-overridable); a vetoed leg is
-    never placed and its slot in the returned tuple is `None`. Successfully placed legs are
-    recorded as each other's OCO sibling in `agent_state` (for `handle_oco_fill`), and the stop
-    price is recorded as `open_stop:<product_id>` for rail 9 (no stop-loss widening) to check
-    future entries/rolls against.
+    ONE native trigger-bracket order (see `_bracket_order_configuration`), so the exchange owns
+    the stop-vs-target race and the position is committed exactly once. It runs through
+    `guards.check` like any other order (un-overridable).
+
+    Two pieces of state are recorded: `open_stop:<product_id>` is rail 9's no-widening reference
+    for future entries and rolls, and `open_target:<product_id>` is needed because a single order
+    now carries both prices -- rolling the stop means re-placing the bracket, and the target is
+    no longer recoverable from a separate leg.
     """
-    stop_intent = OrderIntent(
+    intent = OrderIntent(
         product_id=product_id,
         side=Side.SELL,
         qty=qty,
@@ -491,94 +673,39 @@ def place_oco_bracket(
         is_dca=False,
         rule_kind=rule_name,
     )
-    stop_result = _run_order(
-        stop_intent,
+    result = _run_order(
+        intent,
         broker,
         repo,
         config,
         "bypass",
         None,
         now_ts,
-        order_configuration=_stop_leg_order_configuration(qty, stop),
+        order_configuration=_bracket_order_configuration(qty, target, stop),
     )
+    if not result.placed:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.bracket_not_placed",
+            product=product_id,
+            reason=result.reason,
+            vetoed_by=result.vetoed_by,
+        )
+        return None
 
-    target_intent = OrderIntent(
-        product_id=product_id,
-        side=Side.SELL,
-        qty=qty,
-        entry=target,
-        stop=None,
-        notional=sizing.spend(qty, target),
-        is_dca=False,
-        rule_kind=rule_name,
-    )
-    target_result = _run_order(
-        target_intent,
-        broker,
-        repo,
-        config,
-        "bypass",
-        None,
-        now_ts,
-        order_configuration=_target_leg_order_configuration(qty, target),
-    )
-
-    stop_order_id = stop_result.order_id if stop_result.placed else None
-    target_order_id = target_result.order_id if target_result.placed else None
-
-    if stop_order_id is not None and target_order_id is not None:
-        repo.set_state(f"oco_sibling:{stop_order_id}", target_order_id)
-        repo.set_state(f"oco_sibling:{target_order_id}", stop_order_id)
-
-    if stop_order_id is not None:
-        repo.set_state(f"open_stop:{product_id}", stop)
-
+    repo.set_state(f"open_stop:{product_id}", stop)
+    repo.set_state(f"open_target:{product_id}", target)
     log_event(
         logger,
         logging.INFO,
-        "executor.oco_bracket_placed",
+        "executor.bracket_placed",
         product=product_id,
-        stop_order_id=stop_order_id,
-        target_order_id=target_order_id,
+        order_id=result.order_id,
         stop=stop,
         target=target,
     )
-    return stop_order_id, target_order_id
-
-
-def handle_oco_fill(broker: Any, repo: Repository, filled_order_id: int, now_ts: int) -> int | None:
-    """Mark `filled_order_id` filled and cancel its OCO sibling leg, if any and still pending.
-
-    Call this once monitoring code (the Task 8 agent loop) observes that one leg of a bracket
-    has filled -- the sibling must never be allowed to also fill (that would sell an already-
-    closed position again). Returns the cancelled sibling's order id, or `None` if there was no
-    live sibling to cancel.
-    """
-    repo.update_order(filled_order_id, status="filled", updated_at=now_ts)
-
-    sibling_id = repo.get_state(f"oco_sibling:{filled_order_id}")
-    if sibling_id is None:
-        return None
-
-    sibling = repo.get_order(sibling_id)
-    if sibling is None or sibling["status"] != "pending":
-        return None
-
-    cancel = getattr(broker, "cancel_order", None)
-    if cancel is not None:
-        native_id = _native_order_id(sibling)
-        if native_id is not None:
-            cancel(native_id)
-
-    repo.update_order(sibling_id, status="canceled", updated_at=now_ts)
-    log_event(
-        logger,
-        logging.INFO,
-        "executor.oco_sibling_canceled",
-        order_id=filled_order_id,
-        sibling_order_id=sibling_id,
-    )
-    return sibling_id
+    return result.order_id
 
 
 # -- partial scale-out --------------------------------------------------------------------------
@@ -654,6 +781,29 @@ def _roll_stop(
         )
         return None
 
+    target = repo.get_state(f"open_target:{product_id}")
+    if target is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.stop_roll_refused",
+            product=product_id,
+            reason="no open_target recorded -- cannot re-place the bracket",
+        )
+        return None
+
+    # CANCEL FIRST, then place. This inverts the old two-leg order of operations, and it has to:
+    # the resting native bracket already commits the whole position, so placing a replacement
+    # first would be rejected for insufficient funds. `edit_order` cannot avoid the inversion
+    # either -- it accepts only limit-GTC orders and edits only size/price, never
+    # `stop_trigger_price`. The cost is a brief window in which the position has NO protective
+    # stop; that is the trade-off the native bracket imposes, and the failure path below is why
+    # it must never be silent.
+    old_order = repo.get_order(old_stop_order_id)
+    if old_order is not None and old_order["status"] == "pending":
+        _cancel_at_exchange(broker, repo, old_order)
+        repo.update_order(old_stop_order_id, status="canceled", updated_at=now_ts)
+
     intent = OrderIntent(
         product_id=product_id,
         side=Side.SELL,
@@ -672,26 +822,28 @@ def _roll_stop(
         "bypass",
         None,
         now_ts,
-        order_configuration=_stop_leg_order_configuration(qty, new_stop),
+        order_configuration=_bracket_order_configuration(qty, target, new_stop),
     )
     if not result.placed:
+        # The old bracket is already cancelled, so the position is NAKED right now. There is no
+        # silent recovery: the caller must retry or close the position. Never downgrade this.
+        log_event(
+            logger,
+            logging.CRITICAL,
+            "executor.position_unprotected",
+            product=product_id,
+            reason=result.reason,
+            attempted_stop=new_stop,
+            cancelled_order_id=old_stop_order_id,
+            detail=(
+                "the previous bracket was cancelled and its replacement was REJECTED -- this "
+                "position currently has no protective stop at the exchange"
+            ),
+        )
         return None
 
-    old_order = repo.get_order(old_stop_order_id)
-    if old_order is not None and old_order["status"] == "pending":
-        cancel = getattr(broker, "cancel_order", None)
-        if cancel is not None:
-            native_id = _native_order_id(old_order)
-            if native_id is not None:
-                cancel(native_id)
-        repo.update_order(old_stop_order_id, status="canceled", updated_at=now_ts)
-
-    sibling_id = repo.get_state(f"oco_sibling:{old_stop_order_id}")
-    if sibling_id is not None:
-        repo.set_state(f"oco_sibling:{result.order_id}", sibling_id)
-        repo.set_state(f"oco_sibling:{sibling_id}", result.order_id)
-
     repo.set_state(f"open_stop:{product_id}", new_stop)
+    repo.set_state(f"open_target:{product_id}", target)
     log_event(
         logger,
         logging.INFO,
