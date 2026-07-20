@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -154,3 +155,28 @@ def _isolate_trials_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "keel.research.ledger.DEFAULT_LEDGER_PATH", tmp_path / "trials-ledger.jsonl"
     )
+
+
+@pytest.fixture(autouse=True)
+def _restore_keel_logger():
+    """Undo `configure_logging`'s global mutation of the "keel" logger after every test.
+
+    `keel_core.logging_setup.configure_logging` sets `propagate = False` and (with the default
+    `verbose: false`) level `ERROR` on `logging.getLogger("keel")`. Any test that invokes the
+    CLI therefore leaks that state into every later test: `caplog` attaches its handler to the
+    ROOT logger, so `propagate = False` silently starves it and `caplog.text` comes back empty.
+
+    That is a latent ordering bug, not a theoretical one -- it stayed hidden only because the
+    existing CLI tests live in `tests/test_cli.py`, which sorts AFTER `tests/execution/`.
+    Adding CLI tests under `tests/data/` (which sorts before) broke two equity/reconcile
+    assertions that had nothing to do with the change. Restore the logger instead of relying
+    on collection order.
+    """
+    logger = logging.getLogger("keel")
+    level, propagate, handlers = logger.level, logger.propagate, list(logger.handlers)
+    try:
+        yield
+    finally:
+        logger.setLevel(level)
+        logger.propagate = propagate
+        logger.handlers[:] = handlers

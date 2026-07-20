@@ -67,6 +67,7 @@ from keel_core.telemetry import bind_venue
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
 from keel.config import Config, load_config
+from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
 from keel.data import market_feed
 from keel.data.csv_import import import_dir
@@ -257,6 +258,149 @@ def db_import(ctx: click.Context, dir_path: str) -> None:
     click.echo(f"imported={result.imported} skipped={result.skipped}")
     for warning in result.warnings:
         click.echo(f"  warning: {warning}")
+
+
+# -- fetch ----------------------------------------------------------------------------------
+
+
+def _assess_products(
+    repo: Repository, products: list[str], now_ts: int, start_ts: int, tolerance_bars: int
+) -> list[freshness_mod.Freshness]:
+    """Read-only freshness sweep over every (product, granularity). No network."""
+    out: list[freshness_mod.Freshness] = []
+    for product in products:
+        for granularity in _SIM_GRANULARITIES:
+            info = history_mod.coverage(repo, product, granularity, start_ts)
+            out.append(freshness_mod.assess(info, now_ts, tolerance_bars))
+    return out
+
+
+def _print_freshness(rows: list[freshness_mod.Freshness]) -> None:
+    for row in rows:
+        # A series can be BOTH stale and gapped. The state label reports the most urgent
+        # condition, but the detail always carries BOTH numbers -- an earlier version showed
+        # only the label and silently hid gaps behind staleness.
+        if row.missing:
+            state = "MISSING"
+        elif row.stale:
+            state = "STALE"
+        elif row.gaps:
+            state = "GAPS"
+        else:
+            state = "ok"
+        detail = (
+            "nothing cached"
+            if row.missing
+            else f"{row.bars_behind} bars behind, {row.gaps} internal gaps"
+        )
+        click.echo(
+            f"  {state:<8} {row.product:<12} {row.granularity.value:<9} "
+            f"n={row.n_candles:<7} {detail}"
+        )
+
+
+@cli.command("fetch")
+@click.option("--products", default=None, help="Comma-separated product ids (default: allowlist).")
+@click.option("--years", default=5, show_default=True, help="Years of history to ensure.")
+@click.option(
+    "--check",
+    is_flag=True,
+    default=False,
+    help="Report freshness and exit WITHOUT touching the network. Exits non-zero if any "
+    "series is missing or stale -- so a scheduler can alert on it.",
+)
+@click.option(
+    "--fail-on-gaps",
+    is_flag=True,
+    default=False,
+    help="Also fail --check on internal gaps. Off by default: ensure_history cannot repair "
+    "them, and an alert on an unfixable condition is an alert you learn to ignore.",
+)
+@click.option(
+    "--refresh", is_flag=True, default=False, help="Re-pull from scratch, ignoring cache."
+)
+@click.option(
+    "--tolerance-bars",
+    default=freshness_mod.DEFAULT_TOLERANCE_BARS,
+    show_default=True,
+    help="Bars of lag tolerated before a series counts as stale.",
+)
+@click.pass_context
+@with_disclaimer
+def fetch(
+    ctx: click.Context,
+    products: str | None,
+    years: int,
+    check: bool,
+    fail_on_gaps: bool,
+    refresh: bool,
+    tolerance_bars: int,
+) -> None:
+    """Ensure cached candle history is current for every allowlisted product.
+
+    READ-ONLY with respect to money: this command fetches market data and writes candles. It
+    places no orders, touches no rails and reads no credentials beyond the venue's public
+    market-data endpoints -- which is why it is safe to schedule (see
+    `docs/operations/scheduled-fetch.md`).
+
+    `--check` is the dry-run a scheduler should alert on: it never opens a network connection
+    and exits non-zero when anything is missing, stale or gapped.
+    """
+    now_ts = int(time.time())
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+
+    product_list = _parse_products_option(products, config)
+    start_ts = now_ts - years * _DAYS_PER_YEAR * 86400
+
+    before = _assess_products(repo, product_list, now_ts, start_ts, tolerance_bars)
+    click.echo(f"data cached in: {ctx.obj['db_path']}")
+    _print_freshness(before)
+
+    if check:
+        actionable = [r for r in before if r.needs_fetch]
+        gapped = [r for r in before if r.gaps > 0]
+        if actionable:
+            raise click.ClickException(f"{len(actionable)} series missing or stale")
+        if gapped and fail_on_gaps:
+            raise click.ClickException(f"{len(gapped)} series have internal gaps")
+        if gapped:
+            click.echo(
+                f"\nall series current. {len(gapped)} have internal gaps, which a fetch "
+                "cannot repair (see docs/operations/scheduled-fetch.md)."
+            )
+        else:
+            click.echo("\nall series current")
+        return
+
+    if not refresh and not freshness_mod.any_needs_fetch(before):
+        click.echo("\nall series current -- nothing to fetch")
+        return
+
+    click.echo("\nfetching...")
+    client = _build_broker(config)
+    history_mod.ensure_history(
+        client,
+        repo,
+        product_list,
+        _SIM_GRANULARITIES,
+        years,
+        now_ts,
+        sleep_fn=time.sleep,
+        refresh=refresh,
+    )
+
+    after = _assess_products(repo, product_list, now_ts, start_ts, tolerance_bars)
+    click.echo("\nafter fetch:")
+    _print_freshness(after)
+    if freshness_mod.any_needs_fetch(after):
+        # Not an error: an asset younger than the window, or a venue simply not serving the
+        # most recent bar yet, both land here legitimately. Say so rather than failing a
+        # scheduled run that did everything it could.
+        click.echo(
+            "\nsome series are still short. Common and usually benign: an asset younger than "
+            "the requested window (PAXG-USD), or a bar the venue has not published yet."
+        )
 
 
 # -- trials ledger --------------------------------------------------------------------------
