@@ -1060,3 +1060,149 @@ def test_paper_mode_loads_PAPER_status_rules_not_live_ones(repo, monkeypatch):
     run_once(broker, repo, _paper_config(), now_ts=90_000)
 
     assert repo.get_orders(mode="paper") == [], "a LIVE rule must not trade in paper mode"
+
+
+# -- interactive confirm: run_once threads confirm_fn to placement --------------
+
+
+def _live_config(**over):
+    """Confirm mode, roomy caps, all live-BUY rails satisfied so an approved order places."""
+    over.setdefault(
+        "caps",
+        Caps(
+            max_per_order_usd=Decimal("1000000"),
+            max_per_day_usd=Decimal("1000000"),
+            max_exposure_usd=Decimal("1000000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+    )
+    cfg = _config(**over)
+    return replace(cfg, auto_trade=replace(cfg.auto_trade, mode="confirm"))
+
+
+def _live_ready_repo(repo):
+    """Clear every live-BUY rail that isn't the confirmation itself."""
+    repo.set_state("kill_switch", False)
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 10**12)
+    attest_subscription(repo, now_ts=0, free_volume_usd=Decimal("10000000"))
+    return repo
+
+
+def test_confirm_APPROVED_places_the_order(repo, monkeypatch):
+    """The change: an approved confirm-mode order is actually placed (was: never)."""
+    _live_ready_repo(repo)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=lambda preview: True)
+
+    # An approved entry places the BUY (and its protective OCO bracket) -- was: nothing at all.
+    buys = [c for c in broker.place_calls if c["product_id"] == PRODUCT and c["side"] == Side.BUY]
+    assert len(buys) == 1
+
+
+def test_confirm_DECLINED_places_nothing(repo, monkeypatch):
+    _live_ready_repo(repo)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=lambda preview: False)
+
+    assert broker.place_calls == []
+
+
+def test_confirm_fn_defaulting_to_None_still_fails_closed(repo, monkeypatch):
+    """No confirm_fn (the old default) must still place nothing -- backward compatible."""
+    _live_ready_repo(repo)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _live_config(), now_ts=90_000)  # no confirm_fn
+
+    assert broker.place_calls == []
+
+
+def test_confirm_fn_sees_the_broker_preview(repo, monkeypatch):
+    _live_ready_repo(repo)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    seen = {}
+
+    def _capture(preview):
+        seen.update(preview)
+        return True
+
+    run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=_capture)
+    assert "order_total" in seen  # the preview the operator would be shown
+
+
+def test_a_rail_veto_means_the_confirm_prompt_is_never_reached(repo, monkeypatch):
+    """The rails run FIRST. A vetoed order never asks the human -- confirmation is not a
+    substitute for the hard limits."""
+    _live_ready_repo(repo)
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule("DOGE-USD"), status="live")  # off allowlist
+    broker = FakeBroker(series={("DOGE-USD", Granularity.ONE_DAY): [_candle(0, "100")]})
+    asked = {"n": 0}
+
+    def _count(preview):
+        asked["n"] += 1
+        return True
+
+    run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=_count)
+    assert asked["n"] == 0
+    assert broker.place_calls == []
+
+
+# -- the CLI wires the interactive prompt --------------------------------------
+
+
+def test_interactive_confirm_places_on_yes_declines_on_no(monkeypatch, capsys):
+    """`_interactive_confirm` renders the preview and returns the human's yes/no."""
+    import keel.cli as cli_module
+
+    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: True, raising=False)
+
+    monkeypatch.setattr(cli_module.click, "confirm", lambda *a, **k: True)
+    assert cli_module._interactive_confirm({"order_total": "5.00", "commission_total": "0.03"})
+    out = capsys.readouterr().out
+    assert "Coinbase order preview" in out
+    assert "order_total: 5.00" in out
+
+    monkeypatch.setattr(cli_module.click, "confirm", lambda *a, **k: False)
+    assert cli_module._interactive_confirm({"order_total": "5.00"}) is False
+
+
+def test_interactive_confirm_fails_closed_without_a_tty(monkeypatch):
+    import keel.cli as cli_module
+
+    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: False, raising=False)
+    assert cli_module._interactive_confirm({"order_total": "5.00"}) is False
+
+
+def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypatch):
+    """The wiring: `keel agent` (confirm) hands run_once the interactive confirm_fn; bypass
+    hands it None."""
+    from click.testing import CliRunner
+
+    import keel.cli as cli_module
+    from keel.cli import cli
+
+    captured = {}
+
+    def _fake_run_once(broker, repo_arg, config, now_ts, confirm_fn=None):
+        captured["confirm_fn"] = confirm_fn
+        captured["mode"] = config.auto_trade.mode
+        return agent.LoopResult(
+            ts=now_ts, skipped=False, skip_reason=None, mode=config.auto_trade.mode, polled=0
+        )
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module, "_open_repo", lambda ctx: repo)
+    monkeypatch.setattr(cli_module, "_load_cfg", lambda ctx: _live_config())
+    monkeypatch.setattr(cli_module.agent, "run_once", _fake_run_once)
+
+    result = CliRunner().invoke(cli, ["agent"])
+    assert result.exit_code == 0, result.output
+    assert captured["mode"] == "confirm"
+    assert captured["confirm_fn"] is cli_module._interactive_confirm

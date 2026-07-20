@@ -1158,6 +1158,28 @@ def monitor(
 # -- agent ------------------------------------------------------------------------------
 
 
+def _interactive_confirm(preview: dict) -> bool:
+    """Human-in-the-loop order confirmation for `mode="confirm"`.
+
+    Called by the executor ONLY after the intent has already passed every hard rail -- this is
+    an additional human gate, never a replacement for the rails. Renders the broker's preview
+    and asks for an explicit yes.
+
+    Fails closed: a non-TTY invocation (a script, a cron job, a headless run) declines rather
+    than blocking on stdin, so `mode="confirm"` never trades unattended.
+    """
+    click.echo("\nRails PASSED. Coinbase order preview:")
+    if isinstance(preview, dict) and preview:
+        for key, value in preview.items():
+            click.echo(f"    {key}: {value}")
+    else:
+        click.echo(f"    {preview!r}")
+    if not (sys.stdin is not None and sys.stdin.isatty()):
+        click.echo("no TTY -- declining (confirm mode fails closed).", err=True)
+        return False
+    return click.confirm("Place this order?", default=False)
+
+
 def _print_loop_result(result: agent.LoopResult) -> None:
     if result.skipped:
         click.echo(f"[{result.ts}] skipped: {result.skip_reason}")
@@ -1219,7 +1241,10 @@ def agent_cmd(
     broker = _build_broker(config)
 
     if not loop:
-        _print_loop_result(agent.run_once(broker, repo, config, now_ts=int(time.time())))
+        confirm_fn = _interactive_confirm if mode == "confirm" else None
+        _print_loop_result(
+            agent.run_once(broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn)
+        )
         return
 
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
@@ -1230,7 +1255,8 @@ def agent_cmd(
         _count[0] += 1
         return False
 
-    for result in agent.loop(broker, repo, config, interval, stop_flag):
+    confirm_fn = _interactive_confirm if mode == "confirm" else None
+    for result in agent.loop(broker, repo, config, interval, stop_flag, confirm_fn=confirm_fn):
         _print_loop_result(result)
 
 
