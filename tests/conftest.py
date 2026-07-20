@@ -139,3 +139,18 @@ def write_config(tmp_path: Path):
 @pytest.fixture
 def valid_config_path(write_config) -> Path:
     return write_config(VALID_CONFIG_YAML)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trials_ledger(tmp_path, monkeypatch):
+    """Never let a test write to the REAL trials ledger.
+
+    `docs/experiments/trials-ledger.jsonl` is a git-tracked, append-only, hash-chained audit
+    record. A test run that appends to it corrupts a research artifact with fixture noise --
+    which is exactly what happened once before this fixture existed: the `simulate` CLI tests
+    silently wrote six junk rows into the committed ledger. Autouse, so no future test has to
+    remember.
+    """
+    monkeypatch.setattr(
+        "keel.research.ledger.DEFAULT_LEDGER_PATH", tmp_path / "trials-ledger.jsonl"
+    )
