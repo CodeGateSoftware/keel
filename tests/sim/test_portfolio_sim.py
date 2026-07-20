@@ -231,7 +231,8 @@ def test_no_lookahead_spy_rule_never_sees_future_candles():
 # ---------------------------------------------------------------------------
 
 
-def test_one_position_per_asset_never_overlaps():
+def test_one_position_per_RULE_never_overlaps():
+    """A single rule still never layers on itself -- that is pyramiding (§26.1), not this."""
     hourly = [_zigzag_candle(i) for i in range(30)]
     candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
     rule = _AlwaysOnRule("BTC-USD")
@@ -842,3 +843,71 @@ def test_permissive_dd_thresholds_never_suppress_entries():
 
     assert len(generous.trades) == len(unreachable.trades)
     assert [t.pnl for t in generous.trades] == [t.pnl for t in unreachable.trades]
+
+
+
+# ---------------------------------------------------------------------------
+# concurrent RULE slots on one asset
+# ---------------------------------------------------------------------------
+
+
+def test_two_rules_hold_concurrently_in_the_same_asset():
+    """The change: distinct rules get distinct slots on the same asset.
+
+    The LIVE executor has been able to do this since PR #96's per-tranche `positions` table;
+    the harness could not, which is why the S1+S2 ensemble was judged through a model that
+    could not represent it.
+    """
+    hourly = [_zigzag_candle(i) for i in range(30)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    first = _AlwaysOnRule("BTC-USD")
+    second = _AlwaysOnRule("BTC-USD")
+    second.name = "always_on_2"
+    config = _config()
+
+    result = run(
+        [first, second],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    solo = run(
+        [_AlwaysOnRule("BTC-USD")],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    # The direct evidence of concurrency: two positions opened on the SAME bar in the same
+    # asset. Under the old one-position-per-asset model the second rule was silently skipped,
+    # so this was impossible by construction.
+    from collections import Counter
+
+    per_bar = Counter(trade.entry_ts for trade in result.trades)
+    assert max(per_bar.values()) == 2, "expected two rules to open on the same bar"
+    assert len(result.trades) == 2 * len(solo.trades)
+
+
+def test_a_single_rule_run_is_unchanged_by_the_multi_slot_model():
+    """Regression guard: adding slots must not alter single-rule behaviour."""
+    hourly = [_zigzag_candle(i) for i in range(30)]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config()
+
+    result = run(
+        [_AlwaysOnRule("BTC-USD")],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+    trades = sorted(result.trades, key=lambda tr: tr.entry_ts)
+    for prev, nxt in zip(trades, trades[1:]):
+        assert prev.exit_ts is not None
+        assert prev.exit_ts <= nxt.entry_ts

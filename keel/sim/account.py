@@ -155,7 +155,12 @@ class SimAccount:
         self.slippage_pct = slippage_pct
 
         self.cash_usdc: Decimal = Decimal("0")
-        self.positions: dict[str, OpenPosition] = {}
+        # Keyed by (asset, slot). `slot` is the originating rule's name, so one asset can hold
+        # several concurrent RULE positions -- the ensemble/horizon-ladder case, and what the
+        # LIVE executor has been able to do since PR #96's per-tranche `positions` table. The
+        # default slot `""` preserves the historical one-position-per-asset behaviour for any
+        # caller that does not pass one.
+        self.positions: dict[tuple[str, str], OpenPosition] = {}
         self.dca_positions: dict[str, OpenPosition] = {}
         self.contributed: Decimal = Decimal("0")
         self.realized_pnl: Decimal = Decimal("0")
@@ -189,7 +194,7 @@ class SimAccount:
         # `_total_notional`) for cap purposes -- concentration/exposure risk doesn't care which
         # order class bought the exposure.
         self._volume_log: list[tuple[int, Decimal]] = []
-        self._position_notional: dict[str, Decimal] = {}
+        self._position_notional: dict[tuple[str, str], Decimal] = {}
         self._dca_notional: dict[str, Decimal] = {}
 
     # -- deposits -----------------------------------------------------------------------------
@@ -230,10 +235,21 @@ class SimAccount:
     # -- combined (rule + DCA) notional, for cap purposes --------------------------------------
 
     def _asset_notional(self, asset: str) -> Decimal:
-        """Combined rule-slot + DCA-sleeve notional currently open in `asset`."""
-        return self._position_notional.get(asset, Decimal("0")) + self._dca_notional.get(
-            asset, Decimal("0")
+        """Combined rule-slot + DCA-sleeve notional currently open in `asset`.
+
+        Sums across EVERY rule slot in the asset. With concurrent slots this is the difference
+        between the per-asset concentration cap seeing the real position and seeing only the
+        most recent one -- i.e. between a rail that holds and a rail that silently does not.
+        """
+        slots = sum(
+            (
+                notional
+                for (slot_asset, _), notional in self._position_notional.items()
+                if slot_asset == asset
+            ),
+            Decimal("0"),
         )
+        return slots + self._dca_notional.get(asset, Decimal("0"))
 
     def _total_notional(self) -> Decimal:
         """Combined rule-slot + DCA-sleeve notional currently open across every asset."""
@@ -423,7 +439,13 @@ class SimAccount:
     # -- open / close: fill-time economics -----------------------------------------------------
 
     def open(
-        self, intent: OpenIntent, fill_price: Decimal, now_ts: int, *, dca: bool = False
+        self,
+        intent: OpenIntent,
+        fill_price: Decimal,
+        now_ts: int,
+        *,
+        dca: bool = False,
+        slot: str = "",
     ) -> None:
         """Open (or, for `dca=True`, accumulate into) the position in `intent.asset`, debiting
         cash for the slipped fill plus entry fee, and recording `intent.notional` against the
@@ -464,7 +486,8 @@ class SimAccount:
                 self._dca_notional.get(intent.asset, Decimal("0")) + intent.notional
             )
         else:
-            self.positions[intent.asset] = OpenPosition(
+            key = (intent.asset, slot)
+            self.positions[key] = OpenPosition(
                 asset=intent.asset,
                 qty=intent.qty,
                 entry_fill=entry_fill,
@@ -472,18 +495,19 @@ class SimAccount:
                 stop=intent.stop,
                 rule_kind=intent.rule_kind,
             )
-            self._position_notional[intent.asset] = intent.notional
+            self._position_notional[key] = intent.notional
 
         self._volume_log.append((now_ts, intent.notional))
 
-    def close(self, asset: str, fill_price: Decimal, now_ts: int) -> Decimal:
+    def close(self, asset: str, fill_price: Decimal, now_ts: int, *, slot: str = "") -> Decimal:
         """Close the RULE-slot open position in `asset` (the DCA sleeve is never closed by this
         ledger -- see module docstring), crediting cash for the slipped fill net of exit fee,
         and return the realized P&L (net of both legs' fees). The (pre-slippage) exit notional
         (`fill_price * qty`) is recorded against the day/month VOLUME ledger too -- Coinbase
         One's fee-free allowance is trading volume, buys and sells both (Issue #85)."""
-        position = self.positions.pop(asset)
-        self._position_notional.pop(asset, None)
+        key = (asset, slot)
+        position = self.positions.pop(key)
+        self._position_notional.pop(key, None)
 
         exit_fill = fill_price * (Decimal(1) - self.slippage_pct)
         entry_fee = position.entry_fill * position.qty * self.fee_pct
@@ -494,6 +518,18 @@ class SimAccount:
         self.realized_pnl += pnl
         self._volume_log.append((now_ts, fill_price * position.qty))
         return pnl
+
+    def position(self, asset: str, slot: str = "") -> OpenPosition | None:
+        """One asset+slot's open RULE position, or `None`."""
+        return self.positions.get((asset, slot))
+
+    def positions_for(self, asset: str) -> list[OpenPosition]:
+        """Every concurrent RULE position open in `asset`."""
+        return [
+            position
+            for (slot_asset, _), position in self.positions.items()
+            if slot_asset == asset
+        ]
 
     # -- rail 16: the streak producer -----------------------------------------------------------
 

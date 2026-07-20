@@ -267,7 +267,10 @@ def run(
         asset: [c.ts for c in series] for asset, series in daily_by_asset.items()
     }
 
-    held: dict[str, _Held] = {}
+    # Keyed by (asset, rule_name): one position per RULE per asset, so an asset can hold
+    # several concurrent rule positions. Deliberately NOT multiple positions from the SAME rule
+    # -- that is pyramiding (§26.1), a separate feature with its own exposure-rail implications.
+    held: dict[tuple[str, str], _Held] = {}
     latest_price: dict[str, Decimal] = {}
     idle: dict[str, _IdleAnchor] = {}
 
@@ -313,10 +316,10 @@ def run(
 
             # The RULE slot's exit check runs first and independently of DCA (Issue #85): DCA
             # positions are never in `held`, so this only ever resolves a risk-defined position.
-            was_held = asset in held
-            if was_held:
+            # Snapshot the keys first: `_process_held` mutates `held` when a position closes.
+            for key in [key for key in held if key[0] == asset]:
                 _process_held(
-                    asset, idx, hourly, current, candles_by_tf, held, account, config,
+                    key, idx, hourly, current, candles_by_tf, held, account, config,
                     trades, telemetry,
                 )
 
@@ -334,11 +337,6 @@ def run(
                 asset, idx, hourly, signals, account, config, t, monthly_volume_cap
             )
 
-            if was_held:
-                # The RULE slot was occupied at the START of this bar -- defer new rule-entry
-                # evaluation (and idle tracking) to the next bar, matching the pre-#85 cadence.
-                continue
-
             fired = _process_rule_signals(
                 asset, idx, hourly, signals, rules_by_asset[asset], account, config,
                 latest_price, held, t, monthly_volume_cap,
@@ -350,7 +348,7 @@ def run(
             equity_curve.append((t, account.mark_to_market(latest_price)))
             last_day_start = day_start
 
-    for asset, h in held.items():
+    for (asset, _slot), h in held.items():
         trades.append(
             SimTrade(
                 asset=asset,
@@ -387,12 +385,12 @@ def run(
 
 
 def _process_held(
-    asset: str,
+    key: tuple[str, str],
     idx: int,
     hourly: list[Candle],
     current: Candle,
     candles_by_tf: dict[Granularity, list[Candle]],
-    held: dict[str, _Held],
+    held: dict[tuple[str, str], _Held],
     account: SimAccount,
     config: Config,
     trades: list[SimTrade],
@@ -405,7 +403,8 @@ def _process_held(
     `Rule.exit_signal` if neither level was touched. `held` only ever contains risk-defined RULE
     positions (Issue #85) -- DCA setups are filtered out before ever reaching `held` (see
     `_process_rule_signals`), so every position resolved here has a real stop/target."""
-    h = held[asset]
+    asset, slot = key
+    h = held[key]
     setup = h.setup
 
     h.mfe = max(h.mfe, current.high - h.entry_fill)
@@ -429,7 +428,7 @@ def _process_held(
     if exit_price is None:
         return
 
-    pnl = account.close(asset, exit_price, current.ts)
+    pnl = account.close(asset, exit_price, current.ts, slot=slot)
     exit_fill = exit_price * (Decimal(1) - account.slippage_pct)
 
     # Rail 16: feed the closed trade to the sim-side streak producer, so a `keel simulate` sweep
@@ -470,7 +469,7 @@ def _process_held(
         telemetry.per_bucket_pnl.get(bucket_key, Decimal(0)) + pnl
     )
 
-    del held[asset]
+    del held[key]
 
 
 def _record_cts_telemetry(
@@ -596,8 +595,8 @@ def _process_rule_signals(
             continue
         rule_signal_fired = True
 
-        if asset in held:
-            continue  # only one RULE position per asset at a time
+        if (asset, signal.rule_name) in held:
+            continue  # one position per RULE per asset; re-entry waits for this one to close
 
         rule = rules_by_name.get(signal.rule_name)
         if rule is None:
@@ -638,9 +637,9 @@ def _process_rule_signals(
             continue  # no next bar to fill at -- the signal is lost, not a rejection
 
         fill_bar = hourly[fill_idx]
-        account.open(intent, fill_bar.open, fill_bar.ts)
-        pos = account.positions[asset]
-        held[asset] = _Held(
+        account.open(intent, fill_bar.open, fill_bar.ts, slot=signal.rule_name)
+        pos = account.positions[(asset, signal.rule_name)]
+        held[(asset, signal.rule_name)] = _Held(
             rule=rule,
             setup=setup,
             entry_ts=pos.entry_ts,
