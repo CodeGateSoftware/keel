@@ -125,3 +125,47 @@ def test_pbo_refuses_when_every_trial_is_series_missing(tmp_path):
     result = runner.invoke(cli, ["trials", "pbo", "--ledger", str(path), "--blocks", "4"])
     assert result.exit_code != 0
     assert "no usable columns" in result.output
+
+
+def test_deflate_reports_a_band_and_refuses_to_invent_DSR(tmp_path):
+    """Anything the ledger cannot supply must read as MISSING, not as a plausible default."""
+    runner = CliRunner()
+    path = tmp_path / "trials.jsonl"
+    for i in range(5):
+        _record(runner, path, f"t{i}")
+
+    result = runner.invoke(
+        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
+    )
+    assert result.exit_code == 0, result.output
+    # A band, not a single number, because rho is not measured here.
+    assert "0.00" in result.output and "0.90" in result.output
+    assert "MinBTL" in result.output
+    assert "DSR: NOT COMPUTED" in result.output
+
+
+def test_deflate_computes_dsr_when_the_variance_is_supplied_explicitly(tmp_path):
+    runner = CliRunner()
+    path = tmp_path / "trials.jsonl"
+    for i in range(5):
+        _record(runner, path, f"t{i}")
+
+    result = runner.invoke(
+        cli,
+        ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4",
+         "--rho", "0.5", "--trial-sharpe-variance", "0.05"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "SR_0" in result.output
+    assert "DSR" in result.output
+    assert "NOT COMPUTED" not in result.output
+
+
+def test_deflate_refuses_on_too_few_decision_trials(tmp_path):
+    runner = CliRunner()
+    path = tmp_path / "trials.jsonl"
+    _record(runner, path, "only-one")
+    result = runner.invoke(
+        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
+    )
+    assert result.exit_code != 0
