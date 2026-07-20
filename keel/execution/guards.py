@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import calendar
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -130,12 +130,21 @@ class OrderIntent:
     withdrawals_enabled: bool | None = None
 
 
+#: Rails whose inputs describe the LIVE ACCOUNT and therefore cannot be evaluated offline:
+#: rail 13 needs a broker-fetched quote balance, rail 17 needs the account's real withdrawal
+#: state. Paper trading has no live account, so these are SKIPPED there -- and RECORDED as
+#: skipped, never silently omitted, so a paper track record is honest about its own gaps.
+LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability")
+
+
 @dataclass(frozen=True)
 class GuardResult:
     """The outcome of running all fifteen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
+    #: Rails deliberately not evaluated this run (offline/paper). Empty on every live path.
+    skipped_rails: list[str] = field(default_factory=list)
 
 
 def _asset(product_id: str) -> str:
@@ -224,12 +233,29 @@ def _business_days_elapsed(year: int, month: int, day: int) -> int:
     return sum(1 for d in range(1, day + 1) if _is_business_day(year, month, d))
 
 
-def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) -> GuardResult:
+def check(
+    intent: OrderIntent,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
+    offline: bool = False,
+) -> GuardResult:
     """Run all fifteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* bypass) — un-overridable.
+
+    `offline=True` (paper trading only) skips `LIVE_STATE_RAILS` — the two rails whose inputs
+    describe the real account, which a paper rehearsal has no access to. **Every other rail still
+    runs**, because the promotion gate is scored on the paper track record: a rehearsal that
+    skipped the rails would promote a strategy on evidence of trades live trading would have
+    vetoed, which is exactly what the proving gate exists to prevent.
+
+    ⚠️ Skipped rails are RETURNED in `GuardResult.skipped_rails`, never silently omitted. A paper
+    track record must be honest about which checks it could not make. `offline=True` on a live
+    path would be a serious bug -- `executor.execute` never passes it.
     """
     violations: list[str] = []
+    skipped: list[str] = list(LIVE_STATE_RAILS) if offline else []
     asset = _asset(intent.product_id)
     is_buy = intent.side == Side.BUY
 
@@ -380,7 +406,7 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
     # 13. USDC-funding — a BUY may only spend an already-settled quote-currency balance, never
     #     a linked bank/ACH source. Fails closed: an unknown balance (`None`) vetoes the BUY.
     #     SELL is exempt -- it produces quote currency, it doesn't consume it (Issue #59).
-    if is_buy:
+    if not offline and is_buy:
         balance = intent.available_quote
         if balance is None:
             violations.append(
@@ -508,7 +534,7 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
     #     ENTRIES ONLY, exactly like rails 11/16: existing holdings are already ours, and forcing
     #     a sale to "fix" a withdrawal freeze would be strictly worse than holding through it.
     #     Fails CLOSED on None, like rails 12/13 — silence is not evidence of possession.
-    if is_buy:
+    if is_buy and not offline:
         if intent.withdrawals_enabled is None:
             violations.append(
                 "withdrawal_capability: UNKNOWN (no fresh attestation, or the broker did not "
@@ -534,4 +560,6 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
             violation=violation,
         )
 
-    return GuardResult(ok=not violations, violations=violations)
+    return GuardResult(
+        ok=not violations, violations=violations, skipped_rails=list(skipped)
+    )

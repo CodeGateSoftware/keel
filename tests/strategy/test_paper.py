@@ -300,3 +300,44 @@ class TestTrackRecord:
         assert result.n_trades == 0
         assert result.trades == []
         assert result.win_rate == 0.0
+
+
+# -- rehydration (required for scheduled operation) ----------------------------
+
+
+def test_open_positions_survive_a_new_PaperTrader_over_the_same_repo(repo):
+    """⚠️ The bug this prevents: a per-cycle agent constructs a fresh trader each run.
+
+    Without rehydration it would forget every open position -- never exiting them, and
+    re-entering the same instrument on the next signal. The paper track record, which the
+    promotion gate is scored on, would silently fill with unclosed entries.
+    """
+    first = PaperTrader(repo)
+    first.on_signal(_enter_signal())
+    assert first.has_open_position("BTC-USD")
+
+    second = PaperTrader(repo)
+    assert second.has_open_position("BTC-USD") is True
+
+
+def test_a_closed_position_does_NOT_reopen_on_rehydration(repo):
+    first = PaperTrader(repo)
+    first.on_signal(_enter_signal())
+    first.on_candle("BTC-USD", _candle(2_000, "110", "125", "108", "122"))  # contains target 120
+    assert first.has_open_position("BTC-USD") is False
+
+    assert PaperTrader(repo).has_open_position("BTC-USD") is False
+
+
+def test_a_rehydrated_position_still_exits_on_its_original_stop(repo):
+    """The reconstructed setup must carry the real stop/target, not defaults."""
+    PaperTrader(repo).on_signal(_enter_signal())
+
+    resumed = PaperTrader(repo)
+    exit_id = resumed.on_candle("BTC-USD", _candle(2_000, "100", "101", "89", "90"))
+    assert exit_id is not None
+    assert resumed.has_open_position("BTC-USD") is False
+
+
+def test_rehydration_on_an_empty_repo_is_a_no_op(repo):
+    assert PaperTrader(repo).has_open_position("BTC-USD") is False
