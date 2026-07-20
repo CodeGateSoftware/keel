@@ -616,3 +616,58 @@ class Repository:
         when nothing is currently armed (a no-op).
         """
         self.set_state("bypass_arm", None)
+
+    # -- candle gap probes ----------------------------------------------------
+    # A row asserts: "we asked the venue for this exact window and it returned nothing new."
+    # That is what lets `--fail-on-gaps` be satisfiable -- see `data/gaps.py`.
+
+    def record_gap_probe(
+        self,
+        product: str,
+        granularity: Granularity,
+        start_ts: int,
+        end_ts: int,
+        n_missing: int,
+        probed_at: int,
+    ) -> None:
+        """Mark a window as probed-and-empty. Idempotent; re-probing refreshes `probed_at`."""
+        self._conn.execute(
+            """
+            INSERT INTO candle_gap_probes
+                (product, granularity, start_ts, end_ts, n_missing, probed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product, granularity, start_ts, end_ts)
+            DO UPDATE SET probed_at = excluded.probed_at, n_missing = excluded.n_missing
+            """,
+            (product, Granularity(granularity).value, start_ts, end_ts, n_missing, probed_at),
+        )
+        self._conn.commit()
+
+    def get_gap_probes(
+        self, product: str | None = None, granularity: Granularity | None = None
+    ) -> list[tuple[str, str, int, int]]:
+        """Return probed-and-empty window keys, matching `gaps.GapWindow.key()`."""
+        query = "SELECT product, granularity, start_ts, end_ts FROM candle_gap_probes"
+        clauses: list[str] = []
+        params: list[object] = []
+        if product is not None:
+            clauses.append("product = ?")
+            params.append(product)
+        if granularity is not None:
+            clauses.append("granularity = ?")
+            params.append(Granularity(granularity).value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        rows = self._conn.execute(query, params).fetchall()
+        return [(r["product"], r["granularity"], r["start_ts"], r["end_ts"]) for r in rows]
+
+    def clear_gap_probes(self, product: str | None = None) -> int:
+        """Forget probe results so they are re-attempted. Returns rows removed."""
+        if product is None:
+            cursor = self._conn.execute("DELETE FROM candle_gap_probes")
+        else:
+            cursor = self._conn.execute(
+                "DELETE FROM candle_gap_probes WHERE product = ?", (product,)
+            )
+        self._conn.commit()
+        return cursor.rowcount

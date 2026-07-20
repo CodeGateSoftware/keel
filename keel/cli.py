@@ -70,6 +70,7 @@ from keel.config import Config, load_config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
 from keel.data import market_feed
+from keel.data import repair as repair_mod
 from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
@@ -265,18 +266,25 @@ def db_import(ctx: click.Context, dir_path: str) -> None:
 
 def _assess_products(
     repo: Repository, products: list[str], now_ts: int, start_ts: int, tolerance_bars: int
-) -> list[freshness_mod.Freshness]:
-    """Read-only freshness sweep over every (product, granularity). No network."""
-    out: list[freshness_mod.Freshness] = []
+) -> list[tuple[freshness_mod.Freshness, int]]:
+    """Read-only sweep over every (product, granularity). No network.
+
+    Returns `(freshness, unexplained_gaps)` -- the second being missing bars NOT yet proven
+    absent at the venue. `--fail-on-gaps` judges that number, not the raw gap count, because a
+    hole the venue genuinely does not have can never be closed and would keep the alert red
+    forever.
+    """
+    out: list[tuple[freshness_mod.Freshness, int]] = []
     for product in products:
         for granularity in _SIM_GRANULARITIES:
             info = history_mod.coverage(repo, product, granularity, start_ts)
-            out.append(freshness_mod.assess(info, now_ts, tolerance_bars))
+            unexplained = repair_mod.unexplained_gap_count(repo, product, granularity)
+            out.append((freshness_mod.assess(info, now_ts, tolerance_bars), unexplained))
     return out
 
 
-def _print_freshness(rows: list[freshness_mod.Freshness]) -> None:
-    for row in rows:
+def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
+    for row, unexplained in rows:
         # A series can be BOTH stale and gapped. The state label reports the most urgent
         # condition, but the detail always carries BOTH numbers -- an earlier version showed
         # only the label and silently hid gaps behind staleness.
@@ -288,11 +296,12 @@ def _print_freshness(rows: list[freshness_mod.Freshness]) -> None:
             state = "GAPS"
         else:
             state = "ok"
-        detail = (
-            "nothing cached"
-            if row.missing
-            else f"{row.bars_behind} bars behind, {row.gaps} internal gaps"
-        )
+        if row.missing:
+            detail = "nothing cached"
+        else:
+            proven = row.gaps - unexplained
+            suffix = f" ({proven} proven absent at venue)" if proven else ""
+            detail = f"{row.bars_behind} bars behind, {row.gaps} internal gaps{suffix}"
         click.echo(
             f"  {state:<8} {row.product:<12} {row.granularity.value:<9} "
             f"n={row.n_candles:<7} {detail}"
@@ -320,6 +329,19 @@ def _print_freshness(rows: list[freshness_mod.Freshness]) -> None:
     "--refresh", is_flag=True, default=False, help="Re-pull from scratch, ignoring cache."
 )
 @click.option(
+    "--repair-gaps",
+    is_flag=True,
+    default=False,
+    help="Also re-fetch interior holes window by window. A window the venue cannot supply is "
+    "recorded as absent at source and skipped on later runs.",
+)
+@click.option(
+    "--reprobe-absent",
+    is_flag=True,
+    default=False,
+    help="With --repair-gaps, ignore previously recorded absences and ask again.",
+)
+@click.option(
     "--tolerance-bars",
     default=freshness_mod.DEFAULT_TOLERANCE_BARS,
     show_default=True,
@@ -334,6 +356,8 @@ def fetch(
     check: bool,
     fail_on_gaps: bool,
     refresh: bool,
+    repair_gaps: bool,
+    reprobe_absent: bool,
     tolerance_bars: int,
 ) -> None:
     """Ensure cached candle history is current for every allowlisted product.
@@ -358,22 +382,27 @@ def fetch(
     _print_freshness(before)
 
     if check:
-        actionable = [r for r in before if r.needs_fetch]
-        gapped = [r for r in before if r.gaps > 0]
+        actionable = [r for r, _ in before if r.needs_fetch]
+        unexplained = [r for r, gaps in before if gaps > 0]
         if actionable:
             raise click.ClickException(f"{len(actionable)} series missing or stale")
-        if gapped and fail_on_gaps:
-            raise click.ClickException(f"{len(gapped)} series have internal gaps")
-        if gapped:
+        if unexplained and fail_on_gaps:
+            raise click.ClickException(
+                f"{len(unexplained)} series have unexplained gaps -- run `keel fetch "
+                "--repair-gaps`"
+            )
+        if unexplained:
             click.echo(
-                f"\nall series current. {len(gapped)} have internal gaps, which a fetch "
-                "cannot repair (see docs/operations/scheduled-fetch.md)."
+                f"\nall series current. {len(unexplained)} have UNEXPLAINED gaps -- run "
+                "`keel fetch --repair-gaps` to probe them."
             )
         else:
             click.echo("\nall series current")
         return
 
-    if not refresh and not freshness_mod.any_needs_fetch(before):
+    if not refresh and not repair_gaps and not freshness_mod.any_needs_fetch(
+        [r for r, _ in before]
+    ):
         click.echo("\nall series current -- nothing to fetch")
         return
 
@@ -390,10 +419,35 @@ def fetch(
         refresh=refresh,
     )
 
+    if repair_gaps:
+        click.echo("\nrepairing interior gaps...")
+        for product in product_list:
+            for granularity in _SIM_GRANULARITIES:
+                outcome = repair_mod.repair_series(
+                    client,
+                    repo,
+                    product,
+                    granularity,
+                    now_ts=now_ts,
+                    reprobe_known_absent=reprobe_absent,
+                    sleep_fn=time.sleep,
+                )
+                if not outcome.windows_found:
+                    continue
+                click.echo(
+                    f"  {product:<12} {granularity.value:<9} "
+                    f"windows={outcome.windows_found} probed={outcome.windows_probed} "
+                    f"skipped={outcome.windows_skipped_known_absent} "
+                    f"recovered={outcome.bars_recovered} "
+                    f"absent_at_source={outcome.windows_absent_at_source}"
+                )
+                for error in outcome.errors:
+                    click.echo(f"    error: {error}", err=True)
+
     after = _assess_products(repo, product_list, now_ts, start_ts, tolerance_bars)
     click.echo("\nafter fetch:")
     _print_freshness(after)
-    if freshness_mod.any_needs_fetch(after):
+    if freshness_mod.any_needs_fetch([r for r, _ in after]):
         # Not an error: an asset younger than the window, or a venue simply not serving the
         # most recent bar yet, both land here legitimately. Say so rather than failing a
         # scheduled run that did everything it could.

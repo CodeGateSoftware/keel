@@ -215,3 +215,94 @@ def test_fetch_calls_ensure_history_when_stale(tmp_path, valid_config_path, monk
     assert set(products) == {"BTC-USD", "ETH-USD", "PAXG-USD"}
     assert Granularity.ONE_DAY in grans and Granularity.ONE_HOUR in grans
     assert years == 5
+
+
+# -- gap repair via the CLI ---------------------------------------------------
+
+
+def _seed_with_hole(repo, product: str) -> None:
+    now = int(time.time())
+    last_day = (now // _DAY) * _DAY - _DAY
+    last_hour = (now // _HOUR) * _HOUR - _HOUR
+    days = [last_day - i * _DAY for i in range(30) if i != 5]
+    _seed(repo, product, Granularity.ONE_DAY, days)
+    _seed(repo, product, Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)])
+
+
+def test_check_reports_unexplained_gaps_and_points_at_the_repair_command(
+    tmp_path, valid_config_path, monkeypatch
+):
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    for asset in ("BTC", "ETH", "PAXG"):
+        _seed_with_hole(repo, f"{asset}-USD")
+
+    args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert "UNEXPLAINED" in result.output
+    assert "--repair-gaps" in result.output
+
+    strict = CliRunner().invoke(cli, [*args, "--fail-on-gaps"])
+    assert strict.exit_code != 0
+
+
+def test_a_gap_proven_absent_no_longer_fails_the_strict_check(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The whole point of the probe record: --fail-on-gaps becomes SATISFIABLE.
+
+    Before this, a hole the venue does not have would keep the strict check red forever.
+    """
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    for asset in ("BTC", "ETH", "PAXG"):
+        _seed_with_hole(repo, f"{asset}-USD")
+
+    args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    assert CliRunner().invoke(cli, [*args, "--fail-on-gaps"]).exit_code != 0
+
+    # Record every detected window as probed-and-empty, as a real repair pass would.
+    from keel.data import gaps as gaps_mod
+
+    now = int(time.time())
+    for asset in ("BTC", "ETH", "PAXG"):
+        product = f"{asset}-USD"
+        for gran in (Granularity.ONE_DAY, Granularity.ONE_HOUR):
+            for window in gaps_mod.detect(repo.get_candles(product, gran), product, gran):
+                repo.record_gap_probe(
+                    product, gran, window.start_ts, window.end_ts, window.n_missing, now
+                )
+
+    passed = CliRunner().invoke(cli, [*args, "--fail-on-gaps"])
+    assert passed.exit_code == 0, passed.output
+    assert "proven absent at venue" in passed.output
+
+
+def test_repair_gaps_runs_the_repair_pass(tmp_path, valid_config_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    for asset in ("BTC", "ETH", "PAXG"):
+        _seed_with_hole(repo, f"{asset}-USD")
+
+    calls: list[tuple] = []
+
+    def _fake_repair(client, repo_arg, product, granularity, **kwargs):
+        calls.append((product, granularity))
+        from keel.data.repair import RepairResult
+
+        return RepairResult(product=product, granularity=granularity)
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module.history_mod, "ensure_history", lambda *a, **k: {})
+    monkeypatch.setattr(cli_module.repair_mod, "repair_series", _fake_repair)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--repair-gaps"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 6  # 3 products x 2 granularities
+    assert "repairing interior gaps" in result.output

@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 4
+    assert version == db.SCHEMA_VERSION == 5
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -82,7 +82,8 @@ def test_the_migrated_row_forces_an_explicit_attestation() -> None:
 def test_migration_bumps_the_stored_version() -> None:
     conn = _v1_database()
     db.migrate(conn)
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_migration_is_idempotent() -> None:
@@ -127,7 +128,8 @@ def test_v1_database_without_a_subscription_migrates_to_no_row() -> None:
     db.migrate(conn)
 
     assert _subscription_rows(conn) == []
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("stored", ["750.25", 750.25])
@@ -156,7 +158,8 @@ def test_migration_to_v4_creates_the_positions_table() -> None:
         "id", "product_id", "rule_name", "opened_at", "closed_at",
         "qty", "entry_fill", "entry_fee", "bracket_order_id", "status",
     }
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_an_existing_v1_database_picks_up_the_positions_table() -> None:
@@ -167,4 +170,27 @@ def test_an_existing_v1_database_picks_up_the_positions_table() -> None:
     db.migrate(conn)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
     assert "bracket_order_id" in cols
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 4
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
+
+
+def test_migration_to_v5_creates_the_candle_gap_probes_table() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(candle_gap_probes)")}
+    assert cols >= {"product", "granularity", "start_ts", "end_ts", "n_missing", "probed_at"}
+
+
+def test_an_existing_v1_database_picks_up_the_gap_probes_table_EMPTY() -> None:
+    """Additive DDL, and deliberately NO backfill.
+
+    A row in this table asserts "we asked the venue for this window and it had nothing" -- an
+    observation nobody has made for a pre-existing gap. Seeding it would silently suppress
+    holes that were never probed, which is the single failure mode the table exists to prevent.
+    """
+    conn = _v1_database()
+    db.migrate(conn)
+    (count,) = conn.execute("SELECT COUNT(*) FROM candle_gap_probes").fetchone()
+    assert count == 0
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION

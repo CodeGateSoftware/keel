@@ -59,16 +59,30 @@ Output states per `(product, granularity)`:
 The detail column always reports **both** lag and gap count, since a series can be stale *and*
 gapped and the state label only names the more urgent one.
 
-## Why gaps do not fail `--check` by default
+## Gap repair
 
 `history.ensure_history` fills **forward** from the newest cached bar and probes **backward**
-from the oldest. It does **not** repair holes in the middle. So a gapped-but-current series
-would report "needs fetch" forever while fetching changed nothing — a permanently red alert is
-an alert you learn to ignore, the same reasoning as the lag tolerance.
+from the oldest. Neither motion touches a hole in the middle, so a series can be perfectly
+current and still be missing bars.
 
-Gaps are therefore **reported prominently but do not fail the check**. Pass `--fail-on-gaps` if
-you want strictness. Repairing internal gaps needs targeted re-fetching of the specific missing
-windows, which this command does not yet do.
+```bash
+uv run keel --db keel.db fetch --repair-gaps      # probe each hole individually
+uv run keel --db keel.db fetch --repair-gaps --reprobe-absent   # ignore prior absence records
+```
+
+**Some windows are permanently empty at the venue** — exchange downtime, a thin book, a listing
+boundary. Re-asking for those on every scheduled run is a treadmill, so a window that comes back
+still-incomplete after a *completed* probe is recorded in `candle_gap_probes` as **absent at
+source** and skipped thereafter.
+
+⚠️ That record asserts an **observation** ("we asked and it had nothing"), never an assumption.
+It is only written after a request that actually completed — a fetch that raised proves nothing
+and is deliberately not recorded. The v5 migration backfills the table with nothing for the same
+reason: no pre-existing gap has ever been probed.
+
+**`--fail-on-gaps` judges UNEXPLAINED gaps only** — missing bars not yet proven absent. That is
+what makes it satisfiable, and therefore usable as a default alert. Use `--reprobe-absent` if you
+suspect a transient venue failure poisoned a record rather than a genuine hole in history.
 
 **On the lag tolerance (default 2 bars).** The most recent bar is still *forming* — at 14:30 the
 1-hour bar stamped 14:00 is incomplete and the venue may not serve it — so a correctly-updated
@@ -153,19 +167,23 @@ The first real run surfaced two things worth recording.
 from having had no scheduled refresh. A live `keel fetch` brought all six series to 0 bars
 behind.
 
-**Gaps — open, and not repairable by this command.** After the fetch:
+**Gaps — repaired.** A live `--repair-gaps` pass:
 
-| series | bars | internal gaps |
-|---|---:|---:|
-| BTC-USD ONE_HOUR | 43,642 | 158 |
-| ETH-USD ONE_HOUR | 43,642 | 158 |
-| PAXG-USD ONE_HOUR | 10,455 | 54 |
-| BTC-USD ONE_DAY | 1,819 | 6 |
-| ETH-USD ONE_DAY | 1,819 | 6 |
-| PAXG-USD ONE_DAY | 438 | 1 |
+| series | gaps before | recovered | remaining | remaining status |
+|---|---:|---:|---:|---|
+| BTC-USD ONE_DAY | 6 | 6 | **0** | clean |
+| ETH-USD ONE_DAY | 6 | 6 | **0** | clean |
+| PAXG-USD ONE_DAY | 1 | 1 | **0** | clean |
+| BTC-USD ONE_HOUR | 158 | 145 | 13 | all proven absent at venue |
+| ETH-USD ONE_HOUR | 158 | 145 | 13 | all proven absent at venue |
+| PAXG-USD ONE_HOUR | 54 | 34 | 20 | all proven absent at venue |
 
-⚠️ **Every backtest, the engine validation, and the first PBO run were computed over series with
-these holes.** At ~0.36% of hourly bars and ~0.33% of daily bars this is unlikely to change any
-verdict, and no result is being restated because of it — but it was **invisible before this
-command existed**, and it should be measured rather than assumed benign. Repairing it needs
-targeted re-fetching of the specific missing windows, which is not yet built.
+⭐ **Every daily series is now complete**, which is the one that matters most: the Turtle is a
+daily rule, and the engine validation and PBO runs are computed on daily bars. The remaining
+hourly holes are all *proven* absent at the venue, so `--fail-on-gaps` now **exits 0** and is
+usable as the default alerting mode.
+
+**The earlier caveat has been discharged.** The first PBO run was computed over the gapped daily
+series; it was re-run on the repaired data and every conclusion held (PBO 0.8812 → 0.8926, slope
+−0.0006 → −0.0001, dominance still False/False, G4 still PASS). See
+`docs/experiments/2026-07-20-first-pbo-run.md`.
