@@ -52,6 +52,10 @@
     "min_win_rate": "0.45"
   },
   "quote_currency": "USD",
+  "research": {
+    "pbo_max": "0.1",
+    "slope_floor": "-0.75"
+  },
   "risk_pct": "0.0125",
   "subscription": {
     "assumed_free_volume_usd": "1234.5",

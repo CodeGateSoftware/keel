@@ -85,3 +85,9 @@ logging:
   file: keel-golden.log
   max_file_mb: 25
   file_count: 7
+
+# Deliberately NON-default (defaults are 0.05 / -0.5) so `test_the_two_goldens_actually_differ`
+# proves this section really parses rather than falling through to its defaults.
+research:
+  pbo_max: 0.10
+  slope_floor: -0.75

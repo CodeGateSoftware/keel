@@ -18,9 +18,11 @@ from keel.strategy.backtest import BacktestResult
 from keel.strategy.promotion import (
     DEFAULT_CLASS,
     TREND_FOLLOW,
+    PBOGate,
     PromotionConfig,
     can_promote,
     floor_for_class,
+    g4_pbo_gate,
     promotion_class_of,
     should_demote,
     transition,
@@ -325,3 +327,53 @@ def test_transition_unknown_rule_raises(repo: Repository) -> None:
     cfg = PromotionConfig()
     with pytest.raises(ValueError):
         transition(repo, "no-such-rule", _stats(), cfg)
+
+
+# -- G4: PBO conjunction gate (spec §7) ----------------------------------------
+
+
+def test_g4_passes_when_pbo_low_and_slope_shallow():
+    ok, reasons = g4_pbo_gate(Decimal("0.01"), Decimal("-0.2"), PBOGate())
+    assert ok is True
+    assert reasons == []
+
+
+def test_g4_passes_on_high_pbo_with_shallow_slope():
+    """The plateau case (§78.7 limitation 4).
+
+    A broad plateau is a set of near-identical configurations, which produces high PBO BY
+    CONSTRUCTION -- and §54.10/§73.13 tell us to PREFER a broad plateau. A bare 0.05 gate
+    would punish the robust choice, so the conjunction must let this through.
+    """
+    ok, reasons = g4_pbo_gate(Decimal("0.80"), Decimal("-0.10"), PBOGate())
+    assert ok is True
+    assert reasons == []
+
+
+def test_g4_passes_on_steep_slope_with_low_pbo():
+    ok, _ = g4_pbo_gate(Decimal("0.01"), Decimal("-0.90"), PBOGate())
+    assert ok is True
+
+
+def test_g4_fails_only_on_the_conjunction():
+    ok, reasons = g4_pbo_gate(Decimal("0.80"), Decimal("-0.90"), PBOGate())
+    assert ok is False
+    assert len(reasons) == 1
+    assert "0.80" in reasons[0]
+    assert "-0.90" in reasons[0]
+
+
+def test_g4_boundaries_are_strict_inequalities():
+    # Exactly at both thresholds is a PASS: the gate fires on > and <, not >= and <=.
+    ok, _ = g4_pbo_gate(Decimal("0.05"), Decimal("-0.5"), PBOGate())
+    assert ok is True
+
+
+def test_g4_default_thresholds_match_the_shipped_config():
+    """The gate's defaults and config.yaml must not drift apart."""
+    from keel_core.config import ResearchConfig
+
+    gate = PBOGate()
+    defaults = ResearchConfig()
+    assert gate.pbo_max == defaults.pbo_max
+    assert gate.slope_floor == defaults.slope_floor

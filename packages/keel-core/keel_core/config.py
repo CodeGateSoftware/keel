@@ -229,6 +229,23 @@ def _default_tiers() -> tuple[TierConfig, ...]:
 
 
 @dataclass(frozen=True)
+class ResearchConfig:
+    """Thresholds for the G4 overfitting gate (spec §7, KB §78).
+
+    ⛔ NEVER TUNE THESE TO OBTAIN A DESIRED VERDICT. Tuning an overfitting threshold until a
+    strategy passes is precisely the Strathern misuse the gate exists to prevent (§78.7):
+    "when a measure becomes a target, it ceases to be a good measure."
+
+    `slope_floor` is calibrated from §78.8's worked cases -- real strategy -0.35, pure random
+    walk -0.61, overfit real strategy -0.75 -- so -0.5 sits between the real-strategy case and
+    the noise/overfit cases. It is NEGATIVE, so it must not be validated as non-negative.
+    """
+
+    pbo_max: Decimal = Decimal("0.05")
+    slope_floor: Decimal = Decimal("-0.5")
+
+
+@dataclass(frozen=True)
 class Config:
     allowlist: list[str]
     target_weights: dict[str, Decimal]
@@ -244,6 +261,7 @@ class Config:
     fees: FeesConfig = field(default_factory=FeesConfig)
     quote_currency: str = "USDC"
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
 
 
 # Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
@@ -405,6 +423,32 @@ def _parse_logging(raw: dict[str, Any]) -> LoggingConfig:
     )
 
 
+def _parse_research(raw: dict[str, Any]) -> ResearchConfig:
+    """Parse `research:` -- optional, falls back to `ResearchConfig`'s defaults.
+
+    `slope_floor` is negative by design, so it deliberately does NOT go through
+    `_non_negative_decimal`.
+    """
+    research_raw = raw.get("research") or {}
+    defaults = ResearchConfig()
+
+    pbo_max = _non_negative_decimal(
+        research_raw.get("pbo_max", defaults.pbo_max), "research.pbo_max"
+    )
+    if pbo_max > 1:
+        raise ConfigError(f"research.pbo_max: must be a probability in [0, 1], got {pbo_max!r}")
+
+    raw_slope = research_raw.get("slope_floor", defaults.slope_floor)
+    try:
+        slope_floor = Decimal(str(raw_slope))
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise ConfigError(
+            f"research.slope_floor: expected a number, got {raw_slope!r}"
+        ) from exc
+
+    return ResearchConfig(pbo_max=pbo_max, slope_floor=slope_floor)
+
+
 def load_config(path: str | Path) -> Config:
     """Parse and validate `config.yaml` at `path`, returning a typed `Config`.
 
@@ -529,6 +573,7 @@ def load_config(path: str | Path) -> Config:
         fees=_parse_fees(raw),
         quote_currency=quote_currency,
         logging=_parse_logging(raw),
+        research=_parse_research(raw),
     )
 
 
@@ -562,6 +607,7 @@ __all__ = [
     "SubscriptionConfig",
     "TierConfig",
     "LoggingConfig",
+    "ResearchConfig",
     "FeesConfig",
     "Config",
     "load_config",
