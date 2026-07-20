@@ -149,3 +149,24 @@ def test_a_matching_stamp_on_a_clean_tree_stays_reproducible(monkeypatch):
     info = build_info()
     assert info.dirty is False
     assert info.is_reproducible is True
+
+
+# -- version <-> build hash binding --------------------------------------------
+
+
+def test_full_version_binds_version_to_commit_as_build_metadata():
+    info = BuildInfo(version="0.1.0", commit="c11baba726af", dirty=False, source="release")
+    assert info.full_version == "0.1.0+c11baba726af"
+    assert info.full_version in info.describe()
+
+
+def test_full_version_omits_an_unknown_commit():
+    info = BuildInfo(version="0.1.0", commit="unknown", dirty=False, source="unknown")
+    assert info.full_version == "0.1.0"
+
+
+def test_describe_still_flags_dirty_and_source():
+    dirty = BuildInfo(version="0.1.0", commit="abc", dirty=True, source="checkout").describe()
+    assert "DIRTY" in dirty and "checkout" in dirty
+    clean = BuildInfo(version="0.1.0", commit="abc", dirty=False, source="release").describe()
+    assert "DIRTY" not in clean and "release" in clean
