@@ -84,7 +84,8 @@ from keel.research import cscv as cscv_mod
 from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
-from keel.security import authz
+from keel.security import authz, secret_source
+from keel.security import secrets as secrets_vault
 from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
 from keel.sim import metrics as metrics_mod
@@ -197,10 +198,13 @@ def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only 
     """Construct the real, network-talking `CoinbaseClient`. Tests monkeypatch this function."""
     from coinbase.rest import RESTClient
 
-    from keel.config import load_secrets
     from keel.data.cb_client import CoinbaseClient
+    from keel.security.secret_source import resolve_secrets
 
-    secrets = load_secrets()
+    # Vault first, .env only when no vault exists; vault-present-but-unlockable raises rather
+    # than silently downgrading (see `secret_source`). Non-interactive callers set
+    # KEEL_VAULT_PASSPHRASE; `allow_prompt` lets a real TTY be asked.
+    secrets = resolve_secrets(allow_prompt=True)
     transport = RESTClient(api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"))
     return CoinbaseClient(transport)
 
@@ -789,6 +793,110 @@ def purification(ctx: click.Context) -> None:
             "    Classified neither way on purpose: calling them clean would let riba into "
             "P&L, calling them non-compliant would state an obligation as fact."
         )
+
+
+@cli.group("vault")
+def vault_group() -> None:
+    """Encrypted secrets vault (spec §14). A trade-enabled key belongs here, not in .env."""
+
+
+def _confirm_new_passphrase() -> str:
+    """Prompt twice for a new vault passphrase. Non-TTY callers must pass --passphrase."""
+    if not (sys.stdin is not None and sys.stdin.isatty()):
+        raise click.ClickException(
+            "no TTY -- pass --passphrase explicitly (it will not be echoed in history if you "
+            "use an environment indirection)."
+        )
+    first = click.prompt("New vault passphrase", hide_input=True)
+    second = click.prompt("Repeat", hide_input=True)
+    if first != second:
+        raise click.ClickException("passphrases did not match")
+    if len(first) < 8:
+        raise click.ClickException("passphrase must be at least 8 characters")
+    return first
+
+
+@vault_group.command("init")
+@click.option("--vault", default=secrets_vault.DEFAULT_VAULT_PATH, help="Vault file path.")
+@click.option("--from-env", default=".env", help="Read CDP_API_KEY/SECRET from this .env file.")
+@click.option("--passphrase", default=None, help="Master passphrase (else prompted twice).")
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing vault.")
+@with_disclaimer
+def vault_init(vault: str, from_env: str, passphrase: str | None, force: bool) -> None:
+    """Create the encrypted vault, importing the CDP key from a .env file if present.
+
+    Does NOT delete the .env -- you remove it once you have confirmed the vault unlocks
+    (`keel vault status`). A trade-enabled key should live only in the vault; the plaintext
+    .env is the wrong risk class for it.
+    """
+    if secret_source.vault_exists(vault) and not force:
+        raise click.ClickException(f"a vault already exists at {vault}; pass --force to replace")
+
+    resolved = passphrase or _confirm_new_passphrase()
+    secrets_vault.migrate_from_env(from_env, passphrase=resolved, path=vault)
+    loaded = secrets_vault.load_vault(resolved, path=vault)
+    n = sum(1 for k in ("api_key", "api_secret") if loaded.get(k))
+    click.echo(f"vault written to {vault} ({n} credential field(s) imported from {from_env})")
+    if n:
+        click.echo(
+            "verify it unlocks (`keel vault status`), then delete the plaintext .env. The vault "
+            "is passphrase-protected; .env is not."
+        )
+    else:
+        click.echo(
+            f"note: no CDP credentials found in {from_env} -- the vault is empty but valid. "
+            "Re-run --from-env pointing at a file with CDP_API_KEY/CDP_API_SECRET, or add them "
+            "later."
+        )
+
+
+@vault_group.command("status")
+@click.option("--vault", default=secrets_vault.DEFAULT_VAULT_PATH, help="Vault file path.")
+@click.option("--passphrase", default=None, help="Master passphrase (else env/prompt).")
+def vault_status(vault: str, passphrase: str | None) -> None:
+    """Report whether the vault exists and (if a passphrase is available) whether it unlocks.
+
+    Never prints secret values -- only whether each expected field is present.
+    """
+    if not secret_source.vault_exists(vault):
+        click.echo(
+            f"no vault at {vault}. Live credentials would come from .env (see `vault init`)."
+        )
+        return
+    click.echo(f"vault present at {vault}")
+    resolved = secret_source._resolve_passphrase(passphrase, prompt=True)
+    if resolved is None:
+        click.echo(
+            f"locked -- set {secret_source.PASSPHRASE_ENV} or run interactively to "
+            "check it unlocks."
+        )
+        return
+    try:
+        loaded = secrets_vault.load_vault(resolved, path=vault)
+    except secrets_vault.VaultError as exc:
+        raise click.ClickException(f"unlock failed: {exc}") from exc
+    present = [k for k in ("api_key", "api_secret") if loaded.get(k)]
+    click.echo(f"unlocks OK; credential fields present: {', '.join(present) or '(none)'}")
+
+
+@vault_group.command("rekey")
+@click.option("--vault", default=secrets_vault.DEFAULT_VAULT_PATH, help="Vault file path.")
+@click.option("--old-passphrase", default=None, help="Current passphrase (else env/prompt).")
+@click.option("--new-passphrase", default=None, help="New passphrase (else prompted twice).")
+def vault_rekey(vault: str, old_passphrase: str | None, new_passphrase: str | None) -> None:
+    """Re-encrypt the vault under a new passphrase. The secrets are unchanged."""
+    if not secret_source.vault_exists(vault):
+        raise click.ClickException(f"no vault at {vault}")
+    old = secret_source._resolve_passphrase(old_passphrase, prompt=True)
+    if old is None:
+        raise click.ClickException("no current passphrase available")
+    try:
+        loaded = secrets_vault.load_vault(old, path=vault)
+    except secrets_vault.VaultError as exc:
+        raise click.ClickException(f"current passphrase rejected: {exc}") from exc
+    new = new_passphrase or _confirm_new_passphrase()
+    secrets_vault.save_vault(loaded, new, path=vault)
+    click.echo("vault re-encrypted under the new passphrase")
 
 
 # -- trials ledger --------------------------------------------------------------------------
