@@ -135,11 +135,27 @@ def test_can_promote_respects_custom_config_floors() -> None:
 # -- per-rule-class promotion floors (KB §25.5) ---------------------------------
 
 
-def test_trend_follow_floor_uses_low_win_high_rr_thresholds() -> None:
+def test_trend_follow_floor_relaxes_win_rate_but_NOT_sample_size() -> None:
+    """The trend class relaxes the WIN-RATE axis only. The two axes are independent.
+
+    A trend-follower legitimately wins under half its trades (KB §25.5), so the flat 55%
+    bar is wrong for it -- that relaxation is correct. But `min_trades` was originally
+    relaxed 100 -> 30 in the same change, as if the two were one concession, and two
+    independent lines of evidence say the sample-size axis needed no relaxation at all:
+
+      * the 2026-07-20 random-entry control arm put the requirement at ~68 trades
+        (`docs/experiments/2026-07-20-adx-ablation-and-random-entry-control.md`);
+      * KB §73.3's Minimum Backtest Length independently reproduces that (~68 at N=26)
+        and puts it at ~143 at our real trials count.
+
+    At 30 a rule could promote on roughly HALF the sample its own edge would need to be
+    distinguishable from random entries. See `docs/experiments/2026-07-20-guards-and-
+    strategy-review.md` §A1.
+    """
     floor = floor_for_class(TREND_FOLLOW)
-    assert floor.min_trades == 30
+    assert floor.min_trades == 100, "sample size must NOT be relaxed for trend-followers"
+    assert floor.min_win_rate == 0.30, "the win-rate relaxation is the point of this class"
     assert floor.min_rr == Decimal("1.5")
-    assert floor.min_win_rate == 0.30
     assert floor.min_expectancy == Decimal("0")
 
 
@@ -168,10 +184,34 @@ def test_promotion_class_of_reads_rule_attribute() -> None:
     assert promotion_class_of(_Plain()) == DEFAULT_CLASS
 
 
-def test_turtle_like_edge_passes_trend_floor_but_fails_canonical() -> None:
-    # The live turtle-only edge sample: 40 trades, 37.5% win, avg win 4343 / avg loss
-    # 1938 (R:R ~2.24), positive expectancy. Fails the global 100/0.55 floor by design,
-    # clears the low-win/high-R:R trend floor (KB §25.5).
+def test_low_win_rate_edge_passes_trend_floor_but_fails_canonical() -> None:
+    """What the trend class is FOR: a 37.5%-win rule with asymmetric payoff is a legitimate
+    trend-follower, not a broken one -- so it must clear the class floor while failing the
+    global 55%-win bar (KB §25.5). Sample size is held ABOVE the floor here so that this
+    test exercises the win-rate axis in isolation."""
+    trend_edge = _stats(
+        n_trades=120,
+        win_rate=0.375,
+        avg_win=Decimal("4343"),
+        avg_loss=Decimal("-1938"),
+        expectancy=Decimal("417"),
+    )
+    assert can_promote(trend_edge, PromotionConfig())[0] is False
+    assert can_promote(trend_edge, floor_for_class(TREND_FOLLOW))[0] is True
+
+
+def test_the_live_turtle_sample_now_FAILS_the_trend_floor_on_sample_size() -> None:
+    """The behavioural consequence of un-relaxing `min_trades`, pinned deliberately.
+
+    This is the real turtle-only edge sample -- 40 trades, 37.5% win, R:R ~2.24, positive
+    expectancy. It used to clear the trend floor because that floor asked for only 30
+    trades. It no longer does, and it SHOULD not: 40 trades is well under the ~68 the
+    2026-07-20 random-entry experiment measured as the minimum for this edge to be
+    distinguishable from random entries through the same exit.
+
+    The rule may well be good. We simply do not yet have enough of it to know, and the
+    gate's job is to say so rather than to lower the bar to what we happen to have.
+    """
     turtle = _stats(
         n_trades=40,
         win_rate=0.375,
@@ -179,8 +219,11 @@ def test_turtle_like_edge_passes_trend_floor_but_fails_canonical() -> None:
         avg_loss=Decimal("-1938"),
         expectancy=Decimal("417"),
     )
-    assert can_promote(turtle, PromotionConfig())[0] is False
-    assert can_promote(turtle, floor_for_class(TREND_FOLLOW))[0] is True
+    ok, reasons = can_promote(turtle, floor_for_class(TREND_FOLLOW))
+    assert ok is False
+    assert any("n_trades" in r for r in reasons), reasons
+    # ...and it fails ONLY on sample size -- the win-rate relaxation still works.
+    assert not any("win_rate" in r for r in reasons), reasons
 
 
 # -- should_demote --------------------------------------------------------------

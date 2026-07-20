@@ -55,12 +55,26 @@ class PromotionConfig:
 # "a good trade is not always a winning trade" principle (KB §25.5). So trend-follow rules
 # get a low-win / high-R:R floor instead. Classes not listed here fall back to the caller's
 # default floor (the config-supplied `PromotionConfig`).
+#
+# THIS CLASS RELAXES THE WIN-RATE AXIS ONLY -- `min_trades` stays at the canonical 100.
+# The two axes are independent, and only the first has a justification. `min_trades` was
+# originally relaxed 100 -> 30 in the same change that relaxed the win rate, as though they
+# were one concession; two independent lines of evidence say the sample-size axis needed no
+# relaxation at all:
+#   * the 2026-07-20 random-entry control arm measured the requirement at ~68 trades
+#     (`docs/experiments/2026-07-20-adx-ablation-and-random-entry-control.md`);
+#   * KB §73.3's Minimum Backtest Length independently reproduces that figure (~68 at a
+#     trials budget of 26) and puts it at ~143 at our actual trials count.
+# At 30, a rule could promote on roughly HALF the sample its own edge would need to be
+# statistically distinguishable from random entries through the same exit -- which is the
+# one thing a promotion gate exists to prevent. A low win rate is a legitimate property of
+# a trend-follower; a small sample is not a property of anything, it is just less evidence.
 DEFAULT_CLASS = "default"
 TREND_FOLLOW = "trend_follow"
 
 _CLASS_FLOORS: dict[str, PromotionConfig] = {
     TREND_FOLLOW: PromotionConfig(
-        min_trades=30,
+        min_trades=100,
         min_expectancy=Decimal("0"),
         min_rr=Decimal("1.5"),
         min_win_rate=0.30,

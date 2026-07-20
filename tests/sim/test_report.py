@@ -421,14 +421,46 @@ def test_verdict_train_more_when_data_insufficient():
 
 
 def _turtle_pooled() -> BacktestResult:
-    # The live turtle-only edge sample (KB §25.5): fails canonical 100/0.55 but clears the
-    # trend floor 30/0.30/1.5.
+    # The LIVE turtle-only edge sample: 40 trades, 37.5% win, R:R ~2.24. Fails canonical
+    # 100/0.55 on win rate AND, since `min_trades` was un-relaxed, fails the trend floor
+    # 100/0.30/1.5 on SAMPLE SIZE (40 < 100 < the ~68 the 2026-07-20 random-entry
+    # experiment measured as this edge's minimum). Kept as the real sample precisely so
+    # the tests below record that consequence rather than hiding it.
     return _pooled_result(
         n_trades=40, win_rate=0.375, avg_win=Decimal("4343"), avg_loss=Decimal("-1938")
     )
 
 
+def _low_win_sufficient_sample() -> BacktestResult:
+    # A trend-follower with the same low win rate and asymmetric payoff but ENOUGH trades
+    # to clear the sample-size floor. Isolates the win-rate relaxation, which is the thing
+    # the per-class floor actually exists to provide (KB §25.5).
+    return _pooled_result(
+        n_trades=120, win_rate=0.375, avg_win=Decimal("4343"), avg_loss=Decimal("-1938")
+    )
+
+
 def test_verdict_go_live_when_trend_class_clears_its_own_floor():
+    """A low-win/high-R:R rule with a SUFFICIENT sample clears its class floor and reaches
+    GO-LIVE, while the same numbers fail the canonical 55%-win bar."""
+    v = build_verdict(
+        pooled=_low_win_sufficient_sample(),
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=_benchmark(),
+        coverage={},
+        promotion_cfg=CANONICAL,
+        pooled_by_class={TREND_FOLLOW: _low_win_sufficient_sample()},
+        floors={TREND_FOLLOW: floor_for_class(TREND_FOLLOW)},
+    )
+    assert v.status == "GO-LIVE candidate"
+    assert v.g2_pass
+    assert v.reasons == []
+
+
+def test_verdict_train_more_when_the_trend_class_has_too_few_trades():
+    """The live turtle sample (40 trades) no longer reaches GO-LIVE, and the reason names
+    the trend class. This is the behavioural consequence of un-relaxing `min_trades`, and
+    it is asserted here so a future change cannot quietly restore the old verdict."""
     v = build_verdict(
         pooled=_turtle_pooled(),
         account_metrics=_PASSING_ACCOUNT_METRICS,
@@ -438,9 +470,9 @@ def test_verdict_go_live_when_trend_class_clears_its_own_floor():
         pooled_by_class={TREND_FOLLOW: _turtle_pooled()},
         floors={TREND_FOLLOW: floor_for_class(TREND_FOLLOW)},
     )
-    assert v.status == "GO-LIVE candidate"
-    assert v.g2_pass
-    assert v.reasons == []
+    assert v.status == "TRAIN MORE"
+    assert not v.g2_pass
+    assert any(r.startswith(f"[{TREND_FOLLOW}]") and "n_trades" in r for r in v.reasons)
 
 
 def test_verdict_train_more_when_a_class_fails_its_floor():
@@ -452,7 +484,7 @@ def test_verdict_train_more_when_a_class_fails_its_floor():
         coverage={},
         promotion_cfg=CANONICAL,
         pooled_by_class={
-            TREND_FOLLOW: _turtle_pooled(),
+            TREND_FOLLOW: _low_win_sufficient_sample(),
             "mean_revert": losing,
         },
         floors={TREND_FOLLOW: floor_for_class(TREND_FOLLOW)},
