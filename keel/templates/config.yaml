@@ -1,0 +1,118 @@
+# keel runtime configuration.
+#
+# These are Phase 1 placeholders (spec §21 open item) — no live orders are placed in Phase 1.
+# `allowlist` and `caps` are required and validated by keel.config.load_config; missing or
+# invalid values raise ConfigError naming the offending key rather than silently defaulting.
+
+allowlist:
+  - BTC
+  - ETH
+  - PAXG
+
+target_weights:
+  BTC: 0.40
+  ETH: 0.30
+  PAXG: 0.30
+
+risk_pct: 0.01
+
+caps:
+  # max_per_order_usd / max_per_day_usd are OPTIONAL internal RISK limits, not real Coinbase
+  # limits -- Coinbase One's only subscription constraint is monthly fee-free trading VOLUME
+  # (see `subscription:` below). They default to a non-binding $1B when omitted (Issue #85);
+  # set explicit values here only if you want an extra per-order/per-day risk ceiling tighter
+  # than the exposure/concentration caps below. Left at their non-binding default here so
+  # risk-sized rule orders ($400-24k typical) aren't silently rejected.
+  max_exposure_usd: 5000
+  max_per_asset_pct: 0.50
+
+market_data:
+  granularities:
+    - ONE_DAY
+    - ONE_HOUR
+    - FIFTEEN_MINUTE
+  history_days: 365
+
+auto_trade:
+  mode: paper
+  enabled: false
+  interval_sec: 900
+  # how long a `keel arm-bypass` token stays valid (seconds) before bypass mode requires
+  # re-arming (Issue #60) -- `keel agent --bypass` still needs a fresh armed token even with
+  # the CLI passphrase gate satisfied.
+  bypass_arm_ttl_sec: 3600
+
+promotion:
+  min_trades: 100
+  min_expectancy: 0.0
+  min_rr: 1.5
+  min_win_rate: 0.55
+
+money_mgmt:
+  profit_trigger_pct: 0.10
+  acceleration_pct: 0.05
+  max_total_dd_pct: 0.20
+  max_weekly_dd_pct: 0.08
+  # Rail 16 (consecutive-loss breaker) — DISABLED by default (0 = off).
+  # Set from a backtest sweep, and set it ABOVE the strategy's tested max losing streak:
+  # turtle_breakout's max streak is 5, so a threshold of 3 would fire on normal variance.
+  max_consecutive_losses: 0
+  streak_cooloff_days: 0
+
+dca:
+  budget_usd: 50
+  cadence_days: 7
+
+# quote-currency the executor draws BUY notional from (rail 13, USDC-funding) -- never bank/ACH.
+quote_currency: USDC
+
+subscription:
+  # The SIMULATOR's assumed fee-free monthly volume. The LIVE rail-14 cap is not set here --
+  # it comes from the attested record: `keel subscription attest --venue coinbase --tier <t>`.
+  assumed_free_volume_usd: 500
+  # What rail 14 permits on a venue that is unattested, suspect, lapsed, or overdue.
+  # 0 means such a venue cannot buy at all until it is attested.
+  unsubscribed_allowance_usd: 0
+  pacing: opportunistic  # opportunistic (monthly cap only) | even_daily (also paces per business day)
+
+# Coinbase One subscription tiers (Issue #86) -- fee-free monthly TRADING VOLUME (buys + sells)
+# allowance per tier, used by `keel simulate`'s tier/fee analysis matrix to compare staying
+# within a tier's free volume (throttled, 0 trading fees, but you still pay the subscription)
+# against trading freely and paying the taker fee on volume EXCEEDING it.
+# free_volume_usd: null means unlimited (Premium -- always fee-free, no cap to exceed).
+tiers:
+  - name: Basic
+    free_volume_usd: 500
+    subscription_usd_month: 4.99
+  - name: Preferred
+    free_volume_usd: 10000
+    subscription_usd_month: 29.99
+  - name: Premium
+    free_volume_usd: null
+    subscription_usd_month: 299.99
+
+# Coinbase Advanced trading fees applied to volume beyond a tier's free allowance, for a
+# <$1k-30d-volume account (Coinbase's published fee schedule). taker_pct is the sim's default --
+# it fills market-style at next-bar open; maker_pct is exposed for a caller that wants to model
+# limit-order fills instead.
+fees:
+  taker_pct: 0.012
+  maker_pct: 0.006
+
+# Engine-activity logging. verbose=false (default) means only errors/exceptions are ever logged
+# (the "keel" logger stays at ERROR level); set verbose: true (or `keel -v`) to also log major
+# operations/decisions (INFO level) -- cycle starts, signals, guard vetoes, order outcomes, etc.
+# file_count is the TOTAL number of files kept (the active log + rotated backups), each capped
+# at max_file_mb.
+logging:
+  verbose: false
+  file: logs/keel.log
+  max_file_mb: 25
+  file_count: 5
+
+# G4 overfitting gate (KB §78). NEVER tune these to obtain a desired verdict -- doing so is
+# the exact Strathern misuse the gate exists to prevent (§78.7). slope_floor is calibrated
+# from §78.8's worked cases: real strategy -0.35, pure random walk -0.61, overfit -0.75.
+research:
+  pbo_max: 0.05
+  slope_floor: -0.5

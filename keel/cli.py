@@ -273,6 +273,53 @@ def cli(
     ctx.obj["verbose"] = verbose
 
 
+# -- init (scaffold a working directory) ----------------------------------------------------
+
+
+def _template_config_text() -> str:
+    """The default config.yaml shipped inside the wheel (see pyproject `artifacts`)."""
+    from importlib.resources import files
+
+    return (files("keel.templates") / "config.yaml").read_text(encoding="utf-8")
+
+
+@cli.command("init-config")
+@click.option(
+    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    help="Where to write the config file.",
+)
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
+def init_config(config_path: str, force: bool) -> None:
+    """Write a default `config.yaml` into the current directory, ready to edit.
+
+    The installed wheel ships this template so a fresh working directory has a config to start
+    from -- edit `allowlist`, `caps`, and `auto_trade.mode` before running anything live.
+    """
+    path = Path(config_path)
+    if path.exists() and not force:
+        raise click.ClickException(f"{path} already exists; pass --force to overwrite")
+    path.write_text(_template_config_text(), encoding="utf-8")
+    click.echo(f"wrote {path}. Edit allowlist/caps/auto_trade.mode before going live.")
+
+
+@cli.command("init")
+@click.option(
+    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    help="Config file to write.",
+)
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
+@click.pass_context
+def init_cmd(ctx: click.Context, config_path: str, force: bool) -> None:
+    """Scaffold a working directory: write `config.yaml`, then seed the rules table (candidates).
+
+    A convenience for a fresh install -- equivalent to `keel init-config` followed by
+    `keel rules seed`. Seeds `candidate` rules only; promoting to paper/live is a separate,
+    deliberate step.
+    """
+    ctx.invoke(init_config, config_path=config_path, force=force)
+    ctx.invoke(rules_seed, products=None, kinds=None, force=False, status="candidate")
+
+
 # -- db import ------------------------------------------------------------------------------
 
 
@@ -1322,6 +1369,14 @@ def _json_plain(value: Any) -> Any:
     help="Comma-separated rule kinds (default: every kind in agent.RULE_REGISTRY).",
 )
 @click.option(
+    "--status",
+    type=click.Choice(["candidate", "paper", "live"]),
+    default="candidate",
+    show_default=True,
+    help="Status to seed at. `live` bypasses the promotion gate -- for the supervised "
+    "live-order test only (see the go-live runbook).",
+)
+@click.option(
     "--force",
     is_flag=True,
     default=False,
@@ -1329,7 +1384,13 @@ def _json_plain(value: Any) -> Any:
 )
 @click.pass_context
 @with_disclaimer
-def rules_seed(ctx: click.Context, products: str | None, kinds: str | None, force: bool) -> None:
+def rules_seed(
+    ctx: click.Context,
+    products: str | None,
+    kinds: str | None,
+    force: bool,
+    status: str = "candidate",
+) -> None:
     """Seed the `rules` table with one `candidate` rule per (kind, product) pair (Issue #81).
 
     The `rules` table starts out empty and nothing else populates it -- with zero rows,
@@ -1387,10 +1448,16 @@ def rules_seed(ctx: click.Context, products: str | None, kinds: str | None, forc
             rule = rule_cls(product_id=product)
             params = _json_plain(rule.describe()["params"])
             params["product_id"] = product
-            repo.insert_rule(kind, params, status="candidate", now_ts=now_ts)
+            repo.insert_rule(kind, params, status=status, now_ts=now_ts)
             seeded.append(label)
 
-    click.echo(f"seeded={len(seeded)} skipped={len(skipped)}")
+    click.echo(f"seeded={len(seeded)} skipped={len(skipped)} status={status}")
+    if status == "live":
+        click.echo(
+            "⚠️  seeded at LIVE status, bypassing the promotion gate. This is for the "
+            "supervised live-order test only -- the agent will act on these (still confirm-"
+            "gated and rail-guarded). Do not leave live-seeded rules in place afterwards."
+        )
     for label in seeded:
         click.echo(f"  seeded: {label}")
     for label in skipped:
