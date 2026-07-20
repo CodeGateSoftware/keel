@@ -97,7 +97,7 @@ Unblocks Tasks 2 and 3. Smallest possible change that makes the bracket addressa
 **Interfaces:**
 - Produces: `agent_state["bracket_order:<product_id>"] -> int` (the local `orders.id` of the resting bracket), written by `place_bracket`, cleared whenever the bracket reaches a terminal state.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_place_bracket_records_the_bracket_order_id(repo):
@@ -116,12 +116,12 @@ def test_place_bracket_records_the_bracket_order_id(repo):
     assert repo.get_state("bracket_order:BTC-USD") == order_id
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_executor.py -k records_the_bracket_order_id -q`
 Expected: FAIL — `assert None == 3`
 
-- [ ] **Step 3: Write the bracket id alongside the stop/target pair**
+- [x] **Step 3: Write the bracket id alongside the stop/target pair**
 
 In `place_bracket`, immediately after the existing `repo.set_state(f"open_target:{product_id}", target)`:
 
@@ -132,12 +132,12 @@ In `place_bracket`, immediately after the existing `repo.set_state(f"open_target
     repo.set_state(f"bracket_order:{product_id}", result.order_id)
 ```
 
-- [ ] **Step 4: Run it and watch it pass**
+- [x] **Step 4: Run it and watch it pass**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_executor.py -k records_the_bracket_order_id -q`
 Expected: PASS
 
-- [ ] **Step 5: Write the failing test for clearing it**
+- [x] **Step 5: Write the failing test for clearing it**
 
 ```python
 def test_a_terminal_bracket_clears_the_bracket_order_key(repo):
@@ -156,12 +156,12 @@ def test_a_terminal_bracket_clears_the_bracket_order_key(repo):
     assert repo.get_state("bracket_order:BTC-USD") is None
 ```
 
-- [ ] **Step 6: Run it and watch it fail**
+- [x] **Step 6: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_reconcile.py -k clears_the_bracket_order_key -q`
 Expected: FAIL — `assert 2 is None`
 
-- [ ] **Step 7: Clear it wherever the position is released**
+- [x] **Step 7: Clear it wherever the position is released**
 
 In `reconcile._record_fill`, alongside the existing clears:
 
@@ -175,17 +175,17 @@ And in `executor._clear_resting_bracket`, after a successful cancel:
         repo.set_state(f"bracket_order:{product_id}", None)
 ```
 
-- [ ] **Step 8: Run the full suite and the gates**
+- [x] **Step 8: Run the full suite and the gates**
 
 Run: `.venv/bin/python -m pytest -q && .venv/bin/ruff check . && .venv/bin/mypy .`
 Expected: all pass; baseline fixture unchanged.
 
-- [ ] **Step 9: Mutation check**
+- [x] **Step 9: Mutation check**
 
 Delete the `set_state(f"bracket_order:...")` line in `place_bracket` and re-run the suite.
 Expected: **exactly** `test_place_bracket_records_the_bracket_order_id` fails. If nothing fails, the test is not holding the wiring — fix the test before proceeding. Restore afterwards.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add -A
@@ -203,7 +203,7 @@ git commit -m "feat: persist the resting bracket's order id"
 **Interfaces:**
 - Consumes: `agent_state["bracket_order:<product>"]`, `open_stop:`, `open_target:` (Task 1); `executor.place_bracket`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_a_dead_bracket_on_a_held_position_is_replaced(repo):
@@ -250,12 +250,12 @@ class _RebracketingBroker(_Broker):
         return {"success": True, "order_id": f"cb-re-{len(self.placed)}"}
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_reconcile.py -k dead_bracket_on_a_held_position_is_replaced -q`
 Expected: FAIL — `AssertionError: no replacement bracket was placed`
 
-- [ ] **Step 3: Replace the bracket instead of only warning**
+- [x] **Step 3: Replace the bracket instead of only warning**
 
 Replace the body of `_warn_if_position_left_unprotected` with a re-bracket attempt, keeping the CRITICAL as the *fallback* when replacement is impossible:
 
@@ -330,17 +330,17 @@ def _escalate_unprotected(
 
 Update the call site in the `_DEAD` branch from `_warn_if_position_left_unprotected(repo, row, status)` to `_rebracket_or_escalate(broker, repo, config, row, now_ts)`, and add `from keel.execution import executor` to the imports.
 
-- [ ] **Step 4: Run it and watch it pass**
+- [x] **Step 4: Run it and watch it pass**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_reconcile.py -q`
 Expected: PASS, including the pre-existing `test_a_dead_bracket_on_a_still_held_position_escalates_loudly` — which must now be updated to use a broker that *cannot* place (so the escalation path still fires). Change it to use plain `_Broker`, which has no `place_order`, and assert the CRITICAL.
 
-- [ ] **Step 5: Full gates + mutation check**
+- [x] **Step 5: Full gates + mutation check**
 
 Run: `.venv/bin/python -m pytest -q && .venv/bin/ruff check . && .venv/bin/mypy .`
 Then stub `_rebracket_or_escalate`'s `place_bracket` call to return `None` and confirm the CRITICAL test fails.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -391,7 +391,7 @@ Found by a second adversarial pass, and worse than the above because they would 
 
 9. **A partially-filled dead bracket would close a tranche that is still partly held.** `reconcile.py` routes `filled_size > 0` to `_record_fill`, which has no full-vs-partial distinction. **Fix:** record the outcome for what sold, but only `close_position` when the fill covers the tranche's qty; otherwise leave it open and log.
 
-- [ ] **Step 1: Write the failing migration test**
+- [x] **Step 1: Write the failing migration test**
 
 ```python
 def test_migration_to_v4_creates_the_positions_table():
@@ -405,12 +405,12 @@ def test_migration_to_v4_creates_the_positions_table():
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/data/test_migrations.py -k v4 -q`
 Expected: FAIL — no such table `positions`
 
-- [ ] **Step 3: Add the table and bump the version**
+- [x] **Step 3: Add the table and bump the version**
 
 In `keel/data/db.py`, add to `_SCHEMA_STATEMENTS` (which runs before the version check, so an existing v3 DB picks it up from the `IF NOT EXISTS` DDL — same additive pattern as `trade_outcomes` at v3):
 
@@ -433,12 +433,12 @@ CREATE INDEX IF NOT EXISTS idx_positions_open
 
 Bump `SCHEMA_VERSION` to `4` and add `_migrate_v4_positions` as a deliberate no-op that only advances the stamp, mirroring `_migrate_v3_trade_outcomes`.
 
-- [ ] **Step 4: Run it and watch it pass, then update the pre-existing version assertions**
+- [x] **Step 4: Run it and watch it pass, then update the pre-existing version assertions**
 
 Run: `.venv/bin/python -m pytest tests/data/test_migrations.py -q`
 Three pre-existing assertions expect version 3. Update them to 4 — read the whole file first and confirm each is legitimate fallout of the bump, not a weakened assertion. (Task 2 of the previous plan hit exactly this and the reviewer verified it; do the same.)
 
-- [ ] **Step 5: Write the failing repository test**
+- [x] **Step 5: Write the failing repository test**
 
 ```python
 def test_two_tranches_in_one_product_are_separately_addressable(repo):
@@ -459,12 +459,12 @@ def test_two_tranches_in_one_product_are_separately_addressable(repo):
     assert [r["bracket_order_id"] for r in rows] == [11, 12]
 ```
 
-- [ ] **Step 6: Run it and watch it fail**
+- [x] **Step 6: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/data/test_positions.py -q`
 Expected: FAIL — `AttributeError: 'Repository' object has no attribute 'open_position'`
 
-- [ ] **Step 7: Implement typed access**
+- [x] **Step 7: Implement typed access**
 
 Follow `insert_trade_outcome`/`get_trade_outcomes` in `keel/data/repository.py` for money encoding — use the file's existing `_dec_to_text`/`_text_to_dec` helpers (the trade-outcomes pair used a bare `Decimal(...)`, which the review flagged as inconsistent; do not repeat it).
 
@@ -530,12 +530,12 @@ def close_position(self, position_id: int, *, closed_at: int) -> None:
     self._conn.commit()
 ```
 
-- [ ] **Step 8: Run it and watch it pass**
+- [x] **Step 8: Run it and watch it pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_positions.py -q`
 Expected: PASS
 
-- [ ] **Step 9: Write the failing attribution test**
+- [x] **Step 9: Write the failing attribution test**
 
 ```python
 def test_an_older_tranches_bracket_filling_attributes_to_THAT_tranche(repo):
@@ -563,7 +563,7 @@ def test_an_older_tranches_bracket_filling_attributes_to_THAT_tranche(repo):
     assert [r["id"] for r in repo.get_open_positions(PRODUCT)] != [first]
 ```
 
-- [ ] **Step 10: Run it, watch it fail, then thread the position id through**
+- [x] **Step 10: Run it, watch it fail, then thread the position id through**
 
 Run: `.venv/bin/python -m pytest tests/execution/test_reconcile.py -k older_tranches_bracket -q`
 Expected: FAIL — the outcome is attributed to the newest `position_rule` blob.
@@ -576,12 +576,12 @@ Wire it, keeping ONE linkage direction — a position points at its bracket, nev
 
 `position_rule:<product>` survives only as the exit-rule ownership marker its docstring always described — it no longer carries `entry_fill`/`qty`/`entry_fee`.
 
-- [ ] **Step 11: Full gates + the wiring mutation check**
+- [x] **Step 11: Full gates + the wiring mutation check**
 
 Run: `.venv/bin/python -m pytest -q && .venv/bin/ruff check . && .venv/bin/mypy .`
 Then stub the `repo.open_position(...)` call in `run_once` and confirm an agent-level test fails — not only a repository unit test. If only unit tests fail, the wiring is unheld and this task has reproduced the branch's signature defect.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add -A
@@ -599,7 +599,7 @@ Resolves layering debt: both landed only on `keel/data/cb_client.py`, which brok
 - Modify: `packages/keel-broker-coinbase/keel_broker_coinbase/{transport.py,adapter.py}`
 - Test: the package's existing conformance suite
 
-- [ ] **Step 1: Write the failing conformance test**
+- [x] **Step 1: Write the failing conformance test**
 
 Add to the conformance suite, following its existing shape:
 
@@ -620,12 +620,12 @@ def test_cancel_order_reports_per_order_confirmation(broker):
     assert broker.cancel_order("already-filled") is False
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest packages/keel-broker-api -q`
 Expected: FAIL — `Broker` has no attribute `get_order`
 
-- [ ] **Step 3: Add `OrderStatus` to the port's result types and both methods to the protocol**
+- [x] **Step 3: Add `OrderStatus` to the port's result types and both methods to the protocol**
 
 Mirror the existing `Balance`/`Preview`/`PlaceResult` dataclasses in `packages/keel-broker-api/keel_broker_api/results.py`:
 
@@ -650,15 +650,15 @@ And on the `Broker` protocol:
     def cancel_order(self, order_id: str) -> bool: ...
 ```
 
-- [ ] **Step 4: Implement on the Coinbase adapter**
+- [x] **Step 4: Implement on the Coinbase adapter**
 
 Add `get_order` and `cancel_orders` to `Transport` in `packages/keel-broker-coinbase/keel_broker_coinbase/transport.py`, then implement both adapter methods against them — port the normalization from `keel/data/cb_client.py:254-298` verbatim, including the empty-`results`-is-failure rule.
 
-- [ ] **Step 5: Run the conformance suite and the full suite**
+- [x] **Step 5: Run the conformance suite and the full suite**
 
 Run: `.venv/bin/python -m pytest -q && .venv/bin/ruff check . && .venv/bin/mypy .`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -675,7 +675,7 @@ Third instance of the dormant-rail pattern. `keel simulate` cannot trip rail 11,
 - Modify: `keel/sim/account.py` (drawdown state on `SimAccount`), `keel/sim/portfolio_sim.py` (call it per bar)
 - Test: `tests/sim/test_account.py`, `tests/sim/test_portfolio_sim.py`
 
-- [ ] **Step 1: Write the failing acceptance test**
+- [x] **Step 1: Write the failing acceptance test**
 
 The behavioural one. A parity test will not catch this — that lesson is `49d9657`.
 
@@ -692,29 +692,29 @@ def test_sweeping_max_total_dd_pct_changes_the_backtest():
     )
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `.venv/bin/python -m pytest tests/sim/test_portfolio_sim.py -k sweeping_max_total_dd -q`
 Expected: FAIL with equal trade counts — the same signature `28 > 28` failure rail 16 showed.
 
-- [ ] **Step 3: Add drawdown state to `SimAccount`**
+- [x] **Step 3: Add drawdown state to `SimAccount`**
 
 Mirror `record_trade_outcome`'s shape and place it next to the streak state it sits beside. Track `equity_high_water_mark` in memory (no `Repository`, by design — see the module docstring), update it from `mark_to_market` each bar, and expose `drawdown_total_pct` for `can_open` to read. Contributions are already tracked (`self.contributed`), so unlike live there is no external-flow ambiguity — deposits are known exactly, and the HWM must be rebased by them.
 
-- [ ] **Step 4: Enforce it in `can_open` and call it per bar**
+- [x] **Step 4: Enforce it in `can_open` and call it per bar**
 
 Add the rail-11 check to `SimAccount.can_open` alongside rail 16, and call the equity update from `portfolio_sim`'s per-bar loop *before* signals are evaluated, mirroring `run_once`'s reconcile → equity → entries ordering.
 
-- [ ] **Step 5: Run it and watch it pass**
+- [x] **Step 5: Run it and watch it pass**
 
 Run: `.venv/bin/python -m pytest tests/sim/ -q`
 Expected: PASS. Report the sweep response curve (as `49d9657` did: `0 → 28 | 1 → 3 | 2 → 4 | 3 → 5 | 5 → 6`) in the commit message — a monotonic curve is the evidence the rail is genuinely tunable.
 
-- [ ] **Step 6: Mutation check**
+- [x] **Step 6: Mutation check**
 
 Stub the per-bar equity update in `portfolio_sim` and confirm **exactly** the acceptance test fails.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
