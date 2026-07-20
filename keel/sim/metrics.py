@@ -247,3 +247,28 @@ def return_per_drawdown(total_return_pct: Decimal, max_dd_pct: Decimal) -> Decim
     if max_dd_pct == 0:
         return Decimal(0)
     return total_return_pct / max_dd_pct
+
+
+def bar_pnl(
+    equity_curve: list[tuple[int, Decimal]],
+    contributions: list[tuple[int, Decimal]],
+) -> list[Decimal]:
+    """Per-bar P&L: equity deltas with external contributions removed.
+
+    A raw `equity[i] - equity[i-1]` would score a monthly deposit as a large positive return,
+    which is not P&L at all -- it is new capital. Left uncorrected it would inflate the mean
+    and (because deposits are positive) leave the downside deviation untouched, badly
+    distorting any Sortino computed downstream. Contributions are matched by timestamp and
+    subtracted from the bar they land on.
+
+    Returns one value per step after the first point (an N-point curve yields N-1 P&L values).
+    """
+    if len(equity_curve) < 2:
+        return []
+    by_ts: dict[int, Decimal] = {}
+    for ts, amount in contributions:
+        by_ts[ts] = by_ts.get(ts, Decimal(0)) + amount
+    out: list[Decimal] = []
+    for (_, previous), (ts, current) in zip(equity_curve, equity_curve[1:]):
+        out.append(current - previous - by_ts.get(ts, Decimal(0)))
+    return out

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
@@ -68,6 +69,11 @@ from keel.strategy.promotion import PromotionConfig, can_promote, promotion_clas
 from keel.strategy.rules.base import Rule
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity
+
+if TYPE_CHECKING:
+    # Type-only: `sim` must not take a runtime dependency on `research`. The dependency
+    # direction is research -> sim, never the reverse (spec §3).
+    from keel.research.cscv import PBOResult
 
 __all__ = [
     "DEFAULT_MAE_MFE_THRESHOLD",
@@ -742,6 +748,56 @@ def _render_caveats_section() -> list[str]:
     ]
 
 
+def _render_pbo_section(
+    result: PBOResult, gate_ok: bool, gate_reasons: list[str]
+) -> list[str]:
+    """Render the PBO block. The reading rule travels WITH the number, deliberately.
+
+    §78.7's limitation 4 means a bare PBO is misleading on its own for exactly the plateau
+    shape this project is told to prefer, so the section never prints phi without the
+    degradation slope beside it and the interpretation underneath.
+    """
+    status = "PASS" if gate_ok else "FAIL"
+    lines = [
+        "## Overfitting diagnostics (PBO / CSCV)",
+        "",
+        f"- **PBO (phi):** {result.pbo:.4f}",
+        f"- **Degradation slope:** {result.degradation_slope:.4f}",
+        f"- **Prob[OOS < 0]:** {result.prob_loss:.4f}",
+        f"- **Stochastic dominance:** 1st-order {result.dominance_1st}, "
+        f"2nd-order {result.dominance_2nd}",
+        f"- **Grid:** N={result.n_columns} columns, S={result.n_blocks} blocks, "
+        f"{result.n_combinations} combinations, {result.rows_used} rows "
+        f"({result.rows_dropped} oldest dropped)",
+        "",
+        f"**G4: {status}**",
+        "",
+    ]
+    for reason in gate_reasons:
+        lines.append(f"- {reason}")
+    if gate_reasons:
+        lines.append("")
+    lines.extend(
+        [
+            "> Read PBO alongside the degradation slope, never alone (KB §78.7 limitation 4): "
+            "a broad plateau of near-identical configurations produces a high PBO **by "
+            "construction**, and a broad plateau is what §54.10/§73.13 tell us to prefer. "
+            "High PBO with a flat, positive OOS scatter is the good outcome; high PBO with a "
+            "steeply negative slope is the bad one.",
+            "",
+            "> `Prob[OOS < 0]` is reported **separately** from PBO on purpose (§78.8): even at "
+            "phi near 0 it can be high, meaning OOS performance is poor for reasons other than "
+            "overfitting. They are distinct failure modes.",
+            "",
+            "> PBO is orthogonal to look-ahead bias and fee realism (§78.7 limitation 3). It "
+            "does not check whether the backtest itself is correct, and it does not retire the "
+            "OOS firewall (§54.10) -- both are needed.",
+            "",
+        ]
+    )
+    return lines
+
+
 def render_markdown(
     sim: SimResult,
     edge: dict[str, BacktestResult],
@@ -751,6 +807,8 @@ def render_markdown(
     gaps: list[GapItem],
     in_sample: bool = True,
     tier_results: list[TierFeeResult] | None = None,
+    pbo_result: PBOResult | None = None,
+    pbo_gate: tuple[bool, list[str]] | None = None,
 ) -> str:
     """Render the full report (spec §6 structure, plus Issue #86's tier/fee matrix) as one
     Markdown string.
@@ -761,7 +819,8 @@ def render_markdown(
 
     `tier_results` (Issue #86) is optional and defaults to an empty matrix (renders a
     "not computed" placeholder) so every existing caller of this function keeps working
-    unchanged.
+    unchanged. `pbo_result`/`pbo_gate` (KB §78) follow the same backward-compatible pattern:
+    the overfitting section is emitted only when a PBO run was actually performed.
     """
     sections = [
         _render_verdict_section(verdict, in_sample),
@@ -773,6 +832,9 @@ def render_markdown(
         _render_gaps_section(gaps),
         _render_caveats_section(),
     ]
+    if pbo_result is not None:
+        gate_ok, gate_reasons = pbo_gate if pbo_gate is not None else (True, [])
+        sections.insert(-2, _render_pbo_section(pbo_result, gate_ok, gate_reasons))
     lines = ["# Engine Validation & Trade-Simulation Report", ""]
     for section in sections:
         lines.extend(section)

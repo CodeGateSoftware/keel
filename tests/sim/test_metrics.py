@@ -10,6 +10,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from keel.sim.metrics import (
+    bar_pnl,
     cagr_money_weighted,
     cumulative_returns,
     daily_returns,
@@ -137,3 +138,32 @@ def test_return_per_drawdown_basic():
 
 def test_return_per_drawdown_guards_zero_drawdown():
     assert return_per_drawdown(Decimal("0.5"), Decimal("0")) == Decimal("0")
+
+
+# -- bar_pnl: contribution-adjusted per-bar P&L (spec §4.5) --------------------
+
+
+def test_bar_pnl_subtracts_contributions_from_the_bar_they_land_on():
+    """A deposit is new capital, not profit.
+
+    Uncorrected it would inflate the mean while leaving downside deviation untouched --
+    silently distorting every Sortino computed from this series.
+    """
+    equity = [(0, Decimal("1000")), (1, Decimal("1600")), (2, Decimal("1550"))]
+    contributions = [(1, Decimal("500"))]
+    assert bar_pnl(equity, contributions) == [Decimal("100"), Decimal("-50")]
+
+
+def test_bar_pnl_without_contributions_is_plain_differencing():
+    equity = [(0, Decimal("100")), (1, Decimal("110")), (2, Decimal("105"))]
+    assert bar_pnl(equity, []) == [Decimal("10"), Decimal("-5")]
+
+
+def test_bar_pnl_needs_two_points():
+    assert bar_pnl([], []) == []
+    assert bar_pnl([(0, Decimal("100"))], []) == []
+
+
+def test_bar_pnl_sums_multiple_contributions_on_the_same_bar():
+    equity = [(0, Decimal("0")), (1, Decimal("300"))]
+    assert bar_pnl(equity, [(1, Decimal("100")), (1, Decimal("150"))]) == [Decimal("50")]

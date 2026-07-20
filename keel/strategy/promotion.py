@@ -190,3 +190,44 @@ def transition(
         return status
 
     return status  # "disabled" (or any unrecognized status): terminal, no-op
+
+
+# -- G4: PBO overfitting gate (spec §7, KB §78) --------------------------------
+
+
+@dataclass
+class PBOGate:
+    """G4 thresholds. Defaults mirror `keel_core.config.ResearchConfig`.
+
+    ⛔ NEVER TUNE THESE TO OBTAIN A DESIRED VERDICT (§78.7's Strathern warning).
+    """
+
+    pbo_max: Decimal = Decimal("0.05")
+    slope_floor: Decimal = Decimal("-0.5")
+
+
+def g4_pbo_gate(
+    pbo: Decimal, degradation_slope: Decimal, gate: PBOGate | None = None
+) -> tuple[bool, list[str]]:
+    """G4: fail only on `pbo > pbo_max` AND `degradation_slope < slope_floor`.
+
+    A CONJUNCTION, deliberately, not the bare scalar. §78.7's limitation 4: "it is entirely
+    possible that all the N strategies have high but similar Sharpe ratios... PBO will be
+    high. Here overfitting is among many 'skillful' strategies." That is this project's
+    plateau case exactly, and §54.10/§73.13 direct us to PREFER a broad plateau -- so a bare
+    0.05 gate would reject the robust choice by construction.
+
+    §78.7 supplies the reading rule this encodes: high PBO with a flat, positive OOS scatter
+    is the GOOD outcome; high PBO with a steeply negative degradation slope is the bad one.
+
+    Boundaries are strict (`>` and `<`), so landing exactly on both thresholds passes.
+    """
+    gate = gate or PBOGate()
+    if pbo > gate.pbo_max and degradation_slope < gate.slope_floor:
+        return False, [
+            f"PBO {pbo:.2f} > {gate.pbo_max} AND degradation slope "
+            f"{degradation_slope:.2f} < {gate.slope_floor}: the IS-best configuration "
+            "underperforms the OOS median and OOS performance degrades steeply in IS "
+            "performance -- the signature of a fitted, not a robust, selection (§78.8)"
+        ]
+    return True, []

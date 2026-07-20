@@ -51,6 +51,7 @@ to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroke
 from __future__ import annotations
 
 import functools
+import json
 import sys
 import time
 from dataclasses import replace
@@ -74,6 +75,9 @@ from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
 from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
+from keel.research import cscv as cscv_mod
+from keel.research import ledger as trials_ledger
+from keel.research import matrix as matrix_mod
 from keel.security import authz
 from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
@@ -253,6 +257,140 @@ def db_import(ctx: click.Context, dir_path: str) -> None:
     click.echo(f"imported={result.imported} skipped={result.skipped}")
     for warning in result.warnings:
         click.echo(f"  warning: {warning}")
+
+
+# -- trials ledger --------------------------------------------------------------------------
+
+
+@cli.group("trials")
+def trials_group() -> None:
+    """Append-only trials ledger (spec §4). Records experiments, never money."""
+
+
+_LEDGER_OPTION = click.option(
+    "--ledger",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Ledger path (default: docs/experiments/trials-ledger.jsonl).",
+)
+
+
+def _ledger_path(ledger: Path | None) -> Path:
+    return ledger if ledger is not None else trials_ledger.DEFAULT_LEDGER_PATH
+
+
+@trials_group.command("record")
+@_LEDGER_OPTION
+@click.option("--trial-id", required=True)
+@click.option("--session", required=True, help="Free-text experiment/session label.")
+@click.option("--rule", required=True)
+@click.option("--params", default="{}", help="JSON object of the full parameter dict.")
+@click.option("--provenance", required=True, type=click.Choice(sorted(trials_ledger.PROVENANCE)))
+@click.option("--kind", required=True, type=click.Choice(sorted(trials_ledger.KINDS)))
+@click.option("--decision", required=True, type=click.Choice(sorted(trials_ledger.DECISIONS)))
+@click.option("--series-missing", is_flag=True, default=False)
+@click.option("--per-bar-pnl", default=None, help="JSON array of per-bar P&L.")
+@click.option("--per-trade-pnl", default=None, help="JSON array of per-trade P&L.")
+def trials_record(
+    ledger: Path | None,
+    trial_id: str,
+    session: str,
+    rule: str,
+    params: str,
+    provenance: str,
+    kind: str,
+    decision: str,
+    series_missing: bool,
+    per_bar_pnl: str | None,
+    per_trade_pnl: str | None,
+) -> None:
+    """Record one trial -- the path scratchpad experiments use (spec §4.5)."""
+
+    def _series(raw: str | None) -> list[Decimal]:
+        return [Decimal(str(v)) for v in json.loads(raw)] if raw else []
+
+    try:
+        record = trials_ledger.append_trial(
+            _ledger_path(ledger),
+            trial_id=trial_id,
+            session=session,
+            rule=rule,
+            params=json.loads(params),
+            provenance=provenance,
+            kind=kind,
+            decision=decision,
+            per_trade_pnl=_series(per_trade_pnl),
+            per_bar_pnl=_series(per_bar_pnl),
+            series_missing=series_missing,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"recorded {record.trial_id} ({record.decision}) hash={record.row_hash[:12]}")
+
+
+@trials_group.command("list")
+@_LEDGER_OPTION
+def trials_list(ledger: Path | None) -> None:
+    """List recorded trials and the two N accountings (spec §4.4)."""
+    trials = trials_ledger.read_trials(_ledger_path(ledger))
+    for index, record in enumerate(trials, start=1):
+        flag = " [series_missing]" if record.series_missing else ""
+        click.echo(
+            f"{index:>4}  {record.trial_id:<34} {record.rule:<18} "
+            f"{record.provenance:<9} {record.kind:<16} {record.decision}{flag}"
+        )
+    m, n_decisions = trials_ledger.trial_counts(trials)
+    click.echo(f"\nM={m}  N_decisions={n_decisions}")
+
+
+@trials_group.command("verify")
+@_LEDGER_OPTION
+def trials_verify(ledger: Path | None) -> None:
+    """Verify the hash chain. Exits non-zero if broken."""
+    errors = trials_ledger.verify_chain(_ledger_path(ledger))
+    if not errors:
+        click.echo("chain intact")
+        return
+    for error in errors:
+        click.echo(error, err=True)
+    raise click.ClickException(f"{len(errors)} chain error(s)")
+
+
+@trials_group.command("pbo")
+@_LEDGER_OPTION
+@click.option("--session", default=None, help="Only use columns from this session label.")
+@click.option("--blocks", default=16, show_default=True, help="S: number of row blocks.")
+def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
+    """Probability of Backtest Overfitting over a declared candidate grid (§78.6).
+
+    Reports probabilities. It deliberately does NOT report which configuration won: PBO
+    evaluates the quality of a selection process and must never become the objective that
+    selection relies on (§78.7's Strathern warning).
+    """
+    trials = trials_ledger.read_trials(_ledger_path(ledger))
+    build = matrix_mod.build_matrix(trials, session=session)
+    if not build.columns:
+        raise click.ClickException("no usable columns (all trials are series_missing?)")
+    for warning in build.warnings:
+        click.echo(f"warning: {warning}", err=True)
+    if build.refused:
+        click.echo(f"refused {len(build.refused)} series_missing trial(s)", err=True)
+
+    result = cscv_mod.pbo(build.columns, s=blocks)
+
+    click.echo(f"columns (N)          : {result.n_columns}")
+    click.echo(f"blocks (S)           : {result.n_blocks}")
+    click.echo(f"combinations         : {result.n_combinations}")
+    click.echo(f"rows used / dropped  : {result.rows_used} / {result.rows_dropped}")
+    click.echo(f"PBO                  : {result.pbo:.4f}")
+    click.echo(f"degradation slope    : {result.degradation_slope:.4f}")
+    click.echo(f"Prob[OOS < 0]        : {result.prob_loss:.4f}")
+    click.echo(f"stochastic dominance : 1st={result.dominance_1st} 2nd={result.dominance_2nd}")
+    click.echo(
+        "\nRead PBO alongside the degradation slope, never alone (§78.7 limitation 4): a high "
+        "PBO with a flat, positive OOS scatter is the GOOD outcome -- a broad plateau of "
+        "near-identical configurations produces high PBO by construction."
+    )
 
 
 # -- monitor ------------------------------------------------------------------------------
@@ -935,6 +1073,29 @@ def _default_report_path(now_ts: int) -> Path:
     help="Never touch the network; simulate over whatever is already cached in the DB.",
 )
 @click.option(
+    "--trial-decision",
+    type=click.Choice(sorted(trials_ledger.DECISIONS)),
+    default="diagnostic_only",
+    show_default=True,
+    help=(
+        "How this run counts in the trials ledger. A plain validation run of the shipped "
+        "config is a diagnostic and does NOT increment N (spec §4.4)."
+    ),
+)
+@click.option(
+    "--trial-provenance",
+    type=click.Choice(sorted(trials_ledger.PROVENANCE)),
+    default="a_priori",
+    show_default=True,
+    help="Whether this configuration came from the KB (a_priori) or from fitting (fitted).",
+)
+@click.option(
+    "--no-trial-record",
+    is_flag=True,
+    default=False,
+    help="Skip appending this run to the trials ledger.",
+)
+@click.option(
     "--skip-within-cap",
     is_flag=True,
     default=False,
@@ -955,6 +1116,9 @@ def simulate(
     artifact: bool,
     refresh: bool,
     no_fetch: bool,
+    trial_decision: str,
+    trial_provenance: str,
+    no_trial_record: bool,
     skip_within_cap: bool,
 ) -> None:
     """Simulate the deterministic engine over historical candles (read-only; no authz gate).
@@ -1065,6 +1229,30 @@ def simulate(
         monthly_contribution,
         skip_within_cap,
     )
+
+    if not no_trial_record:
+        # One ledger row per simulate run: the run IS one configuration of the whole rule set,
+        # and its account equity curve is that configuration's per-bar P&L column. Deposits are
+        # stripped by `bar_pnl` -- new capital is not profit (spec §4.5).
+        series = metrics_mod.bar_pnl(sim.equity_curve, sim.contributions)
+        trials_ledger.append_trial(
+            trials_ledger.DEFAULT_LEDGER_PATH,
+            trial_id=f"simulate-{now_ts}",
+            session="keel simulate",
+            rule=",".join(sorted({rule.name for rule in rules})) or "none",
+            params={
+                "products": product_list,
+                "years": years,
+                "monthly_contribution": str(monthly_contribution),
+                "rules": [rule.describe() for rule in rules],
+            },
+            provenance=trial_provenance,
+            kind="sweep_node",
+            decision=trial_decision,
+            per_bar_pnl=series,
+            series_missing=not series,
+            summary={"trade_count": len(sim.trades)},
+        )
 
     md = report_mod.render_markdown(
         sim,

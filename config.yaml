@@ -109,3 +109,10 @@ logging:
   file: logs/keel.log
   max_file_mb: 25
   file_count: 5
+
+# G4 overfitting gate (KB §78). NEVER tune these to obtain a desired verdict -- doing so is
+# the exact Strathern misuse the gate exists to prevent (§78.7). slope_floor is calibrated
+# from §78.8's worked cases: real strategy -0.35, pure random walk -0.61, overfit -0.75.
+research:
+  pbo_max: 0.05
+  slope_floor: -0.5

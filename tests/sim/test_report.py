@@ -691,7 +691,7 @@ def _full_tier_matrix() -> list:
     return rows
 
 
-def _minimal_render_markdown_args(tier_results):
+def _minimal_render_markdown_args(tier_results, **extra):
     sim = SimResult(
         trades=[],
         equity_curve=[(0, Decimal("0")), (86400, Decimal("500"))],
@@ -721,6 +721,7 @@ def _minimal_render_markdown_args(tier_results):
         gaps,
         in_sample=True,
         tier_results=tier_results,
+        **extra,
     )
 
 
@@ -790,3 +791,86 @@ def test_render_markdown_backward_compatible_without_tier_results_kwarg():
         [],
     )
     assert "Subscription tier & fee analysis" in md
+
+
+# -- PBO section (spec §7, KB §78) ---------------------------------------------
+
+
+def test_pbo_section_reports_all_four_statistics_and_the_reading_rule():
+    from keel.research.cscv import PBOResult
+    from keel.sim.report import _render_pbo_section
+
+    result = PBOResult(
+        pbo=Decimal("0.62"),
+        n_combinations=12870,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=1808,
+        rows_dropped=11,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal("-0.20"),
+        prob_loss=Decimal("0.30"),
+        dominance_1st=False,
+        dominance_2nd=True,
+    )
+    body = "\n".join(_render_pbo_section(result, True, []))
+
+    assert "0.6200" in body
+    assert "-0.2000" in body
+    assert "0.3000" in body
+    assert "12870" in body
+    assert "G4: PASS" in body
+    # The reading rule must travel WITH the number (§78.7 limitation 4).
+    assert "plateau" in body.lower()
+    # Prob[OOS<0] is a SEPARATE failure mode from overfitting (§78.8).
+    assert "separately" in body.lower()
+
+
+def test_pbo_section_renders_gate_failure_reasons():
+    from keel.research.cscv import PBOResult
+    from keel.sim.report import _render_pbo_section
+
+    result = PBOResult(
+        pbo=Decimal("0.90"),
+        n_combinations=12870,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=1808,
+        rows_dropped=11,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal("-0.80"),
+    )
+    body = "\n".join(_render_pbo_section(result, False, ["it is fitted, not robust"]))
+    assert "G4: FAIL" in body
+    assert "it is fitted, not robust" in body
+
+
+def test_render_markdown_omits_the_pbo_section_when_no_run_was_performed():
+    """Backward compatibility: every existing caller passes no PBO and must be unaffected."""
+    md = _minimal_render_markdown_args([])
+    assert "Overfitting diagnostics" not in md
+
+
+def test_render_markdown_includes_the_pbo_section_when_a_run_is_supplied():
+    from keel.research.cscv import PBOResult
+
+    result = PBOResult(
+        pbo=Decimal("0.62"),
+        n_combinations=12870,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=1808,
+        rows_dropped=11,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal("-0.20"),
+    )
+    md = _minimal_render_markdown_args([], pbo_result=result, pbo_gate=(True, []))
+    assert "Overfitting diagnostics (PBO / CSCV)" in md
+    # Placed before the gaps backlog and the caveats, which must both still be last.
+    assert md.index("Overfitting diagnostics") < md.index("Knowledge & data gaps")
