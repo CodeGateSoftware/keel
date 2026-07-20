@@ -1073,6 +1073,29 @@ def _default_report_path(now_ts: int) -> Path:
     help="Never touch the network; simulate over whatever is already cached in the DB.",
 )
 @click.option(
+    "--trial-decision",
+    type=click.Choice(sorted(trials_ledger.DECISIONS)),
+    default="diagnostic_only",
+    show_default=True,
+    help=(
+        "How this run counts in the trials ledger. A plain validation run of the shipped "
+        "config is a diagnostic and does NOT increment N (spec §4.4)."
+    ),
+)
+@click.option(
+    "--trial-provenance",
+    type=click.Choice(sorted(trials_ledger.PROVENANCE)),
+    default="a_priori",
+    show_default=True,
+    help="Whether this configuration came from the KB (a_priori) or from fitting (fitted).",
+)
+@click.option(
+    "--no-trial-record",
+    is_flag=True,
+    default=False,
+    help="Skip appending this run to the trials ledger.",
+)
+@click.option(
     "--skip-within-cap",
     is_flag=True,
     default=False,
@@ -1093,6 +1116,9 @@ def simulate(
     artifact: bool,
     refresh: bool,
     no_fetch: bool,
+    trial_decision: str,
+    trial_provenance: str,
+    no_trial_record: bool,
     skip_within_cap: bool,
 ) -> None:
     """Simulate the deterministic engine over historical candles (read-only; no authz gate).
@@ -1203,6 +1229,30 @@ def simulate(
         monthly_contribution,
         skip_within_cap,
     )
+
+    if not no_trial_record:
+        # One ledger row per simulate run: the run IS one configuration of the whole rule set,
+        # and its account equity curve is that configuration's per-bar P&L column. Deposits are
+        # stripped by `bar_pnl` -- new capital is not profit (spec §4.5).
+        series = metrics_mod.bar_pnl(sim.equity_curve, sim.contributions)
+        trials_ledger.append_trial(
+            trials_ledger.DEFAULT_LEDGER_PATH,
+            trial_id=f"simulate-{now_ts}",
+            session="keel simulate",
+            rule=",".join(sorted({rule.name for rule in rules})) or "none",
+            params={
+                "products": product_list,
+                "years": years,
+                "monthly_contribution": str(monthly_contribution),
+                "rules": [rule.describe() for rule in rules],
+            },
+            provenance=trial_provenance,
+            kind="sweep_node",
+            decision=trial_decision,
+            per_bar_pnl=series,
+            series_missing=not series,
+            summary={"trade_count": len(sim.trades)},
+        )
 
     md = report_mod.render_markdown(
         sim,
