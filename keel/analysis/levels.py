@@ -56,45 +56,80 @@ def swing_lows(candles: list[Candle], lookback: int = 2) -> list[int]:
     return idxs
 
 
-def _cluster_pivots(
-    prices: list[Decimal], kind: Literal["support", "resistance"], tolerance: Decimal
-) -> list[Level]:
-    """Greedily cluster sorted prices within relative `tolerance` of the running
-    cluster average into a single `Level`, counting touches.
+def _distinct_touches(timestamps: list[int], min_separation_sec: int) -> int:
+    """Count touches that are separated in TIME, not merely in the list (KB §81.5).
+
+    Three pivots inside one week are one visit to a level, not three independent tests of it.
+    Counting them as three inflates `touches` and manufactures "strong" levels out of a single
+    consolidation. Greedy left-to-right: take the earliest touch, then the next one at least
+    `min_separation_sec` later, and so on.
     """
-    if not prices:
+    if min_separation_sec <= 0:
+        return len(timestamps)
+    kept = 0
+    last: int | None = None
+    for ts in sorted(timestamps):
+        if last is None or ts - last >= min_separation_sec:
+            kept += 1
+            last = ts
+    return kept
+
+
+def _cluster_pivots(
+    pivots: list[tuple[int, Decimal]],
+    kind: Literal["support", "resistance"],
+    tolerance: Decimal,
+    min_separation_sec: int,
+) -> list[Level]:
+    """Greedily cluster `(ts, price)` pivots within relative `tolerance` of the running cluster
+    average into a single `Level`, counting TIME-SEPARATED touches.
+    """
+    if not pivots:
         return []
 
-    ordered = sorted(prices)
-    clusters: list[list[Decimal]] = [[ordered[0]]]
-    for price in ordered[1:]:
+    ordered = sorted(pivots, key=lambda item: item[1])
+    clusters: list[list[tuple[int, Decimal]]] = [[ordered[0]]]
+    for pivot in ordered[1:]:
         current = clusters[-1]
-        avg = sum(current) / len(current)
-        if abs(price - avg) <= avg * tolerance:
-            current.append(price)
+        avg = sum(price for _, price in current) / len(current)
+        if abs(pivot[1] - avg) <= avg * tolerance:
+            current.append(pivot)
         else:
-            clusters.append([price])
+            clusters.append([pivot])
 
     levels = []
     for cluster in clusters:
-        avg_price = sum(cluster) / len(cluster)
-        levels.append(Level(price=avg_price, kind=kind, touches=len(cluster), angular=False))
+        avg_price = sum(price for _, price in cluster) / len(cluster)
+        touches = _distinct_touches([ts for ts, _ in cluster], min_separation_sec)
+        levels.append(Level(price=avg_price, kind=kind, touches=touches, angular=False))
     return levels
+
+
+#: Minimum time between two pivots for them to count as SEPARATE touches (KB §81.5, which
+#: specifies two weeks). Adopted `a_priori` from the source, not fitted here, so it costs no
+#: trials budget (§73.12). Set to 0 to restore the old behaviour of counting every pivot.
+MIN_TOUCH_SEPARATION_SEC = 14 * 24 * 3600
 
 
 def find_levels(
     candles: list[Candle],
     tolerance: Decimal = Decimal("0.002"),
     min_touches: int = 3,
+    min_separation_sec: int = MIN_TOUCH_SEPARATION_SEC,
 ) -> list[Level]:
-    """Cluster swing-pivot prices into support/resistance levels, count touches per
-    cluster, and keep only levels with `touches >= min_touches` (KB §7.3).
-    """
-    low_prices = [candles[i].low for i in swing_lows(candles)]
-    high_prices = [candles[i].high for i in swing_highs(candles)]
+    """Cluster swing-pivot prices into support/resistance levels, count TIME-SEPARATED touches
+    per cluster, and keep only levels with `touches >= min_touches` (KB §7.3, §81.5).
 
-    levels = _cluster_pivots(low_prices, "support", tolerance)
-    levels += _cluster_pivots(high_prices, "resistance", tolerance)
+    ⚠️ **`min_separation_sec` is why this is not just a touch count.** Without it, three pivots
+    inside a single week's consolidation counted as three independent tests of a level, and any
+    tight chop manufactured a "strong" level. KB §81.5 requires at least two weeks between
+    touches; that is the default here.
+    """
+    lows = [(candles[i].ts, candles[i].low) for i in swing_lows(candles)]
+    highs = [(candles[i].ts, candles[i].high) for i in swing_highs(candles)]
+
+    levels = _cluster_pivots(lows, "support", tolerance, min_separation_sec)
+    levels += _cluster_pivots(highs, "resistance", tolerance, min_separation_sec)
 
     return [level for level in levels if level.touches >= min_touches]
 

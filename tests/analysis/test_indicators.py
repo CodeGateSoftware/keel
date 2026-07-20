@@ -7,6 +7,7 @@ exactly as Decimal. Divergence and deceleration are checked on synthetic fixture
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from keel.analysis.indicators import (
     adx,
     atr,
+    close_to_close_volatility,
     deceleration,
     directional_indicators,
     donchian_high,
@@ -28,6 +30,7 @@ from keel.analysis.indicators import (
     macd,
     rsi,
     rsi_divergence,
+    yang_zhang_volatility,
 )
 from keel.types import Candle
 
@@ -390,3 +393,78 @@ def test_deceleration_false_when_bodies_grow():
 def test_deceleration_false_when_too_few_candles():
     candles = [_candle(0, 100, 106, 99, 105), _candle(1, 105, 109, 104, 108)]
     assert deceleration(candles, n=3) is False
+
+
+# -- Yang-Zhang volatility (KB §79.9) ------------------------------------------
+
+
+def _ohlc(ts: int, o: str, h: str, low: str, c: str) -> Candle:
+    return Candle(
+        ts=ts,
+        open=Decimal(o),
+        high=Decimal(h),
+        low=Decimal(low),
+        close=Decimal(c),
+        volume=Decimal("1"),
+    )
+
+
+def _flat_series(n: int, price: str = "100") -> list[Candle]:
+    return [_ohlc(i * 86400, price, price, price, price) for i in range(n)]
+
+
+def test_yang_zhang_needs_window_plus_one_bars():
+    assert yang_zhang_volatility(_flat_series(10), window=60) is None
+    assert yang_zhang_volatility(_flat_series(61), window=60) is not None
+
+
+def test_yang_zhang_rejects_a_degenerate_window():
+    assert yang_zhang_volatility(_flat_series(100), window=1) is None
+
+
+def test_a_perfectly_flat_series_has_zero_volatility():
+    assert yang_zhang_volatility(_flat_series(61), window=60) == 0.0
+
+
+def test_yang_zhang_rises_with_range():
+    """Two series with IDENTICAL closes but different intrabar ranges.
+
+    Close-to-close cannot tell them apart; Yang-Zhang can, via Rogers-Satchell. That is the
+    whole reason to prefer it -- it reads information the baseline discards.
+    """
+    narrow, wide = [], []
+    for i in range(61):
+        close = 100 + (i % 2)
+        narrow.append(_ohlc(i * 86400, str(close), str(close + 0.1), str(close - 0.1), str(close)))
+        wide.append(_ohlc(i * 86400, str(close), str(close + 5), str(close - 5), str(close)))
+
+    assert close_to_close_volatility(narrow, 60) == close_to_close_volatility(wide, 60)
+    assert yang_zhang_volatility(wide, 60) > yang_zhang_volatility(narrow, 60)
+
+
+def test_the_overnight_term_degenerates_on_a_continuous_series():
+    """24/7 spot: O(t) == C(t-1), so the opening-jump term contributes nothing.
+
+    Documents the crypto adaptation rather than leaving it as a surprise: a gapping series with
+    otherwise identical bars must read HIGHER, because the jump term is real there.
+    """
+    continuous, gapping = [], []
+    for i in range(61):
+        base = 100 + i
+        continuous.append(_ohlc(i * 86400, str(base), str(base + 1), str(base - 1), str(base + 1)))
+        # Same bar shape, but each open jumps away from the prior close.
+        gapping.append(
+            _ohlc(i * 86400, str(base + 3), str(base + 4), str(base + 2), str(base + 1))
+        )
+
+    assert yang_zhang_volatility(gapping, 60) > yang_zhang_volatility(continuous, 60)
+
+
+def test_annualisation_constant_scales_as_sqrt():
+    series = [
+        _ohlc(i * 86400, str(100 + i % 3), str(101 + i % 3), str(99 + i % 3), str(100 + i % 3))
+        for i in range(61)
+    ]
+    daily = yang_zhang_volatility(series, 60, periods_per_year=1)
+    annual = yang_zhang_volatility(series, 60, periods_per_year=365)
+    assert annual == pytest.approx(daily * math.sqrt(365), rel=1e-9)

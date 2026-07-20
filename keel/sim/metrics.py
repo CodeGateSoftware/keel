@@ -272,3 +272,68 @@ def bar_pnl(
     for (_, previous), (ts, current) in zip(equity_curve, equity_curve[1:]):
         out.append(current - previous - by_ts.get(ts, Decimal(0)))
     return out
+
+
+def portfolio_volatility(
+    returns_by_asset: dict[str, list[Decimal]],
+    weights: dict[str, Decimal],
+    exposed: list[bool] | None = None,
+    periods_per_year: int = 365,
+) -> Decimal:
+    """Portfolio sigma with NO covariance matrix (KB §83.2).
+
+    Build one synthetic portfolio series -- start each sleeve at its weight, compound it on its
+    own return, sum the sleeves each period -- then take the plain stdev of THAT series'
+    returns. It equals the `sqrt(transpose(w*sigma) x CorrelationMatrix x (w*sigma))` route
+    exactly, because correlation is absorbed by construction in the summed series. No matrix, no
+    transpose, no inversion, no conditioning problem, and no NumPy.
+
+    ⚠️ **`exposed` is not optional in spirit.** Pass a per-period mask of "were we actually
+    holding anything?" and the flat, mostly-cash days are dropped. A whole-period sigma over the
+    Turtle's intermittent series UNDERSTATES risk, because days with no position contribute
+    zeros to the denominator -- §54.22's GASP objection, resolved the same way §73.4 resolved it
+    for Sharpe. Omitting the mask computes the whole-period number, which is the wrong one for
+    an intermittent book; it is allowed only because a fully-invested caller is legitimate.
+
+    ⛔ **A MEASUREMENT, NEVER AN ALLOCATOR.** Feeding this to a weight search is the MPT /
+    mean-variance direction, which is declined (§33, §50.1, §54.22). It exists to answer "how
+    volatile is the book?", not to choose the book.
+
+    Returns `Decimal(0)` rather than raising on degenerate input -- consistent with the rest of
+    this module, which is analytics over historical sims, not a live trading path.
+    """
+    if not returns_by_asset or not weights:
+        return Decimal(0)
+
+    assets = [a for a in returns_by_asset if a in weights]
+    if not assets:
+        return Decimal(0)
+    length = min(len(returns_by_asset[a]) for a in assets)
+    if length < 2:
+        return Decimal(0)
+
+    sleeves = {a: weights[a] for a in assets}
+    total = sum(sleeves.values(), Decimal(0))
+    if total <= 0:
+        return Decimal(0)
+
+    portfolio_returns: list[Decimal] = []
+    previous_value = total
+    for index in range(length):
+        for asset in assets:
+            sleeves[asset] *= Decimal(1) + returns_by_asset[asset][index]
+        value = sum(sleeves.values(), Decimal(0))
+        if previous_value > 0:
+            portfolio_returns.append(value / previous_value - Decimal(1))
+        else:
+            portfolio_returns.append(Decimal(0))
+        previous_value = value
+
+    if exposed is not None:
+        portfolio_returns = [
+            r for r, is_exposed in zip(portfolio_returns, exposed) if is_exposed
+        ]
+
+    if len(portfolio_returns) < 2:
+        return Decimal(0)
+    return _sample_variance(portfolio_returns).sqrt() * Decimal(periods_per_year).sqrt()

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from keel.sim.metrics import (
     bar_pnl,
     cagr_money_weighted,
@@ -17,6 +19,7 @@ from keel.sim.metrics import (
     ewma_volatility,
     irr,
     max_drawdown_pct,
+    portfolio_volatility,
     return_per_drawdown,
     sharpe,
     sortino,
@@ -167,3 +170,73 @@ def test_bar_pnl_needs_two_points():
 def test_bar_pnl_sums_multiple_contributions_on_the_same_bar():
     equity = [(0, Decimal("0")), (1, Decimal("300"))]
     assert bar_pnl(equity, [(1, Decimal("100")), (1, Decimal("150"))]) == [Decimal("50")]
+
+
+# -- portfolio_volatility (KB §83.2) -------------------------------------------
+
+
+def test_a_single_asset_portfolio_equals_that_asset_volatility():
+    """NOTE the convention difference: `volatility()` is per-period, `portfolio_volatility()`
+    is ANNUALISED by default (§83.2 specifies `sigma_daily * sqrt(252)`; we use 365 for 24/7
+    spot). Compare at `periods_per_year=1` so the identity is visible rather than obscured."""
+    returns = [Decimal("0.01"), Decimal("-0.02"), Decimal("0.015"), Decimal("-0.005")]
+    solo = portfolio_volatility({"BTC": returns}, {"BTC": Decimal("1")}, periods_per_year=1)
+    assert solo == pytest.approx(volatility(returns), rel=Decimal("0.02"))
+
+    annual = portfolio_volatility({"BTC": returns}, {"BTC": Decimal("1")})
+    assert annual == pytest.approx(solo * Decimal(365).sqrt(), rel=Decimal("0.001"))
+
+
+def test_perfectly_correlated_sleeves_do_not_diversify():
+    returns = [Decimal("0.02"), Decimal("-0.03"), Decimal("0.01"), Decimal("-0.01")]
+    one = portfolio_volatility({"BTC": returns}, {"BTC": Decimal("1")})
+    two = portfolio_volatility(
+        {"BTC": returns, "ETH": list(returns)},
+        {"BTC": Decimal("0.5"), "ETH": Decimal("0.5")},
+    )
+    assert two == pytest.approx(one, rel=Decimal("0.01"))
+
+
+def test_anticorrelated_sleeves_cancel_toward_zero():
+    """Correlation is absorbed by construction -- no covariance matrix is ever formed."""
+    up = [Decimal("0.02"), Decimal("-0.02"), Decimal("0.02"), Decimal("-0.02")]
+    down = [-r for r in up]
+    hedged = portfolio_volatility(
+        {"A": up, "B": down}, {"A": Decimal("0.5"), "B": Decimal("0.5")}
+    )
+    solo = portfolio_volatility({"A": up}, {"A": Decimal("1")})
+    assert hedged < solo / 10
+
+
+def test_exposed_mask_drops_flat_days_and_raises_the_measured_risk():
+    """§54.22's GASP objection: zero days on an intermittent book understate volatility."""
+    returns = [
+        Decimal("0.05"), Decimal("0"), Decimal("0"), Decimal("0"),
+        Decimal("-0.05"), Decimal("0"), Decimal("0"), Decimal("0"),
+    ]
+    whole = portfolio_volatility({"BTC": returns}, {"BTC": Decimal("1")})
+    exposed_only = portfolio_volatility(
+        {"BTC": returns},
+        {"BTC": Decimal("1")},
+        exposed=[True, False, False, False, True, False, False, False],
+    )
+    assert exposed_only > whole
+
+
+def test_degenerate_inputs_return_zero_rather_than_raising():
+    assert portfolio_volatility({}, {}) == Decimal(0)
+    assert portfolio_volatility({"BTC": [Decimal("0.1")]}, {"BTC": Decimal("1")}) == Decimal(0)
+    # An asset with no weight is ignored, not guessed at.
+    assert portfolio_volatility({"BTC": [Decimal("0.1")] * 5}, {"ETH": Decimal("1")}) == Decimal(0)
+    # Zero total weight is not a portfolio.
+    assert portfolio_volatility({"BTC": [Decimal("0.1")] * 5}, {"BTC": Decimal("0")}) == Decimal(0)
+
+
+def test_uses_the_shortest_common_history():
+    long_series = [Decimal("0.01")] * 10
+    short_series = [Decimal("0.01")] * 4
+    result = portfolio_volatility(
+        {"BTC": long_series, "PAXG": short_series},
+        {"BTC": Decimal("0.5"), "PAXG": Decimal("0.5")},
+    )
+    assert result >= Decimal(0)

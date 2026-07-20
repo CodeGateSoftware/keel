@@ -254,7 +254,18 @@ def check(intent: OrderIntent, repo: Repository, config: Config, now_ts: int) ->
     exposure = _open_exposure_by_asset(repo)
     total_exposure = sum(exposure.values(), Decimal("0"))
 
-    # 4. Total open-exposure cap — sum of at-risk capital across all open positions (§4.1).
+    # 4. Total open-exposure cap (§4.1).
+    #
+    # ⚠️ THIS IS A NOTIONAL CAP, NOT AN AT-RISK CAP (KB §83.3). An earlier comment here read
+    # "sum of at-risk capital across all open positions", which the code does not do and never
+    # did: it compares summed NOTIONAL against `max_exposure_usd`, so $5k behind a 2% stop and
+    # $5k behind a 20% stop are treated identically. The rail is therefore VOLATILITY-BLIND.
+    #
+    # Not a defect to fix here. A true aggregate at-risk cap (`sum(qty * ATR) <= V% * equity`)
+    # is INERT at one tranche per asset -- the 1% risk rail already pins the aggregate near 3%
+    # -- so it belongs with concurrent slots / pyramiding, not before them. Fixing the COMMENT
+    # matters regardless: a comment that overstates what a safety rail enforces is worse than
+    # no comment.
     if is_buy:
         projected_exposure = total_exposure + intent.notional
         if projected_exposure > config.caps.max_exposure_usd:
