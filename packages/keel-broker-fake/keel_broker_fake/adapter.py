@@ -14,6 +14,9 @@ specific assumption:
 | Two granularities, 50-candle page | Coinbase's granularity set and pagination limits          |
 | No fee summary                    | That every venue reports fees -- lapse detection must     |
 |                                   | degrade to attestation alone                              |
+| Unknown order id reports FAILED,  | That an unrecognised id raises -- a real venue's REST     |
+| never raises                      | transport 404s instead, but the port must not make        |
+|                                   | callers catch venue-shaped exceptions from `get_order`    |
 
 All state is in memory. No network, no files, no credentials.
 """
@@ -27,7 +30,7 @@ from decimal import Decimal
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
 from keel_core.types import Candle, Granularity
 
 #: This venue quotes only hourly and daily bars. Anything else it must refuse, not silently
@@ -149,6 +152,45 @@ class FakeAdapter:
         assumed true.
         """
         raise NotImplementedError("fake venue reports no fee summary")
+
+    def get_order(self, order_id: str) -> OrderStatus:
+        """Report a resting order as `"OPEN"`; an unknown id as `"FAILED"` -- never raise.
+
+        This venue fills nothing on its own (there is no matching engine here), so a resting
+        order's money fields are always zero, never modelled. An unknown id could raise instead,
+        but `OrderStatus`'s whole contract is that callers do arithmetic on its money fields
+        without special-casing `None` -- special-casing "does this id exist" one layer up would
+        just move the same problem, so this returns a normal `OrderStatus` either way.
+        """
+        for order in self.resting:
+            if order.order_id == order_id:
+                return OrderStatus(
+                    order_id=order_id,
+                    status="OPEN",
+                    filled_size=Decimal("0"),
+                    average_filled_price=Decimal("0"),
+                    total_fees=Decimal("0"),
+                )
+        return OrderStatus(
+            order_id=order_id,
+            status="FAILED",
+            filled_size=Decimal("0"),
+            average_filled_price=Decimal("0"),
+            total_fees=Decimal("0"),
+        )
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Remove a resting order and its trigger (if any); confirm only what was actually here.
+
+        A stop is two objects at this venue (`_RestingOrder` + `_Trigger`), so cancelling the
+        order without dropping its trigger would leave the trigger free to fire later and place
+        a brand new order for a cancellation the caller believes already happened -- this
+        venue's version of the naked-position bug `reconcile.py` exists to close.
+        """
+        before = len(self.resting)
+        self.resting = [order for order in self.resting if order.order_id != order_id]
+        self.triggers = [t for t in self.triggers if t.order_id != order_id]
+        return len(self.resting) < before
 
 
 __all__ = ["MAX_CANDLES_PER_CALL", "SUPPORTED_GRANULARITIES", "FakeAdapter"]

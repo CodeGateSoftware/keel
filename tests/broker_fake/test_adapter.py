@@ -11,7 +11,7 @@ from decimal import Decimal
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, PlaceResult
+from keel_broker_api.results import Balance, OrderStatus, PlaceResult
 from keel_broker_fake import FakeAdapter
 from keel_broker_fake.adapter import MAX_CANDLES_PER_CALL
 from keel_core.types import Granularity, Side
@@ -93,3 +93,75 @@ def test_a_plain_limit_order_creates_no_trigger() -> None:
 
 def test_get_balances_returns_domain_types() -> None:
     assert all(isinstance(b, Balance) for b in FakeAdapter().get_balances())
+
+
+# --- order status + cancellation -----------------------------------------------------------
+
+
+def test_get_order_reports_a_resting_order_as_open_with_zero_economics() -> None:
+    """This venue fills nothing on its own, so a resting order's money fields are always zero,
+    never modelled."""
+    adapter = FakeAdapter()
+    spec = LimitGTC(
+        product_id="BTC-USD", side=Side.SELL, base_size=Decimal("1"), limit_price=Decimal("70000")
+    )
+    placed = adapter.place_order(spec)
+    assert placed.broker_order_id is not None
+
+    order = adapter.get_order(placed.broker_order_id)
+
+    assert isinstance(order, OrderStatus)
+    assert order.status == "OPEN"
+    assert order.filled_size == Decimal("0")
+    assert order.average_filled_price == Decimal("0")
+    assert order.total_fees == Decimal("0")
+
+
+def test_get_order_on_an_unknown_id_reports_failed_not_a_raise() -> None:
+    """Callers do arithmetic on `OrderStatus`'s money fields without special-casing `None` --
+    special-casing "does this id exist" one layer up would just move the same problem."""
+    order = FakeAdapter().get_order("never-placed")
+
+    assert isinstance(order, OrderStatus)
+    assert order.status == "FAILED"
+    assert order.filled_size == Decimal("0")
+    assert order.average_filled_price == Decimal("0")
+    assert order.total_fees == Decimal("0")
+
+
+def test_cancel_order_removes_a_resting_order_and_confirms() -> None:
+    adapter = FakeAdapter()
+    spec = LimitGTC(
+        product_id="BTC-USD", side=Side.SELL, base_size=Decimal("1"), limit_price=Decimal("70000")
+    )
+    placed = adapter.place_order(spec)
+    assert placed.broker_order_id is not None
+
+    assert adapter.cancel_order(placed.broker_order_id) is True
+    assert adapter.resting == []
+    assert adapter.get_order(placed.broker_order_id).status == "FAILED"
+
+
+def test_cancel_order_on_an_unknown_id_returns_false() -> None:
+    assert FakeAdapter().cancel_order("never-placed") is False
+
+
+def test_cancel_order_drops_the_stops_trigger_too() -> None:
+    """A stop is two objects at this venue. Cancelling the order without dropping its trigger
+    would leave the trigger free to fire later and place a brand new order for a cancellation
+    the caller believes already happened -- this venue's version of the naked-position bug."""
+    adapter = FakeAdapter()
+    spec = StopLimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("1"),
+        stop_price=Decimal("60000"),
+        limit_price=Decimal("59900"),
+    )
+    placed = adapter.place_order(spec)
+    assert placed.broker_order_id is not None
+    assert len(adapter.triggers) == 1
+
+    assert adapter.cancel_order(placed.broker_order_id) is True
+
+    assert adapter.triggers == []

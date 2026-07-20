@@ -38,7 +38,7 @@ from keel_broker_api.orders import (
     StopLimitGTC,
 )
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, PlaceResult, Preview
+from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
 
 _PRODUCT = "BTC-USD"
 
@@ -162,6 +162,42 @@ class BrokerConformanceTests:
         broker = self.broker()
         spec = self._any_supported_spec(broker.capabilities())
         assert isinstance(broker.place_order(spec), PlaceResult)
+
+    # --- order status and cancellation ------------------------------------------------------
+
+    def test_get_order_returns_observed_economics(self) -> None:
+        """`execution.reconcile` duck-types this today against `cb_client`, a module Phase B
+        deletes. It must exist on the PORT or reconciliation breaks the moment Phase B lands.
+
+        The id is round-tripped through `place_order` rather than hardcoded: an order id is a
+        venue's own value, and a suite that invents one tests a fixture instead of a contract.
+        """
+        broker = self.broker()
+        placed = broker.place_order(self._any_supported_spec(broker.capabilities()))
+        assert placed.broker_order_id is not None
+
+        order = broker.get_order(placed.broker_order_id)
+        assert isinstance(order, OrderStatus), f"{type(order).__name__} crossed the port"
+        assert order.status in {"FILLED", "OPEN", "CANCELLED", "EXPIRED", "FAILED", "PENDING"}
+        assert isinstance(order.filled_size, Decimal)
+        assert isinstance(order.average_filled_price, Decimal)
+        assert isinstance(order.total_fees, Decimal)
+
+    def test_cancel_order_reports_per_order_confirmation(self) -> None:
+        """Coinbase's `batch_cancel` answers per order, so a 200 is not a confirmation. The port
+        must surface the per-order boolean, not the HTTP result -- `executor._cancel_at_exchange`
+        records local state on the strength of it, so a cancel that never happened would be
+        recorded as one that did.
+
+        The unknown id must come back `False`, not raise: absence of a refusal is not a
+        confirmation.
+        """
+        broker = self.broker()
+        placed = broker.place_order(self._any_supported_spec(broker.capabilities()))
+        assert placed.broker_order_id is not None
+
+        assert broker.cancel_order(placed.broker_order_id) is True
+        assert broker.cancel_order("an-id-this-venue-never-issued") is False
 
     # --- candles ---------------------------------------------------------------------------
 

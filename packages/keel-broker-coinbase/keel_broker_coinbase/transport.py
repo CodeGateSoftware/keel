@@ -40,6 +40,10 @@ class Transport(Protocol):
 
     def get_transaction_summary(self, **kwargs: Any) -> Any: ...
 
+    def get_order(self, order_id: str, **kwargs: Any) -> Any: ...
+
+    def cancel_orders(self, order_ids: list[str], **kwargs: Any) -> Any: ...
+
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:
     """Read `key` from a plain dict OR a `coinbase-advanced-py` `BaseResponse` object.
