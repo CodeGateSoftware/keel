@@ -94,6 +94,7 @@ from keel.sim import tiers as tiers_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Candle, Granularity
+from keel.version import build_info
 
 DISCLAIMER = (
     "keel is a personal tool, not financial advice and not religious (Shariah) advice. "
@@ -207,7 +208,35 @@ def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only 
 # -- root group ---------------------------------------------------------------------------------
 
 
+def _print_version(ctx: click.Context, param: object, value: bool) -> None:
+    """Eager `--version`: print the build identity and exit before any command runs.
+
+    Prints the working-tree state too. For a tool that can place orders, "0.1.0 (abc123, DIRTY)"
+    and "0.1.0 (abc123)" are materially different claims -- the first corresponds to no commit
+    and cannot be reproduced.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    info = build_info()
+    click.echo(info.describe())
+    if not info.is_reproducible:
+        click.echo(
+            "warning: this build is NOT reproducible -- it does not correspond to a commit. "
+            "Do not run it against live funds.",
+            err=True,
+        )
+    ctx.exit()
+
+
 @click.group()
+@click.option(
+    "--version",
+    is_flag=True,
+    callback=_print_version,
+    expose_value=False,
+    is_eager=True,
+    help="Show the running version, commit and working-tree state, then exit.",
+)
 @click.option(
     "--db", "db_path", default=DEFAULT_DB_PATH, show_default=True, help="SQLite DB path."
 )

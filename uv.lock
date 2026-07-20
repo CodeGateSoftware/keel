@@ -8,11 +8,11 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "keel",
     "keel-broker-api",
     "keel-broker-coinbase",
     "keel-broker-fake",
     "keel-core",
+    "keel-trader",
 ]
 
 [[package]]
@@ -326,43 +326,6 @@ wheels = [
 ]
 
 [[package]]
-name = "keel"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "click" },
-    { name = "cryptography" },
-    { name = "keel-broker-api" },
-    { name = "keel-broker-coinbase" },
-    { name = "keel-core" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "keel-broker-fake" },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.4.2" },
-    { name = "cryptography", specifier = ">=49.0.0" },
-    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
-    { name = "keel-broker-coinbase", editable = "packages/keel-broker-coinbase" },
-    { name = "keel-core", editable = "packages/keel-core" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "keel-broker-fake", editable = "packages/keel-broker-fake" },
-    { name = "mypy", specifier = ">=1.18.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "ruff", specifier = ">=0.15.21" },
-]
-
-[[package]]
 name = "keel-broker-api"
 version = "0.1.0"
 source = { editable = "packages/keel-broker-api" }
@@ -427,6 +390,43 @@ dependencies = [
 requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+]
+
+[[package]]
+name = "keel-trader"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "click" },
+    { name = "cryptography" },
+    { name = "keel-broker-api" },
+    { name = "keel-broker-coinbase" },
+    { name = "keel-core" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "keel-broker-fake" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "click", specifier = ">=8.4.2" },
+    { name = "cryptography", specifier = ">=49.0.0" },
+    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
+    { name = "keel-broker-coinbase", editable = "packages/keel-broker-coinbase" },
+    { name = "keel-core", editable = "packages/keel-core" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "keel-broker-fake", editable = "packages/keel-broker-fake" },
+    { name = "mypy", specifier = ">=1.18.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.15.21" },
 ]
 
 [[package]]

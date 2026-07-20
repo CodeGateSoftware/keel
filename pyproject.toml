@@ -1,5 +1,5 @@
 [project]
-name = "keel"
+name = "keel-trader"
 version = "0.1.0"
 description = "Offline-first, broker-agnostic, rule-based spot-trading agent (halal policy by default)"
 readme = "README.md"
@@ -30,6 +30,10 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
+# The DISTRIBUTION is `keel-trader` (the name `keel` is taken on PyPI by an unrelated project),
+# but the import package and the CLI command stay `keel`. Without this the backend would infer
+# `keel_trader/` from the distribution name.
+module-name = "keel"
 
 [tool.uv.workspace]
 members = ["packages/*"]
