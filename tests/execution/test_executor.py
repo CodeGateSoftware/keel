@@ -168,6 +168,11 @@ def repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
+    # Rail 17 (§65.4) fails closed without a fresh withdrawal attestation, so every test that
+    # is not ABOUT rail 17 supplies one -- same reason this fixture seeds the kill-switch and
+    # feed timestamp for rails 12.
+    r.set_state("withdrawals_enabled", True)
+    r.set_state("withdrawals_attested_at", NOW_TS)
     # A very large, attested monthly allowance so pre-existing (non-rail-14) tests aren't
     # incidentally tripped by it; rail-14-specific tests below override with `_attest(...)`.
     _attest(r, free_volume_usd=Decimal("10000000"))

@@ -145,6 +145,12 @@ def repo() -> Repository:
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
+    # Rail 17 (§65.4) fails closed without a fresh withdrawal attestation. Seeded here for the
+    # same reason the kill-switch is: these tests are not ABOUT rail 17, and a fail-closed rail
+    # would otherwise veto every BUY in the module. A huge attested_at keeps it fresh regardless
+    # of each test's `now_ts`.
+    r.set_state("withdrawals_enabled", True)
+    r.set_state("withdrawals_attested_at", 10**12)
     # `_config()` below defaults `auto_trade.mode` to "bypass" -- Issue #60 (bypass-arm
     # hardening) means `run_once` now refuses that mode unarmed. Every pre-existing test in
     # this module was written against "bypass just works"; arming here (a huge ttl so no test's

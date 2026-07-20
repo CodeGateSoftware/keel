@@ -102,6 +102,9 @@ def _intent(**overrides: Any) -> OrderIntent:
         is_dca=False,
         rule_kind="pullback_continuation",
         available_quote=_LARGE_ALLOWANCE,  # comfortably covers every notional used below
+        # Rail 17 fails closed on None, so every test that is not ABOUT rail 17 supplies a
+        # fresh attestation -- same reason this helper supplies `available_quote` for rail 13.
+        withdrawals_enabled=True,
     )
     base.update(overrides)
     return OrderIntent(**base)
@@ -922,3 +925,31 @@ def test_rail16_violation_message_names_the_cause_and_the_override(repo: Reposit
     assert "consecutive" in violation
     assert "Exits" in violation
     assert "resume-entries" in violation
+
+
+
+# -- rail 17: withdrawal capability (§65.4 qabd) --------------------------------
+
+
+def test_rail17_vetoes_a_buy_when_withdrawals_are_suspended(repo: Repository) -> None:
+    result = check(_intent(withdrawals_enabled=False), repo, _config(), NOW_TS)
+    assert "withdrawal_capability" in _keys(result)
+
+
+def test_rail17_fails_CLOSED_on_unknown(repo: Repository) -> None:
+    """Silence is not evidence of possession -- same posture as rails 12/13."""
+    result = check(_intent(withdrawals_enabled=None), repo, _config(), NOW_TS)
+    assert "withdrawal_capability" in _keys(result)
+
+
+def test_rail17_passes_when_withdrawals_are_attested_enabled(repo: Repository) -> None:
+    result = check(_intent(withdrawals_enabled=True), repo, _config(), NOW_TS)
+    assert "withdrawal_capability" not in _keys(result)
+
+
+def test_rail17_is_ENTRIES_ONLY_sells_are_never_blocked(repo: Repository) -> None:
+    """Existing holdings are already ours; forcing a sale to 'fix' a freeze is strictly worse."""
+    for state in (None, False):
+        intent = _intent(side=Side.SELL, withdrawals_enabled=state)
+        result = check(intent, repo, _config(), NOW_TS)
+        assert "withdrawal_capability" not in _keys(result), state
