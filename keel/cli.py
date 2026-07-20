@@ -481,6 +481,80 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
     )
 
 
+@assets_group.command("discover")
+@click.option("--quote", default=None, help="Settlement currency (default: config.quote_currency).")
+@click.option(
+    "--min-volume-24h", default="5000000", show_default=True,
+    help="Cheap pre-filter on the venue's reported 24h quote volume.",
+)
+@click.option("--limit", default=25, show_default=True, help="Show at most this many candidates.")
+@click.option(
+    "--probe-history",
+    is_flag=True,
+    default=False,
+    help="One extra request per candidate: does daily history exist at the 4-year mark? A "
+    "candidate that fails this can never clear the screen, so probing first avoids spending "
+    "attestation effort on it.",
+)
+@click.pass_context
+@with_disclaimer
+def assets_discover(
+    ctx: click.Context, quote: str | None, min_volume_24h: str, limit: int, probe_history: bool
+) -> None:
+    """PROPOSE allowlist candidates from venue metadata. Admits nothing.
+
+    A cheap pre-filter whose only job is to cut ~900 products to a shortlist worth pulling five
+    years of candles for. Sector and backing are NOT considered here and cannot be -- every
+    candidate below is still REJECTED by `keel assets screen` until a human attests it.
+    """
+    config = _load_cfg(ctx)
+    client = _build_broker(config)
+    products = client.list_products()
+
+    policy = screen_mod.DiscoveryPolicy(
+        quote_currency=quote or config.quote_currency,
+        min_quote_24h_volume=Decimal(min_volume_24h),
+    )
+    candidates = screen_mod.discover_candidates(
+        products, policy, exclude_assets=frozenset(config.allowlist)
+    )
+
+    click.echo(
+        f"{len(products)} venue products -> {len(candidates)} candidates "
+        f"(quote={policy.quote_currency}, 24h volume >= {policy.min_quote_24h_volume:,.0f}, "
+        f"excluding the current allowlist)\n"
+    )
+    header = f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}"
+    click.echo(header + ("  4yr?  name" if probe_history else "  name"))
+
+    now_ts = int(time.time())
+    four_years_ago = now_ts - 4 * _DAYS_PER_YEAR * 86400
+    for index, candidate in enumerate(candidates[:limit], start=1):
+        line = (
+            f"{index:>3}  {candidate.product_id:<14} {candidate.asset:<8} "
+            f"{candidate.quote_24h_volume:>18,.0f}"
+        )
+        if probe_history:
+            try:
+                probed = client.get_candles(
+                    candidate.product_id,
+                    Granularity.ONE_DAY,
+                    four_years_ago,
+                    four_years_ago + 30 * 86400,
+                )
+                marker = "yes " if probed else "NO  "
+            except Exception:  # noqa: BLE001 -- a probe failure is unknown, not a verdict
+                marker = "?   "
+            line += f"  {marker}"
+        click.echo(line + f"  {candidate.base_name}")
+
+    click.echo(
+        "\n⚠️  These are PROPOSALS, not admissions. Nothing above has been screened for sector "
+        "or backing -- those cannot be derived from market data. Each one needs "
+        "`keel assets attest` with a source before `keel assets screen` can admit it."
+    )
+
+
 @assets_group.command("screen")
 @click.option("--products", default=None, help="Comma-separated product ids (default: allowlist).")
 @click.pass_context

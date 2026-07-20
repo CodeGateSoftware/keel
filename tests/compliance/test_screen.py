@@ -148,3 +148,87 @@ def test_every_failure_is_reported_not_just_the_first():
 def test_policy_thresholds_are_configurable():
     lenient = ScreenPolicy(min_daily_bars=100, min_median_daily_volume=Decimal("1"))
     assert screen_asset(_facts(bars=200, volume="5"), _attestation(), lenient).admitted is True
+
+
+# -- discovery (proposal stage) ------------------------------------------------
+
+
+def _product(pid="SOL-USDC", quote="USDC", volume="50000000", **over):
+    base = {
+        "product_id": pid,
+        "base_name": pid.split("-")[0],
+        "quote_currency_id": quote,
+        "status": "online",
+        "trading_disabled": False,
+        "is_disabled": False,
+        "view_only": False,
+        "quote_24h_volume": volume,
+    }
+    base.update(over)
+    return base
+
+
+def test_discovery_keeps_liquid_online_products_in_the_settlement_currency():
+    from keel.compliance.screen import discover_candidates
+
+    found = discover_candidates([_product()])
+    assert [c.asset for c in found] == ["SOL"]
+
+
+def test_discovery_drops_the_wrong_quote_currency():
+    from keel.compliance.screen import discover_candidates
+
+    assert discover_candidates([_product(quote="USD")]) == []
+    assert discover_candidates([_product(quote="BTC")]) == []
+
+
+def test_discovery_drops_untradable_products():
+    from keel.compliance.screen import discover_candidates
+
+    for kwargs in (
+        {"status": "offline"},
+        {"trading_disabled": True},
+        {"is_disabled": True},
+        {"view_only": True},
+    ):
+        assert discover_candidates([_product(**kwargs)]) == [], kwargs
+
+
+def test_discovery_drops_thin_products():
+    from keel.compliance.screen import discover_candidates
+
+    assert discover_candidates([_product(volume="100")]) == []
+
+
+def test_discovery_survives_a_malformed_volume_rather_than_crashing():
+    from keel.compliance.screen import discover_candidates
+
+    assert discover_candidates([_product(volume=None)]) == []
+    assert discover_candidates([_product(volume="n/a")]) == []
+
+
+def test_discovery_excludes_assets_we_already_hold():
+    from keel.compliance.screen import discover_candidates
+
+    found = discover_candidates(
+        [_product("BTC-USDC"), _product("SOL-USDC")], exclude_assets=frozenset({"BTC"})
+    )
+    assert [c.asset for c in found] == ["SOL"]
+
+
+def test_discovery_ranks_by_liquidity():
+    from keel.compliance.screen import discover_candidates
+
+    found = discover_candidates(
+        [_product("A-USDC", volume="10000000"), _product("B-USDC", volume="90000000")]
+    )
+    assert [c.asset for c in found] == ["B", "A"]
+
+
+def test_discovery_proposes_but_never_admits():
+    """A discovered candidate is still REJECTED by the screen until a human attests it."""
+    from keel.compliance.screen import discover_candidates
+
+    (candidate,) = discover_candidates([_product()])
+    result = screen_asset(_facts(asset=candidate.asset), None)
+    assert result.admitted is False

@@ -53,6 +53,8 @@ class Transport(Protocol):
 
     def get_product(self, product_id: str, **kwargs: Any) -> Any: ...
 
+    def get_products(self, **kwargs: Any) -> Any: ...
+
     def get_accounts(self, **kwargs: Any) -> Any: ...
 
     def preview_order(
@@ -163,6 +165,32 @@ class CoinbaseClient:
         if price is None:
             raise ValueError(f"get_spot({product_id!r}): response has no 'price' field")
         return Decimal(price)
+
+    def list_products(self, product_type: str = "SPOT") -> list[dict]:
+        """Every tradable product on the venue, as plain dicts. READ-ONLY market metadata.
+
+        Used only by the allowlist DISCOVERY stage (`keel assets discover`), which proposes
+        candidates for human attestation -- it decides nothing. Per §5's asymmetry, a proposal
+        may come from anywhere; admission goes through `compliance/screen.py`.
+        """
+        raw = self._transport.get_products(product_type=product_type)
+        products = raw["products"] if isinstance(raw, dict) else raw.products
+        out: list[dict] = []
+        for product in products:
+            fields = product if isinstance(product, dict) else vars(product)
+            out.append(
+                {
+                    "product_id": fields.get("product_id"),
+                    "base_name": fields.get("base_name"),
+                    "quote_currency_id": fields.get("quote_currency_id"),
+                    "status": fields.get("status"),
+                    "trading_disabled": bool(fields.get("trading_disabled")),
+                    "is_disabled": bool(fields.get("is_disabled")),
+                    "view_only": bool(fields.get("view_only")),
+                    "quote_24h_volume": fields.get("approximate_quote_24h_volume"),
+                }
+            )
+        return out
 
     def get_accounts(self) -> list[dict]:
         """Return authenticated account balances, keyed by currency."""

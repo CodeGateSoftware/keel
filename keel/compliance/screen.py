@@ -168,3 +168,79 @@ def screen_asset(
         failures=failures,
         warnings=warnings,
     )
+
+
+# -- discovery (candidate PROPOSAL, not admission) -----------------------------
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A venue product that cleared the cheap pre-filter. NOT an admitted asset."""
+
+    product_id: str
+    asset: str
+    base_name: str
+    quote_24h_volume: Decimal
+
+
+@dataclass(frozen=True)
+class DiscoveryPolicy:
+    """The cheap pre-filter, run on venue metadata BEFORE fetching any history.
+
+    Deliberately permissive: its only job is to cut ~900 products to a shortlist worth pulling
+    five years of candles for. Everything that decides admission lives in `screen_asset`.
+    """
+
+    quote_currency: str = "USDC"
+    min_quote_24h_volume: Decimal = Decimal("5000000")
+
+
+def discover_candidates(
+    products: list[dict],
+    policy: DiscoveryPolicy | None = None,
+    exclude_assets: frozenset[str] | None = None,
+) -> list[Candidate]:
+    """Propose candidates from venue metadata. **Proposes only — admits nothing.**
+
+    §5's asymmetry: a proposal may come from anywhere, but activity may only INCREASE through
+    the deterministic gate. Nothing here checks sector or backing, and nothing here may be read
+    as approval — every survivor still has to clear `screen_asset`, which fails closed without a
+    human attestation.
+    """
+    policy = policy or DiscoveryPolicy()
+    exclude = exclude_assets or frozenset()
+    out: list[Candidate] = []
+
+    for product in products:
+        product_id = product.get("product_id") or ""
+        if product.get("quote_currency_id") != policy.quote_currency:
+            continue
+        if product.get("status") != "online":
+            continue
+        if product.get("trading_disabled") or product.get("is_disabled"):
+            continue
+        if product.get("view_only"):
+            continue
+
+        asset = product_id.split("-")[0]
+        if asset in exclude:
+            continue
+
+        raw_volume = product.get("quote_24h_volume")
+        try:
+            volume = Decimal(str(raw_volume))
+        except (TypeError, ArithmeticError, ValueError):
+            continue
+        if volume < policy.min_quote_24h_volume:
+            continue
+
+        out.append(
+            Candidate(
+                product_id=product_id,
+                asset=asset,
+                base_name=product.get("base_name") or asset,
+                quote_24h_volume=volume,
+            )
+        )
+
+    return sorted(out, key=lambda c: c.quote_24h_volume, reverse=True)
