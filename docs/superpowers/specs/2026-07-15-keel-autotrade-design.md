@@ -272,16 +272,27 @@ Enforced in `guards.py` **before every order**, **un-overridable in any mode (in
   losable slice (§22.3).
 - **No classic user authentication.** For a local single-user CLI/daemon, logins/accounts/sessions are YAGNI
   (OS access already opens that door). We invest instead in the two controls below.
-- **Portable encrypted secrets vault** (`security/secrets.py`): the CDP key/secret (and any remote-control token)
-  live in an **AES-GCM-encrypted `secrets.enc`** unlocked by a **master passphrase** (passphrase → scrypt KDF →
-  key). One file, **copyable between machines** (explicitly *not* the machine-bound OS Keychain, so it's
-  transportable). `chmod 600`; secrets never logged; `.enc`/`.env` git-ignored. An optional per-machine keychain
-  *cache* of the derived key may be added for convenience, but the portable `.enc` is the source of truth.
-- **Dangerous-action authorization gate** (`security/authz.py`): a passphrase (stored as a scrypt hash,
-  rate-limited) required **only** to **arm bypass/autonomous mode**, **raise caps above config maxima**, or
-  **disable the kill-switch / resume**. Read-only commands and confirm-mode trades need none. This is local
-  *authorization*, not a login — it forces intentionality and blocks casual/accidental/shoulder-surf misuse of
-  the autonomy capability.
+- ⛔ **SUPERSEDED 2026-07-21 — the vault and the passphrase gate were BUILT and then REMOVED.**
+  See `2026-07-21-security-simplification-design.md`. Both are gone; do not re-propose them without
+  reading that spec first. What replaced them:
+  - **Credentials come from a git-ignored `.env`** (`config.load_secrets`). The encrypted
+    `secrets.enc` vault (`security/secrets.py`) was deleted. It had in fact never been on the live
+    path: `cb_client`/`cli` always loaded credentials from `.env`, and the vault was reachable only
+    via `migrate_from_env` — so it was a *competing* credential path, not the real one.
+  - **The scrypt passphrase gate (`security/authz.py`) was deleted.** Of its four declared
+    actions, `raise_caps` and `unlock_vault` were never used at all. Once placing a real,
+    money-spending order needs only a typed confirmation, requiring a remembered secret to reset a
+    high-water mark is ceremony without a matching threat model. One rule replaced it: **dangerous
+    actions need a human at a terminal; nothing needs a stored secret.** The four halt-releasing
+    commands (`resume`, `resume-entries`, `record-flow`, `reset-hwm`) demand a typed `yes` and fail
+    closed off a TTY, with deliberately no env/flag override (any such seam would be settable from
+    cron and would defeat the fail-closed).
+  - **Autonomy is a profile choice, not a config mode.** `auto_trade.mode` is now `paper|confirm`;
+    the `profile` table (schema v7) holds the user's `autonomous` flag, re-read live on every order
+    so `keel autonomy off` binds on the *next* order. It fails closed on an absent row, cannot be
+    enabled without a terminal, and **never clears a safety halt**.
+  - Real user authentication arrives with the future **server-hosted** deployment; a local
+    single-user vault + passphrase was ceremony in the meantime.
 - **Honest boundary:** on a single-user machine the real security boundary is the **OS account + full-disk
   encryption**. These controls are defense-in-depth (reduce plaintext exposure, prevent casual misuse); they do
   **not** stop an attacker who already holds the OS account. Stated so they aren't mistaken for more.
