@@ -277,7 +277,6 @@ tiers:
         load_config(path)
 
 
-# -- auto_trade.bypass_arm_ttl_sec (Issue #60, bypass-arm hardening) ---------------------------
 
 
 

@@ -12,39 +12,31 @@ Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-swit
 `subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live), and a
 Phase-4 `insights` stub.
 
-**Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
-`{arm_bypass, raise_caps, disable_killswitch, unlock_vault}` require the passphrase gate. In this
-CLI's surface that's `agent --bypass` and `arm-bypass` (both map to the `arm_bypass` action) and
-`resume`, `resume-entries`, `record-flow` and `reset-hwm` (all `disable_killswitch` --
-each either releases a tripped breaker or rebases the state one reads) -- `kill`
-(engaging the kill-switch) and `disarm-bypass` are
-*safe* actions (they only ever reduce capability) and are always allowed; every other command
-here is read-only or a local rules-table/DB mutation with no live-trading blast radius, so per
-the plan ("read-only commands require no passphrase") they are not gated. There is no CLI surface
-for `raise_caps`/`unlock_vault` in this task -- caps are config-file-only (no runtime override
-exists in the merged `execution.guards`/`config` modules) and the vault (`security.secrets`) has
-no CLI command in this task's scope.
+**Dangerous commands ask a human; nothing needs a stored secret.** The former scrypt passphrase
+gate is gone (see `2026-07-21-security-simplification-design.md`). Four commands re-permit trading
+after a safety halt -- `resume`, `resume-entries`, `record-flow` and `reset-hwm` -- and each
+demands a typed `yes` via `_require_interactive_confirmation`, **failing closed off a TTY** so a
+script or cron job can never release a halt. `kill` (engaging the kill-switch) and `autonomy off`
+are *safe* actions -- they only ever reduce capability -- and are always allowed, from anywhere.
+Every other command here is read-only or a local rules-table/DB mutation with no live-trading
+blast radius.
 
-**`agent --bypass`'s passphrase gate is not sufficient on its own (Issue #60).** It only guards
-this CLI entry point -- any other caller invoking `agent.run_once`/`agent.loop` in-process with
-`config.auto_trade.mode == "bypass"` would bypass it entirely. `agent.run_once` therefore also
-requires a separately armed, time-limited token (`Repository.is_bypass_armed`, set by
-`arm-bypass`) before it will actually run in bypass mode -- an unarmed or expired request fails
-safe to confirm-mode behavior (nothing placed) regardless of how `run_once` was invoked. Both
-gates apply to the CLI path (defense in depth); only the arm-token check is un-bypassable
-in-process.
+**Autonomy is a profile choice, checked in-process.** `keel autonomy on` (typed `yes`, TTY
+required) sets `profile.autonomous`; `agent.run_once` re-reads it every cycle via
+`_effective_mode`, so the check cannot be skipped by a caller driving `run_once` in-process, and
+turning autonomy off binds on the next order. It changes who is asked, never what is allowed:
+`guards.check` runs first in every mode, and autonomy never releases a halt.
 
-**No interactive hangs in tests.** `--passphrase` may be passed explicitly; if omitted, it is only
-read via an interactive `click.prompt` when stdin is a real TTY (`_resolve_passphrase`) --
-non-interactive invocations (like `CliRunner`) get an empty passphrase, which fails the gate
-closed rather than blocking on stdin.
+**No interactive hangs in tests.** `_is_interactive()` is the single TTY predicate, with
+deliberately no env-var or flag override -- any such seam would be settable from cron and would
+defeat every fail-closed built on it. Tests patch the predicate.
 
 **Disclaimer.** Every command prints the halal + not-financial/religious-advice disclaimer
 footer (`with_disclaimer`, a decorator applied to every command's callback) -- always, even when
-the command errors out or is refused by the authz gate.
+the command errors out or is refused at a confirmation prompt.
 
 **No live network in tests.** `_build_broker` is the one seam that would construct a real
-`CoinbaseClient` (from `.env`/vault secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
+`CoinbaseClient` (from `.env` secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
 to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker`.
 """
 
@@ -368,7 +360,8 @@ def migrate_cmd(ctx: click.Context, db_override: str | None) -> None:
       on migrate would resurrect rules that were deliberately deleted or refuted.
 
     Runs `keel.data.db.migrate`, which steps the stored `schema_version` up incrementally and is
-    safe to call repeatedly. No network, no authz gate, no orders -- safe against a live database.
+    safe to call repeatedly. No network, no confirmation gate, no orders -- safe against a
+    live database.
     """
     path = db_override or ctx.obj["db_path"]
     conn = connect(path)
@@ -1501,7 +1494,8 @@ def rules_seed(
     already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
     script) without piling up duplicate candidates. `--force` inserts a fresh candidate anyway.
 
-    Read-only w.r.t. the exchange: no network call, no authz gate -- it only ever writes local
+    Read-only w.r.t. the exchange: no network call, no confirmation gate -- it only ever
+    writes local
     `rules` rows, exactly like `rules promote`/`demote`/`disable`.
     """
     repo = _open_repo(ctx)
@@ -1892,7 +1886,7 @@ def simulate(
     no_trial_record: bool,
     skip_within_cap: bool,
 ) -> None:
-    """Simulate the deterministic engine over historical candles (read-only; no authz gate).
+    """Simulate the deterministic engine over historical candles (read-only; no confirmation gate).
 
     Pulls (unless `--no-fetch`) and caches ~`--years` years of candle history in the persistent
     DB (`--db`, never in-memory), replays the real rule set through the engine + a dollar
