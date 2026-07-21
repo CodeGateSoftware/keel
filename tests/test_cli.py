@@ -1165,3 +1165,61 @@ def test_record_flow_rejects_a_non_finite_amount(tmp_path):
 
     assert result.exit_code != 0
     assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("10000")
+
+
+# -- keel migrate (schema-only, idempotent) ------------------------------------
+
+
+def test_migrate_brings_a_fresh_db_up_to_head(tmp_path):
+    """A fresh file has no schema at all: migrate must create it and report 0 -> HEAD."""
+    from keel.data.db import SCHEMA_VERSION
+
+    db = tmp_path / "fresh.db"
+    result = CliRunner().invoke(cli, ["--db", str(db), "migrate"])
+    assert result.exit_code == 0, result.output
+    assert f"0 -> {SCHEMA_VERSION}" in result.output
+    conn = connect(str(db))
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    assert int(row["version"]) == SCHEMA_VERSION
+
+
+def test_migrate_is_idempotent(tmp_path):
+    """Running it twice must be safe -- it is the command CI/an operator re-runs."""
+    db = tmp_path / "twice.db"
+    CliRunner().invoke(cli, ["--db", str(db), "migrate"])
+    again = CliRunner().invoke(cli, ["--db", str(db), "migrate"])
+    assert again.exit_code == 0, again.output
+    assert "nothing to do" in again.output
+
+
+def test_migrate_advances_a_downgraded_db(tmp_path):
+    """The real job: an existing DB stamped below HEAD is stepped up to HEAD."""
+    from keel.data.db import SCHEMA_VERSION
+
+    db = tmp_path / "old.db"
+    conn = connect(str(db))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 1")
+    conn.commit()
+
+    result = CliRunner().invoke(cli, ["--db", str(db), "migrate"])
+    assert result.exit_code == 0, result.output
+    assert f"1 -> {SCHEMA_VERSION}" in result.output
+    check = connect(str(db))
+    assert int(check.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+
+
+def test_migrate_honours_an_explicit_db_option(tmp_path):
+    """--db targets a database directly, so it can point at wherever the DB lives."""
+    from keel.data.db import SCHEMA_VERSION
+
+    target = tmp_path / "explicit.db"
+    result = CliRunner().invoke(cli, ["migrate", "--db", str(target)])
+    assert result.exit_code == 0, result.output
+    assert str(target) in result.output
+    conn = connect(str(target))
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
