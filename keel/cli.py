@@ -623,6 +623,130 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
     )
 
 
+def _screen_product(
+    repo: Repository, product: str, quote: str
+) -> tuple[screen_mod.MarketFacts, screen_mod.ScreenResult]:
+    """THE admission decision, for every candidate source.
+
+    `assets screen`, `assets holdings --screen` and any future proposer (an LLM shortlist, say)
+    all route through here, so none of them can drift onto a laxer path -- which is what makes
+    "the same vetting process" a property of the code rather than an intention. Returns the facts
+    alongside the verdict so a caller can explain WHY without recomputing them.
+    """
+    asset = product.split("-")[0]
+    facts = _market_facts(repo, product, quote)
+    raw = repo.get_asset_attestation(asset)
+    attestation = (
+        screen_mod.AssetAttestation(
+            asset=raw["asset"],
+            sector=raw["sector"],
+            backing=raw["backing"],
+            pays_yield=bool(raw["pays_yield"]),
+            source=raw["source"],
+            attested_by=raw["attested_by"],
+            attested_at=raw["attested_at"],
+        )
+        if raw is not None
+        else None
+    )
+    return facts, screen_mod.screen_asset(facts, attestation)
+
+
+#: The product id this codebase uses for an asset's daily history. `assets screen`,
+#: `keel simulate` and `keel fetch` all key on `-USD` (see `_default_sim_products`), so holdings
+#: must too -- screening `{asset}-{quote_currency}` instead would find zero cached bars for every
+#: asset and report "no local history" forever, which is worse than useless: it looks like a
+#: verdict about the asset.
+def _history_product(asset: str) -> str:
+    return f"{asset}-USD"
+
+
+#: Never candidates: you cannot trade the currency you settle in, and fiat balances are funding,
+#: not positions. Listing them as rejections would be noise, not information.
+_NON_TRADABLE_CURRENCIES = frozenset({"USD", "EUR", "GBP"})
+
+
+@assets_group.command("holdings")
+@click.option(
+    "--min-balance", default="0", show_default=True,
+    help="Ignore balances at or below this (dust from airdrops, forks and rounding).",
+)
+@click.option(
+    "--screen", "run_screen", is_flag=True, default=False,
+    help="Also run each holding through the admission screen.",
+)
+@click.pass_context
+@with_disclaimer
+def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> None:
+    """List the assets you actually hold at the broker, as allowlist CANDIDATES.
+
+    This is a SOURCE, not a gate. **Holding an asset is not a reason to trade it**, so this
+    command admits nothing and writes nothing -- no attestation, no allowlist change, no DB
+    write. It answers "what do I already own that this system might trade?", where
+    `keel assets discover` answers "what could anyone trade?".
+
+    With `--screen`, each holding goes through the SAME fail-closed screen as
+    `keel assets screen`: unattested assets are REJECTED, because sector and backing cannot be
+    derived from a balance any more than from a price.
+    """
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+    broker = _build_broker(config)
+    quote = config.quote_currency
+    floor = Decimal(min_balance)
+
+    try:
+        accounts = broker.get_accounts()
+    except Exception as exc:  # noqa: BLE001 -- an unreachable venue is an error, not "nothing held"
+        raise click.ClickException(
+            f"could not fetch balances from the broker: {exc}. Reporting nothing would read as "
+            "'you hold nothing', which is not what we learned."
+        ) from exc
+
+    excluded = _NON_TRADABLE_CURRENCIES | {quote}
+    holdings = sorted(
+        (a for a in accounts if a["currency"] not in excluded and a["available_balance"] > floor),
+        key=lambda a: a["currency"],
+    )
+
+    if not holdings:
+        click.echo(f"no holdings above {floor} (excluding {quote} and fiat).")
+        return
+
+    allowlist = {asset.upper() for asset in config.allowlist}
+    click.echo(f"{len(holdings)} holding(s) above {floor}, excluding {quote} and fiat:\n")
+
+    for account in holdings:
+        asset = account["currency"]
+        on_allowlist = "on-allowlist" if asset.upper() in allowlist else "not-on-allowlist"
+        attested = "attested" if repo.get_asset_attestation(asset) else "UNATTESTED"
+        click.echo(f"  {asset:<8} balance={account['available_balance']:<18} "
+                   f"{on_allowlist:<16} {attested}")
+
+        if not run_screen:
+            continue
+
+        product = _history_product(asset)
+        facts, result = _screen_product(repo, product, quote)
+        click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
+        if facts.daily_bars == 0:
+            # The likeliest misreading of this whole feature. A rejection for zero cached bars
+            # is a statement about our DATA, not about the asset.
+            click.echo(
+                f"      ! no local history -- run `keel fetch --products {product}` first, then "
+                "re-screen.\n"
+                "        This is a MISSING-DATA verdict, not a verdict about the asset."
+            )
+        for failure in result.failures:
+            click.echo(f"      ✗ {failure}")
+
+    click.echo(
+        "\n⚠️  Holdings are CANDIDATES, not admissions. Nothing here has been admitted to "
+        "trading:\nthat needs `keel assets attest` with a source, a passing screen, and a "
+        "deliberate edit to\n`allowlist` in config.yaml."
+    )
+
+
 @assets_group.command("discover")
 @click.option("--quote", default=None, help="Settlement currency (default: config.quote_currency).")
 @click.option(
@@ -714,22 +838,7 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
     admitted = 0
     for product in product_list:
         asset = product.split("-")[0]
-        facts = _market_facts(repo, product, config.quote_currency)
-        raw = repo.get_asset_attestation(asset)
-        attestation = (
-            screen_mod.AssetAttestation(
-                asset=raw["asset"],
-                sector=raw["sector"],
-                backing=raw["backing"],
-                pays_yield=bool(raw["pays_yield"]),
-                source=raw["source"],
-                attested_by=raw["attested_by"],
-                attested_at=raw["attested_at"],
-            )
-            if raw is not None
-            else None
-        )
-        result = screen_mod.screen_asset(facts, attestation)
+        facts, result = _screen_product(repo, product, config.quote_currency)
         admitted += int(result.admitted)
 
         click.echo(
