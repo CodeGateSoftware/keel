@@ -1158,3 +1158,20 @@ def test_autonomy_on_without_for_hours_warns_that_it_never_lapses(
     assert result.exit_code == 0, result.output
     assert "NO expiry" in result.output
     assert _repo_at(db).get_profile().autonomous_until is None
+
+
+def test_autonomy_on_rejects_a_nonsensical_for_hours(tmp_path, monkeypatch, valid_config_path):
+    """0/negative would write an already-lapsed row while claiming 'autonomy ON until ...';
+    inf/nan/huge would overflow int() AFTER the operator had already typed yes."""
+    _at_a_terminal(monkeypatch)
+    for bad in ("0", "-5", "inf", "nan", "1e18"):
+        db = tmp_path / f"bad-{bad}.db"
+        _repo_at(db)
+        result = CliRunner().invoke(
+            cli,
+            ["--db", str(db), "--config", str(valid_config_path),
+             "autonomy", "on", "--for-hours", bad],
+            input="yes\n",
+        )
+        assert result.exit_code != 0, f"--for-hours {bad} should be rejected: {result.output}"
+        assert _repo_at(db).get_profile().autonomous is False

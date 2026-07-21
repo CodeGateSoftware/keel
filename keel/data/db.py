@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -378,6 +378,23 @@ def _migrate_v7_profile(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v8_autonomy_expiry(conn: sqlite3.Connection) -> None:
+    """v8 adds `profile.autonomous_until` (NULL = the choice never lapses).
+
+    This exists because the column was first added to v7's `CREATE TABLE IF NOT EXISTS`, which
+    silently does nothing for a database already stamped at 7 -- it kept the old three-column
+    table forever, so a recorded choice read back as "off" and `keel autonomy off` died on a
+    missing column. Only ever reachable on a developer database built from the unmerged branch,
+    but the de-risking command must never be the one that crashes.
+
+    Idempotent: a database that got the column from the DDL (fresh, or upgraded from <=v6) is
+    left alone rather than hitting "duplicate column name".
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(profile)")}
+    if "autonomous_until" not in columns:
+        conn.execute("ALTER TABLE profile ADD COLUMN autonomous_until INTEGER")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -385,6 +402,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: _migrate_v5_candle_gap_probes,
     6: _migrate_v6_asset_attestations,
     7: _migrate_v7_profile,
+    8: _migrate_v8_autonomy_expiry,
 }
 
 

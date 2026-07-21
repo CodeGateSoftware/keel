@@ -1211,3 +1211,27 @@ def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypa
     assert result.exit_code == 0, result.output
     assert captured["mode"] == "confirm"
     assert captured["confirm_fn"] is cli_module._interactive_confirm
+
+
+def test_an_EXPIRED_autonomy_falls_back_to_confirm_and_places_nothing(repo):
+    """End-to-end guard on the enforcement chain run_once -> _effective_mode -> is_autonomous.
+    Without this, dropping the now_ts argument would silently un-bound autonomy again."""
+    repo.set_autonomous(True, now_ts=1_000, expires_ts=50_000)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)  # well past the expiry
+
+    assert result.mode == "confirm", "expired autonomy must fall back to asking a human"
+    assert broker.place_calls == []
+
+
+def test_autonomy_still_applies_strictly_before_its_expiry(repo):
+    repo.set_autonomous(True, now_ts=1_000, expires_ts=90_001)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.mode == "autonomous"
+    assert len(broker.place_calls) == 1

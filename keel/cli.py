@@ -13,8 +13,9 @@ Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-swit
 Phase-4 `insights` stub.
 
 **Dangerous commands ask a human; nothing needs a stored secret.** The former scrypt passphrase
-gate is gone (see `2026-07-21-security-simplification-design.md`). Four commands re-permit trading
-after a safety halt -- `resume`, `resume-entries`, `record-flow` and `reset-hwm` -- and each
+gate is gone (see `2026-07-21-security-simplification-design.md`). Five commands re-permit trading
+after a safety halt -- `resume`, `resume-entries`, `record-flow`, `reset-hwm` and
+`withdrawals attest --enabled` (rail 17) -- and each
 demands a typed `yes` via `_require_interactive_confirmation`, **failing closed off a TTY** so a
 script or cron job can never release a halt. `kill` (engaging the kill-switch) and `autonomy off`
 are *safe* actions -- they only ever reduce capability -- and are always allowed, from anywhere.
@@ -92,6 +93,10 @@ DISCLAIMER = (
     "Consult a qualified financial advisor and a knowledgeable scholar before trading. "
     "You are solely responsible for your own trading decisions."
 )
+
+#: Upper bound on `keel autonomy on --for-hours` (1 year). Guards against inf/nan/overflow
+#: and against a "window" so long it is indistinguishable from no expiry at all.
+_MAX_AUTONOMY_HOURS = 8760.0
 
 DEFAULT_DB_PATH = "keel.db"
 DEFAULT_CONFIG_PATH = "config.yaml"
@@ -1303,6 +1308,13 @@ def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
     now_ts = int(time.time())
+    if for_hours is not None and not (0 < for_hours <= _MAX_AUTONOMY_HOURS):
+        # 0/negative would write an already-lapsed row while printing "autonomy ON until ...",
+        # and inf/nan/1e18 would overflow int() after the operator had already typed `yes`.
+        raise click.BadParameter(
+            f"--for-hours must be greater than 0 and at most {_MAX_AUTONOMY_HOURS} "
+            f"({_MAX_AUTONOMY_HOURS // 24} days); got {for_hours!r}."
+        )
     expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
     window = (
         "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"

@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 7
+    assert version == db.SCHEMA_VERSION == 8
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:

@@ -8,6 +8,7 @@ methods. Money and prices are always `Decimal` in the Python API and stored as `
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from decimal import Decimal
@@ -596,10 +597,14 @@ class Repository:
             row = self._conn.execute(
                 "SELECT autonomous, autonomous_until, updated_ts FROM profile WHERE id = 1"
             ).fetchone()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             # A missing or damaged `profile` table must read as "no consent recorded", not
-            # propagate. The contract above promises fail-closed, so implement it rather than
-            # relying on the caller crashing before it reaches an order.
+            # propagate. But it must not be SILENT either: swallowing this indistinguishably
+            # from "the user never opted in" hides a broken migration or a corrupt database
+            # behind a reassuring `autonomy: off`. Fail closed AND say so.
+            logging.getLogger("keel").error(
+                "profile unreadable (%s: %s) -- treating autonomy as OFF", type(exc).__name__, exc
+            )
             return Profile()
         if row is None:
             return Profile()

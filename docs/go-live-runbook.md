@@ -114,9 +114,19 @@ keel resume      # release it -- asks for a typed "yes" at a terminal
 The kill-switch is checked first on every cycle and **defaults to engaged**, so a damaged or
 unreadable state halts trading rather than permitting it.
 
-Four commands re-permit trading after a halt — `resume`, `resume-entries`, `record-flow`,
-`reset-hwm`. Each demands a typed `yes` from a terminal and **cannot be run from a script or cron
-job**. That is deliberate: a breaker that can reset itself is not a breaker.
+**Five** commands re-permit trading after a halt. Each demands a typed `yes` from a terminal and
+**cannot be run from a script or cron job** — a breaker that can reset itself is not a breaker.
+
+| command | releases |
+|---|---|
+| `keel resume` | the kill-switch |
+| `keel resume-entries` | a consecutive-loss halt (rail 16) |
+| `keel record-flow --amount ±N` | rebases rail 11's high-water mark |
+| `keel reset-hwm` | rail 11's high-water mark, clearing a stuck drawdown halt |
+| `keel withdrawals attest --enabled` | rail 17's entry halt |
+
+The de-risking direction of each is always allowed and needs no terminal: `keel kill`,
+`keel withdrawals attest --suspended`, `keel autonomy off`.
 
 ## 7. Only afterwards: autonomy
 
@@ -129,9 +139,22 @@ keel autonomy off    # always allowed, works anywhere, needs no terminal
 ```
 
 Autonomy stops keel asking before each order. It changes **who is asked, never what is allowed** —
-every hard rail still runs first, and it does **not** let the agent clear a safety halt. The
-setting lives in your profile in the database and is re-read on every order, so `keel autonomy off`
-takes effect on the **next order**, not the next restart.
+every hard rail still runs first, and it does **not** let the agent clear a safety halt.
+
+The setting lives in your profile in the database and is re-read **at the start of every cycle**.
+So `keel autonomy off` takes effect on the **next cycle**, not the next restart — but note that
+with `interval_sec: 900` a cycle already in flight can still place orders for up to 15 minutes.
+**If you need trading to stop immediately, use `keel kill`, not `autonomy off`.**
+
+**Prefer a time-bounded session:**
+
+```bash
+keel autonomy on --for-hours 4    # lapses on its own; nothing to remember
+```
+
+Without `--for-hours` autonomy has **no expiry** and stays on until you turn it off — a forgotten
+`autonomy on` will still be trading unattended weeks later. `keel autonomy show` tells you which
+you have and how long is left.
 
 Turn it on only once you have watched several supervised cycles behave correctly.
 
