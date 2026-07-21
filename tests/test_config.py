@@ -280,28 +280,7 @@ tiers:
 # -- auto_trade.bypass_arm_ttl_sec (Issue #60, bypass-arm hardening) ---------------------------
 
 
-def test_load_config_bypass_arm_ttl_sec_default_is_one_hour(valid_config_path):
-    config = load_config(valid_config_path)
 
-    assert config.auto_trade.bypass_arm_ttl_sec == 3600
-
-
-def test_load_config_bypass_arm_ttl_sec_overridable(write_config):
-    text = VALID_CONFIG_YAML.replace("bypass_arm_ttl_sec: 3600", "bypass_arm_ttl_sec: 120")
-    path = write_config(text)
-
-    config = load_config(path)
-
-    assert config.auto_trade.bypass_arm_ttl_sec == 120
-
-
-def test_load_config_bypass_arm_ttl_sec_absent_falls_back_to_default(write_config):
-    text = VALID_CONFIG_YAML.replace("  bypass_arm_ttl_sec: 3600\n", "")
-    path = write_config(text)
-
-    config = load_config(path)
-
-    assert config.auto_trade.bypass_arm_ttl_sec == 3600
 
 
 # -- logging (engine-activity logging feature) --------------------------------------------------
@@ -477,3 +456,40 @@ def test_non_negative_int_rejects_a_negative_threshold(write_config):
     )
     with pytest.raises(ConfigError, match="max_consecutive_losses"):
         load_config(write_config(text))
+
+
+# -- auto_trade.mode is validated (it used to fall back silently) --------------
+
+
+def test_mode_bypass_is_now_a_hard_error(tmp_path):
+    """`bypass` no longer exists. Failing loudly beats silently reinterpreting a config that
+    explicitly asked for autonomy -- autonomy is now a profile choice, not a config mode."""
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        "auto_trade: {mode: bypass}\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(p))
+    assert "auto_trade.mode" in str(exc.value)
+
+
+def test_paper_and_confirm_both_load(tmp_path):
+    for mode in ("paper", "confirm"):
+        p = tmp_path / f"{mode}.yaml"
+        p.write_text(
+            "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+            f"auto_trade: {{mode: {mode}}}\n"
+        )
+        assert load_config(str(p)).auto_trade.mode == mode
+
+
+def test_an_unknown_mode_names_the_offending_key(tmp_path):
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        "auto_trade: {mode: wibble}\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(p))
+    assert "wibble" in str(exc.value)

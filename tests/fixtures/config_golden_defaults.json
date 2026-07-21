@@ -3,7 +3,6 @@
     "BTC"
   ],
   "auto_trade": {
-    "bypass_arm_ttl_sec": 3600,
     "enabled": false,
     "interval_sec": 900,
     "mode": "paper"
