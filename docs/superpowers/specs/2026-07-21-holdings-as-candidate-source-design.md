@@ -50,7 +50,7 @@ hold that this system might trade?".
 ### 3.1 `keel assets holdings`
 
 ```
-keel assets holdings [--min-balance 0] [--screen] [--quote USDC]
+keel assets holdings [--min-balance 0] [--screen]
 ```
 
 1. Fetch `broker.get_accounts()` (already implemented, read-only, proven against the live API).
@@ -96,7 +96,29 @@ REJECT  SOL      no local history -- run `keel fetch --products SOL-USDC` first,
 ```
 
 This distinction is the single most likely misreading of the feature, so it is handled in the
-output rather than left to the operator.
+output rather than left to the operator. For the same reason, the **liquidity** and **settlement**
+failures are suppressed on that path (shown as `· not assessable without history`): with zero bars
+median volume is 0 *because* there are no bars, and `quotable_in_settlement_currency` degenerates
+to `bool(candles)` — printing either as a finding would assert about the asset exactly what the
+missing-data message exists to deny. The `history` failure remains, because it is the real one.
+
+⚠️ **A pre-existing weakness this surfaced, deliberately NOT fixed here.** Because every product
+this codebase screens is `-USD` while `quote_currency` is `USDC`,
+`MarketFacts.quotable_in_settlement_currency` reduces to `bool(candles)` for all of them — so
+`ScreenPolicy.require_settlement_quote` currently re-checks "do we have bars" rather than
+settlement. That affects `assets screen` today, independently of this work. Changing it alters a
+**compliance rail's** behaviour and deserves its own deliberate change, not a quiet edit inside a
+feature PR.
+
+### 3.3a Known limits of the holdings source
+
+- Staked/wrapped balance types (`ETH2`, `CBETH`) and non-settlement stablecoins (`USDT`, `DAI`)
+  appear as candidates, and for a balance with no `-USD` product the `keel fetch` hint will not
+  resolve. They are correctly REJECTED either way (unattested, no history), so the cost is a
+  redundant row, never a wrong admission. Filtering them properly needs the venue product list,
+  which is a network call this read-only report deliberately does not make.
+- The fiat exclusion list is static. A fiat Coinbase quotes that is missing from it shows up as an
+  extra rejected row — cosmetic, never an admission.
 
 ### 3.4 The seam for the LLM proposer
 

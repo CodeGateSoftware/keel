@@ -661,9 +661,16 @@ def _history_product(asset: str) -> str:
     return f"{asset}-USD"
 
 
-#: Never candidates: you cannot trade the currency you settle in, and fiat balances are funding,
-#: not positions. Listing them as rejections would be noise, not information.
-_NON_TRADABLE_CURRENCIES = frozenset({"USD", "EUR", "GBP"})
+# Failure classes that are DOWNSTREAM of having no cached history: with zero bars they report
+# on our data, not on the asset, so `assets holdings` must not print them as verdicts.
+_DATA_DERIVED_FAILURES = frozenset({"liquidity", "settlement"})
+
+# Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
+# a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
+# only cosmetic (an extra row), never an admission.
+_FIAT_CURRENCIES = frozenset(
+    {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "SGD", "BRL", "MXN", "TRY", "INR", "KRW"}
+)
 
 
 @assets_group.command("holdings")
@@ -681,8 +688,9 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     """List the assets you actually hold at the broker, as allowlist CANDIDATES.
 
     This is a SOURCE, not a gate. **Holding an asset is not a reason to trade it**, so this
-    command admits nothing and writes nothing -- no attestation, no allowlist change, no DB
-    write. It answers "what do I already own that this system might trade?", where
+    command admits nothing and mutates nothing -- no attestation, no allowlist change, no data
+    write. (Opening the database does apply any pending schema migration, as every command
+    does.) It answers "what do I already own that this system might trade?", where
     `keel assets discover` answers "what could anyone trade?".
 
     With `--screen`, each holding goes through the SAME fail-closed screen as
@@ -691,22 +699,37 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    broker = _build_broker(config)
     quote = config.quote_currency
-    floor = Decimal(min_balance)
+    try:
+        floor = Decimal(min_balance)
+    except InvalidOperation as exc:
+        raise click.BadParameter(f"--min-balance must be a number; got {min_balance!r}") from exc
+    if not floor.is_finite() or floor < 0:
+        # A NaN floor makes every `balance > floor` comparison raise; a negative one lists every
+        # dust and zero balance as a candidate. Same guard `record-flow`/`subscription set` use.
+        raise click.BadParameter(f"--min-balance must be finite and >= 0; got {min_balance!r}")
 
     try:
-        accounts = broker.get_accounts()
+        accounts = _build_broker(config).get_accounts()
     except Exception as exc:  # noqa: BLE001 -- an unreachable venue is an error, not "nothing held"
+        # Includes broker CONSTRUCTION, so a missing/!invalid `.env` credential surfaces here
+        # rather than as a raw traceback. Reporting an empty list instead would read as
+        # "you hold nothing", which is not what we learned.
         raise click.ClickException(
-            f"could not fetch balances from the broker: {exc}. Reporting nothing would read as "
-            "'you hold nothing', which is not what we learned."
+            f"could not read balances from the broker: {exc}\n"
+            "  If this is an authentication error, check CDP_API_KEY/CDP_API_SECRET in .env."
         ) from exc
 
-    excluded = _NON_TRADABLE_CURRENCIES | {quote}
+    excluded = _FIAT_CURRENCIES | {quote.upper()}
+    # Currency codes are compared UPPERCASED: a `usdc` balance is still the settlement currency,
+    # and must not be presented as something tradable on a casing accident.
     holdings = sorted(
-        (a for a in accounts if a["currency"] not in excluded and a["available_balance"] > floor),
-        key=lambda a: a["currency"],
+        (
+            a
+            for a in accounts
+            if a["currency"].upper() not in excluded and a["available_balance"] > floor
+        ),
+        key=lambda a: a["currency"].upper(),
     )
 
     if not holdings:
@@ -729,16 +752,30 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         product = _history_product(asset)
         facts, result = _screen_product(repo, product, quote)
         click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
+
+        failures = result.failures
         if facts.daily_bars == 0:
-            # The likeliest misreading of this whole feature. A rejection for zero cached bars
-            # is a statement about our DATA, not about the asset.
+            # The likeliest misreading of this whole feature. With no cached bars the liquidity
+            # and settlement checks CANNOT say anything about the asset -- median volume is 0
+            # because there are no bars, and `quotable_in_settlement_currency` degenerates to
+            # `bool(candles)`. Printing them as findings would assert about the asset exactly
+            # what this message exists to deny, so they are shown as derived, not as verdicts.
+            derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
+            failures = [f for f in failures if f not in derived]
             click.echo(
                 f"      ! no local history -- run `keel fetch --products {product}` first, then "
                 "re-screen.\n"
                 "        This is a MISSING-DATA verdict, not a verdict about the asset."
             )
-        for failure in result.failures:
+            for failure in derived:
+                click.echo(f"      · ({failure.split(':')[0]}: not assessable without history)")
+        for failure in failures:
             click.echo(f"      ✗ {failure}")
+        # Warnings carry compliance constraints that apply even to an ADMITted asset (§65.5's
+        # bay' al-sarf regime for gold/silver backing, say). Dropping them would make this
+        # command quietly less informative than `assets screen` for the same asset.
+        for warning in result.warnings:
+            click.echo(f"      ! {warning}")
 
     click.echo(
         "\n⚠️  Holdings are CANDIDATES, not admissions. Nothing here has been admitted to "

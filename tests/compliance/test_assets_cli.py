@@ -374,7 +374,10 @@ def test_holdings_screen_agrees_with_assets_screen_for_the_same_asset(
     )
     held = _holdings(db_path, valid_config_path, "--screen")
 
-    assert ("ADMIT" in screened.output) == ("ADMIT" in held.output)
+    # Assert the verdict POSITIVELY -- `x in a == x in b` also passes when both are False, or
+    # when holdings prints ADMIT unconditionally.
+    assert "ADMIT" in screened.output
+    assert "ADMIT" in held.output
 
 
 def test_no_local_history_is_reported_as_MISSING_DATA_not_a_bad_asset(
@@ -427,7 +430,82 @@ def test_holdings_marks_assets_already_on_the_allowlist(
 
     result = _holdings(db_path, valid_config_path)
 
-    btc_line = next(ln for ln in result.output.splitlines() if "BTC" in ln)
-    sol_line = next(ln for ln in result.output.splitlines() if "SOL" in ln)
-    assert "allowlist" in btc_line.lower() or "yes" in btc_line.lower()
-    assert btc_line != sol_line
+    btc_line = next(ln for ln in result.output.splitlines() if ln.strip().startswith("BTC"))
+    sol_line = next(ln for ln in result.output.splitlines() if ln.strip().startswith("SOL"))
+    # "not-on-allowlist" CONTAINS "on-allowlist", so the negative must be excluded explicitly --
+    # asserting the substring alone passes even if the check is inverted.
+    assert "on-allowlist" in btc_line and "not-on-allowlist" not in btc_line
+    assert "not-on-allowlist" in sol_line
+
+
+def test_holdings_screen_does_not_DROP_compliance_warnings(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`ScreenResult.warnings` carry constraints that bind even on an ADMITted asset (§65.5's
+    bay' al-sarf regime for gold/silver backing). Dropping them made this command quietly less
+    informative than `assets screen` for the very same asset."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD")
+    runner = CliRunner()
+    assert _attest(
+        runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}
+    ).exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("PAXG", "3")]))
+
+    screened = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    held = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "bay' al-sarf" in screened.output, "fixture no longer triggers the warning"
+    assert "bay' al-sarf" in held.output, "holdings dropped a compliance warning"
+
+
+def test_derivative_failures_are_not_asserted_as_verdicts_without_history(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """With zero cached bars, liquidity and settlement report on our DATA, not the asset:
+    median volume is 0 because there are no bars. Printing them as findings would assert
+    exactly what the missing-data message exists to deny."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "no local history" in result.output
+    assert "✗ settlement" not in result.output, "settlement is a naming artifact here"
+    assert "✗ liquidity" not in result.output, "median volume is 0 only because bars are 0"
+    assert "not assessable without history" in result.output
+    assert "✗ history" in result.output  # the REAL, primary finding stays
+
+
+def test_a_lowercase_settlement_currency_is_still_excluded(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A casing accident must not present the currency you settle in as tradable."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("btc", "0.5"), _account("usdc", "500")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    listed = {ln.split()[0].upper() for ln in result.output.splitlines() if ln.startswith("  ")}
+    assert "USDC" not in listed
+    assert "BTC" in listed
+
+
+def test_min_balance_rejects_garbage_and_non_finite_values(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A NaN floor makes every comparison raise; a negative one lists every zero balance."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5")]))
+
+    for bad in ("abc", "nan", "-1", "inf"):
+        result = _holdings(db_path, valid_config_path, "--min-balance", bad)
+        assert result.exit_code != 0, f"--min-balance {bad} should be rejected: {result.output}"
