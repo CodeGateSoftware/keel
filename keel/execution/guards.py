@@ -3,7 +3,8 @@
 `check()` runs the twelve safety rails from the main spec's §14, plus three later, equally
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
 and 16, the consecutive-loss circuit breaker (Task 4), before any order is placed, in every
-`auto_trade` mode (confirm *and* bypass) and for both rule-trading and DCA order classes. It never
+`auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA order
+classes. It never
 short-circuits: every violated rail is collected and reported so an operator (or the executor,
 Task 4) sees the full picture, not just the first trip-wire.
 
@@ -242,7 +243,8 @@ def check(
 ) -> GuardResult:
     """Run all fifteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never short-circuits.
 
-    Called before every order in every `auto_trade` mode (confirm *and* bypass) — un-overridable.
+    Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
+    un-overridable.
 
     `offline=True` (paper trading only) skips `LIVE_STATE_RAILS` — the two rails whose inputs
     describe the real account, which a paper rehearsal has no access to. **Every other rail still

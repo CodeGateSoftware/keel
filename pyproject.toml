@@ -9,7 +9,6 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.4.2",
-    "cryptography>=49.0.0",
     # pyyaml/python-dotenv are deliberately NOT listed here: nothing under `keel/` imports
     # them any more (config parsing and secret loading both moved into keel-core), so they
     # arrive transitively via the `keel-core` dependency below. Re-add them here only if

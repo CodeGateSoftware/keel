@@ -3,7 +3,7 @@
 `run_once()` is a single cycle: poll fresh candles (`data.market_feed.poll_once`), reconstruct
 the `live` rules (`repo.get_rules("live")` -> real `Rule` instances, `RULE_REGISTRY` below),
 `strategy.engine.evaluate` them for ENTER `Signal`s, drive EXIT `Signal`s off currently-held
-positions, and run every signal through `execution.executor.execute` (confirm|bypass, from
+positions, and run every signal through `execution.executor.execute` (confirm|autonomous, from
 `config.auto_trade.mode`) -- respecting the kill-switch (`repo.get_state("kill_switch")`)
 throughout. `loop()` is the scheduled wrapper: call `run_once` every `interval_sec` until
 `stop_flag()` returns `True`.
@@ -34,22 +34,17 @@ the coercion boundary: a caller (this module, or a future CLI command that lists
 only ever deals in real `Rule` instances, never in raw JSON dicts.
 
 **Confirm mode places via a caller-supplied `confirm_fn`.** `run_once`/`loop` take an optional
-to `(broker, repo, config, now_ts)` -- there is no `confirm_fn` slot for a human-in-the-loop
-approval callback. So in `mode="confirm"`, every `executor.execute` call is made with
-`confirm_fn=None`, which -- per `executor.execute`'s own contract -- fails closed: the order is
-previewed and logged but never placed. That is the intended behavior, not an oversight: wiring
-an actual interactive confirm prompt is the CLI's job (Task 9's `agent --loop --confirm`), which
-can drive `run_once`/`loop` with a real `confirm_fn` some other way, or review the previewed-but-
-unplaced orders out of band. `mode="bypass"` places without a prompt, still subject to every
-guard rail (un-overridable, per `guards.check`).
+`confirm_fn`, which `executor.execute` calls with the broker preview. With `confirm_fn=None` --
+the default, and what any caller that does not supply one gets -- confirm mode **fails closed**:
+the order is previewed and logged but never placed. The CLI supplies a real interactive prompt.
 
-**Bypass requires an armed token (Issue #60).** `mode="bypass"` additionally requires
-`repo.is_bypass_armed(now_ts)` -- an explicit, authenticated, time-limited arm set by
-`Repository.arm_bypass` (wired to the CLI's passphrase-gated `keel arm-bypass` command). This
-check is enforced by `_confirm_or_bypass` inside `run_once` itself, not only at the CLI, so a
-caller invoking `run_once`/`loop` directly with `config.auto_trade.mode == "bypass"` cannot skip
-it -- an unarmed or expired request fails safe by falling back to `"confirm"` (which places
-nothing without a `confirm_fn`) rather than trading autonomously.
+**Autonomy is a profile choice, not a config mode.** `_effective_mode` returns `"autonomous"`
+only when `config.auto_trade.mode == "confirm"` **and** `repo.get_profile().autonomous` is true.
+The profile is read fresh every cycle and never cached, so `keel autonomy off` takes effect on
+the next order rather than the next restart. The check lives inside `run_once`, not only at the
+CLI, so an in-process caller cannot obtain autonomy the CLI would have refused; an absent or
+unreadable profile row reads as not-autonomous. In every mode, `guards.check` runs FIRST and is
+un-overridable -- autonomy changes who is asked, never what is allowed.
 """
 
 from __future__ import annotations
@@ -554,42 +549,32 @@ class LoopResult:
     enter_signals: list[Signal] = field(default_factory=list)
     enter_results: list[ExecutionResult] = field(default_factory=list)
     exit_results: list[ExecutionResult] = field(default_factory=list)
-    # Issue #60 (bypass-arm hardening): non-`None` iff `config.auto_trade.mode == "bypass"` was
-    # requested but `repo.is_bypass_armed(now_ts)` was `False` -- `mode` above then reports the
-    # *effective* mode actually used (always `"confirm"` in that case), and this field explains
-    # why the fallback happened. `None` whenever bypass wasn't requested, or was armed and ran.
-    bypass_refused_reason: str | None = None
 
 
-def _confirm_or_bypass(config: Config, repo: Repository, now_ts: int) -> tuple[str, str | None]:
-    """The effective executor mode for this cycle, plus an optional bypass-refusal reason.
+def _effective_mode(config: Config, repo: Repository) -> str:
+    """The executor mode for this cycle: `"autonomous"` or `"confirm"`.
 
-    `AutoTradeConfig.mode` defaults to `"paper"` (a Phase-1 placeholder, spec §21) which isn't
-    an `executor.execute` mode at all -- per the Global Constraints, confirm mode is *always*
-    the default, so anything other than an explicit `"bypass"`/`"confirm"` falls back to
-    `"confirm"` rather than raising or silently bypassing rails.
+    Two independent switches, deliberately not conflated into one enum:
 
-    **Issue #60 (bypass-arm hardening).** A request for `"bypass"` is only honored if
-    `repo.is_bypass_armed(now_ts)` is `True` -- an explicit, authenticated, time-limited arm
-    (`keel arm-bypass`, passphrase-gated, or any other caller that has called
-    `repo.arm_bypass`) recently granted it. This check lives here, inside `run_once`'s own call
-    path, specifically so it cannot be bypassed by a caller that invokes `agent.run_once`
-    in-process with `config.auto_trade.mode == "bypass"` and skips the CLI's passphrase gate
-    entirely -- the CLI gate (`cli._require_authz`) is defense-in-depth, this is the
-    un-overridable second layer. An unarmed/expired request fails safe: it falls back to
-    `"confirm"` (which, with no `confirm_fn`, places nothing -- see `executor.execute`'s own
-    contract) rather than raising or silently proceeding, and the second return value carries a
-    human-readable reason a caller can log or surface.
+    * `config.auto_trade.mode` says whether this is real money at all (`paper` never reaches an
+      executor mode -- it routes to the paper path upstream).
+    * `repo.get_profile().autonomous` says whether the user has opted out of being asked.
+
+    `"autonomous"` is returned ONLY when the config is live (`confirm`) **and** the profile says
+    so. Anything else -- an unknown mode, an absent profile row, a damaged database -- yields
+    `"confirm"`, which with no `confirm_fn` places nothing at all. The failure direction is
+    always toward asking a human.
+
+    **The profile is read here, fresh, on every cycle and never cached**, so `keel autonomy off`
+    takes effect on the NEXT order rather than the next restart. This mirrors rail 14's
+    allowance, which is re-read live for exactly the same reason.
+
+    This lives inside `run_once`'s own call path, not only at the CLI, so a caller driving
+    `run_once` in-process cannot obtain autonomy the CLI would have refused.
     """
-    mode = config.auto_trade.mode
-    if mode not in ("confirm", "bypass"):
-        return "confirm", None
-    if mode == "bypass" and not repo.is_bypass_armed(now_ts):
-        return "confirm", (
-            "bypass mode requested but not armed (no active `keel arm-bypass` token, or it "
-            "expired) -- falling back to confirm mode; no order will be placed"
-        )
-    return mode, None
+    if config.auto_trade.mode != "confirm":
+        return "confirm"
+    return "autonomous" if repo.get_profile().autonomous else "confirm"
 
 
 def run_once(
@@ -641,15 +626,11 @@ def run_once(
         # for recording that the check happened, independent of whether it found anything new.
         repo.set_state("last_feed_ts", now_ts)
 
-        mode, bypass_refused_reason = _confirm_or_bypass(config, repo, now_ts)
-        # `mode: paper` is not an executor mode (see `_confirm_or_bypass`); it routes to the
+        mode = _effective_mode(config, repo)
+        # `mode: paper` is not an executor mode (see `_effective_mode`); it routes to the
         # PAPER path instead, which never touches the broker. Constructed once per cycle and
         # rehydrated from the orders table, so a per-cycle agent resumes its open positions.
         paper_trader = PaperTrader(repo) if config.auto_trade.mode == "paper" else None
-        if bypass_refused_reason is not None:
-            log_event(
-                logger, logging.WARNING, "agent.bypass_refused", reason=bypass_refused_reason
-            )
         log_event(logger, logging.INFO, "agent.mode_resolved", mode=mode)
         max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
         finest = _finest_granularity(granularities)
@@ -791,7 +772,6 @@ def run_once(
             enter_signals=enter_signals,
             enter_results=enter_results,
             exit_results=exit_results,
-            bypass_refused_reason=bypass_refused_reason,
         )
     finally:
         unbind_cycle(cycle_token)

@@ -341,7 +341,7 @@ def test_rail_violating_signal_is_vetoed_before_preview_or_place(repo):
     broker = NoNetworkBroker()
     signal = _enter_signal(product_id="DOGE-USD", setup=_setup(product_id="DOGE-USD"))
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert result.order_id is None
@@ -355,7 +355,7 @@ def test_kill_switch_vetoes_even_in_bypass_mode(repo):
     broker = NoNetworkBroker()
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert any(v.startswith("kill_switch") for v in result.vetoed_by)
@@ -385,7 +385,7 @@ def test_execute_fetches_the_available_quote_balance_for_a_buy_and_places(repo):
     broker = FakeBroker(usdc_balance=Decimal("100000"))
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     assert broker.get_accounts_calls == 1
@@ -395,7 +395,7 @@ def test_broker_balance_fetch_error_vetoes_the_buy_before_preview_or_place(repo)
     broker = _BrokerAccountsError()
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert result.order_id is None
@@ -408,7 +408,7 @@ def test_insufficient_usdc_balance_vetoes_the_buy_before_preview_or_place(repo):
     broker = FakeBroker(usdc_balance=Decimal("10"))  # entry 50000, qty ~1 -> notional ~50000
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert result.preview is None
@@ -432,7 +432,7 @@ def test_exit_signal_never_fetches_a_balance(repo):
         ts=NOW_TS,
     )
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     assert broker.get_accounts_calls == 0
@@ -445,7 +445,7 @@ def test_bypass_mode_compliant_signal_places_without_confirm_fn(repo):
     broker = FakeBroker()
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     assert result.order_id is not None
@@ -458,7 +458,7 @@ def test_bypass_mode_ignores_confirm_fn_if_provided(repo):
     signal = _enter_signal()
 
     result = execute(
-        signal, broker, repo, _config(), mode="bypass", confirm_fn=_reject, now_ts=NOW_TS
+        signal, broker, repo, _config(), mode="autonomous", confirm_fn=_reject, now_ts=NOW_TS
     )
 
     # bypass mode never consults confirm_fn -- a reject-everything fn must not block it.
@@ -473,7 +473,8 @@ def test_unknown_mode_raises_value_error(repo):
     signal = _enter_signal()
 
     with pytest.raises(ValueError, match="mode"):
-        execute(signal, broker, repo, _config(), mode="yolo", now_ts=NOW_TS)  # type: ignore[arg-type]
+        # type: ignore[arg-type]
+        execute(signal, broker, repo, _config(), mode="yolo", now_ts=NOW_TS)
 
 
 # -- broker place failure --------------------------------------------------------------------
@@ -483,7 +484,7 @@ def test_broker_place_failure_is_logged_but_not_placed(repo):
     broker = FakeBroker(place_success=False)
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert result.order_id is not None  # still logged (audit trail even on rejection)
@@ -499,7 +500,7 @@ def test_monthly_allowance_vetoes_a_buy_over_the_live_subscription_cap(repo):
     broker = FakeBroker()
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert any(v.startswith("monthly_subscription_allowance") for v in result.vetoed_by)
@@ -514,11 +515,11 @@ def test_monthly_allowance_updated_subscription_takes_effect_on_the_next_order(r
     broker = FakeBroker()
     signal = _enter_signal()
 
-    first = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    first = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
     assert first.placed is False
 
     _attest(repo, free_volume_usd=Decimal("10000000"))
-    second = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    second = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
     assert second.placed is True
 
 
@@ -529,7 +530,7 @@ def test_dca_signal_sizes_via_dca_size_and_places(repo):
     broker = FakeBroker()
     signal = _dca_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     order = repo.get_order(result.order_id)
@@ -549,7 +550,7 @@ def test_dca_signal_exempt_from_averaging_into_losers_but_bound_by_allowlist(rep
         ),
     )
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert any(v.startswith("halal_allowlist") for v in result.vetoed_by)
@@ -572,7 +573,7 @@ def _seed_open_position(repo: Repository, product_id: str, qty: Decimal, price: 
             expected_fill=price,
             actual_fill=price,
             raw_response=None,
-            confirmation="bypass",
+            confirmation="autonomous",
             rule_id=None,
             created_at=NOW_TS - 1000,
             updated_at=NOW_TS - 1000,
@@ -594,7 +595,7 @@ def test_exit_signal_sells_the_held_position(repo):
         ts=NOW_TS,
     )
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     order = repo.get_order(result.order_id)
@@ -615,7 +616,7 @@ def test_exit_signal_with_no_open_position_is_not_placed(repo):
         ts=NOW_TS,
     )
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is False
     assert result.order_id is None
@@ -628,7 +629,7 @@ def test_execute_attaches_oco_bracket_after_a_stop_target_entry_fills(repo):
     broker = FakeBroker()
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
     # entry + ONE native bracket = 2 place_order calls (was 3: entry + stop leg + target leg)
@@ -844,7 +845,7 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
     )
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), "bypass", confirm_fn=None, now_ts=NOW_TS)
+    result = execute(signal, broker, repo, _config(), "autonomous", confirm_fn=None, now_ts=NOW_TS)
 
     assert result.placed is True
     order = repo.get_order(result.order_id)
@@ -1006,7 +1007,7 @@ def test_execute_surfaces_the_bracket_order_id_it_placed(repo):
     """
     broker = FakeBroker()
 
-    result = execute(_enter_signal(), broker, repo, _config(), mode="bypass", now_ts=NOW_TS)
+    result = execute(_enter_signal(), broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.bracket_order_id is not None, "execute discarded the bracket's order id again"
     bracket = repo.get_order(result.bracket_order_id)
@@ -1024,7 +1025,7 @@ def test_a_vetoed_bracket_leaves_no_bracket_order_id(repo):
     # DCA carries no stop, so no bracket is ever placed for it.
     result = execute(
         _enter_signal(setup=_setup(context={"order_class": "dca"})),
-        broker, repo, _config(), mode="bypass", now_ts=NOW_TS,
+        broker, repo, _config(), mode="autonomous", now_ts=NOW_TS,
     )
 
     assert result.placed is True
@@ -1188,7 +1189,9 @@ def test_an_exit_cancels_the_resting_bracket_before_selling(repo):
         rule_name="pullback_continuation", now_ts=NOW_TS,
     )
 
-    result = execute(_exit_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS + 10)
+    result = execute(
+        _exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS + 10
+    )
 
     assert result.placed is True
     assert repo.get_order(bracket_id)["status"] == "canceled"
@@ -1215,7 +1218,9 @@ def test_an_exit_is_refused_when_the_resting_bracket_cannot_be_cancelled(repo):
     )
     placed_before = len(broker.place_calls)
 
-    result = execute(_exit_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS + 10)
+    result = execute(
+        _exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS + 10
+    )
 
     assert result.placed is False
     assert "bracket" in (result.reason or "").lower()
@@ -1226,7 +1231,7 @@ def test_an_entry_does_not_try_to_cancel_anything(repo):
     """Negative control: the bracket-clearing step is EXIT-only. An entry must not touch it."""
     broker = FakeBroker()
 
-    execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+    execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
 
     assert broker.cancel_calls == []
 
@@ -1251,7 +1256,7 @@ def test_an_immediately_filled_order_upgrades_to_the_OBSERVED_fill_and_fee(repo)
 
     broker = _ObservingBroker()
 
-    result = execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
 
     order = repo.get_order(result.order_id)
     assert order["actual_fill"] == Decimal("50123.45")
@@ -1269,7 +1274,7 @@ def test_an_unobservable_immediate_fill_keeps_the_estimate_rather_than_failing(r
 
     broker = _BlindBroker()
 
-    result = execute(_enter_signal(), broker, repo, _config(), "bypass", None, now_ts=NOW_TS)
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
 
     assert result.placed is True
     order = repo.get_order(result.order_id)

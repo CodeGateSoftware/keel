@@ -2,7 +2,7 @@
 
 `execute()` is the only path from a strategy `Signal` to a real order: it sizes the candidate
 (`execution.sizing`), runs the twelve un-overridable §14 hard rails (`execution.guards.check`)
-**before** anything reaches the broker, previews the order, honors the confirm/bypass mode gate,
+**before** anything reaches the broker, previews the order, honors the confirm/autonomous mode gate,
 places it, and writes a full audit trail to the `orders` table both before and after the broker
 call (so a crash mid-placement, or a broker-side rejection, still leaves a record). No path in
 this module calls `broker.place_order` (or even `broker.preview_order`) without `guards.check`
@@ -109,15 +109,15 @@ def execute(
     broker: Any,
     repo: Repository,
     config: Config,
-    mode: Literal["confirm", "bypass"],
+    mode: Literal["confirm", "autonomous"],
     confirm_fn: ConfirmFn | None = None,
     now_ts: int | None = None,
 ) -> ExecutionResult:
     """Turn `signal` into a guarded order: size -> guards (veto on any violation) -> preview ->
-    confirm|bypass -> place -> log (before and after).
+    confirm|autonomous -> place -> log (before and after).
 
     `mode="confirm"` requires `confirm_fn(preview) -> bool`; a missing or rejecting `confirm_fn`
-    means the order is not placed (fails closed, never silently proceeds). `mode="bypass"`
+    means the order is not placed (fails closed, never silently proceeds). `mode="autonomous"`
     places without a prompt but is *not* exempt from `guards.check` -- rails run before every
     order in every mode, un-overridable, per the main spec §14.
     """
@@ -364,7 +364,7 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     return (net_qty if net_qty > 0 else Decimal("0")), avg_cost
 
 
-# -- shared guard -> preview -> confirm/bypass -> place -> log pipeline ------------------------
+# -- shared guard -> preview -> confirm/autonomous -> place -> log pipeline ------------------------
 
 
 def _run_order(
@@ -433,8 +433,8 @@ def _run_order(
                 preview=preview,
                 reason="rejected at confirm gate",
             )
-    elif mode != "bypass":
-        raise ValueError(f"execute: unknown mode {mode!r} -- must be 'confirm' or 'bypass'")
+    elif mode != "autonomous":
+        raise ValueError(f"execute: unknown mode {mode!r} -- must be 'confirm' or 'autonomous'")
 
     order_id = repo.insert_order(_order_row(intent, mode, now_ts))
 
@@ -717,7 +717,7 @@ def place_bracket(
         broker,
         repo,
         config,
-        "bypass",
+        "autonomous",
         None,
         now_ts,
         order_configuration=_bracket_order_configuration(qty, target, stop),
@@ -762,7 +762,7 @@ def scale_out(
 ) -> ExecutionResult:
     """Partially close `qty` of an open position at `exit_price` (a rule-driven profit-take,
     e.g. "sell half at the first target") -- runs the same guard+preview+place+log pipeline as
-    `execute()` for a plain SELL leg, system-initiated so it proceeds in bypass mode (still
+    `execute()` for a plain SELL leg, system-initiated so it proceeds in autonomous mode (still
     subject to every guard rail, still fully logged).
     """
     intent = OrderIntent(
@@ -784,7 +784,7 @@ def scale_out(
         exit_price=exit_price,
         rule=rule_name,
     )
-    return _run_order(intent, broker, repo, config, "bypass", None, now_ts)
+    return _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
 
 
 # -- stop management: break-even roll + ATR trailing -------------------------------------------
@@ -858,7 +858,7 @@ def _roll_stop(
         broker,
         repo,
         config,
-        "bypass",
+        "autonomous",
         None,
         now_ts,
         order_configuration=_bracket_order_configuration(qty, target, new_stop),
