@@ -2,7 +2,7 @@
 
 `execute()` turns a `Signal` into a guarded live order: build an `OrderIntent` (sized via
 `execution.sizing`), run `guards.check` FIRST (un-overridable -- a violation must never reach
-`preview_order`/`place_order`), preview it, honor confirm/bypass mode, place it, and log it to
+`preview_order`/`place_order`), preview it, honor confirm/autonomous mode, place it, and log it to
 the `orders` table both before and after placement (a full audit trail even if the broker call
 fails). Every test here injects a **fake broker** (no network) -- `FakeBroker` below duck-types
 `CoinbaseClient.preview_order`/`.place_order` (+ an optional `cancel_order` for OCO) against
@@ -438,7 +438,8 @@ def test_exit_signal_never_fetches_a_balance(repo):
     assert broker.get_accounts_calls == 0
 
 
-# -- bypass mode: compliant -> placed without a prompt --------------------------------------------
+# -- autonomous mode: compliant -> placed without a prompt
+# --------------------------------------------
 
 
 def test_bypass_mode_compliant_signal_places_without_confirm_fn(repo):
@@ -461,7 +462,7 @@ def test_bypass_mode_ignores_confirm_fn_if_provided(repo):
         signal, broker, repo, _config(), mode="autonomous", confirm_fn=_reject, now_ts=NOW_TS
     )
 
-    # bypass mode never consults confirm_fn -- a reject-everything fn must not block it.
+    # autonomous mode never consults confirm_fn -- a reject-everything fn must not block it.
     assert result.placed is True
 
 

@@ -54,7 +54,13 @@ These are the properties the removed ceremony was standing in for. Each gets a t
    without asking me" and "un-stick your own drawdown breaker" are different powers. A rail that
    fired because something went wrong still needs a human to clear it — otherwise a breaker can
    silently reset itself and the rail stops meaning anything.
-3. **Autonomy fails closed.** An absent/unreadable profile row reads as `autonomous = False`.
+3. **Autonomy fails closed.** An absent/unreadable/damaged profile row reads as
+   `autonomous = False` — `get_profile` catches `sqlite3.Error` rather than relying on the caller
+   crashing first.
+3a. **Autonomy may be time-bounded.** The removed bypass-arm token was TTL-limited so a forgotten
+   arm could not grant unattended trading forever. `keel autonomy on --for-hours N` restores that
+   bound; the default is a durable choice (per the requirement that it be tracked as a user
+   preference), and `autonomy on` says plainly when no expiry is set.
 4. **Autonomy cannot be enabled non-interactively.** `keel autonomy on` requires a TTY and an
    explicit typed confirmation, so a script, cron job or piped command can never arm it.
 5. **The kill-switch still short-circuits everything**, checked first, defaulting to engaged.
@@ -76,13 +82,18 @@ path.
 Remove `keel/security/authz.py` and `tests/security/test_authz.py`. With both files gone the
 `keel/security/` package has no remaining contents and is deleted entirely.
 
-Of the four declared dangerous actions, `raise_caps` and `unlock_vault` were **never used** (caps
-are config-file-only; the vault is going). `arm_bypass` disappears with bypass mode. That leaves
+Of the four declared dangerous actions, `raise_caps` and `unlock_vault` were **never wired to any
+command** — the gate was declared for them and never applied. ⚠️ Note the premise is narrower than
+it first looks: `raise_caps` was never *enforced*, but capability-raising commands do exist and
+remain ungated — `keel subscription set/attest` raises rail 14's spend allowance at runtime, and
+`keel assets attest` admits an asset. Neither is a regression (both were ungated before this work),
+but neither should be mistaken for "caps cannot be raised at runtime". `arm_bypass` disappears with bypass mode. That leaves
 four *commands*, all one idea — re-permitting trading after a safety halt:
 
 | command | what it releases |
 |---|---|
 | `resume` | the kill-switch |
+| `withdrawals attest --enabled` | rail 17's entry halt (⚠️ found in review — its old justification cited the confirm gate and the bypass-arm token, both of which this work removes) |
 | `resume-entries` | an armed consecutive-loss halt (rail 16) |
 | `record-flow` | declares an external deposit/withdrawal so rail 11 isn't fooled |
 | `reset-hwm` | rail 11's equity high-water mark, clearing a stuck drawdown halt |

@@ -147,7 +147,6 @@ def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypat
     assert result.output.count("skipped: kill_switch") == 3
 
 
-# -- arm-bypass / disarm-bypass (Issue #60, bypass-arm hardening) ------------------------------
 
 
 
@@ -1084,3 +1083,78 @@ def test_autonomy_ON_does_not_let_halt_commands_skip_confirmation(tmp_path, monk
 
         assert result.exit_code != 0, f"{args} was released without a human: {result.output}"
         assert "terminal" in result.output.lower()
+
+
+def test_withdrawals_attest_ENABLED_needs_a_terminal(tmp_path, monkeypatch):
+    """Rail 17 halts ENTRIES when withdrawals are suspended/stale; `--enabled` releases that
+    halt, so it is a halt-releasing command like the other four. Its old justification was that
+    the confirm gate and the bypass-arm token sat in front of it -- with autonomy on, neither
+    does, so a cron line could re-permit live entries with no human anywhere."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "w.db"
+    repo = _repo_at(db)
+    repo.set_autonomous(True, now_ts=1)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "terminal" in result.output.lower()
+    assert _repo_at(db).get_state("withdrawals_enabled") is None
+
+
+def test_withdrawals_attest_SUSPENDED_is_ungated_and_needs_no_terminal(tmp_path, monkeypatch):
+    """De-risking is never obstructed: suspending only ever halts entries."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "w2.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(cli, ["--db", str(db), "withdrawals", "attest", "--suspended"])
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_state("withdrawals_enabled") is False
+
+
+def test_withdrawals_attest_ENABLED_proceeds_on_a_typed_yes(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "w3.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_state("withdrawals_enabled") is True
+
+
+def test_autonomy_on_for_hours_sets_an_expiry_that_lapses(tmp_path, monkeypatch, valid_config_path):
+    """A forgotten `autonomy on` should not be able to grant unattended trading forever."""
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "exp.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on", "--for-hours", "1"],
+        input="yes\n",
+    )
+    assert result.exit_code == 0, result.output
+    profile = _repo_at(db).get_profile()
+    assert profile.autonomous_until is not None
+    assert profile.is_autonomous(profile.autonomous_until - 1) is True
+    assert profile.is_autonomous(profile.autonomous_until) is False
+
+
+def test_autonomy_on_without_for_hours_warns_that_it_never_lapses(
+    tmp_path, monkeypatch, valid_config_path
+):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "noexp.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on"], input="yes\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "NO expiry" in result.output
+    assert _repo_at(db).get_profile().autonomous_until is None

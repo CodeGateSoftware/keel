@@ -242,6 +242,9 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS profile (
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         autonomous  INTEGER NOT NULL DEFAULT 0,
+        -- NULL = no expiry (a durable choice). A timestamp makes autonomy LAPSE on its own,
+        -- restoring the time bound the removed bypass-arm token used to provide.
+        autonomous_until INTEGER,
         updated_ts  INTEGER NOT NULL
     )
     """,

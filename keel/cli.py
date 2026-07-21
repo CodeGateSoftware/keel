@@ -1,8 +1,8 @@
 """keel command-line interface (P3 Task 9).
 
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
-`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `arm-bypass`/
-`disarm-bypass` (the `agent_state` bypass-arm token `agent.run_once` itself enforces, Issue #60),
+`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `autonomy on|off|show`
+(the `profile` row `agent.run_once` itself re-reads each cycle),
 `rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
 `promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
 Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
@@ -814,11 +814,22 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     taking physical possession whenever he desires". An asset we cannot withdraw is an asset we
     may not validly possess -- so rail 17 halts new ENTRIES when this is suspended or unknown.
 
-    Not passphrase-gated in either direction. `--suspended` only ever REDUCES capability, and
-    `--enabled` cannot itself place an order: it restores a precondition that every other rail,
-    the confirm gate and the bypass-arm token still sit in front of.
+    **Asymmetric, like `autonomy`.** `--suspended` only ever REDUCES capability and is ungated,
+    usable from anywhere. `--enabled` RELEASES a rail-17 entry halt, so it demands a typed `yes`
+    at a terminal exactly like `resume`/`resume-entries`/`record-flow`/`reset-hwm`.
+
+    That gate used to be unnecessary for a reason that no longer holds: this command was
+    justified by "the confirm gate and the bypass-arm token still sit in front of it". The
+    bypass-arm token no longer exists, and with `keel autonomy on` the confirm gate is not there
+    either -- so without this, a cron line could clear a rail-17 halt and the next cycle would
+    place live orders with no human anywhere in the loop.
     """
     repo = _open_repo(ctx)
+    if enabled:
+        _require_interactive_confirmation(
+            "attest withdrawals as ENABLED",
+            "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle.",
+        )
     now_ts = int(time.time())
     repo.set_state("withdrawals_enabled", bool(enabled))
     repo.set_state("withdrawals_attested_at", now_ts)
@@ -1165,7 +1176,7 @@ def _interactive_confirm(preview: dict) -> bool:
             click.echo(f"    {key}: {value}")
     else:
         click.echo(f"    {preview!r}")
-    if not (sys.stdin is not None and sys.stdin.isatty()):
+    if not _is_interactive():
         click.echo("no TTY -- declining (confirm mode fails closed).", err=True)
         return False
     return click.confirm("Place this order?", default=False)
@@ -1249,23 +1260,40 @@ def autonomy_group() -> None:
 
 @autonomy_group.command("show")
 @click.pass_context
+@with_disclaimer
 def autonomy_show(ctx: click.Context) -> None:
     """Print the current autonomy setting."""
     profile = _open_repo(ctx).get_profile()
+    now_ts = int(time.time())
+    live = profile.is_autonomous(now_ts)
     state = (
         "ON -- orders are placed WITHOUT asking"
-        if profile.autonomous
+        if live
         else "off -- every order asks first"
     )
     click.echo(f"autonomy: {state}")
+    if profile.autonomous and not live:
+        click.echo(f"  (was ON but LAPSED at {profile.autonomous_until})")
+    elif live and profile.autonomous_until is not None:
+        left = profile.autonomous_until - now_ts
+        click.echo(f"  lapses at {profile.autonomous_until} ({left}s left)")
+    elif live:
+        click.echo("  no expiry set -- stays on until `keel autonomy off`")
     if profile.updated_ts:
         click.echo(f"  last changed: {profile.updated_ts}")
 
 
 @autonomy_group.command("on")
+@click.option(
+    "--for-hours",
+    "for_hours",
+    type=float,
+    default=None,
+    help="Let autonomy LAPSE automatically after this many hours (default: never lapses).",
+)
 @click.pass_context
 @with_disclaimer
-def autonomy_on(ctx: click.Context) -> None:
+def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
     """Let the agent place orders without asking (dangerous: asks for confirmation).
 
     Every order is still subject to all hard rails -- autonomy changes who is asked, never what
@@ -1274,17 +1302,30 @@ def autonomy_on(ctx: click.Context) -> None:
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
+    now_ts = int(time.time())
+    expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
+    window = (
+        "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"
+    )
     _require_interactive_confirmation(
         "turn autonomy ON",
-        f"Orders will be placed with NO further prompt "
+        f"Orders will be placed with NO further prompt, {window} "
         f"(mode={config.auto_trade.mode}, allowlist={config.allowlist}).",
     )
-    repo.set_autonomous(True, int(time.time()))
-    click.echo("autonomy ON. Run `keel autonomy off` to require confirmation again.")
+    repo.set_autonomous(True, now_ts, expires_ts=expires_ts)
+    if expires_ts is None:
+        click.echo(
+            "autonomy ON, with NO expiry -- it stays on until you run `keel autonomy off`.\n"
+            "  Consider `--for-hours N` for a supervised session, so a forgotten `on` cannot "
+            "grant unattended trading indefinitely."
+        )
+    else:
+        click.echo(f"autonomy ON until {expires_ts}. It lapses on its own after that.")
 
 
 @autonomy_group.command("off")
 @click.pass_context
+@with_disclaimer
 def autonomy_off(ctx: click.Context) -> None:
     """Require confirmation before every order again.
 
@@ -2315,8 +2356,9 @@ def record_flow(ctx: click.Context, amount: str) -> None:
     mask a real trading drawdown, which is the one direction a circuit breaker must not fail in.
     """
     _require_interactive_confirmation(
-        "rebase rail 11's high-water mark",
-        "A wrong amount here silently mis-states drawdown from now on.",
+        f"rebase rail 11's high-water mark by {amount}",
+        "A wrong amount or sign here silently mis-states drawdown from now on "
+        "(positive = deposit, negative = withdrawal).",
     )
     try:
         parsed = Decimal(amount)

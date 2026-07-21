@@ -35,6 +35,8 @@ market_data:
 
 auto_trade:
   mode: paper
+  # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
+  # true or false changes nothing. Use `keel kill` to halt trading.
   enabled: false
   interval_sec: 900
 

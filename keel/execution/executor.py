@@ -561,6 +561,9 @@ def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
         expected_fill=intent.entry,
         actual_fill=None,
         raw_response=None,
+        # NOTE: rows written before 2026-07-21 carry `confirmation='bypass'` for what is now
+        # called `'autonomous'`. Nothing reads this column back -- it is an audit trail only --
+        # so the rows are deliberately left as-written rather than rewritten by a migration.
         confirmation=mode,
         rule_id=None,
         created_at=now_ts,

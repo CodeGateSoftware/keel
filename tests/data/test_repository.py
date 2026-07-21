@@ -412,3 +412,30 @@ def test_set_autonomous_upserts_and_never_creates_a_second_row(repo):
         repo.set_autonomous(ts % 2 == 0, now_ts=ts)
     rows = repo._conn.execute("SELECT COUNT(*) AS n FROM profile").fetchone()["n"]
     assert rows == 1
+
+
+def test_autonomy_can_carry_an_expiry_and_lapses_on_its_own(repo):
+    """The removed bypass-arm token was TIME-LIMITED so a forgotten arm could not grant
+    unattended trading forever. An unbounded profile flag loses that; an optional expiry
+    restores it without forcing it on a user who wants a durable choice."""
+    repo.set_autonomous(True, now_ts=1000, expires_ts=2000)
+    p = repo.get_profile()
+    assert p.autonomous is True
+    assert p.autonomous_until == 2000
+
+    assert p.is_autonomous(now_ts=1999) is True
+    # strict now < expiry, like every other freshness check in this codebase
+    assert p.is_autonomous(now_ts=2000) is False
+    assert p.is_autonomous(now_ts=5000) is False
+
+
+def test_autonomy_without_an_expiry_never_lapses(repo):
+    repo.set_autonomous(True, now_ts=1000)
+    p = repo.get_profile()
+    assert p.autonomous_until is None
+    assert p.is_autonomous(now_ts=10**12) is True
+
+
+def test_autonomy_off_is_never_autonomous_whatever_the_expiry(repo):
+    repo.set_autonomous(False, now_ts=1000, expires_ts=10**12)
+    assert repo.get_profile().is_autonomous(now_ts=1001) is False

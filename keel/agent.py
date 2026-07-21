@@ -39,7 +39,8 @@ the default, and what any caller that does not supply one gets -- confirm mode *
 the order is previewed and logged but never placed. The CLI supplies a real interactive prompt.
 
 **Autonomy is a profile choice, not a config mode.** `_effective_mode` returns `"autonomous"`
-only when `config.auto_trade.mode == "confirm"` **and** `repo.get_profile().autonomous` is true.
+only when `config.auto_trade.mode == "confirm"` **and**
+`repo.get_profile().is_autonomous(now_ts)` is true.
 The profile is read fresh every cycle and never cached, so `keel autonomy off` takes effect on
 the next order rather than the next restart. The check lives inside `run_once`, not only at the
 CLI, so an in-process caller cannot obtain autonomy the CLI would have refused; an absent or
@@ -551,21 +552,22 @@ class LoopResult:
     exit_results: list[ExecutionResult] = field(default_factory=list)
 
 
-def _effective_mode(config: Config, repo: Repository) -> str:
+def _effective_mode(config: Config, repo: Repository, now_ts: int) -> str:
     """The executor mode for this cycle: `"autonomous"` or `"confirm"`.
 
     Two independent switches, deliberately not conflated into one enum:
 
     * `config.auto_trade.mode` says whether this is real money at all (`paper` never reaches an
       executor mode -- it routes to the paper path upstream).
-    * `repo.get_profile().autonomous` says whether the user has opted out of being asked.
+    * `repo.get_profile().is_autonomous(now_ts)` says whether the user has opted out of being
+      asked -- honouring any expiry the user set.
 
     `"autonomous"` is returned ONLY when the config is live (`confirm`) **and** the profile says
     so. Anything else -- an unknown mode, an absent profile row, a damaged database -- yields
     `"confirm"`, which with no `confirm_fn` places nothing at all. The failure direction is
     always toward asking a human.
 
-    **The profile is read here, fresh, on every cycle and never cached**, so `keel autonomy off`
+    **The profile is read here, fresh, once per cycle and never cached**, so `keel autonomy off`
     takes effect on the NEXT order rather than the next restart. This mirrors rail 14's
     allowance, which is re-read live for exactly the same reason.
 
@@ -574,7 +576,7 @@ def _effective_mode(config: Config, repo: Repository) -> str:
     """
     if config.auto_trade.mode != "confirm":
         return "confirm"
-    return "autonomous" if repo.get_profile().autonomous else "confirm"
+    return "autonomous" if repo.get_profile().is_autonomous(now_ts) else "confirm"
 
 
 def run_once(
@@ -626,7 +628,7 @@ def run_once(
         # for recording that the check happened, independent of whether it found anything new.
         repo.set_state("last_feed_ts", now_ts)
 
-        mode = _effective_mode(config, repo)
+        mode = _effective_mode(config, repo, now_ts)
         # `mode: paper` is not an executor mode (see `_effective_mode`); it routes to the
         # PAPER path instead, which never touches the broker. Constructed once per cycle and
         # rehydrated from the orders table, so a per-cycle agent resumes its open positions.

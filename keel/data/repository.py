@@ -589,25 +589,42 @@ class Repository:
         `profile` table existed -- reports `autonomous=False`. The safe reading of "no record"
         is that the user never opted into unattended trading, never that they did.
 
-        Callers must re-read this per order decision rather than caching it, so that
-        `keel autonomy off` takes effect on the next order instead of the next restart.
+        Callers must re-read this each cycle rather than caching it, so that
+        `keel autonomy off` takes effect on the next cycle instead of the next restart.
         """
-        row = self._conn.execute(
-            "SELECT autonomous, updated_ts FROM profile WHERE id = 1"
-        ).fetchone()
+        try:
+            row = self._conn.execute(
+                "SELECT autonomous, autonomous_until, updated_ts FROM profile WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            # A missing or damaged `profile` table must read as "no consent recorded", not
+            # propagate. The contract above promises fail-closed, so implement it rather than
+            # relying on the caller crashing before it reaches an order.
+            return Profile()
         if row is None:
             return Profile()
-        return Profile(autonomous=bool(row["autonomous"]), updated_ts=int(row["updated_ts"]))
+        until = row["autonomous_until"]
+        return Profile(
+            autonomous=bool(row["autonomous"]),
+            autonomous_until=None if until is None else int(until),
+            updated_ts=int(row["updated_ts"]),
+        )
 
-    def set_autonomous(self, value: bool, now_ts: int) -> None:
-        """Record the user's autonomy choice, upserting the single profile row."""
+    def set_autonomous(self, value: bool, now_ts: int, expires_ts: int | None = None) -> None:
+        """Record the user's autonomy choice, upserting the single profile row.
+
+        `expires_ts=None` means the choice never lapses. Passing a timestamp makes autonomy
+        expire on its own -- the time bound the removed bypass-arm token used to enforce.
+        """
         self._conn.execute(
             """
-            INSERT INTO profile (id, autonomous, updated_ts) VALUES (1, ?, ?)
+            INSERT INTO profile (id, autonomous, autonomous_until, updated_ts)
+            VALUES (1, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET autonomous = excluded.autonomous,
+                                          autonomous_until = excluded.autonomous_until,
                                           updated_ts = excluded.updated_ts
             """,
-            (1 if value else 0, now_ts),
+            (1 if value else 0, expires_ts, now_ts),
         )
         self._conn.commit()
 
