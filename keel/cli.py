@@ -25,7 +25,7 @@ blast radius.
 **Autonomy is a profile choice, checked in-process.** `keel autonomy on` (typed `yes`, TTY
 required) sets `profile.autonomous`; `agent.run_once` re-reads it every cycle via
 `_effective_mode`, so the check cannot be skipped by a caller driving `run_once` in-process, and
-turning autonomy off binds on the next order. It changes who is asked, never what is allowed:
+turning autonomy off binds on the next cycle. It changes who is asked, never what is allowed:
 `guards.check` runs first in every mode, and autonomy never releases a halt.
 
 **No interactive hangs in tests.** `_is_interactive()` is the single TTY predicate, with
@@ -97,6 +97,9 @@ DISCLAIMER = (
 #: Upper bound on `keel autonomy on --for-hours` (1 year). Guards against inf/nan/overflow
 #: and against a "window" so long it is indistinguishable from no expiry at all.
 _MAX_AUTONOMY_HOURS = 8760.0
+#: One second. Below this the window rounds to zero and we would write an already-lapsed row
+#: while printing "autonomy ON until ..." -- fails safe, but the message would be a lie.
+_MIN_AUTONOMY_HOURS = 1.0 / 3600.0
 
 DEFAULT_DB_PATH = "keel.db"
 DEFAULT_CONFIG_PATH = "config.yaml"
@@ -129,7 +132,7 @@ def with_disclaimer(f: Any) -> Any:
     return wrapper
 
 
-# -- passphrase resolution (no interactive hangs under CliRunner) -----------------------------
+# -- interactive confirmation (no interactive hangs under CliRunner) -----------------------------
 
 
 def _is_interactive() -> bool:
@@ -1268,7 +1271,16 @@ def autonomy_group() -> None:
 @with_disclaimer
 def autonomy_show(ctx: click.Context) -> None:
     """Print the current autonomy setting."""
-    profile = _open_repo(ctx).get_profile()
+    repo = _open_repo(ctx)
+    profile = repo.get_profile()
+    # `_open_repo` runs `migrate()`, which recreates a merely MISSING table -- so this covers
+    # damage migrate cannot heal (a corrupt page, a table of the wrong shape), not a fresh DB.
+    if not repo.profile_readable():
+        click.echo(
+            "WARNING: the profile row could not be read (see the log). Reporting autonomy as "
+            "OFF, which is the safe reading -- but the stored setting is UNKNOWN.",
+            err=True,
+        )
     now_ts = int(time.time())
     live = profile.is_autonomous(now_ts)
     state = (
@@ -1308,12 +1320,12 @@ def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
     now_ts = int(time.time())
-    if for_hours is not None and not (0 < for_hours <= _MAX_AUTONOMY_HOURS):
+    if for_hours is not None and not (_MIN_AUTONOMY_HOURS <= for_hours <= _MAX_AUTONOMY_HOURS):
         # 0/negative would write an already-lapsed row while printing "autonomy ON until ...",
         # and inf/nan/1e18 would overflow int() after the operator had already typed `yes`.
         raise click.BadParameter(
-            f"--for-hours must be greater than 0 and at most {_MAX_AUTONOMY_HOURS} "
-            f"({_MAX_AUTONOMY_HOURS // 24} days); got {for_hours!r}."
+            f"--for-hours must be at least {_MIN_AUTONOMY_HOURS} (one second) and at most "
+            f"{_MAX_AUTONOMY_HOURS} ({int(_MAX_AUTONOMY_HOURS) // 24} days); got {for_hours!r}."
         )
     expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
     window = (

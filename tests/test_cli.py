@@ -1175,3 +1175,5 @@ def test_autonomy_on_rejects_a_nonsensical_for_hours(tmp_path, monkeypatch, vali
         )
         assert result.exit_code != 0, f"--for-hours {bad} should be rejected: {result.output}"
         assert _repo_at(db).get_profile().autonomous is False
+
+

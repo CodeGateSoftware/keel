@@ -46,8 +46,8 @@ class Profile:
     """The user's own settings, as opposed to operational state or file configuration.
 
     `autonomous` is the single choice today: when true, the agent places rule-generated orders
-    without asking. It is stored in the database (not `config.yaml`) and re-read on every order
-    decision, so turning it off takes effect on the NEXT order rather than the next restart.
+    without asking. It is stored in the database (not `config.yaml`) and re-read once per
+    cycle, so turning it off takes effect on the NEXT cycle rather than the next restart.
     """
 
     autonomous: bool = False

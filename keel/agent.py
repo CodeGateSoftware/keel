@@ -42,7 +42,8 @@ the order is previewed and logged but never placed. The CLI supplies a real inte
 only when `config.auto_trade.mode == "confirm"` **and**
 `repo.get_profile().is_autonomous(now_ts)` is true.
 The profile is read fresh every cycle and never cached, so `keel autonomy off` takes effect on
-the next order rather than the next restart. The check lives inside `run_once`, not only at the
+the next cycle rather than the next restart (a cycle in flight can still place; `keel kill` is
+what stops trading immediately). The check lives inside `run_once`, not only at the
 CLI, so an in-process caller cannot obtain autonomy the CLI would have refused; an absent or
 unreadable profile row reads as not-autonomous. In every mode, `guards.check` runs FIRST and is
 un-overridable -- autonomy changes who is asked, never what is allowed.

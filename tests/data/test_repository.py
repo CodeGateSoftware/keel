@@ -439,3 +439,16 @@ def test_autonomy_without_an_expiry_never_lapses(repo):
 def test_autonomy_off_is_never_autonomous_whatever_the_expiry(repo):
     repo.set_autonomous(False, now_ts=1000, expires_ts=10**12)
     assert repo.get_profile().is_autonomous(now_ts=1001) is False
+
+
+def test_profile_readable_reports_damage_that_get_profile_hides(repo):
+    """`get_profile` fails closed on a damaged table, which is right for the trading path but
+    indistinguishable from "never opted in". `profile_readable` is how a caller tells a human
+    the stored setting is UNKNOWN rather than confidently reporting it off."""
+    assert repo.profile_readable() is True
+
+    repo._conn.execute("DROP TABLE profile")
+    repo._conn.commit()
+
+    assert repo.profile_readable() is False
+    assert repo.get_profile().autonomous is False  # still fails closed, still no exception

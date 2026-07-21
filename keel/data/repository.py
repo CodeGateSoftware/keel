@@ -602,7 +602,7 @@ class Repository:
             # propagate. But it must not be SILENT either: swallowing this indistinguishably
             # from "the user never opted in" hides a broken migration or a corrupt database
             # behind a reassuring `autonomy: off`. Fail closed AND say so.
-            logging.getLogger("keel").error(
+            logging.getLogger(__name__).error(
                 "profile unreadable (%s: %s) -- treating autonomy as OFF", type(exc).__name__, exc
             )
             return Profile()
@@ -614,6 +614,19 @@ class Repository:
             autonomous_until=None if until is None else int(until),
             updated_ts=int(row["updated_ts"]),
         )
+
+    def profile_readable(self) -> bool:
+        """Whether the `profile` row could actually be read.
+
+        `get_profile()` fails closed on a damaged table, which is right for the trading path but
+        indistinguishable from "the user never opted in". This lets a caller tell a human that
+        the stored setting is UNKNOWN rather than confidently reporting it as off.
+        """
+        try:
+            self._conn.execute("SELECT autonomous FROM profile WHERE id = 1").fetchone()
+        except sqlite3.Error:
+            return False
+        return True
 
     def set_autonomous(self, value: bool, now_ts: int, expires_ts: int | None = None) -> None:
         """Record the user's autonomy choice, upserting the single profile row.
