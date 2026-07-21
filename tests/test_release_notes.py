@@ -137,3 +137,85 @@ def test_load_categories_reads_the_repo_release_yml():
     assert cats[-1].labels == ("*",), "the catch-all must be last"
     titles = [c.title for c in cats]
     assert "Features" in titles and "Compliance & rails" in titles
+
+
+# -- heading levels: PR bodies must nest UNDER their entry, not beside it ------
+
+
+def test_body_headings_are_demoted_below_the_pr_heading():
+    """A PR body full of `##` headings would otherwise render as siblings of the
+    category headings and destroy the document outline. Found on real data."""
+    from scripts.release_notes import demote_headings
+
+    out = demote_headings("## Top\n\ntext\n\n### Nested\n")
+    assert "#### Top" in out
+    assert "##### Nested" in out
+
+
+def test_demotion_preserves_relative_heading_depth():
+    from scripts.release_notes import demote_headings
+
+    out = demote_headings("# A\n## B\n### C\n")
+    assert "#### A" in out and "##### B" in out and "###### C" in out
+
+
+def test_demotion_never_exceeds_h6():
+    from scripts.release_notes import demote_headings
+
+    assert "####### " not in demote_headings("###### Deep\n")
+
+
+def test_hashes_inside_code_fences_are_not_headings():
+    from scripts.release_notes import demote_headings
+
+    out = demote_headings("```bash\n# not a heading\n```\n\n## real heading\n")
+    assert "# not a heading" in out
+    assert "#### real heading" in out
+
+
+def test_a_body_with_no_headings_is_untouched():
+    from scripts.release_notes import demote_headings
+
+    assert demote_headings("just prose\n") == "just prose\n"
+
+
+def test_composed_notes_demote_real_body_headings():
+    out = compose_release_notes(
+        [_pr(4, title="T", body="## Section\n\nprose", labels=["feature"])], CATS
+    )
+    assert "## Features" in out
+    assert "### T (#4)" in out
+    assert "#### Section" in out
+
+
+# -- size: GitHub rejects a release body over 125k characters ------------------
+
+
+def test_a_long_body_is_truncated_with_a_pointer_to_the_pr():
+    from scripts.release_notes import truncate_body
+
+    out = truncate_body("x" * 5000, 1000, 42)
+    assert len(out) < 1200
+    assert "#42" in out and "truncated" in out
+
+
+def test_truncation_closes_an_orphaned_code_fence():
+    """Cutting mid-fence would break every following block in the release page."""
+    from scripts.release_notes import truncate_body
+
+    out = truncate_body("intro\n\n```python\n" + "y = 1\n" * 500, 200, 7)
+    assert out.count("```") % 2 == 0, "left an unclosed code fence"
+
+
+def test_a_short_body_is_never_truncated():
+    from scripts.release_notes import truncate_body
+
+    assert truncate_body("short", 1000, 1) == "short"
+
+
+def test_total_output_respects_a_total_limit():
+    """The real first release composed 168k chars against a 125k platform limit."""
+    prs = [_pr(n, title=f"PR {n}", body="z" * 9000, labels=["feature"]) for n in range(60)]
+    out = compose_release_notes(prs, CATS, total_limit=40_000)
+    assert len(out) <= 40_000, f"composed {len(out)} chars, over the limit"
+    assert "PR 59" in out, "every PR must still be listed, even if its body is trimmed"
