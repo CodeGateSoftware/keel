@@ -1,8 +1,8 @@
 """keel command-line interface (P3 Task 9).
 
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
-`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `arm-bypass`/
-`disarm-bypass` (the `agent_state` bypass-arm token `agent.run_once` itself enforces, Issue #60),
+`monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `autonomy on|off|show`
+(the `profile` row `agent.run_once` itself re-reads each cycle),
 `rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
 `promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
 Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
@@ -12,39 +12,32 @@ Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-swit
 `subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live), and a
 Phase-4 `insights` stub.
 
-**Dangerous commands are gated.** Per the main spec §14 and `security.authz`, only
-`{arm_bypass, raise_caps, disable_killswitch, unlock_vault}` require the passphrase gate. In this
-CLI's surface that's `agent --bypass` and `arm-bypass` (both map to the `arm_bypass` action) and
-`resume`, `resume-entries`, `record-flow` and `reset-hwm` (all `disable_killswitch` --
-each either releases a tripped breaker or rebases the state one reads) -- `kill`
-(engaging the kill-switch) and `disarm-bypass` are
-*safe* actions (they only ever reduce capability) and are always allowed; every other command
-here is read-only or a local rules-table/DB mutation with no live-trading blast radius, so per
-the plan ("read-only commands require no passphrase") they are not gated. There is no CLI surface
-for `raise_caps`/`unlock_vault` in this task -- caps are config-file-only (no runtime override
-exists in the merged `execution.guards`/`config` modules) and the vault (`security.secrets`) has
-no CLI command in this task's scope.
+**Dangerous commands ask a human; nothing needs a stored secret.** The former scrypt passphrase
+gate is gone (see `2026-07-21-security-simplification-design.md`). Five commands re-permit trading
+after a safety halt -- `resume`, `resume-entries`, `record-flow`, `reset-hwm` and
+`withdrawals attest --enabled` (rail 17) -- and each
+demands a typed `yes` via `_require_interactive_confirmation`, **failing closed off a TTY** so a
+script or cron job can never release a halt. `kill` (engaging the kill-switch) and `autonomy off`
+are *safe* actions -- they only ever reduce capability -- and are always allowed, from anywhere.
+Every other command here is read-only or a local rules-table/DB mutation with no live-trading
+blast radius.
 
-**`agent --bypass`'s passphrase gate is not sufficient on its own (Issue #60).** It only guards
-this CLI entry point -- any other caller invoking `agent.run_once`/`agent.loop` in-process with
-`config.auto_trade.mode == "bypass"` would bypass it entirely. `agent.run_once` therefore also
-requires a separately armed, time-limited token (`Repository.is_bypass_armed`, set by
-`arm-bypass`) before it will actually run in bypass mode -- an unarmed or expired request fails
-safe to confirm-mode behavior (nothing placed) regardless of how `run_once` was invoked. Both
-gates apply to the CLI path (defense in depth); only the arm-token check is un-bypassable
-in-process.
+**Autonomy is a profile choice, checked in-process.** `keel autonomy on` (typed `yes`, TTY
+required) sets `profile.autonomous`; `agent.run_once` re-reads it every cycle via
+`_effective_mode`, so the check cannot be skipped by a caller driving `run_once` in-process, and
+turning autonomy off binds on the next cycle. It changes who is asked, never what is allowed:
+`guards.check` runs first in every mode, and autonomy never releases a halt.
 
-**No interactive hangs in tests.** `--passphrase` may be passed explicitly; if omitted, it is only
-read via an interactive `click.prompt` when stdin is a real TTY (`_resolve_passphrase`) --
-non-interactive invocations (like `CliRunner`) get an empty passphrase, which fails the gate
-closed rather than blocking on stdin.
+**No interactive hangs in tests.** `_is_interactive()` is the single TTY predicate, with
+deliberately no env-var or flag override -- any such seam would be settable from cron and would
+defeat every fail-closed built on it. Tests patch the predicate.
 
 **Disclaimer.** Every command prints the halal + not-financial/religious-advice disclaimer
 footer (`with_disclaimer`, a decorator applied to every command's callback) -- always, even when
-the command errors out or is refused by the authz gate.
+the command errors out or is refused at a confirmation prompt.
 
 **No live network in tests.** `_build_broker` is the one seam that would construct a real
-`CoinbaseClient` (from `.env`/vault secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
+`CoinbaseClient` (from `.env` secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
 to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker`.
 """
 
@@ -84,7 +77,6 @@ from keel.research import cscv as cscv_mod
 from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
-from keel.security import authz
 from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
 from keel.sim import metrics as metrics_mod
@@ -102,13 +94,17 @@ DISCLAIMER = (
     "You are solely responsible for your own trading decisions."
 )
 
+#: Upper bound on `keel autonomy on --for-hours` (1 year). Guards against inf/nan/overflow
+#: and against a "window" so long it is indistinguishable from no expiry at all.
+_MAX_AUTONOMY_HOURS = 8760.0
+#: One second. Below this the window rounds to zero and we would write an already-lapsed row
+#: while printing "autonomy ON until ..." -- fails safe, but the message would be a lie.
+_MIN_AUTONOMY_HOURS = 1.0 / 3600.0
+
 DEFAULT_DB_PATH = "keel.db"
 DEFAULT_CONFIG_PATH = "config.yaml"
-DEFAULT_AUTHZ_PATH = "authz.json"
 
 # The dangerous-action names this CLI's gated commands map to (see module docstring).
-_ARM_BYPASS = "arm_bypass"
-_DISABLE_KILLSWITCH = "disable_killswitch"
 
 # `rules demote` steps a rule back one lifecycle stage; `disabled` is terminal (see
 # `strategy.promotion`'s own `_PROMOTE_NEXT` docstring) and so is not a demote target.
@@ -136,30 +132,39 @@ def with_disclaimer(f: Any) -> Any:
     return wrapper
 
 
-# -- passphrase resolution (no interactive hangs under CliRunner) -----------------------------
+# -- interactive confirmation (no interactive hangs under CliRunner) -----------------------------
 
 
-def _resolve_passphrase(passphrase: str | None) -> str:
-    """`passphrase` if given; else an interactive prompt on a real TTY; else `""` (fails closed).
+def _is_interactive() -> bool:
+    """True when a human is at a terminal.
 
-    A non-interactive invocation (tests, scripts, CI) never blocks on stdin -- it simply gets an
-    empty passphrase, which `authz.verify`/`authz.require` correctly reject.
+    Deliberately has NO env-var or flag override: any such seam would be settable from cron and
+    would defeat the fail-closed behaviour of every gate built on it. Tests patch this predicate.
     """
-    if passphrase:
-        return passphrase
-    if sys.stdin is not None and sys.stdin.isatty():
-        return click.prompt("Passphrase", hide_input=True)
-    return ""
+    return sys.stdin is not None and sys.stdin.isatty()
 
 
-def _require_authz(ctx: click.Context, action: str, passphrase: str | None) -> None:
-    """Enforce the authz gate for `action`, aborting the command (exit 1) on denial."""
-    resolved = _resolve_passphrase(passphrase)
-    try:
-        authz.require(action, resolved, path=ctx.obj["authz_path"])
-    except authz.AuthzError as exc:
-        click.echo(f"Error: {exc}", err=True)
-        ctx.exit(1)
+def _require_interactive_confirmation(action: str, detail: str) -> None:
+    """Demand an explicit typed `yes` from a human at a terminal before a dangerous action.
+
+    This replaces the former scrypt passphrase gate. Once placing a real, money-spending order
+    needs only a typed confirmation, requiring a remembered secret to release a safety halt is
+    ceremony without a matching threat model -- on a single-user machine the honest boundary is
+    the OS account, as the old gate's own docstring conceded. One rule ("dangerous actions need a
+    human at a terminal; nothing needs a stored secret") is easier to reason about and to audit.
+
+    Demands the full word `yes` rather than a bare `y`: these actions are rarer and heavier than
+    an order confirmation. **Fails closed off a TTY**, so cron jobs, pipes and scripts can never
+    release a halt.
+    """
+    if not _is_interactive():
+        raise click.ClickException(
+            f"refusing to {action}: this needs confirmation from an interactive terminal."
+        )
+    click.echo(f"About to {action}.")
+    click.echo(f"  {detail}")
+    if click.prompt('Type "yes" to confirm', default="", show_default=False).strip() != "yes":
+        raise click.ClickException("aborted (confirmation not given).")
 
 
 # -- DB / config / broker construction ---------------------------------------------------------
@@ -248,12 +253,6 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
     help="config.yaml path.",
 )
 @click.option(
-    "--authz-path",
-    default=DEFAULT_AUTHZ_PATH,
-    show_default=True,
-    help="Passphrase-gate state file (see `keel.security.authz`).",
-)
-@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -263,13 +262,12 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
 )
 @click.pass_context
 def cli(
-    ctx: click.Context, db_path: str, config_path: str, authz_path: str, verbose: bool
+    ctx: click.Context, db_path: str, config_path: str, verbose: bool
 ) -> None:
     """keel: an offline-first, halal, guard-railed Coinbase auto-trading agent."""
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
     ctx.obj["config_path"] = config_path
-    ctx.obj["authz_path"] = authz_path
     ctx.obj["verbose"] = verbose
 
 
@@ -370,7 +368,8 @@ def migrate_cmd(ctx: click.Context, db_override: str | None) -> None:
       on migrate would resurrect rules that were deliberately deleted or refuted.
 
     Runs `keel.data.db.migrate`, which steps the stored `schema_version` up incrementally and is
-    safe to call repeatedly. No network, no authz gate, no orders -- safe against a live database.
+    safe to call repeatedly. No network, no confirmation gate, no orders -- safe against a
+    live database.
     """
     path = db_override or ctx.obj["db_path"]
     conn = connect(path)
@@ -823,11 +822,22 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     taking physical possession whenever he desires". An asset we cannot withdraw is an asset we
     may not validly possess -- so rail 17 halts new ENTRIES when this is suspended or unknown.
 
-    Not passphrase-gated in either direction. `--suspended` only ever REDUCES capability, and
-    `--enabled` cannot itself place an order: it restores a precondition that every other rail,
-    the confirm gate and the bypass-arm token still sit in front of.
+    **Asymmetric, like `autonomy`.** `--suspended` only ever REDUCES capability and is ungated,
+    usable from anywhere. `--enabled` RELEASES a rail-17 entry halt, so it demands a typed `yes`
+    at a terminal exactly like `resume`/`resume-entries`/`record-flow`/`reset-hwm`.
+
+    That gate used to be unnecessary for a reason that no longer holds: this command was
+    justified by "the confirm gate and the bypass-arm token still sit in front of it". The
+    bypass-arm token no longer exists, and with `keel autonomy on` the confirm gate is not there
+    either -- so without this, a cron line could clear a rail-17 halt and the next cycle would
+    place live orders with no human anywhere in the loop.
     """
     repo = _open_repo(ctx)
+    if enabled:
+        _require_interactive_confirmation(
+            "attest withdrawals as ENABLED",
+            "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle.",
+        )
     now_ts = int(time.time())
     repo.set_state("withdrawals_enabled", bool(enabled))
     repo.set_state("withdrawals_attested_at", now_ts)
@@ -1174,7 +1184,7 @@ def _interactive_confirm(preview: dict) -> bool:
             click.echo(f"    {key}: {value}")
     else:
         click.echo(f"    {preview!r}")
-    if not (sys.stdin is not None and sys.stdin.isatty()):
+    if not _is_interactive():
         click.echo("no TTY -- declining (confirm mode fails closed).", err=True)
         return False
     return click.confirm("Place this order?", default=False)
@@ -1191,21 +1201,11 @@ def _print_loop_result(result: agent.LoopResult) -> None:
         f"products={result.products} stale={result.stale_products} "
         f"signals={len(result.enter_signals)} entered={entered} exited={exited}"
     )
-    if result.bypass_refused_reason is not None:
-        # Issue #60: `run_once` itself refused bypass (unarmed/expired token) and fell back to
-        # confirm mode -- surface *why*, not just the silently-different `mode=confirm` above.
-        click.echo(f"[{result.ts}] bypass refused: {result.bypass_refused_reason}")
 
 
 @cli.command()
 @click.option(
     "--loop", is_flag=True, default=False, help="Run the scheduled loop, not one cycle."
-)
-@click.option(
-    "--confirm", "mode", flag_value="confirm", default=True, help="Confirm mode (default, safe)."
-)
-@click.option(
-    "--bypass", "mode", flag_value="bypass", help="Bypass mode (dangerous; requires --passphrase)."
 )
 @click.option(
     "--interval",
@@ -1220,28 +1220,26 @@ def _print_loop_result(result: agent.LoopResult) -> None:
     default=None,
     help="Stop --loop after N cycles (default: run until interrupted).",
 )
-@click.option("--passphrase", default=None, help="Required to arm --bypass.")
 @click.pass_context
 @with_disclaimer
 def agent_cmd(
     ctx: click.Context,
     loop: bool,
-    mode: str,
     interval_sec: float | None,
     max_cycles: int | None,
-    passphrase: str | None,
 ) -> None:
-    """Run the agent loop (confirm mode by default; every order is still hard-rail-guarded)."""
-    if mode == "bypass":
-        _require_authz(ctx, _ARM_BYPASS, passphrase)
+    """Run the agent loop. Every order is hard-rail-guarded, in every mode.
 
+    Whether orders are placed at all comes from `config.auto_trade.mode` (`paper` simulates,
+    `confirm` is live). Whether you are ASKED comes from your profile: with autonomy off (the
+    default) each order needs your approval at the terminal; with `keel autonomy on` it does not.
+    """
     config = _load_cfg(ctx)
-    config = replace(config, auto_trade=replace(config.auto_trade, mode=mode))
     repo = _open_repo(ctx)
     broker = _build_broker(config)
 
     if not loop:
-        confirm_fn = _interactive_confirm if mode == "confirm" else None
+        confirm_fn = _interactive_confirm
         _print_loop_result(
             agent.run_once(broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn)
         )
@@ -1255,46 +1253,111 @@ def agent_cmd(
         _count[0] += 1
         return False
 
-    confirm_fn = _interactive_confirm if mode == "confirm" else None
+    confirm_fn = _interactive_confirm
     for result in agent.loop(broker, repo, config, interval, stop_flag, confirm_fn=confirm_fn):
         _print_loop_result(result)
 
 
-# -- arm-bypass / disarm-bypass (Issue #60, bypass-arm hardening) ---------------------------
+# -- autonomy (the user's own choice, stored in their profile) ------------------------------
 
 
-@cli.command("arm-bypass")
-@click.option("--passphrase", default=None, help="Required to arm bypass mode.")
+@cli.group("autonomy")
+def autonomy_group() -> None:
+    """Whether the agent places orders without asking you first."""
+
+
+@autonomy_group.command("show")
 @click.pass_context
 @with_disclaimer
-def arm_bypass_cmd(ctx: click.Context, passphrase: str | None) -> None:
-    """Arm autonomous bypass mode for a limited window (dangerous: requires the passphrase).
+def autonomy_show(ctx: click.Context) -> None:
+    """Print the current autonomy setting."""
+    repo = _open_repo(ctx)
+    profile = repo.get_profile()
+    # `_open_repo` runs `migrate()`, which recreates a merely MISSING table -- so this covers
+    # damage migrate cannot heal (a corrupt page, a table of the wrong shape), not a fresh DB.
+    if not repo.profile_readable():
+        click.echo(
+            "WARNING: the profile row could not be read (see the log). Reporting autonomy as "
+            "OFF, which is the safe reading -- but the stored setting is UNKNOWN.",
+            err=True,
+        )
+    now_ts = int(time.time())
+    live = profile.is_autonomous(now_ts)
+    state = (
+        "ON -- orders are placed WITHOUT asking"
+        if live
+        else "off -- every order asks first"
+    )
+    click.echo(f"autonomy: {state}")
+    if profile.autonomous and not live:
+        click.echo(f"  (was ON but LAPSED at {profile.autonomous_until})")
+    elif live and profile.autonomous_until is not None:
+        left = profile.autonomous_until - now_ts
+        click.echo(f"  lapses at {profile.autonomous_until} ({left}s left)")
+    elif live:
+        click.echo("  no expiry set -- stays on until `keel autonomy off`")
+    if profile.updated_ts:
+        click.echo(f"  last changed: {profile.updated_ts}")
 
-    This is the second, in-process enforcement layer `agent.run_once` itself checks
-    (`repo.is_bypass_armed`) before ever honoring `config.auto_trade.mode == "bypass"` -- the
-    existing `agent --bypass --passphrase` gate alone is not enough, since that only guards the
-    CLI entry point, not a caller that invokes `agent.run_once`/`agent.loop` directly. The
-    window lasts `config.auto_trade.bypass_arm_ttl_sec` seconds (default 3600 = 1h) from now;
-    call this again to reset it, or `keel disarm-bypass` to clear it early.
+
+@autonomy_group.command("on")
+@click.option(
+    "--for-hours",
+    "for_hours",
+    type=float,
+    default=None,
+    help="Let autonomy LAPSE automatically after this many hours (default: never lapses).",
+)
+@click.pass_context
+@with_disclaimer
+def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
+    """Let the agent place orders without asking (dangerous: asks for confirmation).
+
+    Every order is still subject to all hard rails -- autonomy changes who is asked, never what
+    is allowed. It does NOT let the agent clear a safety halt: releasing the kill-switch or a
+    drawdown breaker always needs a human, whatever this is set to.
     """
-    _require_authz(ctx, _ARM_BYPASS, passphrase)
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
     now_ts = int(time.time())
-    ttl_sec = config.auto_trade.bypass_arm_ttl_sec
-    repo.arm_bypass(now_ts, ttl_sec)
-    click.echo(f"bypass ARMED: expires at {now_ts + ttl_sec} (ttl={ttl_sec}s)")
+    if for_hours is not None and not (_MIN_AUTONOMY_HOURS <= for_hours <= _MAX_AUTONOMY_HOURS):
+        # 0/negative would write an already-lapsed row while printing "autonomy ON until ...",
+        # and inf/nan/1e18 would overflow int() after the operator had already typed `yes`.
+        raise click.BadParameter(
+            f"--for-hours must be at least {_MIN_AUTONOMY_HOURS} (one second) and at most "
+            f"{_MAX_AUTONOMY_HOURS} ({int(_MAX_AUTONOMY_HOURS) // 24} days); got {for_hours!r}."
+        )
+    expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
+    window = (
+        "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"
+    )
+    _require_interactive_confirmation(
+        "turn autonomy ON",
+        f"Orders will be placed with NO further prompt, {window} "
+        f"(mode={config.auto_trade.mode}, allowlist={config.allowlist}).",
+    )
+    repo.set_autonomous(True, now_ts, expires_ts=expires_ts)
+    if expires_ts is None:
+        click.echo(
+            "autonomy ON, with NO expiry -- it stays on until you run `keel autonomy off`.\n"
+            "  Consider `--for-hours N` for a supervised session, so a forgotten `on` cannot "
+            "grant unattended trading indefinitely."
+        )
+    else:
+        click.echo(f"autonomy ON until {expires_ts}. It lapses on its own after that.")
 
 
-@cli.command("disarm-bypass")
+@autonomy_group.command("off")
 @click.pass_context
 @with_disclaimer
-def disarm_bypass_cmd(ctx: click.Context) -> None:
-    """Clear the bypass-arm token immediately. Always allowed (safe action; only reduces
-    capability -- fail-safe direction, unlike arming, needs no passphrase)."""
-    repo = _open_repo(ctx)
-    repo.disarm_bypass()
-    click.echo("bypass DISARMED.")
+def autonomy_off(ctx: click.Context) -> None:
+    """Require confirmation before every order again.
+
+    Deliberately ungated and usable without a terminal: reducing risk must never be obstructed,
+    so this works from a script, a cron job or a pipe. Arming is what needs a human.
+    """
+    _open_repo(ctx).set_autonomous(False, int(time.time()))
+    click.echo("autonomy off: every order will ask for confirmation.")
 
 
 # -- rules ------------------------------------------------------------------------------
@@ -1496,7 +1559,8 @@ def rules_seed(
     already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
     script) without piling up duplicate candidates. `--force` inserts a fresh candidate anyway.
 
-    Read-only w.r.t. the exchange: no network call, no authz gate -- it only ever writes local
+    Read-only w.r.t. the exchange: no network call, no confirmation gate -- it only ever
+    writes local
     `rules` rows, exactly like `rules promote`/`demote`/`disable`.
     """
     repo = _open_repo(ctx)
@@ -1887,7 +1951,7 @@ def simulate(
     no_trial_record: bool,
     skip_within_cap: bool,
 ) -> None:
-    """Simulate the deterministic engine over historical candles (read-only; no authz gate).
+    """Simulate the deterministic engine over historical candles (read-only; no confirmation gate).
 
     Pulls (unless `--no-fetch`) and caches ~`--years` years of candle history in the persistent
     DB (`--db`, never in-memory), replays the real rule set through the engine + a dollar
@@ -2251,22 +2315,23 @@ def kill(ctx: click.Context) -> None:
 
 
 @cli.command()
-@click.option("--passphrase", default=None, help="Required to disengage the kill-switch.")
 @click.pass_context
 @with_disclaimer
-def resume(ctx: click.Context, passphrase: str | None) -> None:
-    """Disengage the kill-switch (dangerous: requires the authz passphrase)."""
-    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+def resume(ctx: click.Context) -> None:
+    """Disengage the kill-switch (dangerous: asks for confirmation)."""
+    _require_interactive_confirmation(
+        "disengage the kill-switch",
+        "Trading resumes immediately: the agent may place orders on its next cycle.",
+    )
     repo = _open_repo(ctx)
     repo.set_state("kill_switch", False)
     click.echo("kill-switch disengaged: trading resumed.")
 
 
 @cli.command(name="resume-entries")
-@click.option("--passphrase", default=None, help="Required to clear the breaker.")
 @click.pass_context
 @with_disclaimer
-def resume_entries(ctx: click.Context, passphrase: str | None) -> None:
+def resume_entries(ctx: click.Context) -> None:
     """Clear an armed consecutive-loss halt (rail 16), re-permitting new entries.
 
     This is the ONLY way to release the halt early: rail 16 reads `streak_halt_until` and never
@@ -2277,7 +2342,10 @@ def resume_entries(ctx: click.Context, passphrase: str | None) -> None:
     re-arm the breaker on the very next loss, which is not what an operator clearing a halt
     means. Exits, sells and DCA are never affected by rail 16 and are unaffected here.
     """
-    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    _require_interactive_confirmation(
+        "clear the consecutive-loss halt (rail 16)",
+        "New entries are re-permitted; the loss counter is reset with it.",
+    )
     repo = _open_repo(ctx)
     repo.set_state("streak_halt_until", 0)
     repo.set_state("consecutive_losses", 0)
@@ -2290,10 +2358,9 @@ def resume_entries(ctx: click.Context, passphrase: str | None) -> None:
     required=True,
     help="Signed flow in quote currency: positive for a deposit, negative for a withdrawal.",
 )
-@click.option("--passphrase", default=None, help="Required to rebase the high-water mark.")
 @click.pass_context
 @with_disclaimer
-def record_flow(ctx: click.Context, amount: str, passphrase: str | None) -> None:
+def record_flow(ctx: click.Context, amount: str) -> None:
     """Declare an external deposit or withdrawal so rail 11 does not mistake it for P&L.
 
     Equity is `cash + positions`, so money moving in or out shifts it -- but neither is a
@@ -2312,7 +2379,11 @@ def record_flow(ctx: click.Context, amount: str, passphrase: str | None) -> None
     will never infer a flow on its own: guessing a withdrawal would lower the HWM and silently
     mask a real trading drawdown, which is the one direction a circuit breaker must not fail in.
     """
-    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    _require_interactive_confirmation(
+        f"rebase rail 11's high-water mark by {amount}",
+        "A wrong amount or sign here silently mis-states drawdown from now on "
+        "(positive = deposit, negative = withdrawal).",
+    )
     try:
         parsed = Decimal(amount)
     except InvalidOperation:
@@ -2337,10 +2408,9 @@ def record_flow(ctx: click.Context, amount: str, passphrase: str | None) -> None
 
 
 @cli.command(name="reset-hwm")
-@click.option("--passphrase", default=None, help="Required to reset the high-water mark.")
 @click.pass_context
 @with_disclaimer
-def reset_hwm(ctx: click.Context, passphrase: str | None) -> None:
+def reset_hwm(ctx: click.Context) -> None:
     """Reset rail 11's equity high-water mark, clearing a stuck drawdown halt.
 
     The HWM is MONOTONIC by design -- it never falls -- so any equity reading that was wrong or
@@ -2352,7 +2422,10 @@ def reset_hwm(ctx: click.Context, passphrase: str | None) -> None:
     equity, which is the same path a fresh install takes. `drawdown_total_pct` is zeroed so the
     rail is not left vetoing on a stale scalar in the window before that next cycle runs.
     """
-    _require_authz(ctx, _DISABLE_KILLSWITCH, passphrase)
+    _require_interactive_confirmation(
+        "reset rail 11's high-water mark",
+        "Any real, unrecovered drawdown stops being visible to the rail.",
+    )
     repo = _open_repo(ctx)
     repo.set_state("equity_high_water_mark", None)
     repo.set_state("drawdown_total_pct", Decimal("0"))

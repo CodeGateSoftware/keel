@@ -66,7 +66,7 @@ def test_overdue_attestation_overrides_a_stored_active_status() -> None:
 def test_due_exactly_now_is_already_overdue() -> None:
     """Boundary: due-at is the moment it expires, not one tick still-good.
 
-    Matches `is_bypass_armed`'s strict `now_ts < armed_until` convention elsewhere.
+    Strict `now_ts < expiry`, the freshness convention used throughout this codebase.
     """
     assert _record(attest_due_ts=NOW).effective_status(NOW) is SubscriptionStatus.SUSPECT
 

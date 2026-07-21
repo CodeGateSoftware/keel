@@ -152,13 +152,10 @@ def repo() -> Repository:
     # of each test's `now_ts`.
     r.set_state("withdrawals_enabled", True)
     r.set_state("withdrawals_attested_at", 10**12)
-    # `_config()` below defaults `auto_trade.mode` to "bypass" -- Issue #60 (bypass-arm
-    # hardening) means `run_once` now refuses that mode unarmed. Every pre-existing test in
-    # this module was written against "bypass just works"; arming here (a huge ttl so no test's
-    # `now_ts` can ever run past `armed_until`) keeps that behavior for tests that aren't
-    # specifically exercising the arm/disarm/expiry gate itself (those call
-    # `repo.disarm_bypass()` or a short ttl explicitly).
-    r.arm_bypass(now_ts=0, ttl_sec=10**12)
+    # Autonomy is a PROFILE choice now. Most tests in this module were written against "it just
+    # places"; opting the profile in here preserves that, and the tests that are specifically
+    # about the confirm/autonomous decision set the profile themselves.
+    r.set_autonomous(True, now_ts=0)
     # rail 14 now derives its cap from the attested subscription record rather than a config
     # default; attest a very large allowance so pre-existing tests here (none of which exercise
     # rail 14) aren't incidentally tripped by it.
@@ -178,7 +175,7 @@ def _config(**overrides: Any) -> Config:
             max_per_asset_pct=Decimal("1"),
         ),
         market_data=MarketDataConfig(granularities=[Granularity.ONE_DAY], history_days=365),
-        auto_trade=AutoTradeConfig(mode="bypass", interval_sec=50_000),
+        auto_trade=AutoTradeConfig(mode="confirm", interval_sec=50_000),
         money_mgmt=MoneyMgmtConfig(),
         dca=DcaConfig(budget_usd=Decimal("50"), cadence_days=7),
     )
@@ -222,7 +219,7 @@ def _seed_open_position(
             expected_fill=price,
             actual_fill=price,
             raw_response=None,
-            confirmation="bypass",
+            confirmation="autonomous",
             rule_id=None,
             created_at=ts,
             updated_at=ts,
@@ -315,73 +312,75 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     assert repo.get_state("last_feed_ts") == 90_000
 
 
-# -- run_once: bypass-arm hardening (Issue #60) --------------------------------------------------
+# -- run_once: autonomy is a live-read profile choice --------------------------------------------
 
 
-def test_bypass_without_armed_token_places_nothing_and_reports_refusal(repo):
-    """The core fix: `config.auto_trade.mode == "bypass"` with no armed token must not place
-    any order, even though a real, merged `Dca` rule would otherwise fire -- it fails safe by
-    falling back to confirm behavior (`confirm_fn=None` -> never placed) and surfaces why.
-    """
-    repo.disarm_bypass()
+def test_autonomy_off_places_nothing_even_though_the_rule_fires(repo):
+    """The default. The rule still fires and is logged, but with no `confirm_fn` the order is
+    previewed and never placed -- confirm mode fails closed."""
+    repo.set_autonomous(False, now_ts=0)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
     result = run_once(broker, repo, _config(), now_ts=90_000)
 
-    assert result.skipped is False
     assert len(result.enter_signals) == 1  # the rule still fires...
     assert result.enter_results[0].placed is False  # ...but nothing is placed.
     assert broker.place_calls == []
-    assert result.mode == "confirm"  # fell back, fail-safe
-    assert result.bypass_refused_reason is not None
-    assert "armed" in result.bypass_refused_reason.lower()
+    assert result.mode == "confirm"
     assert repo.get_orders() == []
 
 
-def test_bypass_with_expired_token_places_nothing(repo):
-    repo.arm_bypass(now_ts=1_000, ttl_sec=10)  # armed_until = 1_010
+def test_autonomy_on_places_without_a_confirm_fn(repo):
+    repo.set_autonomous(True, now_ts=0)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
-    result = run_once(broker, repo, _config(), now_ts=90_000)  # long past armed_until
+    result = run_once(broker, repo, _config(), now_ts=90_000)
 
-    assert result.enter_results[0].placed is False
-    assert broker.place_calls == []
-    assert result.mode == "confirm"
-    assert result.bypass_refused_reason is not None
-
-
-def test_bypass_with_fresh_armed_token_places_normally(repo):
-    """A freshly armed token (well within ttl) lets bypass through -- still subject to every
-    guard, but with no confirm prompt required, exactly like bypass behaved before Issue #60."""
-    repo.disarm_bypass()
-    repo.arm_bypass(now_ts=1_000, ttl_sec=100_000)  # armed_until = 101_000
-    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
-    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-
-    result = run_once(broker, repo, _config(), now_ts=90_000)  # inside the armed window
-
-    assert result.mode == "bypass"
-    assert result.bypass_refused_reason is None
+    assert result.mode == "autonomous"
     assert result.enter_results[0].placed is True
     assert len(broker.place_calls) == 1
     assert repo.get_orders(mode="live", product_id=PRODUCT)[0]["side"] == "BUY"
 
 
-def test_confirm_mode_unaffected_by_arming_state(repo):
-    """`mode="confirm"` never even looks at the arm token -- arm-check only gates bypass."""
-    repo.disarm_bypass()
+def test_an_absent_profile_row_is_treated_as_NOT_autonomous(repo):
+    """Fails closed: a database that never recorded a choice must not imply consent."""
+    repo._conn.execute("DELETE FROM profile")
+    repo._conn.commit()
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    config = _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=50_000))
 
-    result = run_once(broker, repo, config, now_ts=90_000)
+    result = run_once(broker, repo, _config(), now_ts=90_000)
 
     assert result.mode == "confirm"
-    assert result.bypass_refused_reason is None  # bypass was never requested
-    assert result.enter_results[0].placed is False  # confirm_fn=None -> fails closed, as always
     assert broker.place_calls == []
+
+
+def test_the_profile_is_re_read_every_cycle_not_cached(repo):
+    """`keel autonomy off` must take effect on the NEXT order, not the next restart."""
+    repo.set_autonomous(True, now_ts=0)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    first = run_once(broker, repo, _config(), now_ts=90_000)
+    assert first.mode == "autonomous"
+
+    repo.set_autonomous(False, now_ts=1)
+    second = run_once(broker, repo, _config(), now_ts=180_000)
+    assert second.mode == "confirm", "the profile was cached; turning autonomy off did nothing"
+
+
+def test_paper_mode_places_nothing_even_when_autonomous(repo):
+    """The two switches are independent: autonomy never turns a simulation into real money."""
+    repo.set_autonomous(True, now_ts=0)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    config = _config(auto_trade=AutoTradeConfig(mode="paper", interval_sec=50_000))
+
+    run_once(broker, repo, config, now_ts=90_000)
+
+    assert broker.place_calls == [], "paper mode must never reach the broker"
 
 
 # -- run_once: EXIT wiring on a held position ---------------------------------------------------
@@ -1091,6 +1090,7 @@ def _live_ready_repo(repo):
 
 def test_confirm_APPROVED_places_the_order(repo, monkeypatch):
     """The change: an approved confirm-mode order is actually placed (was: never)."""
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -1103,6 +1103,7 @@ def test_confirm_APPROVED_places_the_order(repo, monkeypatch):
 
 
 def test_confirm_DECLINED_places_nothing(repo, monkeypatch):
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -1114,6 +1115,7 @@ def test_confirm_DECLINED_places_nothing(repo, monkeypatch):
 
 def test_confirm_fn_defaulting_to_None_still_fails_closed(repo, monkeypatch):
     """No confirm_fn (the old default) must still place nothing -- backward compatible."""
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -1124,6 +1126,7 @@ def test_confirm_fn_defaulting_to_None_still_fails_closed(repo, monkeypatch):
 
 
 def test_confirm_fn_sees_the_broker_preview(repo, monkeypatch):
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -1140,6 +1143,7 @@ def test_confirm_fn_sees_the_broker_preview(repo, monkeypatch):
 def test_a_rail_veto_means_the_confirm_prompt_is_never_reached(repo, monkeypatch):
     """The rails run FIRST. A vetoed order never asks the human -- confirmation is not a
     substitute for the hard limits."""
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule("DOGE-USD"), status="live")  # off allowlist
     broker = FakeBroker(series={("DOGE-USD", Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -1183,6 +1187,7 @@ def test_interactive_confirm_fails_closed_without_a_tty(monkeypatch):
 def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypatch):
     """The wiring: `keel agent` (confirm) hands run_once the interactive confirm_fn; bypass
     hands it None."""
+    repo.set_autonomous(False, now_ts=0)  # these tests are ABOUT the confirm gate
     from click.testing import CliRunner
 
     import keel.cli as cli_module
@@ -1206,3 +1211,27 @@ def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypa
     assert result.exit_code == 0, result.output
     assert captured["mode"] == "confirm"
     assert captured["confirm_fn"] is cli_module._interactive_confirm
+
+
+def test_an_EXPIRED_autonomy_falls_back_to_confirm_and_places_nothing(repo):
+    """End-to-end guard on the enforcement chain run_once -> _effective_mode -> is_autonomous.
+    Without this, dropping the now_ts argument would silently un-bound autonomy again."""
+    repo.set_autonomous(True, now_ts=1_000, expires_ts=50_000)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)  # well past the expiry
+
+    assert result.mode == "confirm", "expired autonomy must fall back to asking a human"
+    assert broker.place_calls == []
+
+
+def test_autonomy_still_applies_strictly_before_its_expiry(repo):
+    repo.set_autonomous(True, now_ts=1_000, expires_ts=90_001)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.mode == "autonomous"
+    assert len(broker.place_calls) == 1

@@ -6,9 +6,8 @@ Every test drives the CLI through `click.testing.CliRunner` -- no live network, 
 `keel.cli._build_broker` (the one seam that would otherwise construct a real, network-talking
 `CoinbaseClient`) to return it instead.
 
-Dangerous commands (`agent --bypass`, `resume`) are gated by `keel.security.authz`; read-only
-commands (`db import`, `monitor`, `rules list`, `pnl`) are not and work with no `authz.json` on
-disk at all.
+Halt-releasing commands (`resume`, `reset-hwm`, ...) demand a typed `yes` from a terminal;
+read-only commands (`db import`, `monitor`, `rules list`, `pnl`) need no confirmation at all.
 """
 
 from __future__ import annotations
@@ -25,11 +24,9 @@ from keel.agent import RULE_REGISTRY, _build_rule
 from keel.cli import DISCLAIMER, cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.security import authz
 from keel.types import Candle, Granularity
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
-PASSPHRASE = "correct-horse-battery-staple"
 
 
 def _repo_at(db_path: Path) -> Repository:
@@ -86,20 +83,6 @@ def test_db_import_runs_importer_against_temp_db(tmp_path):
     assert len(repo.get_transactions()) > 0
 
 
-def test_db_import_needs_no_passphrase(tmp_path):
-    """Read-only command: works even though no --authz-path file exists at all."""
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path), "db", "import", str(FIXTURES_DIR)],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert not authz_path.exists()
-
 
 # -- disclaimer -----------------------------------------------------------------------------
 
@@ -115,10 +98,9 @@ def test_disclaimer_shown_on_every_command(tmp_path):
 
 def test_disclaimer_shown_even_when_refused(tmp_path):
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--db", str(db_path), "--authz-path", str(authz_path), "resume"])
+    result = runner.invoke(cli, ["--db", str(db_path), "resume"])
 
     assert result.exit_code != 0
     assert DISCLAIMER in result.output
@@ -127,74 +109,12 @@ def test_disclaimer_shown_even_when_refused(tmp_path):
 # -- agent --bypass gating --------------------------------------------------------------------
 
 
-def test_agent_bypass_without_passphrase_is_refused(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    runner = CliRunner()
 
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "agent", "--bypass",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "denied" in result.output.lower()
-
-
-def test_agent_bypass_with_wrong_passphrase_is_refused(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "agent", "--bypass", "--passphrase", "wrong-passphrase",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "denied" in result.output.lower()
-
-
-def test_agent_bypass_with_correct_passphrase_proceeds(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "agent", "--bypass", "--passphrase", PASSPHRASE,
-        ],
-    )
-
-    # No `live` rules are configured and the kill-switch defaults to engaged, so `run_once`
-    # fails closed immediately -- but crucially the authz gate let it get that far.
-    assert result.exit_code == 0, result.output
-    assert "skipped: kill_switch" in result.output
 
 
 def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, monkeypatch):
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
     runner = CliRunner()
 
     result = runner.invoke(
@@ -202,13 +122,11 @@ def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, mon
         [
             "--db", str(db_path),
             "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "agent",
+                        "agent",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert not authz_path.exists()
 
 
 def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypatch):
@@ -229,138 +147,11 @@ def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypat
     assert result.output.count("skipped: kill_switch") == 3
 
 
-# -- arm-bypass / disarm-bypass (Issue #60, bypass-arm hardening) ------------------------------
 
 
-def test_arm_bypass_without_passphrase_is_refused(tmp_path, valid_config_path):
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "arm-bypass",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "denied" in result.output.lower()
-    repo = _repo_at(db_path)
-    assert repo.is_bypass_armed(now_ts=0) is False
 
 
-def test_arm_bypass_with_wrong_passphrase_is_refused(tmp_path, valid_config_path):
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
 
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "arm-bypass", "--passphrase", "wrong-passphrase",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "denied" in result.output.lower()
-    repo = _repo_at(db_path)
-    assert repo.is_bypass_armed(now_ts=0) is False
-
-
-def test_arm_bypass_with_correct_passphrase_arms(tmp_path, valid_config_path):
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "arm-bypass", "--passphrase", PASSPHRASE,
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "armed" in result.output.lower()
-    repo = _repo_at(db_path)
-    # `valid_config_path`'s auto_trade.bypass_arm_ttl_sec is 3600 -- armed "now" is well inside.
-    assert repo.is_bypass_armed(now_ts=int(time.time())) is True
-
-
-def test_disarm_bypass_clears_the_token_no_passphrase_needed(tmp_path, valid_config_path):
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
-    runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "arm-bypass", "--passphrase", PASSPHRASE,
-        ],
-    )
-    repo = _repo_at(db_path)
-    assert repo.is_bypass_armed(now_ts=int(time.time())) is True
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "disarm-bypass",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "disarmed" in result.output.lower()
-    repo = _repo_at(db_path)
-    assert repo.is_bypass_armed(now_ts=int(time.time())) is False
-
-
-def test_agent_bypass_without_arm_bypass_places_nothing_even_with_passphrase(
-    tmp_path, valid_config_path, monkeypatch
-):
-    """The Issue #60 gap being closed: the CLI passphrase gate on `agent --bypass` alone is not
-    enough -- without a separate `arm-bypass` call, `run_once` itself refuses to trade
-    autonomously and the CLI surfaces that refusal."""
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    repo = _repo_at(db_path)
-    repo.set_state("kill_switch", False)
-    repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "agent", "--bypass", "--passphrase", PASSPHRASE,
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "bypass" in result.output.lower()
-    assert "not armed" in result.output.lower() or "refused" in result.output.lower()
-    repo = _repo_at(db_path)
-    assert repo.get_orders() == []
 
 
 # -- kill / resume ----------------------------------------------------------------------------
@@ -379,38 +170,20 @@ def test_kill_engages_kill_switch_no_passphrase_needed(tmp_path):
 
 def test_resume_without_passphrase_is_refused(tmp_path):
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
     runner = CliRunner()
     runner.invoke(cli, ["--db", str(db_path), "kill"])
 
-    result = runner.invoke(cli, ["--db", str(db_path), "--authz-path", str(authz_path), "resume"])
+    result = runner.invoke(cli, ["--db", str(db_path), "resume"])
 
     assert result.exit_code != 0
     repo = _repo_at(db_path)
     assert repo.get_state("kill_switch", default=True) is True
 
 
-def test_resume_with_wrong_passphrase_is_refused(tmp_path):
+
+def test_resume_disengages_when_confirmed(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    runner = CliRunner()
-    runner.invoke(cli, ["--db", str(db_path), "kill"])
-
-    result = runner.invoke(
-        cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path), "resume", "--passphrase", "nope"],
-    )
-
-    assert result.exit_code != 0
-    repo = _repo_at(db_path)
-    assert repo.get_state("kill_switch") is True
-
-
-def test_resume_with_correct_passphrase_disengages(tmp_path):
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     runner = CliRunner()
     runner.invoke(cli, ["--db", str(db_path), "kill"])
 
@@ -418,9 +191,9 @@ def test_resume_with_correct_passphrase_disengages(tmp_path):
         cli,
         [
             "--db", str(db_path),
-            "--authz-path", str(authz_path),
-            "resume", "--passphrase", PASSPHRASE,
+                        "resume",
         ],
+        input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -434,7 +207,6 @@ def test_resume_with_correct_passphrase_disengages(tmp_path):
 def test_monitor_single_poll_needs_no_passphrase(tmp_path, valid_config_path, monkeypatch):
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
     runner = CliRunner()
 
     result = runner.invoke(
@@ -442,14 +214,12 @@ def test_monitor_single_poll_needs_no_passphrase(tmp_path, valid_config_path, mo
         [
             "--db", str(db_path),
             "--config", str(valid_config_path),
-            "--authz-path", str(authz_path),
-            "monitor",
+                        "monitor",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert result.output.count("polled") == 1
-    assert not authz_path.exists()
 
 
 def test_monitor_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypatch):
@@ -674,22 +444,19 @@ def test_rules_seed_rows_round_trip_through_build_rule(tmp_path, valid_config_pa
 
 def test_rules_seed_needs_no_passphrase(tmp_path):
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
         [
             "--db", str(db_path),
-            "--authz-path", str(authz_path),
-            "rules", "seed",
+                        "rules", "seed",
             "--products", "BTC-USD",
             "--kinds", "dca",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert not authz_path.exists()
 
 
 # -- pnl --------------------------------------------------------------------------------------
@@ -1019,7 +786,7 @@ def _repo_at(db_path):
     return Repository(conn)
 
 
-def test_resume_entries_clears_an_armed_streak_halt(tmp_path):
+def test_resume_entries_clears_an_armed_streak_halt(tmp_path, monkeypatch):
     """Rail 16's violation message tells the operator to run `keel resume-entries`. Until now
     that command did not exist, and a test merely asserted the message MENTIONED it -- pinning a
     promise nothing implemented.
@@ -1028,50 +795,29 @@ def test_resume_entries_clears_an_armed_streak_halt(tmp_path):
     setting `max_consecutive_losses: 0` does NOT release an armed halt. Without this, an
     operator who mis-set the cooloff waits it out or edits sqlite by hand.
     """
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     repo = _repo_at(db_path)
     repo.set_state("streak_halt_until", 2_000_000_000)
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "resume-entries", "--passphrase", PASSPHRASE],
+        ["--db", str(db_path),          "resume-entries"],
+        input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db_path).get_state("streak_halt_until") == 0
 
 
-def test_resume_entries_is_passphrase_gated(tmp_path):
-    """Negative control: clearing a live-money breaker is a dangerous action, gated like
-    `resume` -- not something a stray shell command can do."""
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    repo = _repo_at(db_path)
-    repo.set_state("streak_halt_until", 2_000_000_000)
-    runner = CliRunner()
 
-    result = runner.invoke(
-        cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "resume-entries", "--passphrase", "wrong-passphrase"],
-    )
-
-    assert result.exit_code != 0
-    assert _repo_at(db_path).get_state("streak_halt_until") == 2_000_000_000
-
-
-def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path):
+def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path, monkeypatch):
     """Rail 11's high-water mark is MONOTONIC, so any bad equity write is permanent: a deposit
     ratchets it up and a later withdrawal then reads as a drawdown that never recovers. Without
     this command the only remedy is hand-editing sqlite."""
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     repo = _repo_at(db_path)
     repo.set_state("equity_high_water_mark", Decimal("15000"))
     repo.set_state("drawdown_total_pct", Decimal("0.33"))
@@ -1079,8 +825,8 @@ def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "reset-hwm", "--passphrase", PASSPHRASE],
+        ["--db", str(db_path),          "reset-hwm"],
+        input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -1089,78 +835,56 @@ def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path):
     assert after.get_state("drawdown_total_pct") == Decimal("0")
 
 
-def test_record_flow_rebases_the_high_water_mark(tmp_path):
+def test_record_flow_rebases_the_high_water_mark(tmp_path, monkeypatch):
     """A deposit is not profit and a withdrawal is not a loss, but equity is cash + positions so
     both move it. Declaring the flow keeps rail 11's drawdown measuring TRADING performance."""
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     repo = _repo_at(db_path)
     repo.set_state("equity_high_water_mark", Decimal("10000"))
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "record-flow", "--amount", "5000", "--passphrase", PASSPHRASE],
+        ["--db", str(db_path),          "record-flow", "--amount", "5000"],
+        input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("15000")
 
 
-def test_record_flow_accepts_a_negative_amount_for_a_withdrawal(tmp_path):
+def test_record_flow_accepts_a_negative_amount_for_a_withdrawal(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     repo = _repo_at(db_path)
     repo.set_state("equity_high_water_mark", Decimal("15000"))
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "record-flow", "--amount", "-5000", "--passphrase", PASSPHRASE],
+        ["--db", str(db_path),          "record-flow", "--amount", "-5000"],
+        input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("10000")
 
 
-def test_record_flow_is_passphrase_gated(tmp_path):
-    """Lowering the HWM relaxes a live-money breaker, so this is a dangerous action: an
-    unauthenticated caller must not be able to shrink a measured drawdown."""
-    db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
-    repo = _repo_at(db_path)
-    repo.set_state("equity_high_water_mark", Decimal("15000"))
-    runner = CliRunner()
 
-    result = runner.invoke(
-        cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "record-flow", "--amount", "-5000", "--passphrase", "wrong-passphrase"],
-    )
-
-    assert result.exit_code != 0
-    assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("15000")
-
-
-def test_record_flow_rejects_a_non_finite_amount(tmp_path):
+def test_record_flow_rejects_a_non_finite_amount(tmp_path, monkeypatch):
     """`Decimal("nan")` parses without raising. Written into the high-water mark it poisons it
     permanently: every later `equity > hwm` is False, so the HWM can never re-seed."""
+    _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
-    authz_path = tmp_path / "authz.json"
-    authz.set_passphrase(PASSPHRASE, path=str(authz_path))
     repo = _repo_at(db_path)
     repo.set_state("equity_high_water_mark", Decimal("10000"))
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--authz-path", str(authz_path),
-         "record-flow", "--amount", "nan", "--passphrase", PASSPHRASE],
+        ["--db", str(db_path),          "record-flow", "--amount", "nan"],
+        input="yes\n",
     )
 
     assert result.exit_code != 0
@@ -1223,3 +947,233 @@ def test_migrate_honours_an_explicit_db_option(tmp_path):
     assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
         SCHEMA_VERSION
     )
+
+
+# -- halt-releasing commands: interactive confirmation, no passphrase ----------
+#
+# These four RE-PERMIT trading after a safety halt. They keep a human gate even when autonomous
+# mode is on -- "trade without asking me" and "un-stick your own drawdown breaker" are different
+# powers, and a breaker that can reset itself is not a breaker.
+#
+# There is deliberately NO env-var/flag override for the TTY check: any such seam would be
+# settable from cron and would defeat the fail-closed. Tests patch the predicate instead.
+
+_HALT_COMMANDS = (
+    ["resume"],
+    ["resume-entries"],
+    ["record-flow", "--amount", "500"],
+    ["reset-hwm"],
+)
+
+
+def _at_a_terminal(monkeypatch, yes: bool = True) -> None:
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: yes)
+
+
+def test_halt_commands_proceed_on_a_typed_yes(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
+    for args in _HALT_COMMANDS:
+        db = tmp_path / f"{args[0]}-yes.db"
+        _repo_at(db)
+        result = CliRunner().invoke(cli, ["--db", str(db), *args], input="yes\n")
+        assert result.exit_code == 0, f"{args}: {result.output}"
+
+
+def test_halt_commands_abort_on_anything_other_than_yes(tmp_path, monkeypatch):
+    """A bare 'y' is not enough -- these are rarer and heavier than an order confirmation."""
+    _at_a_terminal(monkeypatch)
+    for args in _HALT_COMMANDS:
+        db = tmp_path / f"{args[0]}-no.db"
+        _repo_at(db)
+        result = CliRunner().invoke(cli, ["--db", str(db), *args], input="y\n")
+        assert result.exit_code != 0, f"{args} should have aborted: {result.output}"
+        assert "aborted" in result.output.lower()
+
+
+def test_halt_commands_fail_closed_without_a_tty(tmp_path, monkeypatch):
+    """A cron job or piped script must never be able to release a safety halt."""
+    _at_a_terminal(monkeypatch, yes=False)
+    for args in _HALT_COMMANDS:
+        db = tmp_path / f"{args[0]}-notty.db"
+        _repo_at(db)
+        result = CliRunner().invoke(cli, ["--db", str(db), *args], input="yes\n")
+        assert result.exit_code != 0, f"{args} should have refused off-TTY: {result.output}"
+        assert "terminal" in result.output.lower()
+
+
+def test_resume_actually_disengages_the_kill_switch_when_confirmed(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "resume.db"
+    repo = _repo_at(db)
+    repo.set_state("kill_switch", True)
+    result = CliRunner().invoke(cli, ["--db", str(db), "resume"], input="yes\n")
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_state("kill_switch") is False
+
+
+# -- keel autonomy ------------------------------------------------------------
+
+
+def test_autonomy_is_off_by_default(tmp_path):
+    db = tmp_path / "a.db"
+    _repo_at(db)
+    result = CliRunner().invoke(cli, ["--db", str(db), "autonomy", "show"])
+    assert result.exit_code == 0, result.output
+    assert "off" in result.output
+
+
+def test_autonomy_on_requires_a_typed_yes_and_persists(tmp_path, monkeypatch, valid_config_path):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "a.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on"], input="yes\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_profile().autonomous is True
+
+
+def test_autonomy_on_aborts_on_a_bare_y(tmp_path, monkeypatch, valid_config_path):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "a.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on"], input="y\n"
+    )
+    assert result.exit_code != 0
+    assert _repo_at(db).get_profile().autonomous is False
+
+
+def test_autonomy_on_refuses_without_a_terminal(tmp_path, monkeypatch, valid_config_path):
+    """Arming unattended trading must not be scriptable."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "a.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on"], input="yes\n"
+    )
+    assert result.exit_code != 0
+    assert "terminal" in result.output.lower()
+    assert _repo_at(db).get_profile().autonomous is False
+
+
+def test_autonomy_off_works_without_a_terminal(tmp_path, monkeypatch):
+    """De-risking is never obstructed: this must work from cron, a pipe, anywhere."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "a.db"
+    repo = _repo_at(db)
+    repo.set_autonomous(True, now_ts=1)
+
+    result = CliRunner().invoke(cli, ["--db", str(db), "autonomy", "off"])
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_profile().autonomous is False
+
+
+def test_autonomy_ON_does_not_let_halt_commands_skip_confirmation(tmp_path, monkeypatch):
+    """THE invariant. 'Trade without asking me' and 'un-stick your own drawdown breaker' are
+    different powers; a breaker that can reset itself is not a breaker."""
+    _at_a_terminal(monkeypatch, yes=False)  # no terminal available
+    for args in _HALT_COMMANDS:
+        db = tmp_path / f"auto-{args[0]}.db"
+        repo = _repo_at(db)
+        repo.set_autonomous(True, now_ts=1)  # fully autonomous...
+
+        result = CliRunner().invoke(cli, ["--db", str(db), *args], input="yes\n")
+
+        assert result.exit_code != 0, f"{args} was released without a human: {result.output}"
+        assert "terminal" in result.output.lower()
+
+
+def test_withdrawals_attest_ENABLED_needs_a_terminal(tmp_path, monkeypatch):
+    """Rail 17 halts ENTRIES when withdrawals are suspended/stale; `--enabled` releases that
+    halt, so it is a halt-releasing command like the other four. Its old justification was that
+    the confirm gate and the bypass-arm token sat in front of it -- with autonomy on, neither
+    does, so a cron line could re-permit live entries with no human anywhere."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "w.db"
+    repo = _repo_at(db)
+    repo.set_autonomous(True, now_ts=1)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "terminal" in result.output.lower()
+    assert _repo_at(db).get_state("withdrawals_enabled") is None
+
+
+def test_withdrawals_attest_SUSPENDED_is_ungated_and_needs_no_terminal(tmp_path, monkeypatch):
+    """De-risking is never obstructed: suspending only ever halts entries."""
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "w2.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(cli, ["--db", str(db), "withdrawals", "attest", "--suspended"])
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_state("withdrawals_enabled") is False
+
+
+def test_withdrawals_attest_ENABLED_proceeds_on_a_typed_yes(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "w3.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _repo_at(db).get_state("withdrawals_enabled") is True
+
+
+def test_autonomy_on_for_hours_sets_an_expiry_that_lapses(tmp_path, monkeypatch, valid_config_path):
+    """A forgotten `autonomy on` should not be able to grant unattended trading forever."""
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "exp.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on", "--for-hours", "1"],
+        input="yes\n",
+    )
+    assert result.exit_code == 0, result.output
+    profile = _repo_at(db).get_profile()
+    assert profile.autonomous_until is not None
+    assert profile.is_autonomous(profile.autonomous_until - 1) is True
+    assert profile.is_autonomous(profile.autonomous_until) is False
+
+
+def test_autonomy_on_without_for_hours_warns_that_it_never_lapses(
+    tmp_path, monkeypatch, valid_config_path
+):
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "noexp.db"
+    _repo_at(db)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "autonomy", "on"], input="yes\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "NO expiry" in result.output
+    assert _repo_at(db).get_profile().autonomous_until is None
+
+
+def test_autonomy_on_rejects_a_nonsensical_for_hours(tmp_path, monkeypatch, valid_config_path):
+    """0/negative would write an already-lapsed row while claiming 'autonomy ON until ...';
+    inf/nan/huge would overflow int() AFTER the operator had already typed yes."""
+    _at_a_terminal(monkeypatch)
+    for bad in ("0", "-5", "inf", "nan", "1e18"):
+        db = tmp_path / f"bad-{bad}.db"
+        _repo_at(db)
+        result = CliRunner().invoke(
+            cli,
+            ["--db", str(db), "--config", str(valid_config_path),
+             "autonomy", "on", "--for-hours", bad],
+            input="yes\n",
+        )
+        assert result.exit_code != 0, f"--for-hours {bad} should be rejected: {result.output}"
+        assert _repo_at(db).get_profile().autonomous is False
+
+

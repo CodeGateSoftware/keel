@@ -8,6 +8,7 @@ methods. Money and prices are always `Decimal` in the Python API and stored as `
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from decimal import Decimal
@@ -15,7 +16,7 @@ from typing import Any
 
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 
-from keel.types import Candle, Granularity
+from keel.types import Candle, Granularity, Profile
 
 _TRANSACTION_COLUMNS = (
     "coinbase_id",
@@ -580,42 +581,70 @@ class Repository:
             d[field] = _text_to_dec(d[field])
         return d
 
-    # -- bypass arm token (Issue #60, in-process bypass hardening) ---------
+    # -- profile (the user's own settings) ------------------------------------
 
-    def arm_bypass(self, now_ts: int, ttl_sec: int) -> None:
-        """Arm autonomous bypass mode for `ttl_sec` seconds starting at `now_ts`.
+    def get_profile(self) -> Profile:
+        """The user's profile, defaulting to NOT autonomous.
 
-        Overwrites any previous arm token outright -- there is only ever one live token, and
-        arming again (e.g. re-running `keel arm-bypass`) always resets the window from `now_ts`
-        rather than extending the old one. `agent.run_once`'s own `is_bypass_armed` check reads
-        this token fresh on every cycle, so it is the one place bypass mode can be authorized
-        from -- CLI (`keel arm-bypass`, passphrase-gated) or any other authenticated caller.
+        **Fails closed.** An absent row -- a fresh database, or one upgraded from before the
+        `profile` table existed -- reports `autonomous=False`. The safe reading of "no record"
+        is that the user never opted into unattended trading, never that they did.
+
+        Callers must re-read this each cycle rather than caching it, so that
+        `keel autonomy off` takes effect on the next cycle instead of the next restart.
         """
-        self.set_state(
-            "bypass_arm",
-            {"armed_at": now_ts, "armed_until": now_ts + ttl_sec},
+        try:
+            row = self._conn.execute(
+                "SELECT autonomous, autonomous_until, updated_ts FROM profile WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            # A missing or damaged `profile` table must read as "no consent recorded", not
+            # propagate. But it must not be SILENT either: swallowing this indistinguishably
+            # from "the user never opted in" hides a broken migration or a corrupt database
+            # behind a reassuring `autonomy: off`. Fail closed AND say so.
+            logging.getLogger(__name__).error(
+                "profile unreadable (%s: %s) -- treating autonomy as OFF", type(exc).__name__, exc
+            )
+            return Profile()
+        if row is None:
+            return Profile()
+        until = row["autonomous_until"]
+        return Profile(
+            autonomous=bool(row["autonomous"]),
+            autonomous_until=None if until is None else int(until),
+            updated_ts=int(row["updated_ts"]),
         )
 
-    def is_bypass_armed(self, now_ts: int) -> bool:
-        """True iff a bypass-arm token exists and `now_ts` is still inside its window.
+    def profile_readable(self) -> bool:
+        """Whether the `profile` row could actually be read.
 
-        Freshness is a strict `now_ts < armed_until` (matching `market_feed.is_fresh`'s own
-        convention elsewhere in this codebase) -- the instant `armed_until` is reached, the
-        token is treated as expired, not one tick still-good.
+        `get_profile()` fails closed on a damaged table, which is right for the trading path but
+        indistinguishable from "the user never opted in". This lets a caller tell a human that
+        the stored setting is UNKNOWN rather than confidently reporting it as off.
         """
-        token = self.get_state("bypass_arm")
-        if token is None:
+        try:
+            self._conn.execute("SELECT autonomous FROM profile WHERE id = 1").fetchone()
+        except sqlite3.Error:
             return False
-        return now_ts < token["armed_until"]
+        return True
 
-    def disarm_bypass(self) -> None:
-        """Clear the bypass-arm token immediately.
+    def set_autonomous(self, value: bool, now_ts: int, expires_ts: int | None = None) -> None:
+        """Record the user's autonomy choice, upserting the single profile row.
 
-        Fail-safe direction: disarming only ever *reduces* capability, so unlike `arm_bypass`
-        this needs no passphrase gate at the CLI layer -- it is always safe to call, including
-        when nothing is currently armed (a no-op).
+        `expires_ts=None` means the choice never lapses. Passing a timestamp makes autonomy
+        expire on its own -- the time bound the removed bypass-arm token used to enforce.
         """
-        self.set_state("bypass_arm", None)
+        self._conn.execute(
+            """
+            INSERT INTO profile (id, autonomous, autonomous_until, updated_ts)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET autonomous = excluded.autonomous,
+                                          autonomous_until = excluded.autonomous_until,
+                                          updated_ts = excluded.updated_ts
+            """,
+            (1 if value else 0, expires_ts, now_ts),
+        )
+        self._conn.commit()
 
     # -- candle gap probes ----------------------------------------------------
     # A row asserts: "we asked the venue for this exact window and it returned nothing new."

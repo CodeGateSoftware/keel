@@ -218,53 +218,6 @@ def test_set_state_overwrites_existing_key(repo):
     assert repo.get_state("kill_switch") is True
 
 
-# -- bypass arm token (Issue #60, in-process bypass hardening) ---------------
-
-
-def test_is_bypass_armed_false_when_never_armed(repo):
-    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
-
-
-def test_is_bypass_armed_true_right_after_arm_within_ttl(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_599) is True
-
-
-def test_is_bypass_armed_false_once_now_ts_reaches_armed_until(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-
-    # armed_until = 1_700_000_000 + 3600 = 1_700_003_600 -- freshness is a strict `<`.
-    assert repo.is_bypass_armed(now_ts=1_700_003_600) is False
-    assert repo.is_bypass_armed(now_ts=1_700_004_000) is False
-
-
-def test_is_bypass_armed_false_after_disarm(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
-
-    repo.disarm_bypass()
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is False
-
-
-def test_arm_bypass_overwrites_a_previous_arm(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=10)
-    repo.arm_bypass(now_ts=1_700_000_100, ttl_sec=3600)
-
-    # the earlier, shorter-lived arm is gone; the new one governs.
-    assert repo.is_bypass_armed(now_ts=1_700_000_015) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_699) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_700) is False
-
-
-def test_disarm_bypass_is_a_no_op_when_never_armed(repo):
-    repo.disarm_bypass()  # must not raise
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
-
-
 # -- rules -------------------------------------------------------------------
 
 
@@ -431,3 +384,71 @@ def test_held_products_lists_products_with_filled_live_orders(repo: Repository) 
     )
 
     assert repo.held_products() == ["BTC-USD", "ETH-USD"]
+
+
+# -- profile (autonomy is a durable USER CHOICE, read live) ---------------------
+
+
+def test_an_absent_profile_row_reads_as_NOT_autonomous(repo):
+    """Fails closed: a fresh or damaged database must never imply unattended trading."""
+    assert repo.get_profile().autonomous is False
+
+
+def test_set_autonomous_round_trips(repo):
+    repo.set_autonomous(True, now_ts=1000)
+    p = repo.get_profile()
+    assert p.autonomous is True
+    assert p.updated_ts == 1000
+
+    repo.set_autonomous(False, now_ts=2000)
+    p = repo.get_profile()
+    assert p.autonomous is False
+    assert p.updated_ts == 2000
+
+
+def test_set_autonomous_upserts_and_never_creates_a_second_row(repo):
+    """The table is deliberately single-row; two rows would make 'the' profile ambiguous."""
+    for ts in range(1, 6):
+        repo.set_autonomous(ts % 2 == 0, now_ts=ts)
+    rows = repo._conn.execute("SELECT COUNT(*) AS n FROM profile").fetchone()["n"]
+    assert rows == 1
+
+
+def test_autonomy_can_carry_an_expiry_and_lapses_on_its_own(repo):
+    """The removed bypass-arm token was TIME-LIMITED so a forgotten arm could not grant
+    unattended trading forever. An unbounded profile flag loses that; an optional expiry
+    restores it without forcing it on a user who wants a durable choice."""
+    repo.set_autonomous(True, now_ts=1000, expires_ts=2000)
+    p = repo.get_profile()
+    assert p.autonomous is True
+    assert p.autonomous_until == 2000
+
+    assert p.is_autonomous(now_ts=1999) is True
+    # strict now < expiry, like every other freshness check in this codebase
+    assert p.is_autonomous(now_ts=2000) is False
+    assert p.is_autonomous(now_ts=5000) is False
+
+
+def test_autonomy_without_an_expiry_never_lapses(repo):
+    repo.set_autonomous(True, now_ts=1000)
+    p = repo.get_profile()
+    assert p.autonomous_until is None
+    assert p.is_autonomous(now_ts=10**12) is True
+
+
+def test_autonomy_off_is_never_autonomous_whatever_the_expiry(repo):
+    repo.set_autonomous(False, now_ts=1000, expires_ts=10**12)
+    assert repo.get_profile().is_autonomous(now_ts=1001) is False
+
+
+def test_profile_readable_reports_damage_that_get_profile_hides(repo):
+    """`get_profile` fails closed on a damaged table, which is right for the trading path but
+    indistinguishable from "never opted in". `profile_readable` is how a caller tells a human
+    the stored setting is UNKNOWN rather than confidently reporting it off."""
+    assert repo.profile_readable() is True
+
+    repo._conn.execute("DROP TABLE profile")
+    repo._conn.commit()
+
+    assert repo.profile_readable() is False
+    assert repo.get_profile().autonomous is False  # still fails closed, still no exception

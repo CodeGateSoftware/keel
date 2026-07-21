@@ -10,7 +10,6 @@
 #   3. `caps`      -- max_exposure_usd / max_per_asset_pct are your risk ceilings.
 #   4. `subscription` -- attest your venue tier (`keel subscription attest`); rail 14 caps spend.
 #   5. rules       -- `keel init` seeds them as `candidate`; nothing trades until you promote.
-#   6. `auto_trade.enabled` -- still false; set it true to start the scheduled loop.
 #
 # `allowlist` and `caps` are required and validated by keel.config.load_config; missing or
 # invalid values raise ConfigError naming the offending key rather than silently defaulting.
@@ -47,12 +46,10 @@ market_data:
 auto_trade:
   # confirm = preview + explicit approval for every order (the safe live default).
   mode: confirm
+  # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
+  # true or false changes nothing. Use `keel kill` to halt trading.
   enabled: false
   interval_sec: 900
-  # how long a `keel arm-bypass` token stays valid (seconds) before bypass mode requires
-  # re-arming (Issue #60) -- `keel agent --bypass` still needs a fresh armed token even with
-  # the CLI passphrase gate satisfied.
-  bypass_arm_ttl_sec: 3600
 
 promotion:
   min_trades: 100

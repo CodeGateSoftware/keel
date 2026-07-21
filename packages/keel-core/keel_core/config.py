@@ -96,11 +96,6 @@ class AutoTradeConfig:
     mode: str = "paper"
     enabled: bool = False
     interval_sec: int = 900
-    # Issue #60: how long a `keel arm-bypass` token stays valid (`Repository.arm_bypass`'s
-    # `ttl_sec`) before `agent.run_once` refuses `mode="bypass"` again and falls back to
-    # `"confirm"`. 3600s (1h) is a sensible default -- long enough for one supervised session,
-    # short enough that a forgotten arm doesn't grant unattended autonomy indefinitely.
-    bypass_arm_ttl_sec: int = 3600
 
 
 @dataclass(frozen=True)
@@ -135,6 +130,10 @@ class DcaConfig:
 
 
 _VALID_PACING_MODES = ("opportunistic", "even_daily")
+#: `paper` simulates and places nothing; `confirm` is live. Whether you are ASKED is a
+#: PROFILE choice (`keel autonomy on|off`), deliberately not a config mode -- config.yaml
+#: ships as a release asset, and arming unattended trading should not be a YAML edit.
+_VALID_AUTO_TRADE_MODES = ("paper", "confirm")
 
 
 @dataclass(frozen=True)
@@ -276,6 +275,23 @@ _OPTIONAL_CAP_KEYS = (
     "max_per_order_usd",
     "max_per_day_usd",
 )
+
+
+def _parse_auto_trade_mode(raw: dict[str, Any]) -> str:
+    """`auto_trade.mode`, validated against `_VALID_AUTO_TRADE_MODES`.
+
+    Previously any unknown value silently degraded to confirm. It now raises: a config saying
+    `mode: bypass` was explicitly asking for autonomy, and autonomy has since become a profile
+    choice. Reinterpreting that request quietly -- in either direction -- is worse than stopping.
+    """
+    mode = raw.get("mode", "paper")
+    if mode not in _VALID_AUTO_TRADE_MODES:
+        raise ConfigError(
+            f"auto_trade.mode: invalid value {mode!r}; must be one of "
+            f"{_VALID_AUTO_TRADE_MODES!r}. Autonomy is no longer a mode -- it is a profile "
+            f"choice: use `mode: confirm` plus `keel autonomy on`."
+        )
+    return str(mode)
 
 
 def _parse_allowlist(raw: dict[str, Any]) -> list[str]:
@@ -523,10 +539,9 @@ def load_config(path: str | Path) -> Config:
         caps=caps,
         market_data=market_data,
         auto_trade=AutoTradeConfig(
-            mode=auto_trade_raw.get("mode", "paper"),
+            mode=_parse_auto_trade_mode(auto_trade_raw),
             enabled=bool(auto_trade_raw.get("enabled", False)),
             interval_sec=int(auto_trade_raw.get("interval_sec", 900)),
-            bypass_arm_ttl_sec=int(auto_trade_raw.get("bypass_arm_ttl_sec", 3600)),
         ),
         promotion=PromotionConfig(
             min_trades=int(promotion_raw.get("min_trades", 100)),

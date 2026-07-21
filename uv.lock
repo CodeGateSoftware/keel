@@ -398,7 +398,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
-    { name = "cryptography" },
     { name = "keel-broker-api" },
     { name = "keel-broker-coinbase" },
     { name = "keel-core" },
@@ -415,7 +414,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.4.2" },
-    { name = "cryptography", specifier = ">=49.0.0" },
     { name = "keel-broker-api", editable = "packages/keel-broker-api" },
     { name = "keel-broker-coinbase", editable = "packages/keel-broker-coinbase" },
     { name = "keel-core", editable = "packages/keel-core" },

@@ -65,15 +65,20 @@ def test_a_repo_failure_reads_as_UNKNOWN_rather_than_propagating(tmp_path):
 # -- CLI -----------------------------------------------------------------------
 
 
-def test_cli_roundtrip_and_suspension_message(tmp_path):
+def test_cli_roundtrip_and_suspension_message(tmp_path, monkeypatch):
     db_path = tmp_path / "t.db"
     runner = CliRunner()
+    # `--enabled` RELEASES rail 17's entry halt, so it now demands a typed `yes` at a terminal
+    # (`--suspended` stays ungated -- it only ever reduces capability).
+    import keel.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
 
     unknown = runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"])
     assert "UNKNOWN (never attested)" in unknown.output
 
     assert runner.invoke(
-        cli, ["--db", str(db_path), "withdrawals", "attest", "--enabled"]
+        cli, ["--db", str(db_path), "withdrawals", "attest", "--enabled"], input="yes\n"
     ).exit_code == 0
     assert "ENABLED" in runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"]).output
 

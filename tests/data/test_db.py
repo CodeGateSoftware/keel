@@ -101,3 +101,81 @@ def test_agent_state_table_has_key_primary_key():
     columns = conn.execute("PRAGMA table_info(agent_state)").fetchall()
     pk_columns = {row["name"] for row in columns if row["pk"] > 0}
     assert pk_columns == {"key"}
+
+
+def test_schema_version_is_8():
+    """Deliberate tripwire: bump this literal consciously on every schema change."""
+    from keel.data.db import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == 8
+
+
+def test_a_v6_database_migrates_up_and_gains_the_profile_table(tmp_path):
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "old.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 6")
+    conn.commit()
+
+    migrate(conn)
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+    named = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='profile'"
+    ).fetchone()
+    assert named is not None, "v7 must add the profile table"
+
+
+def test_a_v7_database_without_the_expiry_column_gains_it(tmp_path):
+    """Regression: `autonomous_until` was added to v7's CREATE TABLE, but a database already
+    stamped 7 runs no migration step and IF NOT EXISTS is a no-op -- so it kept the old table
+    forever, and `keel autonomy off` (the DE-RISKING command) died on a missing column."""
+    import sqlite3
+
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    path = str(tmp_path / "v7.db")
+    conn = connect(path)
+    migrate(conn)
+    # Recreate the pre-fix v7 shape: profile without the expiry column, stamped at 7.
+    conn.execute("DROP TABLE profile")
+    conn.execute(
+        "CREATE TABLE profile (id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "autonomous INTEGER NOT NULL DEFAULT 0, updated_ts INTEGER NOT NULL)"
+    )
+    conn.execute("INSERT INTO profile (id, autonomous, updated_ts) VALUES (1, 1, 5)")
+    conn.execute("UPDATE schema_version SET version = 7")
+    conn.commit()
+
+    migrate(conn)
+
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(profile)")]
+    assert "autonomous_until" in cols, "v8 must add the expiry column to an existing v7 table"
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+    # the recorded choice survives, and writing to it no longer raises
+    from keel.data.repository import Repository
+
+    repo = Repository(conn)
+    assert repo.get_profile().autonomous is True
+    repo.set_autonomous(False, now_ts=9)  # must not raise sqlite3.OperationalError
+    assert repo.get_profile().autonomous is False
+    assert isinstance(conn, sqlite3.Connection)
+
+
+def test_migrating_a_v6_database_twice_is_idempotent(tmp_path):
+    """v8's ALTER must not fire twice on a DB that already got the column from the DDL."""
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "v6.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 6")
+    conn.commit()
+    migrate(conn)
+    migrate(conn)  # must not raise "duplicate column name"
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
