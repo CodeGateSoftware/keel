@@ -109,3 +109,48 @@ def test_seed_rejects_an_unknown_status(tmp_path):
         cli, ["--db", str(tmp_path / "t.db"), "rules", "seed", "--status", "bogus"]
     )
     assert result.exit_code != 0
+
+
+# -- the LIVE (production) template --------------------------------------------
+
+
+def test_the_live_template_is_a_VALID_config(tmp_path):
+    p = tmp_path / "live.yaml"
+    p.write_text(_template_config_text(live=True))
+    load_config(str(p))  # raises ConfigError if invalid
+
+
+def test_the_live_template_is_CONFIRM_mode_never_armed(tmp_path):
+    """The release asset must ask before every order. This is the tripwire against
+    ever shipping a config that trades unattended straight off a download."""
+    p = tmp_path / "live.yaml"
+    p.write_text(_template_config_text(live=True))
+    assert load_config(str(p)).auto_trade.mode == "confirm"
+
+
+def test_the_dev_template_stays_paper():
+    p = Path(__file__).resolve().parent.parent / "config.yaml"
+    assert load_config(str(p)).auto_trade.mode == "paper"
+
+
+def test_the_two_templates_have_the_same_top_level_keys():
+    """Catches drift: a key added to the dev config must reach the live one too."""
+    import yaml
+
+    dev = yaml.safe_load(_template_config_text())
+    live = yaml.safe_load(_template_config_text(live=True))
+    assert set(dev) == set(live), "live/dev config templates have drifted apart"
+
+
+def test_init_config_live_writes_the_confirm_mode_template(tmp_path):
+    out = tmp_path / "config.yaml"
+    result = CliRunner().invoke(cli, ["init-config", "--config", str(out), "--live"])
+    assert result.exit_code == 0, result.output
+    assert load_config(str(out)).auto_trade.mode == "confirm"
+
+
+def test_init_config_without_live_still_writes_the_paper_template(tmp_path):
+    out = tmp_path / "config.yaml"
+    result = CliRunner().invoke(cli, ["init-config", "--config", str(out)])
+    assert result.exit_code == 0, result.output
+    assert load_config(str(out)).auto_trade.mode == "paper"

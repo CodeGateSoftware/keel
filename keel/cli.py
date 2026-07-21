@@ -276,11 +276,17 @@ def cli(
 # -- init (scaffold a working directory) ----------------------------------------------------
 
 
-def _template_config_text() -> str:
-    """The default config.yaml shipped inside the wheel (see pyproject `artifacts`)."""
+def _template_config_text(live: bool = False) -> str:
+    """A config.yaml template shipped inside the wheel (see pyproject `artifacts`).
+
+    `live=False` returns the dev template (`mode: paper` -- places nothing). `live=True` returns
+    the production template (`mode: confirm` -- previews every order and waits for approval),
+    which is also the `config.yaml` attached to a GitHub Release.
+    """
     from importlib.resources import files
 
-    return (files("keel.templates") / "config.yaml").read_text(encoding="utf-8")
+    name = "config.live.yaml" if live else "config.yaml"
+    return (files("keel.templates") / name).read_text(encoding="utf-8")
 
 
 @cli.command("init-config")
@@ -289,17 +295,28 @@ def _template_config_text() -> str:
     help="Where to write the config file.",
 )
 @click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
-def init_config(config_path: str, force: bool) -> None:
+@click.option(
+    "--live",
+    is_flag=True,
+    default=False,
+    help="Write the PRODUCTION template (mode: confirm) instead of the dev one (mode: paper).",
+)
+def init_config(config_path: str, force: bool, live: bool) -> None:
     """Write a default `config.yaml` into the current directory, ready to edit.
 
-    The installed wheel ships this template so a fresh working directory has a config to start
+    The installed wheel ships both templates so a fresh working directory has a config to start
     from -- edit `allowlist`, `caps`, and `auto_trade.mode` before running anything live.
+
+    `--live` writes the same production config that is attached to a GitHub Release: real
+    allowlist/caps in `mode: confirm`, which previews every order and waits for your approval.
+    Without it you get the dev template in `mode: paper`, which places nothing at all.
     """
     path = Path(config_path)
     if path.exists() and not force:
         raise click.ClickException(f"{path} already exists; pass --force to overwrite")
-    path.write_text(_template_config_text(), encoding="utf-8")
-    click.echo(f"wrote {path}. Edit allowlist/caps/auto_trade.mode before going live.")
+    path.write_text(_template_config_text(live=live), encoding="utf-8")
+    which = "production/confirm" if live else "dev/paper"
+    click.echo(f"wrote {path} [{which}]. Review allowlist/caps/auto_trade before going live.")
 
 
 @cli.command("init")
