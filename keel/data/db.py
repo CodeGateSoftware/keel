@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -238,6 +238,13 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         attested_at  INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS profile (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        autonomous  INTEGER NOT NULL DEFAULT 0,
+        updated_ts  INTEGER NOT NULL
+    )
+    """,
 )
 
 
@@ -357,12 +364,24 @@ def _migrate_v6_asset_attestations(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v7_profile(conn: sqlite3.Connection) -> None:
+    """v7 adds `profile`, which carries the user's autonomy choice. Table creation is handled by
+    `_SCHEMA_STATEMENTS`; there is deliberately NO backfill.
+
+    No row means `get_profile()` reports `autonomous=False`, which is the correct and safe
+    reading of an upgraded database: the user has never opted into unattended trading, so we must
+    not infer that they did. Seeding a row here -- even an explicitly `autonomous=0` one -- would
+    only manufacture a consent record that no human gave.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
     4: _migrate_v4_positions,
     5: _migrate_v5_candle_gap_probes,
     6: _migrate_v6_asset_attestations,
+    7: _migrate_v7_profile,
 }
 
 

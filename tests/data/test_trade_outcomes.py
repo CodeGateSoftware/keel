@@ -35,11 +35,11 @@ def _outcome(**overrides: object) -> dict:
     return base
 
 
-def test_schema_is_at_version_6() -> None:
+def test_schema_is_at_version_7() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 6
+    assert version == db.SCHEMA_VERSION == 7
 
 
 def test_fresh_database_has_no_outcomes() -> None:

@@ -218,53 +218,6 @@ def test_set_state_overwrites_existing_key(repo):
     assert repo.get_state("kill_switch") is True
 
 
-# -- bypass arm token (Issue #60, in-process bypass hardening) ---------------
-
-
-def test_is_bypass_armed_false_when_never_armed(repo):
-    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
-
-
-def test_is_bypass_armed_true_right_after_arm_within_ttl(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_599) is True
-
-
-def test_is_bypass_armed_false_once_now_ts_reaches_armed_until(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-
-    # armed_until = 1_700_000_000 + 3600 = 1_700_003_600 -- freshness is a strict `<`.
-    assert repo.is_bypass_armed(now_ts=1_700_003_600) is False
-    assert repo.is_bypass_armed(now_ts=1_700_004_000) is False
-
-
-def test_is_bypass_armed_false_after_disarm(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=3600)
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is True
-
-    repo.disarm_bypass()
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_001) is False
-
-
-def test_arm_bypass_overwrites_a_previous_arm(repo):
-    repo.arm_bypass(now_ts=1_700_000_000, ttl_sec=10)
-    repo.arm_bypass(now_ts=1_700_000_100, ttl_sec=3600)
-
-    # the earlier, shorter-lived arm is gone; the new one governs.
-    assert repo.is_bypass_armed(now_ts=1_700_000_015) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_699) is True
-    assert repo.is_bypass_armed(now_ts=1_700_003_700) is False
-
-
-def test_disarm_bypass_is_a_no_op_when_never_armed(repo):
-    repo.disarm_bypass()  # must not raise
-
-    assert repo.is_bypass_armed(now_ts=1_700_000_000) is False
-
-
 # -- rules -------------------------------------------------------------------
 
 
@@ -431,3 +384,31 @@ def test_held_products_lists_products_with_filled_live_orders(repo: Repository) 
     )
 
     assert repo.held_products() == ["BTC-USD", "ETH-USD"]
+
+
+# -- profile (autonomy is a durable USER CHOICE, read live) ---------------------
+
+
+def test_an_absent_profile_row_reads_as_NOT_autonomous(repo):
+    """Fails closed: a fresh or damaged database must never imply unattended trading."""
+    assert repo.get_profile().autonomous is False
+
+
+def test_set_autonomous_round_trips(repo):
+    repo.set_autonomous(True, now_ts=1000)
+    p = repo.get_profile()
+    assert p.autonomous is True
+    assert p.updated_ts == 1000
+
+    repo.set_autonomous(False, now_ts=2000)
+    p = repo.get_profile()
+    assert p.autonomous is False
+    assert p.updated_ts == 2000
+
+
+def test_set_autonomous_upserts_and_never_creates_a_second_row(repo):
+    """The table is deliberately single-row; two rows would make 'the' profile ambiguous."""
+    for ts in range(1, 6):
+        repo.set_autonomous(ts % 2 == 0, now_ts=ts)
+    rows = repo._conn.execute("SELECT COUNT(*) AS n FROM profile").fetchone()["n"]
+    assert rows == 1

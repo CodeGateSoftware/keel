@@ -101,3 +101,28 @@ def test_agent_state_table_has_key_primary_key():
     columns = conn.execute("PRAGMA table_info(agent_state)").fetchall()
     pk_columns = {row["name"] for row in columns if row["pk"] > 0}
     assert pk_columns == {"key"}
+
+
+def test_schema_version_is_7():
+    """Deliberate tripwire: bump this literal consciously on every schema change."""
+    from keel.data.db import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == 7
+
+
+def test_a_v6_database_migrates_up_and_gains_the_profile_table(tmp_path):
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "old.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 6")
+    conn.commit()
+
+    migrate(conn)
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+    named = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='profile'"
+    ).fetchone()
+    assert named is not None, "v7 must add the profile table"
