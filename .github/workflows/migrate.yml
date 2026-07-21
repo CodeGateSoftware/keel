@@ -1,0 +1,59 @@
+name: Migrate database
+
+# MANUAL ONLY. Schema migration for an EXISTING database -- never runs on push or merge.
+#
+# Migration is deliberately separate from seeding: `keel init` seeds the strategy (rules) library
+# on a FRESH deployment, while `keel migrate` only evolves an existing database's schema. Seeding
+# on migrate would resurrect rules that were deliberately deleted or refuted.
+#
+# DEFERRED SEAM: today `keel.db` is local, git-ignored and single-user, so CI has no database to
+# reach. Once the app is server-hosted, that deployment's database becomes the `db_path` target
+# (via a self-hosted runner or a mounted volume) and the release workflow can call this job. Until
+# then, dispatching this with no target runs a migration-integrity check instead of pretending to
+# migrate something that is not there.
+on:
+  workflow_dispatch:
+    inputs:
+      db_path:
+        description: "Database to migrate. Leave empty to run the migration smoke test instead."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Migrate, or smoke-test the migration chain
+        run: |
+          set -euo pipefail
+          DB="${{ inputs.db_path }}"
+          if [ -n "$DB" ]; then
+            if [ ! -f "$DB" ]; then
+              echo "::error::no database at '$DB' -- refusing to create one here."
+              echo "::error::A fresh deployment is bootstrapped with 'keel init', not this workflow."
+              exit 1
+            fi
+            echo "migrating $DB"
+            uv run keel migrate --db "$DB"
+          else
+            echo "no db_path given -- verifying the migration chain instead"
+            uv run python scripts/migration_smoke.py
+          fi
