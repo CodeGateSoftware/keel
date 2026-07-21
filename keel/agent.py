@@ -33,7 +33,7 @@ tuples (`PullbackContinuation.granularity`/`buffer_ticks`/`ema_periods`,
 the coercion boundary: a caller (this module, or a future CLI command that lists live rules)
 only ever deals in real `Rule` instances, never in raw JSON dicts.
 
-**Confirm mode has no interactive prompt here.** `run_once`'s signature (per the plan) is fixed
+**Confirm mode places via a caller-supplied `confirm_fn`.** `run_once`/`loop` take an optional
 to `(broker, repo, config, now_ts)` -- there is no `confirm_fn` slot for a human-in-the-loop
 approval callback. So in `mode="confirm"`, every `executor.execute` call is made with
 `confirm_fn=None`, which -- per `executor.execute`'s own contract -- fails closed: the order is
@@ -397,6 +397,7 @@ def _handle_exits(
     config: Config,
     mode: str,
     now_ts: int,
+    confirm_fn: executor.ConfirmFn | None = None,
 ) -> list[ExecutionResult]:
     """Ask the owning rule whether to close `product_id`'s held position, and execute the EXIT
     if it fires. A no-op (`[]`) when there's nothing held, or no rule is on record as owning it
@@ -439,7 +440,7 @@ def _handle_exits(
         ts=now_ts,
     )
     result = executor.execute(
-        exit_signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
+        exit_signal, broker, repo, config, mode, confirm_fn=confirm_fn, now_ts=now_ts
     )
     if result.placed:
         exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
@@ -591,7 +592,13 @@ def _confirm_or_bypass(config: Config, repo: Repository, now_ts: int) -> tuple[s
     return mode, None
 
 
-def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> LoopResult:
+def run_once(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
+    confirm_fn: executor.ConfirmFn | None = None,
+) -> LoopResult:
     """One agent cycle: poll -> (kill-switch / stale-data gates) -> evaluate -> exits -> entries.
 
     The kill-switch is checked *before* anything else (no poll, no evaluation, no orders) --
@@ -715,7 +722,8 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                 _paper_resolve_bars(paper_trader, product_id, candles_by_tf, granularities)
 
             product_exit_results = _handle_exits(
-                product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts
+                product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts,
+                confirm_fn=confirm_fn,
             )
             for exit_result in product_exit_results:
                 log_event(
@@ -743,7 +751,7 @@ def run_once(broker: Any, repo: Repository, config: Config, now_ts: int) -> Loop
                     result = _paper_enter(paper_trader, signal, repo, config, now_ts)
                 else:
                     result = executor.execute(
-                        signal, broker, repo, config, mode, confirm_fn=None, now_ts=now_ts
+                        signal, broker, repo, config, mode, confirm_fn=confirm_fn, now_ts=now_ts
                     )
                 enter_results.append(result)
                 log_event(
@@ -798,6 +806,7 @@ def loop(
     config: Config,
     interval_sec: float,
     stop_flag: Callable[[], bool],
+    confirm_fn: executor.ConfirmFn | None = None,
 ) -> list[LoopResult]:
     """Run `run_once` every `interval_sec` until `stop_flag()` returns `True`.
 
@@ -808,7 +817,9 @@ def loop(
     """
     results: list[LoopResult] = []
     while not stop_flag():
-        results.append(run_once(broker, repo, config, now_ts=int(time.time())))
+        results.append(
+            run_once(broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn)
+        )
         if interval_sec:
             time.sleep(interval_sec)
     return results
