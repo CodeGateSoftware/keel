@@ -34,6 +34,9 @@ module-root = ""
 # but the import package and the CLI command stay `keel`. Without this the backend would infer
 # `keel_trader/` from the distribution name.
 module-name = "keel"
+# Ship the default config template inside the wheel so `keel init-config` can write it out on a
+# fresh install (the wheel otherwise contains only .py files).
+artifacts = ["keel/templates/*.yaml"]
 
 [tool.uv.workspace]
 members = ["packages/*"]

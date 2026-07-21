@@ -98,6 +98,15 @@ jobs:
           printf '%s' "$OUT" | grep -q "DIRTY" && {
             echo "::error::artifact reports a dirty tree"; exit 1; } || true
 
+      # The release ships a ready-for-live config as a downloadable asset. It must be in
+      # `confirm` mode: a config that trades unattended straight off a download is exactly what
+      # this project refuses to ship. Fail the release loudly rather than publish an armed config.
+      - name: Verify and stage the live config asset
+        run: |
+          set -euo pipefail
+          uv run python -c "from keel.config import load_config; m = load_config('keel/templates/config.live.yaml').auto_trade.mode; assert m == 'confirm', f'live config must be confirm mode, got {m!r}'; print('live config OK: mode=confirm')"
+          cp keel/templates/config.live.yaml config.yaml
+
       - name: Tag
         run: |
           set -euo pipefail
@@ -111,17 +120,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Auto-generate the change list from merged PRs since the previous tag, categorised by
-          # .github/release.yml. The tag already exists (previous step), so the API can range on it.
+          # The change list INLINES each merged PR's body -- a reader should never have to click
+          # through to a PR to learn what shipped. Grouping still comes from .github/release.yml.
           PREV="$(git describe --tags --abbrev=0 "v${{ inputs.version }}^" 2>/dev/null || true)"
           if [ -n "$PREV" ]; then
-            GENERATED="$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
-              -f tag_name="v${{ inputs.version }}" -f previous_tag_name="$PREV" -q .body)"
+            RANGE="$PREV..HEAD"
           else
-            # First release: no previous tag, generate from the start of history.
-            GENERATED="$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
-              -f tag_name="v${{ inputs.version }}" -q .body)"
+            # First release: no previous tag, so walk from the start of history.
+            RANGE="HEAD"
           fi
+
+          # Every PR whose commits land in this range, de-duplicated.
+          : > /tmp/pr-numbers.txt
+          for sha in $(git log --format=%H "$RANGE"); do
+            gh api "repos/${{ github.repository }}/commits/$sha/pulls" \
+              -q '.[].number' 2>/dev/null >> /tmp/pr-numbers.txt || true
+          done
+          sort -u -n /tmp/pr-numbers.txt -o /tmp/pr-numbers.txt
+          echo "found $(wc -l < /tmp/pr-numbers.txt) PRs in $RANGE"
+
+          # Fetch each PR's title/body/labels, then compose. jq -s folds the stream into an array.
+          : > /tmp/prs.ndjson
+          while read -r n; do
+            [ -n "$n" ] || continue
+            gh api "repos/${{ github.repository }}/pulls/$n" \
+              -q '{number:.number,title:.title,body:(.body // ""),labels:[.labels[].name]}' \
+              >> /tmp/prs.ndjson
+          done < /tmp/pr-numbers.txt
+          jq -s '.' /tmp/prs.ndjson > /tmp/prs.json
+          GENERATED="$(uv run python scripts/release_notes.py < /tmp/prs.json)"
           {
             echo "Built from $(git rev-parse --short=12 HEAD). Version binds to this hash:"
             echo "\`keel --version\` reports \`keel ${{ inputs.version }}+$(git rev-parse --short=12 HEAD) [release]\`."
@@ -139,6 +166,18 @@ jobs:
             echo "someone else's package. A build reporting **DIRTY** or **[checkout]** is not this"
             echo "release and must not be run against live funds."
             echo
+            echo "## Configure"
+            echo
+            echo "\`config.yaml\` is attached to this release: the production config, in"
+            echo "\`auto_trade.mode: confirm\` — keel previews every order and waits for your"
+            echo "approval. Drop it beside the install (or run \`keel init-config --live\`), put"
+            echo "your CDP key in a git-ignored \`.env\`, then:"
+            echo
+            echo '    keel migrate     # existing database: apply schema migrations'
+            echo '    keel init        # fresh deployment: write config + seed candidate rules'
+            echo
+            echo "Seeded rules start as \`candidate\` and trade nothing until you promote them."
+            echo
             echo "$GENERATED"
           } > /tmp/release-notes.md
           echo "composed $(wc -l < /tmp/release-notes.md) lines of notes"
@@ -147,7 +186,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ inputs.version }}" dist/* \
+          # dist/* = every workspace wheel; config.yaml = the confirm-mode production config.
+          gh release create "v${{ inputs.version }}" dist/* config.yaml \
             --title "keel v${{ inputs.version }}" \
             --notes-file /tmp/release-notes.md
           echo "published v${{ inputs.version }}"

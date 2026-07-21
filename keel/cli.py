@@ -273,6 +273,118 @@ def cli(
     ctx.obj["verbose"] = verbose
 
 
+# -- init (scaffold a working directory) ----------------------------------------------------
+
+
+def _template_config_text(live: bool = False) -> str:
+    """A config.yaml template shipped inside the wheel (see pyproject `artifacts`).
+
+    `live=False` returns the dev template (`mode: paper` -- places nothing). `live=True` returns
+    the production template (`mode: confirm` -- previews every order and waits for approval),
+    which is also the `config.yaml` attached to a GitHub Release.
+    """
+    from importlib.resources import files
+
+    name = "config.live.yaml" if live else "config.yaml"
+    return (files("keel.templates") / name).read_text(encoding="utf-8")
+
+
+@cli.command("init-config")
+@click.option(
+    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    help="Where to write the config file.",
+)
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
+@click.option(
+    "--live",
+    is_flag=True,
+    default=False,
+    help="Write the PRODUCTION template (mode: confirm) instead of the dev one (mode: paper).",
+)
+def init_config(config_path: str, force: bool, live: bool) -> None:
+    """Write a default `config.yaml` into the current directory, ready to edit.
+
+    The installed wheel ships both templates so a fresh working directory has a config to start
+    from -- edit `allowlist`, `caps`, and `auto_trade.mode` before running anything live.
+
+    `--live` writes the same production config that is attached to a GitHub Release: real
+    allowlist/caps in `mode: confirm`, which previews every order and waits for your approval.
+    Without it you get the dev template in `mode: paper`, which places nothing at all.
+    """
+    path = Path(config_path)
+    if path.exists() and not force:
+        raise click.ClickException(f"{path} already exists; pass --force to overwrite")
+    path.write_text(_template_config_text(live=live), encoding="utf-8")
+    which = "production/confirm" if live else "dev/paper"
+    click.echo(f"wrote {path} [{which}]. Review allowlist/caps/auto_trade before going live.")
+
+
+@cli.command("init")
+@click.option(
+    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    help="Config file to write.",
+)
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
+@click.pass_context
+def init_cmd(ctx: click.Context, config_path: str, force: bool) -> None:
+    """Scaffold a working directory: write `config.yaml`, then seed the rules table (candidates).
+
+    A convenience for a fresh install -- equivalent to `keel init-config` followed by
+    `keel rules seed`. Seeds `candidate` rules only; promoting to paper/live is a separate,
+    deliberate step.
+    """
+    ctx.invoke(init_config, config_path=config_path, force=force)
+    ctx.invoke(rules_seed, products=None, kinds=None, force=False, status="candidate")
+
+
+# -- migrate (schema evolution for an EXISTING database) -------------------------------------
+
+
+def _current_schema_version(conn: Any) -> int:
+    """The stored schema version, or 0 when the database has no schema at all yet."""
+    present = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    if present is None:
+        return 0
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    return int(row["version"]) if row is not None else 0
+
+
+@cli.command("migrate")
+@click.option(
+    "--db",
+    "db_override",
+    default=None,
+    help="Database file to migrate (default: the global --db / keel.db).",
+)
+@click.pass_context
+def migrate_cmd(ctx: click.Context, db_override: str | None) -> None:
+    """Apply outstanding schema migrations to an existing database (idempotent, schema-only).
+
+    This is the counterpart to `keel init`, and the two are deliberately NOT the same thing:
+
+    * `keel init` bootstraps a FRESH deployment -- it writes a config and seeds the strategy
+      (rules) library as `candidate`s.
+    * `keel migrate` evolves the SCHEMA of an EXISTING database and **never seeds**. Re-seeding
+      on migrate would resurrect rules that were deliberately deleted or refuted.
+
+    Runs `keel.data.db.migrate`, which steps the stored `schema_version` up incrementally and is
+    safe to call repeatedly. No network, no authz gate, no orders -- safe against a live database.
+    """
+    path = db_override or ctx.obj["db_path"]
+    conn = connect(path)
+
+    before = _current_schema_version(conn)
+    migrate(conn)
+    after = _current_schema_version(conn)
+
+    if after > before:
+        click.echo(f"migrated {path}: schema {before} -> {after}")
+    else:
+        click.echo(f"{path}: already at schema {after}, nothing to do")
+
+
 # -- db import ------------------------------------------------------------------------------
 
 
@@ -1322,6 +1434,14 @@ def _json_plain(value: Any) -> Any:
     help="Comma-separated rule kinds (default: every kind in agent.RULE_REGISTRY).",
 )
 @click.option(
+    "--status",
+    type=click.Choice(["candidate", "paper", "live"]),
+    default="candidate",
+    show_default=True,
+    help="Status to seed at. `live` bypasses the promotion gate -- for the supervised "
+    "live-order test only (see the go-live runbook).",
+)
+@click.option(
     "--force",
     is_flag=True,
     default=False,
@@ -1329,7 +1449,13 @@ def _json_plain(value: Any) -> Any:
 )
 @click.pass_context
 @with_disclaimer
-def rules_seed(ctx: click.Context, products: str | None, kinds: str | None, force: bool) -> None:
+def rules_seed(
+    ctx: click.Context,
+    products: str | None,
+    kinds: str | None,
+    force: bool,
+    status: str = "candidate",
+) -> None:
     """Seed the `rules` table with one `candidate` rule per (kind, product) pair (Issue #81).
 
     The `rules` table starts out empty and nothing else populates it -- with zero rows,
@@ -1387,10 +1513,16 @@ def rules_seed(ctx: click.Context, products: str | None, kinds: str | None, forc
             rule = rule_cls(product_id=product)
             params = _json_plain(rule.describe()["params"])
             params["product_id"] = product
-            repo.insert_rule(kind, params, status="candidate", now_ts=now_ts)
+            repo.insert_rule(kind, params, status=status, now_ts=now_ts)
             seeded.append(label)
 
-    click.echo(f"seeded={len(seeded)} skipped={len(skipped)}")
+    click.echo(f"seeded={len(seeded)} skipped={len(skipped)} status={status}")
+    if status == "live":
+        click.echo(
+            "⚠️  seeded at LIVE status, bypassing the promotion gate. This is for the "
+            "supervised live-order test only -- the agent will act on these (still confirm-"
+            "gated and rail-guarded). Do not leave live-seeded rules in place afterwards."
+        )
     for label in seeded:
         click.echo(f"  seeded: {label}")
     for label in skipped:
