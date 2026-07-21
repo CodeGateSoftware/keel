@@ -90,7 +90,7 @@ Changed" list of PR titles, which is fine. With them, PRs are grouped into secti
 | `bug`, `fix` | Fixes |
 | `compliance`, `rails` | Compliance & rails |
 | `research`, `experiment` | Research & validation |
-| `docs`, `ci`, `tooling` | Docs, CI & tooling |
+| `docs`, `documentation`, `ci`, `tooling` | Docs, CI & tooling |
 | `breaking` | ⚠️ Breaking changes |
 | `norelease` | *excluded from notes* |
 

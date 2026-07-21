@@ -18,7 +18,7 @@ changelog:
     - title: Research & validation
       labels: [research, experiment]
     - title: Docs, CI & tooling
-      labels: [docs, ci, tooling]
+      labels: [docs, documentation, ci, tooling]
     # Catch-all LAST so a labelled PR never lands here by accident.
     - title: Other changes
       labels: ["*"]
