@@ -48,7 +48,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install   # version comes from .python-version; never pin it here twice
 
       - name: Sync dependencies
         run: uv sync --all-extras --dev
@@ -83,7 +83,11 @@ jobs:
       - name: Verify the artifact identifies itself
         run: |
           set -euo pipefail
-          python -m venv /tmp/verify
+          # Must be the PINNED interpreter, not the runner's default `python`. The wheel
+          # carries `Requires-Python: >=3.14.4`, and pip enforces that even for an explicit
+          # local wheel path -- a default-python venv fails here with "requires a different
+          # Python". --seed provides the pip that the install below uses.
+          uv venv --seed --python "$(cat .python-version)" /tmp/verify
           # Install by explicit PATH, never by name. The name `keel` belongs to an unrelated
           # project on PyPI, so a name-based install can silently fetch a stranger's package --
           # unacceptable for a tool that places orders. --find-links resolves the workspace
