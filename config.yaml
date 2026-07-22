@@ -23,7 +23,7 @@ caps:
   # set explicit values here only if you want an extra per-order/per-day risk ceiling tighter
   # than the exposure/concentration caps below. Left at their non-binding default here so
   # risk-sized rule orders ($400-24k typical) aren't silently rejected.
-  max_exposure_usd: 5000
+  max_exposure_usd: 25
   max_per_asset_pct: 0.50
 
 market_data:
@@ -34,7 +34,7 @@ market_data:
   history_days: 365
 
 auto_trade:
-  mode: paper
+  mode: confirm
   # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
   # true or false changes nothing. Use `keel kill` to halt trading.
   enabled: false
@@ -58,7 +58,7 @@ money_mgmt:
   streak_cooloff_days: 0
 
 dca:
-  budget_usd: 50
+  budget_usd: 5
   cadence_days: 7
 
 # quote-currency the executor draws BUY notional from (rail 13, USDC-funding) -- never bank/ACH.
