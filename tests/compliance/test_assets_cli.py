@@ -256,3 +256,315 @@ def test_a_failed_probe_reads_as_UNKNOWN_not_as_a_rejection(
     sol_line = next(ln for ln in result.output.splitlines() if "SOL-USDC" in ln)
     assert "?" in sol_line
     assert "NO" not in sol_line
+
+
+# -- assets holdings: the user's own broker balances as a candidate SOURCE ------
+#
+# A source, not a gate. Holding an asset is not a reason to trade it, so this command admits
+# nothing and writes nothing -- it routes the user's balances through the SAME screen.
+
+
+class _FakeBroker:
+    """Duck-types the bits of CoinbaseClient this command uses."""
+
+    def __init__(self, accounts, fail=False):
+        self._accounts = accounts
+        self._fail = fail
+        self.calls = 0
+
+    def get_accounts(self):
+        self.calls += 1
+        if self._fail:
+            raise RuntimeError("venue unreachable")
+        return self._accounts
+
+
+def _account(currency, balance):
+    return {
+        "uuid": f"u-{currency}",
+        "currency": currency,
+        "available_balance": Decimal(balance),
+        "default": False,
+        "active": True,
+    }
+
+
+def _with_broker(monkeypatch, broker):
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+
+
+def _holdings(db_path, config_path, *extra):
+    return CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "assets", "holdings", *extra],
+    )
+
+
+def test_holdings_lists_what_the_user_holds(tmp_path, valid_config_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5"), _account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "BTC" in result.output and "SOL" in result.output
+
+
+def test_holdings_excludes_the_settlement_currency_and_fiat(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """You cannot trade the currency you settle in; listing it as a candidate is noise."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(
+        monkeypatch,
+        _FakeBroker([_account("BTC", "0.5"), _account("USDC", "500"), _account("USD", "100")]),
+    )
+
+    result = _holdings(db_path, valid_config_path)
+
+    holding_lines = [ln for ln in result.output.splitlines() if ln.startswith("  ")]
+    assets_listed = {ln.split()[0] for ln in holding_lines if ln.split()}
+    assert "BTC" in assets_listed
+    assert "USDC" not in assets_listed, "cannot trade the currency you settle in"
+    assert "USD" not in assets_listed, "fiat is funding, not a position"
+
+
+def test_holdings_filters_dust_by_min_balance(tmp_path, valid_config_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5"), _account("XLM", "0.00001")]))
+
+    result = _holdings(db_path, valid_config_path, "--min-balance", "0.001")
+
+    assert "BTC" in result.output
+    assert "XLM" not in result.output
+
+
+def test_a_HELD_but_unattested_asset_is_still_REJECTED(tmp_path, valid_config_path, monkeypatch):
+    """The point of the whole feature: owning it changes nothing about admission."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "SOL-USD")  # perfect market data...
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert result.exit_code == 0, result.output
+    assert "REJECT" in result.output
+    assert "attestation: MISSING" in result.output
+
+
+def test_holdings_screen_agrees_with_assets_screen_for_the_same_asset(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """One gate, shared by construction -- a proposer must not get a laxer path."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5")]))
+
+    screened = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+    held = _holdings(db_path, valid_config_path, "--screen")
+
+    # Assert the verdict POSITIVELY -- `x in a == x in b` also passes when both are False, or
+    # when holdings prints ADMIT unconditionally.
+    assert "ADMIT" in screened.output
+    assert "ADMIT" in held.output
+
+
+def test_no_local_history_is_reported_as_MISSING_DATA_not_a_bad_asset(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The likeliest misreading: a rejection for zero cached bars says nothing about the asset."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # no candles seeded at all
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "no local history" in result.output
+    assert "keel fetch" in result.output
+
+
+def test_holdings_writes_nothing(tmp_path, valid_config_path, monkeypatch):
+    """A read-only report: no attestation, no allowlist change, no DB mutation."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "SOL-USD")
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    _holdings(db_path, valid_config_path, "--screen")
+
+    assert repo.get_asset_attestations() == []
+    assert _repo_at(db_path).get_asset_attestation("SOL") is None
+
+
+def test_a_broker_failure_is_an_ERROR_not_an_empty_clean_result(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """An unreachable venue must not read as 'you hold nothing suspicious'."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([], fail=True))
+
+    result = _holdings(db_path, valid_config_path)
+
+    assert result.exit_code != 0
+    assert "unreachable" in result.output.lower() or "error" in result.output.lower()
+
+
+def test_holdings_marks_assets_already_on_the_allowlist(
+    tmp_path, valid_config_path, monkeypatch
+):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5"), _account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    btc_line = next(ln for ln in result.output.splitlines() if ln.strip().startswith("BTC"))
+    sol_line = next(ln for ln in result.output.splitlines() if ln.strip().startswith("SOL"))
+    # "not-on-allowlist" CONTAINS "on-allowlist", so the negative must be excluded explicitly --
+    # asserting the substring alone passes even if the check is inverted.
+    assert "on-allowlist" in btc_line and "not-on-allowlist" not in btc_line
+    assert "not-on-allowlist" in sol_line
+
+
+def test_holdings_screen_does_not_DROP_compliance_warnings(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`ScreenResult.warnings` carry constraints that bind even on an ADMITted asset (§65.5's
+    bay' al-sarf regime for gold/silver backing). Dropping them made this command quietly less
+    informative than `assets screen` for the very same asset."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD")
+    runner = CliRunner()
+    assert _attest(
+        runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}
+    ).exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("PAXG", "3")]))
+
+    screened = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    held = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "bay' al-sarf" in screened.output, "fixture no longer triggers the warning"
+    assert "bay' al-sarf" in held.output, "holdings dropped a compliance warning"
+
+
+def test_derivative_failures_are_not_asserted_as_verdicts_without_history(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """With zero cached bars, liquidity and settlement report on our DATA, not the asset:
+    median volume is 0 because there are no bars. Printing them as findings would assert
+    exactly what the missing-data message exists to deny."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "no local history" in result.output
+    assert "✗ settlement" not in result.output, "settlement is a naming artifact here"
+    assert "✗ liquidity" not in result.output, "median volume is 0 only because bars are 0"
+    assert "not assessable without history" in result.output
+    assert "✗ history" in result.output  # the REAL, primary finding stays
+
+
+def test_a_lowercase_settlement_currency_is_still_excluded(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A casing accident must not present the currency you settle in as tradable."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("btc", "0.5"), _account("usdc", "500")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    listed = {ln.split()[0].upper() for ln in result.output.splitlines() if ln.startswith("  ")}
+    assert "USDC" not in listed
+    assert "BTC" in listed
+
+
+def test_min_balance_rejects_garbage_and_non_finite_values(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A NaN floor makes every comparison raise; a negative one lists every zero balance."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5")]))
+
+    for bad in ("abc", "nan", "-1", "inf"):
+        result = _holdings(db_path, valid_config_path, "--min-balance", bad)
+        assert result.exit_code != 0, f"--min-balance {bad} should be rejected: {result.output}"
+
+
+def test_the_derived_failure_tags_actually_match_screen_asset_output():
+    """Pins the string coupling that the zero-bars suppression depends on.
+
+    `assets holdings` suppresses derivative failures by matching `failure.split(":")[0]` against
+    `_DATA_DERIVED_FAILURES`. Renaming a tag in `screen_asset` would silently stop the
+    suppression -- reintroducing 'data artifacts printed as verdicts about the asset' with a
+    fully green suite. This asserts the tags are real.
+    """
+    from keel.compliance import screen as screen_mod
+
+    facts = screen_mod.MarketFacts(
+        asset="SOL",
+        daily_bars=0,
+        median_daily_volume=Decimal(0),
+        quotable_in_settlement_currency=False,
+    )
+    tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
+
+    missing = cli_module._DATA_DERIVED_FAILURES - tags
+    assert not missing, (
+        f"{missing} no longer appear as failure tags in screen_asset -- the holdings "
+        "suppression is now silently inert; update _DATA_DERIVED_FAILURES"
+    )
+
+
+def test_a_lowercase_holding_is_screened_as_the_attested_uppercase_asset(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A `btc` balance must not read as UNATTESTED while `BTC` is attested, nor be handed a
+    `btc-USD` fetch hint that will never resolve."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("btc", "0.5")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "UNATTESTED" not in result.output
+    assert "btc-USD" not in result.output
+    assert "ADMIT" in result.output
+
+
+def test_an_account_with_no_currency_field_does_not_crash(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`CoinbaseClient.get_accounts` defaults a missing currency to None."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    broken = {"uuid": "u", "currency": None, "available_balance": Decimal("1"), "active": True}
+    _with_broker(monkeypatch, _FakeBroker([broken, _account("BTC", "0.5")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "BTC" in result.output
