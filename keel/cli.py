@@ -669,8 +669,11 @@ def _history_product(asset: str, quote: str) -> str:
     return f"{asset}-{quote.upper()}"
 
 
-# Failure classes that are DOWNSTREAM of having no cached history: with zero bars they report
-# on our data, not on the asset, so `assets holdings` must not print them as verdicts.
+# Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
+# reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
+# `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
+# compares the product's quote leg to the settlement currency and never touches candles, so it
+# stays a real, assessable verdict even with zero bars.
 # `settlement` is deliberately NOT here: since it compares the product's quote leg to the
 # configured settlement currency it no longer touches candles at all, so it is fully assessable
 # with zero bars -- suppressing it would hide a real, actionable failure.
@@ -1317,7 +1320,7 @@ def monitor(
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
     broker = _build_broker(config)
-    products = [f"{asset}-USD" for asset in config.allowlist]
+    products = _default_sim_products(config)
     granularities = list(config.market_data.granularities)
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
 
@@ -1682,7 +1685,8 @@ def _json_plain(value: Any) -> Any:
 @click.option(
     "--products",
     default=None,
-    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+    help="Comma-separated product ids (default: the allowlist, in the configured "
+    "settlement currency).",
 )
 @click.option(
     "--kinds",
@@ -2051,7 +2055,8 @@ def _default_report_path(now_ts: int) -> Path:
 @click.option(
     "--products",
     default=None,
-    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+    help="Comma-separated product ids (default: the allowlist, in the configured "
+    "settlement currency).",
 )
 @click.option(
     "--contribution",

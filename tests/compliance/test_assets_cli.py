@@ -568,3 +568,49 @@ def test_an_account_with_no_currency_field_does_not_crash(
 
     assert result.exit_code == 0, result.output
     assert "BTC" in result.output
+
+
+# -- product ids derive from the configured settlement currency ----------------
+
+
+def test_product_ids_derive_from_the_configured_settlement_currency(tmp_path):
+    """Regression for the legacy-config break: hardcoding `-USD` here while the settlement check
+    compared against config made every `quote_currency: USDC` deployment reject every asset on a
+    settlement failure it could never fix. Both derivations must share one source."""
+    from keel.cli import _default_sim_products, _history_product
+    from keel.config import load_config
+    from tests.conftest import VALID_CONFIG_YAML
+
+    assert _history_product("BTC", "USD") == "BTC-USD"
+    assert _history_product("BTC", "usdc") == "BTC-USDC"
+
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text(VALID_CONFIG_YAML.replace("quote_currency: USD", "quote_currency: USDC"))
+    assert all(p.endswith("-USDC") for p in _default_sim_products(load_config(str(legacy))))
+
+    default = tmp_path / "default.yaml"
+    default.write_text(VALID_CONFIG_YAML)
+    assert all(p.endswith("-USD") for p in _default_sim_products(load_config(str(default))))
+
+
+def test_the_settlement_criterion_still_catches_an_EXTERNALLY_supplied_product(
+    tmp_path, valid_config_path
+):
+    """Honesty about what this criterion does. For a product WE derive it is true by
+    construction. It is not dead: it catches a product supplied from outside that derivation --
+    `--products`, or a future venue/LLM-sourced list -- whose quote leg would need a second
+    exchange leg (a cross) to settle. That is the §65.7 case it exists for."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-EUR")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-EUR"],   # settlement is USD
+    )
+
+    assert "settlement" in result.output, "a cross-settled product must fail the settlement check"
+    assert "REJECT" in result.output

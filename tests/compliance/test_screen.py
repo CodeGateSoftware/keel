@@ -232,3 +232,15 @@ def test_discovery_proposes_but_never_admits():
     (candidate,) = discover_candidates([_product()])
     result = screen_asset(_facts(asset=candidate.asset), None)
     assert result.admitted is False
+
+
+def test_discovery_matches_the_quote_currency_case_insensitively():
+    """`quote_currency: usd` must not silently propose nothing while the screen accepts the same
+    product -- the two comparisons have to agree."""
+    from keel.compliance.screen import DiscoveryPolicy, discover_candidates
+
+    lowercase_venue = _product(pid="SOL-USD", quote="usd")
+    assert discover_candidates([lowercase_venue]), "lowercase venue quote id dropped everything"
+    assert discover_candidates(
+        [_product(pid="SOL-USD", quote="USD")], DiscoveryPolicy(quote_currency="usd")
+    ), "lowercase configured quote currency dropped everything"

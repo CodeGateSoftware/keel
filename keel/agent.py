@@ -278,6 +278,14 @@ def _mark_to_market_equity(
     than on a loss. That is why this iterates `products` and not `price_by_product` -- a product
     missing from the price map is exactly the case the fallback exists for.
 
+    ⚠️ **Balances are summed at face value, with NO FX conversion.** That is correct for the
+    supported case -- one settlement currency, whose products all share that quote leg -- and it
+    is why `config.quote_currency` and the products' legs should agree. An account mixing, say,
+    USD and EUR would have them added 1:1 and over-read equity, which (the HWM being monotonic)
+    would arm rail 11 permanently. Reaching that state needs a product whose quote leg differs
+    from the settlement currency, which the admission screen rejects; a live-seeded rule can
+    bypass admission, so this is recorded as a known bound rather than claimed impossible.
+
     Settled cash is summed across EVERY currency in play: `quote_currency` plus the quote leg of
     each product being valued. Counting only the configured currency under-reads an account whose
     cash sits in what its products actually settle in (a `BTC-USD` deployment configured for

@@ -1263,3 +1263,24 @@ def test_equity_counts_settled_cash_in_EVERY_quote_leg_being_traded(repo):
     assert equity >= Decimal("1000"), (
         f"equity {equity} ignored the USD cash that funds BTC-USD orders"
     )
+
+
+def test_equity_is_a_total_when_only_SOME_currencies_are_readable(repo):
+    """`None` means 'equity is unknowable', reserved for when NOTHING is readable. A currency the
+    account simply has no wallet for must contribute nothing, not void the whole reading -- that
+    would return None on a perfectly ordinary account and stall rail 11's equity tracking."""
+
+    class OnlyUsd:
+        def get_accounts(self):
+            return [{"currency": "USD", "available_balance": Decimal("1000")}]
+
+    equity = agent._mark_to_market_equity(repo, OnlyUsd(), ["BTC-USD"], {}, "USDC")
+    assert equity == Decimal("1000"), f"expected a total, got {equity!r}"
+
+
+def test_equity_is_None_only_when_NOTHING_is_readable(repo):
+    class NoAccounts:
+        def get_accounts(self):
+            return []
+
+    assert agent._mark_to_market_equity(repo, NoAccounts(), ["BTC-USD"], {}, "USDC") is None
