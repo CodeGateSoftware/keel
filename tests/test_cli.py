@@ -21,7 +21,8 @@ from click.testing import CliRunner
 
 import keel.cli as cli_module
 from keel.agent import RULE_REGISTRY, _build_rule
-from keel.cli import DISCLAIMER, cli
+from keel.cli import cli
+from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
@@ -967,7 +968,9 @@ _HALT_COMMANDS = (
 
 
 def _at_a_terminal(monkeypatch, yes: bool = True) -> None:
-    monkeypatch.setattr(cli_module, "_is_interactive", lambda: yes)
+    # The TTY predicate lives in keel.commands._common; _require_interactive_confirmation
+    # calls it there, so patch it at its definition (see that module's docstring).
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: yes)
 
 
 def test_halt_commands_proceed_on_a_typed_yes(tmp_path, monkeypatch):

@@ -32,22 +32,28 @@ turning autonomy off binds on the next cycle. It changes who is asked, never wha
 deliberately no env-var or flag override -- any such seam would be settable from cron and would
 defeat every fail-closed built on it. Tests patch the predicate.
 
-**Disclaimer.** Every command prints the halal + not-financial/religious-advice disclaimer
-footer (`with_disclaimer`, a decorator applied to every command's callback) -- always, even when
-the command errors out or is refused at a confirmation prompt.
+**Disclaimer.** The money-touching and dangerous commands print the halal + not-financial/
+religious-advice disclaimer footer via the `with_disclaimer` decorator on their callback --
+always, even when the command errors out or is refused at a confirmation prompt. (Pure-reporting
+commands such as `trials *`, `withdrawals show` and `assets list` deliberately omit it.)
 
 **No live network in tests.** `_build_broker` is the one seam that would construct a real
 `CoinbaseClient` (from `.env` secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
 to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker`.
+
+**Module layout.** This file is the composition root: it defines the root `cli` group, the
+broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
+`_build_broker` seam, and the remaining top-level commands. The broker-free command groups live
+in `keel/commands/*` and are registered here via `cli.add_command(...)`: `db`, `trials`,
+`withdrawals`, `autonomy`, `rules`, `subscription`. The shared seams (`with_disclaimer`, the
+confirmation gate, `_open_repo`/`_load_cfg`/`_build_broker`) live in `keel.commands._common` and
+are re-imported here; `_is_interactive` is reached as `_common._is_interactive()` so a single
+patch point in `keel.commands._common` drives every gate wherever its command is defined.
 """
 
 from __future__ import annotations
 
-import functools
-import json
-import sys
 import time
-from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -55,161 +61,46 @@ from typing import Any
 
 import click
 from keel_core.products import quote_currency_of
-from keel_core.subscription import BrokerSubscription, SubscriptionStatus
-from keel_core.telemetry import bind_venue
 
 from keel import agent
 from keel.analysis import pnl as pnl_analysis
+from keel.commands import _common
+from keel.commands._common import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_DB_PATH,
+    _build_broker,
+    _load_cfg,
+    _open_repo,
+    _require_interactive_confirmation,
+    with_disclaimer,
+)
+from keel.commands._products import _default_sim_products, _history_product
+from keel.commands.autonomy import autonomy_group
+from keel.commands.db import db_group
+from keel.commands.rules import rules_group, rules_seed
+from keel.commands.subscription import subscription_group
+from keel.commands.trials import trials_group
+from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
-from keel.config import Config, load_config
+from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
 from keel.data import market_feed
 from keel.data import repair as repair_mod
-from keel.data.csv_import import import_dir
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
-from keel.execution import executor
-from keel.execution.guards import DEFAULT_VENUE
-from keel.logging_setup import configure_logging
-from keel.research import cscv as cscv_mod
-from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
-from keel.research import matrix as matrix_mod
 from keel.sim import artifact as artifact_mod
 from keel.sim import benchmark as benchmark_mod
 from keel.sim import metrics as metrics_mod
 from keel.sim import portfolio_sim
 from keel.sim import report as report_mod
 from keel.sim import tiers as tiers_mod
-from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Candle, Granularity
 from keel.version import build_info
-
-DISCLAIMER = (
-    "keel is a personal tool, not financial advice and not religious (Shariah) advice. "
-    "Consult a qualified financial advisor and a knowledgeable scholar before trading. "
-    "You are solely responsible for your own trading decisions."
-)
-
-#: Upper bound on `keel autonomy on --for-hours` (1 year). Guards against inf/nan/overflow
-#: and against a "window" so long it is indistinguishable from no expiry at all.
-_MAX_AUTONOMY_HOURS = 8760.0
-#: One second. Below this the window rounds to zero and we would write an already-lapsed row
-#: while printing "autonomy ON until ..." -- fails safe, but the message would be a lie.
-_MIN_AUTONOMY_HOURS = 1.0 / 3600.0
-
-DEFAULT_DB_PATH = "keel.db"
-DEFAULT_CONFIG_PATH = "config.yaml"
-
-# The dangerous-action names this CLI's gated commands map to (see module docstring).
-
-# `rules demote` steps a rule back one lifecycle stage; `disabled` is terminal (see
-# `strategy.promotion`'s own `_PROMOTE_NEXT` docstring) and so is not a demote target.
-_DEMOTE_PREV: dict[str, str] = {"live": "paper", "paper": "candidate"}
-
-
-# -- disclaimer -------------------------------------------------------------------------------
-
-
-def _print_disclaimer() -> None:
-    click.echo("")
-    click.echo(DISCLAIMER)
-
-
-def with_disclaimer(f: Any) -> Any:
-    """Print the disclaimer footer after `f` runs, whether it succeeds, errors, or aborts."""
-
-    @functools.wraps(f)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return f(*args, **kwargs)
-        finally:
-            _print_disclaimer()
-
-    return wrapper
-
-
-# -- interactive confirmation (no interactive hangs under CliRunner) -----------------------------
-
-
-def _is_interactive() -> bool:
-    """True when a human is at a terminal.
-
-    Deliberately has NO env-var or flag override: any such seam would be settable from cron and
-    would defeat the fail-closed behaviour of every gate built on it. Tests patch this predicate.
-    """
-    return sys.stdin is not None and sys.stdin.isatty()
-
-
-def _require_interactive_confirmation(action: str, detail: str) -> None:
-    """Demand an explicit typed `yes` from a human at a terminal before a dangerous action.
-
-    This replaces the former scrypt passphrase gate. Once placing a real, money-spending order
-    needs only a typed confirmation, requiring a remembered secret to release a safety halt is
-    ceremony without a matching threat model -- on a single-user machine the honest boundary is
-    the OS account, as the old gate's own docstring conceded. One rule ("dangerous actions need a
-    human at a terminal; nothing needs a stored secret") is easier to reason about and to audit.
-
-    Demands the full word `yes` rather than a bare `y`: these actions are rarer and heavier than
-    an order confirmation. **Fails closed off a TTY**, so cron jobs, pipes and scripts can never
-    release a halt.
-    """
-    if not _is_interactive():
-        raise click.ClickException(
-            f"refusing to {action}: this needs confirmation from an interactive terminal."
-        )
-    click.echo(f"About to {action}.")
-    click.echo(f"  {detail}")
-    if click.prompt('Type "yes" to confirm', default="", show_default=False).strip() != "yes":
-        raise click.ClickException("aborted (confirmation not given).")
-
-
-# -- DB / config / broker construction ---------------------------------------------------------
-
-
-def _open_repo(ctx: click.Context) -> Repository:
-    conn = connect(ctx.obj["db_path"])
-    migrate(conn)
-    return Repository(conn)
-
-
-def _load_cfg(ctx: click.Context) -> Config:
-    """Load `config.yaml` and wire up engine-activity logging from it.
-
-    `--verbose`/`-v` on the root `cli` group (`ctx.obj["verbose"]`) overrides
-    `config.logging.verbose` to `True` before `configure_logging` is called, so the flag always
-    wins over whatever `config.yaml` says. Every command that loads config (agent/monitor/
-    simulate/etc.) gets logging configured this way, right when the config it's built from
-    becomes available.
-    """
-    config = load_config(ctx.obj["config_path"])
-    if ctx.obj.get("verbose"):
-        config = replace(config, logging=replace(config.logging, verbose=True))
-    configure_logging(config.logging)
-    # Spec §10.2 names `venue` a stable field on every event. Bound once here, at the one
-    # process entry point, rather than passed into ~26 `log_event` call sites -- the engine is
-    # single-venue today, so threading a constant through every payload would mean revisiting
-    # all of them again the moment it stops being one. A process driving several venues rebinds
-    # per cycle instead; nothing else changes.
-    bind_venue(DEFAULT_VENUE)
-    return config
-
-
-def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only against fakes
-    """Construct the real, network-talking `CoinbaseClient`. Tests monkeypatch this function."""
-    from coinbase.rest import RESTClient
-
-    from keel.config import load_secrets
-    from keel.data.cb_client import CoinbaseClient
-
-    secrets = load_secrets()
-    transport = RESTClient(api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"))
-    return CoinbaseClient(transport)
-
 
 # -- root group ---------------------------------------------------------------------------------
 
@@ -387,23 +278,8 @@ def migrate_cmd(ctx: click.Context, db_override: str | None) -> None:
 
 # -- db import ------------------------------------------------------------------------------
 
-
-@cli.group("db")
-def db_group() -> None:
-    """Local data import/maintenance commands."""
-
-
-@db_group.command("import")
-@click.argument("dir_path", type=click.Path(exists=True, file_okay=False))
-@click.pass_context
-@with_disclaimer
-def db_import(ctx: click.Context, dir_path: str) -> None:
-    """Import every `*.csv` Coinbase export in DIR_PATH (read-only w.r.t. the exchange)."""
-    repo = _open_repo(ctx)
-    result = import_dir(dir_path, repo)
-    click.echo(f"imported={result.imported} skipped={result.skipped}")
-    for warning in result.warnings:
-        click.echo(f"  warning: {warning}")
+# The `db` group is defined in `keel.commands.db`; register it here.
+cli.add_command(db_group)
 
 
 # -- fetch ----------------------------------------------------------------------------------
@@ -655,18 +531,6 @@ def _screen_product(
         else None
     )
     return facts, screen_mod.screen_asset(facts, attestation)
-
-
-def _history_product(asset: str, quote: str) -> str:
-    """The product id for an asset, in the deployment's settlement currency.
-
-    ONE source of truth, shared with `_default_sim_products`. Hardcoding `-USD` here while the
-    screen compared against `config.quote_currency` is what let a `quote_currency: USDC` config
-    reject every asset on a settlement failure it could never fix -- a default change does not
-    change configs already on disk. Deriving both from the same setting means the worst case is
-    an honest "no local history, run `keel fetch`", not a silent unfixable rejection.
-    """
-    return f"{asset}-{quote.upper()}"
 
 
 # Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
@@ -972,72 +836,13 @@ def assets_list(ctx: click.Context) -> None:
         )
 
 
-@cli.group("withdrawals")
-def withdrawals_group() -> None:
-    """Withdrawal-capability attestation -- rail 17's input (KB §65.4 qabd/possession)."""
+# -- withdrawals ------------------------------------------------------------------------------
+
+# The `withdrawals` group is defined in `keel.commands.withdrawals`; register it here.
+cli.add_command(withdrawals_group)
 
 
-@withdrawals_group.command("attest")
-@click.option(
-    "--enabled/--suspended",
-    "enabled",
-    required=True,
-    help="Are BTC/ETH/PAXG/USDC balances withdrawable on demand right now?",
-)
-@click.pass_context
-@with_disclaimer
-def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
-    """Attest the account's current withdrawal state.
-
-    Under §65.4 possession (`qabd`) holds only while "there is nothing to prevent the buyer from
-    taking physical possession whenever he desires". An asset we cannot withdraw is an asset we
-    may not validly possess -- so rail 17 halts new ENTRIES when this is suspended or unknown.
-
-    **Asymmetric, like `autonomy`.** `--suspended` only ever REDUCES capability and is ungated,
-    usable from anywhere. `--enabled` RELEASES a rail-17 entry halt, so it demands a typed `yes`
-    at a terminal exactly like `resume`/`resume-entries`/`record-flow`/`reset-hwm`.
-
-    That gate used to be unnecessary for a reason that no longer holds: this command was
-    justified by "the confirm gate and the bypass-arm token still sit in front of it". The
-    bypass-arm token no longer exists, and with `keel autonomy on` the confirm gate is not there
-    either -- so without this, a cron line could clear a rail-17 halt and the next cycle would
-    place live orders with no human anywhere in the loop.
-    """
-    repo = _open_repo(ctx)
-    if enabled:
-        _require_interactive_confirmation(
-            "attest withdrawals as ENABLED",
-            "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle.",
-        )
-    now_ts = int(time.time())
-    repo.set_state("withdrawals_enabled", bool(enabled))
-    repo.set_state("withdrawals_attested_at", now_ts)
-    ttl_days = executor.WITHDRAWAL_ATTESTATION_TTL_SEC // 86400
-    state = "ENABLED" if enabled else "SUSPENDED"
-    click.echo(f"withdrawals attested {state}; expires in {ttl_days} days")
-    if not enabled:
-        click.echo("new ENTRIES are now halted (rail 17). Exits are deliberately unaffected.")
-
-
-@withdrawals_group.command("show")
-@click.pass_context
-def withdrawals_show(ctx: click.Context) -> None:
-    """Show the current attestation and whether it is still fresh."""
-    repo = _open_repo(ctx)
-    now_ts = int(time.time())
-    resolved = executor._withdrawals_enabled(repo, now_ts)
-    attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-
-    if resolved is None and not attested_at:
-        click.echo("withdrawals: UNKNOWN (never attested) -- rail 17 blocks new entries")
-        return
-    age_days = (now_ts - attested_at) / 86400 if attested_at else 0
-    stale = resolved is None and attested_at
-    label = {True: "ENABLED", False: "SUSPENDED", None: "UNKNOWN (attestation STALE)"}[resolved]
-    click.echo(f"withdrawals: {label}")
-    click.echo(f"attested {age_days:.1f} days ago")
-    if stale or resolved is False:
-        click.echo("rail 17 is blocking new entries; exits are unaffected")
+# -- purification ------------------------------------------------------------------------------
 
 
 @cli.command("purification")
@@ -1086,212 +891,9 @@ def purification(ctx: click.Context) -> None:
 
 # -- trials ledger --------------------------------------------------------------------------
 
-
-@cli.group("trials")
-def trials_group() -> None:
-    """Append-only trials ledger (spec §4). Records experiments, never money."""
-
-
-_LEDGER_OPTION = click.option(
-    "--ledger",
-    type=click.Path(dir_okay=False, path_type=Path),
-    default=None,
-    help="Ledger path (default: docs/experiments/trials-ledger.jsonl).",
-)
-
-
-def _ledger_path(ledger: Path | None) -> Path:
-    return ledger if ledger is not None else trials_ledger.DEFAULT_LEDGER_PATH
-
-
-@trials_group.command("record")
-@_LEDGER_OPTION
-@click.option("--trial-id", required=True)
-@click.option("--session", required=True, help="Free-text experiment/session label.")
-@click.option("--rule", required=True)
-@click.option("--params", default="{}", help="JSON object of the full parameter dict.")
-@click.option("--provenance", required=True, type=click.Choice(sorted(trials_ledger.PROVENANCE)))
-@click.option("--kind", required=True, type=click.Choice(sorted(trials_ledger.KINDS)))
-@click.option("--decision", required=True, type=click.Choice(sorted(trials_ledger.DECISIONS)))
-@click.option("--series-missing", is_flag=True, default=False)
-@click.option("--per-bar-pnl", default=None, help="JSON array of per-bar P&L.")
-@click.option("--per-trade-pnl", default=None, help="JSON array of per-trade P&L.")
-def trials_record(
-    ledger: Path | None,
-    trial_id: str,
-    session: str,
-    rule: str,
-    params: str,
-    provenance: str,
-    kind: str,
-    decision: str,
-    series_missing: bool,
-    per_bar_pnl: str | None,
-    per_trade_pnl: str | None,
-) -> None:
-    """Record one trial -- the path scratchpad experiments use (spec §4.5)."""
-
-    def _series(raw: str | None) -> list[Decimal]:
-        return [Decimal(str(v)) for v in json.loads(raw)] if raw else []
-
-    try:
-        record = trials_ledger.append_trial(
-            _ledger_path(ledger),
-            trial_id=trial_id,
-            session=session,
-            rule=rule,
-            params=json.loads(params),
-            provenance=provenance,
-            kind=kind,
-            decision=decision,
-            per_trade_pnl=_series(per_trade_pnl),
-            per_bar_pnl=_series(per_bar_pnl),
-            series_missing=series_missing,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"recorded {record.trial_id} ({record.decision}) hash={record.row_hash[:12]}")
-
-
-@trials_group.command("list")
-@_LEDGER_OPTION
-def trials_list(ledger: Path | None) -> None:
-    """List recorded trials and the two N accountings (spec §4.4)."""
-    trials = trials_ledger.read_trials(_ledger_path(ledger))
-    for index, record in enumerate(trials, start=1):
-        flag = " [series_missing]" if record.series_missing else ""
-        click.echo(
-            f"{index:>4}  {record.trial_id:<34} {record.rule:<18} "
-            f"{record.provenance:<9} {record.kind:<16} {record.decision}{flag}"
-        )
-    m, n_decisions = trials_ledger.trial_counts(trials)
-    click.echo(f"\nM={m}  N_decisions={n_decisions}")
-
-
-@trials_group.command("verify")
-@_LEDGER_OPTION
-def trials_verify(ledger: Path | None) -> None:
-    """Verify the hash chain. Exits non-zero if broken."""
-    errors = trials_ledger.verify_chain(_ledger_path(ledger))
-    if not errors:
-        click.echo("chain intact")
-        return
-    for error in errors:
-        click.echo(error, err=True)
-    raise click.ClickException(f"{len(errors)} chain error(s)")
-
-
-@trials_group.command("deflate")
-@_LEDGER_OPTION
-@click.option("--sharpe", required=True, type=float, help="Observed ANNUALISED Sharpe.")
-@click.option(
-    "--trades-per-year", default=6.0, show_default=True, type=float,
-    help="Realised trade frequency, used to express MinBTL in trades.",
-)
-@click.option(
-    "--rho", default=None, type=float,
-    help="Assumed correlation between trials (§78.2). Omit to report an assumption BAND.",
-)
-@click.option("--skew", default=0.0, show_default=True, type=float)
-@click.option("--kurtosis", default=3.0, show_default=True, type=float, help="Non-excess.")
-@click.option(
-    "--trial-sharpe-variance", default=None, type=float,
-    help="V[{SR_n}] across trials. Omit if the ledger cannot supply it -- DSR is then skipped "
-    "rather than computed from a guess.",
-)
-def trials_deflate(
-    ledger: Path | None,
-    sharpe: float,
-    trades_per_year: float,
-    rho: float | None,
-    skew: float,
-    kurtosis: float,
-    trial_sharpe_variance: float | None,
-) -> None:
-    """Expected-max Sharpe, MinBTL and (where computable) DSR, from the ledger's trial counts.
-
-    ⛔ REPORTING ONLY (§78.7's Strathern rail). Every input is itemised, and anything the ledger
-    cannot supply is reported as MISSING rather than filled in with a plausible default.
-    """
-    trials = trials_ledger.read_trials(_ledger_path(ledger))
-    m_total, n_decisions = trials_ledger.trial_counts(trials)
-    if n_decisions < 2:
-        raise click.ClickException(f"only {n_decisions} decision trials -- need >= 2")
-
-    click.echo("inputs")
-    click.echo(f"  M (all ledger rows)      : {m_total}")
-    click.echo(f"  N decisions (excl. diag) : {n_decisions}")
-    click.echo(f"  observed annualised SR   : {sharpe}")
-    click.echo(f"  trades/year              : {trades_per_year}")
-    click.echo(f"  skew / kurtosis          : {skew} / {kurtosis}")
-
-    bands = [rho] if rho is not None else [0.0, 0.5, 0.9]
-    click.echo("\nMinBTL by assumed trial correlation (§78.2 N̂ = ρ̂ + (1−ρ̂)·M)")
-    click.echo(f"  {'rho':>5} {'N_hat':>8} {'E[max]':>8} {'MinBTL yr':>10} {'MinBTL trades':>14}")
-    for assumed in bands:
-        n_hat = deflate_mod.implied_independent_trials(assumed, n_decisions)
-        effective = max(2, int(round(n_hat)))
-        emax = deflate_mod.expected_max_sharpe(effective)
-        years = deflate_mod.min_backtest_length_years(effective, sharpe)
-        trades = deflate_mod.min_trades(effective, sharpe, trades_per_year)
-        click.echo(
-            f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}"
-        )
-
-    if trial_sharpe_variance is None:
-        click.echo(
-            "\nDSR: NOT COMPUTED. V[{SR_n}] requires a per-trial Sharpe on every ledger row, "
-            "and the backfilled rows are series_missing (§78.4). Supply "
-            "--trial-sharpe-variance to compute it under an explicit assumption."
-        )
-        return
-
-    n_hat = deflate_mod.implied_independent_trials(rho if rho is not None else 0.0, n_decisions)
-    effective = max(2, int(round(n_hat)))
-    sr0 = deflate_mod.sharpe_rejection_threshold(effective, trial_sharpe_variance)
-    observations = int(round(trades_per_year * deflate_mod.min_backtest_length_years(
-        effective, sharpe
-    ))) if sharpe > 0 else 0
-    dsr = deflate_mod.deflated_sharpe(sharpe, sr0, max(2, observations), skew, kurtosis)
-    click.echo(f"\nSR_0 (rejection bar)      : {sr0:.4f}")
-    click.echo(f"DSR                       : {dsr:.4f}")
-
-
-@trials_group.command("pbo")
-@_LEDGER_OPTION
-@click.option("--session", default=None, help="Only use columns from this session label.")
-@click.option("--blocks", default=16, show_default=True, help="S: number of row blocks.")
-def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
-    """Probability of Backtest Overfitting over a declared candidate grid (§78.6).
-
-    Reports probabilities. It deliberately does NOT report which configuration won: PBO
-    evaluates the quality of a selection process and must never become the objective that
-    selection relies on (§78.7's Strathern warning).
-    """
-    trials = trials_ledger.read_trials(_ledger_path(ledger))
-    build = matrix_mod.build_matrix(trials, session=session)
-    if not build.columns:
-        raise click.ClickException("no usable columns (all trials are series_missing?)")
-    for warning in build.warnings:
-        click.echo(f"warning: {warning}", err=True)
-    if build.refused:
-        click.echo(f"refused {len(build.refused)} series_missing trial(s)", err=True)
-
-    result = cscv_mod.pbo(build.columns, s=blocks)
-
-    click.echo(f"columns (N)          : {result.n_columns}")
-    click.echo(f"blocks (S)           : {result.n_blocks}")
-    click.echo(f"combinations         : {result.n_combinations}")
-    click.echo(f"rows used / dropped  : {result.rows_used} / {result.rows_dropped}")
-    click.echo(f"PBO                  : {result.pbo:.4f}")
-    click.echo(f"degradation slope    : {result.degradation_slope:.4f}")
-    click.echo(f"Prob[OOS < 0]        : {result.prob_loss:.4f}")
-    click.echo(f"stochastic dominance : 1st={result.dominance_1st} 2nd={result.dominance_2nd}")
-    click.echo(
-        "\nRead PBO alongside the degradation slope, never alone (§78.7 limitation 4): a high "
-        "PBO with a flat, positive OOS scatter is the GOOD outcome -- a broad plateau of "
-        "near-identical configurations produces high PBO by construction."
-    )
+# The `trials` group is defined in `keel.commands.trials` (a seam-free, ledger-only group);
+# register it on the root CLI here.
+cli.add_command(trials_group)
 
 
 # -- monitor ------------------------------------------------------------------------------
@@ -1355,7 +957,7 @@ def _interactive_confirm(preview: dict) -> bool:
             click.echo(f"    {key}: {value}")
     else:
         click.echo(f"    {preview!r}")
-    if not _is_interactive():
+    if not _common._is_interactive():
         click.echo("no TTY -- declining (confirm mode fails closed).", err=True)
         return False
     return click.confirm("Place this order?", default=False)
@@ -1431,364 +1033,15 @@ def agent_cmd(
 
 # -- autonomy (the user's own choice, stored in their profile) ------------------------------
 
-
-@cli.group("autonomy")
-def autonomy_group() -> None:
-    """Whether the agent places orders without asking you first."""
-
-
-@autonomy_group.command("show")
-@click.pass_context
-@with_disclaimer
-def autonomy_show(ctx: click.Context) -> None:
-    """Print the current autonomy setting."""
-    repo = _open_repo(ctx)
-    profile = repo.get_profile()
-    # `_open_repo` runs `migrate()`, which recreates a merely MISSING table -- so this covers
-    # damage migrate cannot heal (a corrupt page, a table of the wrong shape), not a fresh DB.
-    if not repo.profile_readable():
-        click.echo(
-            "WARNING: the profile row could not be read (see the log). Reporting autonomy as "
-            "OFF, which is the safe reading -- but the stored setting is UNKNOWN.",
-            err=True,
-        )
-    now_ts = int(time.time())
-    live = profile.is_autonomous(now_ts)
-    state = (
-        "ON -- orders are placed WITHOUT asking"
-        if live
-        else "off -- every order asks first"
-    )
-    click.echo(f"autonomy: {state}")
-    if profile.autonomous and not live:
-        click.echo(f"  (was ON but LAPSED at {profile.autonomous_until})")
-    elif live and profile.autonomous_until is not None:
-        left = profile.autonomous_until - now_ts
-        click.echo(f"  lapses at {profile.autonomous_until} ({left}s left)")
-    elif live:
-        click.echo("  no expiry set -- stays on until `keel autonomy off`")
-    if profile.updated_ts:
-        click.echo(f"  last changed: {profile.updated_ts}")
-
-
-@autonomy_group.command("on")
-@click.option(
-    "--for-hours",
-    "for_hours",
-    type=float,
-    default=None,
-    help="Let autonomy LAPSE automatically after this many hours (default: never lapses).",
-)
-@click.pass_context
-@with_disclaimer
-def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
-    """Let the agent place orders without asking (dangerous: asks for confirmation).
-
-    Every order is still subject to all hard rails -- autonomy changes who is asked, never what
-    is allowed. It does NOT let the agent clear a safety halt: releasing the kill-switch or a
-    drawdown breaker always needs a human, whatever this is set to.
-    """
-    config = _load_cfg(ctx)
-    repo = _open_repo(ctx)
-    now_ts = int(time.time())
-    if for_hours is not None and not (_MIN_AUTONOMY_HOURS <= for_hours <= _MAX_AUTONOMY_HOURS):
-        # 0/negative would write an already-lapsed row while printing "autonomy ON until ...",
-        # and inf/nan/1e18 would overflow int() after the operator had already typed `yes`.
-        raise click.BadParameter(
-            f"--for-hours must be at least {_MIN_AUTONOMY_HOURS} (one second) and at most "
-            f"{_MAX_AUTONOMY_HOURS} ({int(_MAX_AUTONOMY_HOURS) // 24} days); got {for_hours!r}."
-        )
-    expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
-    window = (
-        "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"
-    )
-    _require_interactive_confirmation(
-        "turn autonomy ON",
-        f"Orders will be placed with NO further prompt, {window} "
-        f"(mode={config.auto_trade.mode}, allowlist={config.allowlist}).",
-    )
-    repo.set_autonomous(True, now_ts, expires_ts=expires_ts)
-    if expires_ts is None:
-        click.echo(
-            "autonomy ON, with NO expiry -- it stays on until you run `keel autonomy off`.\n"
-            "  Consider `--for-hours N` for a supervised session, so a forgotten `on` cannot "
-            "grant unattended trading indefinitely."
-        )
-    else:
-        click.echo(f"autonomy ON until {expires_ts}. It lapses on its own after that.")
-
-
-@autonomy_group.command("off")
-@click.pass_context
-@with_disclaimer
-def autonomy_off(ctx: click.Context) -> None:
-    """Require confirmation before every order again.
-
-    Deliberately ungated and usable without a terminal: reducing risk must never be obstructed,
-    so this works from a script, a cron job or a pipe. Arming is what needs a human.
-    """
-    _open_repo(ctx).set_autonomous(False, int(time.time()))
-    click.echo("autonomy off: every order will ask for confirmation.")
+# The `autonomy` group is defined in `keel.commands.autonomy`; register it here.
+cli.add_command(autonomy_group)
 
 
 # -- rules ------------------------------------------------------------------------------
 
-
-@cli.group("rules")
-def rules_group() -> None:
-    """Rule lifecycle commands (candidate -> paper -> live -> disabled)."""
-
-
-@rules_group.command("list")
-@click.option("--status", default=None, help="Filter by status (candidate/paper/live/disabled).")
-@click.pass_context
-@with_disclaimer
-def rules_list(ctx: click.Context, status: str | None) -> None:
-    """List rules (read-only)."""
-    repo = _open_repo(ctx)
-    rows = repo.get_rules(status)
-    if not rows:
-        click.echo("no rules found.")
-        return
-    for row in rows:
-        click.echo(f"[{row['id']}] {row['kind']} status={row['status']} params={row['params']}")
-
-
-def _require_rule_row(ctx: click.Context, repo: Repository, rule_id: int) -> dict[str, Any]:
-    rows = {row["id"]: row for row in repo.get_rules()}
-    row = rows.get(rule_id)
-    if row is None:
-        click.echo(f"Error: no rule with id {rule_id}", err=True)
-        ctx.exit(1)
-    assert row is not None  # narrows for type-checkers; ctx.exit() above raises SystemExit
-    return row
-
-
-def _resolve_granularity(rule: Any, granularity_opt: str | None) -> Granularity | None:
-    if granularity_opt:
-        return Granularity(granularity_opt)
-    for attr in ("granularity", "timeframe"):
-        value = getattr(rule, attr, None)
-        if value is not None:
-            return value
-    return None
-
-
-def _run_backtest(
-    ctx: click.Context, repo: Repository, rule: Any, granularity_opt: str | None
-) -> backtest_mod.BacktestResult:
-    product_id = getattr(rule, "product_id", None)
-    if product_id is None:
-        click.echo("Error: rule has no product_id to backtest against", err=True)
-        ctx.exit(1)
-    granularity = _resolve_granularity(rule, granularity_opt)
-    if granularity is None:
-        click.echo("Error: could not determine a granularity; pass --granularity", err=True)
-        ctx.exit(1)
-    candles = repo.get_candles(product_id, granularity)
-    return backtest_mod.backtest(rule, candles)
-
-
-@rules_group.command("backtest")
-@click.argument("rule_id", type=int)
-@click.option(
-    "--granularity", default=None, help="Override the candle granularity (default: the rule's own)."
-)
-@click.pass_context
-@with_disclaimer
-def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
-    """Backtest a stored rule against its historical candles (read-only)."""
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
-    rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
-    click.echo(
-        f"rule {rule_id} ({row['kind']}): n_trades={stats.n_trades} "
-        f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
-        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown}"
-    )
-
-
-@rules_group.command("promote")
-@click.argument("rule_id", type=int)
-@click.option(
-    "--granularity", default=None, help="Override the candle granularity for the backtest."
-)
-@click.pass_context
-@with_disclaimer
-def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
-    """Re-run a rule's backtest and advance its lifecycle status if it clears the floor."""
-    repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
-    rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
-
-    promo_cfg = promotion_mod.PromotionConfig(
-        min_trades=config.promotion.min_trades,
-        min_expectancy=config.promotion.min_expectancy,
-        min_rr=config.promotion.min_rr,
-        min_win_rate=float(config.promotion.min_win_rate),
-    )
-    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg)
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
-
-
-@rules_group.command("demote")
-@click.argument("rule_id", type=int)
-@click.pass_context
-@with_disclaimer
-def rules_demote(ctx: click.Context, rule_id: int) -> None:
-    """Manually step a rule's lifecycle status back one stage (live->paper->candidate)."""
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
-    prev = _DEMOTE_PREV.get(row["status"])
-    if prev is None:
-        click.echo(
-            f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; nothing to demote"
-        )
-        return
-    repo.update_rule_status(rule_id, prev)
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> {prev}")
-
-
-@rules_group.command("disable")
-@click.argument("rule_id", type=int)
-@click.pass_context
-@with_disclaimer
-def rules_disable(ctx: click.Context, rule_id: int) -> None:
-    """Disable a rule (terminal status; it will never trade again)."""
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
-    repo.update_rule_status(rule_id, "disabled")
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> disabled")
-
-
-def _json_plain(value: Any) -> Any:
-    """Coerce `value` into the JSON-plain form `Repository.insert_rule` expects for `params`.
-
-    `Rule.describe()`'s `params` dict holds real `Decimal`s and tuples (constructor kwargs, not
-    storage types) -- `insert_rule` round-trips `params` through plain `json.dumps`/`json.loads`
-    (see `agent._build_rule`'s own docstring), so a `Decimal` here would raise `TypeError` at
-    insert time. This is the inverse of `agent._build_rule`'s `_DECIMAL_PARAMS`/tuple coercion:
-    `Decimal` -> `str`, tuple -> list, recursively through nested dicts/lists.
-    """
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, dict):
-        return {k: _json_plain(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_plain(v) for v in value]
-    return value
-
-
-@rules_group.command("seed")
-@click.option(
-    "--products",
-    default=None,
-    help="Comma-separated product ids (default: the allowlist, in the configured "
-    "settlement currency).",
-)
-@click.option(
-    "--kinds",
-    default=None,
-    help="Comma-separated rule kinds (default: every kind in agent.RULE_REGISTRY).",
-)
-@click.option(
-    "--status",
-    type=click.Choice(["candidate", "paper", "live"]),
-    default="candidate",
-    show_default=True,
-    help="Status to seed at. `live` bypasses the promotion gate -- for the supervised "
-    "live-order test only (see the go-live runbook).",
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Insert a new candidate rule even if one already exists for a (kind, product) pair.",
-)
-@click.pass_context
-@with_disclaimer
-def rules_seed(
-    ctx: click.Context,
-    products: str | None,
-    kinds: str | None,
-    force: bool,
-    status: str = "candidate",
-) -> None:
-    """Seed the `rules` table with one `candidate` rule per (kind, product) pair (Issue #81).
-
-    The `rules` table starts out empty and nothing else populates it -- with zero rows,
-    `agent.run_once`/`keel simulate` have no strategies to evaluate at all, no matter how
-    `config.yaml` or the promotion floor are set. This seeds one row per (kind, product) using
-    each rule kind's own constructor defaults (`RULE_REGISTRY[kind](product_id=...).describe()`),
-    so the resulting rows are exactly what `agent._build_rule` already knows how to
-    reconstruct -- they still start at `candidate` and must clear `rules promote` before they can
-    trade `paper`/`live`.
-
-    Idempotent by (kind, product_id): re-running this with no `--force` skips any pair that
-    already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
-    script) without piling up duplicate candidates. `--force` inserts a fresh candidate anyway.
-
-    Read-only w.r.t. the exchange: no network call, no confirmation gate -- it only ever
-    writes local
-    `rules` rows, exactly like `rules promote`/`demote`/`disable`.
-    """
-    repo = _open_repo(ctx)
-    now_ts = int(time.time())
-
-    if products:
-        product_list = [p.strip() for p in products.split(",") if p.strip()]
-    else:
-        config = _load_cfg(ctx)
-        product_list = _default_sim_products(config)
-
-    if kinds:
-        kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
-    else:
-        kind_list = list(agent.RULE_REGISTRY)
-
-    unknown_kinds = [k for k in kind_list if k not in agent.RULE_REGISTRY]
-    if unknown_kinds:
-        click.echo(
-            f"Error: unknown rule kind(s) {unknown_kinds!r}; known kinds: "
-            f"{sorted(agent.RULE_REGISTRY)!r}",
-            err=True,
-        )
-        ctx.exit(1)
-        return
-
-    existing_keys = {
-        (row["kind"], (row["params"] or {}).get("product_id")) for row in repo.get_rules()
-    }
-
-    seeded: list[str] = []
-    skipped: list[str] = []
-    for kind in kind_list:
-        rule_cls = agent.RULE_REGISTRY[kind]
-        for product in product_list:
-            label = f"{kind}:{product}"
-            if not force and (kind, product) in existing_keys:
-                skipped.append(label)
-                continue
-            rule = rule_cls(product_id=product)
-            params = _json_plain(rule.describe()["params"])
-            params["product_id"] = product
-            repo.insert_rule(kind, params, status=status, now_ts=now_ts)
-            seeded.append(label)
-
-    click.echo(f"seeded={len(seeded)} skipped={len(skipped)} status={status}")
-    if status == "live":
-        click.echo(
-            "⚠️  seeded at LIVE status, bypassing the promotion gate. This is for the "
-            "supervised live-order test only -- the agent will act on these (still confirm-"
-            "gated and rail-guarded). Do not leave live-seeded rules in place afterwards."
-        )
-    for label in seeded:
-        click.echo(f"  seeded: {label}")
-    for label in skipped:
-        click.echo(f"  skipped: {label}")
+# The `rules` group is defined in `keel.commands.rules`; register it here. `rules_seed` is also
+# imported by `init` below, which invokes it to seed candidate rules on a fresh install.
+cli.add_command(rules_group)
 
 
 # -- pnl ------------------------------------------------------------------------------
@@ -1850,15 +1103,6 @@ _SIM_FEE_PCT = Decimal("0.006")
 _SIM_SLIPPAGE_PCT = Decimal("0.0005")
 _SIM_GRANULARITIES = [Granularity.ONE_HOUR, Granularity.ONE_DAY]
 _DAYS_PER_YEAR = 365
-
-
-def _default_sim_products(config: Config) -> list[str]:
-    """Allowlist assets as product ids, in the configured settlement currency.
-
-    Shares `_history_product`'s derivation so `fetch`, `simulate`, `screen` and `holdings`
-    cannot disagree about which product an asset means.
-    """
-    return [_history_product(asset, config.quote_currency) for asset in config.allowlist]
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
@@ -2293,190 +1537,8 @@ def simulate(
 
 # -- subscription (rail 14, per-venue attested allowance) ----------------------------------------
 
-ATTESTATION_PERIOD_SEC = 365 * 24 * 3600
-
-
-@cli.group("subscription")
-def subscription_group() -> None:
-    """View or attest a venue's subscription (the allowance execution.guards rail 14 enforces).
-
-    Coinbase exposes no subscription endpoint, so a subscription is *asserted* by the user, not
-    fetched. `attest` is that assertion. Rail 14 reads the resulting record fresh on every order,
-    so an attestation takes effect on the very next one, with no restart.
-
-    Until a venue is attested, rail 14 caps it at `subscription.unsubscribed_allowance_usd`
-    (default 0) -- keel ships unable to place a live BUY, deliberately.
-    """
-
-
-def _resolve_pacing(
-    repo: Repository, config: Config, venue: str, pacing: str | None
-) -> str:
-    """Explicit `--pacing` wins; otherwise keep the venue's existing choice, else config's.
-
-    Re-attesting must not silently reset a pacing mode the user set earlier.
-    """
-    if pacing is not None:
-        return pacing
-    existing = repo.get_broker_subscription(venue)
-    return existing.pacing if existing is not None else config.subscription.pacing
-
-
-@subscription_group.command("attest")
-@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to attest.")
-@click.option("--tier", "tier_name", required=True, help="Tier name from config.yaml's `tiers`.")
-@click.option(
-    "--pacing",
-    type=click.Choice(["opportunistic", "even_daily"]),
-    default=None,
-    help="Pacing mode (default: keep the venue's current value).",
-)
-@click.pass_context
-@with_disclaimer
-def subscription_attest(
-    ctx: click.Context, venue: str, tier_name: str, pacing: str | None
-) -> None:
-    """Assert which subscription tier this venue is on -- clears `suspect` by asserting a named
-    tier (`subscription set` also clears it, but names no tier)."""
-    repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
-
-    tier = next((t for t in config.tiers if t.name == tier_name), None)
-    if tier is None:
-        valid = ", ".join(t.name for t in config.tiers)
-        click.echo(
-            f"Error: unknown tier {tier_name!r}. Configured tiers: {valid}",
-            err=True,
-        )
-        ctx.exit(1)
-
-    now_ts = int(time.time())
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue=venue,
-            tier_name=tier.name,
-            free_volume_usd=tier.free_volume_usd,
-            pacing=_resolve_pacing(repo, config, venue, pacing),
-            subscription_usd_month=tier.subscription_usd_month,
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=now_ts,
-            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
-        )
-    )
-    volume = "unlimited" if tier.free_volume_usd is None else str(tier.free_volume_usd)
-    click.echo(
-        f"attested {venue}: tier={tier.name} free_volume_usd={volume} "
-        f"status=active due in 365 days"
-    )
-
-
-@subscription_group.command("set")
-@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to update.")
-@click.option(
-    "--free-volume-usd",
-    "free_volume_raw",
-    required=True,
-    help="Raw fee-free monthly volume in USD, e.g. 500.",
-)
-@click.option(
-    "--pacing",
-    type=click.Choice(["opportunistic", "even_daily"]),
-    default=None,
-    help="Pacing mode (default: keep the venue's current value).",
-)
-@click.pass_context
-@with_disclaimer
-def subscription_set(
-    ctx: click.Context, venue: str, free_volume_raw: str, pacing: str | None
-) -> None:
-    """Set a raw allowance without naming a tier -- an escape hatch, not an attestation.
-
-    Leaves `tier_name='unknown'`, which `show` surfaces: the record is visibly a hand-set number
-    rather than a stated tier. Prefer `attest`.
-    """
-    repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
-
-    try:
-        free_volume_usd = Decimal(free_volume_raw)
-    except InvalidOperation:
-        click.echo(
-            f"Error: --free-volume-usd must be a number, got {free_volume_raw!r}", err=True
-        )
-        ctx.exit(1)
-    # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
-    # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
-    # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
-    # "unlimited" has no representation via this command; it is expressed elsewhere in this
-    # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
-    if not free_volume_usd.is_finite():
-        click.echo(
-            f"Error: --free-volume-usd must be a finite number, got {free_volume_raw!r}",
-            err=True,
-        )
-        ctx.exit(1)
-    if free_volume_usd < 0:
-        click.echo("Error: --free-volume-usd must be non-negative", err=True)
-        ctx.exit(1)
-
-    now_ts = int(time.time())
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue=venue,
-            tier_name="unknown",
-            free_volume_usd=free_volume_usd,
-            pacing=_resolve_pacing(repo, config, venue, pacing),
-            # Placeholder: `set` names no tier, so there is no real subscription price to
-            # record here. Must not be read as an actual (free) subscription cost.
-            subscription_usd_month=Decimal("0"),
-            # ACTIVE (full spend authority), even though `tier_name='unknown'` -- the same shape
-            # the v2 migration backfill deliberately marks `suspect` instead. Not a contradiction:
-            # the migration distrusts a *stale* hand-tuned number of unknown provenance, whereas
-            # this is a *fresh, explicit* user assertion made right now, by name, via this
-            # command. Provenance differs even though the resulting record looks identical.
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=now_ts,
-            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
-        )
-    )
-    click.echo(
-        f"set {venue}: free_volume_usd={free_volume_usd} tier=unknown "
-        f"(not an attestation -- prefer `subscription attest`)"
-    )
-
-
-@subscription_group.command("show")
-@click.pass_context
-@with_disclaimer
-def subscription_show(ctx: click.Context) -> None:
-    """Show every venue's subscription, with the status and cap actually in force."""
-    repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
-    records = repo.list_broker_subscriptions()
-
-    if not records:
-        click.echo(
-            "no subscription attested for any venue -- rail 14 caps live BUYs at the "
-            f"unsubscribed allowance {config.subscription.unsubscribed_allowance_usd}. "
-            "Run `keel subscription attest --venue coinbase --tier <tier>`."
-        )
-        return
-
-    now_ts = int(time.time())
-    unsubscribed = config.subscription.unsubscribed_allowance_usd
-    for record in records:
-        allowance = record.allowance_usd(now_ts, unsubscribed)
-        cap = "unlimited" if allowance is None else str(allowance)
-        volume = (
-            "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
-        )
-        click.echo(
-            f"{record.venue}: tier={record.tier_name} free_volume_usd={volume} "
-            f"pacing={record.pacing} stored_status={record.status.value} "
-            f"effective_status={record.effective_status(now_ts).value} "
-            f"effective_cap={cap} attested_at={record.attested_at} "
-            f"attest_due_ts={record.attest_due_ts}"
-        )
+# The `subscription` group is defined in `keel.commands.subscription`; register it here.
+cli.add_command(subscription_group)
 
 
 # -- kill / resume ------------------------------------------------------------------------------

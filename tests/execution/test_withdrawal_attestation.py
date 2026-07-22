@@ -70,9 +70,10 @@ def test_cli_roundtrip_and_suspension_message(tmp_path, monkeypatch):
     runner = CliRunner()
     # `--enabled` RELEASES rail 17's entry halt, so it now demands a typed `yes` at a terminal
     # (`--suspended` stays ungated -- it only ever reduces capability).
-    import keel.cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    # The TTY predicate lives in keel.commands._common; _require_interactive_confirmation
+    # calls it there, so patch it at its definition (see that module's docstring).
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
 
     unknown = runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"])
     assert "UNKNOWN (never attested)" in unknown.output
