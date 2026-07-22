@@ -1341,7 +1341,10 @@ def test_ample_configured_currency_does_NOT_fund_a_differently_quoted_product(re
     broker = FakeBroker(balances={"USDC": Decimal("1000000"), "USD": Decimal("0")})
     signal = _enter_signal()  # BTC-USD -> spends USD
 
-    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
 
     assert result.placed is False, "an order spending USD was funded from a USDC balance"
     assert result.preview is None, "rails must veto before the broker is touched"
@@ -1356,7 +1359,10 @@ def test_the_products_own_quote_balance_is_what_permits_the_buy(repo):
     broker = FakeBroker(balances={"USDC": Decimal("0"), "USD": Decimal("1000000")})
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
 
     assert result.placed is True, result.vetoed_by
 
@@ -1376,8 +1382,24 @@ def test_the_veto_message_names_the_currency_actually_required(repo):
     broker = FakeBroker(balances={"USD": Decimal("1"), "USDC": Decimal("1000000")})
     signal = _enter_signal()
 
-    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
 
     message = next(v for v in result.vetoed_by if v.startswith("usdc_funding"))
     assert "USD" in message
     assert "USDC" not in message, f"message names the wrong currency: {message}"
+
+
+def test_no_account_at_all_for_the_required_currency_fails_closed(repo):
+    """Distinct from a zero balance: the broker returns accounts, none of them the one this
+    order settles in. Silence about a currency is not evidence of funds in it."""
+    broker = FakeBroker(balances={"EUR": Decimal("1000000")})  # no USD account
+    signal = _enter_signal()  # BTC-USD
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert result.preview is None
+    assert any("unknown/unavailable" in v for v in result.vetoed_by)

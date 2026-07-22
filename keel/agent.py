@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
 from keel.config import Config
@@ -277,13 +278,27 @@ def _mark_to_market_equity(
     than on a loss. That is why this iterates `products` and not `price_by_product` -- a product
     missing from the price map is exactly the case the fallback exists for.
 
-    `None`, rather than a partial total, when the quote balance is unavailable: equity is simply
-    unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM never
-    falls, so an under-read arms the breaker on a phantom drawdown from then on).
+    Settled cash is summed across EVERY currency in play: `quote_currency` plus the quote leg of
+    each product being valued. Counting only the configured currency under-reads an account whose
+    cash sits in what its products actually settle in (a `BTC-USD` deployment configured for
+    USDC) -- and because the HWM is monotonic, that under-read arms rail 11 on a phantom
+    drawdown permanently. Currencies with no account contribute nothing rather than failing.
+
+    `None`, rather than a partial total, when NO quote balance could be read at all: equity is
+    simply unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM
+    never falls, so an under-read arms the breaker on a phantom drawdown from then on).
     """
-    quote = _fetch_available_quote(broker, quote_currency)
-    if quote is None:
+    currencies: list[str] = []
+    for candidate in (quote_currency, *(quote_currency_of(p) for p in products)):
+        upper = (candidate or "").upper()
+        if upper and upper not in currencies:
+            currencies.append(upper)
+
+    balances = [(c, _fetch_available_quote(broker, c)) for c in currencies]
+    if all(balance is None for _, balance in balances):
+        # Nothing readable at all -- not "zero cash", genuinely unknown.
         return None
+    quote = sum((balance for _, balance in balances if balance is not None), Decimal("0"))
 
     # Quantities come from `_held_position` (the filled-orders audit log), NEVER from
     # `position_rule:<product>`. That key is exit-rule OWNERSHIP state: it is overwritten on

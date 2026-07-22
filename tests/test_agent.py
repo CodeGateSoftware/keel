@@ -1239,3 +1239,27 @@ def test_autonomy_still_applies_strictly_before_its_expiry(repo):
 
     assert result.mode == "autonomous"
     assert len(broker.place_calls) == 1
+
+
+def test_equity_counts_settled_cash_in_EVERY_quote_leg_being_traded(repo):
+    """Rail 11's HWM is monotonic, so an under-read arms a phantom drawdown PERMANENTLY.
+
+    Counting only `config.quote_currency` under-reads an account whose settled cash sits in the
+    currency its products actually settle in -- and this is reachable now that rail 13 permits
+    such an order. Equity must see the cash that funds the trading.
+    """
+
+    class TwoCurrencyBroker:
+        def get_accounts(self):
+            return [
+                {"currency": "USD", "available_balance": Decimal("1000")},
+                {"currency": "USDC", "available_balance": Decimal("7")},
+            ]
+
+    equity = agent._mark_to_market_equity(
+        repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC"
+    )
+    assert equity is not None
+    assert equity >= Decimal("1000"), (
+        f"equity {equity} ignored the USD cash that funds BTC-USD orders"
+    )

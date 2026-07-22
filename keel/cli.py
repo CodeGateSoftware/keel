@@ -657,18 +657,24 @@ def _screen_product(
     return facts, screen_mod.screen_asset(facts, attestation)
 
 
-#: The product id this codebase uses for an asset's daily history. `assets screen`,
-#: `keel simulate` and `keel fetch` all key on `-USD` (see `_default_sim_products`), so holdings
-#: must too -- screening `{asset}-{quote_currency}` instead would find zero cached bars for every
-#: asset and report "no local history" forever, which is worse than useless: it looks like a
-#: verdict about the asset.
-def _history_product(asset: str) -> str:
-    return f"{asset}-USD"
+def _history_product(asset: str, quote: str) -> str:
+    """The product id for an asset, in the deployment's settlement currency.
+
+    ONE source of truth, shared with `_default_sim_products`. Hardcoding `-USD` here while the
+    screen compared against `config.quote_currency` is what let a `quote_currency: USDC` config
+    reject every asset on a settlement failure it could never fix -- a default change does not
+    change configs already on disk. Deriving both from the same setting means the worst case is
+    an honest "no local history, run `keel fetch`", not a silent unfixable rejection.
+    """
+    return f"{asset}-{quote.upper()}"
 
 
 # Failure classes that are DOWNSTREAM of having no cached history: with zero bars they report
 # on our data, not on the asset, so `assets holdings` must not print them as verdicts.
-_DATA_DERIVED_FAILURES = frozenset({"liquidity", "settlement"})
+# `settlement` is deliberately NOT here: since it compares the product's quote leg to the
+# configured settlement currency it no longer touches candles at all, so it is fully assessable
+# with zero bars -- suppressing it would hide a real, actionable failure.
+_DATA_DERIVED_FAILURES = frozenset({"liquidity"})
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
 # a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
@@ -764,7 +770,7 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         if not run_screen:
             continue
 
-        product = _history_product(asset)
+        product = _history_product(asset, quote)
         facts, result = _screen_product(repo, product, quote)
         click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
 
@@ -1842,7 +1848,12 @@ _DAYS_PER_YEAR = 365
 
 
 def _default_sim_products(config: Config) -> list[str]:
-    return [f"{asset}-USD" for asset in config.allowlist]
+    """Allowlist assets as product ids, in the configured settlement currency.
+
+    Shares `_history_product`'s derivation so `fetch`, `simulate`, `screen` and `holdings`
+    cannot disagree about which product an asset means.
+    """
+    return [_history_product(asset, config.quote_currency) for asset in config.allowlist]
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:

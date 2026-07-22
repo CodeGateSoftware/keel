@@ -213,7 +213,7 @@ def discover_candidates(
 
     for product in products:
         product_id = product.get("product_id") or ""
-        if product.get("quote_currency_id") != policy.quote_currency:
+        if (product.get("quote_currency_id") or "").upper() != policy.quote_currency.upper():
             continue
         if product.get("status") != "online":
             continue

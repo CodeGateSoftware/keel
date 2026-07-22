@@ -44,7 +44,7 @@ separate entry price of its own. `scale_out` closes part of a position (a rule-d
 profit-take) through the same guard+preview+place+log pipeline as a plain SELL leg.
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
-available `config.quote_currency` (default USDC) balance from `broker.get_accounts()` and hands
+available balance of the PRODUCT's quote leg from `broker.get_accounts()` and hands
 it to `guards.check` via `OrderIntent.available_quote` -- guards itself has no broker access, by
 design. This happens *before* `guards.check` runs (the balance is an input to the rail, not
 something guarded itself), so it is the one broker call this module makes ahead of the guard
