@@ -100,7 +100,7 @@ dca:
   budget_usd: 50
   cadence_days: 7
 
-quote_currency: USDC
+quote_currency: USD
 
 subscription:
   assumed_free_volume_usd: 500

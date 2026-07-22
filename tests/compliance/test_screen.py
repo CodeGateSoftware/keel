@@ -153,7 +153,7 @@ def test_policy_thresholds_are_configurable():
 # -- discovery (proposal stage) ------------------------------------------------
 
 
-def _product(pid="SOL-USDC", quote="USDC", volume="50000000", **over):
+def _product(pid="SOL-USD", quote="USD", volume="50000000", **over):
     base = {
         "product_id": pid,
         "base_name": pid.split("-")[0],
@@ -178,7 +178,7 @@ def test_discovery_keeps_liquid_online_products_in_the_settlement_currency():
 def test_discovery_drops_the_wrong_quote_currency():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(quote="USD")]) == []
+    assert discover_candidates([_product(quote="USDC")]) == []
     assert discover_candidates([_product(quote="BTC")]) == []
 
 
@@ -211,7 +211,7 @@ def test_discovery_excludes_assets_we_already_hold():
     from keel.compliance.screen import discover_candidates
 
     found = discover_candidates(
-        [_product("BTC-USDC"), _product("SOL-USDC")], exclude_assets=frozenset({"BTC"})
+        [_product("BTC-USD"), _product("SOL-USD")], exclude_assets=frozenset({"BTC"})
     )
     assert [c.asset for c in found] == ["SOL"]
 
@@ -220,7 +220,7 @@ def test_discovery_ranks_by_liquidity():
     from keel.compliance.screen import discover_candidates
 
     found = discover_candidates(
-        [_product("A-USDC", volume="10000000"), _product("B-USDC", volume="90000000")]
+        [_product("A-USD", volume="10000000"), _product("B-USD", volume="90000000")]
     )
     assert [c.asset for c in found] == ["B", "A"]
 

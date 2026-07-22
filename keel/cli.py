@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.products import quote_currency_of
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.telemetry import bind_venue
 
@@ -619,7 +620,11 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
         asset=asset,
         daily_bars=len(candles),
         median_daily_volume=median,
-        quotable_in_settlement_currency=product.endswith(f"-{quote}") or bool(candles),
+        # A REAL check: does this product settle in the currency this deployment trades in?
+        # The former `or bool(candles)` fallback made it vacuous -- every screened product is
+        # `-USD`, so it always fell through to "do we have bars", which the history criterion
+        # already covers. One of four admission criteria was doing nothing.
+        quotable_in_settlement_currency=quote_currency_of(product) == quote.upper(),
     )
 
 
@@ -672,6 +677,12 @@ _FIAT_CURRENCIES = frozenset(
     {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "SGD", "BRL", "MXN", "TRY", "INR", "KRW"}
 )
 
+# Stablecoins are cash EQUIVALENTS -- funding you hold between positions, not positions. They are
+# excluded for the same reason fiat is: proposing the money as something to buy with the money is
+# noise. (They would be REJECTED anyway -- unattested, and a yield-bearing one fails §28.4 -- so
+# this only removes a redundant row, never an admission.)
+_CASH_EQUIVALENTS = frozenset({"USDC", "USDT", "DAI", "PYUSD", "TUSD", "USDP", "GUSD"})
+
 
 @assets_group.command("holdings")
 @click.option(
@@ -720,7 +731,7 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
             "  If this is an authentication error, check CDP_API_KEY/CDP_API_SECRET in .env."
         ) from exc
 
-    excluded = _FIAT_CURRENCIES | {quote.upper()}
+    excluded = _FIAT_CURRENCIES | _CASH_EQUIVALENTS | {quote.upper()}
     # Currency codes are compared UPPERCASED: a `usdc` balance is still the settlement currency,
     # and must not be presented as something tradable on a casing accident.
     holdings = sorted(

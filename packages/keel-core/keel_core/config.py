@@ -258,7 +258,7 @@ class Config:
     subscription: SubscriptionConfig = field(default_factory=SubscriptionConfig)
     tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
     fees: FeesConfig = field(default_factory=FeesConfig)
-    quote_currency: str = "USDC"
+    quote_currency: str = "USD"
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
 
@@ -508,7 +508,7 @@ def load_config(path: str | Path) -> Config:
             "-- set it with `keel subscription attest --venue coinbase --tier <tier>`."
         )
 
-    quote_currency = raw.get("quote_currency", "USDC")
+    quote_currency = raw.get("quote_currency", "USD")
     if not isinstance(quote_currency, str) or not quote_currency:
         raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
 

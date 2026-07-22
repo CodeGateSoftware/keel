@@ -63,6 +63,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Literal
 
+from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception
 
 from keel.config import Config
@@ -256,14 +257,22 @@ def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
     return bool(enabled)
 
 
-def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
-    """Live available `quote_currency` (default USDC) balance from `broker.get_accounts()`.
+def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal | None:
+    """Live available balance of `quote_currency` from `broker.get_accounts()`.
 
-    `None` on any failure -- a broker error, a malformed response, or simply no account for
-    `quote_currency` -- so rail 13 (USDC-funding) fails closed rather than guessing. This is
+    `quote_currency` is the **product's own settlement leg** (`BTC-USD` -> `USD`), not
+    `config.quote_currency`: the currency an order spends is a property of the product. Checking
+    the configured currency instead could report a healthy balance for a currency the order never
+    touches, letting rail 13 PASS an order the account cannot fund -- precisely the "never draw
+    from a linked bank/ACH source" case the rail exists to prevent.
+
+    `None` on any failure -- a broker error, a malformed response, an unresolvable product id, or
+    simply no account for that currency -- so rail 13 fails closed rather than guessing. This is
     the one broker call `execute()` makes *before* `guards.check` runs: it's an input the rail
     needs, not itself something the guard gate protects (no funds move, no order is placed).
     """
+    if not quote_currency:
+        return None
     if broker is None:
         # Paper mode passes no broker. That is not an error and must not be logged as one --
         # an ERROR per paper entry would fill the operator's log with noise about a condition
@@ -279,7 +288,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str) -> Decimal | None:
         currency = account.get("currency") if isinstance(account, dict) else getattr(
             account, "currency", None
         )
-        if currency != quote_currency:
+        if (currency or "").upper() != quote_currency.upper():
             continue
         balance = account.get("available_balance") if isinstance(account, dict) else getattr(
             account, "available_balance", None
@@ -309,7 +318,10 @@ def _build_intent(
             qty = sizing.size(equity, config.risk_pct, setup.entry, setup.stop)
             stop = setup.stop
 
-        available_quote = _fetch_available_quote(broker, config.quote_currency)
+        # The PRODUCT's quote leg -- what this order actually spends.
+        available_quote = _fetch_available_quote(
+            broker, quote_currency_of(signal.product_id)
+        )
         withdrawals = _withdrawals_enabled(repo, now_ts)
 
         return OrderIntent(

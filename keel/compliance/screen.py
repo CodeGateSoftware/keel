@@ -191,7 +191,7 @@ class DiscoveryPolicy:
     five years of candles for. Everything that decides admission lives in `screen_asset`.
     """
 
-    quote_currency: str = "USDC"
+    quote_currency: str = "USD"
     min_quote_24h_volume: Decimal = Decimal("5000000")
 
 

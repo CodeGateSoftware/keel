@@ -45,7 +45,7 @@
     "min_trades": 100,
     "min_win_rate": "0.55"
   },
-  "quote_currency": "USDC",
+  "quote_currency": "USD",
   "research": {
     "pbo_max": "0.05",
     "slope_floor": "-0.5"

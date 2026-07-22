@@ -167,7 +167,7 @@ def _venue_product(pid, volume, **over):
     base = {
         "product_id": pid,
         "base_name": pid.split("-")[0],
-        "quote_currency_id": "USDC",
+        "quote_currency_id": "USD",
         "status": "online",
         "trading_disabled": False,
         "is_disabled": False,
@@ -181,7 +181,7 @@ def _venue_product(pid, volume, **over):
 def test_discover_proposes_and_says_so_loudly(tmp_path, valid_config_path, monkeypatch):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
-    venue = _FakeVenue([_venue_product("SOL-USDC", "50000000")])
+    venue = _FakeVenue([_venue_product("SOL-USD", "50000000")])
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
 
     result = CliRunner().invoke(
@@ -198,7 +198,7 @@ def test_discover_excludes_the_current_allowlist(tmp_path, valid_config_path, mo
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     venue = _FakeVenue(
-        [_venue_product("BTC-USDC", "90000000"), _venue_product("SOL-USDC", "50000000")]
+        [_venue_product("BTC-USD", "90000000"), _venue_product("SOL-USD", "50000000")]
     )
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
 
@@ -206,7 +206,7 @@ def test_discover_excludes_the_current_allowlist(tmp_path, valid_config_path, mo
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "discover"]
     )
     assert "SOL" in result.output
-    assert "BTC-USDC" not in result.output
+    assert "BTC-USD" not in result.output
 
 
 def test_probe_history_marks_candidates_without_a_four_year_series(
@@ -215,8 +215,8 @@ def test_probe_history_marks_candidates_without_a_four_year_series(
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     venue = _FakeVenue(
-        [_venue_product("SOL-USDC", "50000000"), _venue_product("NEW-USDC", "40000000")],
-        history_for=frozenset({"SOL-USDC"}),
+        [_venue_product("SOL-USD", "50000000"), _venue_product("NEW-USD", "40000000")],
+        history_for=frozenset({"SOL-USD"}),
     )
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
 
@@ -226,9 +226,9 @@ def test_probe_history_marks_candidates_without_a_four_year_series(
          "assets", "discover", "--probe-history"],
     )
     assert result.exit_code == 0, result.output
-    assert set(venue.probe_calls) == {"SOL-USDC", "NEW-USDC"}
-    sol_line = next(ln for ln in result.output.splitlines() if "SOL-USDC" in ln)
-    new_line = next(ln for ln in result.output.splitlines() if "NEW-USDC" in ln)
+    assert set(venue.probe_calls) == {"SOL-USD", "NEW-USD"}
+    sol_line = next(ln for ln in result.output.splitlines() if "SOL-USD" in ln)
+    new_line = next(ln for ln in result.output.splitlines() if "NEW-USD" in ln)
     assert "yes" in sol_line
     assert "NO" in new_line
 
@@ -244,7 +244,7 @@ def test_a_failed_probe_reads_as_UNKNOWN_not_as_a_rejection(
         def get_candles(self, *a, **k):
             raise RuntimeError("timeout")
 
-    venue = _BrokenProbe([_venue_product("SOL-USDC", "50000000")])
+    venue = _BrokenProbe([_venue_product("SOL-USD", "50000000")])
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
 
     result = CliRunner().invoke(
@@ -253,7 +253,7 @@ def test_a_failed_probe_reads_as_UNKNOWN_not_as_a_rejection(
          "assets", "discover", "--probe-history"],
     )
     assert result.exit_code == 0
-    sol_line = next(ln for ln in result.output.splitlines() if "SOL-USDC" in ln)
+    sol_line = next(ln for ln in result.output.splitlines() if "SOL-USD" in ln)
     assert "?" in sol_line
     assert "NO" not in sol_line
 
@@ -327,8 +327,8 @@ def test_holdings_excludes_the_settlement_currency_and_fiat(
     holding_lines = [ln for ln in result.output.splitlines() if ln.startswith("  ")]
     assets_listed = {ln.split()[0] for ln in holding_lines if ln.split()}
     assert "BTC" in assets_listed
-    assert "USDC" not in assets_listed, "cannot trade the currency you settle in"
     assert "USD" not in assets_listed, "fiat is funding, not a position"
+    assert "USDC" not in assets_listed, "a stablecoin is cash held between positions"
 
 
 def test_holdings_filters_dust_by_min_balance(tmp_path, valid_config_path, monkeypatch):

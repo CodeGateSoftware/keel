@@ -61,8 +61,12 @@ class FakeBroker:
         self._order_seq = 0
 
     def get_accounts(self) -> list[dict[str, Any]]:
-        """A comfortably large USDC balance -- rail 13 (USDC-funding) fails closed otherwise."""
-        return [{"currency": "USDC", "available_balance": Decimal("1000000")}]
+        """Comfortable balances -- rail 13 fails closed otherwise. Both legs are funded because
+        rail 13 checks the PRODUCT's quote leg (BTC-USD spends USD), not config.quote_currency."""
+        return [
+            {"currency": "USD", "available_balance": Decimal("1000000")},
+            {"currency": "USDC", "available_balance": Decimal("1000000")},
+        ]
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start: int, end: int
@@ -630,7 +634,7 @@ def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) ->
             self.balance = Decimal("10000")
 
         def get_accounts(self) -> list[dict[str, Any]]:
-            return [{"currency": "USDC", "available_balance": self.balance}]
+            return [{"currency": "USD", "available_balance": self.balance}]
 
     series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
     broker = _DecliningBroker(series=series)
@@ -670,7 +674,7 @@ def test_equity_counts_the_net_held_qty_across_multiple_buys(repo: Repository) -
     broker = FakeBroker()
 
     equity = agent._mark_to_market_equity(
-        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USDC"
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USD"
     )
 
     # 2.5 BTC held, not 0.5 -- cash is FakeBroker's 1_000_000
@@ -684,7 +688,7 @@ def test_equity_counts_a_held_position_whose_rule_is_no_longer_live(repo: Reposi
     broker = FakeBroker()
 
     equity = agent._mark_to_market_equity(
-        repo, broker, [], {PRODUCT: Decimal("100")}, "USDC"
+        repo, broker, [], {PRODUCT: Decimal("100")}, "USD"
     )
 
     assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
@@ -699,7 +703,7 @@ def test_equity_falls_back_to_avg_cost_when_a_held_product_has_no_price(
     _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
     broker = FakeBroker()
 
-    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USDC")
+    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USD")
 
     assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
 

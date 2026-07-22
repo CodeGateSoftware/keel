@@ -58,7 +58,7 @@ def test_load_config_caps_typed_and_correct(valid_config_path):
 def test_load_config_subscription_and_quote_currency_defaults(valid_config_path):
     config = load_config(valid_config_path)
 
-    assert config.quote_currency == "USDC"
+    assert config.quote_currency == "USD"
     assert config.subscription.assumed_free_volume_usd == Decimal("500")
     assert config.subscription.pacing == "opportunistic"
 
@@ -78,7 +78,7 @@ subscription:
 
     config = load_config(path)
 
-    assert config.quote_currency == "USDC"
+    assert config.quote_currency == "USD"
     assert config.subscription.assumed_free_volume_usd == Decimal("500")
     assert config.subscription.pacing == "opportunistic"
 
@@ -170,7 +170,7 @@ def test_the_rejection_message_points_at_attest(write_config) -> None:
 
 
 def test_load_config_quote_currency_empty_raises_configerror(write_config):
-    text = VALID_CONFIG_YAML.replace("quote_currency: USDC", "quote_currency: ''")
+    text = VALID_CONFIG_YAML.replace("quote_currency: USD", "quote_currency: ''")
     path = write_config(text)
 
     with pytest.raises(ConfigError, match="quote_currency"):
