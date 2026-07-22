@@ -1284,3 +1284,17 @@ def test_equity_is_None_only_when_NOTHING_is_readable(repo):
             return []
 
     assert agent._mark_to_market_equity(repo, NoAccounts(), ["BTC-USD"], {}, "USDC") is None
+
+
+def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monkeypatch):
+    """The valuation loop already covers `held_products()`; the currency scan must too. A
+    retired rule leaves its position marked to market while the cash funding it goes unseen --
+    an under-read, and the HWM never falls."""
+
+    class EurOnly:
+        def get_accounts(self):
+            return [{"currency": "EUR", "available_balance": Decimal("500")}]
+
+    monkeypatch.setattr(repo, "held_products", lambda: ["BTC-EUR"])
+    equity = agent._mark_to_market_equity(repo, EurOnly(), [], {}, "USD")
+    assert equity == Decimal("500"), f"cash for a held product's quote leg was missed: {equity!r}"

@@ -1388,8 +1388,11 @@ def test_the_veto_message_names_the_currency_actually_required(repo):
     )
 
     message = next(v for v in result.vetoed_by if v.startswith("usdc_funding"))
-    assert "USD" in message
-    assert "USDC" not in message, f"message names the wrong currency: {message}"
+    # Strip the rail's own lowercase tag before matching currency codes -- otherwise
+    # `"USDC" not in message` passes only by accident of the tag's casing.
+    body = message.split(":", 1)[1]
+    assert "USD" in body
+    assert "USDC" not in body, f"message names the wrong currency: {message}"
 
 
 def test_no_account_at_all_for_the_required_currency_fails_closed(repo):

@@ -297,7 +297,8 @@ def _mark_to_market_equity(
     never falls, so an under-read arms the breaker on a phantom drawdown from then on).
     """
     currencies: list[str] = []
-    for candidate in (quote_currency, *(quote_currency_of(p) for p in products)):
+    scanned = (*products, *repo.held_products())
+    for candidate in (quote_currency, *(quote_currency_of(p) for p in scanned)):
         upper = (candidate or "").upper()
         if upper and upper not in currencies:
             currencies.append(upper)

@@ -674,9 +674,6 @@ def _history_product(asset: str, quote: str) -> str:
 # `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
 # compares the product's quote leg to the settlement currency and never touches candles, so it
 # stays a real, assessable verdict even with zero bars.
-# `settlement` is deliberately NOT here: since it compares the product's quote leg to the
-# configured settlement currency it no longer touches candles at all, so it is fully assessable
-# with zero bars -- suppressing it would hide a real, actionable failure.
 _DATA_DERIVED_FAILURES = frozenset({"liquidity"})
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
@@ -779,11 +776,15 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
 
         failures = result.failures
         if facts.daily_bars == 0:
-            # The likeliest misreading of this whole feature. With no cached bars the liquidity
-            # and settlement checks CANNOT say anything about the asset -- median volume is 0
-            # because there are no bars, and `quotable_in_settlement_currency` degenerates to
-            # `bool(candles)`. Printing them as findings would assert about the asset exactly
-            # what this message exists to deny, so they are shown as derived, not as verdicts.
+            # The likeliest misreading of this whole feature. With no cached bars `liquidity`
+            # cannot say anything about the asset -- median volume is 0 *because* there are no
+            # bars -- so printing it as a finding would assert about the asset exactly what this
+            # message exists to deny. It is shown as derived, not as a verdict.
+            # NOTE: `settlement` is deliberately NOT suppressed. It compares the product's quote
+            # leg to the settlement currency and never reads candles, so it stays assessable at
+            # zero bars. Do not add it to `_DATA_DERIVED_FAILURES` -- no test would catch that
+            # here (a derived product can never fail settlement), and it would hide a real
+            # verdict on any externally supplied product.
             derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
             failures = [f for f in failures if f not in derived]
             click.echo(
