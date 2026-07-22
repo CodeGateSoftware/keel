@@ -73,7 +73,7 @@ read-only report, in the same family as `assets discover`.
 the `screen_asset` call. That block is extracted to:
 
 ```python
-def _screen_product(repo, product, quote) -> screen_mod.ScreenResult
+def _screen_product(repo, product, quote) -> tuple[MarketFacts, ScreenResult]
 ```
 
 and **both** `assets screen` and `assets holdings --screen` call it. This is the mechanism that

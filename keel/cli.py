@@ -727,9 +727,10 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         (
             a
             for a in accounts
-            if a["currency"].upper() not in excluded and a["available_balance"] > floor
+            if (a.get("currency") or "").upper() not in excluded
+            and a["available_balance"] > floor
         ),
-        key=lambda a: a["currency"].upper(),
+        key=lambda a: (a.get("currency") or "").upper(),
     )
 
     if not holdings:
@@ -740,7 +741,10 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     click.echo(f"{len(holdings)} holding(s) above {floor}, excluding {quote} and fiat:\n")
 
     for account in holdings:
-        asset = account["currency"]
+        # Uppercase here too, not just for the exclusion set: screening the raw code would look
+        # up `btc` (UNATTESTED) while the allowlist check matched `BTC`, and would hand the
+        # operator `keel fetch --products btc-USD`, a product id that never resolves.
+        asset = (account.get("currency") or "").upper()
         on_allowlist = "on-allowlist" if asset.upper() in allowlist else "not-on-allowlist"
         attested = "attested" if repo.get_asset_attestation(asset) else "UNATTESTED"
         click.echo(f"  {asset:<8} balance={account['available_balance']:<18} "

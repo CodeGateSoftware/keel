@@ -509,3 +509,62 @@ def test_min_balance_rejects_garbage_and_non_finite_values(
     for bad in ("abc", "nan", "-1", "inf"):
         result = _holdings(db_path, valid_config_path, "--min-balance", bad)
         assert result.exit_code != 0, f"--min-balance {bad} should be rejected: {result.output}"
+
+
+def test_the_derived_failure_tags_actually_match_screen_asset_output():
+    """Pins the string coupling that the zero-bars suppression depends on.
+
+    `assets holdings` suppresses derivative failures by matching `failure.split(":")[0]` against
+    `_DATA_DERIVED_FAILURES`. Renaming a tag in `screen_asset` would silently stop the
+    suppression -- reintroducing 'data artifacts printed as verdicts about the asset' with a
+    fully green suite. This asserts the tags are real.
+    """
+    from keel.compliance import screen as screen_mod
+
+    facts = screen_mod.MarketFacts(
+        asset="SOL",
+        daily_bars=0,
+        median_daily_volume=Decimal(0),
+        quotable_in_settlement_currency=False,
+    )
+    tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
+
+    missing = cli_module._DATA_DERIVED_FAILURES - tags
+    assert not missing, (
+        f"{missing} no longer appear as failure tags in screen_asset -- the holdings "
+        "suppression is now silently inert; update _DATA_DERIVED_FAILURES"
+    )
+
+
+def test_a_lowercase_holding_is_screened_as_the_attested_uppercase_asset(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A `btc` balance must not read as UNATTESTED while `BTC` is attested, nor be handed a
+    `btc-USD` fetch hint that will never resolve."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("btc", "0.5")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "UNATTESTED" not in result.output
+    assert "btc-USD" not in result.output
+    assert "ADMIT" in result.output
+
+
+def test_an_account_with_no_currency_field_does_not_crash(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`CoinbaseClient.get_accounts` defaults a missing currency to None."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    broken = {"uuid": "u", "currency": None, "available_balance": Decimal("1"), "active": True}
+    _with_broker(monkeypatch, _FakeBroker([broken, _account("BTC", "0.5")]))
+
+    result = _holdings(db_path, valid_config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "BTC" in result.output
