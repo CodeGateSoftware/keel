@@ -658,7 +658,13 @@ def run_once(
         # PAPER path instead, which never touches the broker. Constructed once per cycle and
         # rehydrated from the orders table, so a per-cycle agent resumes its open positions.
         paper_trader = PaperTrader(repo) if config.auto_trade.mode == "paper" else None
-        log_event(logger, logging.INFO, "agent.mode_resolved", mode=mode)
+        # What this cycle actually DID, for the log line and `LoopResult`. `_effective_mode`
+        # returns the executor string `"confirm"` for any non-live config -- paper included --
+        # so reporting it verbatim told the user a confirm-mode (live) run happened when the
+        # cycle only ever hit the paper path. `executor.execute`/`_handle_exits` still get the
+        # real executor `mode`; only what we surface to the user changes.
+        reported_mode = "paper" if paper_trader is not None else mode
+        log_event(logger, logging.INFO, "agent.mode_resolved", mode=reported_mode)
         max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
         finest = _finest_granularity(granularities)
 
@@ -792,7 +798,7 @@ def run_once(
             ts=now_ts,
             skipped=False,
             skip_reason=None,
-            mode=mode,
+            mode=reported_mode,
             polled=polled,
             products=products,
             stale_products=stale_products,

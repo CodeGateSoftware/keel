@@ -387,6 +387,22 @@ def test_paper_mode_places_nothing_even_when_autonomous(repo):
     assert broker.place_calls == [], "paper mode must never reach the broker"
 
 
+def test_paper_mode_is_reported_as_paper_not_confirm(repo):
+    """The loop summary must name the real operating mode.
+
+    Paper routes to the paper path and never touches the broker, but `_effective_mode` returns
+    the executor string `"confirm"` for any non-live config -- so a paper cycle used to report
+    `mode=confirm`, telling the user a confirm-mode (live) run happened when nothing did. The
+    reported mode must say `"paper"`.
+    """
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    config = _config(auto_trade=AutoTradeConfig(mode="paper", interval_sec=50_000))
+
+    result = run_once(broker, repo, config, now_ts=90_000)
+
+    assert result.mode == "paper"
+
+
 # -- run_once: EXIT wiring on a held position ---------------------------------------------------
 
 
