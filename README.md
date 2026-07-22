@@ -7,7 +7,7 @@ An offline-first, halal (long-only, no-leverage) auto-trading agent for Coinbase
 ## Development
 
 ```bash
-uv sync                 # install deps (Python 3.12)
+uv sync                 # install deps (Python 3.14)
 uv run pytest           # run tests
 uv run ruff check       # lint
 ```

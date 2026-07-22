@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "CodeGate Software" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14.4"
 dependencies = [
     "click>=8.4.2",
     # pyyaml/python-dotenv are deliberately NOT listed here: nothing under `keel/` imports
@@ -56,17 +56,11 @@ dev = [
     "keel-broker-fake",
 ]
 
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-# UP042: the design spec pins `class X(str, Enum)` explicitly (not `StrEnum`) for these types.
-ignore = ["UP042"]
+# Ruff config lives in ruff.toml at the repo root. A ruff.toml takes precedence over
+# [tool.ruff] here, so keeping a copy in both places would leave silently-dead settings.
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 files = ["packages", "keel", "tests"]
 
 # New packages are strict from birth.
