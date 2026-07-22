@@ -1169,7 +1169,8 @@ def test_interactive_confirm_places_on_yes_declines_on_no(monkeypatch, capsys):
     """`_interactive_confirm` renders the preview and returns the human's yes/no."""
     import keel.cli as cli_module
 
-    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: True, raising=False)
+    # The TTY predicate lives in keel.commands._common; _interactive_confirm calls it there.
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
 
     monkeypatch.setattr(cli_module.click, "confirm", lambda *a, **k: True)
     assert cli_module._interactive_confirm({"order_total": "5.00", "commission_total": "0.03"})
@@ -1184,7 +1185,8 @@ def test_interactive_confirm_places_on_yes_declines_on_no(monkeypatch, capsys):
 def test_interactive_confirm_fails_closed_without_a_tty(monkeypatch):
     import keel.cli as cli_module
 
-    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: False, raising=False)
+    # The TTY predicate lives in keel.commands._common; _interactive_confirm calls it there.
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: False)
     assert cli_module._interactive_confirm({"order_total": "5.00"}) is False
 
 
