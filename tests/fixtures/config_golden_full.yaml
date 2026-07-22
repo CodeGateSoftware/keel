@@ -76,8 +76,8 @@ fees:
   taker_pct: 0.0075
   maker_pct: 0.0035
 
-# Non-default on purpose (the default is USDC) -- see the `tiers` note above.
-quote_currency: USD
+# Non-default on purpose (the default is USD) -- see the `tiers` note above.
+quote_currency: USDC
 
 logging:
   verbose: true

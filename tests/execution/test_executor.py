@@ -62,7 +62,12 @@ class FakeBroker:
         place_success: bool = True,
         place_order_id: str = "broker-order-1",
         usdc_balance: Decimal | None = Decimal("1000000"),
+        balances: dict[str, Decimal | None] | None = None,
     ) -> None:
+        # `balances` models a REAL account: one entry per currency. Without it the fake funds
+        # both USD and USDC with `usdc_balance`, so tests that only mean "the account is funded"
+        # keep meaning that -- the mismatch tests below set the two independently on purpose.
+        self._balances = balances
         self._preview = preview or {
             "order_total": Decimal("50.00"),
             "commission_total": Decimal("0.30"),
@@ -83,9 +88,19 @@ class FakeBroker:
 
     def get_accounts(self) -> list[dict[str, Any]]:
         self.get_accounts_calls += 1
+        if self._balances is not None:
+            return [
+                {"currency": c, "available_balance": b} for c, b in self._balances.items()
+            ]
         if self._usdc_balance is None:
-            return [{"currency": "USDC", "available_balance": None}]
-        return [{"currency": "USDC", "available_balance": self._usdc_balance}]
+            return [
+                {"currency": "USD", "available_balance": None},
+                {"currency": "USDC", "available_balance": None},
+            ]
+        return [
+            {"currency": "USD", "available_balance": self._usdc_balance},
+            {"currency": "USDC", "available_balance": self._usdc_balance},
+        ]
 
     def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
         self.preview_calls.append(
@@ -1310,3 +1325,84 @@ def test_scale_out_has_no_production_caller(repo):
         "bracket, and record a trade outcome for the partial exit -- otherwise rail 16 will "
         f"count net winners as losses. Call sites: {callers}"
     )
+
+
+# -- rail 13 guards the PRODUCT's quote leg, not config.quote_currency ----------
+#
+# The currency an order spends is a property of the product: BTC-USD spends USD whatever
+# `config.quote_currency` says. Checking the configured currency instead could PASS an order the
+# account cannot fund -- the exact case rail 13 exists to prevent.
+
+
+def test_ample_configured_currency_does_NOT_fund_a_differently_quoted_product(repo):
+    """THE hole. config.quote_currency=USDC with a large USDC balance, zero USD, and a BTC-USD
+    order: the old code checked USDC, passed, and let an unfundable order through to the broker.
+    """
+    broker = FakeBroker(balances={"USDC": Decimal("1000000"), "USD": Decimal("0")})
+    signal = _enter_signal()  # BTC-USD -> spends USD
+
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
+
+    assert result.placed is False, "an order spending USD was funded from a USDC balance"
+    assert result.preview is None, "rails must veto before the broker is touched"
+    assert any(v.startswith("usdc_funding") for v in result.vetoed_by)
+    assert broker.place_calls == []
+    assert repo.get_orders() == []
+
+
+def test_the_products_own_quote_balance_is_what_permits_the_buy(repo):
+    """The mirror case, and the false-veto the operator actually hit: funds are in USD, the
+    configured currency is empty, and a BTC-USD order should proceed."""
+    broker = FakeBroker(balances={"USDC": Decimal("0"), "USD": Decimal("1000000")})
+    signal = _enter_signal()
+
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
+
+    assert result.placed is True, result.vetoed_by
+
+
+def test_a_product_id_with_no_resolvable_quote_leg_fails_closed(repo):
+    broker = FakeBroker(balances={"USD": Decimal("1000000")})
+    signal = _enter_signal(product_id="BTCUSD")  # no separator -> unknown quote leg
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert any(v.startswith("usdc_funding") for v in result.vetoed_by)
+
+
+def test_the_veto_message_names_the_currency_actually_required(repo):
+    """'insufficient USDC' on a USD-settled order sends the operator to fund the wrong thing."""
+    broker = FakeBroker(balances={"USD": Decimal("1"), "USDC": Decimal("1000000")})
+    signal = _enter_signal()
+
+    result = execute(
+        signal, broker, repo, _config(quote_currency="USDC"),
+        mode="autonomous", now_ts=NOW_TS,
+    )
+
+    message = next(v for v in result.vetoed_by if v.startswith("usdc_funding"))
+    # Strip the rail's own lowercase tag before matching currency codes -- otherwise
+    # `"USDC" not in message` passes only by accident of the tag's casing.
+    body = message.split(":", 1)[1]
+    assert "USD" in body
+    assert "USDC" not in body, f"message names the wrong currency: {message}"
+
+
+def test_no_account_at_all_for_the_required_currency_fails_closed(repo):
+    """Distinct from a zero balance: the broker returns accounts, none of them the one this
+    order settles in. Silence about a currency is not evidence of funds in it."""
+    broker = FakeBroker(balances={"EUR": Decimal("1000000")})  # no USD account
+    signal = _enter_signal()  # BTC-USD
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert result.preview is None
+    assert any("unknown/unavailable" in v for v in result.vetoed_by)

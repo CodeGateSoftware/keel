@@ -23,8 +23,11 @@ Coinbase account.
 
 ### 1. ⛔ Disable interest / rewards on idle balances — **required**
 
-**Why.** Coinbase pays **USDC Rewards** on idle USDC balances. Rail 13 routes buys through USDC, so the
-account holds a USDC quote balance between trades. Interest accruing on that balance is **riba**
+**Why.** Coinbase pays **USDC Rewards** on idle USDC balances. This applies whenever you hold idle
+USDC — which is the case if you settle in USDC, and remains the case for any USDC you keep aside.
+(Since 2026-07-22 rail 13 checks the quote leg of the product being traded rather than a single
+configured currency, so a `-USD` deployment holds USD between trades; the rewards concern still
+applies to any USDC balance you do hold.) Interest accruing on that balance is **riba**
 (KB §56.3, grounded in §28.1 / §30.1) — and it accrues **with no order placed**, so no rail sees it.
 This is not a trading decision the system can veto; it is an account setting only you can change.
 

@@ -61,8 +61,12 @@ class FakeBroker:
         self._order_seq = 0
 
     def get_accounts(self) -> list[dict[str, Any]]:
-        """A comfortably large USDC balance -- rail 13 (USDC-funding) fails closed otherwise."""
-        return [{"currency": "USDC", "available_balance": Decimal("1000000")}]
+        """Comfortable balances -- rail 13 fails closed otherwise. Both legs are funded because
+        rail 13 checks the PRODUCT's quote leg (BTC-USD spends USD), not config.quote_currency."""
+        return [
+            {"currency": "USD", "available_balance": Decimal("1000000")},
+            {"currency": "USDC", "available_balance": Decimal("1000000")},
+        ]
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start: int, end: int
@@ -630,7 +634,7 @@ def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) ->
             self.balance = Decimal("10000")
 
         def get_accounts(self) -> list[dict[str, Any]]:
-            return [{"currency": "USDC", "available_balance": self.balance}]
+            return [{"currency": "USD", "available_balance": self.balance}]
 
     series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
     broker = _DecliningBroker(series=series)
@@ -670,7 +674,7 @@ def test_equity_counts_the_net_held_qty_across_multiple_buys(repo: Repository) -
     broker = FakeBroker()
 
     equity = agent._mark_to_market_equity(
-        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USDC"
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USD"
     )
 
     # 2.5 BTC held, not 0.5 -- cash is FakeBroker's 1_000_000
@@ -684,7 +688,7 @@ def test_equity_counts_a_held_position_whose_rule_is_no_longer_live(repo: Reposi
     broker = FakeBroker()
 
     equity = agent._mark_to_market_equity(
-        repo, broker, [], {PRODUCT: Decimal("100")}, "USDC"
+        repo, broker, [], {PRODUCT: Decimal("100")}, "USD"
     )
 
     assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
@@ -699,7 +703,7 @@ def test_equity_falls_back_to_avg_cost_when_a_held_product_has_no_price(
     _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
     broker = FakeBroker()
 
-    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USDC")
+    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {}, "USD")
 
     assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
 
@@ -1235,3 +1239,62 @@ def test_autonomy_still_applies_strictly_before_its_expiry(repo):
 
     assert result.mode == "autonomous"
     assert len(broker.place_calls) == 1
+
+
+def test_equity_counts_settled_cash_in_EVERY_quote_leg_being_traded(repo):
+    """Rail 11's HWM is monotonic, so an under-read arms a phantom drawdown PERMANENTLY.
+
+    Counting only `config.quote_currency` under-reads an account whose settled cash sits in the
+    currency its products actually settle in -- and this is reachable now that rail 13 permits
+    such an order. Equity must see the cash that funds the trading.
+    """
+
+    class TwoCurrencyBroker:
+        def get_accounts(self):
+            return [
+                {"currency": "USD", "available_balance": Decimal("1000")},
+                {"currency": "USDC", "available_balance": Decimal("7")},
+            ]
+
+    equity = agent._mark_to_market_equity(
+        repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC"
+    )
+    assert equity is not None
+    assert equity >= Decimal("1000"), (
+        f"equity {equity} ignored the USD cash that funds BTC-USD orders"
+    )
+
+
+def test_equity_is_a_total_when_only_SOME_currencies_are_readable(repo):
+    """`None` means 'equity is unknowable', reserved for when NOTHING is readable. A currency the
+    account simply has no wallet for must contribute nothing, not void the whole reading -- that
+    would return None on a perfectly ordinary account and stall rail 11's equity tracking."""
+
+    class OnlyUsd:
+        def get_accounts(self):
+            return [{"currency": "USD", "available_balance": Decimal("1000")}]
+
+    equity = agent._mark_to_market_equity(repo, OnlyUsd(), ["BTC-USD"], {}, "USDC")
+    assert equity == Decimal("1000"), f"expected a total, got {equity!r}"
+
+
+def test_equity_is_None_only_when_NOTHING_is_readable(repo):
+    class NoAccounts:
+        def get_accounts(self):
+            return []
+
+    assert agent._mark_to_market_equity(repo, NoAccounts(), ["BTC-USD"], {}, "USDC") is None
+
+
+def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monkeypatch):
+    """The valuation loop already covers `held_products()`; the currency scan must too. A
+    retired rule leaves its position marked to market while the cash funding it goes unseen --
+    an under-read, and the HWM never falls."""
+
+    class EurOnly:
+        def get_accounts(self):
+            return [{"currency": "EUR", "available_balance": Decimal("500")}]
+
+    monkeypatch.setattr(repo, "held_products", lambda: ["BTC-EUR"])
+    equity = agent._mark_to_market_equity(repo, EurOnly(), [], {}, "USD")
+    assert equity == Decimal("500"), f"cash for a held product's quote leg was missed: {equity!r}"

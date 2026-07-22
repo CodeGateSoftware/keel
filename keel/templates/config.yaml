@@ -61,8 +61,13 @@ dca:
   budget_usd: 50
   cadence_days: 7
 
-# quote-currency the executor draws BUY notional from (rail 13, USDC-funding) -- never bank/ACH.
-quote_currency: USDC
+# The settlement currency this deployment TRADES IN. It must match the quote leg of the
+# products you actually trade: everything here is `-USD` (see `_default_sim_products` /
+# `_history_product`), so this is USD. It is NOT used to decide which balance funds a given
+# order -- that comes from the product itself (`quote_currency_of`), because BTC-USD spends USD
+# whatever this says. Used to screen candidates and to exclude the settlement balance from
+# `keel assets holdings`.
+quote_currency: USD
 
 subscription:
   # The SIMULATOR's assumed fee-free monthly volume. The LIVE rail-14 cap is not set here --

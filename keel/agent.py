@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
 from keel.config import Config
@@ -277,13 +278,36 @@ def _mark_to_market_equity(
     than on a loss. That is why this iterates `products` and not `price_by_product` -- a product
     missing from the price map is exactly the case the fallback exists for.
 
-    `None`, rather than a partial total, when the quote balance is unavailable: equity is simply
-    unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM never
-    falls, so an under-read arms the breaker on a phantom drawdown from then on).
+    ⚠️ **Balances are summed at face value, with NO FX conversion.** That is correct for the
+    supported case -- one settlement currency, whose products all share that quote leg -- and it
+    is why `config.quote_currency` and the products' legs should agree. An account mixing, say,
+    USD and EUR would have them added 1:1 and over-read equity, which (the HWM being monotonic)
+    would arm rail 11 permanently. Reaching that state needs a product whose quote leg differs
+    from the settlement currency, which the admission screen rejects; a live-seeded rule can
+    bypass admission, so this is recorded as a known bound rather than claimed impossible.
+
+    Settled cash is summed across EVERY currency in play: `quote_currency` plus the quote leg of
+    each product being valued. Counting only the configured currency under-reads an account whose
+    cash sits in what its products actually settle in (a `BTC-USD` deployment configured for
+    USDC) -- and because the HWM is monotonic, that under-read arms rail 11 on a phantom
+    drawdown permanently. Currencies with no account contribute nothing rather than failing.
+
+    `None`, rather than a partial total, when NO quote balance could be read at all: equity is
+    simply unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM
+    never falls, so an under-read arms the breaker on a phantom drawdown from then on).
     """
-    quote = _fetch_available_quote(broker, quote_currency)
-    if quote is None:
+    currencies: list[str] = []
+    scanned = (*products, *repo.held_products())
+    for candidate in (quote_currency, *(quote_currency_of(p) for p in scanned)):
+        upper = (candidate or "").upper()
+        if upper and upper not in currencies:
+            currencies.append(upper)
+
+    balances = [(c, _fetch_available_quote(broker, c)) for c in currencies]
+    if all(balance is None for _, balance in balances):
+        # Nothing readable at all -- not "zero cash", genuinely unknown.
         return None
+    quote = sum((balance for _, balance in balances if balance is not None), Decimal("0"))
 
     # Quantities come from `_held_position` (the filled-orders audit log), NEVER from
     # `position_rule:<product>`. That key is exit-rule OWNERSHIP state: it is overwritten on

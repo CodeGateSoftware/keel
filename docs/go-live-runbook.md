@@ -18,7 +18,7 @@ exchange, correctly, and we have a record of it".
 | ☐ | you have a **trade-enabled** CDP key (the read-only one cannot place orders) | |
 | ☐ | `.env` holds `CDP_API_KEY` / `CDP_API_SECRET`, and `.env` is git-ignored | credentials live only here — there is no vault |
 | ☐ | you are at a real terminal | confirmation and every halt-releasing command fail closed off a TTY |
-| ☐ | funds are in **USDC**, not USD | rail 13 vetoes a BUY that is not funded from `quote_currency`, and never draws from a bank/ACH |
+| ☐ | settled funds are in the **quote leg of the product you trade** (`BTC-USD` → **USD**) | rail 13 checks the balance of the currency the ORDER spends, derived from the product — not `config.quote_currency` — and never draws from a bank/ACH |
 
 ## 1. Bring the deployment up
 

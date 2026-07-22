@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.products import quote_currency_of
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.telemetry import bind_venue
 
@@ -619,7 +620,11 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
         asset=asset,
         daily_bars=len(candles),
         median_daily_volume=median,
-        quotable_in_settlement_currency=product.endswith(f"-{quote}") or bool(candles),
+        # A REAL check: does this product settle in the currency this deployment trades in?
+        # The former `or bool(candles)` fallback made it vacuous -- every screened product is
+        # `-USD`, so it always fell through to "do we have bars", which the history criterion
+        # already covers. One of four admission criteria was doing nothing.
+        quotable_in_settlement_currency=quote_currency_of(product) == quote.upper(),
     )
 
 
@@ -652,18 +657,24 @@ def _screen_product(
     return facts, screen_mod.screen_asset(facts, attestation)
 
 
-#: The product id this codebase uses for an asset's daily history. `assets screen`,
-#: `keel simulate` and `keel fetch` all key on `-USD` (see `_default_sim_products`), so holdings
-#: must too -- screening `{asset}-{quote_currency}` instead would find zero cached bars for every
-#: asset and report "no local history" forever, which is worse than useless: it looks like a
-#: verdict about the asset.
-def _history_product(asset: str) -> str:
-    return f"{asset}-USD"
+def _history_product(asset: str, quote: str) -> str:
+    """The product id for an asset, in the deployment's settlement currency.
+
+    ONE source of truth, shared with `_default_sim_products`. Hardcoding `-USD` here while the
+    screen compared against `config.quote_currency` is what let a `quote_currency: USDC` config
+    reject every asset on a settlement failure it could never fix -- a default change does not
+    change configs already on disk. Deriving both from the same setting means the worst case is
+    an honest "no local history, run `keel fetch`", not a silent unfixable rejection.
+    """
+    return f"{asset}-{quote.upper()}"
 
 
-# Failure classes that are DOWNSTREAM of having no cached history: with zero bars they report
-# on our data, not on the asset, so `assets holdings` must not print them as verdicts.
-_DATA_DERIVED_FAILURES = frozenset({"liquidity", "settlement"})
+# Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
+# reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
+# `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
+# compares the product's quote leg to the settlement currency and never touches candles, so it
+# stays a real, assessable verdict even with zero bars.
+_DATA_DERIVED_FAILURES = frozenset({"liquidity"})
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
 # a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
@@ -671,6 +682,12 @@ _DATA_DERIVED_FAILURES = frozenset({"liquidity", "settlement"})
 _FIAT_CURRENCIES = frozenset(
     {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "SGD", "BRL", "MXN", "TRY", "INR", "KRW"}
 )
+
+# Stablecoins are cash EQUIVALENTS -- funding you hold between positions, not positions. They are
+# excluded for the same reason fiat is: proposing the money as something to buy with the money is
+# noise. (They would be REJECTED anyway -- unattested, and a yield-bearing one fails §28.4 -- so
+# this only removes a redundant row, never an admission.)
+_CASH_EQUIVALENTS = frozenset({"USDC", "USDT", "DAI", "PYUSD", "TUSD", "USDP", "GUSD"})
 
 
 @assets_group.command("holdings")
@@ -720,7 +737,7 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
             "  If this is an authentication error, check CDP_API_KEY/CDP_API_SECRET in .env."
         ) from exc
 
-    excluded = _FIAT_CURRENCIES | {quote.upper()}
+    excluded = _FIAT_CURRENCIES | _CASH_EQUIVALENTS | {quote.upper()}
     # Currency codes are compared UPPERCASED: a `usdc` balance is still the settlement currency,
     # and must not be presented as something tradable on a casing accident.
     holdings = sorted(
@@ -753,17 +770,21 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         if not run_screen:
             continue
 
-        product = _history_product(asset)
+        product = _history_product(asset, quote)
         facts, result = _screen_product(repo, product, quote)
         click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
 
         failures = result.failures
         if facts.daily_bars == 0:
-            # The likeliest misreading of this whole feature. With no cached bars the liquidity
-            # and settlement checks CANNOT say anything about the asset -- median volume is 0
-            # because there are no bars, and `quotable_in_settlement_currency` degenerates to
-            # `bool(candles)`. Printing them as findings would assert about the asset exactly
-            # what this message exists to deny, so they are shown as derived, not as verdicts.
+            # The likeliest misreading of this whole feature. With no cached bars `liquidity`
+            # cannot say anything about the asset -- median volume is 0 *because* there are no
+            # bars -- so printing it as a finding would assert about the asset exactly what this
+            # message exists to deny. It is shown as derived, not as a verdict.
+            # NOTE: `settlement` is deliberately NOT suppressed. It compares the product's quote
+            # leg to the settlement currency and never reads candles, so it stays assessable at
+            # zero bars. Do not add it to `_DATA_DERIVED_FAILURES` -- no test would catch that
+            # here (a derived product can never fail settlement), and it would hide a real
+            # verdict on any externally supplied product.
             derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
             failures = [f for f in failures if f not in derived]
             click.echo(
@@ -1300,7 +1321,7 @@ def monitor(
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
     broker = _build_broker(config)
-    products = [f"{asset}-USD" for asset in config.allowlist]
+    products = _default_sim_products(config)
     granularities = list(config.market_data.granularities)
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
 
@@ -1665,7 +1686,8 @@ def _json_plain(value: Any) -> Any:
 @click.option(
     "--products",
     default=None,
-    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+    help="Comma-separated product ids (default: the allowlist, in the configured "
+    "settlement currency).",
 )
 @click.option(
     "--kinds",
@@ -1831,7 +1853,12 @@ _DAYS_PER_YEAR = 365
 
 
 def _default_sim_products(config: Config) -> list[str]:
-    return [f"{asset}-USD" for asset in config.allowlist]
+    """Allowlist assets as product ids, in the configured settlement currency.
+
+    Shares `_history_product`'s derivation so `fetch`, `simulate`, `screen` and `holdings`
+    cannot disagree about which product an asset means.
+    """
+    return [_history_product(asset, config.quote_currency) for asset in config.allowlist]
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
@@ -2029,7 +2056,8 @@ def _default_report_path(now_ts: int) -> Path:
 @click.option(
     "--products",
     default=None,
-    help="Comma-separated product ids (default: config.yaml's allowlist mapped to -USD pairs).",
+    help="Comma-separated product ids (default: the allowlist, in the configured "
+    "settlement currency).",
 )
 @click.option(
     "--contribution",

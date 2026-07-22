@@ -81,6 +81,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from keel_core.products import quote_currency_of
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import log_event
 
@@ -410,20 +411,29 @@ def check(
     #     SELL is exempt -- it produces quote currency, it doesn't consume it (Issue #59).
     if not offline and is_buy:
         balance = intent.available_quote
-        if balance is None:
+        # The currency this order actually settles in, derived from the product -- NOT
+        # `config.quote_currency`. Naming the configured currency in the message would send an
+        # operator to fund a balance the order never touches.
+        required = quote_currency_of(intent.product_id)
+        if required is None:
             violations.append(
-                f"usdc_funding: available {config.quote_currency} balance is unknown/"
+                f"usdc_funding: cannot determine the settlement currency of "
+                f"{intent.product_id!r} -- failing closed, BUY vetoed"
+            )
+        elif balance is None:
+            violations.append(
+                f"usdc_funding: available {required} balance is unknown/"
                 "unavailable -- failing closed, BUY vetoed"
             )
         elif balance <= 0:
             violations.append(
-                f"usdc_funding: available {config.quote_currency} balance {balance} is not "
+                f"usdc_funding: available {required} balance {balance} is not "
                 "greater than 0"
             )
         elif balance < intent.notional:
             shortfall = intent.notional - balance
             violations.append(
-                f"usdc_funding: available {config.quote_currency} balance {balance} is short "
+                f"usdc_funding: available {required} balance {balance} is short "
                 f"{shortfall} of the {intent.notional} order notional"
             )
 
