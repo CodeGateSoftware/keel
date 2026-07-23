@@ -88,6 +88,10 @@ nothing and costs nothing.
 The rails have already passed at this point. The prompt is an **additional** human gate, never a
 replacement for them.
 
+**If you instead see `signals=0` and no preview**, no rule produced a setup this cycle — the
+cycle itself ran fine. With a DCA test vehicle this is almost always the cadence gotcha (see
+*What can still go wrong*), not a failure.
+
 ## 5. Verify against reality
 
 Do not trust the tool's own success message alone. Check the exchange:
@@ -169,6 +173,17 @@ Turn it on only once you have watched several supervised cycles behave correctly
   in autonomous mode.
 - **Confirm mode places nothing when run headless.** That is not a bug: with no TTY the
   confirmation declines. Use a terminal, or turn autonomy on deliberately.
+- **`signals=0` and no preview — the rule simply didn't fire this cycle.** Nothing broke; no
+  `live` rule produced a setup. If your test vehicle is the **DCA rule**, note it is gated to a
+  **calendar cadence**: it emits a buy only when the most recent daily candle's day-number since
+  the Unix epoch is a multiple of `cadence_days` — for the weekly default (`cadence_days: 7`) that
+  is **Thursdays, UTC**. On any other day you get `signals=0` and never reach the confirm prompt.
+  Either run on a cadence day, or — for an on-demand test — set the DCA rule's `cadence_days` to
+  `1` so it fires every cycle, and revert it afterward. (There is no CLI to edit rule params; it
+  is a one-row update to the `rules` table's `params` JSON, which places no order.) The
+  risk-defined rules (`turtle_breakout`, `pullback_continuation`, `rsi_meanrev`) instead fire only
+  on a genuine market setup, whose timing you cannot choose — so **DCA on a cadence day is the
+  controllable path** for a first live order.
 - **Equity moved because you deposited or withdrew.** Tell the tool (`keel record-flow --amount
   ±N`), or rail 11 will read the movement as drawdown and veto entries on an account that lost
   nothing.
