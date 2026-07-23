@@ -56,6 +56,17 @@ class _OpenPaperPosition:
     qty: Decimal = _QTY
     mfe: Decimal = Decimal(0)
     mae: Decimal = Decimal(0)
+    costed: bool = False
+    """Whether this position's entry was debited against synthetic cash.
+
+    Cash can be seeded (`seed_cash`) at any time relative to a position's open, so the
+    "is cash seeded?" check at entry and at exit can disagree for the SAME position (opened
+    while unseeded, then seeded before it closes). Without this flag, `_close` would credit
+    an exit that was never debited, and `equity()` would mark a position on top of cash that
+    never paid for it -- both manufacture equity out of nothing. Recording, at open time,
+    whether a debit actually happened keeps the close-side credit and the equity mark
+    correct-by-construction regardless of seed timing.
+    """
 
 
 def _touches(candle: Candle, price: Decimal) -> bool:
@@ -141,6 +152,11 @@ class PaperTrader:
                 entry_fill=Decimal(payload["entry"]),
                 entry_ts=setup.ts,
                 qty=Decimal(payload["qty"]),
+                # A surviving (non-filtered) order is always post-epoch: the cutoff above
+                # already dropped anything predating `paper_ledger_start_ts`, and that
+                # timestamp is only ever set by `seed_cash` -- so every rehydrated position
+                # was opened while cash was seeded, and was costed at the time.
+                costed=True,
             )
 
     def has_open_position(self, product_id: str) -> bool:
@@ -169,15 +185,18 @@ class PaperTrader:
         self._repo.set_state("paper_cash_usdc", self._cash)
 
     def equity(self, price_by_product: dict[str, Decimal]) -> Decimal | None:
-        """Mark-to-market equity: synthetic cash plus open paper positions.
+        """Mark-to-market equity: synthetic cash plus costed open paper positions.
 
-        `None` iff cash is unseeded -- there is no synthetic account to mark yet.
+        `None` iff cash is unseeded -- there is no synthetic account to mark yet. An open
+        position that was never debited against cash (`costed=False`, opened before cash was
+        seeded) is excluded -- marking it would inflate equity with a position nothing paid
+        for.
         """
         if self._cash is None:
             return None
         from keel.execution.equity import mark_positions
 
-        product_ids = list(self._open.keys())
+        product_ids = [p for p in self._open if self._open[p].costed]
         positions = [(self._open[p].qty, self._open[p].entry_fill) for p in product_ids]
         return mark_positions(self._cash, positions, price_by_product, product_ids)
 
@@ -237,10 +256,17 @@ class PaperTrader:
             return None
 
         setup = signal.setup
+        entry_fill = setup.entry * (Decimal(1) + self._slippage_pct)
+        fee = entry_fill * qty * self._fee_pct
 
-        if self._cash is not None:
-            notional = setup.entry * qty
-            if self._cash < notional:
+        costed = self._cash is not None
+        if costed:
+            # Gate on the ACTUAL debit (fill + slippage + fee), not the coarser intent
+            # notional (entry * qty) -- gating on notional alone would let cash go
+            # negative for any seed strictly between the two, defeating the check's
+            # purpose (spec Sec. 4.2: keep cash from going negative).
+            fill_cost = entry_fill * qty + fee
+            if self._cash < fill_cost:
                 # Paper-path guard only -- a rejection here just means no synthetic
                 # fill; it never touches guards.py's live-order checks.
                 log_event(
@@ -249,12 +275,10 @@ class PaperTrader:
                     "paper.funding_skip",
                     product_id=signal.product_id,
                     cash=str(self._cash),
-                    notional=str(notional),
+                    fill_cost=str(fill_cost),
                 )
                 return None
 
-        entry_fill = setup.entry * (Decimal(1) + self._slippage_pct)
-        fee = entry_fill * qty * self._fee_pct
         payload = {
             "role": "entry",
             "rule_name": signal.rule_name,
@@ -291,8 +315,9 @@ class PaperTrader:
             entry_fill=entry_fill,
             entry_ts=setup.ts,
             qty=qty,
+            costed=costed,
         )
-        if self._cash is not None:
+        if costed:
             self._cash -= entry_fill * qty + fee
             self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id
@@ -356,7 +381,7 @@ class PaperTrader:
             }
         )
         del self._open[position.product_id]
-        if self._cash is not None:
+        if position.costed and self._cash is not None:
             self._cash += exit_fill * position.qty - exit_fee
             self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id

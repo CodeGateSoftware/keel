@@ -454,3 +454,51 @@ def test_pre_epoch_orders_are_skipped_on_rehydration(repo):
 
     resumed = PaperTrader(repo)
     assert resumed.has_open_position("BTC-USD") is False
+
+
+def test_position_opened_before_seeding_is_never_costed(repo):
+    """A position opened while cash is unseeded, later seeded mid-flight, must not
+    desync the ledger: no debit happened at open, so no credit may happen at close,
+    and it must never inflate `equity()` -- otherwise seeding after the fact would
+    silently manufacture free equity out of an uncosted position.
+    """
+    trader = PaperTrader(repo)
+    trader.on_signal(_enter_signal(setup=_setup(entry="100", stop="90", target="130"), ts=1_000))
+    assert trader.has_open_position("BTC-USD")
+    assert trader.get_cash() is None  # unseeded -- no debit was possible
+
+    trader.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+
+    # equity must be exactly cash -- the uncosted open position contributes nothing
+    assert trader.equity({"BTC-USD": Decimal("120")}) == Decimal("30000")
+
+    # close it via a stop touch
+    trader.on_candle("BTC-USD", _candle(2_000, "89", "91", "88", "90"))
+    assert not trader.has_open_position("BTC-USD")
+
+    # no credit for an uncosted position -- cash stays exactly what was seeded
+    assert trader.get_cash() == Decimal("30000")
+
+
+def test_funding_check_rejects_at_boundary_between_notional_and_actual_fill_cost(repo):
+    """The funding check must gate on the ACTUAL debit (fill + slippage + fee), not
+    the coarser intent notional (entry * qty) -- otherwise cash can go negative for
+    any seed strictly between the two, defeating the check's stated purpose.
+    """
+    trader = PaperTrader(repo)
+    entry = Decimal("100")
+    qty = Decimal("5")
+    notional = entry * qty
+    entry_fill = entry * (Decimal(1) + SLIPPAGE_PCT)
+    fee = entry_fill * qty * FEE_PCT
+    fill_cost = entry_fill * qty + fee
+    assert notional < fill_cost  # slippage+fee always push the real cost higher
+
+    seed = (notional + fill_cost) / 2  # strictly between the two
+    trader.seed_cash(seed, now_ts=1_700_000_000)
+
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130"))
+    assert trader.on_signal(sig, qty=qty) is None
+    assert trader.get_cash() == seed  # unchanged
+    assert not trader.has_open_position("BTC-USD")
+    assert repo.get_orders(mode="paper") == []
