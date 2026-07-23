@@ -539,6 +539,28 @@ def test_monthly_allowance_updated_subscription_takes_effect_on_the_next_order(r
     assert second.placed is True
 
 
+# -- _build_intent equity override (Task 4, sizing fix part 2) ---------------------------------
+
+
+def test_build_intent_uses_equity_override(repo):
+    from keel.execution import executor
+
+    signal = _enter_signal()
+    config = _config()
+
+    default_intent = executor._build_intent(signal, None, repo, config, now_ts=NOW_TS)
+    override_intent = executor._build_intent(
+        signal, None, repo, config, now_ts=NOW_TS, equity_override=Decimal("30000")
+    )
+
+    # qty scales linearly with equity: override (30000) vs config.caps.max_exposure_usd
+    # (1000000 in _config()'s defaults).
+    assert override_intent.qty != default_intent.qty
+    assert override_intent.qty == default_intent.qty * (
+        Decimal("30000") / config.caps.max_exposure_usd
+    )
+
+
 # -- DCA sizing --------------------------------------------------------------------------------
 
 

@@ -301,9 +301,20 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
 
 
 def _build_intent(
-    signal: Signal, broker: Any, repo: Repository, config: Config, now_ts: int
+    signal: Signal,
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
+    equity_override: Decimal | None = None,
 ) -> OrderIntent | None:
-    """Size `signal` into an `OrderIntent`, or `None` for an EXIT with nothing open to sell."""
+    """Size `signal` into an `OrderIntent`, or `None` for an EXIT with nothing open to sell.
+
+    `equity_override`, when given, replaces `config.caps.max_exposure_usd` as the equity input
+    to fixed-fractional sizing on the ENTER/non-DCA path -- used by the paper-trading enter path
+    (Task 6) to size off the paper account's real equity instead of the live exposure cap. `None`
+    (the default) preserves the live-path behavior exactly.
+    """
     if signal.action == Action.ENTER:
         setup = signal.setup
         if setup is None:
@@ -314,7 +325,9 @@ def _build_intent(
             qty = sizing.dca_size(config.dca.budget_usd, setup.entry)
             stop = None
         else:
-            equity = config.caps.max_exposure_usd
+            equity = (
+                equity_override if equity_override is not None else config.caps.max_exposure_usd
+            )
             qty = sizing.size(equity, config.risk_pct, setup.entry, setup.stop)
             stop = setup.stop
 
