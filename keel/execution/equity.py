@@ -29,6 +29,32 @@ WEEK_SECONDS = 7 * 86_400
 UNEXPLAINED_JUMP_PCT = Decimal("0.25")
 
 
+def mark_positions(
+    cash: Decimal,
+    positions: list[tuple[Decimal, Decimal]],
+    price_by_product: dict[str, Decimal],
+    product_ids: list[str],
+) -> Decimal:
+    """Mark-to-market equity = cash + Σ qty·mark, with a cost-basis fallback.
+
+    `positions[i]` is `(qty, cost_basis)` for `product_ids[i]`. A product with no fresh
+    price in `price_by_product` is valued at its `cost_basis` rather than dropped -- dropping
+    a held position understates equity and would trip a drawdown breaker on a data gap rather
+    than a loss (mirrors agent._mark_to_market_equity's fallback).
+    """
+    total = cash
+    for (qty, cost_basis), product_id in zip(positions, product_ids):
+        if qty <= 0:
+            continue
+        mark = price_by_product.get(product_id)
+        if mark is None or mark <= 0:
+            mark = cost_basis
+        if mark <= 0:
+            continue
+        total += qty * mark
+    return total
+
+
 def record_external_flow(repo: Repository, *, amount: Decimal) -> None:
     """Rebase the high-water mark and the rolling weekly peak by an external cash flow.
 

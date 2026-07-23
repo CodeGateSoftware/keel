@@ -24,13 +24,18 @@ produces, so paper and historical stats are directly comparable.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
+
+from keel_core.telemetry import log_event
 
 from keel.data.repository import Repository
 from keel.strategy.rules.base import Action, Setup, Signal, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Side
+
+logger = logging.getLogger(__name__)
 
 # Position sizing (money management) is out of scope here, same as backtest.py:
 # every paper trade uses a fixed 1-unit notional, sufficient for win-rate/
@@ -75,7 +80,9 @@ class PaperTrader:
         self._fee_pct = fee_pct
         self._slippage_pct = slippage_pct
         self._open: dict[str, _OpenPaperPosition] = {}
+        self._ledger_start_ts = self._repo.get_state("paper_ledger_start_ts")
         self._load_open_positions()
+        self._cash = self._repo.get_state("paper_cash_usdc")
 
     def _load_open_positions(self) -> None:
         """Rebuild open paper positions from the orders table.
@@ -99,6 +106,13 @@ class PaperTrader:
                 payload = json.loads(order.get("raw_response") or "{}")
             except (TypeError, ValueError):
                 continue
+            if self._ledger_start_ts is not None:
+                order_ts = payload.get("ts") or order.get("created_at") or 0
+                if int(order_ts) < self._ledger_start_ts:
+                    # Pre-epoch legacy order (predates this synthetic account's seed
+                    # timestamp) -- never rehydrate it, so a legacy 1-unit paper
+                    # position can't silently reappear in the synthetic ledger.
+                    continue
             if payload.get("role") == "exit":
                 entry_id = payload.get("entry_order_id")
                 if entry_id is not None:
@@ -131,6 +145,41 @@ class PaperTrader:
 
     def has_open_position(self, product_id: str) -> bool:
         return product_id in self._open
+
+    def get_cash(self) -> Decimal | None:
+        return self._cash
+
+    def seed_cash(self, amount: Decimal, now_ts: int) -> None:
+        """Set the synthetic cash balance, opting this repo into the funding check.
+
+        Also stamps `paper_ledger_start_ts` the first time it's called (never overwritten
+        after) -- the epoch cutoff `_load_open_positions` uses to ignore legacy pre-epoch
+        orders written before the synthetic account existed.
+        """
+        self._cash = amount
+        self._repo.set_state("paper_cash_usdc", amount)
+        if self._repo.get_state("paper_ledger_start_ts") is None:
+            self._ledger_start_ts = now_ts
+            self._repo.set_state("paper_ledger_start_ts", now_ts)
+
+    def deposit(self, amount: Decimal) -> None:
+        if self._cash is None:
+            return
+        self._cash += amount
+        self._repo.set_state("paper_cash_usdc", self._cash)
+
+    def equity(self, price_by_product: dict[str, Decimal]) -> Decimal | None:
+        """Mark-to-market equity: synthetic cash plus open paper positions.
+
+        `None` iff cash is unseeded -- there is no synthetic account to mark yet.
+        """
+        if self._cash is None:
+            return None
+        from keel.execution.equity import mark_positions
+
+        product_ids = list(self._open.keys())
+        positions = [(self._open[p].qty, self._open[p].entry_fill) for p in product_ids]
+        return mark_positions(self._cash, positions, price_by_product, product_ids)
 
     def on_signal(
         self, signal: Signal, candle: Candle | None = None, qty: Decimal = _QTY
@@ -188,6 +237,22 @@ class PaperTrader:
             return None
 
         setup = signal.setup
+
+        if self._cash is not None:
+            notional = setup.entry * qty
+            if self._cash < notional:
+                # Paper-path guard only -- a rejection here just means no synthetic
+                # fill; it never touches guards.py's live-order checks.
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "paper.funding_skip",
+                    product_id=signal.product_id,
+                    cash=str(self._cash),
+                    notional=str(notional),
+                )
+                return None
+
         entry_fill = setup.entry * (Decimal(1) + self._slippage_pct)
         fee = entry_fill * qty * self._fee_pct
         payload = {
@@ -227,6 +292,9 @@ class PaperTrader:
             entry_ts=setup.ts,
             qty=qty,
         )
+        if self._cash is not None:
+            self._cash -= entry_fill * qty + fee
+            self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id
 
     def _exit_on_signal(self, signal: Signal, candle: Candle) -> int | None:
@@ -288,6 +356,9 @@ class PaperTrader:
             }
         )
         del self._open[position.product_id]
+        if self._cash is not None:
+            self._cash += exit_fill * position.qty - exit_fee
+            self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id
 
 
