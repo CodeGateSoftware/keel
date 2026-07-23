@@ -112,8 +112,19 @@ Two forms exist and they differ; keep them straight:
 
 **keel mapping:** the *dynamic* form is the interesting one and it **overlaps our existing
 account-DD breaker** (the design's total/weekly drawdown circuit-breaker). keel already halts on
-deep drawdown; drawdown-adjusted Kelly would instead *taper* size continuously before the halt.
-Candidate: a graded taper feeding the CTS execution ladder, not a new hard rail.
+deep drawdown; the taper would instead *bleed* size down continuously before the halt.
+
+⚑ **MEASURED (2026-07-23, report [`2026-07-23-drawdown-taper-and-merton-exploration.md`](../../../reports/2026-07-23-drawdown-taper-and-merton-exploration.md)) — KEEP as ceiling/diagnostic; do NOT build yet.**
+The taper **barely engages on keel's 1% base** (drawdown almost never reaches even a tight D=0.15
+ceiling; hard-breaker-trip rate 0.00% tapered *or* not) — confirming its value is **not** protecting
+the tiny base. Its real payoff is letting a **higher** base run safely: tapering a **quarter-Kelly**
+base at **D=0.15** *dominated* both flat-1% (4.27× vs 2.08× median terminal, profile A) **and**
+untapered ¼-Kelly (14.9% vs 22.75% median max-DD, and a **0.00% vs 99.8%** hard-breaker-trip rate).
+**But strictly conditional:** dominance holds only when `D` sits *below* keel's 20% hard breaker
+(it fails at D≥0.25 and in the p-over-estimated world), and a **half-Kelly** base is too large for
+any taper ceiling to rescue. Net — the taper is a *safety wrapper that unlocks a bigger base
+fraction*, not a fix for the 1% base; it only becomes a build candidate **if** we ever raise the
+base off 1%, which §58.11/§84.14 argue against doing autonomously. So: parked, with a number.
 
 ### §84.5 — Optimal f (Ralph Vince) — `OptimalF`
 
@@ -136,8 +147,20 @@ bets, `γ=2` cut volatility 61% while keeping 84% of Kelly's return; `γ=5` cut 
 keeping 77%. This is the *continuous* generalisation of fractional Kelly (choosing `γ` ≈ choosing
 `λ`), and it makes the risk-aversion knob explicit and defensible.
 
-**keel mapping:** a cleaner theoretical framing for "why sub-Kelly" than an ad-hoc `λ`. Same
-candidate as §84.3, expressed as a `γ` we can defend (`γ ≈ 2` is the standard human estimate).
+**keel mapping:** a cleaner, more defensible framing for "why sub-Kelly" than an ad-hoc `λ`.
+
+⚑ **MEASURED (2026-07-23, same report) — PROMOTE to build candidate (as vocabulary/diagnostic, not
+a `risk_pct` change).** Solving `μ/(γσ²) = 0.01` for keel's own floor gives **keel's implied
+γ ≈ 24** (profile A, p .55 / b 1.5) and **≈ 34** (profile B, p .58 / b 2.0): keel sizes like a
+Merton investor **24–34× more risk-averse than full Kelly** (γ=1) and **12–17× past** the textbook
+γ≈2 human estimate — a *mathematically extreme*, not merely "conservative," point, and a crisp
+citable number for the design rationale. The genuinely useful property: **a single fixed γ is
+edge-AND-variance-aware** — γ=24.24 sizes the floor edge at 1.00% but the stronger/lower-variance
+edge B at **1.39%** automatically, with zero re-tuning, which flat-1% *cannot* do by construction.
+Effective `λ = f_merton/f_kelly` = **4.00%** (A) / **3.76%** (B), matching keel-1%'s own ~4%-of-Kelly
+figure (§84.14); ruin stays 0.0% under the p-over-estimated stress (graceful, like fractional
+Kelly). "Promote" here = adopt as a **diagnostic/knob** ("keel runs at γ≈24–34"); the edge-aware
+sizing itself is the same humble candidate as §84.3, still gated by §58.11's small-sample caution.
 
 ### §84.7 — Fixed Fraction — `FixedFractionStrategy`  ★ this is keel today
 
@@ -330,9 +353,13 @@ not mere timidity.
   with a small `λ` and a hard cap could make sizing edge-aware. **Gate:** §58.11/§83.5 already
   ruled per-rule W/R too noisy to size on autonomously — so use it to *flag* a hand-set `risk_pct`
   that exceeds a fractional-Kelly ceiling, never to set it. Deterministic; cheap to prototype.
-- ✎ **Candidate: dynamic drawdown taper (§84.4)** `(1−d/D)·f*` — taper size continuously as
-  account drawdown builds, *before* rail 11's hard breaker halts. Feeds the CTS execution ladder,
-  not a new rail. The one item here with no existing keel analog.
+  ⚑ **Explored 2026-07-23 via Merton (§84.6): PROMOTED to diagnostic** — keel's implied **γ≈24–34**
+  is the citable "how sub-Kelly are we" number, and a fixed γ is edge-aware where flat-1% isn't.
+- ⚑ **Dynamic drawdown taper (§84.4) — EXPLORED 2026-07-23, KEPT as ceiling/diagnostic (not built).**
+  `(1−d/D)·f*` barely engages on the 1% base; its value is unlocking a **higher** base (tapered
+  ¼-Kelly at D<20% dominates flat-1% *and* untapered ¼-Kelly, cutting hard-breaker trips 99.8%→0%),
+  so it only pays off **if** the base is ever raised off 1% — which §58.11/§84.14 argue against.
+  Parked with a number; the one item here with no existing keel analog.
 - ⛔ **Declined:** dynamic streak-scaling (§84.9, anti-martingale — collides with the no-martingale
   rail + the "correlated trades" lesson); optimal-f as a live sizer (§84.5, overfits the worst
   historical loss on 31-trade samples).
