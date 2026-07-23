@@ -367,6 +367,6 @@ not mere timidity.
   (§84.8), naive/DCA (§84.10 = `dca_size`). The "Kelly-CPPI hybrid" the series recommends is,
   structurally, what keel already does (risk-sized order, clamped by exposure caps).
 
-**Cross-references:** design spec `docs/superpowers/specs/2026-07-15-halal-cb-autotrade-design.md` · §54.18 (optimal-f + fractional) · §83.1
+**Cross-references:** design spec `docs/superpowers/specs/2026-07-15-keel-autotrade-design.md` · §54.18 (optimal-f + fractional) · §83.1
 (equity base) · §83.5/§83.11 (Kelly = `W−(1−W)/R`) · §58.11 (small-sample W/R is noise) ·
 §54.7 (volatility-parity sizing) · §33/§50.1/§54.22/§68 (MPT declined — Kelly is *not* MPT).
