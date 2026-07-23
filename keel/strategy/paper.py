@@ -48,6 +48,7 @@ class _OpenPaperPosition:
     entry_order_id: int
     entry_fill: Decimal
     entry_ts: int
+    qty: Decimal = _QTY
     mfe: Decimal = Decimal(0)
     mae: Decimal = Decimal(0)
 
@@ -125,12 +126,15 @@ class PaperTrader:
                 entry_order_id=order_id,
                 entry_fill=Decimal(payload["entry"]),
                 entry_ts=setup.ts,
+                qty=Decimal(payload["qty"]),
             )
 
     def has_open_position(self, product_id: str) -> bool:
         return product_id in self._open
 
-    def on_signal(self, signal: Signal, candle: Candle | None = None) -> int | None:
+    def on_signal(
+        self, signal: Signal, candle: Candle | None = None, qty: Decimal = _QTY
+    ) -> int | None:
         """Apply one `Signal`, writing a paper order if it results in a fill.
 
         ENTER: opens a paper position for `signal.product_id` and immediately writes
@@ -144,7 +148,7 @@ class PaperTrader:
         Returns the written order's id, or `None` if nothing was written.
         """
         if signal.action == Action.ENTER:
-            return self._enter(signal)
+            return self._enter(signal, qty)
         if signal.action == Action.EXIT:
             if candle is None:
                 return None
@@ -179,20 +183,20 @@ class PaperTrader:
 
         return self._close(position, exit_price, candle.ts)
 
-    def _enter(self, signal: Signal) -> int | None:
+    def _enter(self, signal: Signal, qty: Decimal = _QTY) -> int | None:
         if signal.setup is None or signal.product_id in self._open:
             return None
 
         setup = signal.setup
         entry_fill = setup.entry * (Decimal(1) + self._slippage_pct)
-        fee = entry_fill * _QTY * self._fee_pct
+        fee = entry_fill * qty * self._fee_pct
         payload = {
             "role": "entry",
             "rule_name": signal.rule_name,
             "entry": str(entry_fill),
             "stop": str(setup.stop),
             "target": str(setup.target),
-            "qty": str(_QTY),
+            "qty": str(qty),
             "ts": setup.ts,
         }
         order_id = self._repo.insert_order(
@@ -201,7 +205,7 @@ class PaperTrader:
                 "product_id": signal.product_id,
                 "side": Side.BUY.value,
                 "order_type": "market",
-                "qty": _QTY,
+                "qty": qty,
                 "limit_price": setup.entry,
                 "status": "filled",
                 "fee": fee,
@@ -221,6 +225,7 @@ class PaperTrader:
             entry_order_id=order_id,
             entry_fill=entry_fill,
             entry_ts=setup.ts,
+            qty=qty,
         )
         return order_id
 
@@ -234,11 +239,11 @@ class PaperTrader:
 
     def _close(self, position: _OpenPaperPosition, exit_price: Decimal, exit_ts: int) -> int:
         exit_fill = exit_price * (Decimal(1) - self._slippage_pct)
-        entry_fee = position.entry_fill * _QTY * self._fee_pct
-        exit_fee = exit_fill * _QTY * self._fee_pct
-        pnl = (exit_fill - position.entry_fill) * _QTY - entry_fee - exit_fee
+        entry_fee = position.entry_fill * position.qty * self._fee_pct
+        exit_fee = exit_fill * position.qty * self._fee_pct
+        pnl = (exit_fill - position.entry_fill) * position.qty - entry_fee - exit_fee
 
-        risk = (position.entry_fill - position.setup.stop) * _QTY
+        risk = (position.entry_fill - position.setup.stop) * position.qty
         r_multiple = pnl / risk if risk != 0 else None
 
         if pnl > 0:
@@ -254,7 +259,7 @@ class PaperTrader:
             "entry_order_id": position.entry_order_id,
             "entry": str(position.entry_fill),
             "exit": str(exit_fill),
-            "qty": str(_QTY),
+            "qty": str(position.qty),
             "pnl": str(pnl),
             "r_multiple": str(r_multiple) if r_multiple is not None else None,
             "mfe": str(position.mfe),
@@ -269,7 +274,7 @@ class PaperTrader:
                 "product_id": position.product_id,
                 "side": Side.SELL.value,
                 "order_type": "market",
-                "qty": _QTY,
+                "qty": position.qty,
                 "limit_price": exit_price,
                 "status": "filled",
                 "fee": exit_fee,

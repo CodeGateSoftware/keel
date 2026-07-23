@@ -140,6 +140,26 @@ class TestEnterThenTargetHit:
         assert exit_order_id is None
         assert trader.has_open_position("BTC-USD")
 
+    def test_paper_entry_records_supplied_qty(self, repo: Repository) -> None:
+        trader = PaperTrader(repo)
+        signal = _enter_signal(
+            setup=Setup(
+                product_id="BTC-USD",
+                direction="long",
+                entry=Decimal("100"),
+                stop=Decimal("90"),
+                target=Decimal("130"),
+                context={},
+                ts=1_000,
+            )
+        )
+        order_id = trader.on_signal(signal, qty=Decimal("3"))
+
+        assert order_id is not None
+        order = repo.get_order(order_id)
+        assert order["qty"] == Decimal("3")
+        assert json.loads(order["raw_response"])["qty"] == "3"
+
 
 class TestMfeMae:
     def test_mfe_and_mae_recorded_on_close(self, repo: Repository) -> None:
