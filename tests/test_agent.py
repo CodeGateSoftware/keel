@@ -28,6 +28,7 @@ from keel.config import (
     DcaConfig,
     MarketDataConfig,
     MoneyMgmtConfig,
+    PaperConfig,
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
@@ -1079,6 +1080,61 @@ def test_paper_mode_loads_PAPER_status_rules_not_live_ones(repo, monkeypatch):
     run_once(broker, repo, _paper_config(), now_ts=90_000)
 
     assert repo.get_orders(mode="paper") == [], "a LIVE rule must not trade in paper mode"
+
+
+# -- paper equity: seed, mode-flip clear, per-cycle drawdown (P4 Task 5) --------------------
+
+
+class _NullBalanceBroker(FakeBroker):
+    """Serves candles fine, but has no readable account at all -- `_mark_to_market_equity`
+    (and therefore the paper seed's real-equity attempt) must return `None` here, forcing the
+    config fallback rather than a phantom balance."""
+
+    def get_accounts(self) -> list[dict[str, Any]]:
+        return []
+
+
+def test_paper_cycle_advances_drawdown_scalar(repo):
+    """A paper run_once with an already-seeded account and a losing mark (cash below the
+    existing HWM) writes a non-zero `drawdown_total_pct` -- Rail 11's scalars advancing in
+    paper, which is the whole point of this task."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    repo.set_state("paper_cash_usdc", Decimal("7000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    broker = FakeBroker()
+
+    run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_state("equity_state_mode") == "paper"
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000"), "HWM must not fall"
+    assert repo.get_state("drawdown_total_pct") == Decimal("0.3")
+
+
+def test_mode_flip_clears_hwm(repo):
+    """A prior LIVE cycle's HWM/drawdown must not poison the first paper cycle after a flip --
+    it is cleared and re-seeded from the paper account's own (real mark-to-market) equity."""
+    repo.set_state("equity_state_mode", "live")
+    repo.set_state("equity_high_water_mark", Decimal("999999"))
+    repo.set_state("drawdown_total_pct", Decimal("0.9"))
+    broker = FakeBroker()
+
+    run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_state("equity_state_mode") == "paper"
+    assert repo.get_state("equity_high_water_mark") != Decimal("999999")
+    assert repo.get_state("drawdown_total_pct") != Decimal("0.9")
+
+
+def test_seed_falls_back_to_config_when_broker_read_none(repo):
+    """First paper run, broker has no readable balance at all: seed from
+    `config.paper.starting_equity_usd` instead of leaving the account dormant."""
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
 
 
 # -- interactive confirm: run_once threads confirm_fn to placement --------------

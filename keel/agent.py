@@ -342,6 +342,41 @@ def _mark_to_market_equity(
     return total
 
 
+def _seed_paper_account_if_needed(
+    repo: Repository,
+    broker: Any,
+    config: Config,
+    products: list[str],
+    price_by_product: dict[str, Decimal],
+    now_ts: int,
+    paper_trader: PaperTrader,
+) -> None:
+    """Enforce the equity-state mode stamp and seed the synthetic paper account once.
+
+    On a paper->live or live->paper flip, clear the shared HWM/history/drawdown scalars
+    (same keys `keel reset-hwm` clears) before this cycle's update_drawdown, so a synthetic
+    HWM never poisons live equity (or vice versa). Seed `paper_cash_usdc` on first paper run
+    from real broker mark-to-market equity, falling back to `config.paper.starting_equity_usd`.
+    """
+    if repo.get_state("equity_state_mode") != "paper":
+        repo.set_state("equity_high_water_mark", None)
+        repo.set_state("drawdown_total_pct", Decimal("0"))
+        repo.set_state("drawdown_weekly_pct", Decimal("0"))
+        repo.set_state("equity_history", [])
+        repo.set_state("equity_state_mode", "paper")
+    if paper_trader.get_cash() is None:
+        seed = _mark_to_market_equity(
+            repo, broker, products, price_by_product, config.quote_currency
+        )
+        if seed is None:
+            fallback = config.paper.starting_equity_usd
+            seed = fallback if fallback > 0 else None
+        if seed is None:
+            log_event(logger, logging.WARNING, "agent.paper_seed_unavailable")
+            return
+        paper_trader.seed_cash(seed, now_ts)
+
+
 def _paper_resolve_bars(
     trader: PaperTrader,
     product_id: str,
@@ -691,18 +726,21 @@ def run_once(
                 if product_candles:
                     latest_price_by_product[product_id] = product_candles[-1].close
 
-        # Paper never touches the broker. Mark-to-market needs the live quote balance, which a
-        # rehearsal has no claim on -- so rail 11's scalars simply do not advance in paper, the
-        # same "leave the previous cycle's values in place" behaviour as an unavailable broker.
-        # Stated explicitly rather than relying on the fetch failing and being logged as an
-        # error, which is what happened before: paper looked broker-free only by accident.
-        equity_now = (
-            None
-            if paper_trader is not None
-            else _mark_to_market_equity(
+        # Paper now advances rail 11's scalars too: the synthetic account is seeded (once, from
+        # real mark-to-market equity or the config fallback) and marked to market every cycle
+        # exactly like a live account, via `_seed_paper_account_if_needed` + `PaperTrader.equity`.
+        # `equity_state_mode` records which account last drove the shared HWM/drawdown keys, so a
+        # paper<->live flip clears them first rather than letting one mode's scalars poison the
+        # other's (see `_seed_paper_account_if_needed`'s docstring).
+        if paper_trader is not None:
+            _seed_paper_account_if_needed(
+                repo, broker, config, products, latest_price_by_product, now_ts, paper_trader
+            )
+            equity_now = paper_trader.equity(latest_price_by_product)
+        else:
+            equity_now = _mark_to_market_equity(
                 repo, broker, products, latest_price_by_product, config.quote_currency
             )
-        )
         if equity_now is None:
             # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
             log_event(
@@ -712,6 +750,15 @@ def run_once(
                 paper=paper_trader is not None,
             )
         else:
+            # The symmetric live-side mode stamp/clear -- only right before a REAL update, so an
+            # unreadable broker (equity_now is None, handled above) never gets to zero out the
+            # previous cycle's scalars on the strength of a stamp alone.
+            if paper_trader is None and repo.get_state("equity_state_mode") != "live":
+                repo.set_state("equity_high_water_mark", None)
+                repo.set_state("drawdown_total_pct", Decimal("0"))
+                repo.set_state("drawdown_weekly_pct", Decimal("0"))
+                repo.set_state("equity_history", [])
+                repo.set_state("equity_state_mode", "live")
             equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
 
         for product_id in products:
