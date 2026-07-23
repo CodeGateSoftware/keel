@@ -118,22 +118,31 @@ def screen_asset(
     exempt` / `repository.get_screen_exceptions`). It is consulted ONLY when a check would
     otherwise FAIL, and ONLY for criteria in `WAIVABLE_CRITERIA` -- a waiver for anything else
     (a stray `screen_exceptions` row for, say, `attestation`) is silently ignored and that
-    criterion still fails closed. A waiver never affects any criterion other than its own.
+    criterion still fails closed. A waiver never affects any criterion other than its own, and a
+    blank/whitespace rationale is treated as no waiver at all (fail closed -- see the `.strip()`
+    check below, mirroring the unsourced-attestation guard further down).
     """
     policy = policy or ScreenPolicy()
-    waived = waived or {}
+    # Filtered ONCE, up front, rather than inline per-branch: this is the actual defense-in-depth
+    # for a criterion that is not in WAIVABLE_CRITERIA. `history` is currently the SOLE consumer
+    # of a waiver (screen_asset only ever reads `effective_waived["history"]`, so a shariah check
+    # is already structurally unreachable from `waived`) -- but filtering here means that even if
+    # a future edit wires a waiver lookup into another branch, it can never see an entry for a
+    # criterion nobody was allowed to grant one for, because it was dropped before any branch ran.
+    effective_waived = {c: r for c, r in (waived or {}).items() if c in WAIVABLE_CRITERIA}
     failures: list[str] = []
     warnings: list[str] = []
 
     # -- computed market facts -------------------------------------------------
     if facts.daily_bars < policy.min_daily_bars:
-        if "history" in WAIVABLE_CRITERIA and "history" in waived:
+        history_rationale = effective_waived.get("history", "").strip()
+        if history_rationale:
             # Self-retiring: this branch is only reached when the check WOULD fail, so a stale
             # waiver on an asset that has since accumulated enough history produces no output at
-            # all -- see the `>=` branch below, which never looks at `waived`.
+            # all -- see the `>=` branch below, which never looks at `effective_waived`.
             warnings.append(
                 f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required -- "
-                f"WAIVED by documented exception: {waived['history']}"
+                f"WAIVED by documented exception: {history_rationale}"
             )
         else:
             failures.append(

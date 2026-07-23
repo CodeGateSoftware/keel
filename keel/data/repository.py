@@ -781,8 +781,11 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def delete_screen_exception(self, asset: str, criterion: str) -> None:
-        self._conn.execute(
+    def delete_screen_exception(self, asset: str, criterion: str) -> int:
+        """Returns the number of rows removed (0 or 1), so a caller can tell a real revoke from
+        a no-op on a row that never existed rather than echoing success either way."""
+        cursor = self._conn.execute(
             "DELETE FROM screen_exceptions WHERE asset = ? AND criterion = ?", (asset, criterion)
         )
         self._conn.commit()
+        return cursor.rowcount

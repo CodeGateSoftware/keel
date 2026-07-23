@@ -851,6 +851,14 @@ def assets_exempt(
     cannot itself place an order or raise a cap, and the screen it feeds only ever ADMITS to a
     list that `guards.py` rail 1 still enforces per-trade regardless.
     """
+    if not rationale.strip():
+        # Mirrors the unsourced-attestation guard in `screen_asset` (`if not
+        # attestation.source.strip()`): an unsourced claim is not evidence, and a blank rationale
+        # is not documentation -- it would be an "undocumented documented exception."
+        raise click.BadParameter(
+            "rationale must be a non-empty documented reason", param_hint="--rationale"
+        )
+    asset = asset.upper()  # matches the uppercase asset `_screen_product` looks waivers up by
     repo = _open_repo(ctx)
     repo.upsert_screen_exception(
         asset=asset,
@@ -878,9 +886,13 @@ def assets_unexempt(ctx: click.Context, asset: str, criterion: str) -> None:
     After this, `keel assets screen` re-evaluates the criterion normally -- if it still fails,
     the asset is rejected again.
     """
+    asset = asset.upper()  # matches the uppercase asset `assets exempt` records under
     repo = _open_repo(ctx)
-    repo.delete_screen_exception(asset, criterion)
-    click.echo(f"revoked exception: {asset} no longer waives '{criterion}' criterion")
+    removed = repo.delete_screen_exception(asset, criterion)
+    if removed:
+        click.echo(f"revoked exception: {asset} no longer waives '{criterion}' criterion")
+    else:
+        click.echo(f"no such exception: {asset} has no '{criterion}' waiver")
 
 
 @assets_group.command("list")

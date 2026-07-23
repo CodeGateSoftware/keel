@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 import keel.cli as cli_module
@@ -223,6 +224,41 @@ def test_exempt_rejects_a_shariah_criterion_at_the_cli_boundary(tmp_path, valid_
     assert result.exit_code != 0
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_exempt_rejects_a_blank_rationale(tmp_path, valid_config_path, blank):
+    """'documented, never silent' -- a blank rationale is not documentation, so the CLI must
+    refuse to record it rather than write an undocumented 'documented exception.'"""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    result = _exempt(CliRunner(), db_path, valid_config_path, **{"--rationale": blank})
+    assert result.exit_code != 0
+
+
+def test_exempt_normalizes_a_lowercase_asset_so_screening_still_finds_the_waiver(
+    tmp_path, valid_config_path
+):
+    """A `--asset paxg` waiver must not silently no-op against the uppercase `PAXG` a product's
+    asset code resolves to."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)
+    runner = CliRunner()
+    attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+    assert attested.exit_code == 0
+
+    result = _exempt(runner, db_path, valid_config_path, **{"--asset": "paxg"})
+    assert result.exit_code == 0, result.output
+    assert "PAXG" in result.output
+
+    screened = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "1/1 admitted" in screened.output
+    assert "WAIVED" in screened.output
+
+
 def test_assets_list_shows_recorded_exceptions(tmp_path, valid_config_path):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
@@ -256,6 +292,7 @@ def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
 
     revoke = _unexempt(runner, db_path, valid_config_path)
     assert revoke.exit_code == 0, revoke.output
+    assert "revoked exception" in revoke.output
 
     rejected = runner.invoke(
         cli,
@@ -264,6 +301,42 @@ def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
     )
     assert "0/1 admitted" in rejected.output
     assert "✗" in rejected.output
+
+
+def test_unexempt_on_a_nonexistent_row_reports_no_such_exception_not_false_success(
+    tmp_path, valid_config_path
+):
+    """Revoking an exception that was never granted must not read as a successful revoke."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _unexempt(runner, db_path, valid_config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "no such exception" in result.output
+    assert "revoked exception" not in result.output
+
+
+def test_unexempt_normalizes_a_lowercase_asset(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)
+    runner = CliRunner()
+    attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+    assert attested.exit_code == 0
+    assert _exempt(runner, db_path, valid_config_path).exit_code == 0
+
+    revoke = _unexempt(runner, db_path, valid_config_path, asset="paxg")
+    assert revoke.exit_code == 0, revoke.output
+    assert "revoked exception" in revoke.output
+
+    rejected = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "0/1 admitted" in rejected.output
 
 
 # -- discover ------------------------------------------------------------------

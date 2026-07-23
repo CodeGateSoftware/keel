@@ -505,13 +505,21 @@ def test_list_screen_exceptions_returns_all_rows_ordered(repo):
     ]
 
 
-def test_delete_screen_exception_removes_the_row(repo):
+def test_delete_screen_exception_removes_the_row_and_returns_rowcount_1(repo):
     repo.upsert_screen_exception(
         asset="PAXG", criterion="history", rationale="r", granted_by="a", granted_at=1
     )
-    repo.delete_screen_exception("PAXG", "history")
+    removed = repo.delete_screen_exception("PAXG", "history")
+    assert removed == 1
     assert repo.get_screen_exceptions("PAXG") == {}
     assert repo.list_screen_exceptions() == []
+
+
+def test_delete_screen_exception_on_a_nonexistent_row_returns_0(repo):
+    """The caller must be able to tell a real revoke from a no-op -- a nonexistent row is not an
+    error, but it must not be reported as a successful revoke either."""
+    removed = repo.delete_screen_exception("PAXG", "history")
+    assert removed == 0
 
 
 def test_get_screen_exceptions_is_scoped_to_the_asset(repo):
