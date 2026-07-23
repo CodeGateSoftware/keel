@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 8
+    assert version == db.SCHEMA_VERSION == 9
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -209,3 +209,20 @@ def test_migration_to_v6_creates_the_asset_attestations_table_EMPTY() -> None:
     assert cols >= {"asset", "sector", "backing", "pays_yield", "source", "attested_by"}
     (count,) = conn.execute("SELECT COUNT(*) FROM asset_attestations").fetchone()
     assert count == 0
+
+
+def test_migration_to_v9_creates_the_screen_exceptions_table_EMPTY() -> None:
+    """Additive DDL, and deliberately NO backfill.
+
+    A row asserts a human documented a waiver for one asset/criterion pair. Seeding one would
+    fabricate an exception nobody granted; an empty table correctly says nothing has been
+    excepted yet.
+    """
+    conn = _v1_database()
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(screen_exceptions)")}
+    assert cols >= {"asset", "criterion", "rationale", "granted_by", "granted_at"}
+    (count,) = conn.execute("SELECT COUNT(*) FROM screen_exceptions").fetchone()
+    assert count == 0
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION

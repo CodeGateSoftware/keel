@@ -22,6 +22,7 @@ and unknown is a rejection. This mirrors `broker_subscriptions`, where an un-att
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -45,6 +46,15 @@ BACKING_AYN = "ayn"
 BACKING_DAYN = "dayn"
 BACKING_NATIVE = "native"  # a base-layer coin, neither a claim nor a warehouse receipt
 KNOWN_BACKINGS = frozenset({BACKING_AYN, BACKING_DAYN, BACKING_NATIVE})
+
+#: Criteria a documented, human-recorded exception (`keel assets exempt`) may EVER waive. Only
+#: DATA/market criteria belong here -- history depth, liquidity, that kind of thing -- because
+#: those are facts about our own cache, not about the asset's shariah status. The shariah
+#: criteria (a missing attestation, `haram_sector`, `riba_yield`, `dayn`/unknown backing) and
+#: `settlement` can NEVER be waived: nothing in this module consults `waived` for them, and the
+#: CLI's `--criterion` Choice is restricted to this set. Expanding it is a deliberate future
+#: decision, not a default -- do not add to it to make a test pass.
+WAIVABLE_CRITERIA = frozenset({"history"})
 
 
 @dataclass(frozen=True)
@@ -100,18 +110,45 @@ def screen_asset(
     facts: MarketFacts,
     attestation: AssetAttestation | None,
     policy: ScreenPolicy | None = None,
+    waived: Mapping[str, str] | None = None,
 ) -> ScreenResult:
-    """Deterministic admission decision. `attestation=None` fails closed."""
+    """Deterministic admission decision. `attestation=None` fails closed.
+
+    `waived` is `{criterion: rationale}` from a documented human exception (`keel assets
+    exempt` / `repository.get_screen_exceptions`). It is consulted ONLY when a check would
+    otherwise FAIL, and ONLY for criteria in `WAIVABLE_CRITERIA` -- a waiver for anything else
+    (a stray `screen_exceptions` row for, say, `attestation`) is silently ignored and that
+    criterion still fails closed. A waiver never affects any criterion other than its own, and a
+    blank/whitespace rationale is treated as no waiver at all (fail closed -- see the `.strip()`
+    check below, mirroring the unsourced-attestation guard further down).
+    """
     policy = policy or ScreenPolicy()
+    # Filtered ONCE, up front, rather than inline per-branch: this is the actual defense-in-depth
+    # for a criterion that is not in WAIVABLE_CRITERIA. `history` is currently the SOLE consumer
+    # of a waiver (screen_asset only ever reads `effective_waived["history"]`, so a shariah check
+    # is already structurally unreachable from `waived`) -- but filtering here means that even if
+    # a future edit wires a waiver lookup into another branch, it can never see an entry for a
+    # criterion nobody was allowed to grant one for, because it was dropped before any branch ran.
+    effective_waived = {c: r for c, r in (waived or {}).items() if c in WAIVABLE_CRITERIA}
     failures: list[str] = []
     warnings: list[str] = []
 
     # -- computed market facts -------------------------------------------------
     if facts.daily_bars < policy.min_daily_bars:
-        failures.append(
-            f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required "
-            "(a rule cannot be validated on a series shorter than its evidence needs)"
-        )
+        history_rationale = effective_waived.get("history", "").strip()
+        if history_rationale:
+            # Self-retiring: this branch is only reached when the check WOULD fail, so a stale
+            # waiver on an asset that has since accumulated enough history produces no output at
+            # all -- see the `>=` branch below, which never looks at `effective_waived`.
+            warnings.append(
+                f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required -- "
+                f"WAIVED by documented exception: {history_rationale}"
+            )
+        else:
+            failures.append(
+                f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required "
+                "(a rule cannot be validated on a series shorter than its evidence needs)"
+            )
     if facts.median_daily_volume < policy.min_median_daily_volume:
         failures.append(
             f"liquidity: median daily volume {facts.median_daily_volume} < "

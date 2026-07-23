@@ -103,11 +103,11 @@ def test_agent_state_table_has_key_primary_key():
     assert pk_columns == {"key"}
 
 
-def test_schema_version_is_8():
+def test_schema_version_is_9():
     """Deliberate tripwire: bump this literal consciously on every schema change."""
     from keel.data.db import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
 
 
 def test_a_v6_database_migrates_up_and_gains_the_profile_table(tmp_path):
@@ -176,6 +176,42 @@ def test_migrating_a_v6_database_twice_is_idempotent(tmp_path):
     conn.commit()
     migrate(conn)
     migrate(conn)  # must not raise "duplicate column name"
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+
+
+def test_a_v8_database_migrates_up_and_gains_the_screen_exceptions_table(tmp_path):
+    """v9 is a documented no-op migration: `_SCHEMA_STATEMENTS` (IF NOT EXISTS) already creates
+    the new table on an existing v8 DB before the version loop runs, so the migration step itself
+    has nothing to do -- unlike v8's ADD COLUMN case, which needed real work."""
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "v8.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 8")
+    conn.commit()
+
+    migrate(conn)
+
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+    named = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='screen_exceptions'"
+    ).fetchone()
+    assert named is not None, "v9 must add the screen_exceptions table"
+
+
+def test_migrating_a_v8_database_twice_is_idempotent(tmp_path):
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "v8_twice.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 8")
+    conn.commit()
+    migrate(conn)
+    migrate(conn)  # must not raise
     assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
         SCHEMA_VERSION
     )

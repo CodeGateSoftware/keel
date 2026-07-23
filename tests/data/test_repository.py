@@ -452,3 +452,83 @@ def test_profile_readable_reports_damage_that_get_profile_hides(repo):
 
     assert repo.profile_readable() is False
     assert repo.get_profile().autonomous is False  # still fails closed, still no exception
+
+
+# -- screen exceptions --------------------------------------------------------
+
+
+def test_upsert_screen_exception_round_trips_through_get(repo):
+    repo.upsert_screen_exception(
+        asset="PAXG",
+        criterion="history",
+        rationale="only 441 daily bars; sector/backing/liquidity all clear",
+        granted_by="tester",
+        granted_at=1_800_000_000,
+    )
+    assert repo.get_screen_exceptions("PAXG") == {
+        "history": "only 441 daily bars; sector/backing/liquidity all clear"
+    }
+
+
+def test_get_screen_exceptions_is_empty_for_an_asset_with_none(repo):
+    assert repo.get_screen_exceptions("PAXG") == {}
+
+
+def test_upsert_screen_exception_on_conflict_updates_rationale_and_grant_fields(repo):
+    repo.upsert_screen_exception(
+        asset="PAXG", criterion="history", rationale="first", granted_by="alice",
+        granted_at=1_000,
+    )
+    repo.upsert_screen_exception(
+        asset="PAXG", criterion="history", rationale="second", granted_by="bob",
+        granted_at=2_000,
+    )
+
+    assert repo.get_screen_exceptions("PAXG") == {"history": "second"}
+    (row,) = repo.list_screen_exceptions()
+    assert row["granted_by"] == "bob"
+    assert row["granted_at"] == 2_000
+
+
+def test_list_screen_exceptions_returns_all_rows_ordered(repo):
+    repo.upsert_screen_exception(
+        asset="SOL", criterion="history", rationale="r2", granted_by="b", granted_at=2
+    )
+    repo.upsert_screen_exception(
+        asset="PAXG", criterion="history", rationale="r1", granted_by="a", granted_at=1
+    )
+
+    rows = repo.list_screen_exceptions()
+    assert [(r["asset"], r["criterion"]) for r in rows] == [
+        ("PAXG", "history"),
+        ("SOL", "history"),
+    ]
+
+
+def test_delete_screen_exception_removes_the_row_and_returns_rowcount_1(repo):
+    repo.upsert_screen_exception(
+        asset="PAXG", criterion="history", rationale="r", granted_by="a", granted_at=1
+    )
+    removed = repo.delete_screen_exception("PAXG", "history")
+    assert removed == 1
+    assert repo.get_screen_exceptions("PAXG") == {}
+    assert repo.list_screen_exceptions() == []
+
+
+def test_delete_screen_exception_on_a_nonexistent_row_returns_0(repo):
+    """The caller must be able to tell a real revoke from a no-op -- a nonexistent row is not an
+    error, but it must not be reported as a successful revoke either."""
+    removed = repo.delete_screen_exception("PAXG", "history")
+    assert removed == 0
+
+
+def test_get_screen_exceptions_is_scoped_to_the_asset(repo):
+    repo.upsert_screen_exception(
+        asset="PAXG", criterion="history", rationale="paxg reason", granted_by="a", granted_at=1
+    )
+    repo.upsert_screen_exception(
+        asset="SOL", criterion="history", rationale="sol reason", granted_by="a", granted_at=1
+    )
+
+    assert repo.get_screen_exceptions("PAXG") == {"history": "paxg reason"}
+    assert "SOL" not in repo.get_screen_exceptions("PAXG")

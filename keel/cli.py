@@ -530,7 +530,8 @@ def _screen_product(
         if raw is not None
         else None
     )
-    return facts, screen_mod.screen_asset(facts, attestation)
+    waived = repo.get_screen_exceptions(asset)
+    return facts, screen_mod.screen_asset(facts, attestation, waived=waived)
 
 
 # Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
@@ -820,13 +821,88 @@ def assets_attest(
     click.echo(f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield}")
 
 
+@assets_group.command("exempt")
+@click.option("--asset", required=True, help="Asset code, e.g. PAXG.")
+@click.option(
+    "--criterion",
+    required=True,
+    type=click.Choice(sorted(screen_mod.WAIVABLE_CRITERIA)),
+    help="The admission criterion to waive. Restricted to WAIVABLE_CRITERIA -- a DATA/market "
+    "criterion, never a shariah one.",
+)
+@click.option("--rationale", required=True, help="Why this waiver is granted.")
+@click.option("--granted-by", required=True, help="Who granted it.")
+@click.pass_context
+@with_disclaimer
+def assets_exempt(
+    ctx: click.Context, asset: str, criterion: str, rationale: str, granted_by: str
+) -> None:
+    """Record a DOCUMENTED exception waiving one admission criterion for one asset.
+
+    This waives ONLY a computed DATA/market criterion (history depth today) -- never a shariah
+    one (a missing attestation, haram sector, riba yield, or dayn/unknown backing): the
+    `--criterion` Choice is restricted to `screen_mod.WAIVABLE_CRITERIA`, so this command cannot
+    reach those checks no matter what is typed. The exception is recorded and then surfaced
+    loudly by `keel assets screen` as a WARNING, never silently -- it is not a default pass. It
+    is also self-retiring: once the underlying condition it was granted for no longer holds (the
+    asset accumulates enough history, say), `screen_asset` stops mentioning it at all.
+
+    Not passphrase-gated, for the same reason `keel assets attest` is not: recording an exception
+    cannot itself place an order or raise a cap, and the screen it feeds only ever ADMITS to a
+    list that `guards.py` rail 1 still enforces per-trade regardless.
+    """
+    if not rationale.strip():
+        # Mirrors the unsourced-attestation guard in `screen_asset` (`if not
+        # attestation.source.strip()`): an unsourced claim is not evidence, and a blank rationale
+        # is not documentation -- it would be an "undocumented documented exception."
+        raise click.BadParameter(
+            "rationale must be a non-empty documented reason", param_hint="--rationale"
+        )
+    asset = asset.upper()  # matches the uppercase asset `_screen_product` looks waivers up by
+    repo = _open_repo(ctx)
+    repo.upsert_screen_exception(
+        asset=asset,
+        criterion=criterion,
+        rationale=rationale,
+        granted_by=granted_by,
+        granted_at=int(time.time()),
+    )
+    click.echo(f"recorded exception: {asset} waives '{criterion}' criterion (by {granted_by})")
+
+
+@assets_group.command("unexempt")
+@click.option("--asset", required=True, help="Asset code, e.g. PAXG.")
+@click.option(
+    "--criterion",
+    required=True,
+    type=click.Choice(sorted(screen_mod.WAIVABLE_CRITERIA)),
+    help="The waived criterion to revoke.",
+)
+@click.pass_context
+@with_disclaimer
+def assets_unexempt(ctx: click.Context, asset: str, criterion: str) -> None:
+    """Revoke a documented allowlist-screen exception. A de-risking action, always allowed.
+
+    After this, `keel assets screen` re-evaluates the criterion normally -- if it still fails,
+    the asset is rejected again.
+    """
+    asset = asset.upper()  # matches the uppercase asset `assets exempt` records under
+    repo = _open_repo(ctx)
+    removed = repo.delete_screen_exception(asset, criterion)
+    if removed:
+        click.echo(f"revoked exception: {asset} no longer waives '{criterion}' criterion")
+    else:
+        click.echo(f"no such exception: {asset} has no '{criterion}' waiver")
+
+
 @assets_group.command("list")
 @click.pass_context
 def assets_list(ctx: click.Context) -> None:
-    """List recorded attestations."""
+    """List recorded attestations and any documented screen exceptions."""
     repo = _open_repo(ctx)
     rows = repo.get_asset_attestations()
-    if not rows:
+    exceptions = repo.list_screen_exceptions()
+    if not rows and not exceptions:
         click.echo("no attestations recorded")
         return
     for row in rows:
@@ -834,6 +910,13 @@ def assets_list(ctx: click.Context) -> None:
             f"{row['asset']:<8} sector={row['sector']:<16} backing={row['backing']:<8} "
             f"pays_yield={bool(row['pays_yield'])!s:<5} by={row['attested_by']}"
         )
+    if exceptions:
+        click.echo("\nexceptions:")
+        for row in exceptions:
+            click.echo(
+                f"{row['asset']:<8} waives={row['criterion']:<10} by={row['granted_by']} -- "
+                f"{row['rationale']}"
+            )
 
 
 # -- withdrawals ------------------------------------------------------------------------------

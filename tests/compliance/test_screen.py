@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from keel.compliance.screen import (
     AssetAttestation,
     MarketFacts,
@@ -148,6 +150,107 @@ def test_every_failure_is_reported_not_just_the_first():
 def test_policy_thresholds_are_configurable():
     lenient = ScreenPolicy(min_daily_bars=100, min_median_daily_volume=Decimal("1"))
     assert screen_asset(_facts(bars=200, volume="5"), _attestation(), lenient).admitted is True
+
+
+# -- documented allowlist-screen exceptions (waivers) --------------------------
+#
+# Motivating case: PAXG passes shariah/liquidity screening but fails the 4-year history floor
+# (441 bars < 1460). A human can record a DOCUMENTED exception that waives ONLY the `history`
+# criterion -- surfaced loudly as a warning, never a silent exemption -- and only for criteria in
+# `WAIVABLE_CRITERIA`, so the shariah core can never be bypassed this way.
+
+
+def test_insufficient_history_with_no_waiver_still_rejects():
+    result = screen_asset(_facts(bars=400), _attestation())
+    assert result.admitted is False
+    assert any("history" in f for f in result.failures)
+
+
+def test_a_documented_history_waiver_admits_and_warns_loudly():
+    result = screen_asset(
+        _facts(bars=400), _attestation(), waived={"history": "PAXG: 441 bars, human-reviewed"}
+    )
+    assert result.admitted is True
+    assert not any("history" in f for f in result.failures)
+    assert any(
+        "WAIVED" in w and "PAXG: 441 bars, human-reviewed" in w for w in result.warnings
+    )
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_a_blank_rationale_waiver_does_not_admit_undocumented_is_not_documented(blank):
+    """The whole thesis is 'documented, never silent'. A blank rationale is not documentation,
+    so it must fail closed exactly like an unsourced attestation does."""
+    result = screen_asset(_facts(bars=400), _attestation(), waived={"history": blank})
+    assert result.admitted is False
+    assert any("history" in f for f in result.failures)
+    assert not any("WAIVED" in w for w in result.warnings)
+
+
+def test_a_waiver_is_self_retiring_once_history_clears_the_floor():
+    """No leftover warning once the underlying condition it was granted for no longer holds."""
+    result = screen_asset(_facts(bars=2000), _attestation(), waived={"history": "stale reason"})
+    assert result.admitted is True
+    assert not any("WAIVED" in w for w in result.warnings)
+    assert not any("history" in f for f in result.failures)
+
+
+def test_a_waiver_for_a_non_waivable_criterion_is_ignored_and_fails_closed():
+    """SAFETY, non-vacuous: `bars` is BELOW the floor, so the history branch is actually
+    entered -- if the `WAIVABLE_CRITERIA` filter were broken, an attestation-keyed waiver could
+    only matter here if it somehow leaked into the history check too, which this also rules out.
+    A stray `screen_exceptions` row for a shariah criterion must never bypass it, and must not
+    incidentally waive history either (no "history" key was ever granted)."""
+    result = screen_asset(
+        _facts(bars=400), None, waived={"attestation": "someone tried to waive this"}
+    )
+    assert result.admitted is False
+    assert any("attestation: MISSING" in f for f in result.failures)
+    assert any("history" in f for f in result.failures)  # NOT waived -- no "history" key granted
+    assert not any("WAIVED" in w for w in result.warnings)
+
+
+def test_a_non_waivable_key_does_not_rescue_the_asset_it_was_stray_recorded_on():
+    """Same shape as above, but on an asset that is otherwise CLEAN except for low history: an
+    `attestation`-keyed waiver (never granted for `history`) must still leave history REJECTED."""
+    result = screen_asset(_facts(bars=400), _attestation(), waived={"attestation": "x"})
+    assert result.admitted is False
+    assert any("history" in f for f in result.failures)
+    assert not any("WAIVED" in w for w in result.warnings)
+
+
+def test_a_stray_non_waivable_key_alongside_a_real_waiver_is_dropped_not_honored():
+    """The up-front filter drops non-`WAIVABLE_CRITERIA` keys one at a time -- a `settlement`
+    entry riding along with a legitimate `history` waiver must have zero effect."""
+    result = screen_asset(
+        _facts(bars=400),
+        _attestation(),
+        waived={"history": "documented reason", "settlement": "someone tried to waive this too"},
+    )
+    assert result.admitted is True
+    assert any("WAIVED" in w and "documented reason" in w for w in result.warnings)
+    assert not any("settlement" in w for w in result.warnings)
+    assert result.failures == []
+
+
+def test_a_history_waiver_does_not_rescue_a_different_real_failure():
+    """The waiver is scoped to history alone -- it must not paper over an unrelated rejection."""
+    result = screen_asset(
+        _facts(bars=400), None, waived={"history": "reason"}
+    )
+    assert result.admitted is False
+    assert any("attestation: MISSING" in f for f in result.failures)
+
+
+def test_a_history_waiver_does_not_rescue_a_dayn_backing_failure():
+    result = screen_asset(
+        _facts(bars=400),
+        _attestation(backing="dayn"),
+        waived={"history": "reason"},
+    )
+    assert result.admitted is False
+    assert any("dayn" in f for f in result.failures)
+    assert not any("history" in f for f in result.failures)
 
 
 # -- discovery (proposal stage) ------------------------------------------------
