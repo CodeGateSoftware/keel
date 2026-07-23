@@ -32,7 +32,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.types import Candle, Granularity, Side
@@ -1032,7 +1032,11 @@ def test_paper_mode_records_a_fill_and_never_places_or_reads_account_state(repo,
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
 
     broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+    # Task 6: entries now size off the synthetic account equity, so the account needs a seed --
+    # the real-balance read still gets attempted and swallowed exactly as before (see the
+    # caught `AssertionError` in the log), this only supplies the config fallback behind it.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+    result = run_once(broker, repo, cfg, now_ts=90_000)
 
     assert result.skipped is False
     orders = repo.get_orders(mode="paper")
@@ -1049,7 +1053,10 @@ def test_paper_mode_still_enforces_the_offline_rails(repo, monkeypatch):
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT, stop_mult="0.9999"))
 
     broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+    # Sizing needs a seeded synthetic account (Task 6) to reach the rails at all -- see the
+    # matching note on `test_paper_mode_records_a_fill_and_never_places_or_reads_account_state`.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+    result = run_once(broker, repo, cfg, now_ts=90_000)
 
     assert repo.get_orders(mode="paper") == []
     assert any("vetoed by rails" in (r.reason or "") for r in result.enter_results)
@@ -1135,6 +1142,100 @@ def test_seed_falls_back_to_config_when_broker_read_none(repo):
     run_once(broker, repo, cfg, now_ts=90_000)
 
     assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+
+
+# -- paper fills sized off paper equity (P4 Task 6) -----------------------------
+
+
+def _paper_enter_signal(
+    product_id: str = PRODUCT,
+    entry: Decimal = Decimal("100"),
+    stop: Decimal = Decimal("90"),
+    target: Decimal = Decimal("130"),
+    ts: int = 1_000,
+) -> Signal:
+    return Signal(
+        rule_name="fake_enter",
+        product_id=product_id,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id=product_id,
+            direction="long",
+            entry=entry,
+            stop=stop,
+            target=target,
+            context={},
+            ts=ts,
+        ),
+        cts_score=7,
+        entry_technique="signal_candle",
+        ts=ts,
+    )
+
+
+def test_paper_enter_sizes_off_paper_equity(repo):
+    """`_paper_enter` must size the fill off the SYNTHETIC ACCOUNT EQUITY it is handed, not the
+    `$5k max_exposure` proxy `_build_intent` falls back to and not the old fixed 1-unit fill."""
+    from keel.execution import sizing
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    sig = _paper_enter_signal(entry=Decimal("100"), stop=Decimal("90"), target=Decimal("130"))
+
+    result = agent._paper_enter(
+        trader, sig, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert result.placed
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    expected_qty = sizing.size(Decimal("30000"), config.risk_pct, Decimal("100"), Decimal("90"))
+    assert expected_qty == Decimal("30")
+    assert orders[0]["qty"] == expected_qty
+    assert orders[0]["qty"] != Decimal("1"), "must not fill the old fixed 1-unit qty"
+
+
+def test_run_once_sizes_a_paper_entry_off_the_seeded_synthetic_equity(repo, monkeypatch):
+    """Loop-level: the `equity_now` Task 5 computes for the paper branch is what sizes the fill,
+    not a re-derived value and not the fixed 1-unit qty `_AlwaysEnterRule` used to produce."""
+    from keel.execution import sizing
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+    repo.set_state("paper_cash_usdc", Decimal("30000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    repo.set_state("equity_state_mode", "paper")
+    # `_AlwaysEnterRule` sets entry = candle close, stop = 0.95 * close -> a 5% stop distance.
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    expected_qty = sizing.size(
+        Decimal("30000"), _paper_config().risk_pct, Decimal("100"), Decimal("95")
+    )
+    assert orders[0]["qty"] == expected_qty
+    assert orders[0]["qty"] != Decimal("1")
+    assert result.enter_results[0].placed
+
+
+def test_run_once_skips_paper_entries_when_the_synthetic_account_is_unseeded(repo, monkeypatch):
+    """Sizing off an UNKNOWN equity is worse than not trading: an unseeded/unreadable paper
+    account must skip entries this cycle rather than fall back to a garbage size."""
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+    # No cash seeded, and the fallback is disabled (0) -- `equity_now` stays `None` all cycle.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_orders(mode="paper") == []
+    assert result.enter_results, "the signal still fires; it must just not be filled"
+    assert not any(r.placed for r in result.enter_results)
 
 
 # -- interactive confirm: run_once threads confirm_fn to placement --------------

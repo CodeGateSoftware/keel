@@ -405,8 +405,10 @@ def _paper_enter(
     repo: Repository,
     config: Config,
     now_ts: int,
+    paper_equity: Decimal,
 ) -> executor.ExecutionResult:
-    """Run the offline-computable rails, then record a paper fill if they pass.
+    """Run the offline-computable rails, then record a paper fill sized off `paper_equity` if
+    they pass.
 
     Paper runs the rails DELIBERATELY (see `guards.check`'s `offline` docstring): the promotion
     gate is scored on this track record, so a rehearsal that skipped them would promote a
@@ -416,6 +418,12 @@ def _paper_enter(
     `None` for a null broker without logging, and rail 13 -- the rail that would have consumed
     that balance -- is one of the two `offline=True` skips anyway, because paper has no live
     account to read a balance from.
+
+    `paper_equity` sizes the intent (via `equity_override`) AND the fill: the synthetic account
+    equity is what a real paper account would risk `config.risk_pct` of, not the `$5k
+    max_exposure` proxy `_build_intent` falls back to absent an override -- that proxy only ever
+    existed to gate the guard check, and sizing the fill off it would score the track record on
+    trades no real paper balance could have produced.
     """
     def _result(placed, order_id=None, vetoed_by=None, reason=""):
         return ExecutionResult(
@@ -426,7 +434,9 @@ def _paper_enter(
             reason=reason,
         )
 
-    intent = executor._build_intent(signal, None, repo, config, now_ts)
+    intent = executor._build_intent(
+        signal, None, repo, config, now_ts, equity_override=paper_equity
+    )
     if intent is None:
         return _result(False, reason="paper: nothing to size")
 
@@ -434,7 +444,7 @@ def _paper_enter(
     if not verdict.ok:
         return _result(False, vetoed_by=verdict.violations, reason="paper: vetoed by rails")
 
-    order_id = trader.on_signal(signal)
+    order_id = trader.on_signal(signal, qty=intent.qty)
     if order_id is None:
         return _result(False, reason="paper: no fill (position already open)")
     return _result(
@@ -761,6 +771,13 @@ def run_once(
                 repo.set_state("equity_state_mode", "live")
             equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
 
+        # `_paper_enter` sizes the fill off THIS cycle's synthetic equity -- reusing `equity_now`
+        # computed above rather than re-deriving it, so the entry and the drawdown scalars it just
+        # advanced always agree on what the account was worth this cycle. `None` when unseeded or
+        # unreadable (handled just above): sizing a fill off an unknown equity would be worse than
+        # not trading, so paper entries are skipped this cycle instead, below.
+        paper_equity = equity_now if paper_trader is not None else None
+
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
                 repo, product_id, finest, now_ts, max_age_sec
@@ -809,7 +826,25 @@ def run_once(
             for signal in product_signals:
                 enter_signals.append(signal)
                 if paper_trader is not None:
-                    result = _paper_enter(paper_trader, signal, repo, config, now_ts)
+                    if paper_equity is None:
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "agent.paper_enter_skipped_no_equity",
+                            product=product_id,
+                            rule=signal.rule_name,
+                        )
+                        result = ExecutionResult(
+                            placed=False,
+                            order_id=None,
+                            vetoed_by=[],
+                            preview=None,
+                            reason="paper: skipped (synthetic account equity unavailable)",
+                        )
+                    else:
+                        result = _paper_enter(
+                            paper_trader, signal, repo, config, now_ts, paper_equity
+                        )
                 else:
                     result = executor.execute(
                         signal, broker, repo, config, mode, confirm_fn=confirm_fn, now_ts=now_ts
