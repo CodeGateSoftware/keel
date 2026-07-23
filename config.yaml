@@ -8,11 +8,21 @@ allowlist:
   - BTC
   - ETH
   - PAXG
+  - SOL
+  - XLM
+  - LTC
+  - ADA
+  - LINK
 
 target_weights:
-  BTC: 0.40
-  ETH: 0.30
-  PAXG: 0.30
+  BTC: 0.30
+  ETH: 0.20
+  PAXG: 0.20
+  SOL: 0.06
+  XLM: 0.06
+  LTC: 0.06
+  ADA: 0.06
+  LINK: 0.06
 
 risk_pct: 0.01
 
