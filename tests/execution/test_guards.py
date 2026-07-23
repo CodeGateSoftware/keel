@@ -432,6 +432,45 @@ def test_rail11_dca_exempt_from_drawdown_breaker(repo):
     assert result.violations == []
 
 
+# -- P4 Task 8: Rail 11 enforced in PAPER (offline=True) -- the headline acceptance test ---------
+
+
+def test_paper_drawdown_halt_vetoes_buys(repo):
+    """A paper account drawn down past `max_total_dd_pct` gets BUYs vetoed by Rail 11.
+
+    Same shape as `test_rail11_account_drawdown_breaker_total_rejects_new_entries` above, but
+    explicit about the two things that distinguish a PAPER check from a live one: `offline=True`
+    (paper never has a live broker balance to read) and `equity_state_mode="paper"` (the stamp
+    Task 5/6 write so the shared HWM/drawdown keys are known to belong to the synthetic account)
+    -- proving Rail 11 still fires on that path, not just on the live one.
+    """
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("drawdown_total_pct", Decimal("0.25"))  # 25% > 20% ceiling
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", NOW_TS)
+    intent = _intent()
+
+    verdict = check(intent, repo, _config(), NOW_TS, offline=True)
+
+    assert not verdict.ok
+    assert any("account_dd_breaker_total" in v for v in verdict.violations)
+
+
+def test_paper_weekly_drawdown_halt_vetoes_buys(repo):
+    """The weekly twin of the test above: `drawdown_weekly_pct` past `max_weekly_dd_pct` vetoes
+    a paper BUY too, not just the total-drawdown scalar."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("drawdown_weekly_pct", Decimal("0.10"))  # 10% > 8% ceiling
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", NOW_TS)
+    intent = _intent()
+
+    verdict = check(intent, repo, _config(), NOW_TS, offline=True)
+
+    assert not verdict.ok
+    assert any("account_dd_breaker_weekly" in v for v in verdict.violations)
+
+
 # -- rail 12: stale-data / feed-health + kill-switch -----------------------------------------------
 
 
