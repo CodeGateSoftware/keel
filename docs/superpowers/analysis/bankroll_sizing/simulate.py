@@ -39,8 +39,8 @@ from __future__ import annotations
 import random
 import statistics
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -55,7 +55,9 @@ from sizing_strategies import (  # noqa: E402
 )
 
 REPO_ROOT = HERE.parents[3]  # docs/superpowers/analysis/bankroll_sizing -> repo root
-REPORT_PATH = REPO_ROOT / "docs" / "superpowers" / "reports" / "2026-07-22-bankroll-sizing-comparison.md"
+REPORT_PATH = (
+    REPO_ROOT / "docs" / "superpowers" / "reports" / "2026-07-22-bankroll-sizing-comparison.md"
+)
 
 RUIN_THRESHOLD = 1.0  # bankroll <= $1 counts as ruin; path stops (can't go negative)
 
@@ -362,7 +364,9 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     keel_vs_full_pct = EXP2_KEEL_RISK_PCT / floor_full * 100
 
     lines: list[str] = []
-    lines.append("# Bankroll Sizing Comparison: Kelly Criterion Family vs keel's Fixed-Fractional Risk")
+    lines.append(
+        "# Bankroll Sizing Comparison: Kelly Criterion Family vs keel's Fixed-Fractional Risk"
+    )
     lines.append("")
     lines.append("## Purpose and framing")
     lines.append("")
@@ -389,14 +393,19 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     lines.append(
         "keel's PROMOTION FLOOR rule requires win_rate >= 0.55 and R:R (min_rr) >= 1.5 before a "
         "strategy is promoted to live trading. For a rule sitting exactly at that floor "
-        f"(p=0.55, b=1.5), full-Kelly risk fraction is:"
+        "(p=0.55, b=1.5), full-Kelly risk fraction is:"
     )
     lines.append("")
     lines.append("```")
-    lines.append("f* = (b*p - q) / b = (1.5 * 0.55 - 0.45) / 1.5 = 0.375 / 1.5 = 0.25   (25% of equity per trade)")
+    lines.append(
+        "f* = (b*p - q) / b = (1.5 * 0.55 - 0.45) / 1.5 = 0.375 / 1.5 = 0.25"
+        "   (25% of equity per trade)"
+    )
     lines.append(f"half-Kelly  = {floor_half:.4f}  (12.50%)")
     lines.append(f"quarter-Kelly = {floor_quarter:.4f}  (6.25%)")
-    lines.append(f"keel's actual risk_pct = 0.01  (1.00%)  ~= {keel_vs_full_pct:.1f}% of full Kelly")
+    lines.append(
+        f"keel's actual risk_pct = 0.01  (1.00%)  ~= {keel_vs_full_pct:.1f}% of full Kelly"
+    )
     lines.append("```")
     lines.append("")
     lines.append(
@@ -472,7 +481,8 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
         levels = profile_out["kelly_levels"]
         lines.append(
             f"Kelly fractions for this profile: Quarter-Kelly={fmt_pct(levels['Quarter-Kelly'])}, "
-            f"Half-Kelly={fmt_pct(levels['Half-Kelly'])}, Full-Kelly={fmt_pct(levels['Full-Kelly'])}, "
+            f"Half-Kelly={fmt_pct(levels['Half-Kelly'])}, "
+            f"Full-Kelly={fmt_pct(levels['Full-Kelly'])}, "
             f"keel-1%={fmt_pct(levels['keel-1%'])}."
         )
         lines.append("")
@@ -482,8 +492,8 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     lines.append("## What this means for keel")
     lines.append("")
     lines.append(
-        f"**Is 1% too timid?** Mathematically, yes, relative to the growth-maximizing Kelly "
-        f"fraction: at the promotion floor (p=0.55, b=1.5) full Kelly is 25% of equity per trade, "
+        "**Is 1% too timid?** Mathematically, yes, relative to the growth-maximizing Kelly "
+        "fraction: at the promotion floor (p=0.55, b=1.5) full Kelly is 25% of equity per trade, "
         "and keel's 1% is roughly 4% of that. In the \"p correct\" worlds of Experiment 2, every "
         "Kelly-family fraction (even Quarter-Kelly) compounds to a dramatically larger median "
         "terminal multiple than keel-1% over 200 trades, because 1% barely lets a real edge "
@@ -492,6 +502,12 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
         "conservative side of the Kelly curve."
     )
     lines.append("")
+    # Figures for the narrative are formatted from Profile A's results (the first profile) so the
+    # prose can never drift from the tables above. `.0f` rounds the same way source-84.md quotes.
+    _pa_worlds = list(next(iter(exp2_results.values()))["worlds"].values())
+    _fk_correct = _pa_worlds[0]["Full-Kelly"]["median_multiple"]
+    _fk_over = _pa_worlds[1]["Full-Kelly"]["median_multiple"]
+    _fk_over_ruin = _pa_worlds[1]["Full-Kelly"]["ruin_rate"]
     lines.append(
         "**Does the estimation-error run defend sub-Kelly?** Yes, and this is the more important "
         "half of the story. In the \"p over-estimated by 0.05\" worlds, Full-Kelly's edge "
@@ -499,8 +515,9 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
         "with a true p=0.50 is still a real edge -- full Kelly at the *true* p=0.50 would be "
         "~16.7% (down from the 25% it was sized at), not zero -- but Full-Kelly was sized as if "
         "the edge were 8-plus points thicker than it actually is, and that overbetting shows up "
-        "directly in the numbers: median terminal multiple collapses from 5076x (\"p correct\") "
-        "to 22x (\"p over-estimated\"), and a ruin rate that was 0.0% becomes 3.6%. Half- and "
+        f"directly in the numbers: median terminal multiple collapses from {_fk_correct:.0f}x "
+        f"(\"p correct\") to {_fk_over:.0f}x (\"p over-estimated\"), and a ruin rate that was "
+        f"0.0% becomes {fmt_pct(_fk_over_ruin)}. Half- and "
         "Quarter-Kelly degrade far more gracefully under the identical misestimation (their ruin "
         "rates stay at 0.0%), because they were never betting the full assumed edge in the first "
         "place -- the classic argument for sub-Kelly sizing is that it functions as a margin of "
