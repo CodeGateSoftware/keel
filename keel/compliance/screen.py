@@ -22,6 +22,7 @@ and unknown is a rejection. This mirrors `broker_subscriptions`, where an un-att
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -45,6 +46,15 @@ BACKING_AYN = "ayn"
 BACKING_DAYN = "dayn"
 BACKING_NATIVE = "native"  # a base-layer coin, neither a claim nor a warehouse receipt
 KNOWN_BACKINGS = frozenset({BACKING_AYN, BACKING_DAYN, BACKING_NATIVE})
+
+#: Criteria a documented, human-recorded exception (`keel assets exempt`) may EVER waive. Only
+#: DATA/market criteria belong here -- history depth, liquidity, that kind of thing -- because
+#: those are facts about our own cache, not about the asset's shariah status. The shariah
+#: criteria (a missing attestation, `haram_sector`, `riba_yield`, `dayn`/unknown backing) and
+#: `settlement` can NEVER be waived: nothing in this module consults `waived` for them, and the
+#: CLI's `--criterion` Choice is restricted to this set. Expanding it is a deliberate future
+#: decision, not a default -- do not add to it to make a test pass.
+WAIVABLE_CRITERIA = frozenset({"history"})
 
 
 @dataclass(frozen=True)
@@ -100,18 +110,36 @@ def screen_asset(
     facts: MarketFacts,
     attestation: AssetAttestation | None,
     policy: ScreenPolicy | None = None,
+    waived: Mapping[str, str] | None = None,
 ) -> ScreenResult:
-    """Deterministic admission decision. `attestation=None` fails closed."""
+    """Deterministic admission decision. `attestation=None` fails closed.
+
+    `waived` is `{criterion: rationale}` from a documented human exception (`keel assets
+    exempt` / `repository.get_screen_exceptions`). It is consulted ONLY when a check would
+    otherwise FAIL, and ONLY for criteria in `WAIVABLE_CRITERIA` -- a waiver for anything else
+    (a stray `screen_exceptions` row for, say, `attestation`) is silently ignored and that
+    criterion still fails closed. A waiver never affects any criterion other than its own.
+    """
     policy = policy or ScreenPolicy()
+    waived = waived or {}
     failures: list[str] = []
     warnings: list[str] = []
 
     # -- computed market facts -------------------------------------------------
     if facts.daily_bars < policy.min_daily_bars:
-        failures.append(
-            f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required "
-            "(a rule cannot be validated on a series shorter than its evidence needs)"
-        )
+        if "history" in WAIVABLE_CRITERIA and "history" in waived:
+            # Self-retiring: this branch is only reached when the check WOULD fail, so a stale
+            # waiver on an asset that has since accumulated enough history produces no output at
+            # all -- see the `>=` branch below, which never looks at `waived`.
+            warnings.append(
+                f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required -- "
+                f"WAIVED by documented exception: {waived['history']}"
+            )
+        else:
+            failures.append(
+                f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required "
+                "(a rule cannot be validated on a series shorter than its evidence needs)"
+            )
     if facts.median_daily_volume < policy.min_median_daily_volume:
         failures.append(
             f"liquidity: median daily volume {facts.median_daily_volume} < "

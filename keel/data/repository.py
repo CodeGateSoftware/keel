@@ -741,3 +741,48 @@ class Repository:
     def get_asset_attestations(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM asset_attestations ORDER BY asset").fetchall()
         return [dict(row) for row in rows]
+
+    # -- screen exceptions ------------------------------------------------------
+    # Documented, per-asset per-criterion waivers of an allowlist-screen admission criterion (KB
+    # PAXG/history case). See `keel/compliance/screen.py` -- only criteria in `WAIVABLE_CRITERIA`
+    # are ever honoured, so a row here can never bypass the shariah core.
+
+    def upsert_screen_exception(
+        self,
+        asset: str,
+        criterion: str,
+        rationale: str,
+        granted_by: str,
+        granted_at: int,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO screen_exceptions
+                (asset, criterion, rationale, granted_by, granted_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(asset, criterion) DO UPDATE SET
+                rationale = excluded.rationale,
+                granted_by = excluded.granted_by,
+                granted_at = excluded.granted_at
+            """,
+            (asset, criterion, rationale, granted_by, granted_at),
+        )
+        self._conn.commit()
+
+    def get_screen_exceptions(self, asset: str) -> dict[str, str]:
+        rows = self._conn.execute(
+            "SELECT criterion, rationale FROM screen_exceptions WHERE asset = ?", (asset,)
+        ).fetchall()
+        return {row["criterion"]: row["rationale"] for row in rows}
+
+    def list_screen_exceptions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM screen_exceptions ORDER BY asset, criterion"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_screen_exception(self, asset: str, criterion: str) -> None:
+        self._conn.execute(
+            "DELETE FROM screen_exceptions WHERE asset = ? AND criterion = ?", (asset, criterion)
+        )
+        self._conn.commit()

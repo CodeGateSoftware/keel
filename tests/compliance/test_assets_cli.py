@@ -144,6 +144,128 @@ def test_attestations_round_trip_through_list(tmp_path, valid_config_path):
     assert "ayn" in result.output
 
 
+# -- documented allowlist-screen exceptions (waivers) --------------------------
+#
+# `assets exempt` records a DOCUMENTED, per-asset per-criterion waiver; `assets screen` surfaces
+# it loudly (a warning, never a silent pass); `assets unexempt` revokes it. The CLI only lets a
+# human waive a criterion in `screen_mod.WAIVABLE_CRITERIA` -- the shariah core is never reachable
+# through this surface.
+
+
+def _exempt(runner, db_path, config_path, **over):
+    args = {
+        "--asset": "PAXG",
+        "--criterion": "history",
+        "--rationale": "441 daily bars, human-reviewed",
+        "--granted-by": "tester",
+    }
+    args.update(over)
+    flat = [item for pair in args.items() for item in pair]
+    return runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(config_path), "assets", "exempt", *flat]
+    )
+
+
+def _unexempt(runner, db_path, config_path, asset="PAXG", criterion="history"):
+    return runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "assets", "unexempt",
+         "--asset", asset, "--criterion", criterion],
+    )
+
+
+def test_exempt_admits_a_history_failing_asset_and_screen_prints_WAIVED(
+    tmp_path, valid_config_path
+):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)
+    runner = CliRunner()
+    attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+    assert attested.exit_code == 0
+
+    # Before the exception: REJECT on history.
+    before = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "0/1 admitted" in before.output
+    assert "history" in before.output
+
+    result = _exempt(runner, db_path, valid_config_path)
+    assert result.exit_code == 0, result.output
+    assert "PAXG" in result.output and "history" in result.output
+
+    after = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "1/1 admitted" in after.output
+    assert "WAIVED" in after.output
+
+
+def test_exempt_rejects_a_non_waivable_criterion_at_the_cli_boundary(
+    tmp_path, valid_config_path
+):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    result = _exempt(CliRunner(), db_path, valid_config_path, **{"--criterion": "bogus"})
+    assert result.exit_code != 0
+
+
+def test_exempt_rejects_a_shariah_criterion_at_the_cli_boundary(tmp_path, valid_config_path):
+    """The Choice restricts to WAIVABLE_CRITERIA -- 'attestation' must never be a valid value."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    result = _exempt(CliRunner(), db_path, valid_config_path, **{"--criterion": "attestation"})
+    assert result.exit_code != 0
+
+
+def test_assets_list_shows_recorded_exceptions(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+    assert _exempt(runner, db_path, valid_config_path).exit_code == 0
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "list"]
+    )
+    assert "exceptions:" in result.output
+    assert "PAXG" in result.output
+    assert "history" in result.output
+    assert "tester" in result.output
+
+
+def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)
+    runner = CliRunner()
+    attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+    assert attested.exit_code == 0
+    assert _exempt(runner, db_path, valid_config_path).exit_code == 0
+
+    admitted = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "1/1 admitted" in admitted.output
+
+    revoke = _unexempt(runner, db_path, valid_config_path)
+    assert revoke.exit_code == 0, revoke.output
+
+    rejected = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+    assert "0/1 admitted" in rejected.output
+    assert "✗" in rejected.output
+
+
 # -- discover ------------------------------------------------------------------
 
 

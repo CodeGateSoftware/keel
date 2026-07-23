@@ -150,6 +150,67 @@ def test_policy_thresholds_are_configurable():
     assert screen_asset(_facts(bars=200, volume="5"), _attestation(), lenient).admitted is True
 
 
+# -- documented allowlist-screen exceptions (waivers) --------------------------
+#
+# Motivating case: PAXG passes shariah/liquidity screening but fails the 4-year history floor
+# (441 bars < 1460). A human can record a DOCUMENTED exception that waives ONLY the `history`
+# criterion -- surfaced loudly as a warning, never a silent exemption -- and only for criteria in
+# `WAIVABLE_CRITERIA`, so the shariah core can never be bypassed this way.
+
+
+def test_insufficient_history_with_no_waiver_still_rejects():
+    result = screen_asset(_facts(bars=400), _attestation())
+    assert result.admitted is False
+    assert any("history" in f for f in result.failures)
+
+
+def test_a_documented_history_waiver_admits_and_warns_loudly():
+    result = screen_asset(
+        _facts(bars=400), _attestation(), waived={"history": "PAXG: 441 bars, human-reviewed"}
+    )
+    assert result.admitted is True
+    assert not any("history" in f for f in result.failures)
+    assert any(
+        "WAIVED" in w and "PAXG: 441 bars, human-reviewed" in w for w in result.warnings
+    )
+
+
+def test_a_waiver_is_self_retiring_once_history_clears_the_floor():
+    """No leftover warning once the underlying condition it was granted for no longer holds."""
+    result = screen_asset(_facts(bars=2000), _attestation(), waived={"history": "stale reason"})
+    assert result.admitted is True
+    assert not any("WAIVED" in w for w in result.warnings)
+    assert not any("history" in f for f in result.failures)
+
+
+def test_a_waiver_for_a_non_waivable_criterion_is_ignored_and_fails_closed():
+    """SAFETY: a stray `screen_exceptions` row for a shariah criterion must never bypass it."""
+    result = screen_asset(_facts(), None, waived={"attestation": "someone tried to waive this"})
+    assert result.admitted is False
+    assert any("attestation: MISSING" in f for f in result.failures)
+    assert not any("WAIVED" in w for w in result.warnings)
+
+
+def test_a_history_waiver_does_not_rescue_a_different_real_failure():
+    """The waiver is scoped to history alone -- it must not paper over an unrelated rejection."""
+    result = screen_asset(
+        _facts(bars=400), None, waived={"history": "reason"}
+    )
+    assert result.admitted is False
+    assert any("attestation: MISSING" in f for f in result.failures)
+
+
+def test_a_history_waiver_does_not_rescue_a_dayn_backing_failure():
+    result = screen_asset(
+        _facts(bars=400),
+        _attestation(backing="dayn"),
+        waived={"history": "reason"},
+    )
+    assert result.admitted is False
+    assert any("dayn" in f for f in result.failures)
+    assert not any("history" in f for f in result.failures)
+
+
 # -- discovery (proposal stage) ------------------------------------------------
 
 

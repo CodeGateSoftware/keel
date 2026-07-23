@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -239,6 +239,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS screen_exceptions (
+        asset       TEXT NOT NULL,
+        criterion   TEXT NOT NULL,
+        rationale   TEXT NOT NULL,
+        granted_by  TEXT NOT NULL,
+        granted_at  INTEGER NOT NULL,
+        PRIMARY KEY (asset, criterion)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS profile (
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         autonomous  INTEGER NOT NULL DEFAULT 0,
@@ -395,6 +405,21 @@ def _migrate_v8_autonomy_expiry(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE profile ADD COLUMN autonomous_until INTEGER")
 
 
+def _migrate_v9_screen_exceptions(conn: sqlite3.Connection) -> None:
+    """v9 adds `screen_exceptions`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill.
+
+    A row asserts a human documented a waiver for one asset/criterion pair, with a rationale and
+    who granted it. Seeding one would fabricate an exception nobody granted; an empty table
+    correctly says nothing has been excepted yet.
+
+    Unlike v8's `profile.autonomous_until` ADD COLUMN, this is a genuine no-op: `migrate()` runs
+    every `_SCHEMA_STATEMENTS` statement (all `IF NOT EXISTS`) before the version loop below, so
+    a database already stamped at v8 picks up the new table from that pass alone. This step only
+    exists to advance the stamp.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -403,6 +428,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     6: _migrate_v6_asset_attestations,
     7: _migrate_v7_profile,
     8: _migrate_v8_autonomy_expiry,
+    9: _migrate_v9_screen_exceptions,
 }
 
 
