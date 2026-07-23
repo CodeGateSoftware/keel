@@ -746,6 +746,18 @@ def run_once(
             _seed_paper_account_if_needed(
                 repo, broker, config, products, latest_price_by_product, now_ts, paper_trader
             )
+            # Recurring deposit (P4 Task 7), applied once per UTC calendar month -- AFTER the
+            # seed (a first-ever cycle both seeds and contributes) and BEFORE this cycle's
+            # equity/`update_drawdown`, so the deposit lands in the equity this cycle computes
+            # rather than reading as next cycle's unexplained jump. `record_external_flow`
+            # rebases the HWM + weekly history so the deposit is never read as a recovery.
+            contribution = config.paper.monthly_contribution_usd
+            if contribution > 0 and paper_trader.get_cash() is not None:
+                month_start, _ = guards._utc_month_bounds(now_ts)
+                if repo.get_state("paper_last_contribution_month") != month_start:
+                    paper_trader.deposit(contribution)
+                    equity_mod.record_external_flow(repo, amount=contribution)
+                    repo.set_state("paper_last_contribution_month", month_start)
             equity_now = paper_trader.equity(latest_price_by_product)
         else:
             equity_now = _mark_to_market_equity(

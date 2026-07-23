@@ -1238,6 +1238,57 @@ def test_run_once_skips_paper_entries_when_the_synthetic_account_is_unseeded(rep
     assert not any(r.placed for r in result.enter_results)
 
 
+# -- monthly contribution: calendar-month rollover (P4 Task 7) ------------------
+
+
+def test_paper_monthly_contribution_applied_once_per_month(repo):
+    """A configured `monthly_contribution_usd` deposits once per UTC calendar month -- applied
+    the cycle the month is first seen, not re-applied on a later cycle in the SAME month, and
+    applied again once the calendar rolls into the next month."""
+    # JAN15/JAN20 share a UTC month_start; FEB03 is the next calendar month (see
+    # `guards._utc_month_bounds`).
+    JAN15 = 1_705_320_000
+    JAN20 = 1_705_752_000
+    FEB03 = 1_706_961_600
+
+    # `_NullBalanceBroker` (no readable account) forces the paper seed onto the config
+    # fallback, so `paper_cash_usdc` starts deterministic and non-`None`.
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(
+        paper=PaperConfig(
+            starting_equity_usd=Decimal("10000"),
+            monthly_contribution_usd=Decimal("500"),
+        )
+    )
+
+    # Cycle 1 (JAN15): first-ever cycle seeds the account AND applies month 1's contribution.
+    run_once(broker, repo, cfg, now_ts=JAN15)
+    cash_after_first = repo.get_state("paper_cash_usdc")
+    assert cash_after_first == Decimal("10000") + Decimal("500")
+    assert repo.get_state("paper_last_contribution_month") == 1_704_067_200
+
+    # Cycle 2 (JAN20): same calendar month -- no second contribution.
+    run_once(broker, repo, cfg, now_ts=JAN20)
+    assert repo.get_state("paper_cash_usdc") == cash_after_first
+
+    # Cycle 3 (FEB03): calendar rolled over -- contribution applies again.
+    before = repo.get_state("paper_cash_usdc")
+    run_once(broker, repo, cfg, now_ts=FEB03)
+    assert repo.get_state("paper_cash_usdc") >= before + Decimal("500") - Decimal("1")
+    assert repo.get_state("paper_last_contribution_month") == 1_706_745_600
+
+
+def test_paper_monthly_contribution_disabled_by_default(repo):
+    """`monthly_contribution_usd` defaults to 0 -- no deposit, no state key written."""
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=1_705_320_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+    assert repo.get_state("paper_last_contribution_month") is None
+
+
 # -- interactive confirm: run_once threads confirm_fn to placement --------------
 
 
