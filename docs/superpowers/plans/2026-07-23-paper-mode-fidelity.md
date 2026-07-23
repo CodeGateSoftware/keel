@@ -235,7 +235,7 @@ Give `PaperTrader` a persisted synthetic cash balance, a funding check, an `equi
 
 **Interfaces:**
 - Produces:
-  - `equity.mark_positions(cash: Decimal, positions: list[tuple[Decimal, Decimal, Decimal]], price_by_product: dict[str, Decimal], product_ids: list[str]) -> Decimal` — see Step 3a for the exact signature.
+  - `equity.mark_positions(cash: Decimal, positions: list[tuple[Decimal, Decimal]], price_by_product: dict[str, Decimal], product_ids: list[str]) -> Decimal` — each `positions[i]` is `(qty, cost_basis)`; see Step 3a for the exact signature.
   - `PaperTrader.equity(price_by_product: dict[str, Decimal]) -> Decimal | None` (None only if cash is unseeded).
   - State keys: `paper_cash_usdc` (Decimal), `paper_ledger_start_ts` (int).
   - `PaperTrader.seed_cash(amount: Decimal, now_ts: int) -> None` (sets `paper_cash_usdc` and `paper_ledger_start_ts` if unset).
