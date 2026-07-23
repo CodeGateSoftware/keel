@@ -54,6 +54,10 @@ dca:
   budget_usd: 75.5
   cadence_days: 14
 
+paper:
+  starting_equity_usd: 30000
+  monthly_contribution_usd: 500
+
 subscription:
   assumed_free_volume_usd: 1234.5
   unsubscribed_allowance_usd: 25

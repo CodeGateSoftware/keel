@@ -140,6 +140,26 @@ class TestEnterThenTargetHit:
         assert exit_order_id is None
         assert trader.has_open_position("BTC-USD")
 
+    def test_paper_entry_records_supplied_qty(self, repo: Repository) -> None:
+        trader = PaperTrader(repo)
+        signal = _enter_signal(
+            setup=Setup(
+                product_id="BTC-USD",
+                direction="long",
+                entry=Decimal("100"),
+                stop=Decimal("90"),
+                target=Decimal("130"),
+                context={},
+                ts=1_000,
+            )
+        )
+        order_id = trader.on_signal(signal, qty=Decimal("3"))
+
+        assert order_id is not None
+        order = repo.get_order(order_id)
+        assert order["qty"] == Decimal("3")
+        assert json.loads(order["raw_response"])["qty"] == "3"
+
 
 class TestMfeMae:
     def test_mfe_and_mae_recorded_on_close(self, repo: Repository) -> None:
@@ -341,3 +361,196 @@ def test_a_rehydrated_position_still_exits_on_its_original_stop(repo):
 
 def test_rehydration_on_an_empty_repo_is_a_no_op(repo):
     assert PaperTrader(repo).has_open_position("BTC-USD") is False
+
+
+# -- synthetic cash, funding check, equity, epoch cutoff -----------------------
+
+
+def test_paper_equity_seed_and_mark(repo):
+    trader = PaperTrader(repo)
+    assert trader.equity({"BTC-USD": Decimal("100")}) is None  # unseeded
+
+    trader.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+    assert trader.equity({}) == Decimal("30000")  # all cash, no positions
+
+    # open a position and re-mark
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130"))
+    trader.on_signal(sig, qty=Decimal("5"))
+    eq = trader.equity({"BTC-USD": Decimal("120")})
+    # cash was debited by fill+fee; positions valued at 5*120
+    assert eq < Decimal("30000") + Decimal("5") * Decimal("120")  # fee/slippage drag
+    assert eq > Decimal("29000")
+
+
+def test_paper_funding_check_rejects_when_cash_insufficient(repo):
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("50"), now_ts=1_700_000_000)
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130"))
+    # notional 5*100 = 500 >> 50 cash -> no fill
+    assert trader.on_signal(sig, qty=Decimal("5")) is None
+    assert trader.get_cash() == Decimal("50")  # unchanged
+    assert not trader.has_open_position("BTC-USD")
+    assert repo.get_orders(mode="paper") == []
+
+
+def test_paper_funding_check_allows_when_cash_unseeded(repo):
+    """Unseeded (`None`) cash must not block fills -- the funding check only applies
+    once the operator has opted into a synthetic account via `seed_cash`.
+    """
+    trader = PaperTrader(repo)
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130"))
+    assert trader.on_signal(sig, qty=Decimal("5")) is not None
+
+
+def test_seed_cash_only_sets_ledger_start_ts_once(repo):
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("1000"), now_ts=1_700_000_000)
+    trader.seed_cash(Decimal("2000"), now_ts=1_800_000_000)
+    assert repo.get_state("paper_ledger_start_ts") == 1_700_000_000
+    assert trader.get_cash() == Decimal("2000")
+
+
+def test_deposit_adds_to_cash(repo):
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("1000"), now_ts=1_700_000_000)
+    trader.deposit(Decimal("500"))
+    assert trader.get_cash() == Decimal("1500")
+    assert repo.get_state("paper_cash_usdc") == Decimal("1500")
+
+
+def test_deposit_is_a_noop_when_cash_unseeded(repo):
+    trader = PaperTrader(repo)
+    trader.deposit(Decimal("500"))
+    assert trader.get_cash() is None
+
+
+def test_cash_debited_on_entry_and_credited_on_exit(repo):
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("1000"), now_ts=1_000)
+    trader.on_signal(_enter_signal(ts=1_000))  # qty defaults to 1, entry 100
+
+    entry_fill = Decimal("100") * (Decimal(1) + SLIPPAGE_PCT)
+    fee = entry_fill * FEE_PCT
+    expected_after_entry = Decimal("1000") - entry_fill - fee
+    assert trader.get_cash() == expected_after_entry
+
+    trader.on_candle("BTC-USD", _candle(1_060, "115", "121", "114", "120"))  # closes at target
+    exit_fill = Decimal("120") * (Decimal(1) - SLIPPAGE_PCT)
+    exit_fee = exit_fill * FEE_PCT
+    expected_after_exit = expected_after_entry + exit_fill - exit_fee
+    assert trader.get_cash() == expected_after_exit
+
+
+def test_pre_epoch_orders_are_skipped_on_rehydration(repo):
+    """Legacy 1-unit orders written before `paper_ledger_start_ts` was seeded must
+    never rehydrate into the synthetic account.
+    """
+    legacy = PaperTrader(repo)
+    legacy.on_signal(_enter_signal(ts=1_000))
+    assert legacy.has_open_position("BTC-USD")
+
+    # operator now seeds a synthetic ledger epoch AFTER the legacy order was written
+    legacy.seed_cash(Decimal("30000"), now_ts=2_000)
+
+    resumed = PaperTrader(repo)
+    assert resumed.has_open_position("BTC-USD") is False
+
+
+def test_first_cycle_position_survives_rehydration_despite_bar_ts_before_seed_wallclock(repo):
+    """The epoch cutoff must be ID-based, not wall-clock-ts-based.
+
+    `seed_cash`'s `now_ts` is the WALL CLOCK at seed time; an order's `ts` comes from
+    candle/bar time, which always predates wall-clock `now_ts` (the latest CLOSED bar is
+    never in the future). A position opened off an earlier bar during the very seeding
+    cycle must still rehydrate on the NEXT cycle's fresh `PaperTrader` -- a ts-based
+    cutoff would wrongly treat it as pre-epoch and silently drop it (phantom drawdown,
+    orphaned position, double-exposure on re-entry) even though it was written AFTER the
+    seed, by order id.
+    """
+    trader = PaperTrader(repo)
+    now_ts = 1_700_000_000  # realistic wall-clock seed time
+    trader.seed_cash(Decimal("30000"), now_ts=now_ts)
+
+    # Opened the SAME cycle, off a bar whose ts is far EARLIER than the seed wall-clock.
+    bar_ts = 1_699_000_000
+    assert bar_ts < now_ts
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130", ts=bar_ts), ts=bar_ts)
+    trader.on_signal(sig)
+    assert trader.has_open_position("BTC-USD")
+    cash_after_entry = trader.get_cash()
+
+    # Next cycle: a FRESH PaperTrader, exactly like `agent.run_once` reconstructing it.
+    resumed = PaperTrader(repo)
+
+    assert resumed.has_open_position("BTC-USD"), (
+        "the position opened during the seeding cycle must survive rehydration"
+    )
+    assert resumed.get_cash() == cash_after_entry
+    equity = resumed.equity({"BTC-USD": Decimal("120")})
+    assert equity is not None
+    assert equity == cash_after_entry + Decimal("120")  # qty=1 -- position value included
+
+
+def test_pre_seed_order_still_excluded_by_id_based_epoch(repo):
+    """The legacy case the epoch exists for: an order written strictly BEFORE `seed_cash`
+    (its id is at or below the id recorded as the seed epoch) must still be excluded on
+    rehydration, even though the ID-based cutoff replaces the old ts-based one.
+    """
+    legacy = PaperTrader(repo)
+    legacy.on_signal(_enter_signal(ts=1_000))  # unseeded -- written before any seed
+    assert legacy.has_open_position("BTC-USD")
+
+    legacy.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+    start_id = repo.get_state("paper_ledger_start_order_id")
+    assert start_id is not None
+
+    resumed = PaperTrader(repo)
+    assert resumed.has_open_position("BTC-USD") is False
+
+
+def test_position_opened_before_seeding_is_never_costed(repo):
+    """A position opened while cash is unseeded, later seeded mid-flight, must not
+    desync the ledger: no debit happened at open, so no credit may happen at close,
+    and it must never inflate `equity()` -- otherwise seeding after the fact would
+    silently manufacture free equity out of an uncosted position.
+    """
+    trader = PaperTrader(repo)
+    trader.on_signal(_enter_signal(setup=_setup(entry="100", stop="90", target="130"), ts=1_000))
+    assert trader.has_open_position("BTC-USD")
+    assert trader.get_cash() is None  # unseeded -- no debit was possible
+
+    trader.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+
+    # equity must be exactly cash -- the uncosted open position contributes nothing
+    assert trader.equity({"BTC-USD": Decimal("120")}) == Decimal("30000")
+
+    # close it via a stop touch
+    trader.on_candle("BTC-USD", _candle(2_000, "89", "91", "88", "90"))
+    assert not trader.has_open_position("BTC-USD")
+
+    # no credit for an uncosted position -- cash stays exactly what was seeded
+    assert trader.get_cash() == Decimal("30000")
+
+
+def test_funding_check_rejects_at_boundary_between_notional_and_actual_fill_cost(repo):
+    """The funding check must gate on the ACTUAL debit (fill + slippage + fee), not
+    the coarser intent notional (entry * qty) -- otherwise cash can go negative for
+    any seed strictly between the two, defeating the check's stated purpose.
+    """
+    trader = PaperTrader(repo)
+    entry = Decimal("100")
+    qty = Decimal("5")
+    notional = entry * qty
+    entry_fill = entry * (Decimal(1) + SLIPPAGE_PCT)
+    fee = entry_fill * qty * FEE_PCT
+    fill_cost = entry_fill * qty + fee
+    assert notional < fill_cost  # slippage+fee always push the real cost higher
+
+    seed = (notional + fill_cost) / 2  # strictly between the two
+    trader.seed_cash(seed, now_ts=1_700_000_000)
+
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130"))
+    assert trader.on_signal(sig, qty=qty) is None
+    assert trader.get_cash() == seed  # unchanged
+    assert not trader.has_open_position("BTC-USD")
+    assert repo.get_orders(mode="paper") == []

@@ -39,6 +39,10 @@
     "profit_trigger_pct": "0.1",
     "streak_cooloff_days": 0
   },
+  "paper": {
+    "monthly_contribution_usd": "0",
+    "starting_equity_usd": "0"
+  },
   "promotion": {
     "min_expectancy": "0",
     "min_rr": "1.5",

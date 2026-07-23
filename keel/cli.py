@@ -1057,6 +1057,11 @@ def _print_loop_result(result: agent.LoopResult) -> None:
         f"products={result.products} stale={result.stale_products} "
         f"signals={len(result.enter_signals)} entered={entered} exited={exited}"
     )
+    if result.paper_equity is not None:
+        click.echo(
+            f"paper equity ${result.paper_equity} | drawdown "
+            f"{result.drawdown_total_pct} total / {result.drawdown_weekly_pct} weekly"
+        )
 
 
 @cli.command()

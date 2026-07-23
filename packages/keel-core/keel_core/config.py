@@ -129,6 +129,21 @@ class DcaConfig:
     cadence_days: int = 7
 
 
+@dataclass(frozen=True)
+class PaperConfig:
+    """Paper-forward account model (spec: paper-mode fidelity).
+
+    `starting_equity_usd` is only a FALLBACK seed used when the one-time real-equity
+    read at paper-start fails; the primary seed is live mark-to-market equity. A value of
+    0 means "no fallback" -- if the broker read also fails, paper drawdown tracking stays
+    dormant that run (logged loudly) rather than seeding a bogus 0 denominator.
+    `monthly_contribution_usd` models ongoing deposits during the paper-forward; 0 disables.
+    """
+
+    starting_equity_usd: Decimal = Decimal("0")
+    monthly_contribution_usd: Decimal = Decimal("0")
+
+
 _VALID_PACING_MODES = ("opportunistic", "even_daily")
 #: `paper` simulates and places nothing; `confirm` is live. Whether you are ASKED is a
 #: PROFILE choice (`keel autonomy on|off`), deliberately not a config mode -- config.yaml
@@ -255,6 +270,7 @@ class Config:
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
     money_mgmt: MoneyMgmtConfig = field(default_factory=MoneyMgmtConfig)
     dca: DcaConfig = field(default_factory=DcaConfig)
+    paper: PaperConfig = field(default_factory=PaperConfig)
     subscription: SubscriptionConfig = field(default_factory=SubscriptionConfig)
     tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
     fees: FeesConfig = field(default_factory=FeesConfig)
@@ -491,6 +507,7 @@ def load_config(path: str | Path) -> Config:
     promotion_raw = raw.get("promotion") or {}
     money_mgmt_raw = raw.get("money_mgmt") or {}
     dca_raw = raw.get("dca") or {}
+    paper_raw = raw.get("paper") or {}
     subscription_raw = raw.get("subscription") or {}
 
     pacing = subscription_raw.get("pacing", "opportunistic")
@@ -573,6 +590,14 @@ def load_config(path: str | Path) -> Config:
             budget_usd=_to_decimal(dca_raw.get("budget_usd", "0"), "dca.budget_usd"),
             cadence_days=int(dca_raw.get("cadence_days", 7)),
         ),
+        paper=PaperConfig(
+            starting_equity_usd=_non_negative_decimal(
+                paper_raw.get("starting_equity_usd", "0"), "paper.starting_equity_usd"
+            ),
+            monthly_contribution_usd=_non_negative_decimal(
+                paper_raw.get("monthly_contribution_usd", "0"), "paper.monthly_contribution_usd"
+            ),
+        ),
         subscription=SubscriptionConfig(
             assumed_free_volume_usd=_non_negative_decimal(
                 subscription_raw.get("assumed_free_volume_usd", "500"),
@@ -619,6 +644,7 @@ __all__ = [
     "PromotionConfig",
     "MoneyMgmtConfig",
     "DcaConfig",
+    "PaperConfig",
     "SubscriptionConfig",
     "TierConfig",
     "LoggingConfig",

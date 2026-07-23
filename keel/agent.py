@@ -342,6 +342,41 @@ def _mark_to_market_equity(
     return total
 
 
+def _seed_paper_account_if_needed(
+    repo: Repository,
+    broker: Any,
+    config: Config,
+    products: list[str],
+    price_by_product: dict[str, Decimal],
+    now_ts: int,
+    paper_trader: PaperTrader,
+) -> None:
+    """Enforce the equity-state mode stamp and seed the synthetic paper account once.
+
+    On a paper->live or live->paper flip, clear the shared HWM/history/drawdown scalars
+    (same keys `keel reset-hwm` clears) before this cycle's update_drawdown, so a synthetic
+    HWM never poisons live equity (or vice versa). Seed `paper_cash_usdc` on first paper run
+    from real broker mark-to-market equity, falling back to `config.paper.starting_equity_usd`.
+    """
+    if repo.get_state("equity_state_mode") != "paper":
+        repo.set_state("equity_high_water_mark", None)
+        repo.set_state("drawdown_total_pct", Decimal("0"))
+        repo.set_state("drawdown_weekly_pct", Decimal("0"))
+        repo.set_state("equity_history", [])
+        repo.set_state("equity_state_mode", "paper")
+    if paper_trader.get_cash() is None:
+        seed = _mark_to_market_equity(
+            repo, broker, products, price_by_product, config.quote_currency
+        )
+        if seed is None:
+            fallback = config.paper.starting_equity_usd
+            seed = fallback if fallback > 0 else None
+        if seed is None:
+            log_event(logger, logging.WARNING, "agent.paper_seed_unavailable")
+            return
+        paper_trader.seed_cash(seed, now_ts)
+
+
 def _paper_resolve_bars(
     trader: PaperTrader,
     product_id: str,
@@ -370,8 +405,10 @@ def _paper_enter(
     repo: Repository,
     config: Config,
     now_ts: int,
+    paper_equity: Decimal,
 ) -> executor.ExecutionResult:
-    """Run the offline-computable rails, then record a paper fill if they pass.
+    """Run the offline-computable rails, then record a paper fill sized off `paper_equity` if
+    they pass.
 
     Paper runs the rails DELIBERATELY (see `guards.check`'s `offline` docstring): the promotion
     gate is scored on this track record, so a rehearsal that skipped them would promote a
@@ -381,6 +418,12 @@ def _paper_enter(
     `None` for a null broker without logging, and rail 13 -- the rail that would have consumed
     that balance -- is one of the two `offline=True` skips anyway, because paper has no live
     account to read a balance from.
+
+    `paper_equity` sizes the intent (via `equity_override`) AND the fill: the synthetic account
+    equity is what a real paper account would risk `config.risk_pct` of, not the `$5k
+    max_exposure` proxy `_build_intent` falls back to absent an override -- that proxy only ever
+    existed to gate the guard check, and sizing the fill off it would score the track record on
+    trades no real paper balance could have produced.
     """
     def _result(placed, order_id=None, vetoed_by=None, reason=""):
         return ExecutionResult(
@@ -391,7 +434,9 @@ def _paper_enter(
             reason=reason,
         )
 
-    intent = executor._build_intent(signal, None, repo, config, now_ts)
+    intent = executor._build_intent(
+        signal, None, repo, config, now_ts, equity_override=paper_equity
+    )
     if intent is None:
         return _result(False, reason="paper: nothing to size")
 
@@ -399,9 +444,11 @@ def _paper_enter(
     if not verdict.ok:
         return _result(False, vetoed_by=verdict.violations, reason="paper: vetoed by rails")
 
-    order_id = trader.on_signal(signal)
+    order_id = trader.on_signal(signal, qty=intent.qty)
     if order_id is None:
-        return _result(False, reason="paper: no fill (position already open)")
+        return _result(
+            False, reason="paper: no fill (position open or insufficient synthetic cash)"
+        )
     return _result(
         True,
         order_id=order_id,
@@ -575,6 +622,12 @@ class LoopResult:
     enter_signals: list[Signal] = field(default_factory=list)
     enter_results: list[ExecutionResult] = field(default_factory=list)
     exit_results: list[ExecutionResult] = field(default_factory=list)
+    # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
+    # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
+    # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
+    paper_equity: Decimal | None = None
+    drawdown_total_pct: Decimal | None = None
+    drawdown_weekly_pct: Decimal | None = None
 
 
 def _effective_mode(config: Config, repo: Repository, now_ts: int) -> str:
@@ -691,18 +744,39 @@ def run_once(
                 if product_candles:
                     latest_price_by_product[product_id] = product_candles[-1].close
 
-        # Paper never touches the broker. Mark-to-market needs the live quote balance, which a
-        # rehearsal has no claim on -- so rail 11's scalars simply do not advance in paper, the
-        # same "leave the previous cycle's values in place" behaviour as an unavailable broker.
-        # Stated explicitly rather than relying on the fetch failing and being logged as an
-        # error, which is what happened before: paper looked broker-free only by accident.
-        equity_now = (
-            None
-            if paper_trader is not None
-            else _mark_to_market_equity(
+        # Paper now advances rail 11's scalars too: the synthetic account is seeded (once, from
+        # real mark-to-market equity or the config fallback) and marked to market every cycle
+        # exactly like a live account, via `_seed_paper_account_if_needed` + `PaperTrader.equity`.
+        # `equity_state_mode` records which account last drove the shared HWM/drawdown keys, so a
+        # paper<->live flip clears them first rather than letting one mode's scalars poison the
+        # other's (see `_seed_paper_account_if_needed`'s docstring).
+        if paper_trader is not None:
+            _seed_paper_account_if_needed(
+                repo, broker, config, products, latest_price_by_product, now_ts, paper_trader
+            )
+            # Recurring deposit (P4 Task 7), applied once per UTC calendar month -- AFTER the
+            # seed (a first-ever cycle both seeds and contributes) and BEFORE this cycle's
+            # equity/`update_drawdown`, so the deposit lands in the equity this cycle computes
+            # rather than reading as next cycle's unexplained jump. `record_external_flow`
+            # rebases the HWM + weekly history so the deposit is never read as a recovery.
+            contribution = config.paper.monthly_contribution_usd
+            if contribution > 0 and paper_trader.get_cash() is not None:
+                month_start, _ = guards._utc_month_bounds(now_ts)
+                if repo.get_state("paper_last_contribution_month") != month_start:
+                    paper_trader.deposit(contribution)
+                    equity_mod.record_external_flow(repo, amount=contribution)
+                    repo.set_state("paper_last_contribution_month", month_start)
+            equity_now = paper_trader.equity(latest_price_by_product)
+        else:
+            equity_now = _mark_to_market_equity(
                 repo, broker, products, latest_price_by_product, config.quote_currency
             )
-        )
+        # Task 9: paper-forward observability -- the synthetic equity + drawdown scalars this
+        # cycle advanced, surfaced on `LoopResult` (`_print_loop_result` + this log line) instead
+        # of only living in repo state. `None` unless this is a paper cycle that read equity.
+        result_paper_equity: Decimal | None = None
+        result_drawdown_total_pct: Decimal | None = None
+        result_drawdown_weekly_pct: Decimal | None = None
         if equity_now is None:
             # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
             log_event(
@@ -712,7 +786,43 @@ def run_once(
                 paper=paper_trader is not None,
             )
         else:
+            # The symmetric live-side mode stamp/clear -- only right before a REAL update, so an
+            # unreadable broker (equity_now is None, handled above) never gets to zero out the
+            # previous cycle's scalars on the strength of a stamp alone.
+            # TODO(pre-live-arming): asymmetric with the paper-side clear above -- this guards on
+            # `!= "live"` (fires unless already live) rather than `== "paper"` (fires only on an
+            # actual paper->live flip). On a paper->live flip whose first live cycle reads an
+            # unreadable broker, `equity_now` is None, this whole branch is skipped, and stale
+            # paper drawdown scalars survive one extra cycle before self-healing on the next
+            # readable cycle. Fix before arming live execution: gate this clear on `== "paper"`
+            # and hoist it above the broker-equity read so it fires unconditionally on the flip.
+            if paper_trader is None and repo.get_state("equity_state_mode") != "live":
+                repo.set_state("equity_high_water_mark", None)
+                repo.set_state("drawdown_total_pct", Decimal("0"))
+                repo.set_state("drawdown_weekly_pct", Decimal("0"))
+                repo.set_state("equity_history", [])
+                repo.set_state("equity_state_mode", "live")
             equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
+
+            if paper_trader is not None:
+                result_paper_equity = equity_now
+                result_drawdown_total_pct = repo.get_state("drawdown_total_pct")
+                result_drawdown_weekly_pct = repo.get_state("drawdown_weekly_pct")
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "agent.paper_equity",
+                    equity=str(equity_now),
+                    dd_total=str(result_drawdown_total_pct),
+                    dd_weekly=str(result_drawdown_weekly_pct),
+                )
+
+        # `_paper_enter` sizes the fill off THIS cycle's synthetic equity -- reusing `equity_now`
+        # computed above rather than re-deriving it, so the entry and the drawdown scalars it just
+        # advanced always agree on what the account was worth this cycle. `None` when unseeded or
+        # unreadable (handled just above): sizing a fill off an unknown equity would be worse than
+        # not trading, so paper entries are skipped this cycle instead, below.
+        paper_equity = equity_now if paper_trader is not None else None
 
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
@@ -762,7 +872,25 @@ def run_once(
             for signal in product_signals:
                 enter_signals.append(signal)
                 if paper_trader is not None:
-                    result = _paper_enter(paper_trader, signal, repo, config, now_ts)
+                    if paper_equity is None:
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "agent.paper_enter_skipped_no_equity",
+                            product=product_id,
+                            rule=signal.rule_name,
+                        )
+                        result = ExecutionResult(
+                            placed=False,
+                            order_id=None,
+                            vetoed_by=[],
+                            preview=None,
+                            reason="paper: skipped (synthetic account equity unavailable)",
+                        )
+                    else:
+                        result = _paper_enter(
+                            paper_trader, signal, repo, config, now_ts, paper_equity
+                        )
                 else:
                     result = executor.execute(
                         signal, broker, repo, config, mode, confirm_fn=confirm_fn, now_ts=now_ts
@@ -805,6 +933,9 @@ def run_once(
             enter_signals=enter_signals,
             enter_results=enter_results,
             exit_results=exit_results,
+            paper_equity=result_paper_equity,
+            drawdown_total_pct=result_drawdown_total_pct,
+            drawdown_weekly_pct=result_drawdown_weekly_pct,
         )
     finally:
         unbind_cycle(cycle_token)

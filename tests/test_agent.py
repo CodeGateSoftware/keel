@@ -28,10 +28,11 @@ from keel.config import (
     DcaConfig,
     MarketDataConfig,
     MoneyMgmtConfig,
+    PaperConfig,
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.types import Candle, Granularity, Side
@@ -1031,7 +1032,11 @@ def test_paper_mode_records_a_fill_and_never_places_or_reads_account_state(repo,
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
 
     broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+    # Task 6: entries now size off the synthetic account equity, so the account needs a seed --
+    # the real-balance read still gets attempted and swallowed exactly as before (see the
+    # caught `AssertionError` in the log), this only supplies the config fallback behind it.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+    result = run_once(broker, repo, cfg, now_ts=90_000)
 
     assert result.skipped is False
     orders = repo.get_orders(mode="paper")
@@ -1048,7 +1053,10 @@ def test_paper_mode_still_enforces_the_offline_rails(repo, monkeypatch):
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT, stop_mult="0.9999"))
 
     broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+    # Sizing needs a seeded synthetic account (Task 6) to reach the rails at all -- see the
+    # matching note on `test_paper_mode_records_a_fill_and_never_places_or_reads_account_state`.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+    result = run_once(broker, repo, cfg, now_ts=90_000)
 
     assert repo.get_orders(mode="paper") == []
     assert any("vetoed by rails" in (r.reason or "") for r in result.enter_results)
@@ -1079,6 +1087,370 @@ def test_paper_mode_loads_PAPER_status_rules_not_live_ones(repo, monkeypatch):
     run_once(broker, repo, _paper_config(), now_ts=90_000)
 
     assert repo.get_orders(mode="paper") == [], "a LIVE rule must not trade in paper mode"
+
+
+# -- paper equity: seed, mode-flip clear, per-cycle drawdown (P4 Task 5) --------------------
+
+
+class _NullBalanceBroker(FakeBroker):
+    """Serves candles fine, but has no readable account at all -- `_mark_to_market_equity`
+    (and therefore the paper seed's real-equity attempt) must return `None` here, forcing the
+    config fallback rather than a phantom balance."""
+
+    def get_accounts(self) -> list[dict[str, Any]]:
+        return []
+
+
+def test_paper_cycle_advances_drawdown_scalar(repo):
+    """A paper run_once with an already-seeded account and a losing mark (cash below the
+    existing HWM) writes a non-zero `drawdown_total_pct` -- Rail 11's scalars advancing in
+    paper, which is the whole point of this task."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    repo.set_state("paper_cash_usdc", Decimal("7000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    broker = FakeBroker()
+
+    run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_state("equity_state_mode") == "paper"
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000"), "HWM must not fall"
+    assert repo.get_state("drawdown_total_pct") == Decimal("0.3")
+
+
+def test_mode_flip_clears_hwm(repo):
+    """A prior LIVE cycle's HWM/drawdown must not poison the first paper cycle after a flip --
+    it is cleared and re-seeded from the paper account's own (real mark-to-market) equity."""
+    repo.set_state("equity_state_mode", "live")
+    repo.set_state("equity_high_water_mark", Decimal("999999"))
+    repo.set_state("drawdown_total_pct", Decimal("0.9"))
+    broker = FakeBroker()
+
+    run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert repo.get_state("equity_state_mode") == "paper"
+    assert repo.get_state("equity_high_water_mark") != Decimal("999999")
+    assert repo.get_state("drawdown_total_pct") != Decimal("0.9")
+
+
+def test_loop_result_carries_paper_equity_and_drawdown(repo):
+    """Task 9: a paper cycle surfaces its synthetic equity + drawdown scalars on the returned
+    `LoopResult` -- the observability for a paper-forward (`_print_loop_result` + `log_event`),
+    not just a side effect buried in repo state."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    repo.set_state("paper_cash_usdc", Decimal("7000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    broker = FakeBroker()
+
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert result.paper_equity == Decimal("7000")
+    assert result.drawdown_total_pct == Decimal("0.3")
+    assert result.drawdown_weekly_pct is not None
+
+
+def test_seed_falls_back_to_config_when_broker_read_none(repo):
+    """First paper run, broker has no readable balance at all: seed from
+    `config.paper.starting_equity_usd` instead of leaving the account dormant."""
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+
+
+# -- paper fills sized off paper equity (P4 Task 6) -----------------------------
+
+
+def _paper_enter_signal(
+    product_id: str = PRODUCT,
+    entry: Decimal = Decimal("100"),
+    stop: Decimal = Decimal("90"),
+    target: Decimal = Decimal("130"),
+    ts: int = 1_000,
+) -> Signal:
+    return Signal(
+        rule_name="fake_enter",
+        product_id=product_id,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id=product_id,
+            direction="long",
+            entry=entry,
+            stop=stop,
+            target=target,
+            context={},
+            ts=ts,
+        ),
+        cts_score=7,
+        entry_technique="signal_candle",
+        ts=ts,
+    )
+
+
+def test_paper_enter_sizes_off_paper_equity(repo):
+    """`_paper_enter` must size the fill off the SYNTHETIC ACCOUNT EQUITY it is handed, not the
+    `$5k max_exposure` proxy `_build_intent` falls back to and not the old fixed 1-unit fill."""
+    from keel.execution import sizing
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    sig = _paper_enter_signal(entry=Decimal("100"), stop=Decimal("90"), target=Decimal("130"))
+
+    result = agent._paper_enter(
+        trader, sig, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert result.placed
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    expected_qty = sizing.size(Decimal("30000"), config.risk_pct, Decimal("100"), Decimal("90"))
+    assert expected_qty == Decimal("30")
+    assert orders[0]["qty"] == expected_qty
+    assert orders[0]["qty"] != Decimal("1"), "must not fill the old fixed 1-unit qty"
+
+
+def test_run_once_sizes_a_paper_entry_off_the_seeded_synthetic_equity(repo, monkeypatch):
+    """Loop-level: the `equity_now` Task 5 computes for the paper branch is what sizes the fill,
+    not a re-derived value and not the fixed 1-unit qty `_AlwaysEnterRule` used to produce."""
+    from keel.execution import sizing
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+    repo.set_state("paper_cash_usdc", Decimal("30000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    repo.set_state("equity_state_mode", "paper")
+    # `_AlwaysEnterRule` sets entry = candle close, stop = 0.95 * close -> a 5% stop distance.
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    expected_qty = sizing.size(
+        Decimal("30000"), _paper_config().risk_pct, Decimal("100"), Decimal("95")
+    )
+    assert orders[0]["qty"] == expected_qty
+    assert orders[0]["qty"] != Decimal("1")
+    assert result.enter_results[0].placed
+
+
+def test_run_once_skips_paper_entries_when_the_synthetic_account_is_unseeded(repo, monkeypatch):
+    """Sizing off an UNKNOWN equity is worse than not trading: an unseeded/unreadable paper
+    account must skip entries this cycle rather than fall back to a garbage size."""
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT))
+    # No cash seeded, and the fallback is disabled (0) -- `equity_now` stays `None` all cycle.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_orders(mode="paper") == []
+    assert result.enter_results, "the signal still fires; it must just not be filled"
+    assert not any(r.placed for r in result.enter_results)
+
+
+# -- monthly contribution: calendar-month rollover (P4 Task 7) ------------------
+
+
+def test_paper_monthly_contribution_applied_once_per_month(repo):
+    """A configured `monthly_contribution_usd` deposits once per UTC calendar month -- applied
+    the cycle the month is first seen, not re-applied on a later cycle in the SAME month, and
+    applied again once the calendar rolls into the next month."""
+    # JAN15/JAN20 share a UTC month_start; FEB03 is the next calendar month (see
+    # `guards._utc_month_bounds`).
+    JAN15 = 1_705_320_000
+    JAN20 = 1_705_752_000
+    FEB03 = 1_706_961_600
+
+    # `_NullBalanceBroker` (no readable account) forces the paper seed onto the config
+    # fallback, so `paper_cash_usdc` starts deterministic and non-`None`.
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(
+        paper=PaperConfig(
+            starting_equity_usd=Decimal("10000"),
+            monthly_contribution_usd=Decimal("500"),
+        )
+    )
+
+    # Cycle 1 (JAN15): first-ever cycle seeds the account AND applies month 1's contribution.
+    run_once(broker, repo, cfg, now_ts=JAN15)
+    cash_after_first = repo.get_state("paper_cash_usdc")
+    assert cash_after_first == Decimal("10000") + Decimal("500")
+    assert repo.get_state("paper_last_contribution_month") == 1_704_067_200
+
+    # Cycle 2 (JAN20): same calendar month -- no second contribution.
+    run_once(broker, repo, cfg, now_ts=JAN20)
+    assert repo.get_state("paper_cash_usdc") == cash_after_first
+
+    # Cycle 3 (FEB03): calendar rolled over -- contribution applies again.
+    before = repo.get_state("paper_cash_usdc")
+    run_once(broker, repo, cfg, now_ts=FEB03)
+    assert repo.get_state("paper_cash_usdc") >= before + Decimal("500") - Decimal("1")
+    assert repo.get_state("paper_last_contribution_month") == 1_706_745_600
+
+
+def test_paper_monthly_contribution_disabled_by_default(repo):
+    """`monthly_contribution_usd` defaults to 0 -- no deposit, no state key written."""
+    broker = _NullBalanceBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=1_705_320_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+    assert repo.get_state("paper_last_contribution_month") is None
+
+
+# -- Rail 11 end-to-end in paper: a REAL drawdown driven through run_once (P4 Task 8) -----------
+
+
+def test_paper_full_loop_drawdown_halt_vetoes_subsequent_buys(repo, monkeypatch):
+    """The headline acceptance test: drive a genuine drawdown through `run_once` -- not inject
+    the scalar directly -- and prove Rail 11 vetoes the very next paper entry attempt.
+
+    Cycle 1 opens a paper position and marks it at its entry price, seeding the high-water mark.
+    Cycle 2 feeds a catastrophic mark-down for the SAME product; `paper_trader.equity(...)`
+    craters and `update_drawdown` writes `drawdown_total_pct` far past the 20% ceiling -- both
+    via the REAL `run_once` loop, not injected. A fresh paper entry attempt against that
+    loop-produced state is then run through `agent._paper_enter` -- the exact function `run_once`
+    itself calls for every paper ENTER signal -- and must come back vetoed by
+    `account_dd_breaker_total`, proving the scalar Tasks 5/6 wired up is the one Rail 11 actually
+    reads, end-to-end.
+
+    (Deliberately does NOT rely on `engine.evaluate` re-firing `_AlwaysEnterRule` in cycle 2 to
+    produce that attempt: with only two candles on record, `engine`'s own, unrelated
+    choppy-regime gate has too few swing pivots to ever call the window tradeable, and rejecting
+    on THAT gate would prove nothing about rail 11. `_paper_enter` is the real production
+    function `run_once` calls once a signal clears the engine, so driving it directly here still
+    exercises the genuine wiring under test.)
+    """
+    from keel.strategy.paper import PaperTrader
+
+    # A rule registered for PRODUCT is still needed so `run_once` includes it in `products` and
+    # therefore in `latest_price_by_product` -- without that, the loop would never learn day 1's
+    # crashed price and would mark the position at cost basis instead.
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    # Seed the synthetic account and open a large paper position directly, BEFORE any cycle runs
+    # -- the brief's licensed shortcut: prove the SCALAR advances and Rail 11 acts on it through
+    # the real loop, without needing realistic sizing to get a position open in the first place.
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+    entry_signal = _paper_enter_signal(
+        product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"), ts=0
+    )
+    trader.on_signal(entry_signal, qty=Decimal("90"))  # ~90% of the seeded $10k cash
+
+    broker = _MarketDataOnlyBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): [
+                _candle(0, "100"),  # day 0: the price the position was opened at
+                # day 1: a catastrophic mark-down. Realistic sizing/market moves would need a
+                # much bigger position to cross 20%; a large adverse move is the brief's other
+                # licensed shortcut for proving the scalar without modeling a realistic market.
+                _candle(86_400, "1"),
+            ]
+        }
+    )
+
+    # Cycle 1 (now_ts inside day 1 -> day 0's candle is the latest CLOSED): equity marks the
+    # position at its entry price, seeding the high-water mark at a real, non-zero equity.
+    run_once(broker, repo, cfg, now_ts=90_000)
+    hwm_before = repo.get_state("equity_high_water_mark")
+    assert hwm_before is not None and hwm_before > Decimal("9000")
+    assert repo.get_state("drawdown_total_pct") == Decimal("0")
+
+    # Cycle 2 (now_ts inside day 2 -> day 1's candle is now the latest closed): the position
+    # marks down to $1/unit, crashing equity far below the high-water mark.
+    now_ts_2 = 86_400 + 90_000
+    run_once(broker, repo, cfg, now_ts=now_ts_2)
+
+    dd_total = repo.get_state("drawdown_total_pct")
+    assert dd_total is not None and dd_total > Decimal("0.20"), (
+        f"expected the REAL loop to drive drawdown_total_pct past the 20% ceiling, got "
+        f"{dd_total} (hwm was {hwm_before})"
+    )
+
+    # A subsequent paper ENTER attempt, run through the real `_paper_enter` against the state the
+    # loop just produced, must come back vetoed by rail 11 -- not filled.
+    post_crash_trader = PaperTrader(repo)
+    post_crash_equity = post_crash_trader.equity({PRODUCT: Decimal("1")})
+    next_signal = _paper_enter_signal(
+        product_id=PRODUCT,
+        entry=Decimal("1"),
+        stop=Decimal("0.5"),
+        target=Decimal("2"),
+        ts=now_ts_2 + 1,
+    )
+
+    entry_result = agent._paper_enter(
+        post_crash_trader, next_signal, repo, cfg, now_ts=now_ts_2, paper_equity=post_crash_equity
+    )
+
+    assert entry_result.placed is False
+    assert any("account_dd_breaker_total" in v for v in entry_result.vetoed_by), (
+        entry_result.vetoed_by
+    )
+    assert len(repo.get_orders(mode="paper", product_id=PRODUCT)) == 1, (
+        "no new paper order should have been filled once the breaker tripped"
+    )
+
+
+def test_run_once_vetoes_a_paper_entry_through_the_real_loop_when_drawdown_breaker_is_tripped(
+    repo, monkeypatch
+):
+    """Loop-level companion to the acceptance test above: that test drives the drawdown scalar
+    through a real `run_once` cycle, but asserts the veto via a DIRECT `agent._paper_enter(...)`
+    call -- so the within-cycle ordering (drawdown refreshed BEFORE the entry loop, by the SAME
+    `run_once` invocation that then evaluates the entry) is never executed end-to-end.
+
+    This drives a genuine ENTER signal (`_AlwaysEnterRule`, same as the other loop-level paper
+    tests) through `run_once` itself, against a cycle where rail 11's scalar is already tripped,
+    and asserts the resulting `LoopResult.enter_results` shows the veto -- proving the breaker
+    fires through the REAL loop entry path, not just a direct `_paper_enter` call.
+    """
+    from keel.strategy.paper import PaperTrader
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    # Already-seeded paper account (no open position), in "paper" equity-state mode.
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+
+    NOW = 90_000
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", NOW)
+    # Pre-set a high-water mark far above the seeded cash: with no open position, this
+    # cycle's equity is just the $10k cash, so `update_drawdown` (called by `run_once`
+    # itself, before the entry loop) recomputes `drawdown_total_pct` to 0.5 -- well past
+    # the 0.20 ceiling -- from THIS state, through the real loop, not injected directly.
+    repo.set_state("equity_high_water_mark", Decimal("20000"))
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, cfg, now_ts=NOW)
+
+    dd_total = repo.get_state("drawdown_total_pct")
+    assert dd_total is not None and dd_total > Decimal("0.20"), (
+        f"expected the real loop to compute drawdown past the ceiling, got {dd_total}"
+    )
+    assert result.enter_signals, "the rule still fires a signal; it must just be vetoed"
+    assert any(not r.placed for r in result.enter_results)
+    assert any(
+        "account_dd_breaker_total" in v for r in result.enter_results for v in r.vetoed_by
+    ), [r.vetoed_by for r in result.enter_results]
+    assert repo.get_orders(mode="paper") == [], (
+        "no paper BUY order should be written once the breaker tripped, through the real loop"
+    )
 
 
 # -- interactive confirm: run_once threads confirm_fn to placement --------------

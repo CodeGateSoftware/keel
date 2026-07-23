@@ -24,13 +24,18 @@ produces, so paper and historical stats are directly comparable.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
+
+from keel_core.telemetry import log_event
 
 from keel.data.repository import Repository
 from keel.strategy.rules.base import Action, Setup, Signal, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Side
+
+logger = logging.getLogger(__name__)
 
 # Position sizing (money management) is out of scope here, same as backtest.py:
 # every paper trade uses a fixed 1-unit notional, sufficient for win-rate/
@@ -48,8 +53,20 @@ class _OpenPaperPosition:
     entry_order_id: int
     entry_fill: Decimal
     entry_ts: int
+    qty: Decimal = _QTY
     mfe: Decimal = Decimal(0)
     mae: Decimal = Decimal(0)
+    costed: bool = False
+    """Whether this position's entry was debited against synthetic cash.
+
+    Cash can be seeded (`seed_cash`) at any time relative to a position's open, so the
+    "is cash seeded?" check at entry and at exit can disagree for the SAME position (opened
+    while unseeded, then seeded before it closes). Without this flag, `_close` would credit
+    an exit that was never debited, and `equity()` would mark a position on top of cash that
+    never paid for it -- both manufacture equity out of nothing. Recording, at open time,
+    whether a debit actually happened keeps the close-side credit and the equity mark
+    correct-by-construction regardless of seed timing.
+    """
 
 
 def _touches(candle: Candle, price: Decimal) -> bool:
@@ -74,7 +91,10 @@ class PaperTrader:
         self._fee_pct = fee_pct
         self._slippage_pct = slippage_pct
         self._open: dict[str, _OpenPaperPosition] = {}
+        self._ledger_start_ts = self._repo.get_state("paper_ledger_start_ts")
+        self._ledger_start_order_id = self._repo.get_state("paper_ledger_start_order_id")
         self._load_open_positions()
+        self._cash = self._repo.get_state("paper_cash_usdc")
 
     def _load_open_positions(self) -> None:
         """Rebuild open paper positions from the orders table.
@@ -88,6 +108,14 @@ class PaperTrader:
 
         Pairing is exact rather than heuristic: every exit payload carries the
         `entry_order_id` it closed, so an entry whose id never appears in an exit is open.
+
+        The epoch cutoff below is ID-based, not timestamp-based: an order's `ts` comes
+        from BAR/candle time (always at or before wall-clock `now_ts`, since the latest
+        closed bar can't be in the future), while `paper_ledger_start_order_id` is
+        stamped once, at `seed_cash` time, off the max paper order id then on record.
+        Autoincrement ids cleanly separate legacy/pre-seed orders from genuinely new ones
+        regardless of bar time -- a ts-based cutoff would wrongly drop a position opened
+        off an earlier bar during the very seeding cycle.
         """
         orders = self._repo.get_orders(mode="paper")
         closed_entry_ids: set[int] = set()
@@ -98,6 +126,12 @@ class PaperTrader:
                 payload = json.loads(order.get("raw_response") or "{}")
             except (TypeError, ValueError):
                 continue
+            if self._ledger_start_order_id is not None:
+                if int(order["id"]) <= self._ledger_start_order_id:
+                    # Pre-epoch legacy order (written before this synthetic account's
+                    # seed) -- never rehydrate it, so a legacy 1-unit paper position
+                    # can't silently reappear in the synthetic ledger.
+                    continue
             if payload.get("role") == "exit":
                 entry_id = payload.get("entry_order_id")
                 if entry_id is not None:
@@ -125,12 +159,67 @@ class PaperTrader:
                 entry_order_id=order_id,
                 entry_fill=Decimal(payload["entry"]),
                 entry_ts=setup.ts,
+                qty=Decimal(payload["qty"]),
+                # A surviving (non-filtered) order is always post-epoch: the cutoff above
+                # already dropped anything with id <= `paper_ledger_start_order_id`, and
+                # that id is only ever stamped by `seed_cash` -- so every rehydrated
+                # position was opened while cash was seeded, and was costed at the time.
+                costed=True,
             )
 
     def has_open_position(self, product_id: str) -> bool:
         return product_id in self._open
 
-    def on_signal(self, signal: Signal, candle: Candle | None = None) -> int | None:
+    def get_cash(self) -> Decimal | None:
+        return self._cash
+
+    def seed_cash(self, amount: Decimal, now_ts: int) -> None:
+        """Set the synthetic cash balance, opting this repo into the funding check.
+
+        Also stamps `paper_ledger_start_order_id` the first time it's called (never
+        overwritten after) -- the ID-based epoch cutoff `_load_open_positions` uses to
+        ignore legacy pre-epoch orders written before the synthetic account existed.
+        ID-based rather than `now_ts`-based: `now_ts` is wall-clock time, but an order's
+        own `ts` comes from bar/candle time, which always predates wall-clock `now_ts` --
+        a ts cutoff would wrongly drop a position opened off an earlier bar during the
+        very cycle that seeded the account. `paper_ledger_start_ts` is still stamped too
+        (harmless, kept for any external readers) but no longer drives the cutoff.
+        """
+        self._cash = amount
+        self._repo.set_state("paper_cash_usdc", amount)
+        if self._repo.get_state("paper_ledger_start_ts") is None:
+            self._ledger_start_ts = now_ts
+            self._repo.set_state("paper_ledger_start_ts", now_ts)
+        if self._repo.get_state("paper_ledger_start_order_id") is None:
+            start_id = max((o["id"] for o in self._repo.get_orders(mode="paper")), default=0)
+            self._ledger_start_order_id = start_id
+            self._repo.set_state("paper_ledger_start_order_id", start_id)
+
+    def deposit(self, amount: Decimal) -> None:
+        if self._cash is None:
+            return
+        self._cash += amount
+        self._repo.set_state("paper_cash_usdc", self._cash)
+
+    def equity(self, price_by_product: dict[str, Decimal]) -> Decimal | None:
+        """Mark-to-market equity: synthetic cash plus costed open paper positions.
+
+        `None` iff cash is unseeded -- there is no synthetic account to mark yet. An open
+        position that was never debited against cash (`costed=False`, opened before cash was
+        seeded) is excluded -- marking it would inflate equity with a position nothing paid
+        for.
+        """
+        if self._cash is None:
+            return None
+        from keel.execution.equity import mark_positions
+
+        product_ids = [p for p in self._open if self._open[p].costed]
+        positions = [(self._open[p].qty, self._open[p].entry_fill) for p in product_ids]
+        return mark_positions(self._cash, positions, price_by_product, product_ids)
+
+    def on_signal(
+        self, signal: Signal, candle: Candle | None = None, qty: Decimal = _QTY
+    ) -> int | None:
         """Apply one `Signal`, writing a paper order if it results in a fill.
 
         ENTER: opens a paper position for `signal.product_id` and immediately writes
@@ -144,7 +233,7 @@ class PaperTrader:
         Returns the written order's id, or `None` if nothing was written.
         """
         if signal.action == Action.ENTER:
-            return self._enter(signal)
+            return self._enter(signal, qty)
         if signal.action == Action.EXIT:
             if candle is None:
                 return None
@@ -179,20 +268,41 @@ class PaperTrader:
 
         return self._close(position, exit_price, candle.ts)
 
-    def _enter(self, signal: Signal) -> int | None:
+    def _enter(self, signal: Signal, qty: Decimal = _QTY) -> int | None:
         if signal.setup is None or signal.product_id in self._open:
             return None
 
         setup = signal.setup
         entry_fill = setup.entry * (Decimal(1) + self._slippage_pct)
-        fee = entry_fill * _QTY * self._fee_pct
+        fee = entry_fill * qty * self._fee_pct
+
+        costed = self._cash is not None
+        if costed:
+            # Gate on the ACTUAL debit (fill + slippage + fee), not the coarser intent
+            # notional (entry * qty) -- gating on notional alone would let cash go
+            # negative for any seed strictly between the two, defeating the check's
+            # purpose (spec Sec. 4.2: keep cash from going negative).
+            fill_cost = entry_fill * qty + fee
+            if self._cash < fill_cost:
+                # Paper-path guard only -- a rejection here just means no synthetic
+                # fill; it never touches guards.py's live-order checks.
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "paper.funding_skip",
+                    product_id=signal.product_id,
+                    cash=str(self._cash),
+                    fill_cost=str(fill_cost),
+                )
+                return None
+
         payload = {
             "role": "entry",
             "rule_name": signal.rule_name,
             "entry": str(entry_fill),
             "stop": str(setup.stop),
             "target": str(setup.target),
-            "qty": str(_QTY),
+            "qty": str(qty),
             "ts": setup.ts,
         }
         order_id = self._repo.insert_order(
@@ -201,7 +311,7 @@ class PaperTrader:
                 "product_id": signal.product_id,
                 "side": Side.BUY.value,
                 "order_type": "market",
-                "qty": _QTY,
+                "qty": qty,
                 "limit_price": setup.entry,
                 "status": "filled",
                 "fee": fee,
@@ -221,7 +331,12 @@ class PaperTrader:
             entry_order_id=order_id,
             entry_fill=entry_fill,
             entry_ts=setup.ts,
+            qty=qty,
+            costed=costed,
         )
+        if costed:
+            self._cash -= entry_fill * qty + fee
+            self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id
 
     def _exit_on_signal(self, signal: Signal, candle: Candle) -> int | None:
@@ -234,11 +349,11 @@ class PaperTrader:
 
     def _close(self, position: _OpenPaperPosition, exit_price: Decimal, exit_ts: int) -> int:
         exit_fill = exit_price * (Decimal(1) - self._slippage_pct)
-        entry_fee = position.entry_fill * _QTY * self._fee_pct
-        exit_fee = exit_fill * _QTY * self._fee_pct
-        pnl = (exit_fill - position.entry_fill) * _QTY - entry_fee - exit_fee
+        entry_fee = position.entry_fill * position.qty * self._fee_pct
+        exit_fee = exit_fill * position.qty * self._fee_pct
+        pnl = (exit_fill - position.entry_fill) * position.qty - entry_fee - exit_fee
 
-        risk = (position.entry_fill - position.setup.stop) * _QTY
+        risk = (position.entry_fill - position.setup.stop) * position.qty
         r_multiple = pnl / risk if risk != 0 else None
 
         if pnl > 0:
@@ -254,7 +369,7 @@ class PaperTrader:
             "entry_order_id": position.entry_order_id,
             "entry": str(position.entry_fill),
             "exit": str(exit_fill),
-            "qty": str(_QTY),
+            "qty": str(position.qty),
             "pnl": str(pnl),
             "r_multiple": str(r_multiple) if r_multiple is not None else None,
             "mfe": str(position.mfe),
@@ -269,7 +384,7 @@ class PaperTrader:
                 "product_id": position.product_id,
                 "side": Side.SELL.value,
                 "order_type": "market",
-                "qty": _QTY,
+                "qty": position.qty,
                 "limit_price": exit_price,
                 "status": "filled",
                 "fee": exit_fee,
@@ -283,6 +398,9 @@ class PaperTrader:
             }
         )
         del self._open[position.product_id]
+        if position.costed and self._cash is not None:
+            self._cash += exit_fill * position.qty - exit_fee
+            self._repo.set_state("paper_cash_usdc", self._cash)
         return order_id
 
 
