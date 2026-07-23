@@ -636,6 +636,32 @@ def test_run_once_skips_the_drawdown_update_when_the_quote_balance_is_unreadable
     assert repo.get_state("drawdown_total_pct") is None
 
 
+def test_paper_to_live_flip_clears_stale_scalars_even_when_broker_unreadable(
+    repo: Repository,
+) -> None:
+    """Pre-live-arming fix: a paper->live flip whose FIRST live cycle reads an unreadable broker
+    must still clear the stale paper drawdown scalars, not let them survive a cycle. Regression
+    for the asymmetric live-side mode clear (was gated inside the equity-readable branch)."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("equity_high_water_mark", Decimal("999999"))
+    repo.set_state("drawdown_total_pct", Decimal("0.9"))
+    repo.set_state("drawdown_weekly_pct", Decimal("0.5"))
+
+    class _BrokenAccountsBroker(FakeBroker):
+        def get_accounts(self) -> list[dict[str, Any]]:
+            raise RuntimeError("broker down")
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = _BrokenAccountsBroker(series=series)
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_state("equity_state_mode") == "live"
+    assert repo.get_state("equity_high_water_mark") is None
+    assert repo.get_state("drawdown_total_pct") == Decimal("0")
+    assert repo.get_state("drawdown_weekly_pct") == Decimal("0")
+
+
 def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) -> None:
     """Pins the VALUE, not just the presence, of the scalars.
 
