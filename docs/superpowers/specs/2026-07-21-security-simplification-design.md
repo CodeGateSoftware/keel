@@ -209,7 +209,7 @@ It is rewritten here against the real flow: `.env` → `keel migrate`/`init` →
 | `config.yaml`, `keel/templates/config.yaml`, `keel/templates/config.live.yaml` | drop `bypass_arm_ttl_sec` + its comment (root and dev template must stay byte-identical) |
 | `tests/fixtures/config_golden_*.{json,yaml}` | drop `bypass_arm_ttl_sec` |
 | `docs/go-live-runbook.md` | written fresh (supersedes #116) |
-| `docs/superpowers/specs/...-halal-cb-autotrade-design.md` | §14 amended to record the removal and why |
+| `docs/superpowers/specs/2026-07-15-keel-autotrade-design.md` | §14 amended to record the removal and why |
 
 ## Testing
 
