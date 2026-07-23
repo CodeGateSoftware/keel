@@ -141,6 +141,12 @@ R-multiple, expectancy sign) are size-invariant, so the promotion gate is undist
 - Surface paper equity and current total/weekly drawdown in the agent's INFO logging and in
   `keel status`, so a paper-forward is observable.
 
+> **Implementation note (2026-07-23):** `keel status` did not exist in the codebase. Observability
+> was delivered instead via three optional `LoopResult` fields (`paper_equity`,
+> `drawdown_total_pct`, `drawdown_weekly_pct`), printed by `cli._print_loop_result` and emitted as
+> an `agent.paper_equity` INFO log event each paper cycle. A dedicated `keel status` command is
+> deferred as a follow-up.
+
 ## 5. Configuration
 - `paper_starting_equity_usd` (new): fallback seed when the one-time real-equity read fails (§4.1/D2).
 - Monthly contribution during paper-forward: applied via §4.1's `deposit`-rebase **once per calendar
