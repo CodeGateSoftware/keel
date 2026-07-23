@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from sizing_strategies import (
     cppi_fraction,
     drawdown_adjusted_kelly,
@@ -13,7 +12,6 @@ from sizing_strategies import (
     merton_fraction,
     naive_flat_fraction,
 )
-
 
 # --- kelly_fraction ----------------------------------------------------------------------------
 
