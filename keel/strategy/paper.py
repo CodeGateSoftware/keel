@@ -92,6 +92,7 @@ class PaperTrader:
         self._slippage_pct = slippage_pct
         self._open: dict[str, _OpenPaperPosition] = {}
         self._ledger_start_ts = self._repo.get_state("paper_ledger_start_ts")
+        self._ledger_start_order_id = self._repo.get_state("paper_ledger_start_order_id")
         self._load_open_positions()
         self._cash = self._repo.get_state("paper_cash_usdc")
 
@@ -107,6 +108,14 @@ class PaperTrader:
 
         Pairing is exact rather than heuristic: every exit payload carries the
         `entry_order_id` it closed, so an entry whose id never appears in an exit is open.
+
+        The epoch cutoff below is ID-based, not timestamp-based: an order's `ts` comes
+        from BAR/candle time (always at or before wall-clock `now_ts`, since the latest
+        closed bar can't be in the future), while `paper_ledger_start_order_id` is
+        stamped once, at `seed_cash` time, off the max paper order id then on record.
+        Autoincrement ids cleanly separate legacy/pre-seed orders from genuinely new ones
+        regardless of bar time -- a ts-based cutoff would wrongly drop a position opened
+        off an earlier bar during the very seeding cycle.
         """
         orders = self._repo.get_orders(mode="paper")
         closed_entry_ids: set[int] = set()
@@ -117,12 +126,11 @@ class PaperTrader:
                 payload = json.loads(order.get("raw_response") or "{}")
             except (TypeError, ValueError):
                 continue
-            if self._ledger_start_ts is not None:
-                order_ts = payload.get("ts") or order.get("created_at") or 0
-                if int(order_ts) < self._ledger_start_ts:
-                    # Pre-epoch legacy order (predates this synthetic account's seed
-                    # timestamp) -- never rehydrate it, so a legacy 1-unit paper
-                    # position can't silently reappear in the synthetic ledger.
+            if self._ledger_start_order_id is not None:
+                if int(order["id"]) <= self._ledger_start_order_id:
+                    # Pre-epoch legacy order (written before this synthetic account's
+                    # seed) -- never rehydrate it, so a legacy 1-unit paper position
+                    # can't silently reappear in the synthetic ledger.
                     continue
             if payload.get("role") == "exit":
                 entry_id = payload.get("entry_order_id")
@@ -153,9 +161,9 @@ class PaperTrader:
                 entry_ts=setup.ts,
                 qty=Decimal(payload["qty"]),
                 # A surviving (non-filtered) order is always post-epoch: the cutoff above
-                # already dropped anything predating `paper_ledger_start_ts`, and that
-                # timestamp is only ever set by `seed_cash` -- so every rehydrated position
-                # was opened while cash was seeded, and was costed at the time.
+                # already dropped anything with id <= `paper_ledger_start_order_id`, and
+                # that id is only ever stamped by `seed_cash` -- so every rehydrated
+                # position was opened while cash was seeded, and was costed at the time.
                 costed=True,
             )
 
@@ -168,15 +176,24 @@ class PaperTrader:
     def seed_cash(self, amount: Decimal, now_ts: int) -> None:
         """Set the synthetic cash balance, opting this repo into the funding check.
 
-        Also stamps `paper_ledger_start_ts` the first time it's called (never overwritten
-        after) -- the epoch cutoff `_load_open_positions` uses to ignore legacy pre-epoch
-        orders written before the synthetic account existed.
+        Also stamps `paper_ledger_start_order_id` the first time it's called (never
+        overwritten after) -- the ID-based epoch cutoff `_load_open_positions` uses to
+        ignore legacy pre-epoch orders written before the synthetic account existed.
+        ID-based rather than `now_ts`-based: `now_ts` is wall-clock time, but an order's
+        own `ts` comes from bar/candle time, which always predates wall-clock `now_ts` --
+        a ts cutoff would wrongly drop a position opened off an earlier bar during the
+        very cycle that seeded the account. `paper_ledger_start_ts` is still stamped too
+        (harmless, kept for any external readers) but no longer drives the cutoff.
         """
         self._cash = amount
         self._repo.set_state("paper_cash_usdc", amount)
         if self._repo.get_state("paper_ledger_start_ts") is None:
             self._ledger_start_ts = now_ts
             self._repo.set_state("paper_ledger_start_ts", now_ts)
+        if self._repo.get_state("paper_ledger_start_order_id") is None:
+            start_id = max((o["id"] for o in self._repo.get_orders(mode="paper")), default=0)
+            self._ledger_start_order_id = start_id
+            self._repo.set_state("paper_ledger_start_order_id", start_id)
 
     def deposit(self, amount: Decimal) -> None:
         if self._cash is None:

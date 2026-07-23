@@ -1403,6 +1403,56 @@ def test_paper_full_loop_drawdown_halt_vetoes_subsequent_buys(repo, monkeypatch)
     )
 
 
+def test_run_once_vetoes_a_paper_entry_through_the_real_loop_when_drawdown_breaker_is_tripped(
+    repo, monkeypatch
+):
+    """Loop-level companion to the acceptance test above: that test drives the drawdown scalar
+    through a real `run_once` cycle, but asserts the veto via a DIRECT `agent._paper_enter(...)`
+    call -- so the within-cycle ordering (drawdown refreshed BEFORE the entry loop, by the SAME
+    `run_once` invocation that then evaluates the entry) is never executed end-to-end.
+
+    This drives a genuine ENTER signal (`_AlwaysEnterRule`, same as the other loop-level paper
+    tests) through `run_once` itself, against a cycle where rail 11's scalar is already tripped,
+    and asserts the resulting `LoopResult.enter_results` shows the veto -- proving the breaker
+    fires through the REAL loop entry path, not just a direct `_paper_enter` call.
+    """
+    from keel.strategy.paper import PaperTrader
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    # Already-seeded paper account (no open position), in "paper" equity-state mode.
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+
+    NOW = 90_000
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", NOW)
+    # Pre-set a high-water mark far above the seeded cash: with no open position, this
+    # cycle's equity is just the $10k cash, so `update_drawdown` (called by `run_once`
+    # itself, before the entry loop) recomputes `drawdown_total_pct` to 0.5 -- well past
+    # the 0.20 ceiling -- from THIS state, through the real loop, not injected directly.
+    repo.set_state("equity_high_water_mark", Decimal("20000"))
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, cfg, now_ts=NOW)
+
+    dd_total = repo.get_state("drawdown_total_pct")
+    assert dd_total is not None and dd_total > Decimal("0.20"), (
+        f"expected the real loop to compute drawdown past the ceiling, got {dd_total}"
+    )
+    assert result.enter_signals, "the rule still fires a signal; it must just be vetoed"
+    assert any(not r.placed for r in result.enter_results)
+    assert any(
+        "account_dd_breaker_total" in v for r in result.enter_results for v in r.vetoed_by
+    ), [r.vetoed_by for r in result.enter_results]
+    assert repo.get_orders(mode="paper") == [], (
+        "no paper BUY order should be written once the breaker tripped, through the real loop"
+    )
+
+
 # -- interactive confirm: run_once threads confirm_fn to placement --------------
 
 

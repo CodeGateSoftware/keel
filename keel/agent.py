@@ -446,7 +446,9 @@ def _paper_enter(
 
     order_id = trader.on_signal(signal, qty=intent.qty)
     if order_id is None:
-        return _result(False, reason="paper: no fill (position already open)")
+        return _result(
+            False, reason="paper: no fill (position open or insufficient synthetic cash)"
+        )
     return _result(
         True,
         order_id=order_id,
@@ -787,6 +789,13 @@ def run_once(
             # The symmetric live-side mode stamp/clear -- only right before a REAL update, so an
             # unreadable broker (equity_now is None, handled above) never gets to zero out the
             # previous cycle's scalars on the strength of a stamp alone.
+            # TODO(pre-live-arming): asymmetric with the paper-side clear above -- this guards on
+            # `!= "live"` (fires unless already live) rather than `== "paper"` (fires only on an
+            # actual paper->live flip). On a paper->live flip whose first live cycle reads an
+            # unreadable broker, `equity_now` is None, this whole branch is skipped, and stale
+            # paper drawdown scalars survive one extra cycle before self-healing on the next
+            # readable cycle. Fix before arming live execution: gate this clear on `== "paper"`
+            # and hoist it above the broker-equity read so it fires unconditionally on the flip.
             if paper_trader is None and repo.get_state("equity_state_mode") != "live":
                 repo.set_state("equity_high_water_mark", None)
                 repo.set_state("drawdown_total_pct", Decimal("0"))

@@ -456,6 +456,58 @@ def test_pre_epoch_orders_are_skipped_on_rehydration(repo):
     assert resumed.has_open_position("BTC-USD") is False
 
 
+def test_first_cycle_position_survives_rehydration_despite_bar_ts_before_seed_wallclock(repo):
+    """The epoch cutoff must be ID-based, not wall-clock-ts-based.
+
+    `seed_cash`'s `now_ts` is the WALL CLOCK at seed time; an order's `ts` comes from
+    candle/bar time, which always predates wall-clock `now_ts` (the latest CLOSED bar is
+    never in the future). A position opened off an earlier bar during the very seeding
+    cycle must still rehydrate on the NEXT cycle's fresh `PaperTrader` -- a ts-based
+    cutoff would wrongly treat it as pre-epoch and silently drop it (phantom drawdown,
+    orphaned position, double-exposure on re-entry) even though it was written AFTER the
+    seed, by order id.
+    """
+    trader = PaperTrader(repo)
+    now_ts = 1_700_000_000  # realistic wall-clock seed time
+    trader.seed_cash(Decimal("30000"), now_ts=now_ts)
+
+    # Opened the SAME cycle, off a bar whose ts is far EARLIER than the seed wall-clock.
+    bar_ts = 1_699_000_000
+    assert bar_ts < now_ts
+    sig = _enter_signal(setup=_setup(entry="100", stop="90", target="130", ts=bar_ts), ts=bar_ts)
+    trader.on_signal(sig)
+    assert trader.has_open_position("BTC-USD")
+    cash_after_entry = trader.get_cash()
+
+    # Next cycle: a FRESH PaperTrader, exactly like `agent.run_once` reconstructing it.
+    resumed = PaperTrader(repo)
+
+    assert resumed.has_open_position("BTC-USD"), (
+        "the position opened during the seeding cycle must survive rehydration"
+    )
+    assert resumed.get_cash() == cash_after_entry
+    equity = resumed.equity({"BTC-USD": Decimal("120")})
+    assert equity is not None
+    assert equity == cash_after_entry + Decimal("120")  # qty=1 -- position value included
+
+
+def test_pre_seed_order_still_excluded_by_id_based_epoch(repo):
+    """The legacy case the epoch exists for: an order written strictly BEFORE `seed_cash`
+    (its id is at or below the id recorded as the seed epoch) must still be excluded on
+    rehydration, even though the ID-based cutoff replaces the old ts-based one.
+    """
+    legacy = PaperTrader(repo)
+    legacy.on_signal(_enter_signal(ts=1_000))  # unseeded -- written before any seed
+    assert legacy.has_open_position("BTC-USD")
+
+    legacy.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+    start_id = repo.get_state("paper_ledger_start_order_id")
+    assert start_id is not None
+
+    resumed = PaperTrader(repo)
+    assert resumed.has_open_position("BTC-USD") is False
+
+
 def test_position_opened_before_seeding_is_never_costed(repo):
     """A position opened while cash is unseeded, later seeded mid-flight, must not
     desync the ledger: no debit happened at open, so no credit may happen at close,
