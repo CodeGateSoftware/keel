@@ -71,6 +71,10 @@ dca:
   budget_usd: 50
   cadence_days: 7
 
+paper:
+  starting_equity_usd: 0   # fallback seed only; primary seed is live mark-to-market equity
+  monthly_contribution_usd: 0   # ongoing deposits during a paper-forward; 0 disables
+
 # The settlement currency this deployment TRADES IN. It must match the quote leg of the
 # products you actually trade: everything here is `-USD` (see `_default_sim_products` /
 # `_history_product`), so this is USD. It is NOT used to decide which balance funds a given

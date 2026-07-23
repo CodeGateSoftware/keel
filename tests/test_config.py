@@ -492,3 +492,28 @@ def test_an_unknown_mode_names_the_offending_key(tmp_path):
     with pytest.raises(ConfigError) as exc:
         load_config(str(p))
     assert "wibble" in str(exc.value)
+
+
+# -- paper: PaperConfig (paper-mode fidelity: real-equity denominator seed) -----------------
+
+
+def test_paper_config_parsed_from_yaml(write_config):
+    cfg_text = (
+        VALID_CONFIG_YAML
+        + "\npaper:\n  starting_equity_usd: 30000\n  monthly_contribution_usd: 500\n"
+    )
+    cfg = load_config(write_config(cfg_text))
+    assert cfg.paper.starting_equity_usd == Decimal("30000")
+    assert cfg.paper.monthly_contribution_usd == Decimal("500")
+
+
+def test_paper_config_defaults_when_absent(valid_config_path):
+    cfg = load_config(valid_config_path)  # VALID_CONFIG_YAML has no paper: block
+    assert cfg.paper.starting_equity_usd == Decimal("0")
+    assert cfg.paper.monthly_contribution_usd == Decimal("0")
+
+
+def test_paper_config_rejects_negative(write_config):
+    cfg_text = VALID_CONFIG_YAML + "\npaper:\n  starting_equity_usd: -1\n"
+    with pytest.raises(ConfigError):
+        load_config(write_config(cfg_text))
