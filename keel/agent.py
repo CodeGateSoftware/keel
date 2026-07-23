@@ -620,6 +620,12 @@ class LoopResult:
     enter_signals: list[Signal] = field(default_factory=list)
     enter_results: list[ExecutionResult] = field(default_factory=list)
     exit_results: list[ExecutionResult] = field(default_factory=list)
+    # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
+    # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
+    # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
+    paper_equity: Decimal | None = None
+    drawdown_total_pct: Decimal | None = None
+    drawdown_weekly_pct: Decimal | None = None
 
 
 def _effective_mode(config: Config, repo: Repository, now_ts: int) -> str:
@@ -763,6 +769,12 @@ def run_once(
             equity_now = _mark_to_market_equity(
                 repo, broker, products, latest_price_by_product, config.quote_currency
             )
+        # Task 9: paper-forward observability -- the synthetic equity + drawdown scalars this
+        # cycle advanced, surfaced on `LoopResult` (`_print_loop_result` + this log line) instead
+        # of only living in repo state. `None` unless this is a paper cycle that read equity.
+        result_paper_equity: Decimal | None = None
+        result_drawdown_total_pct: Decimal | None = None
+        result_drawdown_weekly_pct: Decimal | None = None
         if equity_now is None:
             # Leave the previous cycle's scalars in place -- see `_mark_to_market_equity`.
             log_event(
@@ -782,6 +794,19 @@ def run_once(
                 repo.set_state("equity_history", [])
                 repo.set_state("equity_state_mode", "live")
             equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
+
+            if paper_trader is not None:
+                result_paper_equity = equity_now
+                result_drawdown_total_pct = repo.get_state("drawdown_total_pct")
+                result_drawdown_weekly_pct = repo.get_state("drawdown_weekly_pct")
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "agent.paper_equity",
+                    equity=str(equity_now),
+                    dd_total=str(result_drawdown_total_pct),
+                    dd_weekly=str(result_drawdown_weekly_pct),
+                )
 
         # `_paper_enter` sizes the fill off THIS cycle's synthetic equity -- reusing `equity_now`
         # computed above rather than re-deriving it, so the entry and the drawdown scalars it just
@@ -899,6 +924,9 @@ def run_once(
             enter_signals=enter_signals,
             enter_results=enter_results,
             exit_results=exit_results,
+            paper_equity=result_paper_equity,
+            drawdown_total_pct=result_drawdown_total_pct,
+            drawdown_weekly_pct=result_drawdown_weekly_pct,
         )
     finally:
         unbind_cycle(cycle_token)

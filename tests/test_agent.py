@@ -1133,6 +1133,23 @@ def test_mode_flip_clears_hwm(repo):
     assert repo.get_state("drawdown_total_pct") != Decimal("0.9")
 
 
+def test_loop_result_carries_paper_equity_and_drawdown(repo):
+    """Task 9: a paper cycle surfaces its synthetic equity + drawdown scalars on the returned
+    `LoopResult` -- the observability for a paper-forward (`_print_loop_result` + `log_event`),
+    not just a side effect buried in repo state."""
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("equity_high_water_mark", Decimal("10000"))
+    repo.set_state("paper_cash_usdc", Decimal("7000"))
+    repo.set_state("paper_ledger_start_ts", 0)
+    broker = FakeBroker()
+
+    result = run_once(broker, repo, _paper_config(), now_ts=90_000)
+
+    assert result.paper_equity == Decimal("7000")
+    assert result.drawdown_total_pct == Decimal("0.3")
+    assert result.drawdown_weekly_pct is not None
+
+
 def test_seed_falls_back_to_config_when_broker_read_none(repo):
     """First paper run, broker has no readable balance at all: seed from
     `config.paper.starting_equity_usd` instead of leaving the account dormant."""

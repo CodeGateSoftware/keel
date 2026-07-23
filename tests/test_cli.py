@@ -148,6 +148,30 @@ def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypat
     assert result.output.count("skipped: kill_switch") == 3
 
 
+def test_agent_prints_paper_equity_and_drawdown_line(tmp_path, write_config, monkeypatch):
+    """Task 9: `_print_loop_result` surfaces the synthetic paper equity + Rail 11's drawdown
+    scalars -- the observability for a paper-forward, not just a side effect buried in state."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    config_path = write_config(VALID_CONFIG_YAML + "\npaper:\n  starting_equity_usd: 10000\n")
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(config_path),
+            "agent",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "paper equity $10000" in result.output
+    assert "drawdown 0 total / 0 weekly" in result.output
+
 
 
 
