@@ -22,6 +22,7 @@ Two layers, mirroring `status.py`'s split:
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -336,6 +337,23 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         curses.wrapper(_loop)
     except KeyboardInterrupt:
         pass
+    except curses.error as exc:
+        # `curses.wrapper` can raise before the loop even runs -- e.g. `cbreak() returned ERR`
+        # when stdin/stdout is not a real, controlling terminal (a captured pipe, a harness that
+        # only fakes a TTY). The `_stdio_is_interactive` pre-check in `tui_cmd` catches the common
+        # case up front; this is the belt-and-braces for a TTY that passes `isatty()` yet still
+        # can't be put into cbreak mode. Turn the raw traceback into a clean, actionable message.
+        raise click.ClickException(
+            f"keel tui could not start a terminal UI ({exc}). It needs a real interactive "
+            "terminal; run it directly in one, or use `keel tui --once` for a one-shot snapshot."
+        ) from exc
+
+
+def _stdio_is_interactive() -> bool:
+    """True only when BOTH stdin and stdout are real TTYs -- curses needs to read keypresses AND
+    own the screen, so either one being a pipe/redirect means the full-screen loop cannot run.
+    Kept as its own function so tests can patch it (and so the check reads as one intent)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 # -- the command ----------------------------------------------------------------------------
@@ -383,5 +401,11 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
         click.echo("")
         click.echo(DISCLAIMER)
         return
+
+    if not _stdio_is_interactive():
+        raise click.ClickException(
+            "keel tui needs an interactive terminal (a real TTY on both stdin and stdout). "
+            "Run it directly in a terminal, or use `keel tui --once` for a one-shot snapshot."
+        )
 
     run_live(open_state, now_fn, interval)
