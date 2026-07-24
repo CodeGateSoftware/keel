@@ -1640,7 +1640,7 @@ cli.add_command(subscription_group)
 cli.add_command(status_cmd)
 
 
-# -- tui (live, read-only, full-screen operator dashboard, no broker call) -----------------------
+# -- tui (live, full-screen operator dashboard, with a help menu and a few gated actions) --------
 
 # `keel status` was built as the substrate for this: `tui_cmd` is a curses view over the same
 # `gather_status` report, defined in `keel.commands.tui` and registered here.
