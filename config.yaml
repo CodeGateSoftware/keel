@@ -72,7 +72,7 @@ dca:
   cadence_days: 7
 
 paper:
-  starting_equity_usd: 0   # fallback seed only; primary seed is live mark-to-market equity
+  starting_equity_usd: 0   # >0 = funded paper-forward override (seeds AT this amount); 0 = seed from real mark-to-market equity
   monthly_contribution_usd: 0   # ongoing deposits during a paper-forward; 0 disables
 
 # The settlement currency this deployment TRADES IN. It must match the quote leg of the

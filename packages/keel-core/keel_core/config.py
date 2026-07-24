@@ -133,10 +133,13 @@ class DcaConfig:
 class PaperConfig:
     """Paper-forward account model (spec: paper-mode fidelity).
 
-    `starting_equity_usd` is only a FALLBACK seed used when the one-time real-equity
-    read at paper-start fails; the primary seed is live mark-to-market equity. A value of
-    0 means "no fallback" -- if the broker read also fails, paper drawdown tracking stays
-    dormant that run (logged loudly) rather than seeding a bogus 0 denominator.
+    `starting_equity_usd` sets the one-time seed for `paper_cash_usdc` at paper-start:
+    - `> 0`: a deliberate FUNDING OVERRIDE -- seed at exactly this amount (a funded
+      paper-forward rehearsal), taking precedence over real broker mark-to-market equity, which
+      is not read for the seed in this case.
+    - `0` (the default): seed from real broker mark-to-market equity instead; if that read
+      fails, paper drawdown tracking stays dormant that run (logged loudly) rather than seeding
+      a bogus 0 denominator.
     `monthly_contribution_usd` models ongoing deposits during the paper-forward; 0 disables.
     """
 

@@ -355,8 +355,16 @@ def _seed_paper_account_if_needed(
 
     On a paper->live or live->paper flip, clear the shared HWM/history/drawdown scalars
     (same keys `keel reset-hwm` clears) before this cycle's update_drawdown, so a synthetic
-    HWM never poisons live equity (or vice versa). Seed `paper_cash_usdc` on first paper run
-    from real broker mark-to-market equity, falling back to `config.paper.starting_equity_usd`.
+    HWM never poisons live equity (or vice versa).
+
+    `paper_cash_usdc`'s seed amount on first paper run, by `config.paper.starting_equity_usd`:
+    - `starting_equity_usd > 0`: seed at THAT amount -- a deliberately-funded paper-forward
+      rehearsal. Real broker mark-to-market equity is NOT read for the seed in this case; the
+      funded amount is the source of truth, so a funded paper-forward can seed with no broker
+      equity read at all.
+    - `starting_equity_usd == 0` (the default): seed from real broker mark-to-market equity; if
+      that read fails, log `agent.paper_seed_unavailable` and leave the account unseeded this
+      cycle (no bogus 0 denominator).
     """
     if repo.get_state("equity_state_mode") != "paper":
         repo.set_state("equity_high_water_mark", None)
@@ -365,15 +373,16 @@ def _seed_paper_account_if_needed(
         repo.set_state("equity_history", [])
         repo.set_state("equity_state_mode", "paper")
     if paper_trader.get_cash() is None:
-        seed = _mark_to_market_equity(
-            repo, broker, products, price_by_product, config.quote_currency
-        )
-        if seed is None:
-            fallback = config.paper.starting_equity_usd
-            seed = fallback if fallback > 0 else None
-        if seed is None:
-            log_event(logger, logging.WARNING, "agent.paper_seed_unavailable")
-            return
+        funding = config.paper.starting_equity_usd
+        if funding > 0:
+            seed = funding
+        else:
+            seed = _mark_to_market_equity(
+                repo, broker, products, price_by_product, config.quote_currency
+            )
+            if seed is None:
+                log_event(logger, logging.WARNING, "agent.paper_seed_unavailable")
+                return
         paper_trader.seed_cash(seed, now_ts)
 
 
