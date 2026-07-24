@@ -875,16 +875,18 @@ def test_simulate_no_fetch_default_runs_full_tier_matrix(tmp_path, monkeypatch):
     assert "Over cap" in report_text
 
 
-# -- insights (stub) ----------------------------------------------------------------------------
+# -- insights (read-only promotion-gate + journal reporting; see tests/commands/test_insights.py)
+# ----------------------------------------------------------------------------------------------
 
 
-def test_insights_stub(tmp_path):
+def test_insights_is_a_group_with_summary_and_journal_subcommands(tmp_path):
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["insights"])
+    result = runner.invoke(cli, ["insights", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "not yet implemented" in result.output
+    assert "summary" in result.output
+    assert "journal" in result.output
 
 
 def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
