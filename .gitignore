@@ -33,3 +33,7 @@ keel/_build_info.py
 
 # operator's own working config (never the shipped template)
 config.local.yaml
+# operational paper-forward config (funded rehearsal; never the shipped template)
+config.paperforward.yaml
+paperforward-run.sh
+com.keel.paperforward.plist
