@@ -89,7 +89,7 @@ def _human_dt(ts: int) -> str:
 
 
 def _title_lines(report: StatusReport, now_ts: int) -> list[ScreenLine]:
-    return [ScreenLine(f"keel · {report.mode} mode · now={_human_dt(now_ts)}", "heading")]
+    return [ScreenLine(f"keel · {report.mode} mode · {_human_dt(now_ts)}", "heading")]
 
 
 def _kill_switch_lines(report: StatusReport) -> list[ScreenLine]:
