@@ -12,7 +12,8 @@ Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-swit
 `subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live),
 `status` (`commands.status`: the read-only, no-broker operator dashboard the paper-mode-fidelity
 spec deferred -- mode/kill-switch/autonomy/Rail 11/positions/rules/data freshness, plus `--json`),
-and a Phase-4 `insights` stub.
+and `insights summary|journal` (`commands.insights`: a read-only VIEW over the same substrate --
+per-rule promotion-gate distance and a filterable trade journal, also with `--json`).
 
 **Dangerous commands ask a human; nothing needs a stored secret.** The former scrypt passphrase
 gate is gone (see `2026-07-21-security-simplification-design.md`). Five commands re-permit trading
@@ -79,6 +80,7 @@ from keel.commands._common import (
 from keel.commands._products import _default_sim_products, _history_product
 from keel.commands.autonomy import autonomy_group
 from keel.commands.db import db_group
+from keel.commands.insights import insights_group
 from keel.commands.rules import rules_group, rules_seed
 from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
@@ -1647,6 +1649,13 @@ cli.add_command(status_cmd)
 cli.add_command(tui_cmd)
 
 
+# -- insights (read-only promotion-gate + journal reporting, no broker call) --------------------
+
+# A pure VIEW over `gather_status`/`StatusReport`, the repository read methods, and the
+# promotion/track-record machinery -- defined in `keel.commands.insights` and registered here.
+cli.add_command(insights_group)
+
+
 # -- kill / resume ------------------------------------------------------------------------------
 
 
@@ -1778,17 +1787,6 @@ def reset_hwm(ctx: click.Context) -> None:
     repo.set_state("drawdown_weekly_pct", Decimal("0"))
     repo.set_state("equity_history", [])
     click.echo("equity high-water mark reset: it will re-seed from the next cycle's equity.")
-
-
-# -- insights (Phase 4 stub) ---------------------------------------------------------------------
-
-
-@cli.command()
-@click.pass_context
-@with_disclaimer
-def insights(ctx: click.Context) -> None:
-    """Portfolio insights (Phase 4 -- not yet implemented)."""
-    click.echo("insights: not yet implemented (see Phase 4 of the roadmap).")
 
 
 if __name__ == "__main__":  # pragma: no cover
