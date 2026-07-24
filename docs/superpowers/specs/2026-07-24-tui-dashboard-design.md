@@ -178,3 +178,29 @@ scrolls rather than truncates.
 clamping/scrolling; `_footer_lines` hints; `toggle_autonomy` both directions × confirm True/False
 (fake repo); `_guarded` success + failure. The curses loop, `_confirm_arm_autonomy`, and the live
 network fetch closure stay thin I/O (smoke only).
+
+---
+
+## v3 — live "available to buy" balance (2026-07-24)
+
+Show how much of the settlement currency (`config.quote_currency`, e.g. USDC) is available in the
+real account to fund buys, refreshed periodically so deposits/sells/buys are reflected. This is a
+LIVE broker read (like `f` fetch, it crosses the no-network line — money-safe: `get_accounts` only).
+
+- Reuse `keel.execution.executor._fetch_available_quote(broker, config.quote_currency)` — the exact
+  live balance rail 13 funds a buy against — so the TUI and the rail never disagree.
+- `AvailableBalance(amount: Decimal | None, quote: str, updated_ts: int | None, error: str | None)`
+  (frozen). `_available_lines(available) -> list[ScreenLine]` (pure): None → []; amount set → an
+  "ok" line `available to buy: {amount:,.2f} {quote}  (live account, {HH:MM:SS})`; unreadable →
+  a "warn" line `available to buy: unavailable — {error}`. Rendered by `build_screen` via a new
+  keyword-only `available=None` param placed in the money section (so `--once`/existing tests,
+  which pass no `available`, are unchanged and stay network-free).
+- `_refresh_balance(open_state, now_fn, balance_fn) -> AvailableBalance` (injectable/testable):
+  `balance_fn(config) -> Decimal | None`; returns an `AvailableBalance`, fail-soft (any exception →
+  an error balance, never crashes the loop). In `run_live` the real `balance_fn` is
+  `lambda cfg: _fetch_available_quote(_build_broker(cfg), cfg.quote_currency)` (lazy-imported).
+- `run_live` refreshes the balance on a SLOW cadence (`_BALANCE_REFRESH_SEC = 30`, not every 5s
+  repaint) and on `r`/after `f`, caches the last value, and passes it to `build_screen`. `--once`
+  stays DB-only (no network); the live balance is a live-loop feature.
+- Tests: `_available_lines` (three cases + style), `build_screen` with/without `available`,
+  `_refresh_balance` (value / None / raising `balance_fn`). Broker wiring stays thin I/O.
