@@ -15,6 +15,8 @@ on:
 
 permissions:
   contents: write # create the tag and the release
+  pull-requests: read # "Compose release notes" reads merged PRs (list-PRs-for-commit + get-PR);
+  # without this the default GITHUB_TOKEN gets 403 "Resource not accessible by integration".
 
 jobs:
   release:
@@ -137,8 +139,11 @@ jobs:
           # Every PR whose commits land in this range, de-duplicated.
           : > /tmp/pr-numbers.txt
           for sha in $(git log --format=%H "$RANGE"); do
+            # `grep '^[0-9]+$'` guards the file against ever holding anything but a bare PR
+            # number: if a `gh api` call errors (e.g. a 403), its body must never be treated as
+            # a "PR number" and fed back into a URL. Belt-and-braces with the numeric loop below.
             gh api "repos/${{ github.repository }}/commits/$sha/pulls" \
-              -q '.[].number' 2>/dev/null >> /tmp/pr-numbers.txt || true
+              -q '.[].number' 2>/dev/null | grep -E '^[0-9]+$' >> /tmp/pr-numbers.txt || true
           done
           sort -u -n /tmp/pr-numbers.txt -o /tmp/pr-numbers.txt
           echo "found $(wc -l < /tmp/pr-numbers.txt) PRs in $RANGE"
@@ -146,7 +151,7 @@ jobs:
           # Fetch each PR's title/body/labels, then compose. jq -s folds the stream into an array.
           : > /tmp/prs.ndjson
           while read -r n; do
-            [ -n "$n" ] || continue
+            case "$n" in ''|*[!0-9]*) continue ;; esac  # numeric PR numbers only
             gh api "repos/${{ github.repository }}/pulls/$n" \
               -q '{number:.number,title:.title,body:(.body // ""),labels:[.labels[].name]}' \
               >> /tmp/prs.ndjson
