@@ -42,6 +42,7 @@ from keel.commands.status import StatusReport, _human_age, gather_status
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Granularity
+from keel.version import _package_version
 
 # -- the pure screen model (the testable core) --------------------------------------------------
 
@@ -88,8 +89,22 @@ def _human_dt(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+def _short_version(raw: str) -> str:
+    """`v<major>.<minor>` from a full version string (`0.1.0` -> `v0.1`). Falls back to `v?` for an
+    unknown or unparseable version, so the header never shows a bare `unknown` or raises."""
+    parts = raw.split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"v{parts[0]}.{parts[1]}"
+    return "v?"
+
+
+#: The short header version, resolved ONCE at import (it never changes within a run). Uses the
+#: lightweight package-metadata reader, not `build_info()`, so no git subprocess runs per repaint.
+_SHORT_VERSION = _short_version(_package_version())
+
+
 def _title_lines(report: StatusReport, now_ts: int) -> list[ScreenLine]:
-    return [ScreenLine(f"keel · {report.mode} mode", "heading")]
+    return [ScreenLine(f"keel {_SHORT_VERSION} · {report.mode} mode", "heading")]
 
 
 def _kill_switch_lines(report: StatusReport) -> list[ScreenLine]:
