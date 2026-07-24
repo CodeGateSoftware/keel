@@ -83,6 +83,7 @@ from keel.commands.rules import rules_group, rules_seed
 from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
 from keel.commands.trials import trials_group
+from keel.commands.tui import tui_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
@@ -1637,6 +1638,13 @@ cli.add_command(subscription_group)
 # The paper-mode-fidelity spec deferred a dedicated `keel status` command as a follow-up; it is
 # defined in `keel.commands.status` and registered here.
 cli.add_command(status_cmd)
+
+
+# -- tui (live, read-only, full-screen operator dashboard, no broker call) -----------------------
+
+# `keel status` was built as the substrate for this: `tui_cmd` is a curses view over the same
+# `gather_status` report, defined in `keel.commands.tui` and registered here.
+cli.add_command(tui_cmd)
 
 
 # -- kill / resume ------------------------------------------------------------------------------
