@@ -117,3 +117,64 @@ Unit tests in `tests/commands/test_tui.py`, driven by `StatusReport` fixtures (r
 
 Acceptance: `uv run pytest -q` green (test count up), `uv run ruff check` clean, and `keel tui
 --once` prints a coherent dashboard against the real `keel.db`.
+
+---
+
+## v2 — human-readable time + interactive controls (2026-07-24)
+
+Two follow-up asks: (1) show human-readable timestamps instead of raw unix seconds; (2) make the
+dashboard *interactive* — a browsable help menu plus a few actions (toggle autonomy, fetch data,
+refresh now). (2) intentionally relaxes v1's "strictly read-only" contract, so the safety design
+below is the important part.
+
+### Human-readable time
+
+- New pure helper `_human_dt(ts: int) -> str` → local-time `YYYY-MM-DD HH:MM:SS` (via
+  `time.localtime`/`strftime`). Applied to the title `now=`, each position's `opened_at=`, and the
+  autonomy `lapses at`/`LAPSED at` timestamps. Freshness keeps `_human_age` (relative "4h ago").
+- Testable deterministically by asserting it equals `time.strftime(fmt, time.localtime(ts))` for a
+  fixed ts (machine-tz-independent).
+
+### Interactive layer (live loop only; `--once` stays a static snapshot)
+
+The safety contract changes from "cannot act" to **"can act, with the same asymmetric gating the
+CLI already enforces"** (spec-wide §5 principle): a de-risking action is immediate; an action that
+*adds* capability needs a typed-`yes` from a human. The hard rails are untouched — autonomy only
+changes *who is asked*, never *what is allowed*.
+
+Loop state: `mode` ∈ {`normal`, `help`}, `help_offset` (scroll), `message` (transient toast).
+
+**Keybindings**
+- normal: `q` quit · `h`/`?` help · `r` refresh-now · `a` toggle autonomy · `f` fetch-all-data.
+- help: `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `Home`/`End` scroll · `q`/`Esc`/`h`/`?` close.
+
+**Command bar** — footer becomes a keybinding hint line (pure `_footer_lines`), replacing v1's
+static "q quit · read-only".
+
+**Help overlay ("built smartly to browse")** — `build_help_screen() -> list[ScreenLine]` (pure)
+lists every key, what it does, and the safety notes. The loop renders a scrolled window of it via
+`_visible_slice(lines, offset, height) -> list[ScreenLine]` (pure, clamps offset) so long help
+scrolls rather than truncates.
+
+**Toast** — after any action the loop shows a one-line result (`✓ …` / `✗ …`) until the next action.
+
+**Actions (injectable, so the logic is unit-tested without curses/network):**
+- `toggle_autonomy(repo, now_ts, confirm_fn) -> str`: reads `repo.get_profile().is_autonomous(now)`.
+  If ON → `set_autonomous(False, now)` immediately (de-risk, ungated) → `"autonomy → OFF"`. If OFF →
+  arming: call `confirm_fn() -> bool`; on True `set_autonomous(True, now)` (no expiry, matching
+  `keel autonomy on` default) → `"autonomy → ON"`, on False → `"autonomy unchanged (arming
+  cancelled)"`. Fully testable with a fake repo + confirm stub.
+- The real `confirm_fn` in the loop is `_confirm_arm_autonomy(stdscr)`: **suspends curses**
+  (`def_prog_mode` → `endwin`), runs a cooked-mode typed-`yes` prompt (the same bar as
+  `_require_interactive_confirmation`), then **restores** (`reset_prog_mode` → `refresh`). Arming
+  from the TUI is thus gated exactly like `keel autonomy on`.
+- Fetch: the loop paints a "fetching…" frame, then runs a closure supplied by `tui_cmd` that lazy-
+  imports the fetch primitives (`_build_broker`, `history_mod.ensure_history`, `_SIM_GRANULARITIES`,
+  `_DAYS_PER_YEAR` — lazy to avoid the `cli`↔`tui` import cycle) over `_default_sim_products`.
+  Money-safe (data only, no orders). Wrapped by `_guarded(label, fn) -> str` which returns `fn()`'s
+  message or `"{label} failed: {exc}"` — `_guarded` is unit-tested with a raising fn.
+
+**Testing additions:** `_human_dt` format; `build_help_screen` content + `_visible_slice`
+clamping/scrolling; `_footer_lines` hints; `toggle_autonomy` both directions × confirm True/False
+(fake repo); `_guarded` success + failure. The curses loop, `_confirm_arm_autonomy`, and the live
+network fetch closure stay thin I/O (smoke only).

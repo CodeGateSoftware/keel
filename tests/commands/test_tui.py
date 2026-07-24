@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -29,14 +30,22 @@ from keel.commands.status import (
 )
 from keel.commands.tui import (
     ScreenLine,
+    _confirm_arm_autonomy,
+    _footer_lines,
     _freshness_style,
+    _guarded,
+    _human_dt,
+    _message_style,
     _paint,
     _stdio_is_interactive,
     _style_attrs,
+    _visible_slice,
+    build_help_screen,
     build_screen,
     render_plain,
     run_live,
     run_once,
+    toggle_autonomy,
 )
 from keel.config import (
     AutoTradeConfig,
@@ -220,7 +229,78 @@ def test_build_screen_footer_is_present_and_interval_independent() -> None:
     footer = lines[-1]
     assert footer.style == "muted"
     assert "quit" in footer.text.lower()
-    assert "read-only" in footer.text.lower()
+    assert "help" in footer.text.lower()
+
+
+def test_footer_lines_contains_keybinding_hints() -> None:
+    lines = _footer_lines()
+    assert len(lines) == 1
+    footer = lines[0]
+    assert footer.style == "muted"
+    text = footer.text.lower()
+    for hint in ("quit", "help", "refresh", "autonomy", "fetch"):
+        assert hint in text
+
+
+# -- human-readable timestamps -------------------------------------------------------------------
+
+
+def test_human_dt_matches_strftime_localtime() -> None:
+    ts = 1_800_012_345
+    assert _human_dt(ts) == time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def test_build_screen_title_has_no_raw_now_int() -> None:
+    report = _base_report()
+    lines = build_screen(report, NOW_TS)
+    title = lines[0]
+    assert f"now={NOW_TS}" not in title.text
+    assert _human_dt(NOW_TS) in title.text
+
+
+def test_open_position_lines_use_human_readable_opened_at() -> None:
+    pos = OpenPositionStatus(
+        id=1,
+        product_id="BTC-USD",
+        rule_name="turtle_breakout",
+        qty=Decimal("0.01"),
+        entry_price=Decimal("65000"),
+        opened_at=NOW_TS - 3600,
+        has_bracket=True,
+    )
+    report = _base_report(open_positions=[pos])
+    lines = build_screen(report, NOW_TS)
+    pos_line = next(line for line in lines if "BTC-USD" in line.text)
+    assert f"opened_at={pos.opened_at}" not in pos_line.text
+    assert _human_dt(pos.opened_at) in pos_line.text
+
+
+def test_autonomy_lapsed_line_uses_human_readable_timestamp() -> None:
+    until = NOW_TS - 60
+    autonomy = AutonomyStatus(
+        live=False,
+        autonomous=True,
+        autonomous_until=until,
+        updated_ts=NOW_TS,
+        profile_readable=True,
+    )
+    report = _base_report(autonomy=autonomy)
+    lines = build_screen(report, NOW_TS)
+    lapsed_line = next(line for line in lines if "LAPSED" in line.text)
+    assert f"LAPSED at {until}" not in lapsed_line.text
+    assert _human_dt(until) in lapsed_line.text
+
+
+def test_autonomy_lapses_at_line_uses_human_readable_timestamp() -> None:
+    until = NOW_TS + 3600
+    autonomy = AutonomyStatus(
+        live=True, autonomous=True, autonomous_until=until, updated_ts=NOW_TS, profile_readable=True
+    )
+    report = _base_report(autonomy=autonomy)
+    lines = build_screen(report, NOW_TS)
+    lapses_line = next(line for line in lines if "lapses at" in line.text)
+    assert f"lapses at {until}" not in lapses_line.text
+    assert _human_dt(until) in lapses_line.text
 
 
 # -- style logic --------------------------------------------------------------------------------
@@ -354,6 +434,9 @@ def _fake_curses(*, has_colors: bool = True) -> SimpleNamespace:
         init_pair=lambda n, fg, bg: calls.append(f"init_pair:{n}"),
         color_pair=lambda n: 1 << (10 + n),
         curs_set=lambda visibility: None,
+        def_prog_mode=lambda: calls.append("def_prog_mode"),
+        endwin=lambda: calls.append("endwin"),
+        reset_prog_mode=lambda: calls.append("reset_prog_mode"),
         calls=calls,
     )
     return fake
@@ -389,6 +472,7 @@ class _FakeStdscr:
         self._height = height
         self._width = width
         self.calls: list[tuple[int, int, str, int]] = []
+        self.refresh_calls = 0
 
     def getmaxyx(self) -> tuple[int, int]:
         return (self._height, self._width)
@@ -400,7 +484,7 @@ class _FakeStdscr:
         pass
 
     def refresh(self) -> None:
-        pass
+        self.refresh_calls += 1
 
 
 def test_paint_does_not_raise_on_tiny_window() -> None:
@@ -467,7 +551,8 @@ def test_run_once_captures_full_frame(repo: Repository) -> None:
     assert echoed  # a full frame was produced
     joined = "\n".join(echoed)
     assert "paper mode" in joined
-    assert "read-only" in joined.lower()
+    assert "quit" in joined.lower()
+    assert "help" in joined.lower()
 
 
 # -- run_live (fake curses module, no real terminal) ---------------------------------------------
@@ -534,6 +619,210 @@ def test_run_live_read_error_does_not_swallow_keyboard_interrupt(
     run_live(open_state, lambda: NOW_TS, interval=0.01)  # must not raise
 
 
+# -- build_help_screen / _visible_slice (pure) ---------------------------------------------------
+
+
+def test_build_help_screen_documents_every_key_and_safety_notes() -> None:
+    lines = build_help_screen()
+    text = " ".join(line.text.lower() for line in lines)
+    for word in ("autonomy", "fetch", "quit", "scroll", "refresh", "help"):
+        assert word in text
+    assert lines[0].style == "heading"
+
+
+def test_build_help_screen_is_longer_than_a_small_terminal() -> None:
+    lines = build_help_screen()
+    assert len(lines) > 24
+
+
+def test_visible_slice_clamps_too_large_offset() -> None:
+    lines = [ScreenLine(str(i), "normal") for i in range(50)]
+    result = _visible_slice(lines, offset=1000, height=10)
+    assert result == lines[40:50]
+
+
+def test_visible_slice_height_covers_all_lines() -> None:
+    lines = [ScreenLine(str(i), "normal") for i in range(5)]
+    result = _visible_slice(lines, offset=0, height=100)
+    assert result == lines
+
+
+def test_visible_slice_zero_height_returns_empty() -> None:
+    lines = [ScreenLine(str(i), "normal") for i in range(5)]
+    assert _visible_slice(lines, offset=0, height=0) == []
+
+
+def test_visible_slice_negative_offset_clamped_to_zero() -> None:
+    lines = [ScreenLine(str(i), "normal") for i in range(5)]
+    result = _visible_slice(lines, offset=-10, height=2)
+    assert result == lines[0:2]
+
+
+def test_visible_slice_offset_past_end_returns_tail() -> None:
+    lines = [ScreenLine(str(i), "normal") for i in range(5)]
+    result = _visible_slice(lines, offset=4, height=2)
+    assert result == lines[3:5]
+
+
+def test_visible_slice_empty_lines_never_raises() -> None:
+    assert _visible_slice([], offset=5, height=10) == []
+    assert _visible_slice([], offset=0, height=0) == []
+
+
+# -- toggle_autonomy / _guarded (injectable actions, no curses/network) ---------------------------
+
+
+class _FakeProfile:
+    def __init__(self, live: bool) -> None:
+        self._live = live
+
+    def is_autonomous(self, now_ts: int) -> bool:
+        return self._live
+
+
+class _FakeAutonomyRepo:
+    def __init__(self, live: bool) -> None:
+        self._profile = _FakeProfile(live)
+        self.set_autonomous_calls: list[tuple[bool, int]] = []
+
+    def get_profile(self) -> _FakeProfile:
+        return self._profile
+
+    def set_autonomous(self, value: bool, now_ts: int, expires_ts: int | None = None) -> None:
+        self.set_autonomous_calls.append((value, now_ts))
+
+
+def test_toggle_autonomy_on_to_off_is_immediate_and_ungated() -> None:
+    repo = _FakeAutonomyRepo(live=True)
+    confirm_calls: list[bool] = []
+
+    result = toggle_autonomy(repo, NOW_TS, lambda: confirm_calls.append(True) or True)
+
+    assert repo.set_autonomous_calls == [(False, NOW_TS)]
+    assert not confirm_calls  # confirm_fn never consulted for de-risking
+    assert "off" in result.lower()
+
+
+def test_toggle_autonomy_off_to_on_confirmed() -> None:
+    repo = _FakeAutonomyRepo(live=False)
+
+    result = toggle_autonomy(repo, NOW_TS, lambda: True)
+
+    assert repo.set_autonomous_calls == [(True, NOW_TS)]
+    assert "on" in result.lower()
+
+
+def test_toggle_autonomy_off_to_on_declined() -> None:
+    repo = _FakeAutonomyRepo(live=False)
+
+    result = toggle_autonomy(repo, NOW_TS, lambda: False)
+
+    assert repo.set_autonomous_calls == []
+    assert "cancelled" in result.lower()
+
+
+def test_guarded_returns_fn_result_on_success() -> None:
+    assert _guarded("fetch", lambda: "ok") == "ok"
+
+
+def test_guarded_returns_label_failed_message_on_exception() -> None:
+    def _raise() -> str:
+        raise RuntimeError("boom")
+
+    result = _guarded("fetch", _raise)
+    assert result == "fetch failed: boom"
+
+
+def test_guarded_does_not_catch_keyboard_interrupt() -> None:
+    def _raise() -> str:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _guarded("fetch", _raise)
+
+
+# -- _message_style -------------------------------------------------------------------------------
+
+
+def test_message_style_arm_on_is_alert_not_ok() -> None:
+    """The dangerous ON transition must never be painted as reassuring green."""
+    assert _message_style("autonomy -> ON (orders placed WITHOUT asking)") == "alert"
+
+
+def test_message_style_off_is_ok() -> None:
+    assert _message_style("autonomy -> OFF (every order will ask first)") == "ok"
+
+
+def test_message_style_failed_is_alert() -> None:
+    assert _message_style("fetch failed: boom") == "alert"
+
+
+def test_message_style_cancelled_is_warn() -> None:
+    assert _message_style("autonomy unchanged (arming cancelled)") == "warn"
+
+
+def test_message_style_fetch_complete_is_ok() -> None:
+    assert _message_style("fetch complete (2 products, 5y history)") == "ok"
+
+
+# -- _confirm_arm_autonomy (fake curses module, fail-closed) ---------------------------------------
+
+
+def test_confirm_arm_autonomy_true_on_typed_yes_and_restores_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_curses = _fake_curses()
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+    monkeypatch.setattr(
+        "keel.commands._common._require_interactive_confirmation",
+        lambda action, detail: None,
+    )
+    stdscr = _FakeStdscr(height=24, width=80)
+    config = _config()
+
+    assert _confirm_arm_autonomy(stdscr, config) is True
+    assert stdscr.refresh_calls == 1
+
+
+def test_confirm_arm_autonomy_false_on_aborted_confirmation_and_restores_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import click
+
+    fake_curses = _fake_curses()
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def _raise_aborted(action: str, detail: str) -> None:
+        raise click.ClickException("aborted")
+
+    monkeypatch.setattr(
+        "keel.commands._common._require_interactive_confirmation", _raise_aborted
+    )
+    stdscr = _FakeStdscr(height=24, width=80)
+    config = _config()
+
+    assert _confirm_arm_autonomy(stdscr, config) is False
+    assert stdscr.refresh_calls == 1
+
+
+def test_confirm_arm_autonomy_fails_closed_when_endwin_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_curses = _fake_curses()
+
+    def _raise_endwin() -> None:
+        raise fake_curses.error("endwin failed")
+
+    fake_curses.endwin = _raise_endwin
+    fake_curses.def_prog_mode = lambda: None
+    fake_curses.reset_prog_mode = lambda: None
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+    stdscr = _FakeStdscr(height=24, width=80)
+    config = _config()
+
+    assert _confirm_arm_autonomy(stdscr, config) is False
+
+
 # -- CLI ----------------------------------------------------------------------------------------
 
 
@@ -553,7 +842,8 @@ def test_tui_once_command_exits_zero_and_prints_frame(tmp_path, valid_config_pat
 
     assert result.exit_code == 0, result.output
     assert "paper mode" in result.output
-    assert "read-only" in result.output.lower()
+    assert "quit" in result.output.lower()
+    assert "help" in result.output.lower()
 
 
 def test_tui_zero_interval_without_once_is_rejected(tmp_path, valid_config_path) -> None:
