@@ -34,7 +34,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -44,6 +44,13 @@ from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Granularity
 from keel.version import _package_version
+
+if TYPE_CHECKING:
+    # `keel.commands.insights` imports `_human_dt` back from this module, so importing it at
+    # module load time would be a circular import -- these names are only used in type
+    # annotations here (never evaluated at runtime, `from __future__ import annotations` keeps
+    # them as strings), and every call site below lazy-imports the real symbols it needs.
+    from keel.commands.insights import InsightsReport, JournalReport
 
 # -- the pure screen model (the testable core) --------------------------------------------------
 
@@ -260,7 +267,8 @@ def _footer_lines() -> list[ScreenLine]:
     interval-independent (see `build_screen`'s note) and pure, so it's directly testable."""
     return [
         ScreenLine(
-            "keys: [q] quit  [h] help  [r] refresh  [a] autonomy  [f] fetch", "muted"
+            "keys: [q] quit  [h] help  [i] insights  [r] refresh  [a] autonomy  [f] fetch",
+            "muted",
         )
     ]
 
@@ -322,6 +330,7 @@ def build_help_screen() -> list[ScreenLine]:
     _row("Normal mode")
     _row("  q            quit")
     _row("  h  /  ?      open this help")
+    _row("  i            open the insights overlay (per-rule track record + promotion gates)")
     _row("  r            refresh now (poll immediately, instead of waiting for the interval)")
     _row("  a            toggle autonomy (arm / disarm the agent placing orders unattended)")
     _row("  f            fetch all data (pull candles for every configured product)")
@@ -341,6 +350,12 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  Home         jump to the top")
     _row("  End          jump to the bottom")
     _row("  q / Esc / h / ?    close help, back to the dashboard")
+    lines.append(_blank())
+    _row("Insights overlay (i)")
+    _note("  Read-only, like the whole dashboard: per-rule track record, distance to the")
+    _note("  promotion gate, an account summary, and a compact recent-trades tail -- the same")
+    _note("  scrolling keys as help mode (up/k, down/j, PgUp/PgDn, Home/End).")
+    _row("  q / Esc / i    close insights, back to the dashboard")
     lines.append(_blank())
     _row("Safety notes")
     _note(
@@ -368,6 +383,68 @@ def build_help_screen() -> list[ScreenLine]:
     _row("action replaces it.")
     lines.append(_blank())
     _row("Press q, Esc, h or ? now to return to the dashboard.")
+    return lines
+
+
+def _insights_line_style(text: str) -> str:
+    """Style a single rendered line from `keel.commands.insights.render_summary`/`render_journal`
+    (plain, unstyled `str`s -- that module has no notion of `ScreenLine`) by its own textual
+    conventions, so the overlay reads at a glance exactly like the rest of the dashboard: a
+    passing gate is reassuring green, a blocked one and its reasons are a warning, the
+    small-sample caveat and "nothing yet" placeholders are muted, never alarming."""
+    stripped = text.strip()
+    if stripped.startswith("gate: PASSING"):
+        return "ok"
+    if stripped.startswith("gate: blocked"):
+        return "warn"
+    if stripped.startswith("- "):
+        return "warn"
+    if stripped.startswith(_SMALL_SAMPLE_NOTE_PREFIX):
+        return "muted"
+    lowered = stripped.lower()
+    if "no rule track record yet" in lowered or "no closed trades yet" in lowered:
+        return "muted"
+    if stripped.startswith("rail11") and "HALTED" in stripped:
+        return "alert"
+    return "normal"
+
+
+#: The first few words of `keel.commands.insights._SMALL_SAMPLE_NOTE` -- matched as a prefix
+#: rather than importing the full constant (which would defeat the point of the lazy import used
+#: to avoid the `insights` <-> `tui` circular import).
+_SMALL_SAMPLE_NOTE_PREFIX = "n<30:"
+
+#: How many of the most recent trades the insights overlay's optional journal tail shows --
+#: compact by design (the overlay is meant to be skimmed, not to replace `keel insights journal`).
+_INSIGHTS_JOURNAL_TAIL = 5
+
+
+def build_insights_screen(
+    insights_report: InsightsReport, journal_report: JournalReport | None = None
+) -> list[ScreenLine]:
+    """A titled, scrollable, READ-ONLY overlay: the per-rule track record + promotion-gate
+    distance + account summary (`render_summary`), plus an optional compact recent-journal tail
+    (`render_journal`) when `journal_report` is supplied. PURE -- both inputs are already-built
+    reports (`build_insights_report`/`build_journal_report`, called by the live loop, never by
+    this function), so this never touches the repo/network/broker itself; it only styles text
+    that `keel/commands/insights.py` already rendered, exactly the way `build_screen` only styles
+    `StatusReport`. Never raises on a zero-rule/zero-trade report -- `render_summary`'s own
+    friendly "no rule track record yet" line covers that, so this never renders a blank overlay.
+    """
+    from keel.commands.insights import render_journal, render_summary
+
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- insights", "heading"), _blank()]
+    for text in render_summary(insights_report):
+        lines.append(ScreenLine(text, _insights_line_style(text)) if text else _blank())
+
+    if journal_report is not None:
+        lines.append(_blank())
+        lines.append(ScreenLine(f"recent trades (last {_INSIGHTS_JOURNAL_TAIL}):", "heading"))
+        for text in render_journal(journal_report):
+            lines.append(ScreenLine(text, _insights_line_style(text)) if text else _blank())
+
+    lines.append(_blank())
+    lines.append(ScreenLine("Press i or Esc to return to the dashboard.", "muted"))
     return lines
 
 
@@ -608,13 +685,17 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     process -- gathers a fresh report, paints it, then waits up to `interval` seconds for a
     keypress.
 
-    Two modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
-    action) and `help` (a scrolled window of `build_help_screen()`, via `_visible_slice`).
-    Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `r` refresh now; `a` toggle autonomy
-    (`toggle_autonomy`, gated by `_confirm_arm_autonomy` on the OFF->ON direction only); `f`
-    fetch all data (`_do_fetch`, money-safe). `a` and `f` are both wrapped in `_guarded` so a
-    failure becomes a toast, never a crash. Help-mode keys scroll (`up`/`k`, `down`/`j`,
-    `PgUp`/`PgDn`, `Home`/`End`) or close back to normal (`q`/`Esc`/`h`/`?`).
+    Three modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
+    action), `help` (a scrolled window of `build_help_screen()`), and `insights` (a scrolled
+    window of `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
+    `build_journal_report`, rebuilt fresh each poll while open, fail-soft exactly like the
+    normal-mode status read below). All scrolling goes through `_visible_slice`.
+    Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `r` refresh now; `a`
+    toggle autonomy (`toggle_autonomy`, gated by `_confirm_arm_autonomy` on the OFF->ON direction
+    only); `f` fetch all data (`_do_fetch`, money-safe). `a` and `f` are both wrapped in
+    `_guarded` so a failure becomes a toast, never a crash. Help-mode and insights-mode keys both
+    scroll (`up`/`k`, `down`/`j`, `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on
+    `q`/`Esc`/`h`/`?` (help) or `q`/`Esc`/`i` (insights).
 
     Also refreshes the live "available to buy" balance (`_refresh_balance`) on its own slow
     cadence (`_BALANCE_REFRESH_SEC`, not every repaint -- it's a real broker call), and
@@ -647,6 +728,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
 
         mode = "normal"
         help_offset = 0
+        insights_offset = 0
         message: str | None = None
         message_ts = 0
         available: AvailableBalance | None = None
@@ -675,6 +757,56 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     mode = "normal"
                     help_offset = 0
                 help_offset = max(0, min(help_offset, max(0, len(help_lines) - height)))
+                continue
+
+            if mode == "insights":
+                # Read-only + fail-soft, mirroring the normal-mode status read below: a transient
+                # error (e.g. `database is locked` from a concurrent `keel agent` writer) must
+                # never crash the loop -- it paints an alert line and keeps polling instead. Only
+                # read methods are touched (`gather_status` is broker-free, and
+                # `build_insights_report`/`build_journal_report` are pure views over it plus
+                # `Repository`'s existing read methods) -- this never places an order or writes.
+                from keel.commands.insights import build_insights_report, build_journal_report
+
+                now_ts = now_fn()
+                try:
+                    insights_repo, insights_config = open_state()
+                    insights_status = gather_status(insights_repo, insights_config, now_ts)
+                    insights_report = build_insights_report(
+                        insights_repo, insights_config, insights_status, now_ts
+                    )
+                    journal_report = build_journal_report(
+                        insights_repo,
+                        insights_status,
+                        now_ts,
+                        limit=_INSIGHTS_JOURNAL_TAIL,
+                    )
+                    insights_lines = build_insights_screen(insights_report, journal_report)
+                except Exception as exc:
+                    insights_lines = [
+                        ScreenLine(f"insights read failed: {exc} -- retrying...", "alert")
+                    ]
+
+                height, _width = stdscr.getmaxyx()
+                _paint(stdscr, _visible_slice(insights_lines, insights_offset, height))
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (curses.KEY_UP, ord("k")):
+                    insights_offset -= 1
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    insights_offset += 1
+                elif ch == curses.KEY_PPAGE:
+                    insights_offset -= max(height - 1, 1)
+                elif ch == curses.KEY_NPAGE:
+                    insights_offset += max(height - 1, 1)
+                elif ch == curses.KEY_HOME:
+                    insights_offset = 0
+                elif ch == curses.KEY_END:
+                    insights_offset = len(insights_lines)
+                elif ch in (ord("q"), 27, ord("i")):
+                    mode = "normal"
+                    insights_offset = 0
+                insights_offset = max(0, min(insights_offset, max(0, len(insights_lines) - height)))
                 continue
 
             # mode == "normal"
@@ -717,6 +849,10 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
             if ch in (ord("h"), ord("?")):
                 mode = "help"
                 help_offset = 0
+                continue
+            if ch == ord("i"):
+                mode = "insights"
+                insights_offset = 0
                 continue
             if ch == ord("r"):
                 last_balance_ts = 0  # force the balance to re-fetch on the next iteration too
@@ -789,10 +925,12 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     autonomy, Rail 11 drawdown/equity state, open positions, rule counts, per-product data
     freshness, and subscriptions, auto-refreshing on an interval. Never places an order and never
     touches the network except when explicitly asked to (`f`). Press `h`/`?` for the in-app help
-    (every keybinding and the safety notes); `a` toggles autonomy (turning it OFF is instant,
-    turning it ON needs a typed "yes" at the terminal, exactly like `keel autonomy on`); `f`
-    fetches fresh candle history for every configured product (money-safe: no orders); `r`
-    refreshes immediately. Quit with `q`.
+    (every keybinding and the safety notes); `i` opens a browsable, READ-ONLY insights overlay
+    (per-rule track record, promotion-gate distance, account summary, and a recent-trades tail --
+    reusing `keel insights`' own pure builders/renderers verbatim); `a` toggles autonomy (turning
+    it OFF is instant, turning it ON needs a typed "yes" at the terminal, exactly like `keel
+    autonomy on`); `f` fetches fresh candle history for every configured product (money-safe: no
+    orders); `r` refreshes immediately. Quit with `q`.
 
     `--once` renders a single, static frame to stdout and exits without touching curses, for
     pipes/CI, matching `status`'s scripting-friendliness (and prints the disclaimer footer after
