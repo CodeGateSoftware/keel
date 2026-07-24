@@ -440,6 +440,29 @@ _SMALL_SAMPLE_NOTE = (
     "proven edge"
 )
 
+_TWO_DP = Decimal("0.01")
+
+
+def _quantized(x: Any) -> Any:
+    """2dp-round a `Decimal` for HUMAN display only -- `--json` stays full precision
+    (`json.dumps(..., default=str)` never goes through this).
+
+    Passes through anything that isn't a finite `Decimal` unchanged: a sentinel string
+    ("n/a (no losses yet)", "n/a", "dca"), `None`, or a non-finite `Decimal` (`Infinity`,
+    which `BacktestResult.profit_factor`/a zero-loss realized-rr can legitimately be, and
+    which `.quantize()` itself refuses to round) all render exactly as before.
+    """
+    if isinstance(x, Decimal) and x.is_finite():
+        return x.quantize(_TWO_DP)
+    return x
+
+
+# One shared helper covers both money and ratio fields (both are just "round this Decimal to
+# 2dp for a human, leave any sentinel alone") -- two names kept at call sites purely for the
+# reader, per the field groupings above.
+_money = _quantized
+_ratio = _quantized
+
 
 def render_summary(report: InsightsReport) -> list[str]:
     """The `keel insights summary` (default, non-`--json`) rendering, as a list of lines."""
@@ -474,8 +497,9 @@ def render_summary(report: InsightsReport) -> list[str]:
         rr = r.realized_rr if r.realized_rr is not None else "n/a (no losses yet)"
         lines.append(
             f"  [{r.rule_name}] status={r.status} class={r.promotion_class} n={r.n_trades} "
-            f"win_rate={r.win_rate:.1%} avg_win={r.avg_win} avg_loss={r.avg_loss} rr={rr} "
-            f"expectancy={r.expectancy} profit_factor={r.profit_factor} max_dd={r.max_drawdown}"
+            f"win_rate={r.win_rate:.1%} avg_win={_money(r.avg_win)} avg_loss={_money(r.avg_loss)} "
+            f"rr={_ratio(rr)} expectancy={_money(r.expectancy)} "
+            f"profit_factor={_ratio(r.profit_factor)} max_dd={_money(r.max_drawdown)}"
         )
         if not r.significant:
             lines.append(f"    {_SMALL_SAMPLE_NOTE}")
@@ -503,7 +527,15 @@ def render_journal(report: JournalReport) -> list[str]:
     active_filters = {k: v for k, v in report.filters.items() if v not in (None, False)}
     filters_desc = ", ".join(f"{k}={v}" for k, v in active_filters.items()) or "none"
     lines.append(f"filters: {filters_desc}")
-    lines.append(f"showing {len(report.entries)} of {report.total_count} closed trades")
+    # `report.total_count` is the pre-`--limit` CLOSED count; `report.entries` (once
+    # `--include-open` appends live positions) mixes closed rows with `outcome == "open"` ones,
+    # so the numerator here must exclude those or the line lies (e.g. "4 of 3 closed trades").
+    shown_closed = sum(1 for e in report.entries if e.outcome != "open")
+    open_shown = len(report.entries) - shown_closed
+    count_line = f"showing {shown_closed} of {report.total_count} closed trades"
+    if open_shown:
+        count_line += f" (+{open_shown} open)"
+    lines.append(count_line)
     lines.append("")
 
     if not report.entries:
@@ -513,21 +545,23 @@ def render_journal(report: JournalReport) -> list[str]:
     for e in reversed(report.entries):
         if e.outcome == "open":
             lines.append(
-                f"  OPEN  {e.product_id} qty={e.qty} entry={e.entry_fill} "
+                f"  OPEN  {e.product_id} qty={_money(e.qty)} entry={_money(e.entry_fill)} "
                 f"opened_at={_human_dt(e.opened_at)} rule={e.rule_name}"
             )
         elif e.is_dca:
             age = _human_age(max(report.now_ts - (e.closed_at or report.now_ts), 0))
             lines.append(
-                f"  [{_human_dt(e.closed_at or 0)} / {age}] {e.product_id} DCA qty={e.qty} "
-                f"pnl_net={e.pnl_net} -- DCA: no stop, excluded from R/expectancy"
+                f"  [{_human_dt(e.closed_at or 0)} / {age}] {e.product_id} DCA "
+                f"qty={_money(e.qty)} pnl_net={_money(e.pnl_net)} -- "
+                f"DCA: no stop, excluded from R/expectancy"
             )
         else:
             r_text = e.r_multiple if e.r_multiple is not None else "n/a"
             age = _human_age(max(report.now_ts - (e.closed_at or report.now_ts), 0))
             lines.append(
                 f"  [{_human_dt(e.closed_at or 0)} / {age}] {e.product_id} rule={e.rule_name} "
-                f"outcome={e.outcome} qty={e.qty} pnl_net={e.pnl_net} R={r_text}"
+                f"outcome={e.outcome} qty={_money(e.qty)} pnl_net={_money(e.pnl_net)} "
+                f"R={_ratio(r_text)}"
             )
 
     return lines

@@ -19,6 +19,9 @@ from click.testing import CliRunner
 
 from keel.cli import cli
 from keel.commands.insights import (
+    AccountSummary,
+    InsightsReport,
+    RuleTrackRecord,
     build_account_summary,
     build_gate_distance,
     build_insights_report,
@@ -581,6 +584,77 @@ def test_render_journal_dca_row_labeled_and_no_r_equals_zero(repo: Repository) -
     joined = "\n".join(lines)
     assert "DCA" in joined
     assert "R=0" not in joined
+
+
+def test_render_journal_include_open_count_line_excludes_open_from_closed_count(
+    repo: Repository,
+) -> None:
+    """Regression for the "showing 4 of 3 closed trades" bug: `--include-open` appends
+    `outcome == "open"` rows onto `report.entries`, but the "showing N of total_count closed
+    trades" line's numerator must count only the CLOSED rows actually shown, with the open
+    ones called out separately."""
+    _seed_trade_outcome(repo, closed_at=1000, opened_at=900, rule_name="dca")
+    _seed_trade_outcome(repo, closed_at=2000, opened_at=1900, rule_name="dca")
+    _seed_trade_outcome(repo, closed_at=3000, opened_at=2900, rule_name="dca")
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=NOW_TS - 100,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        bracket_order_id=None,
+    )
+    config = _config()
+    status_report = gather_status(repo, config, now_ts=NOW_TS)
+
+    report = build_journal_report(repo, status_report, NOW_TS, include_open=True)
+
+    assert report.total_count == 3
+    assert sum(1 for e in report.entries if e.outcome == "open") == 1
+
+    lines = render_journal(report)
+    joined = "\n".join(lines)
+    assert "showing 3 of 3 closed trades" in joined
+    assert "(+1 open)" in joined
+
+
+def test_render_summary_quantizes_ratio_to_two_decimal_places() -> None:
+    """The human render rounds ratios (rr here) to 2dp; `--json` (untouched by this render
+    path) stays full precision -- this only exercises the human renderer."""
+    account = AccountSummary(
+        mode="paper",
+        equity_state_mode=None,
+        high_water_mark=None,
+        drawdown_total_pct=None,
+        drawdown_weekly_pct=None,
+        max_total_dd_pct=Decimal("0.20"),
+        max_weekly_dd_pct=Decimal("0.08"),
+        rail11_status="unknown",
+        paper_cash_usdc=None,
+    )
+    rule = RuleTrackRecord(
+        rule_name="dca",
+        status="live",
+        promotion_class="default",
+        n_trades=40,
+        win_rate=0.6,
+        avg_win=Decimal("7"),
+        avg_loss=Decimal("-3"),
+        realized_rr=Decimal("7") / Decimal("3"),  # 2.3333333333333333333333333333...
+        expectancy=Decimal("2.5"),
+        profit_factor=Decimal("3"),
+        max_drawdown=Decimal("10"),
+        significant=True,
+        gate=None,
+    )
+    report = InsightsReport(now_ts=NOW_TS, account=account, rules=[rule], closed_trade_count=40)
+
+    lines = render_summary(report)
+
+    joined = "\n".join(lines)
+    assert "rr=2.33" in joined
+    assert "2.3333333333333333333333333333" not in joined
 
 
 # -- the `keel insights` commands ----------------------------------------------------------------
