@@ -4,6 +4,8 @@ secrets.enc
 
 # databases
 *.db
+# local keel.db backups / snapshots (e.g. pre-migration or smoketest copies)
+keel.db.bak-*
 
 # logs (engine-activity logging, keel.config.LoggingConfig)
 logs/
@@ -21,6 +23,12 @@ dist/
 
 # os
 .DS_Store
+
+# editors
+.vscode/
+
+# local scratch / experiment notes -- never committed
+scratchpad/
 
 # Claude Code agent worktrees / transcripts
 .claude/
