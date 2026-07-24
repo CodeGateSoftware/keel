@@ -31,6 +31,7 @@ from keel.commands.tui import (
     ScreenLine,
     _freshness_style,
     _paint,
+    _stdio_is_interactive,
     _style_attrs,
     build_screen,
     render_plain,
@@ -595,3 +596,57 @@ def test_tui_negative_interval_is_rejected(tmp_path, valid_config_path) -> None:
     )
 
     assert result.exit_code != 0
+
+
+# -- interactive-terminal guard (no curses under CliRunner / pipes) ----------------------------
+
+
+def test_stdio_is_interactive_requires_both_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """True only when BOTH stdin and stdout are TTYs -- either being a pipe means the full-screen
+    loop cannot run."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    assert _stdio_is_interactive() is True
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    assert _stdio_is_interactive() is False
+
+
+def test_tui_without_once_needs_interactive_terminal(tmp_path, valid_config_path) -> None:
+    """`keel tui` (live) under CliRunner -- stdin/stdout are not TTYs -- must fail with a clean,
+    actionable message pointing at `--once`, NOT enter curses and dump a traceback."""
+    db_path = tmp_path / "keel.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "tui"]
+    )
+
+    assert result.exit_code != 0
+    assert "interactive terminal" in result.output.lower()
+    assert "--once" in result.output
+
+
+def test_run_live_wraps_curses_error_as_clickexception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt-and-braces: if `curses.wrapper` itself raises `curses.error` (e.g. `cbreak()
+    returned ERR` on a TTY that passes `isatty()` but can't be put into cbreak mode), `run_live`
+    turns it into a `click.ClickException` with a helpful message rather than a raw traceback."""
+    import click
+
+    fake_curses = _fake_curses()
+
+    def _raise_wrapper(_fn: Any) -> None:
+        raise fake_curses.error("cbreak() returned ERR")
+
+    fake_curses.wrapper = _raise_wrapper
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def _must_not_open() -> Any:
+        raise AssertionError("open_state must not be called -- wrapper raised first")
+
+    with pytest.raises(click.ClickException) as excinfo:
+        run_live(_must_not_open, lambda: 0, 5.0)
+
+    assert "--once" in str(excinfo.value)
