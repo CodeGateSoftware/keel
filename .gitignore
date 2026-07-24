@@ -45,3 +45,7 @@ config.local.yaml
 config.paperforward.yaml
 paperforward-run.sh
 com.keel.paperforward.plist
+# supervised-live sandbox (tiny-cap confirm-mode turtle detector; operational, never shipped)
+config.live-sandbox.yaml
+keel-live-run.sh
+com.keel.live.plist
