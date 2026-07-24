@@ -33,6 +33,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import click
@@ -165,6 +166,39 @@ def _equity_lines(report: StatusReport) -> list[ScreenLine]:
     return lines
 
 
+@dataclass(frozen=True)
+class AvailableBalance:
+    """The live, real-account balance of `config.quote_currency` available to fund a buy --
+    fetched via the exact same `_fetch_available_quote` rail 13 funds a buy against, so the TUI
+    and the rail never disagree. `amount is None` means the balance could not be read (`error`
+    explains why); `updated_ts` is when the read was attempted, whether or not it succeeded."""
+
+    amount: Decimal | None
+    quote: str
+    updated_ts: int | None
+    error: str | None
+
+
+def _available_lines(available: AvailableBalance | None) -> list[ScreenLine]:
+    """PURE: `available is None` (e.g. `--once`, which never touches the network) renders
+    nothing. A successful read is an `"ok"` line naming the live account and when it was read; an
+    unreadable balance (any broker/network failure, fail-soft) is a `"warn"` line with the
+    reason -- never a crash, never a silently blank line.
+
+    Labelled `"live account"`, not `"available to buy"`: in paper mode a buy spends
+    `paper_cash_usdc`, not this real-account balance, so calling it "available to buy" would
+    mislead an operator watching the paper dashboard."""
+    if available is None:
+        return []
+    if available.amount is not None:
+        text = (
+            f"live account: {available.amount:,.2f} {available.quote} available  "
+            f"({_human_dt(available.updated_ts)})"
+        )
+        return [ScreenLine(text, "ok")]
+    return [ScreenLine(f"live account: unavailable -- {available.error}", "warn")]
+
+
 def _open_position_lines(report: StatusReport) -> list[ScreenLine]:
     lines: list[ScreenLine] = []
     if not report.open_positions:
@@ -231,16 +265,24 @@ def _footer_lines() -> list[ScreenLine]:
     ]
 
 
-def build_screen(report: StatusReport, now_ts: int) -> list[ScreenLine]:
+def build_screen(
+    report: StatusReport, now_ts: int, *, available: AvailableBalance | None = None
+) -> list[ScreenLine]:
     """Turn a `StatusReport` into styled rows -- a PURE function of the report, reusing every
     logic decision (Rail 11, freshness, autonomy) `gather_status` already made. Never re-derives
-    status; only styles it."""
+    status; only styles it.
+
+    `available` is the live "available to buy" balance (v3) -- keyword-only and defaulted to
+    `None` so every existing caller (`--once`, `render_plain`, the whole pre-v3 test suite), which
+    passes no `available`, renders EXACTLY as before and stays network-free. Only `run_live`
+    threads a real `AvailableBalance` through, refreshed on its own slow cadence."""
     lines: list[ScreenLine] = []
     lines.extend(_title_lines(report, now_ts))
     lines.extend(_kill_switch_lines(report))
     lines.extend(_autonomy_lines(report))
     lines.append(_blank())
     lines.extend(_equity_lines(report))
+    lines.extend(_available_lines(available))
     lines.append(_blank())
     lines.extend(_open_position_lines(report))
     lines.append(_blank())
@@ -285,6 +327,11 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  f            fetch all data (pull candles for every configured product)")
     _note("               can pull up to 5y of candles; the dashboard freezes until it finishes")
     _note("               (Ctrl-C aborts the whole TUI, not just the fetch)")
+    lines.append(_blank())
+    _row("Live balance")
+    _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
+    _note("  refreshed every ~30s and immediately on 'r' or 'f' -- so a deposit or sell shows up.")
+    _note("  In paper mode, paper buys spend paper_cash_usdc instead -- not this balance.")
     lines.append(_blank())
     _row("Help mode (this screen)")
     _row("  up / k       scroll up one line")
@@ -433,6 +480,47 @@ Echo = Callable[[str], None]
 #: (e.g. "autonomy -> ON" still showing after autonomy has since lapsed).
 _MESSAGE_TTL_SEC = 12
 
+#: How often (seconds) `run_live` refreshes the live "available to buy" balance -- deliberately
+#: SLOWER than the dashboard's own repaint interval (typically 5s): it is a real broker call
+#: (`get_accounts`), and re-fetching it every repaint would hammer the venue for no operator
+#: benefit. `r` (refresh-now) and a completed `f` (fetch) both force an immediate re-fetch by
+#: resetting the cadence clock, so the balance still updates promptly on demand.
+_BALANCE_REFRESH_SEC = 30
+
+#: Network timeout (seconds) bounding the live balance's `get_accounts` call -- a hung request
+#: must never freeze the whole dashboard indefinitely. Deliberately generous (this is a
+#: background refresh, not something the operator is blocked waiting on) but finite.
+_BALANCE_TIMEOUT_SEC = 10
+
+
+def _refresh_balance(
+    open_state: OpenState, now_fn: NowFn, balance_fn: Callable[[Config], Decimal | None]
+) -> AvailableBalance:
+    """Fetch the live "available to buy" balance -- injectable (`open_state`/`now_fn`/
+    `balance_fn`) so it's testable with fakes, no curses/network/broker involved. FAIL-SOFT: any
+    exception anywhere (opening the repo, reading config, the broker call inside `balance_fn`)
+    becomes an error `AvailableBalance` with `quote="?"` (the configured quote currency itself may
+    be unreadable), never a raised exception -- a transient balance-read failure must never crash
+    the live loop. `balance_fn(config) -> Decimal | None` returning `None` covers BOTH "no matching
+    account" and any broker/auth/network error it swallowed internally, so the message deliberately
+    does not assert "no balance" -- that would wrongly tell an operator a deposit never landed when
+    the real cause could be an unreachable broker or bad credentials."""
+    try:
+        _repo, config = open_state()
+        amount = balance_fn(config)
+        if amount is None:
+            error = (
+                f"{config.quote_currency} balance unreadable "
+                "(no funds, or account/credentials unavailable)"
+            )
+            return AvailableBalance(None, config.quote_currency, now_fn(), error)
+        return AvailableBalance(amount, config.quote_currency, now_fn(), None)
+    except Exception as exc:
+        # Truncated: this raw exception text is painted full-screen (`_available_lines`) -- keep
+        # a stray huge or sensitive blob (e.g. an HTTP error body) off the display.
+        error = str(exc)[:120]
+        return AvailableBalance(None, "?", now_fn(), error)
+
 
 def run_once(open_state: OpenState, now_fn: NowFn, echo: Echo) -> None:
     """Render a single frame and hand each line to `echo` -- drives `--once` (pipes/CI) and is
@@ -528,9 +616,27 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     failure becomes a toast, never a crash. Help-mode keys scroll (`up`/`k`, `down`/`j`,
     `PgUp`/`PgDn`, `Home`/`End`) or close back to normal (`q`/`Esc`/`h`/`?`).
 
+    Also refreshes the live "available to buy" balance (`_refresh_balance`) on its own slow
+    cadence (`_BALANCE_REFRESH_SEC`, not every repaint -- it's a real broker call), and
+    immediately on `r`. This is the one other live-network read besides `f` fetch, and it is
+    likewise money-safe: `get_accounts` only, the exact same read rail 13 funds a buy against.
+
     Quits on `q`/`Q` in normal mode; a `KeyboardInterrupt` (Ctrl-C) exits gracefully rather than
     dumping a traceback onto a terminal `curses.wrapper` may not have fully restored."""
     import curses
+
+    def _balance_fn(cfg: Config) -> Decimal | None:
+        # Lazy imports -- `keel.commands._common` and `keel.execution.executor` both import
+        # (transitively) from `keel.cli`/`keel.commands`, so importing them at module load time
+        # would create an import cycle with this module. `_fetch_available_quote` is the EXACT
+        # live-balance read rail 13 funds a buy against, reused verbatim so the TUI and the rail
+        # never disagree.
+        from keel.commands._common import _build_broker
+        from keel.execution.executor import _fetch_available_quote
+
+        return _fetch_available_quote(
+            _build_broker(cfg, timeout=_BALANCE_TIMEOUT_SEC), cfg.quote_currency
+        )
 
     def _loop(stdscr: Any) -> None:
         try:
@@ -543,6 +649,8 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         help_offset = 0
         message: str | None = None
         message_ts = 0
+        available: AvailableBalance | None = None
+        last_balance_ts = 0
 
         while True:
             if mode == "help":
@@ -577,7 +685,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 # simply falls out of scope and is garbage-collected.
                 repo, config = open_state()
                 report = gather_status(repo, config, now_ts)
-                lines = build_screen(report, now_ts)
+                lines = build_screen(report, now_ts, available=available)
                 if message is not None and now_ts - message_ts > _MESSAGE_TTL_SEC:
                     message = None
                 if message is not None:
@@ -590,6 +698,18 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 # (it isn't an `Exception`) so Ctrl-C still reaches the outer handler below.
                 _paint(stdscr, [ScreenLine(f"status read failed: {exc} -- retrying...", "alert")])
 
+            if now_ts - last_balance_ts >= _BALANCE_REFRESH_SEC:
+                # A live broker call (`get_accounts`) on its own SLOW cadence -- not every
+                # repaint, which would hammer the venue for no operator benefit. Deliberately
+                # AFTER the paint above: the first iteration paints the dashboard immediately
+                # (`available` is still `None`, so no balance line yet) rather than blocking the
+                # first frame on a network call; the balance line appears on the NEXT repaint,
+                # once this fetch completes. `_refresh_balance` is itself fail-soft, so a
+                # broker/network failure here becomes a warn line next repaint, never a crash of
+                # this loop.
+                available = _refresh_balance(open_state, now_fn, _balance_fn)
+                last_balance_ts = now_ts
+
             stdscr.timeout(int(interval * 1000))
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
@@ -599,6 +719,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 help_offset = 0
                 continue
             if ch == ord("r"):
+                last_balance_ts = 0  # force the balance to re-fetch on the next iteration too
                 continue
             if ch == ord("a"):
 
@@ -615,6 +736,9 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 _paint(stdscr, [ScreenLine("fetching data... please wait", "normal")])
                 message = _guarded("fetch", lambda: _do_fetch(open_state, now_fn))
                 message_ts = now_fn()
+                # A fetch is a "refresh everything" gesture: re-read the live balance too, so a
+                # deposit/sell that landed alongside the new candles shows up immediately.
+                last_balance_ts = 0
                 continue
 
     try:

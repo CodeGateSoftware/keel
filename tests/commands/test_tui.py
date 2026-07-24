@@ -30,7 +30,9 @@ from keel.commands.status import (
 )
 from keel.commands.tui import (
     _SHORT_VERSION,
+    AvailableBalance,
     ScreenLine,
+    _available_lines,
     _confirm_arm_autonomy,
     _footer_lines,
     _freshness_style,
@@ -38,6 +40,7 @@ from keel.commands.tui import (
     _human_dt,
     _message_style,
     _paint,
+    _refresh_balance,
     _short_version,
     _stdio_is_interactive,
     _style_attrs,
@@ -242,6 +245,122 @@ def test_footer_lines_contains_keybinding_hints() -> None:
     text = footer.text.lower()
     for hint in ("quit", "help", "refresh", "autonomy", "fetch"):
         assert hint in text
+
+
+# -- available-to-buy balance (v3) ---------------------------------------------------------------
+
+
+def test_available_lines_none_is_empty() -> None:
+    assert _available_lines(None) == []
+
+
+def test_available_lines_with_amount_is_ok_style_and_informative() -> None:
+    available = AvailableBalance(Decimal("10234.5"), "USDC", NOW_TS, None)
+    lines = _available_lines(available)
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.style == "ok"
+    assert "live account" in line.text
+    assert "10,234.50" in line.text
+    assert "USDC" in line.text
+
+
+def test_available_lines_with_error_is_warn_style() -> None:
+    available = AvailableBalance(None, "USDC", NOW_TS, "no USDC balance")
+    lines = _available_lines(available)
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.style == "warn"
+    assert "unavailable" in line.text
+    assert "no USDC balance" in line.text
+
+
+def test_build_screen_includes_available_line_after_equity_before_positions() -> None:
+    report = _base_report()
+    available = AvailableBalance(Decimal("500.00"), "USDC", NOW_TS, None)
+    lines = build_screen(report, NOW_TS, available=available)
+    texts = [line.text for line in lines]
+    available_idx = next(i for i, t in enumerate(texts) if "live account" in t)
+    rail11_idx = next(i for i, t in enumerate(texts) if "rail11" in t.lower())
+    positions_idx = next(i for i, t in enumerate(texts) if "open positions" in t.lower())
+    assert rail11_idx < available_idx < positions_idx
+
+
+def test_build_screen_without_available_has_no_available_line() -> None:
+    """Default (no `available` kwarg) renders exactly as before -- protects `--once`."""
+    report = _base_report()
+    lines = build_screen(report, NOW_TS)
+    texts = " ".join(line.text.lower() for line in lines)
+    assert "live account" not in texts
+
+
+def test_refresh_balance_returns_amount_on_success() -> None:
+    config = _config()
+
+    def open_state() -> tuple[Any, Config]:
+        return object(), config
+
+    result = _refresh_balance(open_state, lambda: NOW_TS, lambda cfg: Decimal("123.45"))
+
+    assert result.amount == Decimal("123.45")
+    assert result.quote == config.quote_currency
+    assert result.updated_ts == NOW_TS
+    assert result.error is None
+
+
+def test_refresh_balance_none_amount_is_error_mentioning_quote_not_false_no_balance() -> None:
+    """`balance_fn` returning `None` covers BOTH "no matching account" and a swallowed
+    broker/auth/network error -- the message must not assert "no balance", which would wrongly
+    tell an operator a deposit never landed when the real cause could be unrelated."""
+    config = _config()
+
+    def open_state() -> tuple[Any, Config]:
+        return object(), config
+
+    result = _refresh_balance(open_state, lambda: NOW_TS, lambda cfg: None)
+
+    assert result.amount is None
+    assert result.quote == config.quote_currency
+    assert result.updated_ts == NOW_TS
+    assert result.error is not None
+    assert config.quote_currency in result.error
+    assert "unreadable" in result.error
+    assert "no " + config.quote_currency + " balance" != result.error
+
+
+def test_refresh_balance_raising_balance_fn_is_contained() -> None:
+    def open_state() -> tuple[Any, Config]:
+        return object(), _config()
+
+    def _raise(cfg: Config) -> Decimal | None:
+        raise RuntimeError("boom")
+
+    result = _refresh_balance(open_state, lambda: NOW_TS, _raise)
+
+    assert result.amount is None
+    assert result.updated_ts == NOW_TS
+    assert result.error is not None
+    assert "boom" in result.error
+
+
+def test_refresh_balance_raising_balance_fn_truncates_long_error() -> None:
+    """A stray huge (or sensitive) exception message must not be painted full-screen verbatim --
+    `.error` is bounded, and the loop this feeds never crashes either way."""
+    config = _config()
+
+    def open_state() -> tuple[Any, Config]:
+        return object(), config
+
+    long_message = "x" * 5000
+
+    def _raise(cfg: Config) -> Decimal | None:
+        raise RuntimeError(long_message)
+
+    result = _refresh_balance(open_state, lambda: NOW_TS, _raise)
+
+    assert result.amount is None
+    assert result.error is not None
+    assert len(result.error) <= 120
 
 
 # -- human-readable timestamps -------------------------------------------------------------------
@@ -609,6 +728,11 @@ def test_run_live_survives_transient_read_error_and_keeps_polling(
 
     def open_state() -> tuple[Repository, Any]:
         opens.append(1)
+        # `run_live` calls `open_state()` at least twice on the first normal-mode iteration: once
+        # for the status report itself (call 1, the one this test targets to exercise the per-poll
+        # read-error safeguard -- the balance refresh was deliberately moved AFTER the paint, so
+        # it no longer blocks the first frame), and once for the slow-cadence balance refresh
+        # (call 2, which swallows its own errors and never reaches this test's assertions).
         if len(opens) == 1:
             raise sqlite3.OperationalError("database is locked")
         return repo, config

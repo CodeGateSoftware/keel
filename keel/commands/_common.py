@@ -134,13 +134,23 @@ def _load_cfg(ctx: click.Context) -> Config:
     return config
 
 
-def _build_broker(config: Config) -> Any:  # pragma: no cover -- exercised only against fakes
-    """Construct the real, network-talking `CoinbaseClient`. Tests monkeypatch this function."""
+def _build_broker(  # pragma: no cover -- exercised only against fakes
+    config: Config, *, timeout: int | None = None
+) -> Any:
+    """Construct the real, network-talking `CoinbaseClient`. Tests monkeypatch this function.
+
+    `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no timeout),
+    matching every existing caller (the agent/executor broker path) exactly. Callers that cannot
+    tolerate a hung network call (e.g. `keel tui`'s live balance refresh, which must never freeze
+    the dashboard) pass an explicit bound.
+    """
     from coinbase.rest import RESTClient
 
     from keel.config import load_secrets
     from keel.data.cb_client import CoinbaseClient
 
     secrets = load_secrets()
-    transport = RESTClient(api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"))
+    transport = RESTClient(
+        api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"), timeout=timeout
+    )
     return CoinbaseClient(transport)
