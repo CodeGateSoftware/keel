@@ -258,6 +258,14 @@ def test_build_screen_title_has_no_raw_now_int() -> None:
     assert _human_dt(NOW_TS) in title.text
 
 
+def test_build_screen_title_drops_now_label() -> None:
+    """The header shows the human-readable clock but not the `now=` label itself."""
+    report = _base_report()
+    title = build_screen(report, NOW_TS)[0]
+    assert "now=" not in title.text
+    assert _human_dt(NOW_TS) in title.text
+
+
 def test_open_position_lines_use_human_readable_opened_at() -> None:
     pos = OpenPositionStatus(
         id=1,
