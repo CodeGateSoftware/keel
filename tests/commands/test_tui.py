@@ -29,6 +29,7 @@ from keel.commands.status import (
     SubscriptionStatusRow,
 )
 from keel.commands.tui import (
+    _SHORT_VERSION,
     ScreenLine,
     _confirm_arm_autonomy,
     _footer_lines,
@@ -37,6 +38,7 @@ from keel.commands.tui import (
     _human_dt,
     _message_style,
     _paint,
+    _short_version,
     _stdio_is_interactive,
     _style_attrs,
     _visible_slice,
@@ -250,14 +252,30 @@ def test_human_dt_matches_strftime_localtime() -> None:
     assert _human_dt(ts) == time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-def test_build_screen_title_shows_mode_without_datetime() -> None:
-    """The header is just `keel · <mode> mode` -- no clock, no `now=` label. (Event times like
-    a position's `opened_at` and autonomy lapse still render via `_human_dt`.)"""
+def test_build_screen_title_shows_version_and_mode_without_datetime() -> None:
+    """The header is `keel v<major>.<minor> · <mode> mode` -- version, no clock, no `now=` label.
+    (Event times like a position's `opened_at` and autonomy lapse still render via `_human_dt`.)"""
     report = _base_report()
     title = build_screen(report, NOW_TS)[0]
-    assert title.text == "keel · paper mode"
+    assert title.text == f"keel {_SHORT_VERSION} · paper mode"
     assert "now=" not in title.text
     assert _human_dt(NOW_TS) not in title.text
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("0.1.0", "v0.1"),
+        ("0.2.5", "v0.2"),
+        ("2.0", "v2.0"),
+        ("10.34.1+abc", "v10.34"),
+        ("unknown", "v?"),
+        ("1", "v?"),
+        ("", "v?"),
+    ],
+)
+def test_short_version(raw: str, expected: str) -> None:
+    assert _short_version(raw) == expected
 
 
 def test_open_position_lines_use_human_readable_opened_at() -> None:
