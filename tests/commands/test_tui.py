@@ -250,20 +250,14 @@ def test_human_dt_matches_strftime_localtime() -> None:
     assert _human_dt(ts) == time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-def test_build_screen_title_has_no_raw_now_int() -> None:
-    report = _base_report()
-    lines = build_screen(report, NOW_TS)
-    title = lines[0]
-    assert f"now={NOW_TS}" not in title.text
-    assert _human_dt(NOW_TS) in title.text
-
-
-def test_build_screen_title_drops_now_label() -> None:
-    """The header shows the human-readable clock but not the `now=` label itself."""
+def test_build_screen_title_shows_mode_without_datetime() -> None:
+    """The header is just `keel · <mode> mode` -- no clock, no `now=` label. (Event times like
+    a position's `opened_at` and autonomy lapse still render via `_human_dt`.)"""
     report = _base_report()
     title = build_screen(report, NOW_TS)[0]
+    assert title.text == "keel · paper mode"
     assert "now=" not in title.text
-    assert _human_dt(NOW_TS) in title.text
+    assert _human_dt(NOW_TS) not in title.text
 
 
 def test_open_position_lines_use_human_readable_opened_at() -> None:
