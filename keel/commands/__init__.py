@@ -6,7 +6,8 @@ seam, and the other top-level commands, then registers each group defined here v
 `cli.add_command(...)`.
 
 The broker-free command groups live here as standalone modules -- `db`, `trials`, `withdrawals`,
-`autonomy`, `rules`, `subscription` -- so the large CLI file stays a thin wiring layer. They draw
+`autonomy`, `rules`, `subscription`, `status` -- so the large CLI file stays a thin wiring layer.
+They draw
 the shared seams they need (`_open_repo`, `_load_cfg`, the confirmation gate, the disclaimer
 decorator) from `_common`, and the shared product-id derivation from `_products`; neither of those
 helper modules imports `keel.cli`, so there is no cycle. The `assets` group stays in `keel/cli.py`

@@ -1,0 +1,361 @@
+"""Tests for `keel status` -- the read-only, no-broker operator dashboard.
+
+Two layers, matching `keel/commands/status.py`'s split:
+
+- `gather_status` is a PURE function (`Repository` + `Config` + `now_ts` -> `StatusReport`
+  dataclass), driven directly here for every logic branch (Rail 11 halted/ok/unknown,
+  kill-switch rendering, positions, rule counts, freshness). No click, no CliRunner needed for
+  these.
+- The `keel status` command itself (human-readable + `--json`) gets one thin `CliRunner` pass,
+  since the rendering/wiring is what's left untested by the pure-function tests.
+
+Fixtures mirror `tests/test_agent.py::repo` (in-memory `Repository`, `set_state` seeding) and
+`tests/conftest.py::valid_config_path` (a real `config.yaml` on disk for the CLI test).
+"""
+
+from __future__ import annotations
+
+import json
+from decimal import Decimal
+from typing import Any
+
+import pytest
+from click.testing import CliRunner
+
+from keel.cli import cli
+from keel.commands.status import gather_status
+from keel.config import (
+    AutoTradeConfig,
+    Caps,
+    Config,
+    DcaConfig,
+    MarketDataConfig,
+    MoneyMgmtConfig,
+)
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.types import Candle, Granularity
+
+NOW_TS = 1_800_000_000
+
+
+@pytest.fixture
+def repo() -> Repository:
+    conn = connect(":memory:")
+    migrate(conn)
+    r = Repository(conn)
+    r.set_state("kill_switch", False)
+    return r
+
+
+def _config(**overrides: Any) -> Config:
+    base: dict[str, Any] = dict(
+        allowlist=["BTC", "ETH"],
+        target_weights={},
+        risk_pct=Decimal("0.01"),
+        caps=Caps(
+            max_per_order_usd=Decimal("100000"),
+            max_per_day_usd=Decimal("300000"),
+            max_exposure_usd=Decimal("1000000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        ),
+        auto_trade=AutoTradeConfig(mode="paper", interval_sec=900),
+        money_mgmt=MoneyMgmtConfig(
+            max_total_dd_pct=Decimal("0.20"), max_weekly_dd_pct=Decimal("0.08")
+        ),
+        dca=DcaConfig(budget_usd=Decimal("50"), cadence_days=7),
+    )
+    base.update(overrides)
+    return Config(**base)
+
+
+# -- mode / kill-switch / autonomy -----------------------------------------------------------
+
+
+def test_paper_mode_surfaces_equity_and_ok_drawdown(repo: Repository) -> None:
+    repo.set_state("equity_state_mode", "paper")
+    repo.set_state("paper_cash_usdc", Decimal("955.25"))
+    repo.set_state("drawdown_total_pct", Decimal("0.05"))
+    repo.set_state("drawdown_weekly_pct", Decimal("0.01"))
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.mode == "paper"
+    assert report.equity_state_mode == "paper"
+    assert report.paper_cash_usdc == Decimal("955.25")
+    assert report.drawdown_total_pct == Decimal("0.05")
+    assert report.drawdown_weekly_pct == Decimal("0.01")
+    assert report.rail11_status == "ok"
+
+
+def test_confirm_mode_reports_no_paper_cash(repo: Repository) -> None:
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
+    assert report.mode == "confirm"
+    assert report.paper_cash_usdc is None
+
+
+def test_rail11_halted_on_total_drawdown_breach(repo: Repository) -> None:
+    repo.set_state("drawdown_total_pct", Decimal("0.20"))  # == ceiling: >= trips it
+    repo.set_state("drawdown_weekly_pct", Decimal("0.00"))
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.rail11_status == "HALTED"
+
+
+def test_rail11_halted_on_weekly_drawdown_breach(repo: Repository) -> None:
+    repo.set_state("drawdown_total_pct", Decimal("0.00"))
+    repo.set_state("drawdown_weekly_pct", Decimal("0.09"))  # > 0.08 ceiling
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.rail11_status == "HALTED"
+
+
+def test_rail11_unknown_when_state_never_written(repo: Repository) -> None:
+    """A fresh DB has never written `drawdown_total_pct`/`drawdown_weekly_pct` -- unknown must
+    not be misread as safe ("ok") nor as an alarm ("HALTED")."""
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.drawdown_total_pct is None
+    assert report.drawdown_weekly_pct is None
+    assert report.rail11_status == "unknown"
+
+
+def test_kill_switch_defaults_engaged(repo: Repository) -> None:
+    """`get_state("kill_switch", default=True)` fails closed -- an UNSET key must read engaged,
+    not clear. This repo fixture explicitly clears it (`set_state("kill_switch", False)`), so
+    exercise the true default via a second, untouched connection."""
+    conn = connect(":memory:")
+    migrate(conn)
+    fresh = Repository(conn)
+
+    report = gather_status(fresh, _config(), now_ts=NOW_TS)
+
+    assert report.kill_switch_engaged is True
+
+
+def test_kill_switch_clear_when_resumed(repo: Repository) -> None:
+    repo.set_state("kill_switch", False)
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.kill_switch_engaged is False
+
+
+def test_autonomy_reflects_profile(repo: Repository) -> None:
+    repo.set_autonomous(True, now_ts=NOW_TS - 10)
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.autonomy.live is True
+    assert report.autonomy.autonomous is True
+
+
+def test_autonomy_off_by_default(repo: Repository) -> None:
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.autonomy.live is False
+
+
+# -- open positions ---------------------------------------------------------------------------
+
+
+def test_no_open_positions_is_empty_list(repo: Repository) -> None:
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.open_positions == []
+
+
+def _insert_bracket_order(repo: Repository, product_id: str, ts: int) -> int:
+    """`positions.bracket_order_id` is a real FK into `orders`; seed one to attach."""
+    return repo.insert_order(
+        dict(
+            mode="live",
+            product_id=product_id,
+            side="SELL",
+            order_type="limit",
+            qty=Decimal("0.01"),
+            limit_price=Decimal("70000"),
+            status="pending",
+            fee=Decimal("0"),
+            expected_fill=None,
+            actual_fill=None,
+            raw_response=None,
+            confirmation="autonomous",
+            rule_id=None,
+            created_at=ts,
+            updated_at=ts,
+        )
+    )
+
+
+def test_open_position_appears_in_report(repo: Repository) -> None:
+    bracket_id = _insert_bracket_order(repo, "BTC-USD", NOW_TS - 3600)
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS - 3600,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        bracket_order_id=bracket_id,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert len(report.open_positions) == 1
+    pos = report.open_positions[0]
+    assert pos.product_id == "BTC-USD"
+    assert pos.qty == Decimal("0.01")
+    assert pos.entry_price == Decimal("65000")
+    assert pos.opened_at == NOW_TS - 3600
+    assert pos.has_bracket is True
+
+
+def test_open_position_without_bracket_reports_false(repo: Repository) -> None:
+    repo.open_position(
+        product_id="ETH-USD",
+        rule_name="dca",
+        opened_at=NOW_TS,
+        qty=Decimal("1"),
+        entry_fill=Decimal("3000"),
+        entry_fee=Decimal("2"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.open_positions[0].has_bracket is False
+
+
+# -- rules ---------------------------------------------------------------------------------
+
+
+def test_rule_counts_grouped_by_status(repo: Repository) -> None:
+    repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"}, status="candidate")
+    repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="candidate")
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="live")
+    repo.insert_rule("mean_reversion", {"product_id": "SOL-USD"}, status="disabled")
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.rule_counts == {"candidate": 2, "live": 1, "disabled": 1}
+
+
+def test_live_rules_are_listed_with_kind_and_product(repo: Repository) -> None:
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD", "lookback": 20}, status="live")
+    repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="candidate")
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert len(report.live_rules) == 1
+    rule = report.live_rules[0]
+    assert rule.kind == "turtle_breakout"
+    assert rule.product_id == "BTC-USD"
+    assert rule.params["lookback"] == 20
+
+
+def test_no_rules_gives_empty_counts_and_list(repo: Repository) -> None:
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.rule_counts == {}
+    assert report.live_rules == []
+
+
+# -- data freshness ---------------------------------------------------------------------------
+
+
+def _candle(ts: int, price: str = "100") -> Candle:
+    p = Decimal(price)
+    return Candle(ts=ts, open=p, high=p, low=p, close=p, volume=Decimal("1"))
+
+
+def test_data_freshness_uses_finest_granularity_and_computes_age(repo: Repository) -> None:
+    # Two candles on the finest configured granularity (ONE_HOUR); a coarser ONE_DAY series
+    # (seeded with a far staler ts) proves freshness does NOT read that one instead.
+    repo.upsert_candles(
+        "BTC-USD",
+        Granularity.ONE_HOUR,
+        [_candle(NOW_TS - 7200), _candle(NOW_TS - 3600)],
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(NOW_TS - 999_999)])
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    btc = next(f for f in report.data_freshness if f.product_id == "BTC-USD")
+    assert btc.last_ts == NOW_TS - 3600
+    assert btc.age_sec == 3600
+    eth = next(f for f in report.data_freshness if f.product_id == "ETH-USD")
+    assert eth.last_ts is None
+    assert eth.age_sec is None
+
+
+# -- subscriptions (rail 14, optional section) ------------------------------------------------
+
+
+def test_subscriptions_empty_when_none_attested(repo: Repository) -> None:
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.subscriptions == []
+
+
+def test_subscriptions_surfaced_when_attested(repo: Repository) -> None:
+    from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue="coinbase",
+            tier_name="Preferred",
+            free_volume_usd=Decimal("10000"),
+            pacing="opportunistic",
+            subscription_usd_month=Decimal("29.99"),
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=NOW_TS - 1000,
+            attest_due_ts=NOW_TS + 1_000_000,
+        )
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert len(report.subscriptions) == 1
+    row = report.subscriptions[0]
+    assert row.venue == "coinbase"
+    assert row.effective_status == "active"
+
+
+# -- the `keel status` command --------------------------------------------------------------
+
+
+def _repo_at(db_path) -> Repository:
+    conn = connect(str(db_path))
+    migrate(conn)
+    return Repository(conn)
+
+
+def test_status_command_runs_read_only_and_prints_key_facts(tmp_path, valid_config_path) -> None:
+    db_path = tmp_path / "keel.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "status"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "mode: paper" in result.output
+    assert "kill_switch: clear" in result.output.lower() or "clear" in result.output.lower()
+    assert "no open positions" in result.output.lower()
+
+
+def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_path) -> None:
+    db_path = tmp_path / "keel.db"
+    seeded = _repo_at(db_path)
+    seeded.set_state("kill_switch", False)
+    seeded.set_state("drawdown_total_pct", Decimal("0.01"))
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "status", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "paper"
+    assert payload["kill_switch_engaged"] is False
+    assert payload["rail11_status"] in {"ok", "HALTED", "unknown"}
+    assert "open_positions" in payload
+    assert "rule_counts" in payload
+    assert "data_freshness" in payload

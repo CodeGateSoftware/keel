@@ -9,8 +9,10 @@ Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-swit
 `resume-entries` (clear an armed rail-16 consecutive-loss halt), `record-flow`
 (declare a deposit/withdrawal so rail 11 does not read it as P&L) and `reset-hwm`
 (reset rail 11's high-water mark),
-`subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live), and a
-Phase-4 `insights` stub.
+`subscription attest|set|show` (the per-venue, user-attested allowance rail 14 reads live),
+`status` (`commands.status`: the read-only, no-broker operator dashboard the paper-mode-fidelity
+spec deferred -- mode/kill-switch/autonomy/Rail 11/positions/rules/data freshness, plus `--json`),
+and a Phase-4 `insights` stub.
 
 **Dangerous commands ask a human; nothing needs a stored secret.** The former scrypt passphrase
 gate is gone (see `2026-07-21-security-simplification-design.md`). Five commands re-permit trading
@@ -78,6 +80,7 @@ from keel.commands._products import _default_sim_products, _history_product
 from keel.commands.autonomy import autonomy_group
 from keel.commands.db import db_group
 from keel.commands.rules import rules_group, rules_seed
+from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
 from keel.commands.trials import trials_group
 from keel.commands.withdrawals import withdrawals_group
@@ -1627,6 +1630,13 @@ def simulate(
 
 # The `subscription` group is defined in `keel.commands.subscription`; register it here.
 cli.add_command(subscription_group)
+
+
+# -- status (interim operator-observability dashboard, no broker call) --------------------------
+
+# The paper-mode-fidelity spec deferred a dedicated `keel status` command as a follow-up; it is
+# defined in `keel.commands.status` and registered here.
+cli.add_command(status_cmd)
 
 
 # -- kill / resume ------------------------------------------------------------------------------
