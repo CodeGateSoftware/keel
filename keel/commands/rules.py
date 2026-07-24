@@ -8,11 +8,13 @@ never the broker seam.
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
 from typing import Any
 
 import click
+from keel_core.telemetry import log_event
 
 from keel import agent
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
@@ -21,6 +23,8 @@ from keel.data.repository import Repository
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Granularity
+
+logger = logging.getLogger(__name__)
 
 # `rules demote` steps a rule back one lifecycle stage; `disabled` is terminal (see
 # `strategy.promotion`'s own `_PROMOTE_NEXT` docstring) and so is not a demote target.
@@ -107,13 +111,57 @@ def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) ->
 @click.option(
     "--granularity", default=None, help="Override the candle granularity for the backtest."
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Skip the backtest/promotion gate and advance the rule one lifecycle step directly "
+    "(candidate->paper, or paper->live). For a deliberate, un-gated paper-forward start when "
+    "a rule's backtest can never reach the min_trades floor -- analogous to `rules seed "
+    "--status live`'s gate bypass.",
+)
 @click.pass_context
 @with_disclaimer
-def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
-    """Re-run a rule's backtest and advance its lifecycle status if it clears the floor."""
+def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, force: bool) -> None:
+    """Re-run a rule's backtest and advance its lifecycle status if it clears the floor.
+
+    With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
+    directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can
+    NEVER produce `min_trades` (default 100) trades -- without a bypass such a rule could never
+    reach `paper` status, yet the whole point of a paper-forward is to accrue the out-of-sample
+    trades the backtest can't. Use deliberately and audit the (loud) warning this prints.
+    """
     repo = _open_repo(ctx)
-    config = _load_cfg(ctx)
     row = _require_rule_row(ctx, repo, rule_id)
+
+    if force:
+        target = promotion_mod.next_status(row["status"])
+        if target is None:
+            click.echo(
+                f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; "
+                "nothing to promote"
+            )
+            return
+        repo.update_rule_status(rule_id, target)
+        click.echo(
+            f"⚠️  FORCE-PROMOTING rule {rule_id} ({row['kind']}): {row['status']} -> {target}, "
+            "BYPASSING the backtest/promotion gate. This is for a deliberate, un-gated "
+            "paper-forward start (e.g. a low-frequency trend-follower whose backtest can never "
+            "reach the min_trades floor). Confirm this is intentional and monitor accordingly."
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "rules.promote_forced",
+            rule_id=rule_id,
+            kind=row["kind"],
+            from_status=row["status"],
+            to_status=target,
+        )
+        click.echo(f"rule {rule_id} ({row['kind']}): status -> {target}")
+        return
+
+    config = _load_cfg(ctx)
     rule = agent._build_rule(row)
     stats = _run_backtest(ctx, repo, rule, granularity)
 

@@ -23,6 +23,7 @@ from keel.strategy.promotion import (
     can_promote,
     floor_for_class,
     g4_pbo_gate,
+    next_status,
     promotion_class_of,
     should_demote,
     transition,
@@ -327,6 +328,25 @@ def test_transition_unknown_rule_raises(repo: Repository) -> None:
     cfg = PromotionConfig()
     with pytest.raises(ValueError):
         transition(repo, "no-such-rule", _stats(), cfg)
+
+
+# -- next_status: public un-gated-step helper (funded paper-forward, `rules promote --force`) --
+
+
+def test_next_status_candidate_to_paper() -> None:
+    assert next_status("candidate") == "paper"
+
+
+def test_next_status_paper_to_live() -> None:
+    assert next_status("paper") == "live"
+
+
+def test_next_status_live_has_no_next_step() -> None:
+    assert next_status("live") is None
+
+
+def test_next_status_disabled_has_no_next_step() -> None:
+    assert next_status("disabled") is None
 
 
 # -- G4: PBO conjunction gate (spec §7) ----------------------------------------

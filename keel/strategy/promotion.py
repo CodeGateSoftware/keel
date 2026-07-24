@@ -36,6 +36,19 @@ from keel.strategy.backtest import BacktestResult
 _PROMOTE_NEXT: dict[str, str] = {"candidate": "paper", "paper": "live"}
 
 
+def next_status(status: str) -> str | None:
+    """The lifecycle status one un-gated step ahead of `status` (`candidate`->`paper`,
+    `paper`->`live`), or `None` when `status` has no next step (`live`, `disabled`, or any
+    unrecognized status).
+
+    Public wrapper around `_PROMOTE_NEXT`, for a caller that wants to advance a rule's status
+    WITHOUT going through `transition`'s backtest/`can_promote` gate -- e.g. `rules promote
+    --force`, a deliberate, auditable bypass for starting a paper-forward whose backtest can
+    never reach the promotion floor (see that command's docstring).
+    """
+    return _PROMOTE_NEXT.get(status)
+
+
 @dataclass
 class PromotionConfig:
     """Performance floors a rule's stats must clear to promote (spec §11/§4.5)."""

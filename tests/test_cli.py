@@ -332,6 +332,114 @@ def test_rules_promote_stays_when_floor_not_cleared(tmp_path, valid_config_path)
     assert "status -> candidate" in result.output
 
 
+# -- rules promote --force (funded paper-forward: un-gated lifecycle step) ------------------
+
+
+def test_rules_promote_force_advances_candidate_to_paper_without_a_passing_backtest(tmp_path):
+    """A low-frequency trend-follower's backtest can never clear the `min_trades=100` floor,
+    yet the whole point of a paper-forward is to accrue the out-of-sample trades the backtest
+    can't -- `--force` advances the lifecycle step directly, no backtest/gate involved. (0
+    candles here stands in for "backtest that could never reach the floor".)"""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "status -> paper" in result.output
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "paper"
+
+
+def test_rules_promote_force_advances_paper_to_live(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="paper")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "status -> live" in result.output
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "live"
+
+
+def test_rules_promote_force_on_live_rule_is_a_noop(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to promote" in result.output.lower()
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "live"
+
+
+def test_rules_promote_force_on_disabled_rule_is_a_noop(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="disabled")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to promote" in result.output.lower()
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "disabled"
+
+
+def test_rules_promote_force_prints_a_loud_bypass_warning(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "bypass" in result.output.lower()
+
+
+def test_rules_promote_without_force_still_gates_on_the_backtest(tmp_path, valid_config_path):
+    """Unchanged non-force behavior: no candles -> the backtest can't clear the floor -> the
+    rule stays `candidate`, exactly as `test_rules_promote_stays_when_floor_not_cleared` covers."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "rules", "promote", str(rule_id),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "status -> candidate" in result.output
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "candidate"
+
+
 def test_rules_demote_steps_back_one_stage(tmp_path):
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)

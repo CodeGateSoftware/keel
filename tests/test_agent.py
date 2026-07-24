@@ -1187,6 +1187,32 @@ def test_seed_falls_back_to_config_when_broker_read_none(repo):
     assert repo.get_state("paper_cash_usdc") == Decimal("10000")
 
 
+def test_seed_prefers_configured_funding_over_real_equity_when_broker_IS_readable(repo):
+    """A funded paper-forward: `config.paper.starting_equity_usd > 0` is a DELIBERATE funding
+    override and must win even when the broker's real mark-to-market equity is readable (and
+    very different) -- the whole point is to rehearse at a specific funded amount, not at
+    whatever the real account happens to hold. `FakeBroker`'s real balance ($1,000,000) would
+    produce a wildly different seed if the real-equity read were still used."""
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+
+
+def test_seed_uses_real_equity_when_starting_equity_usd_is_zero(repo, monkeypatch):
+    """`starting_equity_usd == 0` (the default) keeps the existing behavior: seed from real
+    broker mark-to-market equity, not the (disabled) funding override."""
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    monkeypatch.setattr(agent, "_mark_to_market_equity", lambda *a, **k: Decimal("42000"))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("42000")
+
+
 # -- paper fills sized off paper equity (P4 Task 6) -----------------------------
 
 
