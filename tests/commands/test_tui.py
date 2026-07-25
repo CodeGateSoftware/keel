@@ -20,6 +20,16 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
+from keel.commands.insights import (
+    AccountSummary as InsightsAccountSummary,
+)
+from keel.commands.insights import (
+    GateDistance,
+    InsightsReport,
+    JournalEntry,
+    JournalReport,
+    RuleTrackRecord,
+)
 from keel.commands.status import (
     AutonomyStatus,
     OpenPositionStatus,
@@ -46,6 +56,7 @@ from keel.commands.tui import (
     _style_attrs,
     _visible_slice,
     build_help_screen,
+    build_insights_screen,
     build_screen,
     render_plain,
     run_live,
@@ -243,7 +254,7 @@ def test_footer_lines_contains_keybinding_hints() -> None:
     footer = lines[0]
     assert footer.style == "muted"
     text = footer.text.lower()
-    for hint in ("quit", "help", "refresh", "autonomy", "fetch"):
+    for hint in ("quit", "help", "refresh", "autonomy", "fetch", "insights"):
         assert hint in text
 
 
@@ -566,6 +577,12 @@ def _fake_curses(*, has_colors: bool = True) -> SimpleNamespace:
         COLOR_RED=1,
         COLOR_YELLOW=2,
         COLOR_GREEN=3,
+        KEY_UP=1001,
+        KEY_DOWN=1002,
+        KEY_PPAGE=1003,
+        KEY_NPAGE=1004,
+        KEY_HOME=1005,
+        KEY_END=1006,
         error=_FakeCursesError,
         has_colors=lambda: has_colors,
         start_color=lambda: calls.append("start_color"),
@@ -746,6 +763,122 @@ def test_run_live_survives_transient_read_error_and_keeps_polling(
     assert any("paper" in t for t in painted_texts)
 
 
+class _KeySequenceStdscr(_FakeStdscr):
+    """Like `_FakeStdscr`, but `getch()` replays a scripted sequence of keycodes, one per poll,
+    then returns `q` forever once exhausted -- so a test can drive the loop through an exact
+    sequence of mode transitions deterministically."""
+
+    def __init__(self, height: int, width: int, keys: list[int]) -> None:
+        super().__init__(height, width)
+        self._keys = list(keys)
+
+    def timeout(self, ms: int) -> None:
+        pass
+
+    def getch(self) -> int:
+        if self._keys:
+            return self._keys.pop(0)
+        return ord("q")
+
+
+def test_run_live_i_opens_insights_overlay_and_esc_closes_it(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config()
+    # poll1: normal -> 'i' opens insights. poll2: insights (offset 0). poll3: Esc closes back to
+    # normal. poll4: normal -> 'q' quits (via the stdscr's post-exhaustion default).
+    keys = [ord("i"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    insights_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- insights" in t)
+    # Proves Esc (key 27) actually closed the overlay and returned control to the dashboard --
+    # not just that the loop happened to end (which `q` would also produce, even if the Esc
+    # branch itself were deleted): a LATER frame, after the insights heading was painted, must
+    # paint the normal-mode dashboard's own title line again.
+    dashboard_after_idx = next(
+        i for i, t in enumerate(painted_texts) if i > insights_idx and "paper mode" in t
+    )
+    assert dashboard_after_idx > insights_idx
+
+
+def test_run_live_scrolling_keys_move_insights_offset(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config()
+    fake_curses = _fake_curses()
+    # poll1: normal -> 'i'. poll2: insights offset=0, KEY_DOWN -> offset=1. poll3: insights
+    # offset=1, paint recorded. Esc closes. poll4: normal -> quits (post-exhaustion default).
+    keys = [ord("i"), fake_curses.KEY_DOWN, 27]
+    stdscr = _KeySequenceStdscr(height=5, width=80, keys=keys)
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    # Each frame paints exactly `height` (5) addstr calls (the insights content is long enough
+    # to fill the window). Frame1=normal, Frame2=insights offset=0, Frame3=insights offset=1.
+    frames = [stdscr.calls[i : i + 5] for i in range(0, len(stdscr.calls), 5)]
+    assert len(frames) >= 3
+    frame2_top = frames[1][0][2]
+    frame3_top = frames[2][0][2]
+    assert "keel tui -- insights" in frame2_top  # offset 0 starts at the heading
+    assert frame2_top != frame3_top  # scrolling down moved the visible window
+
+
+def test_run_live_insights_survives_transient_read_error_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The insights branch has its OWN `try`/`except` (separate from normal mode's), guarding
+    `open_state`/`gather_status`/`build_insights_report`/`build_journal_report`. A transient
+    failure there (e.g. `database is locked` from a concurrent `keel agent` writer) must paint an
+    `insights read failed` alert line -- not crash or hang the loop -- and the loop must still be
+    able to close the overlay and keep running afterwards."""
+    config = _config()
+    # poll1: normal -> open_state call #1 (status) + call #2 (balance refresh) both succeed;
+    # 'i' opens insights. poll2: insights -> open_state call #3 raises; Esc closes back to
+    # normal. poll3: normal -> open_state call #4 succeeds; 'q' quits (post-exhaustion default).
+    keys = [ord("i"), 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    opens: list[int] = []
+
+    def open_state() -> tuple[Repository, Any]:
+        opens.append(1)
+        if len(opens) == 3:
+            raise RuntimeError("database is locked")
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    # The loop returned (no hang/crash) and made further open_state calls after the failure.
+    assert len(opens) >= 4
+    painted_texts = [call[2] for call in stdscr.calls]
+    failed_idx = next(i for i, t in enumerate(painted_texts) if "insights read failed" in t)
+    assert "database is locked" in painted_texts[failed_idx]
+    # ... and the loop kept going afterwards: Esc still closed the (failed) overlay and a later
+    # frame painted the normal dashboard again.
+    assert any(
+        i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts)
+    )
+
+
 def test_run_live_read_error_does_not_swallow_keyboard_interrupt(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -811,6 +944,185 @@ def test_visible_slice_offset_past_end_returns_tail() -> None:
 def test_visible_slice_empty_lines_never_raises() -> None:
     assert _visible_slice([], offset=5, height=10) == []
     assert _visible_slice([], offset=0, height=0) == []
+
+
+# -- build_insights_screen (pure, reuses keel.commands.insights renderers) ----------------------
+
+
+def _insights_account(**overrides: Any) -> InsightsAccountSummary:
+    base: dict[str, Any] = dict(
+        mode="paper",
+        equity_state_mode="paper",
+        high_water_mark=Decimal("10000"),
+        drawdown_total_pct=Decimal("0.05"),
+        drawdown_weekly_pct=Decimal("0.01"),
+        max_total_dd_pct=Decimal("0.20"),
+        max_weekly_dd_pct=Decimal("0.08"),
+        rail11_status="ok",
+        paper_cash_usdc=Decimal("955.25"),
+    )
+    base.update(overrides)
+    return InsightsAccountSummary(**base)
+
+
+def _gate(**overrides: Any) -> GateDistance:
+    base: dict[str, Any] = dict(
+        rule_name="turtle_breakout",
+        promotion_class="default",
+        n_trades=12,
+        min_trades=30,
+        trades_remaining=18,
+        win_rate=0.55,
+        min_win_rate=0.5,
+        realized_rr=Decimal("1.8"),
+        min_rr=Decimal("1.5"),
+        expectancy=Decimal("12.5"),
+        min_expectancy=Decimal("0"),
+        passing=False,
+        blocking_reasons=["n_trades 12 < 30"],
+    )
+    base.update(overrides)
+    return GateDistance(**base)
+
+
+def _rule_track_record(**overrides: Any) -> RuleTrackRecord:
+    base: dict[str, Any] = dict(
+        rule_name="turtle_breakout",
+        status="paper",
+        promotion_class="default",
+        n_trades=12,
+        win_rate=0.55,
+        avg_win=Decimal("25.00"),
+        avg_loss=Decimal("-14.00"),
+        realized_rr=Decimal("1.79"),
+        expectancy=Decimal("12.5"),
+        profit_factor=Decimal("2.1"),
+        max_drawdown=Decimal("30.0"),
+        significant=False,
+        gate=_gate(),
+    )
+    base.update(overrides)
+    return RuleTrackRecord(**base)
+
+
+def _insights_report(**overrides: Any) -> InsightsReport:
+    base: dict[str, Any] = dict(
+        now_ts=NOW_TS,
+        account=_insights_account(),
+        rules=[_rule_track_record()],
+        closed_trade_count=12,
+    )
+    base.update(overrides)
+    return InsightsReport(**base)
+
+
+def _journal_entry(**overrides: Any) -> JournalEntry:
+    base: dict[str, Any] = dict(
+        closed_at=NOW_TS - 60,
+        opened_at=NOW_TS - 3600,
+        rule_name="turtle_breakout",
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("64000"),
+        exit_fill=Decimal("65000"),
+        pnl_net=Decimal("10.00"),
+        fees=Decimal("0.50"),
+        r_multiple=Decimal("1.2"),
+        is_dca=False,
+        outcome="win",
+    )
+    base.update(overrides)
+    return JournalEntry(**base)
+
+
+def _journal_report(**overrides: Any) -> JournalReport:
+    base: dict[str, Any] = dict(
+        now_ts=NOW_TS,
+        mode="paper",
+        entries=[_journal_entry()],
+        total_count=1,
+        filters={"rule": None, "asset": None, "since_ts": None, "until_ts": None,
+                 "limit": 5, "include_open": False},
+    )
+    base.update(overrides)
+    return JournalReport(**base)
+
+
+def test_build_insights_screen_is_nonempty_and_titled() -> None:
+    report = _insights_report()
+    lines = build_insights_screen(report)
+    assert lines
+    assert lines[0].style == "heading"
+    assert "insights" in lines[0].text.lower()
+
+
+def test_build_insights_screen_includes_rule_name_and_gate() -> None:
+    report = _insights_report()
+    lines = build_insights_screen(report)
+    texts = " ".join(line.text for line in lines)
+    assert "turtle_breakout" in texts
+    assert "gate:" in texts
+
+
+def test_build_insights_screen_includes_account_summary_line() -> None:
+    report = _insights_report()
+    lines = build_insights_screen(report)
+    texts = " ".join(line.text for line in lines)
+    assert "mode: paper" in texts
+    assert "paper_cash_usdc" in texts
+
+
+def test_build_insights_screen_handles_zero_trade_report_with_friendly_line() -> None:
+    """An empty-DB/zero-trade report must render a friendly explanatory line, not a blank."""
+    report = _insights_report(rules=[], closed_trade_count=0)
+    lines = build_insights_screen(report)
+    texts = [line.text for line in lines]
+    assert any(t.strip() for t in texts)  # not all-blank
+    joined = " ".join(texts).lower()
+    assert "no rule track record yet" in joined
+
+
+def test_build_insights_screen_gate_passing_is_ok_style() -> None:
+    passing_gate = _gate(passing=True, blocking_reasons=[])
+    report = _insights_report(rules=[_rule_track_record(gate=passing_gate)])
+    lines = build_insights_screen(report)
+    gate_line = next(line for line in lines if line.text.strip().startswith("gate:"))
+    assert gate_line.style == "ok"
+    assert "PASSING" in gate_line.text
+
+
+def test_build_insights_screen_gate_blocked_is_warn_style() -> None:
+    report = _insights_report(rules=[_rule_track_record(gate=_gate(passing=False))])
+    lines = build_insights_screen(report)
+    gate_line = next(line for line in lines if line.text.strip().startswith("gate:"))
+    assert gate_line.style == "warn"
+    assert "blocked" in gate_line.text
+
+
+def test_build_insights_screen_without_journal_report_omits_recent_trades() -> None:
+    report = _insights_report()
+    lines = build_insights_screen(report)
+    texts = " ".join(line.text.lower() for line in lines)
+    assert "recent trades" not in texts
+
+
+def test_build_insights_screen_includes_journal_tail_when_provided() -> None:
+    report = _insights_report()
+    journal = _journal_report()
+    lines = build_insights_screen(report, journal)
+    texts = " ".join(line.text for line in lines)
+    assert "recent trades" in texts.lower()
+    assert "BTC-USD" in texts
+
+
+def test_build_insights_screen_is_read_only_pure() -> None:
+    """Calling it twice on the same fixture reports must be idempotent -- it never mutates its
+    inputs (frozen dataclasses would raise on mutation anyway, but this guards intent)."""
+    report = _insights_report()
+    journal = _journal_report()
+    first = build_insights_screen(report, journal)
+    second = build_insights_screen(report, journal)
+    assert [line.text for line in first] == [line.text for line in second]
 
 
 # -- toggle_autonomy / _guarded (injectable actions, no curses/network) ---------------------------
