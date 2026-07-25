@@ -800,7 +800,15 @@ def test_run_live_i_opens_insights_overlay_and_esc_closes_it(
     run_live(open_state, lambda: NOW_TS, interval=0.01)
 
     painted_texts = [call[2] for call in stdscr.calls]
-    assert any("keel tui -- insights" in t for t in painted_texts)
+    insights_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- insights" in t)
+    # Proves Esc (key 27) actually closed the overlay and returned control to the dashboard --
+    # not just that the loop happened to end (which `q` would also produce, even if the Esc
+    # branch itself were deleted): a LATER frame, after the insights heading was painted, must
+    # paint the normal-mode dashboard's own title line again.
+    dashboard_after_idx = next(
+        i for i, t in enumerate(painted_texts) if i > insights_idx and "paper mode" in t
+    )
+    assert dashboard_after_idx > insights_idx
 
 
 def test_run_live_scrolling_keys_move_insights_offset(
@@ -828,6 +836,47 @@ def test_run_live_scrolling_keys_move_insights_offset(
     frame3_top = frames[2][0][2]
     assert "keel tui -- insights" in frame2_top  # offset 0 starts at the heading
     assert frame2_top != frame3_top  # scrolling down moved the visible window
+
+
+def test_run_live_insights_survives_transient_read_error_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The insights branch has its OWN `try`/`except` (separate from normal mode's), guarding
+    `open_state`/`gather_status`/`build_insights_report`/`build_journal_report`. A transient
+    failure there (e.g. `database is locked` from a concurrent `keel agent` writer) must paint an
+    `insights read failed` alert line -- not crash or hang the loop -- and the loop must still be
+    able to close the overlay and keep running afterwards."""
+    config = _config()
+    # poll1: normal -> open_state call #1 (status) + call #2 (balance refresh) both succeed;
+    # 'i' opens insights. poll2: insights -> open_state call #3 raises; Esc closes back to
+    # normal. poll3: normal -> open_state call #4 succeeds; 'q' quits (post-exhaustion default).
+    keys = [ord("i"), 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    opens: list[int] = []
+
+    def open_state() -> tuple[Repository, Any]:
+        opens.append(1)
+        if len(opens) == 3:
+            raise RuntimeError("database is locked")
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    # The loop returned (no hang/crash) and made further open_state calls after the failure.
+    assert len(opens) >= 4
+    painted_texts = [call[2] for call in stdscr.calls]
+    failed_idx = next(i for i, t in enumerate(painted_texts) if "insights read failed" in t)
+    assert "database is locked" in painted_texts[failed_idx]
+    # ... and the loop kept going afterwards: Esc still closed the (failed) overlay and a later
+    # frame painted the normal dashboard again.
+    assert any(
+        i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts)
+    )
 
 
 def test_run_live_read_error_does_not_swallow_keyboard_interrupt(
