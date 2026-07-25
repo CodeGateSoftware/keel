@@ -397,6 +397,24 @@ def test_a_rehydrated_position_still_closes_with_its_original_rule_id(repo):
     assert repo.get_order(exit_id)["rule_id"] == rule_id
 
 
+def test_a_rehydrated_position_with_a_legacy_null_rule_id_still_closes_without_crashing(repo):
+    """A pre-change entry order (written before this fix, or from a signal with no `rule_id`)
+    has `rule_id = NULL` in the DB. `_load_open_positions` reads it via `order.get("rule_id")`,
+    not `order["rule_id"]`/direct attribute access on a dataclass default -- proving the legacy
+    NULL case rehydrates cleanly (no KeyError/crash) and the resulting exit also writes NULL,
+    never fabricating an id that was never there.
+    """
+    first = PaperTrader(repo)
+    entry_order_id = first.on_signal(_enter_signal())  # no rule_id -> NULL in the DB
+    assert repo.get_order(entry_order_id)["rule_id"] is None
+
+    resumed = PaperTrader(repo)
+    exit_id = resumed.on_candle("BTC-USD", _candle(2_000, "110", "125", "108", "122"))
+
+    assert exit_id is not None
+    assert repo.get_order(exit_id)["rule_id"] is None
+
+
 def test_a_closed_position_does_NOT_reopen_on_rehydration(repo):
     first = PaperTrader(repo)
     first.on_signal(_enter_signal())

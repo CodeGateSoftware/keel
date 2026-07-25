@@ -437,7 +437,7 @@ def test_paper_mode_is_reported_as_paper_not_confirm(repo):
 
 
 def test_held_position_whose_exit_fires_gets_an_exit_order(repo):
-    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    rule_id = repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
     _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
     repo.set_state(f"position_rule:{PRODUCT}", "fake_exit")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -452,6 +452,9 @@ def test_held_position_whose_exit_fires_gets_an_exit_order(repo):
     sell_orders = [o for o in orders if o["side"] == "SELL"]
     assert len(sell_orders) == 1
     assert sell_orders[0]["qty"] == Decimal("0.1")
+    # the exit Signal built in `_handle_exits` threads the owning rule's real DB id --
+    # same fix as the ENTER path, exercised here on the LIVE EXIT path.
+    assert sell_orders[0]["rule_id"] == rule_id
 
     # the position is no longer tracked as open once the exit is placed.
     assert not repo.get_state(f"position_rule:{PRODUCT}")
