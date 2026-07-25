@@ -1,6 +1,6 @@
 [project]
 name = "keel-trader"
-version = "0.2.0"
+version = "0.3.0"
 description = "Offline-first, broker-agnostic, rule-based spot-trading agent (halal policy by default)"
 readme = "README.md"
 authors = [
