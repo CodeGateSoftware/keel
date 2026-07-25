@@ -91,6 +91,7 @@ from keel.commands.tui import tui_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
+from keel.compliance.screen import DATA_DERIVED_FAILURES as _DATA_DERIVED_FAILURES
 from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
@@ -546,8 +547,9 @@ def _screen_product(
 # reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
 # `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
 # compares the product's quote leg to the settlement currency and never touches candles, so it
-# stays a real, assessable verdict even with zero bars.
-_DATA_DERIVED_FAILURES = frozenset({"liquidity"})
+# stays a real, assessable verdict even with zero bars. Single source of truth lives in
+# `screen.py` (it owns the failure tags); `keel/proposer.py` imports the same constant so the two
+# callers cannot silently drift apart.
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
 # a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is

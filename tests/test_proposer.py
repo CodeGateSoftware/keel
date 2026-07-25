@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from keel.compliance import screen as screen_mod
+from keel.compliance.screen import DATA_DERIVED_FAILURES
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.proposer import (
@@ -66,6 +67,15 @@ def test_missing_asset_is_invalid():
     assert "asset" in parsed.invalid[0].reason
 
 
+def test_asset_with_a_hyphen_is_invalid():
+    """`sol-usd` would make `_history_product` build `SOL-USD-USD` and would make the
+    on_allowlist/attested labels (keyed on the full string) disagree with what the gate actually
+    screens (keyed on `product.split("-")[0]`) -- reject it at schema validation instead."""
+    parsed = parse_proposal({"candidates": [_entry(asset="sol-usd")]})
+    assert parsed.candidates == []
+    assert "alphanumeric" in parsed.invalid[0].reason
+
+
 def test_malformed_top_level_raises():
     with pytest.raises(ProposalError):
         parse_proposal({"not_candidates": []})
@@ -77,6 +87,13 @@ def test_mixed_valid_and_invalid_are_partitioned():
     parsed = parse_proposal({"candidates": [_entry(asset="BTC"), _entry(sources=[])]})
     assert [c.asset for c in parsed.candidates] == ["BTC"]
     assert len(parsed.invalid) == 1
+
+
+def test_non_dict_candidate_entry_is_invalid_not_a_crash():
+    parsed = parse_proposal({"candidates": ["just a string"]})
+    assert parsed.candidates == []
+    assert len(parsed.invalid) == 1
+    assert parsed.invalid[0].reason == "entry is not an object"
 
 
 def _repo():
@@ -243,3 +260,24 @@ def test_jsonable_is_json_serializable_and_has_keys():
     assert row["admitted"] is True
     assert row["sources"] == ["https://coinmarketcap.com/currencies/solana/"]
     assert "shariah_hypothesis" in row
+
+
+def test_data_derived_failures_tags_actually_match_screen_asset_output():
+    """Pins the shared `DATA_DERIVED_FAILURES` constant to what `screen_asset` actually emits.
+
+    `keel/proposer.py` and `keel/cli.py` both import this single constant (rather than each
+    defining their own copy) specifically so a failure-tag rename in `screen_asset` breaks THIS
+    test instead of silently disabling the zero-bar suppression in both callers.
+    """
+    facts = screen_mod.MarketFacts(
+        asset="SOL",
+        daily_bars=0,
+        median_daily_volume=Decimal(0),
+        quotable_in_settlement_currency=False,
+    )
+    tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
+    missing = DATA_DERIVED_FAILURES - tags
+    assert not missing, (
+        f"{missing} no longer appear as failure tags in screen_asset -- the zero-bar "
+        "suppression is now silently inert; update DATA_DERIVED_FAILURES in screen.py"
+    )

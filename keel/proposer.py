@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from keel.commands._products import _history_product
 from keel.compliance import screen as screen_mod
+from keel.compliance.screen import DATA_DERIVED_FAILURES
 from keel.data.repository import Repository
 
 ScreenFn = Callable[
@@ -63,6 +64,11 @@ def _candidate_error(entry: Any) -> str | None:
     asset = entry.get("asset")
     if not isinstance(asset, str) or not asset.strip():
         return "missing or empty 'asset'"
+    if not asset.strip().isalnum():
+        # `_history_product`/the gate key off `product.split("-")[0]`; an asset containing "-"
+        # (or any other punctuation) would build a malformed product id and, worse, make the
+        # on_allowlist/attested labels in the report disagree with what was actually screened.
+        return "'asset' must be an alphanumeric symbol"
     rationale = entry.get("rationale")
     if not isinstance(rationale, str) or not rationale.strip():
         return "missing or empty 'rationale'"
@@ -161,9 +167,6 @@ def build_proposal_report(
     return ProposalReport(screened=screened, invalid=parsed.invalid)
 
 
-_DATA_DERIVED_FAILURES = frozenset({"liquidity"})  # keep in sync with cli.py `assets holdings`
-
-
 def render_proposal_report(report: ProposalReport) -> list[str]:
     """Human-readable lines. Admits nothing -- this only reports gate verdicts + next steps."""
     lines: list[str] = []
@@ -188,7 +191,7 @@ def render_proposal_report(report: ProposalReport) -> list[str]:
             )
         failures = list(sc.result.failures)
         if sc.facts.daily_bars == 0:
-            derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
+            derived = [f for f in failures if f.split(":")[0] in DATA_DERIVED_FAILURES]
             failures = [f for f in failures if f not in derived]
             lines.append(
                 f"    ! no local history -- run `keel fetch --products {sc.product}` first, "

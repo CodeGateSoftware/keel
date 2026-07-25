@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 import keel.cli as cli_module
 from keel.cli import cli
+from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
@@ -865,14 +866,17 @@ def test_propose_and_screen_agree_for_the_same_asset(tmp_path, valid_config_path
 
 
 def test_propose_writes_nothing(tmp_path, valid_config_path):
+    """A read-only report: no attestation, no allowlist change, no DB mutation."""
     db_path = tmp_path / "t.db"
-    repo = _repo_at(db_path)
+    _repo_at(db_path)
     shortlist = _write_shortlist(tmp_path, [_SOL])
     CliRunner().invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path),
               "assets", "propose", "--from", str(shortlist)],
     )
-    assert repo.get_asset_attestation("SOL") is None  # nothing attested/admitted
+    # Reopen from the path (not the handle held from before the run) so a stray write to ANY
+    # asset/table would actually be caught, not just the one candidate we happened to propose.
+    assert _repo_at(db_path).get_asset_attestations() == []
 
 
 def test_propose_json_is_valid_and_has_no_trailing_prose(tmp_path, valid_config_path):
@@ -912,3 +916,14 @@ def test_propose_hypothesis_never_admits(tmp_path, valid_config_path):
     )
     assert "REJECT" in result.output  # unattested + no history => rejected despite the hypothesis
     assert "UNVERIFIED" in result.output
+
+
+def test_propose_human_output_ends_with_the_disclaimer(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+    assert DISCLAIMER in result.output
