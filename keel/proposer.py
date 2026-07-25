@@ -8,9 +8,18 @@ so this module never imports `keel.cli` (which would cycle) and stays unit-testa
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
+
+from keel.commands._products import _history_product
+from keel.compliance import screen as screen_mod
+from keel.data.repository import Repository
+
+ScreenFn = Callable[
+    [Repository, str, str], tuple[screen_mod.MarketFacts, screen_mod.ScreenResult]
+]
 
 
 class ProposalError(ValueError):
@@ -100,3 +109,53 @@ def parse_proposal(raw: Any) -> ParsedProposal:
             )
         )
     return ParsedProposal(candidates=candidates, invalid=invalid)
+
+
+@dataclass(frozen=True)
+class ScreenedCandidate:
+    candidate: Candidate
+    product: str
+    on_allowlist: bool
+    attested: bool
+    facts: screen_mod.MarketFacts
+    result: screen_mod.ScreenResult
+
+
+@dataclass(frozen=True)
+class ProposalReport:
+    screened: list[ScreenedCandidate]
+    invalid: list[InvalidEntry]
+
+    @property
+    def admitted_count(self) -> int:
+        return sum(1 for s in self.screened if s.result.admitted)
+
+
+def build_proposal_report(
+    parsed: ParsedProposal,
+    repo: Repository,
+    quote: str,
+    allowlist: list[str],
+    screen_fn: ScreenFn,
+) -> ProposalReport:
+    """Route each valid candidate through the injected admission gate. Writes nothing.
+
+    `screen_fn` receives only (repo, product, quote) -- the LLM's rationale and shariah_hypothesis
+    are never passed to the gate, so they cannot influence admission (asymmetry, by construction).
+    """
+    allow = {a.upper() for a in allowlist}
+    screened: list[ScreenedCandidate] = []
+    for cand in parsed.candidates:
+        product = _history_product(cand.asset, quote)
+        facts, result = screen_fn(repo, product, quote)
+        screened.append(
+            ScreenedCandidate(
+                candidate=cand,
+                product=product,
+                on_allowlist=cand.asset in allow,
+                attested=repo.get_asset_attestation(cand.asset) is not None,
+                facts=facts,
+                result=result,
+            )
+        )
+    return ProposalReport(screened=screened, invalid=parsed.invalid)
