@@ -140,7 +140,13 @@ def _build_rule(row: dict[str, Any]) -> Rule:
         if "signal_patterns" in kwargs:
             kwargs["signal_patterns"] = tuple(kwargs["signal_patterns"])
 
-    return rule_cls(**kwargs)
+    rule = rule_cls(**kwargs)
+    # Thread the real `rules.id` onto the instance (additive `Rule.rule_id`, default `None`) so
+    # it can flow onto emitted `Signal`s and, from there, into `orders.rule_id`/`signals.rule_id`
+    # for audit -- `.get` rather than `row["id"]` so a hand-built row with no "id" (some tests)
+    # still builds a rule, just with `rule_id` left at its `None` default.
+    rule.rule_id = row.get("id")
+    return rule
 
 
 # -- freshness -----------------------------------------------------------------------------
@@ -532,6 +538,7 @@ def _handle_exits(
         cts_score=0,
         entry_technique="market",
         ts=now_ts,
+        rule_id=owning_rule.rule_id,
     )
     result = executor.execute(
         exit_signal, broker, repo, config, mode, confirm_fn=confirm_fn, now_ts=now_ts

@@ -9,16 +9,18 @@ mirroring `backtest.py`'s per-trade bookkeeping) and journals every fill to
 `orders(mode='paper')` via `Repository`. No live order placement ever happens here
 (Phase 3 `execution/*` owns that).
 
-**Schema note:** `orders.rule_id` is an `INTEGER` foreign key into the `rules` table
-(populated by promotion/demotion, task 9); paper fills from a rule that hasn't been
-persisted there yet would violate that FK, so paper orders leave `rule_id` NULL and
-instead carry `rule_name` plus this module's own reconstruction fields (`role`,
-`entry_order_id`, pnl/mfe/mae/outcome/etc.) JSON-encoded in `orders.raw_response` --
-the column live trading reserves for a broker's raw response, unused for paper
-fills. `track_record()` reads that back out (via `Repository.get_orders(mode='paper')`,
-P3 Task 1) to reconstruct `Trade`s and aggregates them via the shared
-`strategy.stats.summarize` helper into the same `BacktestResult` shape `backtest.py`
-produces, so paper and historical stats are directly comparable.
+**Schema note:** `orders.rule_id` is an `INTEGER` foreign key into the `rules` table. A paper
+`Signal` carries `rule_id` only when it was emitted for a rule reconstructed from a persisted
+`rules` row (`agent._build_rule`) -- which is always true for a real paper cycle (paper mode
+loads its rules the same way live mode does, from `repo.get_rules("paper")`), so the FK is
+satisfied by construction; a hand-built `Signal` with no `rule_id` (most tests) still writes
+`NULL`, exactly as before. Either way, `rule_name` plus this module's own reconstruction fields
+(`role`, `entry_order_id`, pnl/mfe/mae/outcome/etc.) are still JSON-encoded in
+`orders.raw_response` -- the column live trading reserves for a broker's raw response, unused for
+paper fills -- since `rule_id` alone doesn't carry that bookkeeping. `track_record()` reads that
+back out (via `Repository.get_orders(mode='paper')`, P3 Task 1) to reconstruct `Trade`s and
+aggregates them via the shared `strategy.stats.summarize` helper into the same `BacktestResult`
+shape `backtest.py` produces, so paper and historical stats are directly comparable.
 """
 
 from __future__ import annotations
@@ -67,6 +69,10 @@ class _OpenPaperPosition:
     whether a debit actually happened keeps the close-side credit and the equity mark
     correct-by-construction regardless of seed timing.
     """
+    #: The entry order's `rule_id` (its DB row's real value, `None` if it had none) -- carried
+    #: so the paired exit order writes the SAME `rule_id`, mirroring how `rule_name` above is
+    #: taken from the position rather than re-read off the exit signal.
+    rule_id: int | None = None
 
 
 def _touches(candle: Candle, price: Decimal) -> bool:
@@ -165,6 +171,10 @@ class PaperTrader:
                 # that id is only ever stamped by `seed_cash` -- so every rehydrated
                 # position was opened while cash was seeded, and was costed at the time.
                 costed=True,
+                # The entry order's own `rule_id` column -- a real DB value, not something the
+                # JSON payload needs to carry -- so a restart-rehydrated position still closes
+                # with the same `rule_id` a same-process exit would have written.
+                rule_id=order.get("rule_id"),
             )
 
     def has_open_position(self, product_id: str) -> bool:
@@ -319,7 +329,7 @@ class PaperTrader:
                 "actual_fill": entry_fill,
                 "raw_response": json.dumps(payload),
                 "confirmation": "paper",
-                "rule_id": None,
+                "rule_id": signal.rule_id,
                 "created_at": signal.ts,
                 "updated_at": signal.ts,
             }
@@ -333,6 +343,7 @@ class PaperTrader:
             entry_ts=setup.ts,
             qty=qty,
             costed=costed,
+            rule_id=signal.rule_id,
         )
         if costed:
             self._cash -= entry_fill * qty + fee
@@ -392,7 +403,7 @@ class PaperTrader:
                 "actual_fill": exit_fill,
                 "raw_response": json.dumps(payload),
                 "confirmation": "paper",
-                "rule_id": None,
+                "rule_id": position.rule_id,
                 "created_at": exit_ts,
                 "updated_at": exit_ts,
             }

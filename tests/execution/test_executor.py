@@ -349,6 +349,98 @@ def test_confirm_mode_without_confirm_fn_defaults_to_not_placed(repo):
     assert len(broker.place_calls) == 0
 
 
+# -- rule_id metadata (Phase-2 debt: orders.rule_id was always written NULL) ----------------------
+
+
+def test_placed_order_carries_the_signals_rule_id(repo):
+    """The fix under test: `orders.rule_id` used to be hardcoded `None` in `_order_row`
+    regardless of the signal. It must now carry `signal.rule_id` end to end through
+    `_build_intent`'s `OrderIntent.rule_id`.
+    """
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="live")
+    broker = FakeBroker()
+    signal = _enter_signal(rule_id=rule_id)
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["rule_id"] == rule_id
+
+
+def test_a_signal_with_no_rule_id_still_writes_none(repo):
+    """Backward-compat: a signal from a hand-constructed rule (no `rule_id` supplied, the
+    default) still writes `NULL`, exactly as before this fix."""
+    broker = FakeBroker()
+    signal = _enter_signal()  # no rule_id override -> defaults to None
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["rule_id"] is None
+
+
+def test_rule_id_is_purely_additive_metadata_placement_and_guards_are_unchanged(repo):
+    """The metadata-only guarantee: two otherwise-identical signals, differing only in
+    `rule_id`, must produce byte-for-byte identical guard/placement outcomes -- same veto
+    decisions, same `placed`, same broker calls/order-configuration, same sized qty/notional.
+    The ONLY difference in the resulting order rows is the `rule_id` column.
+    """
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="live")
+    broker_a = FakeBroker()
+    broker_b = FakeBroker()
+    signal_no_id = _enter_signal(rule_id=None)
+    signal_with_id = _enter_signal(rule_id=rule_id)
+
+    result_a = execute(signal_no_id, broker_a, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+    result_b = execute(
+        signal_with_id, broker_b, repo, _config(), mode="autonomous", now_ts=NOW_TS + 1
+    )
+
+    assert result_a.placed == result_b.placed is True
+    assert result_a.vetoed_by == result_b.vetoed_by == []
+    assert len(broker_a.preview_calls) == len(broker_b.preview_calls)
+    assert len(broker_a.place_calls) == len(broker_b.place_calls)
+    assert (
+        broker_a.place_calls[0]["order_configuration"]
+        == broker_b.place_calls[0]["order_configuration"]
+    )
+
+    order_a = repo.get_order(result_a.order_id)
+    order_b = repo.get_order(result_b.order_id)
+    # Every field EXCEPT rule_id/created_at/updated_at/id must match -- proving rule_id is the
+    # only thing that changed.
+    for field in (
+        "mode",
+        "product_id",
+        "side",
+        "order_type",
+        "qty",
+        "status",
+        "confirmation",
+    ):
+        assert order_a[field] == order_b[field], f"{field} differs -- not metadata-only"
+    assert order_a["rule_id"] is None
+    assert order_b["rule_id"] == rule_id
+
+
+def test_rail_violating_signal_with_a_rule_id_is_still_vetoed_the_same_way(repo):
+    """`rule_id` must not influence guard decisions -- a vetoed intent stays vetoed."""
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="live")
+    broker = NoNetworkBroker()
+    signal = _enter_signal(
+        product_id="DOGE-USD", setup=_setup(product_id="DOGE-USD"), rule_id=rule_id
+    )
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert any(v.startswith("halal_allowlist") for v in result.vetoed_by)
+    assert repo.get_orders() == []
+
+
 # -- rail-violating signal -> vetoed, never previews/places --------------------------------------
 
 

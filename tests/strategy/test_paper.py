@@ -54,6 +54,7 @@ def _enter_signal(
     product_id: str = "BTC-USD",
     setup: Setup | None = None,
     ts: int = 1_000,
+    rule_id: int | None = None,
 ) -> Signal:
     return Signal(
         rule_name=rule_name,
@@ -64,11 +65,15 @@ def _enter_signal(
         cts_score=7,
         entry_technique="signal_candle",
         ts=ts,
+        rule_id=rule_id,
     )
 
 
 def _exit_signal(
-    rule_name: str = "pullback_continuation", product_id: str = "BTC-USD", ts: int = 1_000
+    rule_name: str = "pullback_continuation",
+    product_id: str = "BTC-USD",
+    ts: int = 1_000,
+    rule_id: int | None = None,
 ) -> Signal:
     return Signal(
         rule_name=rule_name,
@@ -79,6 +84,7 @@ def _exit_signal(
         cts_score=0,
         entry_technique="confirm_3bar",
         ts=ts,
+        rule_id=rule_id,
     )
 
 
@@ -99,6 +105,30 @@ class TestEnterThenTargetHit:
         assert order["status"] == "filled"
         expected_entry_fill = Decimal("100") * (Decimal(1) + SLIPPAGE_PCT)
         assert order["actual_fill"] == expected_entry_fill
+
+    def test_entry_order_sets_the_rule_id_column_and_keeps_the_raw_response_rule_name(
+        self, repo: Repository
+    ) -> None:
+        """The Phase-2 debt this branch fixes on the paper path: `orders.rule_id` used to be
+        hardcoded `None` for every paper fill. `raw_response.rule_name` is untouched -- other
+        code (`track_record`) still reads it -- this only ADDS the column."""
+        rule_id = repo.insert_rule("pullback_continuation", {}, status="paper")
+        trader = PaperTrader(repo)
+        entry_order_id = trader.on_signal(_enter_signal(rule_id=rule_id))
+
+        order = repo.get_order(entry_order_id)
+        assert order["rule_id"] == rule_id
+        payload = json.loads(order["raw_response"])
+        assert payload["rule_name"] == "pullback_continuation"
+
+    def test_entry_order_with_no_rule_id_still_writes_none(self, repo: Repository) -> None:
+        """Backward-compat: a signal from a hand-constructed rule (no `rule_id`) still writes
+        `NULL`, exactly as before this fix."""
+        trader = PaperTrader(repo)
+        entry_order_id = trader.on_signal(_enter_signal())
+
+        order = repo.get_order(entry_order_id)
+        assert order["rule_id"] is None
 
     def test_target_hit_writes_exit_order_with_correct_pnl(self, repo: Repository) -> None:
         trader = PaperTrader(repo)
@@ -127,6 +157,17 @@ class TestEnterThenTargetHit:
         assert Decimal(payload["pnl"]) == expected_pnl
         assert payload["outcome"] == "win"
         assert payload["entry_order_id"] is not None
+
+    def test_exit_order_carries_the_same_rule_id_as_its_entry(self, repo: Repository) -> None:
+        rule_id = repo.insert_rule("pullback_continuation", {}, status="paper")
+        trader = PaperTrader(repo)
+        trader.on_signal(_enter_signal(ts=1_000, rule_id=rule_id))
+
+        target_candle = _candle(1_060, "115", "121", "114", "120")
+        exit_order_id = trader.on_candle("BTC-USD", target_candle)
+
+        exit_order = repo.get_order(exit_order_id)
+        assert exit_order["rule_id"] == rule_id
 
     def test_no_touch_leaves_position_open_and_writes_no_exit_order(
         self, repo: Repository
@@ -338,6 +379,40 @@ def test_open_positions_survive_a_new_PaperTrader_over_the_same_repo(repo):
 
     second = PaperTrader(repo)
     assert second.has_open_position("BTC-USD") is True
+
+
+def test_a_rehydrated_position_still_closes_with_its_original_rule_id(repo):
+    """`rule_id` isn't in the `raw_response` JSON payload (it's a real DB column) --
+    `_load_open_positions` must read it off the entry order row directly, so a
+    restart-rehydrated position's exit still carries the same `rule_id` a same-process exit
+    would have written."""
+    rule_id = repo.insert_rule("pullback_continuation", {}, status="paper")
+    first = PaperTrader(repo)
+    first.on_signal(_enter_signal(rule_id=rule_id))
+
+    resumed = PaperTrader(repo)
+    exit_id = resumed.on_candle("BTC-USD", _candle(2_000, "110", "125", "108", "122"))
+
+    assert exit_id is not None
+    assert repo.get_order(exit_id)["rule_id"] == rule_id
+
+
+def test_a_rehydrated_position_with_a_legacy_null_rule_id_still_closes_without_crashing(repo):
+    """A pre-change entry order (written before this fix, or from a signal with no `rule_id`)
+    has `rule_id = NULL` in the DB. `_load_open_positions` reads it via `order.get("rule_id")`,
+    not `order["rule_id"]`/direct attribute access on a dataclass default -- proving the legacy
+    NULL case rehydrates cleanly (no KeyError/crash) and the resulting exit also writes NULL,
+    never fabricating an id that was never there.
+    """
+    first = PaperTrader(repo)
+    entry_order_id = first.on_signal(_enter_signal())  # no rule_id -> NULL in the DB
+    assert repo.get_order(entry_order_id)["rule_id"] is None
+
+    resumed = PaperTrader(repo)
+    exit_id = resumed.on_candle("BTC-USD", _candle(2_000, "110", "125", "108", "122"))
+
+    assert exit_id is not None
+    assert repo.get_order(exit_id)["rule_id"] is None
 
 
 def test_a_closed_position_does_NOT_reopen_on_rehydration(repo):

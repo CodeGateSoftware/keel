@@ -136,6 +136,7 @@ def evaluate(
             cts_score=cts_result.total,
             entry_technique=technique,
             ts=setup.ts,
+            rule_id=rule.rule_id,
         )
         signals.append(signal)
         log_event(
@@ -321,10 +322,11 @@ def _persist_signal(repo: Repository, signal: Signal, cts_result: indicators_cts
     """Write an emitted `Signal` to the `signals` table via `Repository.insert_signal`
     (schema: `data/db.py`; P3 Task 1 added the typed method).
 
-    `rule_id` is left `NULL` (no DB-backed `rules` row lookup is wired here -- Task 9's
-    promotion lifecycle owns that linkage); `indicators` carries the full CTS breakdown +
-    setup for audit/explainability; `fired=1` marks this as an actionable, gate-cleared
-    signal -- rejected candidates are never persisted at all.
+    `rule_id` carries `signal.rule_id` -- the originating `rules.id`, threaded from
+    `agent._build_rule` through the `Rule` that emitted this `Signal` (`None` for a signal from a
+    hand-constructed rule, e.g. most tests); `indicators` carries the full CTS breakdown + setup
+    for audit/explainability; `fired=1` marks this as an actionable, gate-cleared signal --
+    rejected candidates are never persisted at all.
     """
     setup = signal.setup
     payload = {
@@ -347,7 +349,7 @@ def _persist_signal(repo: Repository, signal: Signal, cts_result: indicators_cts
     }
     repo.insert_signal(
         {
-            "rule_id": None,
+            "rule_id": signal.rule_id,
             "product_id": signal.product_id,
             "ts": signal.ts,
             "indicators": json.dumps(payload, default=str),

@@ -179,6 +179,26 @@ def test_insert_order_ids_increment(repo):
     assert id2 > id1
 
 
+def test_insert_order_round_trips_a_non_none_rule_id(repo):
+    """`orders.rule_id` is a real FK into `rules` -- once the row exists, an order naming it
+    must round-trip that id exactly, not just `None` (the `_order()` default)."""
+    rule_id = repo.insert_rule("pullback_continuation", {"lookback": 20})
+
+    order_id = repo.insert_order(_order(rule_id=rule_id))
+
+    stored = repo.get_order(order_id)
+    assert stored["rule_id"] == rule_id
+
+
+def test_get_orders_also_round_trips_rule_id(repo):
+    rule_id = repo.insert_rule("dca", {})
+    repo.insert_order(_order(rule_id=rule_id))
+    repo.insert_order(_order(rule_id=None))
+
+    rows = repo.get_orders()
+    assert {r["rule_id"] for r in rows} == {rule_id, None}
+
+
 def test_update_order_updates_fields_and_round_trips_decimal(repo):
     order_id = repo.insert_order(_order())
 
@@ -346,6 +366,15 @@ def test_insert_signal_returns_id_and_round_trips(repo):
     assert row["ts"] == 1_700_000_000
     assert row["cts_score"] == "5"
     assert row["fired"] == 1
+
+
+def test_insert_signal_round_trips_a_non_none_rule_id(repo):
+    rule_id = repo.insert_rule("rsi_meanrev", {})
+
+    signal_id = repo.insert_signal(_signal(rule_id=rule_id))
+
+    row = repo._conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+    assert row["rule_id"] == rule_id
 
 
 def test_insert_signal_ids_increment(repo):

@@ -65,6 +65,10 @@ class Signal:
     cts_score: int
     entry_technique: str
     ts: int
+    #: The originating `rules.id` DB row, when the emitting `Rule` was reconstructed via
+    #: `agent._build_rule` (which threads `Rule.rule_id` through). `None` for a hand-constructed
+    #: `Rule`/`Signal` (most tests) -- purely additive metadata, never read by any gate/guard.
+    rule_id: int | None = None
 
 
 @dataclass
@@ -92,11 +96,18 @@ class Rule(ABC):
     `promotion_class` selects the rule's promotion floor (`strategy.promotion.floor_for_class`):
     the default `"default"` uses the canonical 100/0.55 floor; trend-followers override it to
     `"trend_follow"` for a low-win/high-R:R floor (KB §25.5).
+
+    `rule_id` is the originating `rules.id` DB row, set by `agent._build_rule` on a rule loaded
+    from `repo.get_rules()`. It defaults to `None` -- same pattern as `promotion_class` -- so
+    every hand-constructed `Rule` in tests (or anywhere else) is unaffected; it exists purely so
+    the id can be threaded onto emitted `Signal`s and, from there, into `orders.rule_id` for
+    audit -- it plays no part in `detect`/`exit_signal`/any guard or gate.
     """
 
     name: str
     params: dict
     promotion_class: str = "default"
+    rule_id: int | None = None
 
     @abstractmethod
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
