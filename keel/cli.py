@@ -56,6 +56,7 @@ patch point in `keel.commands._common` drives every gate wherever its command is
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -71,6 +72,7 @@ from keel.commands import _common
 from keel.commands._common import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_DB_PATH,
+    DISCLAIMER,
     _build_broker,
     _load_cfg,
     _open_repo,
@@ -784,6 +786,53 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
             click.echo(f"    ! {warning}")
 
     click.echo(f"\n{admitted}/{len(product_list)} admitted")
+
+
+@assets_group.command("propose")
+@click.option(
+    "--from", "from_file", required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON shortlist file produced OUTSIDE keel (an LLM + web-search scout).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
+@click.pass_context
+def assets_propose(ctx: click.Context, from_file: str, as_json: bool) -> None:
+    """Screen an externally-produced LLM asset shortlist. ADMITS NOTHING.
+
+    The shortlist is produced outside keel (you, or your Claude + the firecrawl skills). Each
+    candidate is routed through the SAME admission gate as `assets screen`; unattested or
+    history-less candidates fail closed. This command never attests, never edits the allowlist,
+    never writes to the DB -- it only reports verdicts and next steps.
+    """
+    from keel.proposer import (
+        ProposalError,
+        build_proposal_report,
+        parse_proposal,
+        render_proposal_report,
+        report_to_jsonable,
+    )
+
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+    try:
+        raw = json.loads(Path(from_file).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"could not read/parse {from_file}: {exc}") from exc
+    try:
+        parsed = parse_proposal(raw)
+    except ProposalError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    report = build_proposal_report(
+        parsed, repo, config.quote_currency, config.allowlist, _screen_product
+    )
+    if as_json:
+        click.echo(json.dumps(report_to_jsonable(report), indent=2, default=str))
+        return
+    for line in render_proposal_report(report):
+        click.echo(line)
+    click.echo("")
+    click.echo(DISCLAIMER)
 
 
 @assets_group.command("attest")
