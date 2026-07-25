@@ -56,6 +56,7 @@ patch point in `keel.commands._common` drives every gate wherever its command is
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -71,6 +72,7 @@ from keel.commands import _common
 from keel.commands._common import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_DB_PATH,
+    DISCLAIMER,
     _build_broker,
     _load_cfg,
     _open_repo,
@@ -89,6 +91,7 @@ from keel.commands.tui import tui_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
+from keel.compliance.screen import DATA_DERIVED_FAILURES as _DATA_DERIVED_FAILURES
 from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
@@ -544,8 +547,9 @@ def _screen_product(
 # reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
 # `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
 # compares the product's quote leg to the settlement currency and never touches candles, so it
-# stays a real, assessable verdict even with zero bars.
-_DATA_DERIVED_FAILURES = frozenset({"liquidity"})
+# stays a real, assessable verdict even with zero bars. Single source of truth lives in
+# `screen.py` (it owns the failure tags); `keel/proposer.py` imports the same constant so the two
+# callers cannot silently drift apart.
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
 # a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
@@ -784,6 +788,53 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
             click.echo(f"    ! {warning}")
 
     click.echo(f"\n{admitted}/{len(product_list)} admitted")
+
+
+@assets_group.command("propose")
+@click.option(
+    "--from", "from_file", required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON shortlist file produced OUTSIDE keel (an LLM + web-search scout).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
+@click.pass_context
+def assets_propose(ctx: click.Context, from_file: str, as_json: bool) -> None:
+    """Screen an externally-produced LLM asset shortlist. ADMITS NOTHING.
+
+    The shortlist is produced outside keel (you, or your Claude + the firecrawl skills). Each
+    candidate is routed through the SAME admission gate as `assets screen`; unattested or
+    history-less candidates fail closed. This command never attests, never edits the allowlist,
+    never writes to the DB -- it only reports verdicts and next steps.
+    """
+    from keel.proposer import (
+        ProposalError,
+        build_proposal_report,
+        parse_proposal,
+        render_proposal_report,
+        report_to_jsonable,
+    )
+
+    config = _load_cfg(ctx)
+    repo = _open_repo(ctx)
+    try:
+        raw = json.loads(Path(from_file).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"could not read/parse {from_file}: {exc}") from exc
+    try:
+        parsed = parse_proposal(raw)
+    except ProposalError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    report = build_proposal_report(
+        parsed, repo, config.quote_currency, config.allowlist, _screen_product
+    )
+    if as_json:
+        click.echo(json.dumps(report_to_jsonable(report), indent=2, default=str))
+        return
+    for line in render_proposal_report(report):
+        click.echo(line)
+    click.echo("")
+    click.echo(DISCLAIMER)
 
 
 @assets_group.command("attest")

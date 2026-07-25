@@ -56,6 +56,16 @@ KNOWN_BACKINGS = frozenset({BACKING_AYN, BACKING_DAYN, BACKING_NATIVE})
 #: decision, not a default -- do not add to it to make a test pass.
 WAIVABLE_CRITERIA = frozenset({"history"})
 
+#: Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
+#: reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
+#: callers presenting a zero-bar candidate (`assets holdings`, `assets propose`) must not print it
+#: as a verdict. `settlement` is deliberately NOT here -- it compares the product's quote leg to
+#: the settlement currency and never touches candles, so it stays a real, assessable verdict even
+#: with zero bars. This is the single source of truth for that tag set; callers import it rather
+#: than duplicating the string, so a tag rename here cannot silently disable the suppression
+#: elsewhere.
+DATA_DERIVED_FAILURES = frozenset({"liquidity"})
+
 
 @dataclass(frozen=True)
 class AssetAttestation:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from click.testing import CliRunner
 
 import keel.cli as cli_module
 from keel.cli import cli
+from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
@@ -809,3 +811,119 @@ def test_the_settlement_criterion_still_catches_an_EXTERNALLY_supplied_product(
 
     assert "settlement" in result.output, "a cross-settled product must fail the settlement check"
     assert "REJECT" in result.output
+
+
+# -- assets propose -----------------------------------------------------------------------------
+
+
+def _write_shortlist(tmp_path, candidates):
+    path = tmp_path / "shortlist.json"
+    path.write_text(json.dumps({"candidates": candidates}))
+    return path
+
+
+_SOL = {
+    "asset": "SOL",
+    "rationale": "high liquidity",
+    "sources": ["https://coinmarketcap.com/currencies/solana/"],
+}
+
+
+def test_propose_rejects_an_unattested_candidate(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "propose", "--from", str(shortlist)],
+    )
+    assert result.exit_code == 0
+    assert "REJECT" in result.output
+    assert "0/1 admitted" in result.output
+
+
+def test_propose_and_screen_agree_for_the_same_asset(tmp_path, valid_config_path):
+    """One gate, shared by construction -- the proposer must not get a laxer path."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    shortlist = _write_shortlist(
+        tmp_path, [{"asset": "BTC", "rationale": "reserve asset", "sources": ["https://bitcoin.org"]}]
+    )
+    proposed = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+    screened = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "screen", "--products", "BTC-USD"],
+    )
+    assert "ADMIT" in proposed.output
+    assert "ADMIT" in screened.output
+
+
+def test_propose_writes_nothing(tmp_path, valid_config_path):
+    """A read-only report: no attestation, no allowlist change, no DB mutation."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+    CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+    # Reopen from the path (not the handle held from before the run) so a stray write to ANY
+    # asset/table would actually be caught, not just the one candidate we happened to propose.
+    assert _repo_at(db_path).get_asset_attestations() == []
+
+
+def test_propose_json_is_valid_and_has_no_trailing_prose(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist), "--json"],
+    )
+    payload = json.loads(result.output)  # must parse cleanly
+    assert payload["admitted_count"] == 0
+    assert payload["screened"][0]["asset"] == "SOL"
+
+
+def test_propose_missing_file_is_a_clean_error(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(tmp_path / "nope.json")],
+    )
+    assert result.exit_code != 0
+
+
+def test_propose_hypothesis_never_admits(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(
+        tmp_path,
+        [{"asset": "SOL", "rationale": "x", "sources": ["https://x.invalid"],
+          "shariah_hypothesis": "definitely halal"}],
+    )
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+    assert "REJECT" in result.output  # unattested + no history => rejected despite the hypothesis
+    assert "UNVERIFIED" in result.output
+
+
+def test_propose_human_output_ends_with_the_disclaimer(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+    assert DISCLAIMER in result.output
