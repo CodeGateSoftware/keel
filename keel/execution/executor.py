@@ -346,6 +346,7 @@ def _build_intent(
             notional=sizing.spend(qty, setup.entry),
             is_dca=is_dca,
             rule_kind=signal.rule_name,
+            rule_id=signal.rule_id,
             available_quote=available_quote,
             withdrawals_enabled=withdrawals,
         )
@@ -365,6 +366,7 @@ def _build_intent(
         notional=sizing.spend(qty, entry),
         is_dca=False,
         rule_kind=signal.rule_name,
+        rule_id=signal.rule_id,
     )
 
 
@@ -590,7 +592,7 @@ def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
         # called `'autonomous'`. Nothing reads this column back -- it is an audit trail only --
         # so the rows are deliberately left as-written rather than rewritten by a migration.
         confirmation=mode,
-        rule_id=None,
+        rule_id=intent.rule_id,
         created_at=now_ts,
         updated_at=now_ts,
     )

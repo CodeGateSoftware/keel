@@ -119,6 +119,12 @@ class OrderIntent:
     notional: Decimal
     is_dca: bool
     rule_kind: str
+    # The originating `rules.id` DB row (`signal.rule_id`, threaded from `agent._build_rule`),
+    # carried through purely so `executor._order_row` can write it to `orders.rule_id` -- no rail
+    # reads this, and it plays no part in any guard decision. `None` (the default) for an intent
+    # built from a hand-constructed `Rule`/`Signal` (most tests) or a caller that doesn't thread
+    # one (`place_bracket`/`scale_out`/`_roll_stop`, which only have a `rule_name` string).
+    rule_id: int | None = None
     # Rail 13 (USDC-funding): the live available quote-currency (default USDC) balance, fetched
     # by the caller (the executor) from the broker -- guards has no broker access of its own.
     # `None` means "unknown/unavailable" and fails the BUY closed, same as a missing quote

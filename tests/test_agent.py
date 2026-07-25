@@ -317,6 +317,35 @@ def test_run_once_polls_evaluates_and_executes_a_real_dca_rule(repo):
     assert repo.get_state("last_feed_ts") == 90_000
 
 
+def test_run_once_writes_the_seeded_rules_db_id_onto_the_order(repo):
+    """The metadata-only fix under test: a full cycle's placed order now carries the
+    originating rule's real `rules.id`, threaded `_build_rule` -> `Rule.rule_id` ->
+    `engine.evaluate`'s `Signal.rule_id` -> `executor._build_intent`'s `OrderIntent.rule_id` ->
+    `executor._order_row`. Everything else about the placed order matches
+    `test_run_once_polls_evaluates_and_executes_a_real_dca_rule` exactly -- proving this is
+    ADDITIVE metadata, not a change to what gets placed.
+    """
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert len(result.enter_signals) == 1
+    assert result.enter_signals[0].rule_id == rule_id
+    assert result.enter_results[0].placed is True
+
+    orders = repo.get_orders(mode="live", product_id=PRODUCT)
+    assert len(orders) == 1
+    order = orders[0]
+    assert order["rule_id"] == rule_id
+    # Everything else about the order is unchanged from the pre-fix shape/values.
+    assert order["side"] == "BUY"
+    assert order["qty"] == Decimal("0.5")
+    assert order["status"] == "filled"
+    assert len(broker.place_calls) == 1
+
+
 # -- run_once: autonomy is a live-read profile choice --------------------------------------------
 
 
@@ -562,6 +591,30 @@ def test_build_rule_reconstructs_a_real_pullback_continuation_rule():
     assert rule.granularity == Granularity.ONE_HOUR
     assert rule.params["buffer_ticks"] == Decimal("0.02")
     assert rule.params["ema_periods"] == (8, 20, 50)
+
+
+def test_build_rule_populates_rule_id_from_the_row(repo):
+    """The Phase-2 debt this branch fixes: `_build_rule` used to discard `row["id"]` entirely,
+    which is the root cause of `orders.rule_id` always being written NULL."""
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT})
+    row = repo.get_rules()[0]
+
+    rule = _build_rule(row)
+
+    assert rule.rule_id == rule_id
+
+
+def test_build_rule_leaves_rule_id_none_for_a_row_with_no_id():
+    """A hand-built row (no "id" key -- e.g. a caller assembling params directly, not via
+    `repo.get_rules()`) must not raise; `rule_id` just stays at its default `None`."""
+    row = {
+        "kind": "dca",
+        "params": {"product_id": PRODUCT},
+    }
+
+    rule = _build_rule(row)
+
+    assert rule.rule_id is None
 
 
 def test_build_rule_unknown_kind_raises():
@@ -1069,6 +1122,31 @@ def test_paper_mode_records_a_fill_and_never_places_or_reads_account_state(repo,
     assert len(orders) == 1
     assert orders[0]["side"] == Side.BUY.value
     assert track_record(repo, "fake_enter").n_trades >= 0
+
+
+def test_paper_mode_full_cycle_writes_the_seeded_rules_db_id_onto_the_order(repo, monkeypatch):
+    """Same fix as the live path, exercised end-to-end on the PAPER path: this test does NOT
+    monkeypatch `_build_rule` (unlike `_seed_rule`'s helper above), so the real rule-id threading
+    runs -- `repo.get_rules()` -> `_build_rule` -> `Rule.rule_id` -> `Signal.rule_id` ->
+    `PaperTrader._enter`'s inserted order.
+    """
+    monkeypatch.setitem(agent.RULE_REGISTRY, "fake_enter", _AlwaysEnterRule)
+    rule_id = repo.insert_rule("fake_enter", {"product_id": PRODUCT}, status="paper")
+
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+
+    result = run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert result.skipped is False
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    assert orders[0]["rule_id"] == rule_id
+    # the rule_name blob in raw_response is untouched by this fix -- still present.
+    import json
+
+    payload = json.loads(orders[0]["raw_response"])
+    assert payload["rule_name"] == "fake_enter"
 
 
 def test_paper_mode_still_enforces_the_offline_rails(repo, monkeypatch):

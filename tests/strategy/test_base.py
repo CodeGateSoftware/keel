@@ -88,6 +88,36 @@ class TestSignal:
         assert signal.entry_technique == "signal_candle"
         assert signal.ts == 1_700_000_100
 
+    def test_rule_id_defaults_to_none(self) -> None:
+        """A hand-constructed `Signal` (most tests, and any caller that predates this field)
+        must still build with no `rule_id` kwarg -- additive, backward-compatible default."""
+        setup = _setup()
+        signal = Signal(
+            rule_name="pullback_continuation",
+            product_id="BTC-USD",
+            action=Action.ENTER,
+            side=Side.BUY,
+            setup=setup,
+            cts_score=7,
+            entry_technique="signal_candle",
+            ts=1_700_000_100,
+        )
+        assert signal.rule_id is None
+
+    def test_rule_id_round_trips_when_supplied(self) -> None:
+        signal = Signal(
+            rule_name="pullback_continuation",
+            product_id="BTC-USD",
+            action=Action.ENTER,
+            side=Side.BUY,
+            setup=None,
+            cts_score=7,
+            entry_technique="signal_candle",
+            ts=0,
+            rule_id=42,
+        )
+        assert signal.rule_id == 42
+
     def test_setup_may_be_none_for_none_action(self) -> None:
         signal = Signal(
             rule_name="rsi_meanrev",
@@ -187,3 +217,17 @@ class TestRule:
         assert rule.describe() == {"name": "trivial", "params": {}}
         assert rule.name == "trivial"
         assert rule.params == {}
+
+    def test_rule_id_defaults_to_none(self) -> None:
+        """A hand-constructed `Rule` (most tests, and every rule not loaded via
+        `agent._build_rule`) must still build with no `rule_id` -- additive, backward-compatible
+        default, same pattern as `promotion_class`."""
+        rule = _TrivialRule()
+        assert rule.rule_id is None
+
+    def test_rule_id_is_settable_after_construction(self) -> None:
+        """`agent._build_rule` sets this as a plain attribute post-construction (not a
+        constructor kwarg) -- `Rule` is a plain mutable object, not frozen."""
+        rule = _TrivialRule()
+        rule.rule_id = 7
+        assert rule.rule_id == 7
