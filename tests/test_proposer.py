@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 import pytest
@@ -11,6 +12,8 @@ from keel.proposer import (
     ProposalReport,
     build_proposal_report,
     parse_proposal,
+    render_proposal_report,
+    report_to_jsonable,
 )
 
 
@@ -150,3 +153,93 @@ def test_invalid_entries_pass_through_to_report():
     assert report.screened == []
     assert calls == []  # invalid entries are never screened
     assert len(report.invalid) == 1
+
+
+def _report(admitted, bars, attested=False, hypothesis=None):
+    parsed = parse_proposal(
+        {"candidates": [_entry(asset="SOL", shariah_hypothesis=hypothesis)]}
+    )
+
+    def screen_fn(repo, product, quote):
+        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True)
+        failures = (
+            []
+            if admitted
+            else (
+                ["history: too few bars"]
+                if bars
+                else ["liquidity: 0", "attestation: MISSING."]
+            )
+        )
+        return facts, screen_mod.ScreenResult("SOL", admitted=admitted, failures=failures)
+
+    repo = _repo()
+    if attested:
+        repo.upsert_asset_attestation(
+            asset="SOL",
+            sector="payments",
+            backing="native",
+            pays_yield=False,
+            source="https://x.invalid",
+            attested_by="t",
+            attested_at=0,
+        )
+    return build_proposal_report(parsed, repo, "USD", [], screen_fn)
+
+
+def test_render_admit_shows_summary_and_sources():
+    lines = render_proposal_report(_report(admitted=True, bars=2000))
+    text = "\n".join(lines)
+    assert "ADMIT" in text
+    assert "SOL" in text
+    assert "source: https://coinmarketcap.com/currencies/solana/" in text
+    assert "1/1 admitted" in text
+
+
+def test_render_unverified_hypothesis_is_labeled():
+    lines = render_proposal_report(_report(admitted=False, bars=2000, hypothesis="halal L1"))
+    text = "\n".join(lines)
+    assert "UNVERIFIED" in text
+    assert "halal L1" in text
+
+
+def test_render_no_history_shows_missing_data_next_step():
+    lines = render_proposal_report(_report(admitted=False, bars=0))
+    text = "\n".join(lines)
+    assert "no local history" in text
+    assert "keel fetch --products SOL-USD" in text
+    assert "MISSING-DATA verdict" in text
+    # the liquidity failure is suppressed as not-assessable-without-history
+    assert "not assessable without history" in text
+
+
+def test_render_unattested_reject_shows_attest_next_step():
+    lines = render_proposal_report(_report(admitted=False, bars=2000, attested=False))
+    assert any("keel assets attest SOL" in line for line in lines)
+
+
+def test_render_empty_report_is_friendly_not_blank():
+    parsed = parse_proposal({"candidates": []})
+    report = build_proposal_report(parsed, _repo(), "USD", [], lambda *a: None)
+    lines = render_proposal_report(report)
+    assert lines and "no candidates" in "\n".join(lines).lower()
+
+
+def test_render_invalid_entries_are_listed():
+    parsed = parse_proposal({"candidates": [_entry(sources=[])]})
+    report = build_proposal_report(parsed, _repo(), "USD", [], lambda *a: None)
+    text = "\n".join(render_proposal_report(report))
+    assert "INVALID" in text
+    assert "1 invalid" in text
+
+
+def test_jsonable_is_json_serializable_and_has_keys():
+    payload = report_to_jsonable(_report(admitted=True, bars=2000))
+    dumped = json.dumps(payload, indent=2, default=str)  # must not raise
+    back = json.loads(dumped)
+    assert back["admitted_count"] == 1
+    row = back["screened"][0]
+    assert row["asset"] == "SOL"
+    assert row["admitted"] is True
+    assert row["sources"] == ["https://coinmarketcap.com/currencies/solana/"]
+    assert "shariah_hypothesis" in row

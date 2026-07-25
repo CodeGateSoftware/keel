@@ -159,3 +159,87 @@ def build_proposal_report(
             )
         )
     return ProposalReport(screened=screened, invalid=parsed.invalid)
+
+
+_DATA_DERIVED_FAILURES = frozenset({"liquidity"})  # keep in sync with cli.py `assets holdings`
+
+
+def render_proposal_report(report: ProposalReport) -> list[str]:
+    """Human-readable lines. Admits nothing -- this only reports gate verdicts + next steps."""
+    lines: list[str] = []
+    if not report.screened and not report.invalid:
+        return ["no candidates in proposal."]
+
+    for sc in report.screened:
+        cand = sc.candidate
+        allow = "on-allowlist" if sc.on_allowlist else "not-on-allowlist"
+        attested = "attested" if sc.attested else "UNATTESTED"
+        lines.append("")
+        lines.append(
+            f"{sc.result.summary:<7} {cand.asset:<8} bars={sc.facts.daily_bars} "
+            f"{allow} {attested}"
+        )
+        lines.append(f"    rationale: {cand.rationale}")
+        for src in cand.sources:
+            lines.append(f"    source: {src}")
+        if cand.shariah_hypothesis:
+            lines.append(
+                f"    UNVERIFIED hypothesis (never used for admission): {cand.shariah_hypothesis}"
+            )
+        failures = list(sc.result.failures)
+        if sc.facts.daily_bars == 0:
+            derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
+            failures = [f for f in failures if f not in derived]
+            lines.append(
+                f"    ! no local history -- run `keel fetch --products {sc.product}` first, "
+                "then re-screen."
+            )
+            lines.append("      This is a MISSING-DATA verdict, not a verdict about the asset.")
+            for failure in derived:
+                lines.append(f"    · ({failure.split(':')[0]}: not assessable without history)")
+        for failure in failures:
+            lines.append(f"    ✗ {failure}")
+        for warning in sc.result.warnings:
+            lines.append(f"    ! {warning}")
+        if not sc.result.admitted and not sc.attested:
+            lines.append(
+                f"    next: human-classify with `keel assets attest {cand.asset} "
+                "--sector <s> --backing <ayn|dayn|native> --source <url>`, then fetch data "
+                "and backtest."
+            )
+
+    for entry in report.invalid:
+        lines.append("")
+        lines.append(f"INVALID  {entry.reason}: {entry.raw}")
+
+    invalid_word = "entry" if len(report.invalid) == 1 else "entries"
+    lines.append("")
+    lines.append(
+        f"{report.admitted_count}/{len(report.screened)} admitted "
+        f"({len(report.invalid)} invalid {invalid_word})"
+    )
+    return lines
+
+
+def report_to_jsonable(report: ProposalReport) -> dict[str, Any]:
+    return {
+        "screened": [
+            {
+                "asset": sc.candidate.asset,
+                "product": sc.product,
+                "rationale": sc.candidate.rationale,
+                "sources": sc.candidate.sources,
+                "shariah_hypothesis": sc.candidate.shariah_hypothesis,
+                "on_allowlist": sc.on_allowlist,
+                "attested": sc.attested,
+                "admitted": sc.result.admitted,
+                "summary": sc.result.summary,
+                "daily_bars": sc.facts.daily_bars,
+                "failures": sc.result.failures,
+                "warnings": sc.result.warnings,
+            }
+            for sc in report.screened
+        ],
+        "invalid": [{"reason": e.reason, "raw": e.raw} for e in report.invalid],
+        "admitted_count": report.admitted_count,
+    }
