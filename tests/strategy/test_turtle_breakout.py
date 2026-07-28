@@ -13,6 +13,7 @@ current *forming* day and must be dropped to avoid intraday lookahead.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from keel import agent
@@ -120,6 +121,26 @@ def _falling_candles(n: int = 10, start: float = 200.0, decr: float = 3.0) -> li
     close breaks below.
     """
     return _trending_base(n, start=start, incr=-decr)
+
+
+_DAY = 24 * 60 * 60
+_HOUR = 60 * 60
+#: An epoch second that is exactly a UTC day boundary (86400 * 20660). The forming-bar guard
+#: compares real bar timestamps, so the day-shaped fixtures need day-aligned ones.
+_DAY_ZERO = 1_785_024_000
+
+
+def _day_candle(ts: int, o: float, h: float, low: float, c: float) -> Candle:
+    return _candle(ts, o, h, low, c)
+
+
+def _on_days(candles: list[Candle], start_ts: int = _DAY_ZERO) -> list[Candle]:
+    """Re-stamp a hand-built series onto consecutive UTC day boundaries.
+
+    The shared fixtures number their bars 0, 1, 2...; the live-agent shape needs timestamps a
+    real daily series would have, since that is what the guard reasons about.
+    """
+    return [replace(c, ts=start_ts + i * _DAY) for i, c in enumerate(candles)]
 
 
 def _rule(**overrides) -> TurtleBreakout:
@@ -268,6 +289,90 @@ class TestFormingBarLookaheadGuard:
         # The decided-on bar is the completed breakout, not the forming pullback.
         assert setup.entry == Decimal(str(breakout_price))
         assert setup.ts == 20
+
+
+class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
+    """The LIVE agent (`agent.run_once`) hands the rule an `ONE_HOUR` key too, but its daily
+    series has NO forming bar: `data.market_feed` only ever persists CLOSED candles. Dropping
+    the newest daily bar there is not a lookahead guard, it is a full day of lag on every
+    breakout -- the rule decides on a bar that closed up to 48h ago.
+
+    What separates the two callers is not the presence of `ONE_HOUR` but where the hourly
+    series SITS: the account sim's hourly window is always inside the last daily bar's own
+    period (`portfolio_sim` slices daily with `bisect_right(daily_ts, t)`), while the live
+    agent's has advanced into a later day.
+    """
+
+    def test_breakout_on_the_newest_closed_daily_bar_fires(self) -> None:
+        rule = _rule()
+        # Penultimate completed day pulls back -- no breakout there -- so only the NEWEST daily
+        # bar can produce a setup. If it is dropped, detect() returns None.
+        base = _on_days(_trending_base(19))
+        pullback_price = float(base[-3].close)
+        base.append(
+            _day_candle(
+                base[-1].ts + _DAY,
+                pullback_price - 0.5, pullback_price + 0.5, pullback_price - 0.5, pullback_price,
+            )
+        )
+        breakout_price = float(base[-2].close) + 20.0
+        breakout_ts = base[-1].ts + _DAY
+        base.append(
+            _day_candle(
+                breakout_ts,
+                breakout_price - 0.5, breakout_price + 0.5, breakout_price - 0.5, breakout_price,
+            )
+        )
+        # The live agent's newest CLOSED hourly bar sits in the day AFTER the newest daily bar,
+        # which is only possible once that daily bar has itself closed.
+        hourly = [_day_candle(breakout_ts + _DAY, 1, 1, 1, 1)]
+
+        setup = rule.detect({Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: base})
+
+        assert setup is not None
+        assert setup.ts == breakout_ts
+
+    def test_account_sim_forming_bar_is_still_dropped(self) -> None:
+        """The guard must keep working for `portfolio_sim`, whose hourly bar sits INSIDE the
+        last daily bar's period -- the one shape where that bar really is still forming.
+        """
+        rule = _rule()
+        base = _on_days(_trending_base(19))
+        pullback_price = float(base[-3].close)
+        base.append(
+            _day_candle(
+                base[-1].ts + _DAY,
+                pullback_price - 0.5, pullback_price + 0.5, pullback_price - 0.5, pullback_price,
+            )
+        )
+        forming_ts = base[-1].ts + _DAY
+        breakout_price = float(base[-2].close) + 20.0
+        base.append(
+            _day_candle(
+                forming_ts,
+                breakout_price - 0.5, breakout_price + 0.5, breakout_price - 0.5, breakout_price,
+            )
+        )
+        # Mid-day hourly bar, inside the last daily bar's own period = still forming.
+        hourly = [_day_candle(forming_ts + 12 * _HOUR, 1, 1, 1, 1)]
+
+        assert rule.detect({Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: base}) is None
+
+    def test_exit_fires_on_the_newest_closed_daily_bar(self) -> None:
+        rule = _rule()
+        # A rising base, then a single sharp drop below the prior 3-day channel low ON THE
+        # NEWEST bar. No earlier bar breaks its own channel, so dropping the newest = no exit.
+        base = _on_days(_trending_base(20))
+        break_price = float(min(c.low for c in base[-3:])) - 5.0
+        break_ts = base[-1].ts + _DAY
+        base.append(
+            _day_candle(
+                break_ts, break_price + 0.5, break_price + 0.5, break_price - 0.5, break_price
+            )
+        )
+        hourly = [_day_candle(break_ts + _DAY, 1, 1, 1, 1)]
+
+        assert rule.exit_signal(None, {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: base})
 
 
 class TestExitSignal:
