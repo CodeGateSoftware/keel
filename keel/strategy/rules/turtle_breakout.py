@@ -26,15 +26,18 @@ chosen by **walk-forward out-of-sample validation** on cached 5yr BTC/ETH/PAXG (
 lookback longer than 20 beat 20 out-of-sample; 40 was the most robust across held-out years). The
 2:1 asymmetric ratio, ADX(14) gate, and 20-day ATR "N" are unchanged.
 
-**Forming-bar lookahead guard.** The two backtest passes present the daily series differently:
+**Forming-bar lookahead guard.** Three callers present the daily series differently:
 - The *edge* backtester (`strategy.backtest.backtest`) drives the rule on its native series
   only -- no `ONE_HOUR` key -- and every daily bar in it is already closed.
 - The *account* simulator (`sim.portfolio_sim`) iterates hourly and hands the rule BOTH an
   `ONE_HOUR` window AND the `ONE_DAY` series, where the last daily bar is the CURRENT, still-
   forming day (its DB OHLC is the completed day = lookahead if consumed intraday).
-`detect()`/`exit_signal()` therefore drop the last daily bar iff an `ONE_HOUR` key is present,
-so decisions are made only on completed days in the account pass while using every (closed) bar
-in the edge pass.
+- The *live agent* (`agent.run_once`) also passes an `ONE_HOUR` key, but `data.market_feed`
+  persists only CLOSED candles, so its last daily bar has already closed.
+`detect()`/`exit_signal()` therefore drop the last daily bar only when it is genuinely still
+forming -- decided by where the hourly series SITS, not by whether it exists (`_completed_days`).
+Keying it on the mere presence of `ONE_HOUR` cost the live agent a full day of lag on every
+breakout, since it discarded a completed day the sim never had.
 """
 
 from __future__ import annotations
@@ -44,6 +47,35 @@ from decimal import Decimal
 from keel.analysis.indicators import adx, atr, donchian_high, donchian_low, macd
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
+
+_DAY_SECONDS = 24 * 60 * 60
+
+
+def _completed_days(candles_by_tf: dict[Granularity, list[Candle]]) -> list[Candle]:
+    """The `ONE_DAY` series with any still-FORMING last bar dropped.
+
+    The account sim (`sim.portfolio_sim`) slices its daily series with
+    `bisect_right(daily_ts, t)` against the current hourly bar `t`, so its last daily bar
+    always CONTAINS that hourly bar -- it is the current, still-forming day, and its DB OHLC is
+    the completed day (lookahead if consumed intraday).
+
+    The live agent (`agent.run_once`) passes an `ONE_HOUR` key too, but `data.market_feed`
+    persists only CLOSED candles, so its last daily bar has already closed. Keying the drop on
+    the mere PRESENCE of `ONE_HOUR` therefore threw away a completed day there and left the
+    rule deciding on a bar up to 48h old -- a day of lag on every breakout.
+
+    So the test is where the hourly series SITS, not whether it exists: the newest daily bar is
+    still forming unless the newest hourly bar opens at or after that day's close. In the sim
+    that is never true (its hourly bar is by construction inside the day), so the sim's guard is
+    unchanged; in the live agent it is true from the first full hour of the next UTC day.
+    """
+    daily = candles_by_tf.get(Granularity.ONE_DAY, [])
+    hourly = candles_by_tf.get(Granularity.ONE_HOUR)
+    if not hourly or not daily:
+        return daily
+    if hourly[-1].ts < daily[-1].ts + _DAY_SECONDS:
+        return daily[:-1]
+    return daily
 
 
 class TurtleBreakout(Rule):
@@ -125,13 +157,10 @@ class TurtleBreakout(Rule):
         this target; it only exists to clear the evaluation engine's rr>=1 kill-zone gate and
         let winners run past a fixed 1:1/2:1 cap).
         """
-        daily = candles_by_tf.get(Granularity.ONE_DAY, [])
-        # Account sim (portfolio_sim) includes the current *forming* daily bar alongside an
-        # ONE_HOUR window -> drop it to decide only on completed days (no lookahead). The
-        # daily-only edge backtest has no ONE_HOUR key and every daily bar is already closed,
-        # so use them all.
-        if candles_by_tf.get(Granularity.ONE_HOUR):
-            daily = daily[:-1]
+        # Drop the last daily bar only when it is genuinely still forming -- see
+        # `_completed_days`. The daily-only edge backtest has no ONE_HOUR key and every daily
+        # bar is already closed, so it uses them all.
+        daily = _completed_days(candles_by_tf)
 
         entry_lookback = self.params["entry_lookback"]
         exit_lookback = self.params["exit_lookback"]
@@ -229,11 +258,8 @@ class TurtleBreakout(Rule):
         nominal target are the backtester/account-sim's job to enforce separately.
         """
         del held
-        daily = candles_by_tf.get(Granularity.ONE_DAY, [])
-        # Same forming-bar guard as detect(): the account sim carries the current forming daily
-        # bar alongside an ONE_HOUR window -> decide on completed days only.
-        if candles_by_tf.get(Granularity.ONE_HOUR):
-            daily = daily[:-1]
+        # Same forming-bar guard as detect() -- see `_completed_days`.
+        daily = _completed_days(candles_by_tf)
 
         exit_lookback = self.params["exit_lookback"]
         if len(daily) <= exit_lookback + 1:
