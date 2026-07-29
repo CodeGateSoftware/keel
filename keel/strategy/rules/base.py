@@ -108,6 +108,13 @@ class Rule(ABC):
     params: dict
     promotion_class: str = "default"
     rule_id: int | None = None
+    #: Why the last `detect()` call declined, or `None` if it fired (or never recorded one).
+    #: `strategy.engine.evaluate` merges it into the `engine.no_signal` event it already emits,
+    #: so a cycle reporting `signals=0` can say whether price was 1% or 40% off the trigger.
+    #: PURELY DIAGNOSTIC -- no gate, guard or sizing path reads it, and a rule that never sets
+    #: it logs exactly what it logged before. Recording it is optional for a rule; the shape is
+    #: `{"gate": <stable id>, ...numbers}`.
+    last_rejection: dict | None = None
 
     @abstractmethod
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:

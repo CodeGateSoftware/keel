@@ -291,6 +291,61 @@ class TestFormingBarLookaheadGuard:
         assert setup.ts == 20
 
 
+class TestRejectionDiagnostics:
+    """`detect()` records WHY it declined on `last_rejection`, so `engine.evaluate` can put the
+    near-miss numbers into its `engine.no_signal` event.
+
+    Purely diagnostic: no gate, guard or sizing path reads it. A cycle logging `signals=0`
+    otherwise says nothing about whether price was 1% or 40% away from the channel, which is the
+    difference between "nearly fired" and "nowhere near".
+    """
+
+    def test_a_close_below_the_channel_records_how_far_below(self) -> None:
+        rule = _rule()
+        candles = _no_breakout_candles()
+
+        assert rule.detect({Granularity.ONE_DAY: candles}) is None
+
+        rejection = rule.last_rejection
+        assert rejection["gate"] == "donchian_high"
+        assert rejection["close"] == float(candles[-1].close)
+        assert rejection["entry_level"] > rejection["close"]
+        assert rejection["gap_pct"] > 0
+
+    def test_a_breakout_rejected_by_adx_records_the_reading_and_the_threshold(self) -> None:
+        """The ETH-USD case: price DID clear the channel and only the trend filter declined it."""
+        rule = _rule()
+
+        assert rule.detect({Granularity.ONE_DAY: _choppy_breakout_candles()}) is None
+
+        rejection = rule.last_rejection
+        assert rejection["gate"] == "adx"
+        assert rejection["adx"] < rejection["adx_threshold"]
+        # the breakout numbers are carried too -- that it broke out at all is the news
+        assert rejection["close"] > rejection["entry_level"]
+
+    def test_too_little_history_records_what_it_needed(self) -> None:
+        rule = _rule()
+
+        assert rule.detect({Granularity.ONE_DAY: _trending_base(3)}) is None
+
+        rejection = rule.last_rejection
+        assert rejection["gate"] == "insufficient_history"
+        assert rejection["bars"] == 3
+        assert rejection["bars_needed"] > 3
+
+    def test_a_fired_setup_clears_the_previous_rejection(self) -> None:
+        """Stale diagnostics are worse than none: a rule that fired must not still be carrying
+        the reason it declined last time."""
+        rule = _rule()
+        rule.detect({Granularity.ONE_DAY: _no_breakout_candles()})
+        assert rule.last_rejection is not None
+
+        assert rule.detect({Granularity.ONE_DAY: _breakout_candles()}) is not None
+
+        assert rule.last_rejection is None
+
+
 class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
     """The LIVE agent (`agent.run_once`) hands the rule an `ONE_HOUR` key too, but its daily
     series has NO forming bar: `data.market_feed` only ever persists CLOSED candles. Dropping

@@ -51,6 +51,17 @@ from keel.types import Candle, Granularity
 _DAY_SECONDS = 24 * 60 * 60
 
 
+def _gap_pct(close: float, entry_level: float) -> float | None:
+    """How far below the channel top `close` sits, in percent (negative once it has cleared it).
+
+    `None` for a non-positive close rather than dividing by it -- a diagnostic must never be the
+    thing that raises inside `detect()`.
+    """
+    if close <= 0:
+        return None
+    return (entry_level - close) / close * 100
+
+
 def _completed_days(candles_by_tf: dict[Granularity, list[Candle]]) -> list[Candle]:
     """The `ONE_DAY` series with any still-FORMING last bar dropped.
 
@@ -150,6 +161,20 @@ class TurtleBreakout(Rule):
     # Rule interface
     # ------------------------------------------------------------------
 
+    def _decline(self, gate: str, **numbers: object) -> None:
+        """Record WHY this bar declined on `last_rejection`, and return `None` for `detect()`.
+
+        Returning `None` (rather than setting and letting the caller `return None`) keeps each
+        decline a single line, so the reason can never drift from the branch that produced it.
+
+        This only ever writes an attribute -- it does NOT log. `detect()` runs once per bar in
+        `strategy.backtest` and `sim.portfolio_sim`, so logging here would emit millions of
+        events in a sim; `engine.evaluate` reads the attribute and folds it into the one
+        `engine.no_signal` event it already emits per declining rule.
+        """
+        self.last_rejection = {"gate": gate, **numbers}
+        return None
+
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         """Confirmed close above the prior entry-lookback Donchian high, ADX>threshold, and
         (optionally) a positive MACD histogram -- then a 2xATR stop and a distant nominal
@@ -169,7 +194,7 @@ class TurtleBreakout(Rule):
 
         min_needed = max(entry_lookback, adx_period, atr_period) + 2
         if len(daily) < min_needed:
-            return None
+            return self._decline("insufficient_history", bars=len(daily), bars_needed=min_needed)
 
         # PERFORMANCE: this rule runs every bar over long series (O(N^2) in a naive sim).
         # Only the current-bar indicator value is ever used, so bound the work: Donchian is
@@ -181,18 +206,28 @@ class TurtleBreakout(Rule):
         current = work[-1]
 
         entry_level = donchian_high(daily[:-1], entry_lookback)
-        if not float(current.close) > entry_level:
-            return None
+        close = float(current.close)
+        # Carried on EVERY decline from here down: that price cleared the channel and something
+        # else declined it is the interesting case, and it is invisible from `signals=0` alone.
+        breakout = {
+            "close": close,
+            "entry_level": entry_level,
+            "gap_pct": _gap_pct(close, entry_level),
+        }
+        if not close > entry_level:
+            return self._decline("donchian_high", **breakout)
 
         adx_now = adx(work, adx_period)[-1]
         if not adx_now > self.params["adx_threshold"]:
-            return None
+            return self._decline(
+                "adx", adx=adx_now, adx_threshold=self.params["adx_threshold"], **breakout
+            )
 
         if self.params["use_macd_confirm"]:
             closes = [float(c.close) for c in work]
             histogram = macd(closes)[2]
             if not histogram[-1] > 0:
-                return None
+                return self._decline("macd_histogram", histogram=histogram[-1], **breakout)
 
         # Low-volume breakout filter (default off): a breakout on thin volume is a likely
         # fakeout, so require the breakout bar's volume to exceed `volume_mult` x the average
@@ -203,17 +238,23 @@ class TurtleBreakout(Rule):
             prior = daily[-vperiod - 1 : -1]
             if prior:
                 avg_vol = sum((c.volume for c in prior), Decimal(0)) / len(prior)
-                if not current.volume > Decimal(str(self.params["volume_mult"])) * avg_vol:
-                    return None
+                required = Decimal(str(self.params["volume_mult"])) * avg_vol
+                if not current.volume > required:
+                    return self._decline(
+                        "min_volume",
+                        volume=float(current.volume),
+                        volume_required=float(required),
+                        **breakout,
+                    )
 
         atr_now = Decimal(str(atr(work, atr_period)[-1]))
         if atr_now <= 0:
-            return None
+            return self._decline("atr", atr=float(atr_now), **breakout)
 
         entry = current.close
         stop = entry - self.params["atr_stop_mult"] * atr_now
         if stop >= entry:
-            return None
+            return self._decline("stop_not_below_entry", stop=float(stop), **breakout)
 
         risk = entry - stop
         target = entry + self.params["target_rr"] * risk
@@ -226,8 +267,9 @@ class TurtleBreakout(Rule):
         # so it behaves identically in the edge backtest, the account sim, and live. Runs only
         # here, on a bar that actually breaks out, so the bounded replay is cheap.
         if self.params["s1_filter"] and self._prior_breakout_won(daily):
-            return None
+            return self._decline("s1_filter", **breakout)
 
+        self.last_rejection = None  # this bar FIRED -- a stale reason would misreport it
         context = {
             "rule_class": "trend_follow",
             "adx": adx_now,
