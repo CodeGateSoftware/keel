@@ -76,6 +76,39 @@ for any live (network) commands. `.env` is git-ignored and never committed. Offl
 Runtime settings (allowlist, target weights, risk caps, market data granularities, etc.) live in
 `config.yaml` at the repo root — see `keel/config.py` for the schema and validation rules.
 
+## Deploying a new version
+
+Cutting a release is `docs/RELEASING.md`. Installing one into a deployment (e.g. `~/keel`) is four
+commands, run **from the deployment directory** — every path below is relative to it:
+
+```bash
+gh release download v0.3.1 --repo CodeGateSoftware/keel --pattern '*.whl' --dir Release/
+uv pip install --python .venv --find-links Release Release/keel_trader-0.3.1-py3-none-any.whl
+.venv/bin/keel --version
+.venv/bin/keel status
+```
+
+Substitute the version being deployed in both of the first two lines. `--find-links Release` is
+what lets the single `keel_trader` wheel resolve its `keel-core` / `keel-broker-*` siblings from
+that same directory — which is why step 1 downloads them all. Installing **by path** rather than
+by bare name is deliberate: `keel` on PyPI is an unrelated project, so `pip install keel` fetches a
+stranger's code (see `keel/version.py`).
+
+Step 3 is the check that matters. It must report the version you just installed, bound to a
+commit, from source `[release]`:
+
+```
+keel 0.3.1+deb8fa7e978d [release]
+```
+
+A build reporting `(DIRTY)` or `[checkout]` corresponds to no commit and **must not be run against
+live funds**. Step 4 is a read-only snapshot — no orders, no writes — confirming the new build
+opens the database and reaches the venue.
+
+If the deployment runs on a schedule (LaunchAgents, cron), a new build takes effect on the next
+cycle with nothing to restart — each cycle is a fresh process. A **long-running** process is the
+exception: a `keel tui` left open keeps the build it started with until you quit and relaunch it.
+
 ## Before trading live
 
 Read `docs/operator-runbook.md`. It lists the compliance obligations **no rail can enforce** — chiefly
