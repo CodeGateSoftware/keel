@@ -84,7 +84,23 @@ def evaluate(
     for rule in rules:
         setup = rule.detect(candles_by_tf)
         if setup is None:
-            log_event(logger, logging.INFO, "engine.no_signal", rule=rule.name)
+            # Fold in whatever the rule recorded about WHY (`Rule.last_rejection`) -- the gate it
+            # tripped and the numbers behind it. This enriches the event that already fires here
+            # rather than adding one: `detect()` runs once per bar in `strategy.backtest` and
+            # `sim.portfolio_sim`, so a new per-decline call site would be millions of events.
+            # A rule that records nothing logs exactly the bare event it logged before.
+            # `product` comes from the rule, not a `Setup` (there isn't one). Omitted entirely
+            # rather than logged as `None` when a rule declares no `product_id`, so a rule
+            # without one logs exactly the bare event it logged before.
+            product = getattr(rule, "product_id", None)
+            log_event(
+                logger,
+                logging.INFO,
+                "engine.no_signal",
+                rule=rule.name,
+                **({"product": product} if product else {}),
+                **(rule.last_rejection or {}),
+            )
             continue
 
         trading_gran = _trading_granularity(rule, candles_by_tf)

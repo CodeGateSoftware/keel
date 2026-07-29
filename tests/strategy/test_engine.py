@@ -12,6 +12,7 @@ the module docstring notes inline for what each fixture is known to produce.
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 
 from keel.data.db import connect, migrate
@@ -20,6 +21,7 @@ from keel.strategy.engine import DEFAULT_RR_FLOOR, evaluate
 from keel.strategy.rules.base import Action, Rule, Setup
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Candle, Granularity, Side
 
 _DAY = 86_400
@@ -417,3 +419,56 @@ class TestHigherTfBiasGate:
         signals = evaluate(rules=[rule], candles_by_tf=candles_by_tf)
 
         assert len(signals) == 1
+
+
+class TestNoSignalDiagnostics:
+    """`engine.no_signal` carries whatever the rule recorded on `last_rejection`.
+
+    The event already fires once per declining rule; enriching it costs no extra call site and
+    no extra event, which matters because `backtest`/`portfolio_sim` drive `evaluate()` once per
+    bar. A rule that records nothing logs exactly what it logged before.
+    """
+
+    def test_the_event_carries_the_rules_rejection_numbers(self, caplog) -> None:
+        rule = TurtleBreakout(
+            product_id="BTC-USD", entry_lookback=5, exit_lookback=3, adx_period=5, atr_period=5
+        )
+        # A rising base whose final bar pulls back below the channel: declines on donchian_high.
+        candles = _flat_series([100 + 2 * i for i in range(20)] + [104])
+
+        with caplog.at_level(logging.INFO):
+            assert evaluate(rules=[rule], candles_by_tf={Granularity.ONE_DAY: candles}) == []
+
+        record = next(
+            r for r in caplog.records if r.getMessage() == "engine.no_signal"
+        )
+        fields = record.keel_fields
+        assert fields["rule"] == "turtle_breakout"
+        assert fields["gate"] == "donchian_high"
+        assert fields["close"] == 104.0
+        assert fields["entry_level"] > fields["close"]
+
+    def test_the_event_names_the_product(self, caplog) -> None:
+        """Every turtle rule is named `turtle_breakout`, so without the product the five lines a
+        five-product cycle emits are indistinguishable -- and near-miss numbers you cannot
+        attribute to an asset are not diagnostics."""
+        rule = TurtleBreakout(
+            product_id="ETH-USD", entry_lookback=5, exit_lookback=3, adx_period=5, atr_period=5
+        )
+        candles = _flat_series([100 + 2 * i for i in range(20)] + [104])
+
+        with caplog.at_level(logging.INFO):
+            evaluate(rules=[rule], candles_by_tf={Granularity.ONE_DAY: candles})
+
+        record = next(r for r in caplog.records if r.getMessage() == "engine.no_signal")
+        assert record.keel_fields["product"] == "ETH-USD"
+
+    def test_a_rule_recording_nothing_logs_the_bare_event(self, caplog) -> None:
+        rule = _NoSetupRule()
+
+        with caplog.at_level(logging.INFO):
+            candles_by_tf = {Granularity.ONE_DAY: _flat_series([1, 2])}
+            assert evaluate(rules=[rule], candles_by_tf=candles_by_tf) == []
+
+        record = next(r for r in caplog.records if r.getMessage() == "engine.no_signal")
+        assert record.keel_fields == {"rule": rule.name}
