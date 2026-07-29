@@ -49,3 +49,7 @@ com.keel.paperforward.plist
 config.live-sandbox.yaml
 keel-live-run.sh
 com.keel.live.plist
+
+# operator wrappers (config+db pinned) -- deployment artifacts, copied to ~/keel
+keel-live
+keel-paper
