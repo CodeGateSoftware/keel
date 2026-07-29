@@ -39,6 +39,7 @@ from keel.commands.status import (
     SubscriptionStatusRow,
 )
 from keel.commands.tui import (
+    _REFRESH_MESSAGE,
     _SHORT_VERSION,
     AvailableBalance,
     ScreenLine,
@@ -1396,3 +1397,33 @@ def test_run_live_wraps_curses_error_as_clickexception(
         run_live(_must_not_open, lambda: 0, 5.0)
 
     assert "--once" in str(excinfo.value)
+
+
+def test_run_live_r_toasts_that_it_refreshed(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`r` re-reads local state and forces the balance re-fetch, but set no message -- so the one
+    keypress that always "works" was indistinguishable from a dead key. Every other action key
+    (`a`, `f`) toasts; this one must too.
+    """
+    config = _config()
+    # poll1: normal -> 'r'. poll2: the repaint that must carry the toast. poll3: 'q' (default).
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=[ord("r"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("refreshed" in t for t in painted_texts)
+
+
+def test_the_refresh_toast_reads_as_ok_not_as_a_failure() -> None:
+    """It is a routine, successful action -- it must not paint in the alert/warn colours reserved
+    for a failure, a cancelled action, or arming autonomy."""
+    assert _message_style(_REFRESH_MESSAGE) == "ok"

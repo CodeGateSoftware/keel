@@ -557,6 +557,14 @@ Echo = Callable[[str], None]
 #: (e.g. "autonomy -> ON" still showing after autonomy has since lapsed).
 _MESSAGE_TTL_SEC = 12
 
+#: The `r` toast. `r` re-reads local state and forces the live-balance re-fetch, but it used to
+#: set no message at all -- and since the DB usually has not changed between two repaints, the
+#: screen came back byte-identical and the key was indistinguishable from a dead one. Every other
+#: action key toasts; this says what `r` did, and (unlike `f`) what it deliberately did NOT do.
+#: The balance is re-read AFTER the paint, so it lands on the following frame -- hence "balance
+#: updating" rather than a claim it is already showing.
+_REFRESH_MESSAGE = "refreshed local state -- balance updating (no candle fetch; use [f] for that)"
+
 #: How often (seconds) `run_live` refreshes the live "available to buy" balance -- deliberately
 #: SLOWER than the dashboard's own repaint interval (typically 5s): it is a real broker call
 #: (`get_accounts`), and re-fetching it every repaint would hammer the venue for no operator
@@ -856,6 +864,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 continue
             if ch == ord("r"):
                 last_balance_ts = 0  # force the balance to re-fetch on the next iteration too
+                # Toast it. `r` always succeeds and usually changes nothing on screen (the DB
+                # rarely differs between two repaints), so without this the key is
+                # indistinguishable from a dead one -- see `_REFRESH_MESSAGE`.
+                message = _REFRESH_MESSAGE
+                message_ts = now_fn()
                 continue
             if ch == ord("a"):
 
