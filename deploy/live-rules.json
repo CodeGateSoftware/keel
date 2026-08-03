@@ -98,7 +98,7 @@
     },
     {
       "kind": "dca",
-      "status": "candidate",
+      "status": "live",
       "params": {
         "product_id": "BTC-USD",
         "cadence_days": 7,
