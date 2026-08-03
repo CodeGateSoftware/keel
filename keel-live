@@ -1,0 +1,25 @@
+#!/bin/bash
+# keel-live -- run ANY keel command against the SUPERVISED-LIVE sandbox, with the config and
+# database pinned together so they can never be mismatched.
+#
+# The footgun this exists to remove: `--db` defaults to keel.db, so running
+#   keel --config config.live-sandbox.yaml agent
+# without `--db keel-live.db` would drive the 5 live-status rules against the PAPER ledger.
+# Config and db must always travel as a pair; here they do.
+#
+# THIS IS THE REAL-MONEY PATH. Placing still requires a typed `y` per order (mode: confirm),
+# and it fails closed with no TTY -- this wrapper does not weaken any rail, it only fixes the
+# argument pairing.
+#
+#   ./keel-live status          # read-only snapshot
+#   ./keel-live agent           # interactive cycle; approve a detected breakout SAME DAY
+#   ./keel-live rules list
+#
+# Authored in the dev repo (gitignored). DEPLOY (copy) to ~/keel.
+set -euo pipefail
+
+# Resolve the deployment dir from this script's own location, so it works from any cwd.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+exec ./.venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db "$@"
