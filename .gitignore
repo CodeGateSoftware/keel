@@ -41,15 +41,10 @@ keel/_build_info.py
 
 # operator's own working config (never the shipped template)
 config.local.yaml
-# operational paper-forward config (funded rehearsal; never the shipped template)
-config.paperforward.yaml
-paperforward-run.sh
-com.keel.paperforward.plist
-# supervised-live sandbox (tiny-cap confirm-mode turtle detector; operational, never shipped)
-config.live-sandbox.yaml
-keel-live-run.sh
-com.keel.live.plist
 
-# operator wrappers (config+db pinned) -- deployment artifacts, copied to ~/keel
-keel-live
-keel-paper
+# The paper-forward and supervised-live deployment files (configs, run scripts, launchd plists,
+# operator wrappers) were ignored here until 2026-08-03, on the reasoning that they are
+# operational and never shipped. Both are still true -- they are excluded from the wheel and from
+# the release assets by the packaging config, not by this file -- but ignoring them meant the only
+# copy of the running deployment's configuration lived on one laptop, with no history and no
+# offsite copy. They are now tracked. They contain no credentials; those stay in `.env` (line 2).

@@ -66,6 +66,16 @@ keel rules promote <id>       # candidate -> paper -> live
 Promoting to `live` is what the promotion floor exists to gate. If you are deliberately
 short-circuiting it for this test, know that you are — and promote a single rule, not the library.
 
+A **DCA** rule cannot clear the gate at all, structurally: it has no stop and no target, so
+`backtest()` opens a position that never closes, every trade stays `open`, and the aggregates see
+`n_trades=0` against `min_trades: 100`. It also needs `--granularity ONE_DAY`, because `Dca` never
+sets `self.granularity` the way `TurtleBreakout` does. So a DCA go-live is
+`keel rules promote <id> --force`, twice — the bypass that flag documents, not a judgement call.
+
+Once promoted, record the change: `python scripts/rule_manifest.py export --db <db>` and commit
+`deploy/live-rules.json`. A fresh deployment re-seeds from constructor defaults and will otherwise
+bring back a differently-sized rule (see `docs/RELEASING.md`).
+
 ## 4. Run one cycle, in confirm mode, and watch
 
 ```bash

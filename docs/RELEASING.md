@@ -62,6 +62,35 @@ keel migrate   # EXISTING database: apply outstanding schema migrations. Never s
   database. It never re-seeds, because that would resurrect rules deliberately deleted or refuted.
   `--db <path>` targets a database directly.
 
+### The rule set does not survive a fresh deployment on its own
+
+An **in-place upgrade** (new wheels + `keel migrate`) keeps the strategy library: the schema steps
+are additive (`CREATE TABLE IF NOT EXISTS rules`) and `migrate` never seeds.
+
+A **fresh deployment** does not. `keel init` seeds every rule at `candidate` from each rule kind's
+**constructor defaults**, so any parameter an operator tuned by hand silently reverts — a DCA rule
+deliberately set to `budget_usd: 25` comes back as the built-in `50`, unpromoted, on a box that
+otherwise looks correctly provisioned. Nothing errors.
+
+`deploy/live-rules.json` is the committed record of the live deployment's rule set, so that state
+is a diff in a PR rather than a fact stored on one laptop:
+
+```
+python scripts/rule_manifest.py export --db keel-live.db      # snapshot; commit the diff
+python scripts/rule_manifest.py apply  --db keel-live.db      # dry run: what a rebuild would do
+python scripts/rule_manifest.py apply  --db keel-live.db --apply --allow-live
+```
+
+Regenerate and commit whenever the live rule set changes deliberately. `apply` refuses to rewrite
+an existing rule's params (it reports drift and exits non-zero) and refuses to create `live` rules
+without `--allow-live` — a manifest must never be able to resize or arm a rule by file edit, which
+is what the promotion ladder exists to prevent. Promotion stays `keel rules promote`'s job.
+
+The deployment's **configs** (`config.live-sandbox.yaml`, `config.paperforward.yaml`, the run
+scripts, the launchd plists and the `keel-live`/`keel-paper` wrappers) are tracked as of
+2026-08-03 for the same reason. They are still excluded from the wheel and the release assets —
+that exclusion comes from the packaging config, which ships only `keel/`, not from `.gitignore`.
+
 The **Migrate database** workflow (Actions → Migrate database → Run workflow) is manual-only. Give
 it a `db_path` to migrate that database; leave it empty and it verifies the migration chain
 instead (a fresh DB and a downgraded DB both reach `SCHEMA_VERSION`). CI has no database to reach

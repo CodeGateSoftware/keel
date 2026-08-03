@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.keel.live</string>
+
+    <!-- Daily SUPERVISED-LIVE detector. Runs one HEADLESS confirm-mode cycle (places nothing,
+         fails closed) to check whether a Turtle breakout fired, and notifies if so. Scheduled at
+         09:05 local -- just after the 09:00 paper-forward, so both see the fresh daily bar.
+
+         Fires hourly at :05 through 20:05, plus on load (= login/boot), because launchd re-runs a
+         missed calendar interval on wake from SLEEP but NOT when the trigger passed while the
+         machine was powered OFF -- so a shutdown over 09:05 lost the detector for the day
+         (observed 2026-07-28: booted 09:24, `launchctl print` reported runs = 0). ONCE PER DAY is
+         enforced by keel-live-run.sh's day-stamp, not by the trigger count: the first run at or
+         after 09:00 with no stamp for today does the cycle, later ones are no-ops, and a FAILED
+         cycle leaves no stamp so the next hour retries it.
+
+         This changes cadence only. The detector still places nothing: confirm mode fails closed
+         with no TTY, so approving remains a deliberate interactive `keel-live agent`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elmehdiaitbrahim/keel/keel-live-run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>5</integer></dict>
+    </array>
+
+    <!-- Run on load, so a boot after the 09:05 trigger catches the day up immediately. The
+         runner's day-stamp makes a repeated load harmless. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elmehdiaitbrahim/keel</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/keel-live.detector.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/keel-live.detector.err.log</string>
+</dict>
+</plist>

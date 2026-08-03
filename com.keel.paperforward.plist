@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.keel.paperforward</string>
+
+    <!-- One paper cycle per day (daily Turtle). The ONCE-PER-DAY property is enforced by
+         paperforward-run.sh's day-stamp, NOT by having a single trigger here: launchd re-runs a
+         missed calendar interval when the machine wakes from SLEEP, but NOT when the trigger
+         passed while it was powered OFF. A shutdown over 09:00 therefore lost the day outright
+         (observed 2026-07-28: booted 09:24, `launchctl print` reported runs = 0).
+
+         So this fires often and the runner decides: 09:00 through 20:00 hourly, plus on load
+         (= login/boot). The first trigger at or after 09:00 that finds no stamp for today runs
+         the cycle; every later one is a no-op. A cycle that FAILS leaves no stamp, so the next
+         hour retries it -- which also covers waking with no network. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elmehdiaitbrahim/keel/paperforward-run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <!-- Run on load, so a boot AFTER the 09:00 trigger catches the day up immediately instead of
+         waiting for the next hour. The runner's day-stamp makes a repeated load harmless, and its
+         before-09:00 guard stops an early-morning boot from consuming the day. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elmehdiaitbrahim/keel</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paperforward.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paperforward.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,20 @@
+#!/bin/bash
+# keel-paper -- run ANY keel command against the PAPER-FORWARD deployment, with the config and
+# database pinned together. Symmetric with `keel-live`; having both means you never type a raw
+# `keel` invocation and never have to remember which db goes with which config.
+#
+# Paper mode places NOTHING real -- it loads only `paper`-status rules and routes them to the
+# PaperTrader. The live READ-ONLY Coinbase API is still used for candles.
+#
+#   ./keel-paper status
+#   ./keel-paper tui            # the full-screen operator dashboard
+#   ./keel-paper agent          # one paper cycle (same as paperforward-run.sh)
+#
+# Authored in the dev repo (gitignored). DEPLOY (copy) to ~/keel.
+set -euo pipefail
+
+# Resolve the deployment dir from this script's own location, so it works from any cwd.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+exec ./.venv/bin/keel --config config.paperforward.yaml "$@"

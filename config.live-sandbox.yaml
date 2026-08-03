@@ -1,0 +1,111 @@
+# keel runtime configuration -- SUPERVISED-LIVE SANDBOX (confirm mode, tiny caps).
+#
+# Purpose: a small, human-approved live test of the 5-trend Turtle running IN PARALLEL with the
+# paper-forward (which stays on config.paperforward.yaml + keel.db, untouched). Every order is
+# PREVIEWED and requires a typed `y`. Caps are deliberately tiny so a bad fill can lose only a
+# few dollars.
+#
+# Authored in the dev repo (gitignored). DEPLOYED to ~/keel at arm-time alongside its
+# OWN database keel-live.db. There it runs as:
+#   .venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db agent   (interactive)
+
+# The 5-trend Turtle set (same as the paper-forward + the walk-forward/PBO analysis).
+# SOL/LTC/LINK are deliberately excluded -- they're the unvalidated skip set.
+allowlist:
+  - BTC
+  - ETH
+  - PAXG
+  - ADA
+  - XLM
+
+target_weights:
+  BTC: 0.30
+  ETH: 0.20
+  PAXG: 0.20
+  ADA: 0.15
+  XLM: 0.15
+
+risk_pct: 0.01   # 1% of the (proxy) equity risked per trade
+
+caps:
+  # NOTE: these are POSITION/SIZE caps, NOT a monthly spend cap. The MONTHLY spend limit you
+  # asked for (start $200/mo, scale to your Coinbase Basic $500/mo) is Rail 14, stored in the DB
+  # (keel-live.db) via `keel subscription set --free-volume-usd 200`, NOT here. To scale it later:
+  #   keel --config config.live-sandbox.yaml --db keel-live.db subscription set --free-volume-usd 500
+  #
+  # max_exposure_usd = the TOTAL held-at-once ceiling AND the live sizing equity proxy, so it also
+  # bounds order size: at risk_pct 0.01 and a ~2xATR stop, a proposed order lands around $60-80.
+  # Think of it as "this sandbox is a $200 account." Raise it alongside the monthly cap as you scale.
+  max_exposure_usd: 200      # total open exposure across all positions AT ONCE (NOT per day, NOT per month)
+  max_per_order_usd: 100     # per-single-order ceiling
+  max_per_day_usd: 200       # per-rolling-24h ceiling
+  max_per_asset_pct: 0.50    # no single asset may exceed 50% of the $200 exposure ($100)
+
+market_data:
+  granularities:
+    - ONE_DAY
+    - ONE_HOUR
+    - FIFTEEN_MINUTE
+  history_days: 365
+
+auto_trade:
+  mode: confirm   # LIVE, but every order asks for a typed `y` first (fails closed with no human)
+  enabled: false
+  interval_sec: 900
+
+promotion:
+  min_trades: 100
+  min_expectancy: 0.0
+  min_rr: 1.5
+  min_win_rate: 0.55
+
+money_mgmt:
+  profit_trigger_pct: 0.10
+  acceleration_pct: 0.05
+  max_total_dd_pct: 0.20
+  max_weekly_dd_pct: 0.08
+  max_consecutive_losses: 0
+  streak_cooloff_days: 0
+
+dca:
+  budget_usd: 50
+  cadence_days: 7
+
+# The settlement currency this deployment TRADES IN -- USD, matching the cached -USD history and
+# the paper-forward. (each product spends USD, so the account needs a USD balance to fund a buy;
+# rail 13 vetoes if there's no USD available -- see the note when you arm.)
+quote_currency: USD
+
+subscription:
+  assumed_free_volume_usd: 500
+  unsubscribed_allowance_usd: 0
+  pacing: opportunistic
+
+tiers:
+  - name: Basic
+    free_volume_usd: 500
+    subscription_usd_month: 4.99
+  - name: Preferred
+    free_volume_usd: 10000
+    subscription_usd_month: 29.99
+  - name: Premium
+    free_volume_usd: null
+    subscription_usd_month: 299.99
+
+fees:
+  taker_pct: 0.012
+  maker_pct: 0.006
+
+# verbose: true since 2026-07-29, matching config.paperforward.yaml -- the detector's `signals=N`
+# line says nothing about why a setup was or wasn't taken, and on the live side the rail vetoes
+# are exactly what you want on record. Separate file from the paper deployment, so the two
+# never interleave.
+logging:
+  verbose: true
+  file: logs/keel-live.log
+  max_file_mb: 25
+  file_count: 5
+
+research:
+  pbo_max: 0.05
+  slope_floor: -0.5
