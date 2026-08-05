@@ -177,6 +177,54 @@ def test_load_config_quote_currency_empty_raises_configerror(write_config):
         load_config(path)
 
 
+# -- settlement_currencies (rail 18's allowed set) ------------------------------------------
+
+
+def test_load_config_settlement_currencies_defaults_to_usd_and_usdc(valid_config_path):
+    """Absent from `config.yaml` -- the venue's own declared set, which is what rail 18 should
+    enforce when the operator has expressed no opinion."""
+    config = load_config(valid_config_path)
+
+    assert config.settlement_currencies == frozenset({"USD", "USDC"})
+
+
+def test_load_config_settlement_currencies_are_uppercased(write_config):
+    """`quote_currency_of` uppercases what it resolves, so the configured set must be
+    uppercased too or rail 18 would compare `'USD'` against `'usd'` and veto a funded order."""
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies:\n  - usd\n  - UsDc\n"
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.settlement_currencies == frozenset({"USD", "USDC"})
+
+
+def test_load_config_settlement_currencies_empty_raises_configerror(write_config):
+    """An empty set would veto every order ever placed -- almost certainly a typo, never intent."""
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies: []\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="settlement_currencies"):
+        load_config(path)
+
+
+def test_load_config_settlement_currencies_bare_string_raises_configerror(write_config):
+    """`settlement_currencies: USD` iterates into `{'U', 'S', 'D'}` if taken as a sequence."""
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies: USD\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="settlement_currencies"):
+        load_config(path)
+
+
+def test_load_config_settlement_currencies_invalid_entry_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies:\n  - USD\n  - ''\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="settlement_currencies"):
+        load_config(path)
+
+
 def test_load_config_promotion_defaults_are_canonical_proving_floors(write_config):
     """Phase-1 placeholders (30 trades / 40% win) were replaced with the canonical
     proving-gate floors from spec §6.2/§11 (Issue #66): 100 trades / 55% win rate.

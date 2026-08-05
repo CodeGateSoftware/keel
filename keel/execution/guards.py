@@ -1,10 +1,11 @@
 """THE HARD RAILS (§14) — enforced before every order, un-overridable.
 
-`check()` runs the twelve safety rails from the main spec's §14, plus three later, equally
+`check()` runs the twelve safety rails from the main spec's §14, plus five later, equally
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
-and 16, the consecutive-loss circuit breaker (Task 4), before any order is placed, in every
-`auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA order
-classes. It never
+16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, and 18, the
+settlement-currency rail — seventeen in all, since there is no rail 15. They run before any order
+is placed, in every `auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA
+order classes. It never
 short-circuits: every violated rail is collected and reported so an operator (or the executor,
 Task 4) sees the full picture, not just the first trip-wire.
 
@@ -70,6 +71,16 @@ BEFORE the drawdown accumulates. It reads exactly one precomputed `agent_state` 
 and cannot disagree with itself. ENTRIES ONLY, and DCA-exempt like rail 11 (§12.6) -- a breaker
 that blocked exits would trap capital in a losing position, inverting its own purpose. Ships
 DISABLED (`config.money_mgmt.max_consecutive_losses` defaults to 0).
+
+Rail 18 (settlement-currency, safety-critical, un-overridable) is the ONLY rail that gates the
+instrument CLASS rather than the trade: it vetoes any intent whose `quote_currency_of(product_id)`
+is not in `config.settlement_currencies` (default `{USD, USDC}`). It closes the hole the
+2026-08-05 Coinbase asset-class feasibility study found by execution -- rail 1 reduces
+`ADA-28AUG26-CDE` to the allowlisted `ADA` and passes a futures contract, and the only rail that
+incidentally stopped it (13) is BUY-only and skipped in paper. Unlike rails 13/17 this one runs in
+EVERY mode and on BOTH sides, because it needs no broker and no live account state -- see the
+rail's own comment for why that is the whole point, and for the deliberate spot pairs it also
+excludes.
 """
 
 from __future__ import annotations
@@ -147,7 +158,7 @@ LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability")
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all fifteen rails: `ok` iff `violations` is empty."""
+    """The outcome of running all seventeen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -248,7 +259,8 @@ def check(
     now_ts: int,
     offline: bool = False,
 ) -> GuardResult:
-    """Run all fifteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never short-circuits.
+    """Run all seventeen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never
+    short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
     un-overridable.
@@ -567,6 +579,48 @@ def check(
                 "possessed, so new ENTRIES are halted. Existing holdings and exits are "
                 "deliberately unaffected."
             )
+
+    # 18. Settlement currency — the order's settlement leg must be one the operator configured
+    #     (`config.settlement_currencies`, default USD/USDC). This is an INSTRUMENT-CLASS gate
+    #     wearing a currency's clothes: `quote_currency_of` returns `"CDE"` for every Coinbase
+    #     futures contract (`ADA-28AUG26-CDE`) and `None` for every equity product (a 64-char
+    #     hash with no separator), so one comparison rejects both classes without keel needing an
+    #     instrument model it does not have (feasibility study R1,
+    #     `docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`).
+    #
+    #     BOTH SIDES, and in EVERY MODE — deliberately not in `LIVE_STATE_RAILS`. That is the
+    #     entire point: rail 13 incidentally vetoed a live futures BUY (no `CDE` balance exists,
+    #     so it failed closed), but it is BUY-only and skipped offline, and the study verified by
+    #     execution that a live SELL of `ADA-28AUG26-CDE` passed every rail on the real live
+    #     config. This rail needs no broker and no account state precisely so paper cannot skip
+    #     it.
+    #
+    #     ⚠️ ACCEPTED BEHAVIOUR CHANGE, not an oversight: with the default `{USD, USDC}` this
+    #     also rejects the ~120 non-USD/USDC SPOT pairs Coinbase lists (`BTC-EUR`, `ETH-GBP`,
+    #     `SOL-INR`, and crypto-quoted pairs like `*-BTC`/`*-USDT`) -- which is what the Coinbase
+    #     adapter's own `quote_currencies` declaration already says should happen. Nothing in the
+    #     live deployment reaches one: every rule is `BASE-USD`, and all three deployment configs
+    #     set `quote_currency: USD`, so `_history_product` can only construct `-USD` ids. An
+    #     operator who wants a different set widens `settlement_currencies` in config.yaml --
+    #     that field is the escape hatch, which is why the set is not hardcoded here.
+    #
+    #     Returns a VIOLATION, never raises, on an unparseable id. `_asset` and the rail
+    #     machinery also run over historical filled orders (`_open_exposure_by_asset`), and an
+    #     exception on one bad audit row would turn a veto into a crashed agent cycle -- strictly
+    #     worse than the hole it closes.
+    settlement = quote_currency_of(intent.product_id)
+    if settlement is None:
+        violations.append(
+            f"settlement_currency: cannot resolve a settlement currency from "
+            f"{intent.product_id!r} -- failing closed. Allowed settlement currencies: "
+            f"{sorted(config.settlement_currencies)}"
+        )
+    elif settlement not in config.settlement_currencies:
+        violations.append(
+            f"settlement_currency: {intent.product_id} settles in {settlement}, which is not one "
+            f"of the configured settlement_currencies {sorted(config.settlement_currencies)}. "
+            f"Only spot products quoted in a configured currency may be traded."
+        )
 
     for violation in violations:
         log_event(

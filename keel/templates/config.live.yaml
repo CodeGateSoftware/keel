@@ -94,6 +94,18 @@ paper:
 # `keel assets holdings`.
 quote_currency: USD
 
+# Rail 18 (settlement-currency): the settlement legs an order is ALLOWED to have. Every intent
+# is vetoed unless `quote_currency_of(product_id)` -- the quote leg of the product itself -- is
+# in this set, on BOTH sides and in every mode including paper. This is the class gate: it is
+# what stops a Coinbase futures contract (`ADA-28AUG26-CDE`, whose quote leg parses as the venue
+# suffix `CDE`) or an equity product (a 64-char hash with no quote leg at all) from ever being
+# ordered, even though `ADA` is allowlisted. It deliberately also excludes non-USD/USDC SPOT
+# pairs (`BTC-EUR`, `*-USDT`); widen this list if you actually trade one -- it is the escape
+# hatch, and the venue must declare it settles in whatever you add here.
+settlement_currencies:
+  - USD
+  - USDC
+
 subscription:
   # The SIMULATOR's assumed fee-free monthly volume. The LIVE rail-14 cap is not set here --
   # it comes from the attested record: `keel subscription attest --venue coinbase --tier <t>`.

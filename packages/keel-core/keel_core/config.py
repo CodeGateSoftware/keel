@@ -76,6 +76,14 @@ def _non_negative_int(value: Any, key: str) -> int:
 # caps ARE configured; only the shipped defaults stop being a silent, fabricated blocker.
 NON_BINDING_CAP_USD = Decimal("1000000000")  # $1B -- not a real limit, just "don't bind"
 
+# Rail 18 (settlement-currency): the settlement legs an order is allowed to spend/receive.
+# Defaults to exactly what the Coinbase adapter declares it settles in
+# (`keel_broker_coinbase.adapter._CAPABILITIES.quote_currencies`), so the shipped default and the
+# venue's own statement agree without either being derived from the other. It is a FIELD rather
+# than a constant in `guards.py` so an operator whose venue settles elsewhere has an escape
+# hatch that is not a code edit -- see `Config.settlement_currencies`.
+DEFAULT_SETTLEMENT_CURRENCIES = frozenset({"USD", "USDC"})
+
 
 @dataclass(frozen=True)
 class Caps:
@@ -278,6 +286,13 @@ class Config:
     tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
     fees: FeesConfig = field(default_factory=FeesConfig)
     quote_currency: str = "USD"
+    # Rail 18's allowed settlement legs -- the currencies an order may settle in, matched against
+    # `quote_currency_of(product_id)`. NOT the same field as `quote_currency` above, which names
+    # the ONE currency this deployment trades in (it screens candidates and excludes the
+    # settlement balance from `keel assets holdings`); this is the SET a product's own quote leg
+    # must belong to for the order to be admitted at all. A frozenset, so it is a safe dataclass
+    # default without a factory and cannot be mutated out from under a rail.
+    settlement_currencies: frozenset[str] = DEFAULT_SETTLEMENT_CURRENCIES
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
 
@@ -321,6 +336,40 @@ def _parse_allowlist(raw: dict[str, Any]) -> list[str]:
         if not isinstance(entry, str) or not entry:
             raise ConfigError(f"allowlist: invalid entry {entry!r}; must be non-empty strings")
     return list(allowlist)
+
+
+def _parse_settlement_currencies(raw: dict[str, Any]) -> frozenset[str]:
+    """`settlement_currencies:`, uppercased -- rail 18's allowed set. Optional; absent falls back
+    to `DEFAULT_SETTLEMENT_CURRENCIES`.
+
+    Uppercased at parse because `quote_currency_of` uppercases what it resolves, so the rail
+    compares like with like by construction rather than by every call site remembering to fold
+    case (the same normalisation `_history_product` applies when it CONSTRUCTS an id).
+
+    A bare string is rejected rather than iterated: `settlement_currencies: USD` is a plausible
+    typo, and taking it as a sequence would silently configure `{"U", "S", "D"}` -- a set that
+    admits nothing and would veto every order with a message naming three letters.
+    """
+    value = raw.get("settlement_currencies")
+    if value is None:
+        return DEFAULT_SETTLEMENT_CURRENCIES
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ConfigError(
+            f"settlement_currencies: must be a non-empty list of currency codes, got {value!r}"
+        )
+    codes = set()
+    for entry in value:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"settlement_currencies: invalid entry {entry!r}; must be non-empty strings"
+            )
+        codes.add(entry.strip().upper())
+    if not codes:
+        raise ConfigError(
+            "settlement_currencies: empty; must be a non-empty list of currency codes. An empty "
+            "set would veto every order, since no product's quote leg could be in it."
+        )
+    return frozenset(codes)
 
 
 def _parse_caps(raw: dict[str, Any]) -> Caps:
@@ -615,6 +664,7 @@ def load_config(path: str | Path) -> Config:
         tiers=_parse_tiers(raw),
         fees=_parse_fees(raw),
         quote_currency=quote_currency,
+        settlement_currencies=_parse_settlement_currencies(raw),
         logging=_parse_logging(raw),
         research=_parse_research(raw),
     )
@@ -641,6 +691,7 @@ def load_secrets(env_path: str | Path = ".env") -> dict:
 __all__ = [
     "ConfigError",
     "NON_BINDING_CAP_USD",
+    "DEFAULT_SETTLEMENT_CURRENCIES",
     "Caps",
     "MarketDataConfig",
     "AutoTradeConfig",
