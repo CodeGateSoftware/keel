@@ -18,14 +18,12 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from keel_broker_api.capabilities import BrokerCapabilities
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
     AutoTradeConfig,
     Caps,
     Config,
-    ConfigError,
     DcaConfig,
     MarketDataConfig,
     MoneyMgmtConfig,
@@ -35,7 +33,6 @@ from keel.data.repository import Repository
 from keel.execution.executor import (
     CancelUnavailable,
     ExecutionResult,
-    _reconcile_settlement_currencies,
     execute,
     place_bracket,
     roll_to_break_even,
@@ -1523,92 +1520,3 @@ def test_no_account_at_all_for_the_required_currency_fails_closed(repo):
     assert result.placed is False
     assert result.preview is None
     assert any("unknown/unavailable" in v for v in result.vetoed_by)
-
-
-# -- config cannot widen rail 18 past what the venue actually settles in ------------------------
-
-
-class DeclaringBroker(FakeBroker):
-    """A `FakeBroker` that also declares `BrokerCapabilities`, like the broker-port adapters do.
-
-    The live broker today (`data.cb_client.CoinbaseClient`) declares nothing -- the declaration
-    lives on `keel_broker_coinbase.CoinbaseAdapter` -- so this fake models the adapter-shaped
-    broker the reconciliation actually has something to check against.
-    """
-
-    def __init__(self, quote_currencies: frozenset[str], **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._quote_currencies = quote_currencies
-
-    def capabilities(self) -> BrokerCapabilities:
-        return BrokerCapabilities(
-            venue="fake",
-            supported_orders=frozenset({"market_ioc_quote", "limit_gtc"}),
-            supports_native_preview=True,
-            synthesizes_preview=False,
-            supports_fee_summary=False,
-            quote_currencies=self._quote_currencies,
-            asset_classes=frozenset({"spot"}),
-        )
-
-
-def test_a_settlement_currency_the_venue_does_not_declare_fails_loudly(repo):
-    """Rail 18's allowed set is the operator's, but the venue's declaration is the ceiling: a
-    config naming a currency Coinbase does not settle in is a misconfiguration, not a trade."""
-    broker = DeclaringBroker(frozenset({"USD", "USDC"}))
-    signal = _enter_signal()
-
-    with pytest.raises(ConfigError, match="EUR"):
-        execute(
-            signal,
-            broker,
-            repo,
-            _config(settlement_currencies=frozenset({"USD", "USDC", "EUR"})),
-            mode="autonomous",
-            now_ts=NOW_TS,
-        )
-
-    assert broker.preview_calls == []
-    assert broker.place_calls == []
-    assert repo.get_orders() == []
-
-
-def test_a_settlement_currency_set_within_the_venues_declaration_places(repo):
-    broker = DeclaringBroker(frozenset({"USD", "USDC"}))
-
-    result = execute(
-        _enter_signal(),
-        broker,
-        repo,
-        _config(settlement_currencies=frozenset({"USD"})),
-        mode="autonomous",
-        now_ts=NOW_TS,
-    )
-
-    assert result.placed is True, result.vetoed_by
-
-
-def test_a_broker_that_declares_no_capabilities_is_not_treated_as_a_veto(repo):
-    """`CoinbaseClient` -- the broker the live path actually constructs -- has no
-    `capabilities()`. There is nothing to reconcile against, and refusing to trade on that basis
-    would take the live path down for a check that cannot be made. Rail 18 still enforces the
-    configured set on every order regardless.
-    """
-    broker = FakeBroker()
-
-    result = execute(
-        _enter_signal(),
-        broker,
-        repo,
-        _config(settlement_currencies=frozenset({"USD", "EUR"})),
-        mode="autonomous",
-        now_ts=NOW_TS,
-    )
-
-    assert result.placed is True, result.vetoed_by
-
-
-def test_the_venue_reconciliation_is_skipped_when_there_is_no_broker():
-    """`agent._paper_enter` passes `broker=None` on purpose. Paper has no venue to reconcile
-    against, and raising there would stop a rehearsal that places nothing."""
-    _reconcile_settlement_currencies(None, _config(settlement_currencies=frozenset({"EUR"})))

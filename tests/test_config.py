@@ -225,6 +225,78 @@ def test_load_config_settlement_currencies_invalid_entry_raises_configerror(writ
         load_config(path)
 
 
+def test_load_config_settlement_currencies_explicit_null_raises_configerror(write_config):
+    """`settlement_currencies:` with nothing under it is YAML `None`, not an absent key. An
+    operator who typed the key was trying to change something; falling back to the default would
+    answer that edit with silence -- the same reason `[]` is rejected rather than defaulted."""
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies:\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="settlement_currencies"):
+        load_config(path)
+
+
+def test_load_config_settlement_currencies_malformed_code_raises_configerror(write_config):
+    """`US D` is not a currency code, and rail 18 compares against `quote_currency_of`'s output,
+    which can never contain a space -- so a typo like this configures a member that admits
+    nothing. Caught at load, where the message can name it."""
+    text = VALID_CONFIG_YAML + "\nsettlement_currencies:\n  - 'US D'\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="settlement_currencies"):
+        load_config(path)
+
+
+def test_load_config_quote_currency_outside_settlement_currencies_raises_configerror(
+    write_config,
+):
+    """The deployment-wide veto this cross-check exists to prevent.
+
+    `_history_product` builds every id keel names as `f"{asset}-{quote_currency}"`, and rail 18
+    vetoes any id whose quote leg is not in `settlement_currencies`. A config that changes one
+    and not the other therefore has EVERY order it can construct vetoed, forever, with nothing
+    at load time saying why.
+    """
+    text = VALID_CONFIG_YAML.replace("quote_currency: USD", "quote_currency: EUR")
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="quote_currency") as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert "EUR" in message
+    assert "USDC" in message
+    assert "settlement_currencies" in message
+
+
+def test_load_config_quote_currency_changed_together_with_settlement_currencies_loads(
+    write_config,
+):
+    """The cross-check constrains the two settings to agree; it does not pin them to USD. An
+    operator who moves the deployment to a currency rail 18 also admits is a supported config."""
+    text = (
+        VALID_CONFIG_YAML.replace("quote_currency: USD", "quote_currency: EUR")
+        + "\nsettlement_currencies:\n  - EUR\n"
+    )
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.quote_currency == "EUR"
+    assert config.settlement_currencies == frozenset({"EUR"})
+
+
+def test_load_config_quote_currency_is_case_folded_before_the_cross_check(write_config):
+    """`settlement_currencies` is uppercased at parse, so a lowercase `quote_currency` must be
+    folded before the comparison or a consistent config would be rejected as a mismatch."""
+    text = VALID_CONFIG_YAML.replace("quote_currency: USD", "quote_currency: usd")
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.settlement_currencies == frozenset({"USD", "USDC"})
+
+
 def test_load_config_promotion_defaults_are_canonical_proving_floors(write_config):
     """Phase-1 placeholders (30 trades / 40% win) were replaced with the canonical
     proving-gate floors from spec §6.2/§11 (Issue #66): 100 trades / 55% win rate.

@@ -51,14 +51,6 @@ something guarded itself), so it is the one broker call this module makes ahead 
 gate; `_fetch_available_quote` swallows any exception from the call and returns `None`, which
 rail 13 then treats as fail-closed (vetoes the BUY) exactly like an unknown balance from a
 missing quote-currency account. SELL intents never fetch a balance (the rail exempts them).
-
-**Settlement-currency reconciliation (rail 18).** Rail 18 enforces the operator's configured
-`settlement_currencies`; `_reconcile_settlement_currencies` enforces that the operator did not
-configure a currency the VENUE does not settle in, by checking the set against the adapter's own
-`BrokerCapabilities.quote_currencies`. It runs at the top of `_run_order` -- ahead of the rails,
-because it is a statement about the config rather than about the intent -- and raises rather than
-vetoing: an impossible settlement currency is a misconfiguration to fix, not a trade to skip. It
-is a no-op when there is no broker (paper) or the broker declares no capabilities.
 """
 
 from __future__ import annotations
@@ -74,7 +66,7 @@ from typing import Any, Literal
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception
 
-from keel.config import Config, ConfigError
+from keel.config import Config
 from keel.data.repository import Repository
 from keel.execution import guards, sizing
 from keel.execution.guards import OrderIntent
@@ -308,58 +300,6 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     return None
 
 
-def _reconcile_settlement_currencies(broker: Any, config: Config) -> None:
-    """Refuse to trade a venue that does not settle in every currency rail 18 was told to allow.
-
-    Rail 18 enforces `config.settlement_currencies`, which is the OPERATOR's set. This is the
-    other direction: the adapter's `BrokerCapabilities.quote_currencies` is the VENUE's own
-    declaration, and a config that names a currency outside it is asking the rail to admit
-    orders the venue cannot settle. Raises `ConfigError` -- loudly, before any order is placed --
-    rather than degrading quietly, because there is no safe interpretation of the request and the
-    fix is a one-line config edit.
-
-    Runs on the LIVE path only, which is where a broker exists to ask:
-
-    - `broker is None` (`agent._paper_enter` passes it deliberately) -> nothing to reconcile
-      against, and a rehearsal that places nothing must not be stopped by a venue's declaration.
-    - a broker with no `capabilities()` -> also nothing to reconcile against. This is the live
-      broker today: `data.cb_client.CoinbaseClient` declares nothing (the declaration lives on
-      `keel_broker_coinbase.CoinbaseAdapter`, which the executor is not yet wired to). Refusing
-      to trade on a check that cannot be made would take the live path down to close a hole that
-      rail 18 already closes on every order regardless.
-    """
-    if broker is None:
-        return
-    capabilities = getattr(broker, "capabilities", None)
-    if not callable(capabilities):
-        return
-    try:
-        declared = frozenset(capabilities().quote_currencies)
-    except Exception:
-        # An unreadable declaration is not the same claim as a narrow one, and rail 18 still
-        # enforces the configured set on this order. Log it and carry on rather than inventing a
-        # veto out of a broken adapter.
-        log_exception(logger, "executor.capabilities_read_failed")
-        return
-
-    unsupported = frozenset(config.settlement_currencies) - declared
-    if unsupported:
-        log_event(
-            logger,
-            logging.ERROR,
-            "executor.settlement_currency_unsupported",
-            configured=sorted(config.settlement_currencies),
-            declared=sorted(declared),
-            unsupported=sorted(unsupported),
-        )
-        raise ConfigError(
-            f"settlement_currencies: {sorted(unsupported)} is not settled by this venue, which "
-            f"declares {sorted(declared)}. Configuring a settlement currency the venue does not "
-            f"support would widen rail 18 past what can actually be traded -- narrow "
-            f"settlement_currencies in config.yaml."
-        )
-
-
 def _build_intent(
     signal: Signal,
     broker: Any,
@@ -464,12 +404,6 @@ def _run_order(
     now_ts: int,
     order_configuration: dict[str, Any] | None = None,
 ) -> ExecutionResult:
-    # Ahead of the rails, because it is a statement about the CONFIG the rails are about to be
-    # run with, not about this intent: rail 18's allowed set must not exceed what the venue
-    # declares it settles in. Every order path funnels through here, so this is the one place it
-    # has to live.
-    _reconcile_settlement_currencies(broker, config)
-
     guard_result = guards.check(intent, repo, config, now_ts)
     if not guard_result.ok:
         log_event(

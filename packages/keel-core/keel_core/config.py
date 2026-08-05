@@ -8,6 +8,7 @@ Phase-1-safe defaults — unused fields are fine per the plan.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -83,6 +84,15 @@ NON_BINDING_CAP_USD = Decimal("1000000000")  # $1B -- not a real limit, just "do
 # than a constant in `guards.py` so an operator whose venue settles elsewhere has an escape
 # hatch that is not a code edit -- see `Config.settlement_currencies`.
 DEFAULT_SETTLEMENT_CURRENCIES = frozenset({"USD", "USDC"})
+
+# The shape a settlement/quote currency code may take, applied after case-folding. Deliberately
+# loose about WHICH codes exist (keel does not carry an ISO-4217 table, and venue codes like
+# `USDC` are not in one anyway) and strict only about the shape a code can possibly have: rail 18
+# compares these against `quote_currency_of`'s output, which is a single dash-delimited token, so
+# anything with a space or punctuation in it is a typo that would sit in the set admitting
+# nothing. 2 chars minimum because no real code is one letter; 10 maximum to catch a sentence
+# pasted into the list.
+_CURRENCY_CODE_RE = re.compile(r"[A-Z0-9]{2,10}")
 
 
 @dataclass(frozen=True)
@@ -339,8 +349,8 @@ def _parse_allowlist(raw: dict[str, Any]) -> list[str]:
 
 
 def _parse_settlement_currencies(raw: dict[str, Any]) -> frozenset[str]:
-    """`settlement_currencies:`, uppercased -- rail 18's allowed set. Optional; absent falls back
-    to `DEFAULT_SETTLEMENT_CURRENCIES`.
+    """`settlement_currencies:`, uppercased -- rail 18's allowed set. Optional; an ABSENT key
+    falls back to `DEFAULT_SETTLEMENT_CURRENCIES`.
 
     Uppercased at parse because `quote_currency_of` uppercases what it resolves, so the rail
     compares like with like by construction rather than by every call site remembering to fold
@@ -349,10 +359,28 @@ def _parse_settlement_currencies(raw: dict[str, Any]) -> frozenset[str]:
     A bare string is rejected rather than iterated: `settlement_currencies: USD` is a plausible
     typo, and taking it as a sequence would silently configure `{"U", "S", "D"}` -- a set that
     admits nothing and would veto every order with a message naming three letters.
+
+    "Key absent" and "key present but null" are deliberately NOT the same thing: `raw.get` cannot
+    tell them apart, so membership is tested instead. An operator who typed `settlement_currencies:`
+    and left it bare was trying to change the rail's set; silently handing back the default would
+    answer a deliberate edit with no feedback at all, and the currency they meant to add would
+    still be vetoed on every order. Explicit null is rejected exactly like `[]`.
+
+    Entries are shape-checked, not just non-empty: `quote_currency_of` can only ever return an
+    uppercase alphanumeric token, so a code that is not one (`'US D'`, `'U'`, a sentence) is a
+    member that admits nothing. Failing at load names the typo; admitting it would show up as a
+    rail-18 veto on an order the operator believed they had just enabled.
     """
-    value = raw.get("settlement_currencies")
-    if value is None:
+    if "settlement_currencies" not in raw:
         return DEFAULT_SETTLEMENT_CURRENCIES
+    value = raw["settlement_currencies"]
+    if value is None:
+        raise ConfigError(
+            "settlement_currencies: present but empty. Remove the key to accept the default "
+            f"{sorted(DEFAULT_SETTLEMENT_CURRENCIES)}, or list the currency codes rail 18 should "
+            "admit -- an empty set would veto every order, since no product's quote leg could "
+            "be in it."
+        )
     if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
         raise ConfigError(
             f"settlement_currencies: must be a non-empty list of currency codes, got {value!r}"
@@ -363,7 +391,15 @@ def _parse_settlement_currencies(raw: dict[str, Any]) -> frozenset[str]:
             raise ConfigError(
                 f"settlement_currencies: invalid entry {entry!r}; must be non-empty strings"
             )
-        codes.add(entry.strip().upper())
+        code = entry.strip().upper()
+        if not _CURRENCY_CODE_RE.fullmatch(code):
+            raise ConfigError(
+                f"settlement_currencies: invalid entry {entry!r}; a currency code is 2-10 "
+                "alphanumeric characters (USD, USDC, EUR). Rail 18 matches this against the "
+                "quote leg parsed out of a product id, which can never contain a space or "
+                "punctuation, so this entry would admit nothing."
+            )
+        codes.add(code)
     if not codes:
         raise ConfigError(
             "settlement_currencies: empty; must be a non-empty list of currency codes. An empty "
@@ -581,6 +617,26 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(quote_currency, str) or not quote_currency:
         raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
 
+    settlement_currencies = _parse_settlement_currencies(raw)
+
+    # The two settings are independent knobs that describe the SAME leg, and a config that moves
+    # one without the other is dead on arrival: `_history_product` builds every id keel can name
+    # as `f"{asset}-{quote_currency}"`, and rail 18 vetoes any id whose quote leg is not in
+    # `settlement_currencies`. So `quote_currency: EUR` against the default `{USD, USDC}` means
+    # every order the deployment is capable of constructing is vetoed -- forever, on every cycle,
+    # with a rail message about a currency the operator never typed. That is precisely the
+    # "silent unfixable rejection" `_history_product`'s docstring was written to prevent, and it
+    # is invisible until an order is attempted, so it is caught here instead.
+    if quote_currency.upper() not in settlement_currencies:
+        raise ConfigError(
+            f"quote_currency: {quote_currency!r} is not in settlement_currencies "
+            f"{sorted(settlement_currencies)}. Every product id keel builds is quoted in "
+            f"quote_currency, and rail 18 vetoes any order whose settlement leg is outside "
+            f"settlement_currencies -- as written, every order this deployment could place "
+            f"would be rejected. Add {quote_currency.upper()!r} to settlement_currencies, or "
+            f"set quote_currency to one of {sorted(settlement_currencies)}."
+        )
+
     # Rail 16's two knobs are only meaningful together. The breaker arms
     # `halt_until = now_ts + streak_cooloff_days * 86400` and the rail tests `now_ts < halt_until`,
     # so a cooloff of 0 makes them equal: the breaker logs `streak.breaker_tripped` at WARNING,
@@ -664,7 +720,7 @@ def load_config(path: str | Path) -> Config:
         tiers=_parse_tiers(raw),
         fees=_parse_fees(raw),
         quote_currency=quote_currency,
-        settlement_currencies=_parse_settlement_currencies(raw),
+        settlement_currencies=settlement_currencies,
         logging=_parse_logging(raw),
         research=_parse_research(raw),
     )

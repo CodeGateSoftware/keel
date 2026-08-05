@@ -635,16 +635,31 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
      crashed cycle. R2's separate `_asset` item is untouched — `_asset` still does not validate.
 
    The allowed set is **config, not a hardcode**: `settlement_currencies` in
-   `packages/keel-core/keel_core/config.py` (default `{USD, USDC}`, non-empty, uppercased at
-   parse, documented in both shipped templates). The adapter's declaration stays the source of
-   truth in the direction that matters: `executor._reconcile_settlement_currencies` runs at the
-   top of `_run_order` — every order path funnels through it — and raises `ConfigError` if the
-   configured set is not a subset of `BrokerCapabilities.quote_currencies`, so config cannot widen
-   rail 18 past what the venue settles in. It is a no-op when there is no broker
-   (`agent.py:475`'s paper path) or when the broker declares no capabilities, which today includes
-   the live `data.cb_client.CoinbaseClient` — the executor is not yet wired to the port adapter,
-   so that reconciliation is armed for R2/the port migration rather than firing now. Rail 18
-   itself does not depend on it.
+   `packages/keel-core/keel_core/config.py` (default `{USD, USDC}`, non-empty, uppercased and
+   shape-checked at parse, documented in both shipped templates). `load_config` also refuses a
+   config whose `quote_currency` is outside that set: `_history_product` builds every id keel can
+   name as `f"{asset}-{quote_currency}"`, so the two disagreeing means every order the deployment
+   can construct is vetoed by rail 18 forever, with nothing at load time saying why.
+
+   **What was deliberately NOT shipped: the venue-declaration check.** The obvious companion —
+   reconcile the configured set against the adapter's own `BrokerCapabilities.quote_currencies`
+   and refuse to trade if config is wider than the venue — was written, then removed before merge.
+   Two reasons, both verified:
+   - **It cannot fire today.** The only broker the live path constructs is
+     `data.cb_client.CoinbaseClient`, which has no `capabilities()` at all; the declaration lives
+     on `keel_broker_coinbase.CoinbaseAdapter`, which the executor is not yet wired to. `broker=None`
+     (paper) is a no-op too. So on every real path it is dead code that reads as a defence.
+   - **A per-order raise on the exit path can trap a position.** It ran inside `_run_order` and
+     raised `ConfigError`. `agent.run_once` has no `except` — only `try:`/`finally:` — and
+     `agent.loop` does not catch either, so the raise would kill the cycle; and `_handle_exits`
+     runs BEFORE entries, so the first exit order would be the one to die. No bracket, no stop
+     roll, no scale-out, position left unmanaged. That is exactly what rail 16's docstring
+     condemns: "a breaker that blocked exits would trap capital in a losing position, inverting
+     its own purpose." A misconfiguration check paid for in trapped capital is the wrong trade.
+
+   It belongs with the broker-port migration that makes `capabilities()` reachable — at which
+   point it should be a **load-time** check against the adapter's declaration, not a per-order
+   raise. Rail 18 does not depend on it and never did.
 
    The non-USD/USDC **spot** rejection predicted above is real and was accepted: `BTC-EUR`,
    `ETH-GBP`, `*-USDT` and friends are vetoed by the shipped default. Blast radius on the
