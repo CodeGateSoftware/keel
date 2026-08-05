@@ -337,6 +337,10 @@ live path reads it today.
 
 ### ⚠️ A live fragility this probe surfaced, worth fixing regardless of every decision below
 
+**This section records the state on 2026-08-05, before R1. R1 has since shipped and closes it —
+rail 18 (`settlement_currency`) vetoes every id below on both sides and in every mode. Read what
+follows as the measurement that motivated the fix, not as current behaviour; see R1.**
+
 keel refuses these products today **by accident, not by design** — and the accident is thinner
 than it looks. Both legs of it were probed: the rails let a live SELL through outright, and the
 "keel can never name one" leg holds only for the paths keel drives itself.
@@ -580,8 +584,8 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
 
 **Ranked.**
 
-1. **R1 — Reject any intent whose settlement leg the adapter does not declare. (~1 hour. Do this
-   first.)**
+1. ✅ **R1 — Reject any intent whose settlement leg the adapter does not declare. (~1 hour. Do this
+   first.) — SHIPPED 2026-08-05, see "What R1 actually shipped" below.**
    The whole class closes today, with no new instrument model, using machinery the rails already
    trust. `guards.check` already calls `quote_currency_of(intent.product_id)` at `guards.py:423`;
    the Coinbase adapter already declares
@@ -612,6 +616,54 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
    `ADA-28AUG26-CDE` is vetoed (`tests/execution/test_guards.py`). That test is half the
    deliverable — without it this silently regresses the next time the rails are edited, and the
    failure mode is a live short.
+
+   **What R1 actually shipped.** **Rail 18, `settlement_currency`** (`keel/execution/guards.py`),
+   an un-overridable hard rail like every other: it vetoes any intent whose
+   `quote_currency_of(product_id)` is not in `config.settlement_currencies`. Three properties are
+   the whole point, and each has a test:
+   - **Every mode.** It is deliberately NOT in `LIVE_STATE_RAILS`, so `offline=True` does not skip
+     it. It needs no broker and no account state — which is precisely the defect in the rail it
+     replaces as last line of defence, since rail 13 is paper-exempt.
+   - **Both sides.** BUY and SELL. The SELL of `ADA-28AUG26-CDE` this document verified passing
+     every rail on the live config is now vetoed on that config, live and offline
+     (`tests/execution/test_guards.py`,
+     `test_rail18_a_SELL_of_a_futures_contract_on_an_allowlisted_asset_is_vetoed`, which also
+     asserts rail 1 still passes it — the hole, stated as a test).
+   - **Fails closed, never raises.** A 64-hex equity id resolves to `None` and is vetoed, not
+     admitted; a malformed id returns a violation string rather than an exception, so the
+     historical-order walk in `_open_exposure_by_asset` cannot turn one bad audit row into a
+     crashed cycle. R2's separate `_asset` item is untouched — `_asset` still does not validate.
+
+   The allowed set is **config, not a hardcode**: `settlement_currencies` in
+   `packages/keel-core/keel_core/config.py` (default `{USD, USDC}`, non-empty, uppercased and
+   shape-checked at parse, documented in both shipped templates). `load_config` also refuses a
+   config whose `quote_currency` is outside that set: `_history_product` builds every id keel can
+   name as `f"{asset}-{quote_currency}"`, so the two disagreeing means every order the deployment
+   can construct is vetoed by rail 18 forever, with nothing at load time saying why.
+
+   **What was deliberately NOT shipped: the venue-declaration check.** The obvious companion —
+   reconcile the configured set against the adapter's own `BrokerCapabilities.quote_currencies`
+   and refuse to trade if config is wider than the venue — was written, then removed before merge.
+   Two reasons, both verified:
+   - **It cannot fire today.** The only broker the live path constructs is
+     `data.cb_client.CoinbaseClient`, which has no `capabilities()` at all; the declaration lives
+     on `keel_broker_coinbase.CoinbaseAdapter`, which the executor is not yet wired to. `broker=None`
+     (paper) is a no-op too. So on every real path it is dead code that reads as a defence.
+   - **A per-order raise on the exit path can trap a position.** It ran inside `_run_order` and
+     raised `ConfigError`. `agent.run_once` has no `except` — only `try:`/`finally:` — and
+     `agent.loop` does not catch either, so the raise would kill the cycle; and `_handle_exits`
+     runs BEFORE entries, so the first exit order would be the one to die. No bracket, no stop
+     roll, no scale-out, position left unmanaged. That is exactly what rail 16's docstring
+     condemns: "a breaker that blocked exits would trap capital in a losing position, inverting
+     its own purpose." A misconfiguration check paid for in trapped capital is the wrong trade.
+
+   It belongs with the broker-port migration that makes `capabilities()` reachable — at which
+   point it should be a **load-time** check against the adapter's declaration, not a per-order
+   raise. Rail 18 does not depend on it and never did.
+
+   The non-USD/USDC **spot** rejection predicted above is real and was accepted: `BTC-EUR`,
+   `ETH-GBP`, `*-USDT` and friends are vetoed by the shipped default. Blast radius on the
+   deployment is nil, as measured here, and `settlement_currencies` is the escape hatch.
 2. **R2 — Then make the spot-only assumption structural. (~2–4 days.)**
    R1 is a settlement-leg check, not an instrument model; it would not stop a hypothetical future
    product that happens to settle in USD. Turn `BrokerCapabilities.asset_classes`
@@ -653,15 +705,17 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
 
 - ❌ **Do not complete CFM futures onboarding "just to have the option."** It is the one blocker
   removable without code or a ruling, which makes it the one most likely to be removed
-  prematurely. It converts a hard 403 into an open order path while R1's and R2's gates do not yet
-  exist.
+  prematurely. It converts a hard 403 into an open order path. R1 has since shipped, so this is no
+  longer the last line of defence it was when this was written — but R2's gate still does not
+  exist, and R3's ruling is still unanswered.
 - ❌ **Do not fund or create a `CDE`-denominated balance on the account.** Rail 13's veto of a live
   futures BUY is **entirely** an artefact of `quote_currency_of` returning `"CDE"` and the broker
   having no such balance to report (`executor.py:336`, `guards.py:423`). A positive `CDE` balance
-  would satisfy rail 13 on its own terms and silently disarm the only rail standing between the
-  live config and a futures entry — no code change, no config change, and nothing in the logs
-  saying a defence was removed. Pair this with the onboarding warning above: those two account
-  actions are the whole distance between today and a live futures position.
+  would satisfy rail 13 on its own terms — no code change, no config change, and nothing in the
+  logs saying a defence was removed. Since R1, rail 18 vetoes that same `"CDE"` leg outright on
+  both sides and in every mode, so this no longer disarms the last rail; it remains a bad idea
+  for exactly the reason it was one, and the veto it would remove is a rail nobody should be
+  relying on twice.
 - ❌ **Do not add any futures product id to the `allowlist` of any config.** `guards._asset`
   reduces `SOL-28AUG26-CDE` to `SOL` and `GOL-25NOV26-CDE` to `GOL`; the allowlist cannot
   distinguish a contract from a coin.

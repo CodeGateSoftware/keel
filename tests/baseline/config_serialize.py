@@ -49,6 +49,10 @@ def _canonical(value: Any) -> Any:
         return {str(k): _canonical(value[k]) for k in sorted(value, key=str)}
     if isinstance(value, (list, tuple)):
         return [_canonical(v) for v in value]
+    # Sets are SORTED, not just listed: `Config.settlement_currencies` is a frozenset, whose
+    # iteration order is not stable across runs, and an unsorted golden would diff at random.
+    if isinstance(value, (set, frozenset)):
+        return sorted(_canonical(v) for v in value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     # Enums and anything else with a meaningful str() -- e.g. Granularity.

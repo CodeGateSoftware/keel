@@ -60,6 +60,9 @@
     "slope_floor": "-0.75"
   },
   "risk_pct": "0.0125",
+  "settlement_currencies": [
+    "USDC"
+  ],
   "subscription": {
     "assumed_free_volume_usd": "1234.5",
     "pacing": "even_daily",

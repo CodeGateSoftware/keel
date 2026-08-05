@@ -55,6 +55,10 @@
     "slope_floor": "-0.5"
   },
   "risk_pct": "0.01",
+  "settlement_currencies": [
+    "USD",
+    "USDC"
+  ],
   "subscription": {
     "assumed_free_volume_usd": "500",
     "pacing": "opportunistic",

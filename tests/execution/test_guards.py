@@ -16,6 +16,7 @@ import pytest
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
+    DEFAULT_SETTLEMENT_CURRENCIES,
     AutoTradeConfig,
     Caps,
     Config,
@@ -66,6 +67,7 @@ def _config(
     unsubscribed_allowance_usd: Decimal = Decimal("0"),
     pacing: str = "opportunistic",
     max_consecutive_losses: int = 0,
+    settlement_currencies: frozenset[str] = DEFAULT_SETTLEMENT_CURRENCIES,
 ) -> Config:
     return Config(
         allowlist=list(allowlist),
@@ -88,6 +90,7 @@ def _config(
             unsubscribed_allowance_usd=unsubscribed_allowance_usd,
             pacing=pacing,
         ),
+        settlement_currencies=settlement_currencies,
     )
 
 
@@ -992,6 +995,130 @@ def test_rail17_is_ENTRIES_ONLY_sells_are_never_blocked(repo: Repository) -> Non
         intent = _intent(side=Side.SELL, withdrawals_enabled=state)
         result = check(intent, repo, _config(), NOW_TS)
         assert "withdrawal_capability" not in _keys(result), state
+
+
+# -- rail 18: settlement currency (instrument admission, every mode, both sides) ----------------
+#
+# These exist because of `docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md` (R1),
+# which established by execution that a SELL of `ADA-28AUG26-CDE` -- a Coinbase futures contract
+# -- passed EVERY rail on the real live config. `_asset` reduces it to `ADA`, which is
+# allowlisted, so rail 1 waves it through; the only rail that stopped the BUY (rail 13) is
+# BUY-only and skipped in paper. Rail 18 is the class gate that was missing.
+
+#: The futures contract from the study. `_asset` -> "ADA" (allowlisted), `quote_currency_of` ->
+#: "CDE", which is a Coinbase venue suffix, not a settlement leg.
+FUTURES_PRODUCT_ID = "ADA-28AUG26-CDE"
+#: A Coinbase EQUITY product id: an opaque 64-char hash with no separator at all, so
+#: `quote_currency_of` returns None and the rail must fail CLOSED rather than pass it.
+EQUITY_PRODUCT_ID = "ac568fb9e6c5a67da94f065a49fb7b0c59b7b258cfdf0a3b1560849071c3b05e"
+
+#: The live deployment's allowlist verbatim (`~/keel/config.live-sandbox.yaml`) -- the point of
+#: the regression tests is that this allowlist does NOT stop the contract, and rail 18 does.
+LIVE_ALLOWLIST = ("BTC", "ETH", "PAXG", "ADA", "XLM")
+
+
+def test_rail18_a_SELL_of_a_futures_contract_on_an_allowlisted_asset_is_vetoed(
+    repo: Repository,
+) -> None:
+    """The exact hole the feasibility study found: SELL `ADA-28AUG26-CDE`, live config, no veto.
+
+    Rail 1 is not the defence here and never was -- assert that too, so a future reader cannot
+    mistake this for a duplicate allowlist test.
+    """
+    intent = _intent(product_id=FUTURES_PRODUCT_ID, side=Side.SELL)
+    result = check(intent, repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    assert "settlement_currency" in _keys(result)
+    assert "halal_allowlist" not in _keys(result), "rail 1 passes the contract -- that is the hole"
+    assert result.ok is False
+
+
+def test_rail18_a_futures_contract_is_vetoed_offline_too(repo: Repository) -> None:
+    """Paper/offline is where the compensating rail (13) is skipped, so rail 18 must NOT be one
+    of `LIVE_STATE_RAILS`: it needs no broker and no live account state."""
+    intent = _intent(
+        product_id=FUTURES_PRODUCT_ID,
+        side=Side.SELL,
+        available_quote=None,
+        withdrawals_enabled=None,
+    )
+    result = check(intent, repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS, offline=True)
+
+    assert "settlement_currency" in _keys(result)
+    assert "settlement_currency" not in result.skipped_rails
+    assert "settlement_currency" not in LIVE_STATE_RAILS
+
+
+def test_rail18_a_futures_contract_is_vetoed_on_a_BUY(repo: Repository) -> None:
+    result = check(
+        _intent(product_id=FUTURES_PRODUCT_ID), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS
+    )
+    assert "settlement_currency" in _keys(result)
+
+
+def test_rail18_an_equity_hash_product_id_fails_CLOSED(repo: Repository) -> None:
+    """`quote_currency_of` returns None for a 64-hex equity id. Unknown is not permission."""
+    for side in (Side.BUY, Side.SELL):
+        for offline in (False, True):
+            intent = _intent(product_id=EQUITY_PRODUCT_ID, side=side)
+            result = check(intent, repo, _config(), NOW_TS, offline=offline)
+            assert "settlement_currency" in _keys(result), (side, offline)
+
+
+def test_rail18_never_raises_on_a_malformed_product_id(repo: Repository) -> None:
+    """A veto, never an exception: the rail machinery also runs over historical filled orders
+    (`_open_exposure_by_asset`), where one bad audit row must not crash the agent cycle."""
+    for product_id in ("", "-", "BTC-", "-USD", "   ", "BTCUSD"):
+        result = check(_intent(product_id=product_id), repo, _config(), NOW_TS)
+        assert "settlement_currency" in _keys(result), product_id
+
+
+def test_rail18_passes_ordinary_usd_and_usdc_spot(repo: Repository) -> None:
+    for product_id in ("ADA-USD", "BTC-USDC"):
+        result = check(
+            _intent(product_id=product_id), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS
+        )
+        assert "settlement_currency" not in _keys(result), product_id
+
+
+def test_rail18_passes_a_lowercase_settlement_leg(repo: Repository) -> None:
+    """`quote_currency_of` uppercases, and the configured set is uppercased at parse, so the
+    comparison is case-insensitive by construction rather than by luck."""
+    result = check(_intent(product_id="BTC-usdc"), repo, _config(), NOW_TS)
+    assert "settlement_currency" not in _keys(result)
+
+
+def test_rail18_reads_the_allowed_set_from_config_not_a_hardcode(repo: Repository) -> None:
+    """The configured set is the operator's escape hatch -- widening it admits `-EUR` spot, and
+    narrowing it below the default takes `-USDC` away. Neither is hardcoded in guards."""
+    config = _config(settlement_currencies=frozenset({"EUR"}))
+
+    admitted = check(_intent(product_id="BTC-EUR"), repo, config, NOW_TS)
+    rejected = check(_intent(product_id="BTC-USD"), repo, config, NOW_TS)
+
+    assert "settlement_currency" not in _keys(admitted)
+    assert "settlement_currency" in _keys(rejected)
+
+
+def test_rail18_default_rejects_non_usd_usdc_spot(repo: Repository) -> None:
+    """A DELIBERATE, accepted behaviour change: ~120 non-USD/USDC spot pairs Coinbase lists are
+    now rejected by default. Nothing in the live deployment trades one."""
+    for product_id in ("BTC-EUR", "ETH-GBP", "BTC-USDT"):
+        result = check(_intent(product_id=product_id), repo, _config(), NOW_TS)
+        assert "settlement_currency" in _keys(result), product_id
+
+
+def test_rail18_violation_names_the_product_the_currency_and_the_allowed_set(
+    repo: Repository,
+) -> None:
+    """An operator must be able to act on the message without reading this module."""
+    result = check(
+        _intent(product_id=FUTURES_PRODUCT_ID), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS
+    )
+    violation = next(v for v in result.violations if v.startswith("settlement_currency"))
+    assert FUTURES_PRODUCT_ID in violation
+    assert "CDE" in violation
+    assert "USD" in violation and "USDC" in violation
 
 
 # -- offline mode (paper trading only) -----------------------------------------
