@@ -1,6 +1,6 @@
 [project]
 name = "keel-broker-api"
-version = "0.4.0"
+version = "0.5.0"
 description = "Broker port, domain types, capability model, and conformance suite for keel"
 requires-python = ">=3.14.4"
 dependencies = ["keel-core"]
