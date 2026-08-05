@@ -1,6 +1,6 @@
 [project]
 name = "keel-broker-coinbase"
-version = "0.3.2"
+version = "0.4.0"
 description = "Coinbase Advanced Trade adapter for keel"
 requires-python = ">=3.14.4"
 dependencies = ["keel-core", "keel-broker-api", "coinbase-advanced-py>=1.8.4"]
