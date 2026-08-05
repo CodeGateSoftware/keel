@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 from keel_core.types import Granularity, Side
 
-from keel_broker_api.capabilities import BrokerCapabilities
+from keel_broker_api.capabilities import ASSET_CLASSES, BrokerCapabilities
 from keel_broker_api.orders import (
     ORDER_KINDS,
     LimitGTC,
@@ -85,6 +85,31 @@ class BrokerConformanceTests:
 
     def test_venue_is_a_non_empty_string(self) -> None:
         assert self.broker().capabilities().venue
+
+    def test_asset_classes_is_non_empty_and_drawn_from_the_known_vocabulary(self) -> None:
+        """An adapter that declares nothing declares nothing checkable.
+
+        `BrokerCapabilities.__post_init__` already refuses an unknown class, so this is the
+        subset assertion restated where a future adapter author will read it -- plus the
+        non-emptiness that a frozenset default would otherwise let through silently.
+        """
+        caps: BrokerCapabilities = self.broker().capabilities()
+        assert caps.asset_classes
+        assert caps.asset_classes <= ASSET_CLASSES
+
+    def test_quote_currencies_is_non_empty(self) -> None:
+        """Kept alongside the `asset_classes` check above because rail 18 is the other half of
+        the same question, and this is the declaration it is checked against.
+
+        `config.DEFAULT_SETTLEMENT_CURRENCIES` is `{"USD", "USDC"}` because that is what
+        `keel_broker_coinbase`'s `_CAPABILITIES.quote_currencies` says the venue settles in --
+        neither is derived from the other (see the comment on that constant), and an agreement
+        between two independent statements is only meaningful while both actually state
+        something. An adapter declaring none would be saying it settles in nothing, which cannot
+        be true of a venue that accepts orders, and would make that agreement vacuous rather
+        than false -- the failure mode nothing else here would catch.
+        """
+        assert self.broker().capabilities().quote_currencies
 
     # --- capabilities cannot lie about orders ---------------------------------------------
 

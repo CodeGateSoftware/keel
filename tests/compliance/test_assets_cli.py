@@ -723,6 +723,7 @@ def test_the_derived_failure_tags_actually_match_screen_asset_output():
         daily_bars=0,
         median_daily_volume=Decimal(0),
         quotable_in_settlement_currency=False,
+        product_id="SOL-EUR",
     )
     tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
 
@@ -811,6 +812,88 @@ def test_the_settlement_criterion_still_catches_an_EXTERNALLY_supplied_product(
 
     assert "settlement" in result.output, "a cross-settled product must fail the settlement check"
     assert "REJECT" in result.output
+
+
+def test_screen_REPORTS_on_a_futures_id_rather_than_refusing_the_option(
+    tmp_path, valid_config_path
+):
+    """`assets screen` is the ONE `--products` caller that does not validate its option, and this
+    pins that exception (feasibility study R2).
+
+    Every other caller -- `fetch`, `monitor`, `simulate`, `rules seed` -- refuses an id keel
+    cannot trade at the keyboard. Screening must not, because screening is the command that
+    ANSWERS "may keel trade this, and why not". A usage error would make the one tool whose job
+    is to explain an inadmissible asset the one tool that cannot be asked about one. It writes
+    nothing and orders nothing; rails 18/19 stop the id if it ever reaches an order.
+    """
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "ADA-28AUG26-CDE")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "ADA").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "ADA-28AUG26-CDE"],
+    )
+
+    assert result.exit_code == 0, "screening must report a verdict, not a usage error"
+    assert "REJECT" in result.output
+    # The verdict carries the REASON -- which is the whole point of not refusing the option.
+    assert "settlement" in result.output
+
+
+def test_screen_REJECTS_the_derivative_shaped_id_rail_19_exists_to_refuse(
+    tmp_path, valid_config_path
+):
+    """The residual, asked of the screen instead of the rails (feasibility study R2).
+
+    `ADA-28AUG26-CDE` above fails on SETTLEMENT (`CDE` is not a configured currency), so it
+    never exercised the shape question at all. `BTC-PERP-USD` is the id that does: its quote leg
+    IS `USD`, so the settlement criterion admits it, and with attested BTC and cached history
+    every other criterion admitted it too. The one command whose job is answering "may keel
+    trade this" said ADMIT about the one product this rail exists to refuse.
+
+    The exemption from `--products` validation is preserved -- the screen still REPORTS rather
+    than refusing -- but what it reports is now the truth.
+    """
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-PERP-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-PERP-USD"],
+    )
+
+    assert result.exit_code == 0, "screening must report a verdict, not a usage error"
+    assert "REJECT" in result.output
+    assert "spot_instrument" in result.output
+    assert "BTC-PERP-USD" in result.output, "the verdict must name the id it is about"
+
+
+def test_screen_still_ADMITS_a_well_formed_spot_pair(tmp_path, valid_config_path):
+    """The new criterion must not cost the screen its ordinary answer: the same seeded,
+    attested BTC on a real spot id is still ADMITted."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ADMIT" in result.output
+    assert "spot_instrument" not in result.output
 
 
 # -- assets propose -----------------------------------------------------------------------------

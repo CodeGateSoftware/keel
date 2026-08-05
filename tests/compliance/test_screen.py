@@ -14,12 +14,13 @@ from keel.compliance.screen import (
 )
 
 
-def _facts(asset="BTC", bars=2000, volume="50000000", quotable=True) -> MarketFacts:
+def _facts(asset="BTC", bars=2000, volume="50000000", quotable=True, product=None) -> MarketFacts:
     return MarketFacts(
         asset=asset,
         daily_bars=bars,
         median_daily_volume=Decimal(volume),
         quotable_in_settlement_currency=quotable,
+        product_id=product if product is not None else f"{asset}-USD",
     )
 
 
@@ -138,13 +139,75 @@ def test_an_asset_not_quotable_in_the_settlement_currency_is_rejected():
     assert any("settlement" in f for f in result.failures)
 
 
+def test_an_instrument_that_is_not_a_spot_pair_is_rejected():
+    """The criterion `assets screen` was missing (feasibility study R2).
+
+    Settlement was the screen's ONLY id-derived criterion, and a derivative-shaped id whose last
+    segment is a legitimate settlement currency passes it -- `quote_currency_of("BTC-PERP-USD")`
+    is `"USD"`. So the command whose whole job is answering "may keel trade this" said ADMIT
+    about the one product shape rail 19 was built to refuse.
+    """
+    result = screen_asset(_facts(product="BTC-PERP-USD"), _attestation())
+    assert result.admitted is False
+    assert any(f.startswith("spot_instrument") for f in result.failures)
+    assert any("BTC-PERP-USD" in f for f in result.failures), "the verdict must name the id"
+
+
+@pytest.mark.parametrize(
+    "product",
+    [
+        "BTC-PERP-USD",  # the R2 residual: derivative-shaped, USD-settled
+        "ADA-28AUG26-CDE",  # futures
+        "ac568fb9e6c5a67da94f065a49fb7b0c59b7b258cfdf0a3b1560849071c3b05e",  # equity hash
+        "btc-usd",  # lowercase: not the id the venue lists
+        "BTCUSD",
+        "",
+    ],
+)
+def test_the_shape_criterion_uses_rail_19s_grammar_not_a_second_copy(product):
+    """One grammar, so the screen and the rail cannot disagree about what a spot id is: an id
+    the screen ADMITs but rail 19 vetoes is the worst possible answer to "may keel trade this"."""
+    result = screen_asset(_facts(product=product), _attestation())
+    assert any(f.startswith("spot_instrument") for f in result.failures), product
+
+
+def test_the_spot_instrument_verdict_survives_a_missing_attestation():
+    """It is a market fact, computed before the attestation early-return, so an unattested
+    derivative reports BOTH reasons rather than only the shariah one."""
+    result = screen_asset(_facts(product="BTC-PERP-USD"), None)
+    assert any(f.startswith("spot_instrument") for f in result.failures)
+    assert any(f.startswith("attestation") for f in result.failures)
+
+
+def test_the_spot_instrument_criterion_can_never_be_waived():
+    """`WAIVABLE_CRITERIA` is `{"history"}`; spot-only is this agent's charter, not a threshold.
+    A stray exception row naming it must be dropped by the up-front filter like any other."""
+    result = screen_asset(
+        _facts(product="BTC-PERP-USD"),
+        _attestation(),
+        waived={"spot_instrument": "we really want it"},
+    )
+    assert result.admitted is False
+    assert any(f.startswith("spot_instrument") for f in result.failures)
+
+
+def test_the_spot_instrument_failure_is_assessable_with_zero_cached_bars():
+    """Like `settlement`, it reads the product id and never touches candles -- so it must NOT be
+    in `DATA_DERIVED_FAILURES`, or `assets holdings` would suppress a real verdict."""
+    from keel.compliance.screen import DATA_DERIVED_FAILURES
+
+    assert "spot_instrument" not in DATA_DERIVED_FAILURES
+    result = screen_asset(_facts(bars=0, volume="0", product="BTC-PERP-USD"), _attestation())
+    assert any(f.startswith("spot_instrument") for f in result.failures)
+
+
 def test_every_failure_is_reported_not_just_the_first():
     """A screening report that stops at the first problem wastes a round trip."""
     result = screen_asset(
-        _facts(bars=10, volume="1", quotable=False),
+        _facts(bars=10, volume="1", quotable=False, product="BTC-PERP-EUR"),
         _attestation(sector="gambling", backing="dayn", yield_=True),
     )
-    assert len(result.failures) >= 6
+    assert len(result.failures) >= 7
 
 
 def test_policy_thresholds_are_configurable():

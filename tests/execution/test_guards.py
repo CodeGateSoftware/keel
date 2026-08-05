@@ -9,10 +9,12 @@ so `result.violations` names precisely the rail expected.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_core.products import parse_spot_product_id
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
@@ -1119,6 +1121,348 @@ def test_rail18_violation_names_the_product_the_currency_and_the_allowed_set(
     assert FUTURES_PRODUCT_ID in violation
     assert "CDE" in violation
     assert "USD" in violation and "USDC" in violation
+
+
+# -- rail 19: spot instrument shape (instrument admission, every mode, both sides) --------------
+#
+# Rail 18 closed the CLASS hole the study found by execution. Its residual -- R2 in
+# `docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md` -- is that it checks the
+# settlement LEG, not the instrument SHAPE. `quote_currency_of("BTC-PERP-USD")` returns `"USD"`,
+# which is a configured settlement currency, and `_asset` returns the allowlisted `"BTC"`, so a
+# derivative-shaped id with a legitimate final segment passes BOTH shipped defences. Rail 19 is
+# the shape gate that was missing.
+
+#: The residual, as one id: derivative-shaped, USD-settled, allowlisted base. Coinbase does not
+#: list this product today -- that is the point. Rail 18 is a check on the settlement leg and
+#: cannot see the middle segment, so a venue that ever listed one would find keel's rails open.
+DERIVATIVE_SHAPED_USD_ID = "BTC-PERP-USD"
+
+
+def test_rail19_a_usd_settled_derivative_shaped_id_is_vetoed(repo: Repository) -> None:
+    """The R2 residual, stated as a test: SELL `BTC-PERP-USD` on the live allowlist.
+
+    Both shipped defences pass it -- rail 1 because `_asset` reduces it to the allowlisted
+    `BTC`, rail 18 because its settlement leg really is `USD`. Assert BOTH of those, so a future
+    reader cannot mistake this for a duplicate of either, and only rail 19 stops it.
+    """
+    intent = _intent(product_id=DERIVATIVE_SHAPED_USD_ID, side=Side.SELL)
+    result = check(intent, repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    assert "spot_instrument" in _keys(result)
+    assert "settlement_currency" not in _keys(result), (
+        "rail 18 passes it -- its settlement leg is genuinely USD; that is the residual"
+    )
+    assert "halal_allowlist" not in _keys(result), "rail 1 passes it too -- `_asset` sees BTC"
+    assert result.ok is False
+
+
+def test_rail19_is_vetoed_offline_too_and_is_never_skipped(repo: Repository) -> None:
+    """Like rail 18, this needs no broker and no live account state, so paper cannot skip it.
+    A rehearsal that admitted a derivative would prove a track record live trading would veto."""
+    intent = _intent(
+        product_id=DERIVATIVE_SHAPED_USD_ID,
+        side=Side.SELL,
+        available_quote=None,
+        withdrawals_enabled=None,
+    )
+    result = check(intent, repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS, offline=True)
+
+    assert "spot_instrument" in _keys(result)
+    assert "spot_instrument" not in result.skipped_rails
+    assert "spot_instrument" not in LIVE_STATE_RAILS
+
+
+def test_rail19_vetoes_both_sides_in_every_mode(repo: Repository) -> None:
+    for side in (Side.BUY, Side.SELL):
+        for offline in (False, True):
+            result = check(
+                _intent(product_id=DERIVATIVE_SHAPED_USD_ID, side=side),
+                repo,
+                _config(allowlist=LIVE_ALLOWLIST),
+                NOW_TS,
+                offline=offline,
+            )
+            assert "spot_instrument" in _keys(result), (side, offline)
+
+
+def test_rail19_vetoes_DCA_too(repo: Repository) -> None:
+    """DCA is exempt from rails 8 and 11, never from instrument admission (§12.6)."""
+    result = check(
+        _intent(product_id=DERIVATIVE_SHAPED_USD_ID, is_dca=True, rule_kind="dca"),
+        repo,
+        _config(allowlist=LIVE_ALLOWLIST),
+        NOW_TS,
+    )
+    assert "spot_instrument" in _keys(result)
+
+
+def test_rail19_vetoes_a_futures_contract_and_an_equity_hash(repo: Repository) -> None:
+    """The two classes rail 18 already stops are stopped here too -- belt and braces, and the
+    reason rail 19 can be read on its own without tracing what rail 18 happens to catch."""
+    for product_id in (FUTURES_PRODUCT_ID, EQUITY_PRODUCT_ID):
+        result = check(
+            _intent(product_id=product_id), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS
+        )
+        assert "spot_instrument" in _keys(result), product_id
+
+
+def test_rail19_never_raises_on_a_malformed_product_id(repo: Repository) -> None:
+    """A veto, never an exception -- same contract as rail 18, for the same reason: the rail
+    machinery also walks historical filled orders, where one bad row must not crash the cycle."""
+    for product_id in ("", "-", "BTC-", "-USD", "BTC--USD", "btc-usd", "   ", "BTCUSD"):
+        result = check(_intent(product_id=product_id), repo, _config(), NOW_TS)
+        assert "spot_instrument" in _keys(result), product_id
+
+
+def test_rail19_passes_every_live_deployment_product(repo: Repository) -> None:
+    """The six rules in the live DB verbatim (five turtle + the BTC DCA rule). Rail 19 must be
+    invisible to the deployment as it stands -- blast radius nil, exactly as rail 18's was."""
+    for product_id in ("BTC-USD", "ETH-USD", "PAXG-USD", "ADA-USD", "XLM-USD"):
+        result = check(
+            _intent(product_id=product_id), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS
+        )
+        assert "spot_instrument" not in _keys(result), product_id
+
+    dca = check(
+        _intent(product_id="BTC-USD", is_dca=True, rule_kind="dca"),
+        repo,
+        _config(allowlist=LIVE_ALLOWLIST),
+        NOW_TS,
+    )
+    assert "spot_instrument" not in _keys(dca)
+
+
+def test_rail19_passes_a_well_formed_spot_pair_rail_18_rejects(repo: Repository) -> None:
+    """Shape and settlement are separate questions and must stay separately reported: `BTC-EUR`
+    is a perfectly well-formed spot pair, vetoed only by the settlement set."""
+    result = check(_intent(product_id="BTC-EUR"), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    assert "spot_instrument" not in _keys(result)
+    assert "settlement_currency" in _keys(result)
+
+
+def test_rail19_does_NOT_close_the_two_segment_derivative_case_rail_18_does(
+    repo: Repository,
+) -> None:
+    """The residual this rail leaves open, pinned so the comment above cannot quietly rot.
+
+    `BTC-PERP` is Coinbase International's real perpetual-futures format, and it PASSES rail
+    19's grammar: `PERP` is a legal quote leg by shape, and the grammar cannot know which
+    four-letter tokens are currencies without a currency table it deliberately does not carry.
+    Rail 18 is what stops it. So for a two-segment derivative id, spot-only is still a property
+    of `settlement_currencies` -- and an operator who widened that list to a token their venue
+    also uses as an instrument suffix would reopen the hole. Rail 19 makes spot-only structural
+    for THREE-or-more-segment ids; that is the honest claim.
+    """
+    assert parse_spot_product_id("BTC-PERP") == ("BTC", "PERP"), "the grammar admits it"
+
+    result = check(_intent(product_id="BTC-PERP"), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    assert "spot_instrument" not in _keys(result), "rail 19 passes it -- that is the residual"
+    assert "settlement_currency" in _keys(result), "rail 18 is the only thing stopping it"
+    assert result.ok is False
+
+
+def test_rail19_violation_names_the_product_and_says_what_shape_is_required(
+    repo: Repository,
+) -> None:
+    """An operator must be able to act on the message without reading this module."""
+    result = check(
+        _intent(product_id=DERIVATIVE_SHAPED_USD_ID),
+        repo,
+        _config(allowlist=LIVE_ALLOWLIST),
+        NOW_TS,
+    )
+    violation = next(v for v in result.violations if v.startswith("spot_instrument"))
+    assert DERIVATIVE_SHAPED_USD_ID in violation
+    assert "BASE-QUOTE" in violation
+
+
+# -- `_asset` and the history walk are total ---------------------------------------------------
+
+
+def test__asset_is_total(repo: Repository) -> None:
+    """`_asset` runs over every historical filled order, so it must never raise on anything the
+    audit log can hold. `_asset(None)` used to raise `AttributeError`."""
+    for weird in (
+        None,
+        "",
+        "-",
+        "BTC-",
+        "-USD",
+        "BTC--USD",
+        "btc-usd",
+        "   ",
+        EQUITY_PRODUCT_ID,
+        FUTURES_PRODUCT_ID,
+        42,
+        3.5,
+        b"BTC-USD",
+        ["BTC-USD"],
+        {"BTC": "USD"},
+    ):
+        guards._asset(weird)  # must not raise
+
+
+def test__asset_still_returns_exactly_what_it_returned_before(repo: Repository) -> None:
+    """Totality is the ONLY behaviour change. `_asset` stays the loose parse on purpose.
+
+    Tightening it to `parse_spot_product_id` would silently change rail 1's verdict on a futures
+    id -- destroying the "rail 1 passes the contract, that is the hole" assertion above -- and
+    would split a derivative's exposure out of its root's bucket, under-stating the figure rails
+    4/5/6 cap. Rail 19 is where an unparseable id is refused; this is only a grouping key.
+    """
+    assert guards._asset("BTC-USD") == "BTC"
+    assert guards._asset(FUTURES_PRODUCT_ID) == "ADA"
+    assert guards._asset(DERIVATIVE_SHAPED_USD_ID) == "BTC"
+    assert guards._asset(EQUITY_PRODUCT_ID) == EQUITY_PRODUCT_ID  # no separator: the whole hash
+    assert guards._asset(None) == "None"  # a key, not an AttributeError
+
+
+def test_open_exposure_walk_survives_a_malformed_history_row(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One unparseable audit row must not crash the cycle -- and a malformed BUY is COUNTED.
+
+    The direction is what makes this safe, and it is SIDE-DEPENDENT because
+    `_open_exposure_by_asset` is a net figure: BUY adds, SELL subtracts. A malformed BUY counted
+    can only over-state exposure against caps 4/5/6, which is the closed direction. (A malformed
+    SELL is the opposite and is skipped -- see the two tests below.)
+    """
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("400"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id=EQUITY_PRODUCT_ID,
+        side=Side.BUY,
+        qty=Decimal("2"),
+        price=Decimal("50"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        exposure = guards._open_exposure_by_asset(repo)
+        result = check(_intent(), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    # Counted under `_asset`'s key: the futures contract lands in its root's bucket (merging can
+    # only over-state ADA, the closed direction), the separator-less hash under itself.
+    assert exposure == {"ADA": Decimal("400"), EQUITY_PRODUCT_ID: Decimal("100")}
+    # The WARNING is how an operator finds out -- and it must NAME the row, or it cannot be
+    # acted on. `log_event` carries fields in the `keel_fields` extra, not in the message.
+    warned = {
+        r.keel_fields["product"]
+        for r in caplog.records
+        if r.getMessage() == "guards.exposure_row_unparseable"
+    }
+    assert warned == {FUTURES_PRODUCT_ID, EQUITY_PRODUCT_ID}
+    assert "guards.exposure_row_unparseable" in caplog.text
+    assert isinstance(result, GuardResult)  # no raise
+
+
+def test_a_malformed_history_row_still_counts_toward_the_exposure_cap(repo: Repository) -> None:
+    """The rail that matters: the $400 above is real money at risk, and rail 4 must see it."""
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("960"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    result = check(_intent(notional=Decimal("50")), repo, _config(), NOW_TS)
+
+    assert "total_exposure_cap" in _keys(result), (
+        "an unparseable row was dropped from exposure -- that is fail-OPEN"
+    )
+
+
+def test_a_malformed_SELL_history_row_is_SKIPPED_not_counted(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half, and the one the shipped rule originally got backwards.
+
+    `_open_exposure_by_asset` is NET: SELL *subtracts*. So counting an unparseable SELL under
+    `_asset`'s key REDUCES the bucket its root is capped by, i.e. it LOOSENS rails 4/5/6 -- the
+    fail-OPEN direction the counting rule was chosen to avoid. A futures SELL is precisely the
+    row shape the feasibility study found passing every shipped rail, so this is not a
+    hypothetical.
+
+    Refusing to let an unreadable row release a cap is the closed answer; the WARNING is still
+    how the operator finds out, and it says which way the row went.
+    """
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("900"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,  # `_asset` -> "ADA": the same bucket
+        side=Side.SELL,
+        qty=Decimal("1"),
+        price=Decimal("800"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        exposure = guards._open_exposure_by_asset(repo)
+
+    assert exposure == {"ADA": Decimal("900")}, (
+        "the unparseable SELL relieved ADA's measured exposure -- that is fail-OPEN"
+    )
+    skipped = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "guards.exposure_row_unparseable"
+        and r.keel_fields["product"] == FUTURES_PRODUCT_ID
+    ]
+    assert skipped, "a skipped row must still be reported, or nobody can act on it"
+    assert skipped[0].keel_fields["action"] == "skipped"
+
+
+def test_a_malformed_SELL_cannot_zero_out_a_bucket_and_release_the_concentration_cap(
+    repo: Repository,
+) -> None:
+    """The rail that matters, stated as money. The trailing `if amt > 0` filter means a large
+    enough malformed SELL does not merely shrink a bucket, it deletes it -- and rail 5's
+    per-asset concentration cap then admits an order the honest figure refuses."""
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("900"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,
+        side=Side.SELL,
+        qty=Decimal("1"),
+        price=Decimal("5000"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    result = check(
+        _intent(product_id="ADA-USD", notional=Decimal("50")),
+        repo,
+        _config(allowlist=LIVE_ALLOWLIST, max_exposure_usd=Decimal("1000")),
+        NOW_TS,
+    )
+
+    assert "per_asset_concentration_cap" in _keys(result), (
+        "an unparseable SELL emptied ADA's bucket and bought the agent headroom it has not got"
+    )
 
 
 # -- offline mode (paper trading only) -----------------------------------------

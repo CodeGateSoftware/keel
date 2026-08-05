@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from keel_core.products import is_spot_base_code
 from keel_core.types import Granularity
 
 
@@ -339,12 +340,49 @@ def _parse_auto_trade_mode(raw: dict[str, Any]) -> str:
 
 
 def _parse_allowlist(raw: dict[str, Any]) -> list[str]:
+    """`allowlist:` -- the BASE legs every product id keel constructs is built from.
+
+    Entries are shape-checked against `is_spot_base_code`, the base-leg half of the spot grammar
+    rail 19 gates on, for the reason `_parse_settlement_currencies` shape-checks currency codes
+    and the reason `quote_currency` is cross-checked against `settlement_currencies`: an entry
+    this function admits and the rails then veto is a **silent, unfixable rejection**. An
+    allowlist asset only ever reaches the venue through `_history_product`'s
+    `f"{asset}-{quote_currency}"`, so `allowlist: [btc]` derives `btc-USD` -- which rail 19
+    vetoes on every cycle and rail 1 never even reaches. The operator's first signal would be a
+    veto on an asset they believed they had just enabled.
+
+    ⚠️ **REJECTED, never uppercased** -- deliberately the opposite of `settlement_currencies`
+    beside it, and the difference is what the value is FOR. A settlement code is *compared*
+    against `quote_currency_of`'s already-uppercased output, so folding it makes the two sides
+    agree by construction and changes nothing an operator can observe. An allowlist entry is
+    *concatenated* into a venue identifier. Folding it would mean the asset keel goes on to
+    trade is not the asset the file names, which is the same judgement
+    `commands._products.validate_product_ids` makes about a typed `--products` id: a venue
+    identifier is not free text, and guessing at one is how a typo becomes a position. The
+    message carries the uppercase form, so the fix costs the operator one keystroke and stays
+    theirs. (Blast radius nil: every shipped config -- live, paper-forward, sandbox, local --
+    already lists uppercase tickers.)
+
+    Reports the FIRST bad entry rather than all of them, matching the other `_parse_*` helpers
+    here; the whole-list report belongs to `validate_product_ids`, where an operator is typing a
+    list at a prompt rather than editing a file they can re-read.
+    """
     allowlist = raw.get("allowlist")
     if not allowlist or not isinstance(allowlist, list):
         raise ConfigError("allowlist: missing or empty; must be a non-empty list of asset codes")
     for entry in allowlist:
         if not isinstance(entry, str) or not entry:
             raise ConfigError(f"allowlist: invalid entry {entry!r}; must be non-empty strings")
+        if not is_spot_base_code(entry):
+            # The hint fires only when case is the ONLY thing wrong, so it can never propose an
+            # entry that is itself inadmissible -- `btc-usd` gets the refusal, not advice.
+            hint = f" -- did you mean {entry.upper()}?" if is_spot_base_code(entry.upper()) else ""
+            raise ConfigError(
+                f"allowlist: invalid entry {entry!r}; an asset code is 1-16 UPPERCASE "
+                f"alphanumeric characters (BTC, PAXG, 1INCH) -- it is the base leg of the "
+                f"product id keel builds as '<asset>-{{quote_currency}}', so anything else "
+                f"derives an id rail 19 would veto on every cycle{hint}"
+            )
     return list(allowlist)
 
 

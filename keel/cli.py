@@ -79,7 +79,11 @@ from keel.commands._common import (
     _require_interactive_confirmation,
     with_disclaimer,
 )
-from keel.commands._products import _default_sim_products, _history_product
+from keel.commands._products import (
+    _default_sim_products,
+    _history_product,
+    parse_products_option,
+)
 from keel.commands.autonomy import autonomy_group
 from keel.commands.db import db_group
 from keel.commands.insights import insights_group
@@ -510,6 +514,9 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
         # `-USD`, so it always fell through to "do we have bars", which the history criterion
         # already covers. One of four admission criteria was doing nothing.
         quotable_in_settlement_currency=quote_currency_of(product) == quote.upper(),
+        # Carried, not reduced: `screen_asset` applies rail 19's grammar to it, so the screen's
+        # shape verdict and the rail's cannot disagree, and the verdict can name the id.
+        product_id=product,
     )
 
 
@@ -770,7 +777,18 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    product_list = _parse_products_option(products, config)
+    # Deliberately UNVALIDATED, unlike every other `--products` caller: screening is the command
+    # that answers "may keel trade this, and why not", and `screen_asset` has BOTH id-derived
+    # criteria of its own -- `settlement` (the quote leg vs `config.quote_currency`) and
+    # `spot_instrument` (the whole id vs rail 19's spot grammar) -- so it REJECTs a cross-settled
+    # or derivative-shaped id with the same reason a usage error would have carried, plus the
+    # history/liquidity/attestation verdicts a usage error would have suppressed. Validating
+    # here would replace that reasoned answer with a refusal to answer.
+    #
+    # That exemption is only honest because those criteria are real. Settlement alone was not
+    # enough: `quote_currency_of("BTC-PERP-USD")` is `"USD"`, so before the `spot_instrument`
+    # criterion this command ADMITted the one product shape rail 19 exists to veto.
+    product_list, _ = parse_products_option(products, config, validate=False)
 
     admitted = 0
     for product in product_list:
@@ -1251,9 +1269,31 @@ _DAYS_PER_YEAR = 365
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
-    if not products:
-        return _default_sim_products(config)
-    return [p.strip() for p in products.split(",") if p.strip()]
+    """`--products` for `fetch`/`simulate`: a malformed id is refused, a cross-settled one warns.
+
+    The parse itself lives in `commands._products` so `rules seed` uses the same one. This
+    wrapper turns its `ValueError` into a `click.BadParameter` -- a usage error naming the
+    offending ids rather than a traceback -- and prints the non-fatal reasons it hands back
+    (feasibility study R2).
+
+    `settlement_is_fatal=False` is the difference from `rules seed`, and it is about what each
+    command WRITES. Seeding a rule for a product rail 18 vetoes puts a row in the table that the
+    agent polls forever; fetching its candles puts market data in the cache, which is exactly
+    what an operator needs before `assets screen` can tell them anything about the asset. See
+    `parse_products_option`. `monitor` is deliberately absent from this list: it has no
+    `--products` option and polls `_default_sim_products` directly.
+    """
+    try:
+        product_list, warnings = parse_products_option(
+            products, config, settlement_is_fatal=False
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--products") from exc
+    for warning in warnings:
+        # Loud, and on stderr-adjacent footing with the other ⚠️ notices: this run is legitimate,
+        # but no ORDER for such a product ever will be under the current config.
+        click.echo(f"⚠️  {warning}\n    Fetching/simulating it is fine; trading it is not.")
+    return product_list
 
 
 def _sim_asset(product_id: str) -> str:
