@@ -79,7 +79,11 @@ from keel.commands._common import (
     _require_interactive_confirmation,
     with_disclaimer,
 )
-from keel.commands._products import _default_sim_products, _history_product
+from keel.commands._products import (
+    _default_sim_products,
+    _history_product,
+    parse_products_option,
+)
 from keel.commands.autonomy import autonomy_group
 from keel.commands.db import db_group
 from keel.commands.insights import insights_group
@@ -770,7 +774,10 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    product_list = _parse_products_option(products, config)
+    # Deliberately UNVALIDATED, unlike every other `--products` caller: screening is the command
+    # that answers "may keel trade this", and `screen_asset` rejects a cross-settled or malformed
+    # id with a reason. Validating here would turn that answer into a usage error.
+    product_list = parse_products_option(products, config, validate=False)
 
     admitted = 0
     for product in product_list:
@@ -1251,9 +1258,16 @@ _DAYS_PER_YEAR = 365
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
-    if not products:
-        return _default_sim_products(config)
-    return [p.strip() for p in products.split(",") if p.strip()]
+    """`--products` for `fetch`/`screen`/`monitor`/`simulate`, refused here if keel cannot trade it.
+
+    The parse itself lives in `commands._products` so `rules seed` uses the same one. This
+    wrapper exists only to turn its `ValueError` into a `click.BadParameter`, i.e. a usage error
+    naming the offending ids rather than a traceback (feasibility study R2).
+    """
+    try:
+        return parse_products_option(products, config)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--products") from exc
 
 
 def _sim_asset(product_id: str) -> str:

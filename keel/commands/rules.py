@@ -18,7 +18,7 @@ from keel_core.telemetry import log_event
 
 from keel import agent
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
-from keel.commands._products import _default_sim_products
+from keel.commands._products import parse_products_option
 from keel.data.repository import Repository
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
@@ -272,6 +272,12 @@ def rules_seed(
     already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
     script) without piling up duplicate candidates. `--force` inserts a fresh candidate anyway.
 
+    `--products` is validated before anything is written (`parse_products_option`): an id keel
+    could not trade -- a futures contract, an equity hash, a pair settling outside
+    `settlement_currencies`, a lowercase typo -- is refused here, naming it, and NO row is
+    seeded. Rails 18/19 would veto every order for such a rule anyway; the difference is that
+    the operator hears it now rather than reading it out of a log after the row is in the table.
+
     Read-only w.r.t. the exchange: no network call, no confirmation gate -- it only ever
     writes local
     `rules` rows, exactly like `rules promote`/`demote`/`disable`.
@@ -279,11 +285,19 @@ def rules_seed(
     repo = _open_repo(ctx)
     now_ts = int(time.time())
 
-    if products:
-        product_list = [p.strip() for p in products.split(",") if p.strip()]
-    else:
-        config = _load_cfg(ctx)
-        product_list = _default_sim_products(config)
+    # Config is loaded UNCONDITIONALLY now, where it used to be loaded only on the
+    # allowlist-default branch: `parse_products_option` needs `settlement_currencies` to answer
+    # rail 18's question about a typed id, and a `--products` seed that skipped that check is
+    # exactly the case R2 exists to close -- `--products XLM-28AUG26-CDE --status live` wrote a
+    # row that looked seeded and that the agent then polled and vetoed on every cycle forever.
+    # The cost is that `rules seed --products ...` now needs a readable `config.yaml`, like every
+    # other command that touches products; the gain is that the operator hears "no" at the
+    # keyboard, with the reason, instead of in a log line nobody is reading.
+    config = _load_cfg(ctx)
+    try:
+        product_list = parse_products_option(products, config)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--products") from exc
 
     if kinds:
         kind_list = [k.strip() for k in kinds.split(",") if k.strip()]

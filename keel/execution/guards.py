@@ -1,13 +1,13 @@
 """THE HARD RAILS (§14) — enforced before every order, un-overridable.
 
-`check()` runs the twelve safety rails from the main spec's §14, plus five later, equally
+`check()` runs the twelve safety rails from the main spec's §14, plus six later, equally
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
-16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, and 18, the
-settlement-currency rail — seventeen in all, since there is no rail 15. They run before any order
-is placed, in every `auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA
-order classes. It never
-short-circuits: every violated rail is collected and reported so an operator (or the executor,
-Task 4) sees the full picture, not just the first trip-wire.
+16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, 18, the
+settlement-currency rail, and 19, the spot-instrument rail — eighteen in all, since there is no
+rail 15. They run before any order is placed, in every `auto_trade` mode (confirm *and*
+autonomous) and for both rule-trading and DCA order classes. It never short-circuits: every
+violated rail is collected and reported so an operator (or the executor, Task 4) sees the full
+picture, not just the first trip-wire.
 
 Design notes on rails that need state this repo doesn't compute anywhere else yet (Task 3 lands
 before the executor/money_mgmt modules that would normally produce some of these numbers):
@@ -81,6 +81,16 @@ incidentally stopped it (13) is BUY-only and skipped in paper. Unlike rails 13/1
 EVERY mode and on BOTH sides, because it needs no broker and no live account state -- see the
 rail's own comment for why that is the whole point, and for the deliberate spot pairs it also
 excludes.
+
+Rail 19 (spot-instrument, safety-critical, un-overridable) closes rail 18's residual (the same
+study's R2): rail 18 checks the settlement LEG, this one checks the instrument SHAPE. They are
+not redundant. `quote_currency_of("BTC-PERP-USD")` is `"USD"` -- a configured settlement currency
+-- and `_asset` reduces it to the allowlisted `"BTC"`, so a derivative-shaped id whose final
+segment is legitimate passes rails 1 AND 18 and is stopped only here. Rail 18 catches the classes
+Coinbase lists TODAY on their settlement legs; rail 19 makes spot-only structural rather than a
+property of which suffixes the venue currently happens to use. Every mode, both sides, DCA
+included, and no config field to widen -- spot-only is this agent's charter, not an operator
+preference.
 """
 
 from __future__ import annotations
@@ -92,7 +102,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from keel_core.products import quote_currency_of
+from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import log_event
 
@@ -158,7 +168,7 @@ LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability")
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all seventeen rails: `ok` iff `violations` is empty."""
+    """The outcome of running all eighteen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -166,8 +176,35 @@ class GuardResult:
     skipped_rails: list[str] = field(default_factory=list)
 
 
-def _asset(product_id: str) -> str:
-    return product_id.split("-")[0]
+def _asset(product_id: object) -> str:
+    """The base leg of `product_id`: the bucket key rails 1/4/5/6/8 group and compare by.
+
+    **Total by contract** -- never raises, on any input, which is why the parameter is typed
+    `object`. That is the R2 fix and the only behaviour change here: `_asset(None)` used to raise
+    `AttributeError`. It matters because `_asset` runs over every historical filled order in
+    `_open_exposure_by_asset`, whose `product_id` column holds whatever the audit log happens to
+    hold, and one bad row crashing the agent cycle is strictly worse than the hole rail 19 closes.
+
+    ⚠️ **Deliberately still the LOOSE parse, not `parse_spot_product_id`.** Admission is rail
+    19's job, and it does that job on the intent before anything is placed; `_asset` is a
+    grouping key, and for a key the loose reduction is the *closed* direction on both rails that
+    read it:
+
+    - **Rail 1.** Reducing `ADA-28AUG26-CDE` to `ADA` is what makes the allowlist pass a futures
+      contract -- the hole the feasibility study found, and the hole rail 19 exists to close. It
+      is asserted, as a hole, in `tests/execution/test_guards.py`. Keeping rail 1's verdict
+      unchanged keeps rail 19 the single, legible reason such an intent is refused, instead of
+      splitting the story across two rails whose messages disagree about what the asset even is.
+    - **Rails 4/5/6.** A derivative on an allowlisted root belongs in that root's exposure
+      bucket. Keying `ADA-28AUG26-CDE` under its own name instead would split ADA's measured
+      exposure in two, and the per-asset concentration cap would then admit an order the
+      combined figure refuses. Merging can only over-state a bucket; splitting under-states it.
+
+    So: same string as before for every input that has one, and `str()` first so that inputs
+    which never had one (`None`, a stray `int`) produce a key rather than an exception. A key
+    that is not in the allowlist, which is the closed outcome for a value that should not exist.
+    """
+    return str(product_id).split("-")[0]
 
 
 def _utc_day_bounds(ts: int) -> tuple[int, int]:
@@ -188,10 +225,34 @@ def _order_notional(order: dict[str, Any]) -> Decimal:
 
 
 def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
-    """Net at-risk notional per asset from filled live orders (BUY adds, SELL reduces)."""
+    """Net at-risk notional per asset from filled live orders (BUY adds, SELL reduces).
+
+    ⚠️ A row whose `product_id` is not a well-formed spot id is LOGGED AND STILL COUNTED, under
+    whatever key `_asset` gives it -- never skipped. A deliberate correction to the feasibility
+    study's own "skip-or-flag the row and keep going" wording (R2), and the direction is the
+    whole argument: this figure feeds rails 4/5/6, which are CAPS, so dropping a row REDUCES
+    measured exposure and LOOSENS every one of them. That is fail-OPEN -- a malformed audit row
+    would buy the agent headroom it has not got. Counting it can only over-state exposure, which
+    is the closed direction, and an over-stated cap refuses an order a human can then look at.
+    The WARNING is how the operator finds out; it is not a substitute for counting the money.
+
+    Such a row should be impossible going forward -- rail 19 vetoes the intent before it can be
+    written, and the live `orders` table held zero rows when rail 19 shipped -- but "impossible"
+    is what the study said about a futures SELL passing every rail.
+    """
     exposure: dict[str, Decimal] = {}
     for order in repo.get_orders(mode="live", status="filled"):
-        asset = _asset(order["product_id"])
+        product_id = order["product_id"]
+        if parse_spot_product_id(product_id) is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "guards.exposure_row_unparseable",
+                product=str(product_id),
+                order_id=order.get("id"),
+                side=order.get("side"),
+            )
+        asset = _asset(product_id)
         amount = _order_notional(order)
         if order["side"] == Side.BUY.value:
             exposure[asset] = exposure.get(asset, Decimal("0")) + amount
@@ -259,7 +320,7 @@ def check(
     now_ts: int,
     offline: bool = False,
 ) -> GuardResult:
-    """Run all seventeen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never
+    """Run all eighteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never
     short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
@@ -620,6 +681,44 @@ def check(
             f"settlement_currency: {intent.product_id} settles in {settlement}, which is not one "
             f"of the configured settlement_currencies {sorted(config.settlement_currencies)}. "
             f"Only spot products quoted in a configured currency may be traded."
+        )
+
+    # 19. Spot instrument shape — the product id must BE a spot pair, `BASE-QUOTE`
+    #     (`parse_spot_product_id`). Rail 18 and this rail ask different questions about the same
+    #     id and neither subsumes the other:
+    #
+    #       rail 18 — *what does it settle in?*   the LAST segment, vs `settlement_currencies`
+    #       rail 19 — *what shape is it?*         the WHOLE id, vs the spot grammar
+    #
+    #     THE RESIDUAL THIS CLOSES (feasibility study R2,
+    #     `docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`): a derivative-shaped
+    #     id whose final segment is a legitimate settlement currency passes both shipped
+    #     defences. `quote_currency_of("BTC-PERP-USD")` is `"USD"` -- configured -- so rail 18
+    #     admits it, and `_asset` reduces it to the allowlisted `"BTC"`, so rail 1 admits it too.
+    #     Only the shape stops it. Coinbase lists no such product today; rail 18 catches the
+    #     classes that DO exist (`CDE` futures, equity hashes) on their settlement legs. This
+    #     rail is what makes spot-only structural rather than a property of which suffixes the
+    #     venue currently happens to use.
+    #
+    #     BOTH SIDES, EVERY MODE, DCA INCLUDED — deliberately not in `LIVE_STATE_RAILS`, for
+    #     rail 18's reason: it needs no broker and no account state, so paper cannot skip it, and
+    #     a rehearsal cannot build a track record on trades live trading would veto.
+    #
+    #     Spot-only is this agent's CHARTER, not an operator preference, so there is no config
+    #     field here to widen (unlike rail 18's `settlement_currencies`). Nor does this consult
+    #     `BrokerCapabilities.asset_classes`: `guards.check` has no broker handle, the live path
+    #     constructs `data.cb_client.CoinbaseClient` which has no `capabilities()` at all, and
+    #     paper passes `broker=None` -- so such a gate would be dead code that reads as a
+    #     defence. That exact pattern was built and deleted once already (R1's "what was
+    #     deliberately NOT shipped"). It belongs with the broker-port migration.
+    #
+    #     Returns a VIOLATION, never raises, on any input. `parse_spot_product_id` is total.
+    if parse_spot_product_id(intent.product_id) is None:
+        violations.append(
+            f"spot_instrument: {intent.product_id!r} is not a well-formed spot product id "
+            f"(BASE-QUOTE, uppercase, exactly one hyphen). keel is spot-only: futures "
+            f"(BASE-DDMMMYY-CDE), equities (an opaque 64-char hash) and any other instrument "
+            f"shape are refused here regardless of what they settle in."
         )
 
     for violation in violations:

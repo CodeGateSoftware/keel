@@ -104,6 +104,75 @@ def test_seed_status_live_bypasses_the_gate_and_warns(tmp_path):
     assert live[0]["kind"] == "dca"
 
 
+# -- rules seed --products: rejected at the KEYBOARD, not at the rails ---------
+#
+# Feasibility study R2. Rails 18/19 stop an inadmissible product where the agent trades it; that
+# is the right place for a safety rail and the wrong place for a typo. Seeding one wrote a row
+# that looked seeded, that the agent then polled every cycle and vetoed forever.
+
+
+def test_seed_refuses_a_futures_contract_and_names_it(tmp_path, valid_config_path):
+    repo = _repo(tmp_path)
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca",
+              "--products", "XLM-28AUG26-CDE", "--status", "live"]
+    )
+
+    assert result.exit_code != 0
+    assert "XLM-28AUG26-CDE" in result.output
+    assert repo.get_rules() == [], "nothing may be seeded when the list is rejected"
+
+
+def test_seed_refuses_a_derivative_shaped_id_that_settles_in_usd(tmp_path, valid_config_path):
+    """The R2 residual at the keyboard: rail 18 alone would pass `BTC-PERP-USD`."""
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca", "--products", "BTC-PERP-USD"]
+    )
+    assert result.exit_code != 0
+    assert "BTC-PERP-USD" in result.output
+
+
+def test_seed_refuses_an_unsettleable_but_well_formed_pair(tmp_path, valid_config_path):
+    """`BTC-EUR` is a real spot pair; it fails on settlement membership, not on shape."""
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca", "--products", "BTC-EUR"]
+    )
+    assert result.exit_code != 0
+    assert "BTC-EUR" in result.output
+    assert "settles in EUR" in result.output
+
+
+def test_seed_refuses_a_lowercase_id_with_a_hint_rather_than_fixing_it(
+    tmp_path, valid_config_path
+):
+    repo = _repo(tmp_path)
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca", "--products", "btc-USD"]
+    )
+
+    assert result.exit_code != 0
+    assert "did you mean BTC-USD" in result.output
+    assert repo.get_rules() == [], "never silently uppercased into a real seeded rule"
+
+
+def test_seed_with_no_products_still_seeds_the_allowlist(tmp_path, valid_config_path):
+    """The default path must keep working: it now loads config unconditionally (it needs the
+    settlement set to validate against), where before it loaded config only on this branch."""
+    repo = _repo(tmp_path)
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca"]
+    )
+
+    assert result.exit_code == 0, result.output
+    seeded = {r["params"]["product_id"] for r in repo.get_rules()}
+    assert seeded == {"BTC-USD", "ETH-USD", "PAXG-USD"}
+
+
 def test_seed_rejects_an_unknown_status(tmp_path):
     result = CliRunner().invoke(
         cli, ["--db", str(tmp_path / "t.db"), "rules", "seed", "--status", "bogus"]

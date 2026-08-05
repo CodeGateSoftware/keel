@@ -1,7 +1,7 @@
 """The order executor (P3 Task 4) -- turns a `Signal` into a guarded live order.
 
 `execute()` is the only path from a strategy `Signal` to a real order: it sizes the candidate
-(`execution.sizing`), runs the seventeen un-overridable §14 hard rails (`execution.guards.check`)
+(`execution.sizing`), runs the eighteen un-overridable §14 hard rails (`execution.guards.check`)
 **before** anything reaches the broker, previews the order, honors the confirm/autonomous mode gate,
 places it, and writes a full audit trail to the `orders` table both before and after the broker
 call (so a crash mid-placement, or a broker-side rejection, still leaves a record). No path in

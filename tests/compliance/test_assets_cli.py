@@ -813,6 +813,36 @@ def test_the_settlement_criterion_still_catches_an_EXTERNALLY_supplied_product(
     assert "REJECT" in result.output
 
 
+def test_screen_REPORTS_on_a_futures_id_rather_than_refusing_the_option(
+    tmp_path, valid_config_path
+):
+    """`assets screen` is the ONE `--products` caller that does not validate its option, and this
+    pins that exception (feasibility study R2).
+
+    Every other caller -- `fetch`, `monitor`, `simulate`, `rules seed` -- refuses an id keel
+    cannot trade at the keyboard. Screening must not, because screening is the command that
+    ANSWERS "may keel trade this, and why not". A usage error would make the one tool whose job
+    is to explain an inadmissible asset the one tool that cannot be asked about one. It writes
+    nothing and orders nothing; rails 18/19 stop the id if it ever reaches an order.
+    """
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "ADA-28AUG26-CDE")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "ADA").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "ADA-28AUG26-CDE"],
+    )
+
+    assert result.exit_code == 0, "screening must report a verdict, not a usage error"
+    assert "REJECT" in result.output
+    # The verdict carries the REASON -- which is the whole point of not refusing the option.
+    assert "settlement" in result.output
+
+
 # -- assets propose -----------------------------------------------------------------------------
 
 

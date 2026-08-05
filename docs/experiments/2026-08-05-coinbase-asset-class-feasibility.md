@@ -664,7 +664,8 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
    The non-USD/USDC **spot** rejection predicted above is real and was accepted: `BTC-EUR`,
    `ETH-GBP`, `*-USDT` and friends are vetoed by the shipped default. Blast radius on the
    deployment is nil, as measured here, and `settlement_currencies` is the escape hatch.
-2. **R2 — Then make the spot-only assumption structural. (~2–4 days.)**
+2. ✅ **R2 — Then make the spot-only assumption structural. (~2–4 days.) — SHIPPED 2026-08-05, see
+   "What R2 actually shipped" below.**
    R1 is a settlement-leg check, not an instrument model; it would not stop a hypothetical future
    product that happens to settle in USD. Turn `BrokerCapabilities.asset_classes`
    (`capabilities.py:20`) from a dead stub into a real gate — and price it honestly, because the
@@ -684,6 +685,89 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
    *On the estimate:* this is the `asset_classes`-gate half of **A6** (3–5 days), plus the A1 slice
    above and the CLI-entry rejection, minus A6's `AssetAttestation`-to-instruments extension. It is
    not additive on top of A6; if Path A is ever built, A6 subsumes it.
+
+   **What R2 actually shipped.** **Rail 19, `spot_instrument`** (`keel/execution/guards.py`) —
+   eighteen rails now, still no rail 15 — plus a strict grammar, a total `_asset`, and rejection
+   at the keyboard. The framing that made it a day rather than the estimated 2–4 is that the
+   residual is answerable **without** an instrument model: rail 18 asks *what does this settle
+   in?* and rail 19 asks *what shape is this?*, and the second question is decided by the id
+   alone.
+   - **The residual, exactly.** `quote_currency_of("BTC-PERP-USD")` is `"USD"` — a configured
+     settlement currency — and `_asset` reduces it to the allowlisted `"BTC"`, so a
+     derivative-shaped id with a legitimate final segment passes rails 1 **and** 18. Verified by
+     execution before writing anything. Rail 19 is the only thing that stops it, and that is the
+     test: `test_rail19_a_usd_settled_derivative_shaped_id_is_vetoed` asserts `spot_instrument`
+     is in the violations while `settlement_currency` and `halal_allowlist` are not — the same
+     "both shipped defences pass it, that is the hole" pattern R1's test uses.
+   - **The grammar.** `parse_spot_product_id` (`packages/keel-core/keel_core/products.py`),
+     alongside `quote_currency_of` and leaving it untouched: a well-formed spot id is
+     `[A-Z0-9]{1,16}-[A-Z0-9]{2,10}`, returning `(base, quote)` or `None`, **total** — it never
+     raises, on any input including non-strings. The census above is its basis: all 936 spot ids
+     have exactly one hyphen, every futures id has two, and every equity id has none. The quote
+     leg's 2–10 bound is not a free choice — it is config's own `_CURRENCY_CODE_RE`, so a
+     well-formed spot id that no `settlement_currencies` set could ever name cannot exist. A
+     property test pins that agreement.
+   - **Every mode, both sides, DCA included**, deliberately not in `LIVE_STATE_RAILS`, for rail
+     18's reason: it needs no broker and no account state, so paper cannot skip it.
+   - **No config field**, unlike rail 18's `settlement_currencies`. Spot-only is this agent's
+     charter, not an operator preference, and a knob whose only safe value is its default is a
+     liability.
+   - **CLI-entry rejection.** `validate_product_ids` / `parse_products_option` in
+     `keel/commands/_products.py` — the existing single source of truth for id construction, so
+     the derivation and the validation cannot disagree — asks both questions of a typed
+     `--products` list and raises `ValueError` naming *every* bad id; `keel/cli.py` and
+     `keel/commands/rules.py` wrap that in `click.BadParameter`. `keel rules seed --products
+     XLM-28AUG26-CDE --status live` now fails at the keyboard with the reason and seeds nothing,
+     where it used to write a row the agent would poll and rails 18/19 veto forever. A lowercase
+     id is **rejected with a "did you mean BTC-USD?" hint, never silently uppercased**: a product
+     id is a venue identifier, not free text, and guessing at one is how a typo becomes a
+     position. `rules seed` loads config unconditionally now (it needs the settlement set);
+     `--products` on `assets screen` is refused one layer earlier than the screen's own
+     settlement criterion, which is unchanged and still unit-tested.
+   - **`BrokerCapabilities.asset_classes` hardened, not wired.** `ASSET_CLASSES = {"spot",
+     "futures", "equity"}` with an `__post_init__` rejection of anything else, mirroring the
+     `ORDER_KINDS` check beside it, and two conformance assertions (`asset_classes` non-empty and
+     a subset; `quote_currencies` non-empty). Both first-party adapters pass.
+
+   **What was deliberately NOT shipped**, and why each was a decision rather than an omission:
+   - **No engine read of `capabilities().asset_classes`** — the same finding that killed R1's
+     venue-declaration check, unchanged and re-verified: the live path constructs
+     `keel/data/cb_client.py`'s `CoinbaseClient`, which has **no `capabilities()` at all**, and
+     the paper path passes `broker=None`. A gate there is dead code on every real path that
+     reads as a defence. That pattern was built and deleted once in this codebase already; rail
+     19 needs no broker handle, which is why it can be the gate today. The reconciliation belongs
+     with the broker-port migration, at **load** time, never as a per-order raise.
+   - **No `capabilities()` on `CoinbaseClient`.** Bolting one on to make the above reachable
+     would put a second, divergent declaration next to `keel_broker_coinbase.CoinbaseAdapter`'s —
+     two answers to one question, which is the failure the port exists to prevent.
+   - **No id→class classifier**, and so none of the A1 slice this entry priced in. The recommendation
+     assumed the gate had to be *"is this instrument's class in the declared set"*, which does
+     require classifying an id. Rail 19 asks the strictly weaker question *"is this a spot pair"*,
+     which is decidable from the id and is the only question a spot-only agent has. A classifier
+     that named the class of a product keel refuses either way would be inventory, not safety.
+   - **No config field for asset classes.** See above.
+   - **`OrderIntent` still carries no instrument class**, for the same reason.
+
+   **One deliberate correction to this document's own wording.** The bullet above says of the
+   history walk: *"on history, skip-or-flag the row and keep going."* **Skipping is wrong, and
+   the shipped behaviour logs at WARNING (`guards.exposure_row_unparseable`) and STILL COUNTS the
+   row.** `_open_exposure_by_asset` feeds rails 4/5/6, which are **caps**: dropping a row
+   *reduces* measured exposure and therefore *loosens* all three. That is fail-**open** — a
+   malformed audit row would buy the agent headroom it has not got. Counting it can only
+   over-state exposure, which is the closed direction, and an over-stated cap refuses an order a
+   human can then look at. Tested both ways round
+   (`test_open_exposure_walk_survives_a_malformed_history_row`, and a companion asserting the row
+   still trips the exposure cap).
+
+   **`_asset` was made total, not strict** — the second correction, and the smaller one. The
+   bullet asks for a *violation* on a non-`BASE-QUOTE` id; the violation is rail 19's, on the
+   intent, and `_asset` is a **grouping key**, not an admission check. Tightening the key would
+   have changed rail 1's verdict on `ADA-28AUG26-CDE` from pass to fail — destroying the "rail 1
+   passes the contract, that is the hole" assertion this study's own R1 test records — and would
+   have split a derivative's exposure out of its root's bucket, under-stating the figure rails
+   4/5/6 cap. So `_asset` returns exactly the string it always did, with a `str()` in front so
+   that `_asset(None)` yields a key instead of the `AttributeError` it used to raise. Totality
+   was the defect; strictness was not.
 3. **R3 — Answer question 1 (cash-settled or delivered?) before spending anything else.**
    It is a documentation lookup plus, if needed, one email to Coinbase support. If CDE contracts
    settle in cash, §65.11 closes the entire futures family and Paths A and C are dead for ~zero
@@ -694,7 +778,10 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
    claim is not evidence (`screen.py:210`).
 5. **R5 — Only after R3 and R4 both clear: build Path A**, dated contracts before perp-style
    (dated ones have no funding mechanic, so they carry strictly fewer open questions), and gate it
-   behind the R2 capability check from day one.
+   behind the R2 capability check from day one. **Amended by what R2 shipped:** there is no
+   capability check to gate behind. Rail 19 refuses every non-spot shape outright, so Path A's
+   first task is not adding a gate but deliberately *widening* one, in `guards.py`, where the
+   change is visible in the rails rather than in an adapter's declaration.
 6. **R6 — Re-probe equities in ~6 months.** The venue gate is Coinbase's to remove and there is no
    signal it is imminent. Re-running `docs/experiments/2026-08-05-coinbase-asset-class-probe.py`
    (command at the top of this document; ~1 minute) answers it: if the `MARKET DATA -- equity …`
