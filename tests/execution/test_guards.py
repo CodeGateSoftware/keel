@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_core.products import parse_spot_product_id
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
@@ -1240,6 +1241,28 @@ def test_rail19_passes_a_well_formed_spot_pair_rail_18_rejects(repo: Repository)
     assert "settlement_currency" in _keys(result)
 
 
+def test_rail19_does_NOT_close_the_two_segment_derivative_case_rail_18_does(
+    repo: Repository,
+) -> None:
+    """The residual this rail leaves open, pinned so the comment above cannot quietly rot.
+
+    `BTC-PERP` is Coinbase International's real perpetual-futures format, and it PASSES rail
+    19's grammar: `PERP` is a legal quote leg by shape, and the grammar cannot know which
+    four-letter tokens are currencies without a currency table it deliberately does not carry.
+    Rail 18 is what stops it. So for a two-segment derivative id, spot-only is still a property
+    of `settlement_currencies` -- and an operator who widened that list to a token their venue
+    also uses as an instrument suffix would reopen the hole. Rail 19 makes spot-only structural
+    for THREE-or-more-segment ids; that is the honest claim.
+    """
+    assert parse_spot_product_id("BTC-PERP") == ("BTC", "PERP"), "the grammar admits it"
+
+    result = check(_intent(product_id="BTC-PERP"), repo, _config(allowlist=LIVE_ALLOWLIST), NOW_TS)
+
+    assert "spot_instrument" not in _keys(result), "rail 19 passes it -- that is the residual"
+    assert "settlement_currency" in _keys(result), "rail 18 is the only thing stopping it"
+    assert result.ok is False
+
+
 def test_rail19_violation_names_the_product_and_says_what_shape_is_required(
     repo: Repository,
 ) -> None:
@@ -1299,11 +1322,12 @@ def test__asset_still_returns_exactly_what_it_returned_before(repo: Repository) 
 def test_open_exposure_walk_survives_a_malformed_history_row(
     repo: Repository, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """One unparseable audit row must not crash the cycle -- and must not be SKIPPED either.
+    """One unparseable audit row must not crash the cycle -- and a malformed BUY is COUNTED.
 
-    Skipping would REDUCE measured exposure, loosening rails 4/5/6: that is fail-OPEN, which is
-    why this deliberately departs from the feasibility doc's "skip-or-flag" wording. Counting it
-    can only over-state exposure, which is the closed direction.
+    The direction is what makes this safe, and it is SIDE-DEPENDENT because
+    `_open_exposure_by_asset` is a net figure: BUY adds, SELL subtracts. A malformed BUY counted
+    can only over-state exposure against caps 4/5/6, which is the closed direction. (A malformed
+    SELL is the opposite and is skipped -- see the two tests below.)
     """
     _seed_filled_order(
         repo,
@@ -1356,6 +1380,88 @@ def test_a_malformed_history_row_still_counts_toward_the_exposure_cap(repo: Repo
 
     assert "total_exposure_cap" in _keys(result), (
         "an unparseable row was dropped from exposure -- that is fail-OPEN"
+    )
+
+
+def test_a_malformed_SELL_history_row_is_SKIPPED_not_counted(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half, and the one the shipped rule originally got backwards.
+
+    `_open_exposure_by_asset` is NET: SELL *subtracts*. So counting an unparseable SELL under
+    `_asset`'s key REDUCES the bucket its root is capped by, i.e. it LOOSENS rails 4/5/6 -- the
+    fail-OPEN direction the counting rule was chosen to avoid. A futures SELL is precisely the
+    row shape the feasibility study found passing every shipped rail, so this is not a
+    hypothetical.
+
+    Refusing to let an unreadable row release a cap is the closed answer; the WARNING is still
+    how the operator finds out, and it says which way the row went.
+    """
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("900"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,  # `_asset` -> "ADA": the same bucket
+        side=Side.SELL,
+        qty=Decimal("1"),
+        price=Decimal("800"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        exposure = guards._open_exposure_by_asset(repo)
+
+    assert exposure == {"ADA": Decimal("900")}, (
+        "the unparseable SELL relieved ADA's measured exposure -- that is fail-OPEN"
+    )
+    skipped = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "guards.exposure_row_unparseable"
+        and r.keel_fields["product"] == FUTURES_PRODUCT_ID
+    ]
+    assert skipped, "a skipped row must still be reported, or nobody can act on it"
+    assert skipped[0].keel_fields["action"] == "skipped"
+
+
+def test_a_malformed_SELL_cannot_zero_out_a_bucket_and_release_the_concentration_cap(
+    repo: Repository,
+) -> None:
+    """The rail that matters, stated as money. The trailing `if amt > 0` filter means a large
+    enough malformed SELL does not merely shrink a bucket, it deletes it -- and rail 5's
+    per-asset concentration cap then admits an order the honest figure refuses."""
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("900"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id=FUTURES_PRODUCT_ID,
+        side=Side.SELL,
+        qty=Decimal("1"),
+        price=Decimal("5000"),
+        created_at=NOW_TS - 86_400,
+    )
+
+    result = check(
+        _intent(product_id="ADA-USD", notional=Decimal("50")),
+        repo,
+        _config(allowlist=LIVE_ALLOWLIST, max_exposure_usd=Decimal("1000")),
+        NOW_TS,
+    )
+
+    assert "per_asset_concentration_cap" in _keys(result), (
+        "an unparseable SELL emptied ADA's bucket and bought the agent headroom it has not got"
     )
 
 

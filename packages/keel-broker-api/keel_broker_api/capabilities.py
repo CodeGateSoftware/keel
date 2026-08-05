@@ -6,12 +6,18 @@ from dataclasses import dataclass
 
 from keel_broker_api.orders import ORDER_KINDS
 
-#: The instrument classes an adapter may declare -- the three the 2026-08-05 Coinbase
-#: asset-class study enumerated at the venue (`SPOT`, `FUTURE`, `EQUITY`;
-#: `docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`). A closed vocabulary for
-#: the same reason `ORDER_KINDS` is one: a declaration checked against nothing is a comment with
-#: a type annotation, and the near-misses (`SPOT`, `future`, `perp`) are exactly the values that
-#: would sit in a set gating nothing.
+#: The instrument classes an adapter may declare: one KEEL-side name per class the 2026-08-05
+#: Coinbase asset-class study found at the venue
+#: (`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`).
+#:
+#: ⚠️ These are **keel's spellings, not the venue's.** Coinbase's `product_type` field reads
+#: `SPOT` / `FUTURE` / `EQUITY`; this vocabulary is lowercase, and plural for futures. That is
+#: deliberate -- an adapter declares what it can do in the port's words, so a second venue with
+#: its own casing has one obvious answer rather than a choice -- and it is why the venue's own
+#: spellings are REFUSED here rather than accepted as synonyms. `SPOT` and `future` are near
+#: misses that a `frozenset` would otherwise carry silently into a set gating nothing, so
+#: `__post_init__` rejects them by name, exactly as `ORDER_KINDS` does. An adapter author who
+#: pastes the venue's value gets an error at construction naming what they pasted.
 ASSET_CLASSES: frozenset[str] = frozenset({"spot", "futures", "equity"})
 
 

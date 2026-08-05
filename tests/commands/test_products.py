@@ -1,4 +1,4 @@
-"""`keel.commands._products.validate_product_ids` -- rejecting a bad id at the KEYBOARD.
+"""`keel.commands._products` -- rejecting (or flagging) a bad `--products` id at the KEYBOARD.
 
 Rails 18 and 19 stop an inadmissible product where the agent trades it, which is the right place
 for a safety rail and the wrong place for a typo. `keel rules seed --products XLM-28AUG26-CDE
@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import pytest
 
-from keel.commands._products import validate_product_ids
+from keel.commands._products import (
+    SETTLEMENT,
+    SHAPE,
+    check_product_ids,
+    validate_product_ids,
+)
 
 _SETTLEMENT = frozenset({"USD", "USDC"})
 
@@ -97,3 +102,53 @@ def test_it_never_raises_anything_but_ValueError():
     for weird in ([None], [42], [""], ["   "], [b"BTC-USD"]):
         with pytest.raises(ValueError):
             validate_product_ids(weird, _SETTLEMENT)
+
+
+# -- the two failure KINDS are distinguishable, so callers can weigh them differently ----------
+#
+# Feasibility study R2, corrected. Both questions are worth asking wherever an operator types an
+# id, but they do not carry the same consequence, and a caller that can only string-match the
+# message cannot act on the difference:
+#
+#   SHAPE      -- `BASE-QUOTE` or not. Always a typo. There is no config edit that rescues it,
+#                 and no command for which it is a legitimate request.
+#   SETTLEMENT -- a real spot pair whose quote leg this deployment does not settle in. Rail 18
+#                 vetoes an ORDER for it; `keel fetch` places none, and needs the history before
+#                 `assets screen` can say anything about the asset at all.
+
+
+def test_the_two_failure_kinds_are_reported_separately():
+    problems = check_product_ids(["BTC-USD", "XLM-28AUG26-CDE", "BTC-EUR"], _SETTLEMENT)
+    assert [(p.product_id, p.kind) for p in problems] == [
+        ("XLM-28AUG26-CDE", SHAPE),
+        ("BTC-EUR", SETTLEMENT),
+    ]
+
+
+def test_a_clean_list_has_no_problems():
+    assert check_product_ids(["BTC-USD", "BTC-USDC"], _SETTLEMENT) == []
+
+
+def test_shape_is_asked_FIRST_so_a_malformed_id_is_never_reported_as_a_settlement_problem():
+    """`quote_currency_of("XLM-28AUG26-CDE")` is `"CDE"`, a perfectly resolvable-looking leg.
+    Reporting that as "settles in CDE, widen settlement_currencies" would invite a config edit
+    that admits a futures contract -- so the shape question has to come first and stop there."""
+    problems = check_product_ids(["XLM-28AUG26-CDE"], _SETTLEMENT)
+    assert [p.kind for p in problems] == [SHAPE]
+
+
+def test_validate_product_ids_still_raises_on_BOTH_kinds():
+    """`rules seed` keeps both fatal: it writes a row the agent will poll every cycle, and a rule
+    the rails veto forever is not a lesser problem than a typo -- it is a quieter one."""
+    for bad in ("XLM-28AUG26-CDE", "BTC-EUR"):
+        with pytest.raises(ValueError):
+            validate_product_ids([bad], _SETTLEMENT)
+
+
+def test_every_problem_carries_its_own_reason_string():
+    """The message an operator reads is per-id, not per-run, so a caller that reports only some
+    of the problems still reports each one in full."""
+    problems = check_product_ids(["XLM-28AUG26-CDE", "BTC-EUR"], _SETTLEMENT)
+    assert all(p.product_id in p.reason for p in problems)
+    assert "not a spot product id" in problems[0].reason
+    assert "settles in EUR" in problems[1].reason

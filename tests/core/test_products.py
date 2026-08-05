@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 from keel_core.config import _CURRENCY_CODE_RE
-from keel_core.products import parse_spot_product_id, quote_currency_of
+from keel_core.products import is_spot_base_code, parse_spot_product_id, quote_currency_of
 
 
 def test_the_quote_leg_is_the_part_after_the_last_dash():
@@ -130,3 +130,53 @@ def test_the_two_parsers_agree_on_the_quote_leg_of_a_well_formed_spot_id():
         if expected is None:
             continue
         assert quote_currency_of(product_id) == expected[1], product_id
+
+
+# -- is_spot_base_code (the base-leg half, which `config.allowlist` is checked against) ---------
+
+
+@pytest.mark.parametrize("code", ["BTC", "ETH", "PAXG", "ADA", "XLM", "SOL", "LTC", "LINK",
+                                  "1INCH", "A", "ABCDEFGHIJKLMNOP"])
+def test_a_real_ticker_is_a_valid_base_code(code):
+    """Every asset the shipped configs list, plus the digit-leading and 16-char edges."""
+    assert is_spot_base_code(code) is True
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "btc",  # lowercase: a typo, not a ticker -- and never folded for us
+        "Btc",
+        "BTC-USD",  # a product id pasted where an asset belongs: derives `BTC-USD-USD`
+        "BT C",
+        "BTC/USD",
+        "BTC.",
+        "",
+        " BTC",
+        "BTC ",
+        "ABCDEFGHIJKLMNOPQ",  # 17 chars: past the ceiling
+    ],
+)
+def test_a_malformed_base_code_is_refused(bad):
+    assert is_spot_base_code(bad) is False
+
+
+@pytest.mark.parametrize("weird", [None, 42, 3.5, b"BTC", ["BTC"], {"BTC": 1}, object()])
+def test_is_spot_base_code_is_TOTAL_and_never_raises(weird):
+    assert is_spot_base_code(weird) is False
+
+
+@pytest.mark.parametrize("code", ["BTC", "ETH", "PAXG", "1INCH", "A", "ABCDEFGHIJKLMNOP"])
+@pytest.mark.parametrize("quote", ["USD", "USDC", "EUR", "USDT"])
+def test_an_admitted_base_code_always_builds_an_id_the_spot_grammar_admits(code, quote):
+    """THE property `config._parse_allowlist` rests on, and the reason the base grammar is shared
+    rather than restated.
+
+    `_history_product` is the only path from an allowlist entry to a venue id, and it is pure
+    concatenation. So "config admitted this asset" must imply "rail 19 admits the id it derives",
+    for every settlement currency `_CURRENCY_CODE_RE` allows -- otherwise config can hand the
+    operator an asset the rails veto on every cycle, which is precisely the silent unfixable
+    rejection the load-time checks exist to prevent.
+    """
+    assert _CURRENCY_CODE_RE.fullmatch(quote), "test premise: a configurable settlement code"
+    assert parse_spot_product_id(f"{code}-{quote}") == (code, quote)

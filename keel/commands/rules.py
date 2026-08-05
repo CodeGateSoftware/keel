@@ -295,7 +295,11 @@ def rules_seed(
     # keyboard, with the reason, instead of in a log line nobody is reading.
     config = _load_cfg(ctx)
     try:
-        product_list = parse_products_option(products, config)
+        # `settlement_is_fatal` stays at its default here, unlike `fetch`/`simulate`: this
+        # command WRITES a row the agent then polls every cycle, so a rule the rails veto
+        # forever is not a lesser problem than a typo, only a quieter one. Nothing is warned
+        # about and admitted; hence no warnings to print.
+        product_list, _ = parse_products_option(products, config)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--products") from exc
 

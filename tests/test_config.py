@@ -36,6 +36,69 @@ def test_load_config_missing_allowlist_raises_configerror_mentioning_allowlist(w
         load_config(path)
 
 
+# -- allowlist entries are shape-checked, for the same reason settlement codes are -------------
+#
+# Feasibility study R2 residual. `allowlist` is not a list of product ids -- it is the list of
+# BASE legs `_history_product` builds them from (`f"{asset}-{quote_currency}"`). Rail 19 then
+# applies the spot grammar to the whole id, so an entry that is not a well-formed base leg
+# produces a product this deployment can never trade, on every cycle, with nothing at load time
+# saying why. That is exactly the silent unfixable rejection the `quote_currency`-vs-
+# `settlement_currencies` cross-check below exists to prevent.
+
+
+def test_a_lowercase_allowlist_entry_is_refused_at_load_not_silently_untradeable(write_config):
+    """`allowlist: [btc]` derives `btc-USD`, which rail 19 vetoes and rail 1 never even reaches.
+
+    The operator's first signal would otherwise be a veto on every cycle, for an asset they
+    believed they had just enabled.
+    """
+    text = VALID_CONFIG_YAML.replace("  - BTC\n", "  - btc\n", 1)
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="allowlist") as excinfo:
+        load_config(path)
+    assert "btc" in str(excinfo.value)
+    assert "BTC" in str(excinfo.value), "the message must carry the fix, not just the refusal"
+
+
+def test_an_allowlist_entry_is_never_silently_uppercased(write_config):
+    """The other half of the same decision, asserted so a future 'helpful' `.upper()` fails here.
+
+    `settlement_currencies` IS case-folded, because rail 18 compares it against
+    `quote_currency_of`'s already-uppercased output -- folding makes the two sides agree by
+    construction. An allowlist entry is not compared, it is CONCATENATED into a venue
+    identifier, so folding it would mean the asset keel trades is not the asset the file names.
+    """
+    text = VALID_CONFIG_YAML.replace("  - BTC\n", "  - btc\n", 1)
+    with pytest.raises(ConfigError):
+        load_config(write_config(text))
+
+
+@pytest.mark.parametrize("bad", ["BTC-USD", "BT C", "BTC/USD", "1INCHTOOLONGATICKERBYFAR", "*"])
+def test_an_allowlist_entry_that_is_not_a_base_leg_is_refused(write_config, bad):
+    """A product id, a space, punctuation, an over-long ticker -- each builds an id no
+    `settlement_currencies` set could rescue. `BTC-USD` is the likeliest of them: the allowlist
+    holds assets, and pasting a product id in derives `BTC-USD-USD`."""
+    text = VALID_CONFIG_YAML.replace("  - BTC\n", f"  - '{bad}'\n", 1)
+
+    with pytest.raises(ConfigError, match="allowlist"):
+        load_config(write_config(text))
+
+
+def test_a_digit_leading_ticker_is_still_accepted(write_config):
+    """`1INCH-USD` is a real Coinbase spot pair, so the base-leg grammar is `[A-Z0-9]`, not
+    `[A-Z]`. Rejecting it would be a new, invented restriction rather than a shape check."""
+    text = VALID_CONFIG_YAML.replace("  - BTC\n", "  - 1INCH\n", 1)
+    assert "1INCH" in load_config(write_config(text)).allowlist
+
+
+def test_every_shipped_config_allowlist_still_loads(write_config):
+    """Blast radius, stated: the live/paper/sandbox allowlists are uppercase tickers already."""
+    for entry in ("BTC", "ETH", "PAXG", "SOL", "XLM", "LTC", "ADA", "LINK"):
+        text = VALID_CONFIG_YAML.replace("  - BTC\n", f"  - {entry}\n", 1)
+        assert entry in load_config(write_config(text)).allowlist
+
+
 def test_load_config_negative_cap_raises_configerror(write_config):
     text = VALID_CONFIG_YAML.replace(
         "max_per_order_usd: 100", "max_per_order_usd: -100"

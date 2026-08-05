@@ -519,7 +519,11 @@ def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path)
     assert len(repo.get_rules()) == 2 * 3 * len(RULE_REGISTRY)
 
 
-def test_rules_seed_respects_products_and_kinds_options(tmp_path):
+def test_rules_seed_respects_products_and_kinds_options(tmp_path, valid_config_path):
+    # `--config` is passed even though this is not a config test: `rules seed` loads config
+    # unconditionally (it needs `settlement_currencies` to validate `--products`), so without it
+    # the default `config.yaml` resolves against the CURRENT WORKING DIRECTORY and this passes
+    # only because pytest happens to run from the repo root. See tests/test_init_and_seed.py.
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)
     runner = CliRunner()
@@ -528,6 +532,7 @@ def test_rules_seed_respects_products_and_kinds_options(tmp_path):
         cli,
         [
             "--db", str(db_path),
+            "--config", str(valid_config_path),
             "rules", "seed",
             "--products", "BTC-USD",
             "--kinds", "dca",
@@ -575,7 +580,7 @@ def test_rules_seed_rows_round_trip_through_build_rule(tmp_path, valid_config_pa
         assert rule.product_id == row["params"]["product_id"]
 
 
-def test_rules_seed_needs_no_passphrase(tmp_path):
+def test_rules_seed_needs_no_passphrase(tmp_path, valid_config_path):
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -583,7 +588,8 @@ def test_rules_seed_needs_no_passphrase(tmp_path):
         cli,
         [
             "--db", str(db_path),
-                        "rules", "seed",
+            "--config", str(valid_config_path),
+            "rules", "seed",
             "--products", "BTC-USD",
             "--kinds", "dca",
         ],

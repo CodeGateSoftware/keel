@@ -27,8 +27,9 @@ def _caps(**overrides: object) -> BrokerCapabilities:
 
 
 def test_the_vocabulary_is_the_three_classes_the_venue_study_enumerated() -> None:
-    """`SPOT`, `FUTURE` and `EQUITY` are what Coinbase lists. A set that drifts from the
-    vocabulary adapters declare against is how a typo becomes a silently permissive gate."""
+    """One keel-side name per class Coinbase lists, in the PORT's spelling rather than the
+    venue's (`SPOT`/`FUTURE`/`EQUITY`). A set that drifts from the vocabulary adapters declare
+    against is how a typo becomes a silently permissive gate."""
     assert ASSET_CLASSES == frozenset({"spot", "futures", "equity"})
 
 
@@ -39,7 +40,13 @@ def test_a_declaration_of_spot_is_accepted() -> None:
 @pytest.mark.parametrize("bogus", ["margin_spot", "SPOT", "perp", "", "future"])
 def test_an_unknown_asset_class_is_refused_at_construction(bogus: str) -> None:
     """Mirrors the `supported_orders` check: an adapter cannot invent a class the engine has no
-    vocabulary for. `SPOT` and `future` are the near-misses that would otherwise pass silently."""
+    vocabulary for.
+
+    `SPOT` and `future` are the near-misses that matter most, and they are refused *because*
+    they are Coinbase's own spellings of `product_type`: an adapter author pasting the venue's
+    value is the likeliest way a set that gates nothing gets written, so it has to fail at
+    construction naming what was pasted rather than sit there looking declared.
+    """
     with pytest.raises(ValueError) as excinfo:
         _caps(asset_classes=frozenset({bogus}))
     assert bogus in str(excinfo.value)

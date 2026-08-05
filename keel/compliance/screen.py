@@ -26,6 +26,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from keel_core.products import parse_spot_product_id
+
 #: §28.4's haram business lines, plus the crypto-specific readings it names.
 HARAM_SECTORS = frozenset(
     {
@@ -88,6 +90,16 @@ class MarketFacts:
     daily_bars: int
     median_daily_volume: Decimal
     quotable_in_settlement_currency: bool
+    #: The venue id the other facts were gathered for. Carried rather than reduced to a bool so
+    #: `screen_asset` can apply `parse_spot_product_id` -- rail 19's own grammar, one copy -- and
+    #: so its verdict can NAME the id. `asset` is that id's base leg and cannot answer the shape
+    #: question: `BTC-PERP-USD` and `BTC-USD` have the same `asset`.
+    #:
+    #: Deliberately has NO default. A default would have to be some id, and any id that parses
+    #: is a fail-OPEN default for a criterion whose whole job is refusing one that does not --
+    #: so a construction site that forgets it must fail loudly at the call, not quietly at the
+    #: verdict.
+    product_id: str
 
 
 @dataclass(frozen=True)
@@ -168,6 +180,31 @@ def screen_asset(
         failures.append(
             "settlement: not quotable in the configured settlement currency -- a cross would "
             "add a second exchange leg, and §65.7 requires each leg be priced and settled"
+        )
+    # The SHAPE criterion, and rail 19's question asked one gate earlier (feasibility study R2).
+    # Settlement used to be this screen's ONLY id-derived criterion, and settlement reads the
+    # LAST segment: `quote_currency_of("BTC-PERP-USD")` is `"USD"`, so a derivative-shaped id
+    # with a legitimate final segment passed it. `assets screen` -- the command that ANSWERS
+    # "may keel trade this, and why not", and the one `--products` caller deliberately exempt
+    # from option validation so that it can report rather than refuse -- therefore said ADMIT
+    # about the one product shape rail 19 exists to veto. The exemption is only honest if the
+    # answer is right.
+    #
+    # NO `ScreenPolicy` knob, unlike `require_settlement_quote` beside it, and for rail 19's
+    # reason: settlement currencies are an operator preference with a real escape hatch
+    # (`config.settlement_currencies`), whereas spot-only is this agent's charter. A knob whose
+    # only safe value is its default is a liability.
+    #
+    # `parse_spot_product_id` is rail 19's own grammar, imported rather than restated, so the
+    # screen and the rail cannot drift into disagreeing about what a spot id is -- an id this
+    # gate admits and that rail then vetoes forever is the worst answer either could give.
+    if parse_spot_product_id(facts.product_id) is None:
+        failures.append(
+            f"spot_instrument: {facts.product_id!r} is not a well-formed spot product id "
+            "(BASE-QUOTE, uppercase, exactly one hyphen). keel is spot-only, so futures "
+            "(BASE-DDMMMYY-CDE), equities (an opaque 64-char hash) and any other instrument "
+            "shape are refused regardless of what they settle in -- rail 19 would veto every "
+            "order for it"
         )
 
     # -- attested shariah classification ---------------------------------------

@@ -707,6 +707,17 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
      leg's 2–10 bound is not a free choice — it is config's own `_CURRENCY_CODE_RE`, so a
      well-formed spot id that no `settlement_currencies` set could ever name cannot exist. A
      property test pins that agreement.
+   - ⚠️ **What rail 19 does NOT close, stated plainly.** It makes spot-only structural for ids of
+     three or more segments. It does not for **two-segment** ones: `BTC-PERP` — Coinbase
+     International's actual perpetual format, not a hypothetical — **passes** this grammar,
+     because `PERP` is a legal quote leg by shape and the grammar cannot know which four-letter
+     tokens are currencies without a currency table it deliberately does not carry. What stops
+     `BTC-PERP` is **rail 18**, on `PERP` not being in `settlement_currencies`. So for a
+     two-segment derivative id, spot-only remains a property of the settlement-currency *list*,
+     exactly as it was before this rail, and widening that list to a token a venue also uses as
+     an instrument suffix would reopen it. Pinned by
+     `test_rail19_does_NOT_close_the_two_segment_derivative_case_rail_18_does`. Closing it
+     properly needs the venue instrument model (A1/A6) priced above.
    - **Every mode, both sides, DCA included**, deliberately not in `LIVE_STATE_RAILS`, for rail
      18's reason: it needs no broker and no account state, so paper cannot skip it.
    - **No config field**, unlike rail 18's `settlement_currencies`. Spot-only is this agent's
@@ -721,9 +732,33 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
      where it used to write a row the agent would poll and rails 18/19 veto forever. A lowercase
      id is **rejected with a "did you mean BTC-USD?" hint, never silently uppercased**: a product
      id is a venue identifier, not free text, and guessing at one is how a typo becomes a
-     position. `rules seed` loads config unconditionally now (it needs the settlement set);
-     `--products` on `assets screen` is refused one layer earlier than the screen's own
-     settlement criterion, which is unchanged and still unit-tested.
+     position. `rules seed` loads config unconditionally now (it needs the settlement set).
+     The same grammar's base-leg half (`is_spot_base_code`) is applied to `allowlist` entries at
+     config load, for `load_config`'s existing `quote_currency`-vs-`settlement_currencies`
+     reason: `allowlist: [btc]` derives `btc-USD`, which passes nothing and would have surfaced
+     as a veto on every cycle rather than as an error naming the file.
+   - **Two callers weigh the two failure kinds differently, and `validate_product_ids` reports
+     which kind failed so they can.** A SHAPE failure is always a typo and is fatal everywhere.
+     A SETTLEMENT mismatch is a real product this deployment does not settle in: fatal on `rules
+     seed`, which WRITES a row the agent polls, and a WARNING on `fetch`/`simulate`, which place
+     no orders. Making it fatal there broke the screening workflow outright — `assets screen
+     --products BTC-EUR` is exempt from validation precisely so the pair CAN be asked about, but
+     the screen's answer is dominated by "0 daily bars < 1460 required", and there was no way to
+     fetch that history without first widening `settlement_currencies`. The config change had to
+     be made before the evidence for making it could be gathered.
+   - **`assets screen` is EXEMPT from `--products` validation** (`validate=False`) — the one
+     caller that is. Screening is the command that ANSWERS "may keel trade this, and why not",
+     so a usage error would make the one tool whose job is to explain an inadmissible asset the
+     one tool that cannot be asked about one. **That exemption obliged the screen to grow the
+     shape criterion it lacked.** `screen_asset`'s only id-derived criterion was `settlement`,
+     and settlement reads the LAST segment: `quote_currency_of("BTC-PERP-USD")` is `"USD"`, so
+     with BTC attested and history cached, `keel assets screen --products BTC-PERP-USD` printed
+     `ADMIT` — the command whose stated job is answering "may keel trade this" saying YES about
+     the one product this work exists to refuse. `screen.py` now carries a `spot_instrument`
+     criterion beside `settlement`, applying `parse_spot_product_id` (rail 19's grammar,
+     imported rather than restated) to a `product_id` that `MarketFacts` now carries. It flows
+     through the `_screen_product` chokepoint, so `assets propose` and `assets holdings
+     --screen` inherit it. Exempting the option is honest only while the answer is right.
    - **`BrokerCapabilities.asset_classes` hardened, not wired.** `ASSET_CLASSES = {"spot",
      "futures", "equity"}` with an `__post_init__` rejection of anything else, mirroring the
      `ORDER_KINDS` check beside it, and two conformance assertions (`asset_classes` non-empty and
@@ -748,16 +783,32 @@ crypto). Gold and silver are named prohibited in the KB. Do not start here.
    - **No config field for asset classes.** See above.
    - **`OrderIntent` still carries no instrument class**, for the same reason.
 
-   **One deliberate correction to this document's own wording.** The bullet above says of the
-   history walk: *"on history, skip-or-flag the row and keep going."* **Skipping is wrong, and
-   the shipped behaviour logs at WARNING (`guards.exposure_row_unparseable`) and STILL COUNTS the
-   row.** `_open_exposure_by_asset` feeds rails 4/5/6, which are **caps**: dropping a row
-   *reduces* measured exposure and therefore *loosens* all three. That is fail-**open** — a
-   malformed audit row would buy the agent headroom it has not got. Counting it can only
-   over-state exposure, which is the closed direction, and an over-stated cap refuses an order a
-   human can then look at. Tested both ways round
-   (`test_open_exposure_walk_survives_a_malformed_history_row`, and a companion asserting the row
-   still trips the exposure cap).
+   **One deliberate correction to this document's own wording — and then a correction to the
+   correction.** The bullet above says of the history walk: *"on history, skip-or-flag the row
+   and keep going."* That is unconditional, and so was the first amendment to it, which said the
+   row is always counted. **Neither absolute survives a SELL, and the shipped rule is
+   SIDE-DEPENDENT.** `_open_exposure_by_asset` is a NET figure — BUY adds, SELL subtracts —
+   feeding rails 4/5/6, which are **caps**. So:
+
+   - a malformed **BUY** is **COUNTED**: it makes the measured figure larger, i.e. the cap
+     tighter, and an over-stated cap refuses an order a human can then look at;
+   - a malformed **SELL** is **SKIPPED**: counting it would *subtract* from the bucket its root
+     is capped by, which *loosens* all three rails. Measured by execution: `ADA-USD` BUY \$900
+     gives `{'ADA': 900}`; adding an `ADA-28AUG26-CDE` SELL of \$800 — the same bucket, since
+     `_asset` reduces both to `ADA` — gives `{'ADA': 100}`, and past the BUY total the trailing
+     `if amt > 0` filter deletes the bucket outright. A large enough unreadable SELL does not
+     shrink a cap, it removes it. **And a futures SELL is exactly the row shape this study found
+     passing every shipped rail**, so this is the case, not a corner of it.
+
+   Both choices are the same choice — never let a row nobody can read make this figure smaller —
+   and it is the row's SIGN, not the fact of it, that decides which action achieves that. Both
+   are logged at WARNING (`guards.exposure_row_unparseable`, carrying `action=counted|skipped`),
+   because seeing a bad row and having it release a cap are different events to whoever is
+   reading. Tested on both halves: `test_open_exposure_walk_survives_a_malformed_history_row`
+   plus its exposure-cap companion for the BUY side,
+   `test_a_malformed_SELL_history_row_is_SKIPPED_not_counted` and
+   `test_a_malformed_SELL_cannot_zero_out_a_bucket_and_release_the_concentration_cap` for the
+   SELL side, which the original tests seeded no rows for and so never exercised.
 
    **`_asset` was made total, not strict** — the second correction, and the smaller one. The
    bullet asks for a *violation* on a non-`BASE-QUOTE` id; the violation is rail 19's, on the

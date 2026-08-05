@@ -98,9 +98,17 @@ class BrokerConformanceTests:
         assert caps.asset_classes <= ASSET_CLASSES
 
     def test_quote_currencies_is_non_empty(self) -> None:
-        """Rail 18's default settlement set is derived FROM this declaration. An adapter that
-        declared none would be saying it settles in nothing, which cannot be true of a venue
-        that accepts orders."""
+        """Kept alongside the `asset_classes` check above because rail 18 is the other half of
+        the same question, and this is the declaration it is checked against.
+
+        `config.DEFAULT_SETTLEMENT_CURRENCIES` is `{"USD", "USDC"}` because that is what
+        `keel_broker_coinbase`'s `_CAPABILITIES.quote_currencies` says the venue settles in --
+        neither is derived from the other (see the comment on that constant), and an agreement
+        between two independent statements is only meaningful while both actually state
+        something. An adapter declaring none would be saying it settles in nothing, which cannot
+        be true of a venue that accepts orders, and would make that agreement vacuous rather
+        than false -- the failure mode nothing else here would catch.
+        """
         assert self.broker().capabilities().quote_currencies
 
     # --- capabilities cannot lie about orders ---------------------------------------------

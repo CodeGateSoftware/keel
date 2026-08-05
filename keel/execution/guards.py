@@ -87,10 +87,11 @@ study's R2): rail 18 checks the settlement LEG, this one checks the instrument S
 not redundant. `quote_currency_of("BTC-PERP-USD")` is `"USD"` -- a configured settlement currency
 -- and `_asset` reduces it to the allowlisted `"BTC"`, so a derivative-shaped id whose final
 segment is legitimate passes rails 1 AND 18 and is stopped only here. Rail 18 catches the classes
-Coinbase lists TODAY on their settlement legs; rail 19 makes spot-only structural rather than a
-property of which suffixes the venue currently happens to use. Every mode, both sides, DCA
-included, and no config field to widen -- spot-only is this agent's charter, not an operator
-preference.
+Coinbase lists TODAY on their settlement legs; rail 19 makes spot-only structural for ids of THREE
+OR MORE segments. It does not for two-segment ones -- `BTC-PERP` passes this grammar and is
+stopped by rail 18 alone -- so there spot-only remains a property of `settlement_currencies`. See
+the rail's own comment for that residual in full. Every mode, both sides, DCA included, and no
+config field to widen -- spot-only is this agent's charter, not an operator preference.
 """
 
 from __future__ import annotations
@@ -227,36 +228,59 @@ def _order_notional(order: dict[str, Any]) -> Decimal:
 def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
     """Net at-risk notional per asset from filled live orders (BUY adds, SELL reduces).
 
-    ⚠️ A row whose `product_id` is not a well-formed spot id is LOGGED AND STILL COUNTED, under
-    whatever key `_asset` gives it -- never skipped. A deliberate correction to the feasibility
-    study's own "skip-or-flag the row and keep going" wording (R2), and the direction is the
-    whole argument: this figure feeds rails 4/5/6, which are CAPS, so dropping a row REDUCES
-    measured exposure and LOOSENS every one of them. That is fail-OPEN -- a malformed audit row
-    would buy the agent headroom it has not got. Counting it can only over-state exposure, which
-    is the closed direction, and an over-stated cap refuses an order a human can then look at.
-    The WARNING is how the operator finds out; it is not a substitute for counting the money.
+    ⚠️ **An unparseable `product_id` is handled by SIDE, and always logged at WARNING.** A
+    malformed **BUY** is COUNTED, under whatever key `_asset` gives it; a malformed **SELL** is
+    SKIPPED. Both choices are the same choice -- never let a row nobody can read make this
+    figure SMALLER -- and it is the sign of the row, not the fact of the row, that decides which
+    action achieves that.
+
+    The arithmetic is why. This is a NET figure feeding rails 4/5/6, which are CAPS:
+
+    - **A counted BUY adds.** A larger measured exposure is a TIGHTER cap. Over-stating refuses
+      an order a human can then look at: the closed direction.
+    - **A counted SELL subtracts**, so counting one is the fail-OPEN move -- it buys the agent
+      headroom it has not got. `ADA-USD` BUY $900 measures `{'ADA': 900}`; add an
+      `ADA-28AUG26-CDE` SELL $800 (`_asset` -> the same `ADA` bucket) and counting it measures
+      $100. Past the BUY total the trailing `if amt > 0` filter drops the bucket entirely, so a
+      large enough unreadable SELL does not merely shrink a cap, it deletes it. Skipping is what
+      keeps the bucket at the figure the rows we CAN read support.
+
+    This supersedes the feasibility study's "skip-or-flag the row and keep going" (R2), which
+    was unconditional, and the first correction of it, which was unconditionally the other way.
+    Neither absolute is right, because neither survives a SELL.
+
+    A row with a side that is neither takes the SELL branch -- it contributes nothing either
+    way, and reporting it as skipped is the honest description of that.
 
     Such a row should be impossible going forward -- rail 19 vetoes the intent before it can be
     written, and the live `orders` table held zero rows when rail 19 shipped -- but "impossible"
-    is what the study said about a futures SELL passing every rail.
+    is what the study said about a futures SELL passing every rail, and a futures SELL is
+    exactly the shape this branch exists for.
     """
     exposure: dict[str, Decimal] = {}
     for order in repo.get_orders(mode="live", status="filled"):
         product_id = order["product_id"]
+        side = order["side"]
         if parse_spot_product_id(product_id) is None:
+            # `action` is in the log line because "we saw a bad row" and "we let it release a
+            # cap" are different events to the operator reading this at 3am.
+            counted = side == Side.BUY.value
             log_event(
                 logger,
                 logging.WARNING,
                 "guards.exposure_row_unparseable",
                 product=str(product_id),
                 order_id=order.get("id"),
-                side=order.get("side"),
+                side=side,
+                action="counted" if counted else "skipped",
             )
+            if not counted:
+                continue
         asset = _asset(product_id)
         amount = _order_notional(order)
-        if order["side"] == Side.BUY.value:
+        if side == Side.BUY.value:
             exposure[asset] = exposure.get(asset, Decimal("0")) + amount
-        elif order["side"] == Side.SELL.value:
+        elif side == Side.SELL.value:
             exposure[asset] = exposure.get(asset, Decimal("0")) - amount
     return {asset: amt for asset, amt in exposure.items() if amt > 0}
 
@@ -696,9 +720,19 @@ def check(
     #     defences. `quote_currency_of("BTC-PERP-USD")` is `"USD"` -- configured -- so rail 18
     #     admits it, and `_asset` reduces it to the allowlisted `"BTC"`, so rail 1 admits it too.
     #     Only the shape stops it. Coinbase lists no such product today; rail 18 catches the
-    #     classes that DO exist (`CDE` futures, equity hashes) on their settlement legs. This
-    #     rail is what makes spot-only structural rather than a property of which suffixes the
-    #     venue currently happens to use.
+    #     classes that DO exist (`CDE` futures, equity hashes) on their settlement legs.
+    #
+    #     ⚠️ **THE RESIDUAL THIS DOES NOT CLOSE, stated plainly.** This rail makes spot-only
+    #     structural for ids of three or more segments; it does not for TWO-segment ones.
+    #     `BTC-PERP` -- Coinbase International's actual perpetual-futures format, not a
+    #     hypothetical -- PASSES this grammar: `PERP` is a legal quote leg by shape, since the
+    #     grammar cannot know which four-letter tokens are currencies without carrying a
+    #     currency table it deliberately does not carry. What stops `BTC-PERP` is rail 18, on
+    #     `PERP` not being in `settlement_currencies`. So for a two-segment derivative id,
+    #     spot-only remains a property of the settlement-currency LIST, exactly as it was before
+    #     this rail. Widening that list to a token a venue also uses as an instrument suffix
+    #     would reopen it. Closing this properly needs a venue instrument model (A1/A6), which
+    #     is priced in the feasibility study and is not what this rail is.
     #
     #     BOTH SIDES, EVERY MODE, DCA INCLUDED — deliberately not in `LIVE_STATE_RAILS`, for
     #     rail 18's reason: it needs no broker and no account state, so paper cannot skip it, and

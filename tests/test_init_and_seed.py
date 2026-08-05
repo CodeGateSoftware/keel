@@ -78,23 +78,30 @@ def test_init_writes_config_and_seeds_candidates(tmp_path):
 
 
 # -- rules seed --status -------------------------------------------------------
+#
+# ⚠️ Both of these pass `--config` even though neither is about config. `rules seed` loads config
+# UNCONDITIONALLY now -- it needs `settlement_currencies` to validate `--products` -- so without
+# it they resolve the default `config.yaml` relative to the CURRENT WORKING DIRECTORY and pass
+# only because pytest happens to run from the repo root, where one exists. That is a test suite
+# whose result depends on where it is invoked from, which is a worse defect than the assertion
+# it hides.
 
 
-def test_seed_defaults_to_candidate(tmp_path):
+def test_seed_defaults_to_candidate(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "rules", "seed",
-              "--kinds", "dca", "--products", "BTC-USD"]
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca", "--products", "BTC-USD"]
     )
     rules = repo.get_rules()
     assert rules and all(r["status"] == "candidate" for r in rules)
 
 
-def test_seed_status_live_bypasses_the_gate_and_warns(tmp_path):
+def test_seed_status_live_bypasses_the_gate_and_warns(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "rules", "seed",
-              "--kinds", "dca", "--products", "BTC-USD", "--status", "live"]
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
+              "rules", "seed", "--kinds", "dca", "--products", "BTC-USD", "--status", "live"]
     )
     assert result.exit_code == 0, result.output
     assert "LIVE status" in result.output

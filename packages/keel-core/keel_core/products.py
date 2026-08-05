@@ -37,7 +37,13 @@ import re
 # `_CURRENCY_CODE_RE`, so a settlement currency that regex admits and this grammar rejects (or
 # the reverse) cannot exist. A well-formed spot id no `settlement_currencies` set could ever
 # name would be vetoed by rail 18 forever with nothing saying why.
-_SPOT_PRODUCT_ID_RE = re.compile(r"[A-Z0-9]{1,16}-[A-Z0-9]{2,10}")
+#
+# The base leg is split out rather than inlined because `config._parse_allowlist` checks against
+# it: `allowlist` holds BASE legs, which `_history_product` concatenates into ids this grammar
+# then judges. Two copies of the base grammar could disagree, and the config side losing that
+# disagreement means an allowlist entry that loads cleanly and is vetoed on every cycle.
+_SPOT_BASE_CODE_RE = re.compile(r"[A-Z0-9]{1,16}")
+_SPOT_PRODUCT_ID_RE = re.compile(_SPOT_BASE_CODE_RE.pattern + r"-[A-Z0-9]{2,10}")
 
 
 def quote_currency_of(product_id: str | None) -> str | None:
@@ -54,6 +60,27 @@ def quote_currency_of(product_id: str | None) -> str | None:
     if not separator or not base.strip() or not quote.strip():
         return None
     return quote.strip().upper()
+
+
+def is_spot_base_code(code: object) -> bool:
+    """Whether `code` is a well-formed BASE leg -- the half of the spot grammar before the hyphen.
+
+    `"BTC"` -> `True`; `"btc"`, `"BTC-USD"`, `"BT C"`, `""` and non-strings -> `False`.
+
+    The question `config._parse_allowlist` asks. An allowlist entry is not a product id: it is
+    the base leg `_history_product` concatenates a settlement currency onto, so the whole-id
+    grammar would reject every legitimate entry. Asking the base-leg half of the SAME grammar is
+    what makes `asset in allowlist` imply `parse_spot_product_id(f"{asset}-{quote}")` for any
+    quote the currency regex admits -- i.e. what stops config from admitting an asset rail 19
+    will veto forever.
+
+    **No normalisation, and no case-folding**, for `parse_spot_product_id`'s reason: this decides
+    whether an id keel is about to CONSTRUCT will be well formed, and folding the input would
+    mean the asset keel trades is not the asset the config file names.
+
+    **Total by contract.** Never raises, on any input -- hence `object`.
+    """
+    return isinstance(code, str) and _SPOT_BASE_CODE_RE.fullmatch(code) is not None
 
 
 def parse_spot_product_id(product_id: object) -> tuple[str, str] | None:

@@ -306,3 +306,78 @@ def test_repair_gaps_runs_the_repair_pass(tmp_path, valid_config_path, monkeypat
     assert result.exit_code == 0, result.output
     assert len(calls) == 6  # 3 products x 2 granularities
     assert "repairing interior gaps" in result.output
+
+
+# -- --products validation: a SHAPE error is fatal, a SETTLEMENT mismatch is not ---------------
+#
+# Feasibility study R2, corrected. Validating `--products` where the operator types it is right
+# for `rules seed`, which WRITES a row the agent then polls. `fetch` places no orders and needs
+# no rail -- and making a settlement mismatch fatal here broke the screening workflow outright:
+# `assets screen --products BTC-EUR` is exempt from validation so an operator CAN ask about a
+# cross-settled pair, but the screen's answer is dominated by "0 daily bars < 1460 required",
+# and there was no way to fetch that history without first widening `settlement_currencies`.
+# You had to make the config change before you could evaluate whether to make it.
+
+
+def test_fetch_refuses_a_malformed_product_id_because_that_is_always_a_typo(
+    tmp_path, valid_config_path, monkeypatch
+):
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "fetch", "--check", "--products", "XLM-28AUG26-CDE"],
+    )
+
+    assert result.exit_code != 0
+    assert "XLM-28AUG26-CDE" in result.output
+    assert "not a spot product id" in result.output
+
+
+def test_fetch_WARNS_on_a_cross_settled_pair_and_proceeds(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The history has to be fetchable before the screen can say anything about the asset.
+
+    `BTC-EUR` is a real Coinbase spot pair. Rail 18 vetoes an ORDER for it under the shipped
+    settlement set -- which is why the warning is loud -- but `fetch` writes candles, and
+    refusing to cache them makes `settlement_currencies` a decision the operator has to take
+    before they can gather the evidence for it.
+    """
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "fetch", "--check", "--products", "BTC-EUR"],
+    )
+
+    assert "BTC-EUR" in result.output
+    assert "settles in EUR" in result.output
+    assert "MISSING" in result.output, "it must actually go on to assess the product"
+    # `--check` exits non-zero on a missing series, which is the assessment, not the refusal.
+    assert "Invalid value for --products" not in result.output
+
+
+def test_fetch_reports_a_shape_error_even_when_a_settlement_warning_rides_along(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """One fatal id in the list still stops the run, and the warning-worthy one is not what
+    decides that -- otherwise the two kinds would have to be typed in separate invocations."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "fetch", "--check", "--products", "BTC-EUR,XLM-28AUG26-CDE"],
+    )
+
+    assert result.exit_code != 0
+    assert "XLM-28AUG26-CDE" in result.output
