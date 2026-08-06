@@ -26,7 +26,7 @@ import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
-from keel_core.telemetry import log_exception
+from keel_core.telemetry import log_exception, log_venue_failure
 
 from keel.types import Candle, Granularity, Side
 
@@ -193,11 +193,17 @@ class CoinbaseClient:
         return out
 
     def get_accounts(self) -> list[dict]:
-        """Return authenticated account balances, keyed by currency."""
+        """Return authenticated account balances, keyed by currency.
+
+        Logged through `log_venue_failure`, not `log_exception`: this is polled on a cadence by
+        the TUI's balance refresh, so an unreachable venue would otherwise write a full
+        traceback every 30s for as long as the machine is offline. Always re-raises, unchanged
+        -- severity is a logging concern and rail 13 fails closed on the exception itself.
+        """
         try:
             response = self._transport.get_accounts()
         except Exception:
-            log_exception(logger, "cb_client.accounts_fetch_failed")
+            log_venue_failure(logger, "cb_client.accounts_fetch_failed")
             raise
         raw_accounts = _field(response, "accounts", []) or []
         accounts = []
