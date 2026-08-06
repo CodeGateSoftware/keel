@@ -27,12 +27,53 @@
 # may not still be there tomorrow. In that mode this is a detector + reminder, not the thing that
 # trades.
 #
-# EXACTLY ONCE PER CALENDAR DAY, and it CATCHES UP -- same day-stamp scheme as
-# paperforward-run.sh, for the same reason: launchd re-runs a missed StartCalendarInterval on
-# wake from SLEEP but NOT when the trigger passed while the machine was powered OFF, so a
-# shutdown over 09:05 silently skipped the detector for the day (observed 2026-07-28). The plist
-# now fires hourly and on load; the stamp keeps that to one cycle. Detecting twice would be
-# harmless in itself, but it would notify twice for the same breakout.
+# EXACTLY ONCE PER **UTC** DAY, and it CATCHES UP.
+#
+# READ THIS BEFORE TOUCHING THE STAMP. The day-stamp below is a CORRECTNESS mechanism, not
+# notification hygiene. It is the ONLY thing that stops the live money path entering the same
+# daily signal twice, because NOTHING DOWNSTREAM DEDUPES AN ENTRY:
+#   * `get_open_positions` gates exits, reconciliation and status -- never entry;
+#   * the `signals` table is written but never read back;
+#   * `client_order_id` is a fresh uuid4 on every call, so the exchange cannot dedupe either;
+#   * the rails in execution/guards.py are DOLLAR CAPS, not per-day counters -- a second entry
+#     inside the caps passes every one of them.
+# The PAPER path does gate (strategy/paper.py refuses a second entry while the product is already
+# open). The LIVE path does not. So two cycles in one UTC day = two entries off one daily bar.
+# This header previously described the stamp as merely avoiding a duplicate notification. That
+# was wrong, and it made the stamp look optional. It is not. tests/test_schedule.py and the
+# characterization tests in tests/test_agent.py pin the consequences; read them before editing.
+#
+# COROLLARY, and it is not theoretical: a manual `keel agent` run BYPASSES this script entirely
+# and therefore bypasses the stamp. Running the agent by hand on a day the detector has already
+# run can place a SECOND entry for the same breakout. If you want to re-run a cycle by hand, know
+# that going in.
+#
+# WHY UTC, AND WHY 01:00. Daily candles close at 00:00 UTC, but turtle_breakout._completed_days
+# withholds the just-closed daily bar until the 00:00-01:00 UTC HOURLY bar has closed (that guard
+# stops the account simulator consuming a still-forming day; see its docstring). So 01:00 UTC is
+# the earliest instant a cycle sees fresh data -- hence SCHED_HOUR=1, on the UTC clock. This used
+# to gate and stamp on the LOCAL date at 09:00, i.e. 13:00/14:00 UTC, roughly twelve hours of
+# avoidable lag on every breakout.
+#
+# THE INVARIANT. For any UTC date X the newest VISIBLE daily bar is constant -- it is X-1 --
+# across the whole eligible window [01:00 UTC, 24:00 UTC). So whichever eligible trigger fires
+# first on UTC date X evaluates bar X-1 and stamps X, and every later trigger that UTC day is a
+# no-op: every daily bar evaluated exactly once, no missed day and no double day. That only holds
+# because the stamp and the gate are on the SAME clock. A LOCAL date straddles two UTC dates, so
+# the old gate could run twice within one UTC day on the catch-up path (machine off until late in
+# the local day) -- see tests/test_schedule.py.
+#
+# CATCH-UP. launchd re-runs a missed StartCalendarInterval on wake from SLEEP but NOT when the
+# trigger passed while the machine was powered OFF, so a shutdown over the scheduled hour silently
+# skipped the detector for the day (observed 2026-07-28). The plist therefore fires every hour and
+# on load; the stamp keeps that to one cycle. The trigger count is catch-up BREADTH, not cadence,
+# and the window is now 23h rather than 12h.
+#
+# NOTE: paperforward-run.sh used to share this scheme verbatim and no longer does -- it is still
+# LOCAL-anchored at SCHED_HOUR=9. That is a deliberate non-change, not an oversight: the paper
+# path already refuses a second entry while a product is open (strategy/paper.py), so a duplicate
+# cycle there is inert, and it is not worth touching a runner that places nothing real. Do not
+# assume the two scripts still match.
 #
 # The stamp is written only after keel EXITS CLEAN, so a failed cycle is retried on the next
 # trigger instead of being recorded as done -- and a detector that failed must not look like a
@@ -49,23 +90,27 @@ DB="keel-live.db"
 OUTLOG="$DIR/logs/keel-live.out.log"
 PENDLOG="$DIR/logs/keel-live.pending.log"
 STAMP="$DIR/logs/.keel-live-last-run"
-SCHED_HOUR=9
+# UTC hour at or after which a cycle is allowed: 01:00 UTC is the instant _completed_days stops
+# withholding the daily bar that closed at 00:00 UTC. See the header. This is a UTC hour, and it
+# is only meaningful because TODAY below is a UTC date too -- change one and you must change both.
+SCHED_HOUR=1
 
 cd "$DIR" || exit 1
 
-TODAY="$(date '+%Y-%m-%d')"
+TODAY="$(date -u '+%Y-%m-%d')"
 # 10# forces base 10: `date +%H` yields 08/09, which arithmetic would otherwise read as octal.
-HOUR="$((10#$(date '+%H')))"
+HOUR="$((10#$(date -u '+%H')))"
 STAMPED="$(cat "$STAMP" 2>/dev/null || true)"
 
 if [ "$STAMPED" = "$TODAY" ]; then
-  printf '%s [keel-live] detector already ran today -- skipping\n' "$(date '+%Y-%m-%d %H:%M')"
+  printf '%s [keel-live] detector already ran this UTC day (%s) -- skipping\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$TODAY"
   exit 0
 fi
 
 if [ "$HOUR" -lt "$SCHED_HOUR" ]; then
-  printf '%s [keel-live] before %02d:00 -- leaving today to the scheduled run\n' \
-    "$(date '+%Y-%m-%d %H:%M')" "$SCHED_HOUR"
+  printf '%s [keel-live] before %02d:00 UTC -- the fresh daily bar is not visible yet\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$SCHED_HOUR"
   exit 0
 fi
 
@@ -89,11 +134,12 @@ if [ "${SIGNALS}" -gt 0 ]; then
   printf '%s [keel-live] %s\n' "$(date '+%Y-%m-%d %H:%M')" "${MSG}" >> "$PENDLOG"
 fi
 
-# Only a clean cycle counts as "today is done"; anything else leaves the day open for a retry.
+# Only a clean cycle counts as "this UTC day is done"; anything else leaves the day open for one
+# of the remaining hourly triggers to retry.
 if [ "$STATUS" -eq 0 ]; then
   printf '%s\n' "$TODAY" > "$STAMP"
 else
   printf '%s [keel-live] cycle exited %d -- not stamping, will retry\n' \
-    "$(date '+%Y-%m-%d %H:%M')" "$STATUS" >> "$OUTLOG"
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STATUS" >> "$OUTLOG"
 fi
 exit "$STATUS"

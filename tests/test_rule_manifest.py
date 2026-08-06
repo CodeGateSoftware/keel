@@ -10,7 +10,9 @@ opt-in.
 from __future__ import annotations
 
 import json
+import re
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -141,4 +143,22 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     assert len(rebuilt) == len(json.loads(committed.read_text())["rules"])
     dca = [r for r in rebuilt if r["kind"] == "dca"]
     assert len(dca) == 1, "the live DCA rule is missing from the manifest"
-    assert dca[0]["params"]["budget_usd"] == "25", "DCA budget must not revert to the default 50"
+
+    # This used to pin the rule's budget at "25" with the rationale "must not revert to the
+    # default 50". That rationale was backwards, because the number it protected was never the
+    # number being spent: the live executor sizes DCA from `config.dca.budget_usd`
+    # (`execution/executor.py::_build_intent`) and ignores the RULE's `budget_usd` entirely. So
+    # the rule row said 25, the config said 50, and 50 was what moved. The rule's value is read
+    # only by the account simulator, which means the divergence also made the sim model a
+    # position size the live path would never take.
+    #
+    # 50 is the intended budget, so all three now agree, and the assertion checks the AGREEMENT
+    # rather than a literal -- a hardcoded number here would just re-create the drift it is
+    # supposed to catch, one deploy later.
+    live_config = REPO_ROOT / "config.live-sandbox.yaml"
+    configured = re.search(r"^dca:\n(?:.*\n)*?  budget_usd: (\S+)$", live_config.read_text(), re.M)
+    assert configured is not None, "config.live-sandbox.yaml no longer declares dca.budget_usd"
+    assert Decimal(dca[0]["params"]["budget_usd"]) == Decimal(configured.group(1)), (
+        "the live DCA rule's budget_usd must match config.dca.budget_usd, which is the value the "
+        "executor actually spends -- if they diverge, the simulator and the live path disagree"
+    )

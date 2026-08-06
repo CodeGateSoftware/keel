@@ -5,25 +5,50 @@
     <key>Label</key>
     <string>com.keel.live</string>
 
-    <!-- Daily SUPERVISED-LIVE cycle on the real money path. Runs one HEADLESS cycle to check
+    <!-- NOTE ON COMMENT STYLE. The rest of this repo separates asides with a double hyphen. XML
+         forbids a double hyphen inside a comment, and while Apple's CoreFoundation parser is
+         lenient enough to accept one (plutil -lint says OK), a strict parser such as expat does
+         not, which makes the file unreadable to ordinary XML tooling and to the tests that assert
+         on the schedule below. So this one file uses other punctuation. Do not "fix" it back.
+
+         DAILY SUPERVISED-LIVE cycle on the real money path. Runs one HEADLESS cycle to check
          whether a Turtle breakout fired. Whether it PLACES the resulting order or merely notifies
          depends on the AUTONOMY flag on the profile row, read fresh from the database each cycle
-         (see keel-live-run.sh's header) -- with autonomy ON it places, unattended. Scheduled at
-         09:05 local -- just after the 09:00 paper-forward, so both see the fresh daily bar.
+         (see keel-live-run.sh's header); with autonomy ON it places, unattended.
 
-         Fires hourly at :05 through 20:05, plus on load (= login/boot), because launchd re-runs a
-         missed calendar interval on wake from SLEEP but NOT when the trigger passed while the
-         machine was powered OFF -- so a shutdown over 09:05 lost the detector for the day
-         (observed 2026-07-28: booted 09:24, `launchctl print` reported runs = 0). ONCE PER DAY is
-         enforced by keel-live-run.sh's day-stamp, not by the trigger count: the first run at or
-         after 09:00 with no stamp for today does the cycle, later ones are no-ops, and a FAILED
-         cycle leaves no stamp so the next hour retries it.
+         ANCHORED TO UTC, NOT TO LOCAL TIME. Daily candles close at 00:00 UTC, but
+         turtle_breakout._completed_days withholds the just-closed daily bar until the 00:00 to
+         01:00 UTC HOURLY bar has closed, so 01:00 UTC is the earliest instant at which a cycle
+         sees fresh data. keel-live-run.sh gates on UTC hour >= 1 and stamps the UTC date. This
+         used to sit at 09:05 LOCAL, i.e. 13:05/14:05 UTC, which cost roughly twelve hours of
+         avoidable lag on every breakout for no benefit whatsoever.
 
-         This changes cadence only -- it does not change whether a cycle can place an order, which
-         is autonomy's job alone. This comment used to say "the detector still places nothing:
-         confirm mode fails closed with no TTY", which held only with autonomy OFF while the
-         deployment has run with it ON. Do not restore that wording without checking the profile
-         row first. -->
+         WHY :20 AND NOT :00. Twenty minutes of margin for Coinbase to publish the 00:00 to 01:00
+         UTC hourly candle and for data.market_feed to persist it. That candle is the thing that
+         releases the fresh daily bar; a trigger at exactly 01:00 UTC would race the very bar it
+         exists to consume. The trigger nearest the boundary is 01:20 UTC.
+
+         WHY 24 TRIGGERS. The count is CATCH-UP BREADTH, not cadence. launchd re-runs a missed
+         StartCalendarInterval on wake from SLEEP but NOT when the trigger passed while the
+         machine was powered OFF, so a shutdown over the scheduled hour silently lost the detector
+         for the day (observed 2026-07-28: booted 09:24, `launchctl print` reported runs = 0). The
+         only defence is another trigger later, so there is one every hour; the catch-up window is
+         now 23 hours rather than 12. Since these are local hours and the gate is on UTC, every
+         UTC date gets a trigger in every UTC hour, so an eligible one always exists, including
+         across both DST transitions.
+
+         ONCE PER UTC DAY is enforced by keel-live-run.sh's day-stamp, NOT by the trigger count.
+         For any UTC date X the newest visible daily bar is constant (it is X-1) across the whole
+         eligible window, so whichever eligible trigger fires first evaluates bar X-1 and stamps
+         X; later triggers that UTC day are no-ops, and a FAILED cycle leaves no stamp so the next
+         hour retries it. That stamp is a CORRECTNESS mechanism: nothing on the live path dedupes
+         an entry, so two cycles in one UTC day means two entries off one daily bar. See
+         tests/test_schedule.py, which pins all of this.
+
+         This changes WHEN a cycle runs, never whether it may place an order, which is autonomy's
+         job alone. This comment used to say "the detector still places nothing: confirm mode
+         fails closed with no TTY", which held only with autonomy OFF while the deployment has run
+         with it ON. Do not restore that wording without checking the profile row first. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
@@ -32,22 +57,35 @@
 
     <key>StartCalendarInterval</key>
     <array>
-        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>20</integer></dict>
     </array>
 
-    <!-- Run on load, so a boot after the 09:05 trigger catches the day up immediately. The
-         runner's day-stamp makes a repeated load harmless. -->
+    <!-- Run on load, so a boot that lands between triggers catches the UTC day up immediately
+         instead of waiting up to an hour. The runner's day-stamp makes a repeated load
+         harmless. -->
     <key>RunAtLoad</key>
     <true/>
 

@@ -6,8 +6,10 @@ the rule set -- but a FRESH deployment gets `keel init`, which seeds every rule 
 using each rule kind's CONSTRUCTOR DEFAULTS. Any parameter an operator tuned by hand is silently
 replaced by the default: a DCA rule deliberately set to `budget_usd: 25` comes back as the
 built-in `50`, at `candidate`, on a box that otherwise looks correctly provisioned. Nothing
-errors. This module makes that state an artifact you can diff in a PR instead of a fact that
-lives only on one laptop.
+errors. (That is a worked example rather than a description of today's deployment -- the live DCA
+rule is now `50` on purpose, matching the constructor default and `config.dca.budget_usd`, which
+is the value the live executor actually spends.) This module makes that state an artifact you can
+diff in a PR instead of a fact that lives only on one laptop.
 
 **`export`** writes the manifest. It is the source of truth's snapshot, not the source of truth:
 re-run it and commit the diff whenever the live rule set changes deliberately.
