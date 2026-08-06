@@ -72,7 +72,11 @@ A **fresh deployment** does not. `keel init` seeds every rule at `candidate` fro
 deliberately set to `budget_usd: 25` comes back as the built-in `50`, unpromoted, on a box that
 otherwise looks correctly provisioned. Nothing errors. (A worked example, not a description of
 today's deployment: the live DCA rule is now `50`, deliberately matching both the constructor
-default and `config.dca.budget_usd`, which is the value the live executor actually spends.)
+default and `config.dca.budget_usd`, which is the value the live executor actually spends. That
+coincidence means the value alone can no longer prove the rule wasn't reseeded — `keel init`'s
+default and the operator's intended value are now the same number. `test_committed_manifest_is_valid`
+in `tests/test_rule_manifest.py` covers the gap by also asserting every committed rule's *status*
+is `live`, since `keel init` always seeds at `candidate` regardless of what the params say.)
 
 `deploy/live-rules.json` is the committed record of the live deployment's rule set, so that state
 is a diff in a PR rather than a fact stored on one laptop:
