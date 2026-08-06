@@ -45,6 +45,14 @@
          an entry, so two cycles in one UTC day means two entries off one daily bar. See
          tests/test_schedule.py, which pins all of this.
 
+         "NO MISSED DAY" IS CONDITIONAL, NOT UNCONDITIONAL: it holds only if the machine is
+         powered ON for at least one eligible trigger during that UTC day. launchd does NOT
+         re-run a StartCalendarInterval that passed while the machine was OFF (see WHY 24
+         TRIGGERS above, which is the exact mechanism the 2026-07-28 incident exposed), so a
+         machine that is off from just after 01:00 UTC through the rest of a UTC date gets no
+         eligible trigger at all that day, and nothing catches it up; that UTC date is simply
+         skipped. Do not read "no missed day" as a guarantee independent of power.
+
          This changes WHEN a cycle runs, never whether it may place an order, which is autonomy's
          job alone. This comment used to say "the detector still places nothing: confirm mode
          fails closed with no TTY", which held only with autonomy OFF while the deployment has run
