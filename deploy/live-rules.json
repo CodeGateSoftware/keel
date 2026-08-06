@@ -102,7 +102,7 @@
       "params": {
         "product_id": "BTC-USD",
         "cadence_days": 7,
-        "budget_usd": "25",
+        "budget_usd": "50",
         "dip_bonus_pct": "0",
         "lookback_days": 90
       }

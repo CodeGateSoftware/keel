@@ -32,6 +32,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution import executor
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
@@ -1821,3 +1822,216 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
     monkeypatch.setattr(repo, "held_products", lambda: ["BTC-EUR"])
     equity = agent._mark_to_market_equity(repo, EurOnly(), [], {}, "USD")
     assert equity == Decimal("500"), f"cash for a held product's quote leg was missed: {equity!r}"
+
+
+# -- CHARACTERIZATION: same-UTC-day re-entry is NOT deduped on the live path -------------------
+#
+# These two tests are deliberately NOT regression tests for a bug fix -- they PIN a hazard that
+# exists today in the live path, on purpose, so it cannot regress into "nobody noticed it was
+# there" without a test going red.
+#
+# The only thing that stops `keel-live-run.sh` from driving `agent.run_once` twice for the same
+# signal on the same day is the script's own day-stamp file (`$DIR/logs/.keel-live-last-run`,
+# written only after a clean exit -- see the file's own header, "EXACTLY ONCE PER CALENDAR DAY").
+# That stamp lives entirely OUTSIDE `run_once`/`executor.execute`/`guards.check`: nothing in this
+# module, or in anything it calls, remembers "we already entered this product today" and refuses
+# a second attempt. Concretely (verified by reading, not assumed):
+#   * `Repository.get_open_positions` is read by the EXIT/reconcile/status paths, never by the
+#     ENTER path -- an ENTER never asks "is one already open?".
+#   * `strategy.engine.evaluate` writes to the `signals` table (`_persist_signal`) but nothing
+#     ever reads it back to suppress a repeat; it is an audit log, not a dedupe key.
+#   * `executor._build_intent` mints a fresh `uuid4()` `client_order_id` every call, so Coinbase's
+#     own idempotency-key protection (which would catch an exact retry) never engages either --
+#     each cycle looks like a brand-new, unrelated order to the exchange.
+#   * `execution/guards.py`'s eighteen-and-counting rails are all DOLLAR caps
+#     (`max_per_order_usd`/`max_per_day_usd`/`max_exposure_usd`/`max_per_asset_pct`) or account
+#     state (drawdown, streak, balance) -- there is no "N entries per product per day" rail.
+#
+# So: delete or weaken the runner's day-stamp (or run two DIFFERENT trigger paths against the
+# same DB the same day -- e.g. a wake-from-sleep replay racing a manual `keel agent` invocation),
+# and the live path happily takes the same signal twice. These two tests drive `agent.run_once`
+# directly, twice, with two `now_ts` values inside one UTC calendar day -- exactly what the
+# runner's stamp exists to collapse into one -- and assert the DUPLICATE actually happens.
+#
+# If someone later adds a real live-side entry dedupe (an actual per-day-per-product guard,
+# not just the shell script's stamp), these two tests SHOULD start failing. That failure is the
+# signal to REWRITE them to assert a single entry, not to delete them: until that rail exists,
+# this is the only thing in the test suite that would notice its absence.
+
+
+def test_two_cycles_in_one_utc_day_place_two_dca_orders(repo):
+    """CHARACTERIZATION, not a spec: pins the DCA half of the live day-stamp hazard described
+    in the section header above. See that comment for the full mechanism.
+
+    Template: `test_run_once_polls_evaluates_and_executes_a_real_dca_rule` (single day-0 daily
+    candle, `Dca`'s cadence-boundary fixture -- `latest.ts // 86_400 % cadence_days == 0` with
+    `cadence_days=7`, and `0 % 7 == 0`). `market_feed._latest_closed_ts(now_ts, 86_400)` resolves
+    to that same day-0 candle for ANY `now_ts` inside calendar day 1 (`[86_400, 172_800)`), so
+    both cycles below evaluate the identical `Setup` off the identical candle -- the rule does
+    not "know" it already fired.
+
+    `EARLY`/`LATE` model the runner's own two-trigger-in-one-day shape (an hourly-launchd
+    detector re-armed after a missed day-stamp -- see `keel-live-run.sh`'s header): `EARLY` is
+    the first cycle of day 1, `LATE` is a much later cycle the SAME day. `LATE` is kept inside
+    rail 12's staleness window (`config.auto_trade.interval_sec(50_000) * FEED_STALENESS_CYCLES
+    (3) = 150_000` seconds past the day-0 candle) so the second cycle still finds the feed fresh
+    and reaches the rule at all -- a stale-feed skip would prove nothing about this hazard.
+    """
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+    config = _config()
+
+    EARLY = 90_000  # 1h into day 1 -- the day's first cycle.
+    LATE = 140_000  # ~14h40m later, same UTC day (still < the 150_000s staleness ceiling).
+
+    first = run_once(broker, repo, config, now_ts=EARLY)
+    second = run_once(broker, repo, config, now_ts=LATE)
+
+    # The hazard, stated as an assertion: BOTH cycles place. A real dedupe would make the second
+    # `placed is False` (or the signal never fire at all); today it does not.
+    assert first.enter_results[0].placed is True
+    assert second.enter_results[0].placed is True
+
+    orders = repo.get_orders(mode="live", product_id=PRODUCT)
+    assert len(orders) == 2, (
+        "expected the SAME dca signal to place twice in one UTC day -- if this is 1, a dedupe "
+        "now exists and this test must be REWRITTEN (not deleted) to assert that instead"
+    )
+    assert all(o["side"] == "BUY" for o in orders)
+
+
+def test_two_cycles_in_one_utc_day_reenter_the_same_turtle_breakout(repo, monkeypatch):
+    """CHARACTERIZATION, not a spec: pins the risk-defined-rule half of the same hazard (see the
+    section header above for the full mechanism) -- this time with a rule that opens a bracketed
+    position, not a no-stop DCA buy, so it also exercises `executor.place_bracket` twice.
+
+    Candle series: `tests/strategy/test_turtle_breakout.py`'s own `_trending_base` (a smooth,
+    strictly monotonic rise) is enough to fire `TurtleBreakout.detect()` directly, as that
+    module's tests do -- but `strategy.engine.evaluate` ALSO gates on
+    `analysis.regime.detect_condition`, which classifies structure from swing PIVOTS (local
+    highs/lows with a neighbor on each side). A strictly monotonic series has no interior pivot
+    at all, so `detect_condition` reads it as CHOPPY and `engine.evaluate` discards the signal
+    before `executor.execute` is ever reached -- verified directly against this module's own
+    `_trending_base(20)` + breakout bar. So this reuses the OTHER verified-BULLISH fixture next
+    door, `tests/strategy/test_engine.py::_uptrend_candles` (a real up-down-up zigzag with
+    higher highs and higher lows), plus one final bar that closes above the prior 5-day Donchian
+    high with a strongly trending ADX -- confirmed by direct script run to clear every gate:
+    `TurtleBreakout.detect()`'s own donchian/ADX gates, `engine.evaluate`'s choppy-regime gate,
+    and the kill-zone `rr>=1` floor (`rr` comes out at the rule's default `target_rr=6`).
+    `entry_lookback=5, exit_lookback=3, adx_period=5, atr_period=5` is `test_turtle_breakout.py`'s
+    own `_SMALL_PARAMS`, reused so `min_needed` (`max(lookbacks) + 2 == 7`) stays well under this
+    11-candle series.
+
+    Per the notes this test was written against: rail 8 (`no_averaging_into_losers`) does not
+    veto the second entry because `execute()` records `actual_fill = intent.entry`
+    (`executor.py`), so the average cost basis equals each entry's own setup price -- an
+    identical setup on the second cycle is not "averaging into a loser". Rail 9
+    (`no_stop_widening`) does not veto the second bracket because the setup (and therefore the
+    stop `place_bracket` writes to `open_stop:<product>`) is byte-for-byte identical between the
+    two cycles -- there is nothing to widen against. Both were verified by running this exact
+    scenario, not assumed.
+
+    `place_bracket` is a module-level function in `keel.execution.executor`, called by name from
+    `execute()` -- wrapping it (rather than replacing it) here counts calls while still letting
+    the real bracket placement run, so the SELL leg this asserts on on the repo side is genuine,
+    not simulated.
+    """
+    _DAY = 86_400
+    # `test_engine.py::_uptrend_candles`'s base prices -- verified `regime.detect_condition ==
+    # BULLISH` there. This module's own `_candle` helper builds a FLAT bar
+    # (open=high=low=close), which would erase the very swing structure `regime` needs, so the
+    # 0.5 high/low spread is rebuilt here instead of reusing `_candle`.
+    base_prices = [100, 105, 102, 108, 104, 112, 109, 118, 114, 124]
+    candles = [
+        Candle(
+            ts=i * _DAY,
+            open=Decimal(str(v)),
+            high=Decimal(str(v)) + Decimal("0.5"),
+            low=Decimal(str(v)) - Decimal("0.5"),
+            close=Decimal(str(v)),
+            volume=Decimal("1"),
+        )
+        for i, v in enumerate(base_prices)
+    ]
+    breakout_price = Decimal("140")  # clears the prior 5-day Donchian high with room to spare.
+    breakout_ts = len(base_prices) * _DAY
+    candles.append(
+        Candle(
+            ts=breakout_ts,
+            open=breakout_price - Decimal("0.5"),
+            high=breakout_price + Decimal("0.5"),
+            low=breakout_price - Decimal("0.5"),
+            close=breakout_price,
+            volume=Decimal("1"),
+        )
+    )
+    # `market_feed.poll_once` only ever fetches from `latest_closed` forward on a bare DB (its
+    # first-ever poll fetches a single day, not the lookback window `backfill` would have primed
+    # in production) -- seeding the repo directly is the honest way to give the rule its full
+    # history without also testing `poll_once`'s own resumability, which is `test_market_feed.py`'s
+    # job, not this test's.
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, candles)
+    repo.insert_rule(
+        "turtle_breakout",
+        {
+            "product_id": PRODUCT,
+            "entry_lookback": 5,
+            "exit_lookback": 3,
+            "adx_period": 5,
+            "atr_period": 5,
+        },
+        status="live",
+    )
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): candles})
+    config = _config()
+
+    # `market_feed._latest_closed_ts(now_ts, 86_400)` resolves to `breakout_ts` for any `now_ts`
+    # in calendar day 11 (`[11*86_400, 12*86_400)`) -- both cycles below land in that one day, so
+    # both evaluate the SAME breakout bar. `LATE` is kept inside rail 12's staleness window
+    # (`interval_sec(50_000) * FEED_STALENESS_CYCLES(3) = 150_000`s past `breakout_ts`) for the
+    # same reason as the DCA test above.
+    EARLY = breakout_ts + 90_000
+    LATE = breakout_ts + 136_000
+
+    real_place_bracket = executor.place_bracket
+    bracket_calls = {"n": 0}
+
+    def _spy_place_bracket(*args, **kwargs):
+        bracket_calls["n"] += 1
+        return real_place_bracket(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "place_bracket", _spy_place_bracket)
+
+    first = run_once(broker, repo, config, now_ts=EARLY)
+    second = run_once(broker, repo, config, now_ts=LATE)
+
+    # The hazard, stated as an assertion: the SAME breakout is entered twice, same day.
+    assert len(first.enter_results) == 1
+    assert len(second.enter_results) == 1
+    assert first.enter_results[0].placed is True
+    assert second.enter_results[0].placed is True
+
+    entry_orders = [
+        o for o in repo.get_orders(mode="live", product_id=PRODUCT) if o["side"] == "BUY"
+    ]
+    assert len(entry_orders) == 2, (
+        "expected the SAME turtle_breakout signal to enter twice in one UTC day -- if this is "
+        "1, a live-side entry dedupe now exists and this test must be REWRITTEN (not deleted) "
+        "to assert that instead"
+    )
+
+    assert bracket_calls["n"] == 2, (
+        "each of the two live entries should have opened its own exchange-side exit bracket "
+        "(rail 8/9 notes above explain why neither is vetoed) -- if this is 1, something started "
+        "deduping the bracket even though the entry itself still duplicated, which is a new and "
+        "different hazard worth its own test, not a fix for this one"
+    )
+    # Counting the CALLS is not enough on its own: `place_bracket` returns `None` when a rail
+    # vetoes, and a vetoed second bracket would leave a real position riding with no exchange-side
+    # stop while this test still went green. Asserting the returned ids proves the docstring's
+    # claim about rail 9 -- that an identical stop is not "widening" -- rather than assuming it.
+    assert first.enter_results[0].bracket_order_id is not None
+    assert second.enter_results[0].bracket_order_id is not None, (
+        "the second entry's bracket was vetoed -- the duplicate position is riding without an "
+        "exchange-side stop, which is strictly worse than the duplicate entry this test pins"
+    )

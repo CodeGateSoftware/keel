@@ -329,6 +329,16 @@ def _build_intent(
 
         is_dca = _is_dca_setup(setup.context)
         if is_dca:
+            # CAREFUL: the live path sizes DCA from the CONFIG's `dca.budget_usd`, and ignores
+            # the RULE's own `budget_usd` / the `size_usd` the rule computed from it (which is
+            # sitting right there in `setup.context`). That is deliberate -- the config is the
+            # operator-facing dial and a rule row is not reviewed on every deploy -- but it means
+            # the two can disagree silently, and a rule row saying 25 while the config says 50
+            # spends 50. It surprised us once; do not assume the rule's number is what moves.
+            # The account simulator (`sim/portfolio_sim.py`) prefers `context["size_usd"]` and
+            # only falls back to this config value, so a divergence also makes the sim and the
+            # live path model different position sizes. Keep rule, config and
+            # `deploy/live-rules.json` in agreement.
             qty = sizing.dca_size(config.dca.budget_usd, setup.entry)
             stop = None
         else:

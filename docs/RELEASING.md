@@ -70,7 +70,9 @@ are additive (`CREATE TABLE IF NOT EXISTS rules`) and `migrate` never seeds.
 A **fresh deployment** does not. `keel init` seeds every rule at `candidate` from each rule kind's
 **constructor defaults**, so any parameter an operator tuned by hand silently reverts — a DCA rule
 deliberately set to `budget_usd: 25` comes back as the built-in `50`, unpromoted, on a box that
-otherwise looks correctly provisioned. Nothing errors.
+otherwise looks correctly provisioned. Nothing errors. (A worked example, not a description of
+today's deployment: the live DCA rule is now `50`, deliberately matching both the constructor
+default and `config.dca.budget_usd`, which is the value the live executor actually spends.)
 
 `deploy/live-rules.json` is the committed record of the live deployment's rule set, so that state
 is a diff in a PR rather than a fact stored on one laptop:
