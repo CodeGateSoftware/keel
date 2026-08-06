@@ -1520,3 +1520,55 @@ def test_no_account_at_all_for_the_required_currency_fails_closed(repo):
     assert result.placed is False
     assert result.preview is None
     assert any("unknown/unavailable" in v for v in result.vetoed_by)
+
+
+# --- _fetch_available_quote failure severity ----------------------------------------------
+#
+# The second half of the 2026-08-06 log-noise pair: every `get_accounts` failure was logged
+# twice at ERROR with a full traceback -- once by `cb_client`, then again here. Rail 13 still
+# fails closed (`None`) either way; only the severity of the record changes.
+
+
+class _UnreachableBroker:
+    """A broker whose `get_accounts` raises as an offline HTTP stack does."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def get_accounts(self) -> list[dict]:
+        raise self._exc
+
+
+def _quote_failure_payload(caplog, exc: BaseException) -> tuple[Decimal | None, dict]:
+    from keel_core import telemetry
+
+    from keel.execution.executor import _fetch_available_quote
+
+    formatter = telemetry.JsonFormatter()
+    with caplog.at_level(logging.DEBUG, logger="keel.execution.executor"):
+        result = _fetch_available_quote(_UnreachableBroker(exc), "USD")
+    records = [r for r in caplog.records if r.getMessage() == "executor.quote_fetch_failed"]
+    assert len(records) == 1
+    return result, json.loads(formatter.format(records[0]))
+
+
+def test_quote_fetch_logs_an_unreachable_venue_as_a_warning(caplog) -> None:
+    exc = type("ConnectionError", (Exception,), {})("api.coinbase.com unreachable")
+
+    result, payload = _quote_failure_payload(caplog, exc)
+
+    assert result is None  # rail 13 still fails closed
+    assert payload["level"] == "WARNING"
+    assert payload["unreachable"] is True
+    assert "exc" not in payload
+    assert payload["quote_currency"] == "USD"
+
+
+def test_quote_fetch_keeps_a_real_broker_error_at_error_with_its_traceback(caplog) -> None:
+    exc = type("HTTPError", (Exception,), {})("401 Client Error: Unauthorized")
+
+    result, payload = _quote_failure_payload(caplog, exc)
+
+    assert result is None
+    assert payload["level"] == "ERROR"
+    assert "Traceback" in payload["exc"]

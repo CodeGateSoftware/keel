@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import uuid
 from contextvars import ContextVar, Token
 from typing import Any
@@ -39,6 +40,34 @@ _FIELDS_ATTR = "keel_fields"
 # Stable payload keys written directly by `JsonFormatter.format`. A caller field with one of
 # these names is renamed (not dropped, not allowed to overwrite) -- see module docstring.
 _RESERVED = frozenset({"ts", "level", "logger", "event", "cycle_id", "exc"})
+
+# Exception type NAMES that mean "the venue was unreachable" rather than "something is wrong" --
+# see `is_venue_unreachable` for why this is a name match and not an `isinstance` check. Covers
+# the builtin socket errors plus the `requests`/`urllib3` wrappers a broker's HTTP stack raises.
+_UNREACHABLE_EXC_NAMES = frozenset(
+    {
+        "ConnectionError",  # builtin, and requests.exceptions.ConnectionError
+        "ConnectionResetError",
+        "ConnectionRefusedError",
+        "ConnectionAbortedError",
+        "TimeoutError",  # builtin, and requests.exceptions.Timeout's socket cause
+        "Timeout",
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "ProxyError",
+        "MaxRetryError",
+        "NewConnectionError",
+        "NameResolutionError",
+        "gaierror",  # socket.gaierror -- DNS not up yet after a wake
+    }
+)
+
+# Cap on the one-line `error` summary that replaces a traceback on the unreachable path. Long
+# enough to keep the host and the underlying cause `requests` nests into its message, short
+# enough that the event stays one readable line.
+_ERROR_SUMMARY_MAX_CHARS = 200
 
 
 def new_cycle_id() -> str:
@@ -112,6 +141,61 @@ def log_exception(logger: logging.Logger, event: str, /, **fields: Any) -> None:
     which `JsonFormatter` renders into the payload's `exc` key.
     """
     logger.log(logging.ERROR, event, exc_info=True, extra={_FIELDS_ATTR: fields})
+
+
+def is_venue_unreachable(exc: BaseException | None) -> bool:
+    """True when `exc` means "could not reach the venue", not "something is wrong".
+
+    Matched on the exception type's NAME, walked over the `__cause__`/`__context__` chain,
+    because `requests` wraps the underlying socket/DNS error and the outermost type is not
+    always the signal. Matching by name (rather than importing `requests`/`urllib3` and using
+    `isinstance`) keeps `keel-core` free of an HTTP dependency it otherwise does not need, and
+    keeps the classification working for any broker adapter's HTTP stack.
+
+    `SSLError` is deliberately absent: a failed TLS handshake can mean interception or a bad
+    certificate, which an operator must see at ERROR rather than have filed as "wifi is down".
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ in _UNREACHABLE_EXC_NAMES:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def log_venue_failure(logger: logging.Logger, event: str, /, **fields: Any) -> bool:
+    """Emit a broker-call failure at a severity that matches what it actually cost. Returns
+    whether the active exception was classified unreachable.
+
+    Use inside an `except` block, in place of `log_exception`, for any call that crosses the
+    network to a venue.
+
+    - **Unreachable, outside a trade cycle** (a dashboard's balance refresh while the laptop is
+      asleep) -> WARNING, one line, no traceback. Nothing was lost; the caller already fails
+      soft. This is the case that motivated the helper: a 35-minute offline window on
+      2026-08-06 wrote 60 twenty-frame ERROR tracebacks through `get_accounts`, around a single
+      real `401 Unauthorized` that no operator would ever have spotted in the noise.
+    - **Unreachable, inside a trade cycle** (`cycle_id` bound) -> ERROR. Here it did cost
+      something: rail 13 fails closed on a missing balance, so an order did not go out. Still
+      no traceback -- the cause is known and the frames say nothing the summary does not.
+    - **Anything else** (auth, malformed response, a bug) -> ERROR with the full traceback,
+      byte-for-byte what `log_exception` would have emitted.
+
+    The unreachable paths add `unreachable=True` and a truncated `error` summary. Caller fields
+    win over both, on the same principle as `log_event`: a logging call must never raise.
+    """
+    exc = sys.exc_info()[1]
+    if not is_venue_unreachable(exc):
+        log_exception(logger, event, **fields)
+        return False
+
+    level = logging.ERROR if _cycle_id.get() is not None else logging.WARNING
+    summary = f"{type(exc).__name__}: {exc}"
+    if len(summary) > _ERROR_SUMMARY_MAX_CHARS:
+        summary = summary[:_ERROR_SUMMARY_MAX_CHARS] + "..."
+    log_event(logger, level, event, **{"unreachable": True, "error": summary, **fields})
+    return True
 
 
 class JsonFormatter(logging.Formatter):

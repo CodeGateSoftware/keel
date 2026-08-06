@@ -8,9 +8,13 @@ canned, real-shaped JSON loaded from `tests/fixtures/cb_*.json`. No live network
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+import pytest
+from keel_core import telemetry
 
 from keel.data.cb_client import CoinbaseClient
 from keel.types import Candle, Granularity, Side
@@ -532,3 +536,61 @@ def test_cancel_order_returns_false_on_an_empty_result_set():
     client = CoinbaseClient(FakeTransport(cancel={"results": []}))
 
     assert client.cancel_order("abc") is False
+
+
+# --- get_accounts failure severity --------------------------------------------------------
+#
+# `get_accounts` is polled every 30s by the TUI's balance refresh. An offline laptop must not
+# write a 20-frame ERROR traceback per poll -- that is what buried a real `401 Unauthorized`
+# among 60 connection failures on 2026-08-06. It must still RAISE either way: severity is a
+# logging concern, and callers (rail 13 among them) depend on the exception.
+
+
+class _RaisingTransport:
+    """A transport whose `get_accounts` raises whatever it was handed."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def get_accounts(self, **kwargs: Any) -> dict:
+        raise self._exc
+
+
+def _accounts_failure_payload(caplog, exc: BaseException) -> dict:
+    formatter = telemetry.JsonFormatter()
+    client = CoinbaseClient(_RaisingTransport(exc))
+    with caplog.at_level(logging.DEBUG, logger="keel.data.cb_client"):
+        with pytest.raises(type(exc)):
+            client.get_accounts()
+    records = [r for r in caplog.records if r.getMessage() == "cb_client.accounts_fetch_failed"]
+    assert len(records) == 1
+    return json.loads(formatter.format(records[0]))
+
+
+def test_get_accounts_logs_an_unreachable_venue_as_a_warning(caplog) -> None:
+    exc = type("ConnectionError", (Exception,), {})("api.coinbase.com unreachable")
+
+    payload = _accounts_failure_payload(caplog, exc)
+
+    assert payload["level"] == "WARNING"
+    assert payload["unreachable"] is True
+    assert "exc" not in payload
+
+
+def test_get_accounts_still_logs_a_401_as_an_error_with_its_traceback(caplog) -> None:
+    exc = type("HTTPError", (Exception,), {})("401 Client Error: Unauthorized")
+
+    payload = _accounts_failure_payload(caplog, exc)
+
+    assert payload["level"] == "ERROR"
+    assert "Traceback" in payload["exc"]
+
+
+def test_get_accounts_still_raises_when_the_venue_is_unreachable(caplog) -> None:
+    """Severity changed; control flow must not. Rail 13 fails closed on this exception."""
+    boom = type("ConnectionError", (Exception,), {})("unreachable")
+    client = CoinbaseClient(_RaisingTransport(boom))
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(type(boom)):
+            client.get_accounts()

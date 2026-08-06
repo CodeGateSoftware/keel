@@ -64,7 +64,7 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from keel_core.products import quote_currency_of
-from keel_core.telemetry import log_event, log_exception
+from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -281,7 +281,14 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     try:
         accounts = broker.get_accounts()
     except Exception:
-        log_exception(logger, "executor.quote_fetch_failed", quote_currency=quote_currency)
+        # `log_venue_failure`, not `log_exception`: an unreachable venue outside a trade cycle
+        # is a dashboard balance refresh on a sleeping laptop, and this line is the SECOND
+        # record for that one failure (`cb_client.get_accounts` logs it first) -- two full
+        # tracebacks per poll, every 30s, for as long as the machine is offline. Inside a cycle
+        # it escalates back to ERROR on its own: there it means rail 13 failed closed and an
+        # order did not go out. Kept as its own event rather than dropped because it carries
+        # `quote_currency`, and because a non-Coinbase broker may not log anything itself.
+        log_venue_failure(logger, "executor.quote_fetch_failed", quote_currency=quote_currency)
         return None
 
     for account in accounts or []:

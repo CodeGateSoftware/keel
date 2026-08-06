@@ -265,3 +265,114 @@ def test_unbind_venue_restores_the_outer_venue() -> None:
     finally:
         telemetry.unbind_venue(outer)
     assert telemetry.current_venue() is None
+
+
+# --- log_venue_failure --------------------------------------------------------------------
+#
+# A venue that cannot be reached (laptop asleep, wifi down, DNS not up yet after wake) is an
+# expected condition already handled by every caller, not a defect. Logging it at ERROR with a
+# 20-frame traceback on every poll buries the failures that DO mean something -- one offline
+# window on 2026-08-06 wrote 60 tracebacks around a single real `401 Unauthorized`.
+
+
+# Stand-ins for `requests.exceptions.*`. `log_venue_failure` matches on `type(exc).__name__`
+# precisely so `keel-core` need not depend on `requests`/`urllib3` to classify their exceptions --
+# which means a class of the same name is a faithful fake here.
+ConnectionErrorLike = type("ConnectionError", (Exception,), {})
+ConnectTimeoutLike = type("ConnectTimeout", (Exception,), {})
+HTTPErrorLike = type("HTTPError", (Exception,), {})
+
+
+def _capture_raising(caplog, exc: BaseException, **fields) -> dict:
+    """Run `log_venue_failure` inside a real `except` block and return the JSON payload."""
+    formatter = telemetry.JsonFormatter()
+    with caplog.at_level(logging.DEBUG, logger="keel.test"):
+        try:
+            raise exc
+        except BaseException:
+            telemetry.log_venue_failure(
+                logging.getLogger("keel.test"), "cb_client.accounts_fetch_failed", **fields
+            )
+    assert len(caplog.records) == 1
+    return json.loads(formatter.format(caplog.records[0]))
+
+
+def test_unreachable_venue_is_a_warning_not_an_error(caplog) -> None:
+    payload = _capture_raising(caplog, ConnectionErrorLike("api.coinbase.com unreachable"))
+
+    assert payload["level"] == "WARNING"
+    assert payload["event"] == "cb_client.accounts_fetch_failed"
+    assert payload["unreachable"] is True
+
+
+def test_unreachable_venue_carries_a_summary_instead_of_a_traceback(caplog) -> None:
+    """The operator still learns what happened -- in one line, not twenty frames."""
+    payload = _capture_raising(caplog, ConnectionErrorLike("api.coinbase.com unreachable"))
+
+    assert "exc" not in payload
+    assert payload["error"] == "ConnectionError: api.coinbase.com unreachable"
+
+
+def test_a_long_unreachable_message_is_truncated_to_stay_one_line(caplog) -> None:
+    payload = _capture_raising(caplog, ConnectionErrorLike("x" * 5_000))
+
+    assert len(payload["error"]) <= 220
+    assert payload["error"].endswith("...")
+
+
+def test_a_timeout_is_also_unreachable(caplog) -> None:
+    payload = _capture_raising(caplog, ConnectTimeoutLike("timed out"))
+
+    assert payload["level"] == "WARNING"
+    assert payload["unreachable"] is True
+
+
+def test_a_real_error_keeps_its_traceback_at_error(caplog) -> None:
+    """The 401 that the 60 tracebacks were burying. This must NOT be downgraded."""
+    payload = _capture_raising(caplog, HTTPErrorLike("401 Client Error: Unauthorized"))
+
+    assert payload["level"] == "ERROR"
+    assert "exc" in payload
+    assert "Traceback" in payload["exc"]
+    assert "unreachable" not in payload
+
+
+def test_unreachable_is_detected_through_the_cause_chain(caplog) -> None:
+    """`requests` wraps the socket error, so the outermost type is not always the signal."""
+    cause = ConnectionErrorLike("failed to resolve api.coinbase.com")
+    wrapper = RuntimeError("balance read failed")
+    wrapper.__cause__ = cause
+
+    payload = _capture_raising(caplog, wrapper)
+
+    assert payload["level"] == "WARNING"
+    assert payload["unreachable"] is True
+
+
+def test_unreachable_during_a_trade_cycle_stays_an_error(caplog) -> None:
+    """Outside a cycle this is a dashboard refresh missing a balance -- cosmetic. INSIDE one it
+    blocked real work (rail 13 fails closed and the order does not go out), so it keeps ERROR."""
+    token = telemetry.bind_cycle("cycle-abc")
+    try:
+        payload = _capture_raising(caplog, ConnectionErrorLike("unreachable"))
+    finally:
+        telemetry.unbind_cycle(token)
+
+    assert payload["level"] == "ERROR"
+    assert payload["unreachable"] is True
+    assert "exc" not in payload  # still no traceback -- the cause is known and uninteresting
+
+
+def test_caller_fields_survive_on_the_warning_path(caplog) -> None:
+    payload = _capture_raising(
+        caplog, ConnectionErrorLike("unreachable"), quote_currency="USD"
+    )
+
+    assert payload["quote_currency"] == "USD"
+
+
+def test_a_caller_field_wins_over_the_generated_one(caplog) -> None:
+    """A logging call must never raise on a duplicate keyword."""
+    payload = _capture_raising(caplog, ConnectionErrorLike("unreachable"), error="mine")
+
+    assert payload["error"] == "mine"
