@@ -331,21 +331,40 @@ def _triggers(
 def _run_gate(
     triggers: list[tuple[datetime, datetime]], sched_hour: int, *, utc_anchored: bool
 ) -> list[datetime]:
-    """Replay `keel-live-run.sh`'s two guards over `triggers`; return the UTC instants that RAN.
+    """Replay `keel-live-run.sh`'s two guards over `triggers`; return the UTC instants that RAN a
+    cycle (i.e. invoked keel) -- NOT whether the script exited 0, 67, or anything else; see the
+    note below on why that distinction is deliberately outside what this model represents.
 
-    The shell, in Python, as of the hardened script:
+    The shell's gate, in Python, as of the hardened script:
 
-        if [ -n "$STAMPED" ] && ! [[ "$STAMPED" < "$TODAY" ]]; then exit 0; fi  # already ran/behind
-        if [ "$HOUR" -lt "$SCHED_HOUR" ]; then exit 0; fi  # too early in the day
+        if [ -n "$STAMPED" ] && [[ "$STAMPED" > "$TODAY" ]]; then exit 67; fi  # ahead: alert
+        if [ -n "$STAMPED" ] && [ "$STAMPED" = "$TODAY" ]; then exit 0; fi     # already ran
+        if [ "$HOUR" -lt "$SCHED_HOUR" ]; then exit 0; fi                     # too early
+
+    Both `STAMPED > TODAY` (Defect 1's forward-excursion alert, exit 67) and `STAMPED == TODAY`
+    (the ordinary already-ran case, exit 0) leave the stamp untouched and never invoke keel, so
+    both collapse into the same `not (stamp < clock.date())` test below for the purpose of "did a
+    cycle run" -- this model is deliberately blind to WHICH of the two no-run outcomes fired, since
+    only the shipped script's exit code and notifications (not this pure model) distinguish them.
+    That distinction is covered against the REAL script by
+    `test_forward_clock_excursion_escalates_instead_of_silently_skipping` and
+    `test_clock_rollback_does_not_rerun_or_move_the_stamp_backwards`.
 
     `utc_anchored=False` reproduces the OLD (pre-UTC-anchoring) behaviour (both `TODAY` and `HOUR`
     from LOCAL time), so the two can be compared on identical trigger lists. Every cycle here is
     assumed to succeed -- a failed cycle writes no stamp and is retried, which only ever ADDS a
-    later run on the same date, never removes one. The strict `<` compare and `stamp < clock.date()`
-    below behave identically to the old `==` compare for any MONOTONICALLY forward-moving trigger
-    sequence (which every trigger list built by `_triggers` is) -- the two diverge only under a
-    clock rollback, which is covered separately by the real-script test
-    `test_clock_rollback_does_not_rerun_or_move_the_stamp_backwards`, not by this pure model.
+    later run on the same date, never removes one.
+
+    CORRECTION: an earlier version of this docstring claimed the strict `<` compare (this PR) and
+    the pre-PR-174 `==` compare "diverge only under a clock rollback". That was FALSE, and the
+    false claim is precisely why nothing here covered the other direction before now: a FORWARD
+    clock excursion (a bad RTC reading a bogus future date before NTP settles) also makes the two
+    diverge, and in the more dangerous direction -- `==` self-heals the very next real day (the
+    bogus stamp no longer equals today, so the cycle runs and re-stamps correctly), `<` does not
+    self-heal at all, ever, until the real clock catches up to the bogus future stamp, which could
+    be years. See `test_forward_clock_excursion_escalates_instead_of_silently_skipping` for that
+    case driven against the real script; both directions of divergence (rollback and forward
+    excursion) are covered now.
     """
     ran: list[datetime] = []
     stamp: date | None = None
@@ -749,13 +768,28 @@ def test_the_simulated_gate_matches_the_real_script(tmp_path: Path) -> None:
     invocation) -- not acceptable, so this sequence is curated rather than exhaustive. It covers:
     three consecutive normal UTC days; the 00:20 UTC trigger below `SCHED_HOUR`; the full
     spring-forward day (2026-03-08, 23 triggers, the hour-lost case); the full fall-back day
-    (2026-11-01, 25 triggers, including BOTH firings of the repeated local hour); and the
+    (2026-11-01, 25 triggers, including BOTH firings of the repeated local hour); the
     boot-after-outage catch-up sequence from
-    `test_the_old_local_date_gate_could_double_run_within_one_utc_day`. All of it runs through ONE
-    sandbox, replayed as a single sequence sorted by UTC instant (the order a real machine would
-    execute them in), so the stamp evolves exactly as it would across all these cases back to
-    back -- one continuous timeline is cheaper than one sandbox per scenario and just as faithful,
-    since the gate only ever compares ISO-date strings, never wall-clock elapsed time.
+    `test_the_old_local_date_gate_could_double_run_within_one_utc_day`; and (Defect 1) a forward
+    clock excursion followed by a return to real dates. Before Defect 1 was found, NEITHER this
+    differential test NOR the pure model covered a forward excursion at all -- which is precisely
+    how the regression got through review: nothing here would have caught "the script now returns
+    the wrong exit code and stays silent forever", because this test only ever asserted whether a
+    cycle ran, and a forward excursion never runs one, on the buggy script OR the fixed one (see
+    `_run_gate`'s docstring). The excursion is added for completeness and to guard the "did a cycle
+    run" property specifically, not to catch Defect 1 itself --
+    `test_forward_clock_excursion_escalates_instead_of_silently_skipping` is what proves the exit
+    code and notification, which this coarser differential test cannot see.
+
+    Most of it runs through ONE sandbox, replayed as a single sequence sorted by UTC instant (the
+    order a real machine would execute them in), so the stamp evolves exactly as it would across
+    all these cases back to back -- one continuous timeline is cheaper than one sandbox per
+    scenario and just as faithful, since the gate only ever compares ISO-date strings, never
+    wall-clock elapsed time. The forward-excursion mini-sequence is the one exception: it is
+    APPENDED after the sort, in its own literal firing order, rather than sorted in with the rest,
+    because "jump forward then return to real dates" is deliberately NOT monotonic in the clock's
+    own reading -- sorting it back into chronological order would erase the exact anomaly under
+    test. It is kept small (4 extra triggers) to keep the added wall-clock cost tiny.
     """
     sb = _sandbox(tmp_path, keel_exit_code=0)
     tz = ZoneInfo(DEPLOYMENT_TZ)
@@ -782,6 +816,18 @@ def test_the_simulated_gate_matches_the_real_script(tmp_path: Path) -> None:
     pairs.extend(pair for pair in all_triggers if pair[0] >= boot)
 
     pairs.sort(key=lambda pair: pair[0])
+
+    # Defect 1: a forward clock excursion, then a return to real dates -- appended AFTER the sort,
+    # in this exact order, deliberately not re-sorted with the rest (see the docstring above). The
+    # last chronological trigger sorted in above is the fall-back day, 2026-11-01, so this segment
+    # starts a month later to land on an ordinary already-stamped day first.
+    forward_excursion_and_return = [
+        (datetime(2026, 12, 1, 1, 20, tzinfo=UTC), datetime(2026, 12, 1, 1, 20, tzinfo=UTC)),
+        (datetime(2035, 1, 1, 3, 20, tzinfo=UTC), datetime(2035, 1, 1, 3, 20, tzinfo=UTC)),
+        (datetime(2026, 12, 2, 1, 20, tzinfo=UTC), datetime(2026, 12, 2, 1, 20, tzinfo=UTC)),
+        (datetime(2026, 12, 3, 1, 20, tzinfo=UTC), datetime(2026, 12, 3, 1, 20, tzinfo=UTC)),
+    ]
+    pairs.extend(forward_excursion_and_return)
 
     model_ran = set(_run_gate(pairs, SCHED_HOUR, utc_anchored=True))
 
@@ -966,14 +1012,22 @@ def test_malformed_stamp_content_refuses_to_run(tmp_path: Path) -> None:
 
 
 def test_clock_rollback_does_not_rerun_or_move_the_stamp_backwards(tmp_path: Path) -> None:
-    """Finding 4 (MED): a clock reading a PAST date (bad RTC before NTP settles) must not re-run.
+    """Finding 4 (MED) / Defect 1 (MED): a clock reading a PAST date must not re-run -- and now
+    alerts instead of skipping silently.
 
     `RunAtLoad` fires immediately on boot, potentially before NTP has corrected a bad real-time
-    clock. With the OLD `=` compare, a bogus past date is "not today", so the cycle RUNS and
-    stamps the bogus date; when the clock then corrects forward, the real date no longer matches
-    that bogus stamp, so the cycle runs AGAIN -- re-evaluating, and potentially re-entering, a bar
-    it already traded. The fix requires the stamp to be STRICTLY BEFORE today, so a stamp equal to
-    OR ahead of today both read as "done" -- and the stamp itself must never move backwards.
+    clock. With the OLD `=` compare, a bogus past date was "not today", so the cycle RAN and
+    stamped the bogus date; when the clock then corrected forward, the real date no longer matched
+    that bogus stamp, so the cycle ran AGAIN -- re-evaluating, and potentially re-entering, a bar
+    it already traded. Requiring the stamp to be STRICTLY BEFORE today closes that: a stamp equal
+    to OR ahead of today both read as "done, do not run" -- and the stamp itself must never move
+    backwards.
+
+    What changed under Defect 1: a rolled-back clock makes today's stamp read as AHEAD of "today",
+    which is now exit 67 (notify, refuse) rather than the old silent exit 0 -- the two no-run
+    outcomes used to be one path and are now two, see `_run_gate`'s docstring. The behaviour this
+    test exists to pin -- never re-run, never move the stamp backwards -- is unchanged; only the
+    exit code and the fact that a human now hears about it are new.
     """
     sb = _sandbox(tmp_path, keel_exit_code=0)
     x = datetime(2026, 6, 15, 1, 20, tzinfo=UTC)
@@ -985,19 +1039,187 @@ def test_clock_rollback_does_not_rerun_or_move_the_stamp_backwards(tmp_path: Pat
     assert sb.stamp.read_text().strip() == "2026-06-15"
     ran_once = _count_lines(sb.invocations_log)
 
-    _run(sb, months_in_the_past)
+    rolled_back = _run(sb, months_in_the_past)
+    assert rolled_back.returncode == 67, "a stamp ahead of today must exit 67, not exit 0"
     assert _count_lines(sb.invocations_log) == ran_once, "a clock in the past must not run a cycle"
     assert sb.stamp.read_text().strip() == "2026-06-15", "the stamp must never move backwards"
+    assert sb.calls_log.exists() and sb.calls_log.read_text().strip(), (
+        "a rolled-back clock must alert a human now, not skip silently forever"
+    )
 
-    _run(sb, x)
+    calls_after_rollback = _count_lines(sb.calls_log)
+    same_day = _run(sb, x)
+    assert same_day.returncode == 0, (
+        "the stamp's own date, re-seen, is the ORDINARY already-ran case"
+    )
     assert _count_lines(sb.invocations_log) == ran_once, (
         "the stamp's own date, re-seen, must not re-run either"
     )
     assert sb.stamp.read_text().strip() == "2026-06-15"
+    assert _count_lines(sb.calls_log) == calls_after_rollback, (
+        "re-seeing the stamp's own date is the ordinary already-ran path -- it must stay silent, "
+        "not alert again"
+    )
 
     _run(sb, x_plus_1)
     assert _count_lines(sb.invocations_log) == ran_once + 1, "the day after must run exactly once"
     assert sb.stamp.read_text().strip() == "2026-06-16"
+
+
+def test_forward_clock_excursion_escalates_instead_of_silently_skipping(tmp_path: Path) -> None:
+    """Defect 1 (MED), a REGRESSION PR #174 itself introduced: a forward clock excursion must not
+    become a permanent silent outage.
+
+    Reproduces the reviewer's exact sequence through this PR's own sandbox harness: the detector
+    runs normally and stamps a real UTC date; a bad RTC before NTP settles then reads YEARS into
+    the future (`RunAtLoad` firing on a not-yet-corrected boot clock), the cycle runs and stamps
+    that bogus future date; every real trigger afterwards then reads a correctly-dated TODAY that
+    is, and stays, behind the bogus stamp.
+
+    Under the OLD `=` compare (pre-PR-174) this SELF-HEALED the very next real day: the bogus
+    stamp no longer equalled today, so the cycle ran again and re-stamped the correct date. PR
+    #174's `<` compare fixed clock ROLLBACK but broke this direction instead: `! [[ "$STAMPED" <
+    "$TODAY" ]]` stays true for every subsequent real day until the real clock catches up to the
+    bogus stamp -- which could be years -- so this is a SILENT outage, rc=0 throughout, zero
+    notifications. This test is therefore a regression test for THIS FIX, not a test of the
+    original Finding 4: the monotonic `<` compare did not exist before PR #174, so there is no
+    "before PR #174" behaviour to regress against here.
+
+    The fix: a stamp strictly AHEAD of today is corrupt state, not "already ran" -- exit 67,
+    notify, and never overwrite the stamp. Checked over SEVERAL consecutive real days, not just
+    one, to prove the alert keeps firing rather than notifying once and then going quiet again
+    exactly like the bug it replaces.
+    """
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+
+    real_run = datetime(2026, 8, 6, 1, 20, tzinfo=UTC)
+    first = _run(sb, real_run)
+    assert first.returncode == 0
+    assert sb.stamp.read_text().strip() == "2026-08-06"
+    ran_once = _count_lines(sb.invocations_log)
+
+    # Bad RTC before NTP settles: RunAtLoad fires with a clock reading years in the future.
+    bad_rtc = datetime(2035, 1, 1, 3, 20, tzinfo=UTC)
+    jumped = _run(sb, bad_rtc)
+    assert jumped.returncode == 0, (
+        "the bogus future date is, from the stamp's point of view, just another unstamped day -- "
+        "it runs normally, which is exactly how the bogus stamp gets written in the first place"
+    )
+    assert sb.stamp.read_text().strip() == "2035-01-01"
+    assert _count_lines(sb.invocations_log) == ran_once + 1
+
+    calls_before_return = _count_lines(sb.calls_log)
+    for day in (7, 8, 9, 10, 11):
+        back_to_real = datetime(2026, 8, day, 1, 20, tzinfo=UTC)
+        result = _run(sb, back_to_real)
+        assert result.returncode == 67, (
+            f"2026-08-{day:02d} must exit 67 (stamp ahead of today) -- the OLD `=` compare would "
+            "have exited 0 and RUN a (duplicate) cycle here instead; the regression this PR "
+            "introduced exited 0 and skipped SILENTLY instead of either"
+        )
+        assert _count_lines(sb.invocations_log) == ran_once + 1, (
+            "a stamp ahead of today must never run a cycle, on any of these days"
+        )
+        assert sb.stamp.read_text().strip() == "2035-01-01", (
+            "the bogus future stamp must not move just because more real days went by"
+        )
+
+    assert _count_lines(sb.calls_log) == calls_before_return + 5, (
+        "all 5 subsequent real days must alert -- one notification and then silence would be no "
+        "better than the regression this fix closes, just with a one-day grace period"
+    )
+
+
+def test_ordinary_already_ran_stays_silent(tmp_path: Path) -> None:
+    """The control for Defect 1's fix: an ordinary same-UTC-day second trigger must still exit 0
+    with NO notification.
+
+    Splitting "stamp ahead of today" (exit 67, alert) out from "stamp equal to today" (exit 0,
+    silent) is only a correct fix if the ordinary, overwhelmingly common case -- one of the day's
+    23 remaining triggers finding the day already done -- does not start alerting too. A version of
+    the fix that over-eagerly notified on every non-run, not just the forward-excursion one, would
+    defeat the NOTIFICATION POLICY this script depends on (see its header): training the operator
+    to expect routine noise on the ordinary path is exactly what makes the operator ignore the
+    alerts that matter.
+    """
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+    now = datetime(2026, 6, 15, 1, 20, tzinfo=UTC)
+
+    first = _run(sb, now)
+    assert first.returncode == 0
+    assert sb.stamp.read_text().strip() == "2026-06-15"
+    assert _count_lines(sb.calls_log) == 0, "a normal first-of-the-day run must not alert either"
+
+    second = _run(sb, now)
+    assert second.returncode == 0
+    assert "already ran" in second.stdout
+    assert _count_lines(sb.calls_log) == 0, (
+        "the ordinary already-ran path must stay exactly as silent as before this fix"
+    )
+
+
+def test_stuck_detector_escalates_after_consecutive_failures(tmp_path: Path) -> None:
+    """Defect 2 (MED): nothing previously escalated a detector that keeps failing every trigger.
+
+    A nonzero exit from keel is deliberately NOT notified on its own (NOTIFICATION POLICY: it is
+    normally an expected, self-healing publication lag that the next hourly trigger retries). But
+    that means 23 consecutive failing triggers in one UTC day produced ZERO notifications, and a
+    persistently stuck detector was indistinguishable from a quiet day with no signals -- which
+    matters more now that another change on this branch (the entry gate in `keel/agent.py`) makes
+    ANY one chronically-lagging product withhold the WHOLE cycle's entries, so a single stuck
+    product could keep the day permanently unstamped with nothing ever shouting about it.
+
+    Proves all four pieces of the fix: N-1 consecutive failures stay silent, the Nth (N=3) alerts,
+    the stamp is never written on any of the failing cycles, and a subsequent CLEAN cycle resets
+    the counter so a later isolated failure is silent again rather than continuing to count from a
+    long-resolved outage.
+    """
+    now = datetime(2026, 6, 15, 1, 20, tzinfo=UTC)
+    failcount = tmp_path / "logs" / ".keel-live-last-run.failures"
+
+    failing = _sandbox(tmp_path, keel_exit_code=3)
+
+    first = _run(failing, now)
+    assert first.returncode == 3
+    assert not failing.stamp.exists(), "a failing cycle must never fabricate a stamp"
+    assert _count_lines(failing.calls_log) == 0, "one failure is ordinary publication lag -- silent"
+
+    second = _run(failing, now)
+    assert second.returncode == 3
+    assert not failing.stamp.exists()
+    assert _count_lines(failing.calls_log) == 0, (
+        "two failures in a row is still not 'stuck' -- silent"
+    )
+
+    third = _run(failing, now)
+    assert third.returncode == 3
+    assert not failing.stamp.exists(), (
+        "escalating must never fabricate a stamp -- the day stays open"
+    )
+    assert _count_lines(failing.calls_log) == 1, "the third consecutive failure must escalate"
+    assert "3 consecutive" in failing.calls_log.read_text()
+
+    # A clean, verified cycle heals the detector -- the counter must reset, not just pause.
+    clean = _sandbox(tmp_path, keel_exit_code=0)
+    healed = _run(clean, now)
+    assert healed.returncode == 0
+    assert clean.stamp.read_text().strip() == "2026-06-15"
+    assert not failcount.exists(), (
+        "a clean, verified stamp write must reset the consecutive-failure counter, not merely "
+        "pause it -- a missing counter file reads as 0"
+    )
+
+    # One more failure, on a later day so the fresh stamp does not itself block it: must be silent,
+    # proving the counter actually reset rather than continuing on from 3.
+    calls_before_next_failure = _count_lines(clean.calls_log)
+    failing_again = _sandbox(tmp_path, keel_exit_code=5)
+    later = datetime(2026, 6, 16, 1, 20, tzinfo=UTC)
+    single_failure = _run(failing_again, later)
+    assert single_failure.returncode == 5
+    assert _count_lines(failing_again.calls_log) == calls_before_next_failure, (
+        "the counter reset means a single later failure is silent again, not counted onward from "
+        "the earlier, already-resolved outage"
+    )
 
 
 def test_pendlog_is_utc_labelled(tmp_path: Path) -> None:

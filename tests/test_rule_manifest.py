@@ -168,6 +168,16 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     # for that: (2) status, which is the only thing that still can, and (3) a pinned check on
     # the coincidence itself, so that if the operator ever moves the budget off the default, the
     # value check regains its old power and (3) is what tells them so.
+    #
+    # SCOPE, so nobody reads more assurance into this than it gives. Everything below asserts
+    # against the COMMITTED FILE, `deploy/live-rules.json` -- not against any deployment's
+    # database. So it does NOT detect a box that has been reseeded; it detects a reseeded box's
+    # state being COMMITTED, i.e. someone re-running `rule_manifest.py export` against a
+    # reseeded DB and committing the diff. That is the reviewable choke point this manifest
+    # exists to create, and it is worth guarding -- but the reseed itself is silent on the box
+    # until an export happens, and nothing here changes that. Catching it live would take a
+    # check against a real DB (`rule_manifest.py apply` already reports exactly that drift and
+    # exits 1), which is a deploy-time step, not a unit test.
 
     # (1) AGREEMENT -- the manifest's budget must match config.dca.budget_usd, the value the live
     # executor actually spends.

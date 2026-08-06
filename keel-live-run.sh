@@ -98,14 +98,28 @@
 #   66 -- the day-stamp could not be proven persistable before running a cycle (pre-flight), or
 #         could not be verified written back after one (post-cycle). See the PRE-FLIGHT and
 #         ATOMIC STAMP WRITE comments below for why there are two layers and which one matters.
+#   67 -- the on-disk stamp is a well-formed date but is STRICTLY AHEAD of today. That is not the
+#         ordinary "already ran" case (stamp equal to today) -- it means either the clock read
+#         forward before NTP settled, or the stamp file is otherwise corrupt, and treating it as
+#         "already ran" would silently disable the detector until the real clock catches up to the
+#         bogus stamp, which could be years. Distinct from 65 (stamp is not a date at all) so an
+#         operator can tell the two apart at a glance -- see A2, part two, below.
 #
-# NOTIFICATION POLICY. A macOS notification fires ONLY for a condition the machine cannot
-# self-heal without a human: exit codes 64/65/66 above. An ordinary NONZERO exit from keel itself
-# (e.g. the venue has not yet published the bar this cycle needs) is EXPECTED and SELF-HEALING --
-# one of the remaining hourly triggers retries it, and the OUTLOG line below is enough of a
-# record -- so it does NOT notify. Notifying 23 times a day for a condition that resolves itself
-# on its own would train the operator to ignore notifications, which defeats the ones that
-# actually need a human.
+# NOTIFICATION POLICY. A macOS notification fires for two kinds of thing:
+#   (a) a condition the machine cannot self-heal without a human touching it -- exit codes
+#       64/65/66/67 above; and
+#   (b) a detector that has been failing an ORDINARY nonzero exit from keel itself for
+#       $ESCALATE_EVERY consecutive triggers or more, and on every further multiple of
+#       $ESCALATE_EVERY after that (see the consecutive-failure counter near the bottom of this
+#       script). A SINGLE ordinary nonzero exit (e.g. the venue has not yet published the bar this
+#       cycle needs) is EXPECTED and SELF-HEALING -- one of the remaining hourly triggers retries
+#       it, and the OUTLOG line below is enough of a record -- so it does NOT notify by itself.
+#       Notifying on every one of 23 triggers a day for a condition that usually resolves itself
+#       would train the operator to ignore notifications, which defeats the ones that actually
+#       need a human. But a detector still failing after that many tries in a row is no longer
+#       "usual publication lag", and a chronically stuck detector that never notifies is
+#       indistinguishable from a quiet day with no signals -- which is its own silent-failure mode,
+#       the same class as 64/65/66/67, just reached by a different door.
 #
 # TOCTOU (Finding 8, OPTIONAL, not closed). Between reading $STAMPED and writing $STAMP, two
 # CONCURRENT invocations of this script could both pass the gate and both run a cycle -- `flock`
@@ -127,6 +141,11 @@ DB="keel-live.db"
 OUTLOG="$DIR/logs/keel-live.out.log"
 PENDLOG="$DIR/logs/keel-live.pending.log"
 STAMP="$DIR/logs/.keel-live-last-run"
+# A8 (Defect 2, MED). Consecutive-failure counter, next to $STAMP rather than inside it, so the
+# stamp's own format -- a single ISO date, load-bearing for the A2 compare below -- never has to
+# also carry an integer. See the increment/reset sites near the bottom of this script and the
+# NOTIFICATION POLICY paragraph above.
+FAILCOUNT="$STAMP.failures"
 # The one seam every macOS notification in this script goes through. Same purpose as the `DIR=`
 # rewrite tests/test_schedule.py::_sandbox already relies on: it lets the schedule tests swap in a
 # recorder and assert BOTH that a machine-is-broken condition alerts and that an ordinary
@@ -136,14 +155,36 @@ OSASCRIPT="/usr/bin/osascript"
 # withholding the daily bar that closed at 00:00 UTC. See the header. This is a UTC hour, and it
 # is only meaningful because TODAY below is a UTC date too -- change one and you must change both.
 SCHED_HOUR=1
+# A8 threshold: notify once a stuck detector has failed this many triggers IN A ROW, and again on
+# every further multiple (6, 9, ...). See the increment site near the bottom of this script for why
+# a repeating multiple, not a single one-shot alert.
+ESCALATE_EVERY=3
 
 cd "$DIR" || exit 1
 
-# Single seam for every macOS alert this script can raise, so the alert-worthy paths (64/65/66)
-# all read the same and none of them can forget the `2>/dev/null || true` that keeps a notify
-# failure from ever masking the exit code it is reporting on.
+# Single seam for every macOS alert this script can raise, so the alert-worthy paths
+# (64/65/66/67, plus the A8 escalation below) all read the same and none of them can forget the
+# `2>/dev/null || true` that keeps a notify failure from ever masking the exit code it is
+# reporting on.
 notify() {
   "$OSASCRIPT" -e "display notification \"$1\" with title \"keel-live\" subtitle \"supervised live\" sound name \"Glass\"" 2>/dev/null || true
+}
+
+# A8. Read the consecutive-failure counter, guarded so ANY problem reading it -- the common case
+# of the file not existing yet (a healthy detector has none), a permissions problem, or someone
+# having hand-edited it to non-numeric junk -- reads as 0 rather than aborting the script or
+# corrupting the retry path this file exists to support. This function, and both call sites below,
+# must never be able to change $STATUS or block a retry: the failure counter is an ALERTING
+# convenience, not a second correctness mechanism, and a bug in it must degrade to "stops
+# escalating" rather than "stops trading" or "hides that a cycle failed".
+read_failcount() {
+  local n
+  n="$(cat "$FAILCOUNT" 2>/dev/null || true)"
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$n"
+  else
+    printf '0'
+  fi
 }
 
 TODAY_RAW="$(date -u '+%Y-%m-%d')"
@@ -186,20 +227,49 @@ if [ -n "$STAMPED" ] && ! [[ "$STAMPED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
   exit 65
 fi
 
-# A2, part two: the compare is STRICTLY LESS THAN, not EQUALS. A Mac that boots with a bad RTC
-# before NTP settles (RunAtLoad fires immediately, before the clock is trustworthy) can read a
-# date in the PAST. With `=` that reads as "not today", the cycle RUNS and stamps the bogus past
-# date; when the clock then corrects forward, the real date differs from that bogus stamp so the
-# cycle runs AGAIN -- re-evaluating a bar it already traded, a second entry on the live money
-# path. Requiring the stamp to be STRICTLY BEFORE today closes both directions: a stamp equal to
-# today (ordinary "already ran") and a stamp AHEAD of today (clock rolled back after a correct
-# stamp) both read as "done, do not run" -- neither should trigger a second cycle.
+# A2, part two: a stamp that is not BEFORE today splits into two outcomes, not one. A Mac that
+# boots with a bad RTC before NTP settles (RunAtLoad fires immediately, before the clock is
+# trustworthy) can read a date in the PAST. With the OLD `=` compare that read as "not today", the
+# cycle RAN and stamped the bogus past date; when the clock then corrected forward, the real date
+# differed from that bogus stamp so the cycle ran AGAIN -- re-evaluating a bar it already traded, a
+# second entry on the live money path. Requiring the stamp to be STRICTLY BEFORE today (`<`, not
+# `=`) closed that: a stamp AHEAD of today (clock rolled back after a correct stamp) now reads as
+# "done, do not run", same as a stamp equal to today.
+#
+# But collapsing "ahead" and "equal" into a single silent skip is itself a regression this same fix
+# must not repeat, because a bad RTC is not only ever wrong in the PAST direction. RunAtLoad firing
+# before NTP settles can just as easily read the clock FORWARD -- e.g. a default/garbage RTC date
+# of 2035. That runs a cycle and stamps a date years ahead of real time; every real trigger
+# afterwards then has a correctly-read TODAY that is, and stays, BEHIND that bogus stamp, so
+# `! [[ "$STAMPED" < "$TODAY" ]]` is true FOREVER -- a silent, self-perpetuating outage that looks
+# exactly like "already ran today", every single trigger, until the real clock catches up to the
+# bogus stamp years later. Under the OLD `=` compare this self-healed the very next real day
+# (STAMPED != TODAY, so the cycle ran and re-stamped the correct date); the `<` compare above traded
+# that self-healing away for the rollback fix, and nothing caught the trade until now.
+#
+# So: a stamp STRICTLY AHEAD of today is no longer treated as "already ran". It is corrupt state,
+# the same family as a stamp that is not a date at all (A2 part one, exit 65) -- something is wrong
+# with the clock or the stamp file, and it needs a human, not a silent skip. A distinct exit code
+# (67, not a reuse of 65) lets an operator tell the two apart at a glance: 65 says "go inspect the
+# stamp file", 67 says "go check the clock (and, only if that is sane, then the stamp file)" --
+# collapsing them into one code would cost that distinction for free. The rollback protection is
+# unaffected: the stamp still never moves backwards and a rolled-back clock still never re-runs the
+# cycle -- it now ALERTS instead of skipping silently, which is strictly better for the identical
+# behaviour.
+#
 # ISO-8601 dates sort lexicographically, so a plain string comparison gives us date comparison for
-# free. `<` inside `[[ ]]` is a bash STRING comparison, which is what we want here; the same `<`
-# inside a POSIX `[ ]` is output redirection and would silently truncate a file instead of
-# comparing -- `[[ ]]` is not a style choice on this line, it is the only correct spelling.
-if [ -n "$STAMPED" ] && ! [[ "$STAMPED" < "$TODAY" ]]; then
-  printf '%s [keel-live] stamp (%s) is not before today (%s) -- already ran, or the clock moved backward -- skipping\n' \
+# free. `<`/`>`/`=` inside `[[ ]]` are bash STRING comparisons, which is what we want here; `<`/`>`
+# inside a POSIX `[ ]` are output/input redirection and would silently mangle a file instead of
+# comparing -- `[[ ]]` is not a style choice on these lines, it is the only correct spelling.
+if [ -n "$STAMPED" ] && [[ "$STAMPED" > "$TODAY" ]]; then
+  notify "keel-live: the day-stamp (${STAMPED}) is AHEAD of today (${TODAY}) -- refusing to run a cycle. This means either the clock read forward before NTP settled, or the stamp file is corrupt; investigate ${STAMP} and the system clock before the next trigger. Nothing has been run and the stamp has not been touched."
+  printf '%s [keel-live] stamp (%s) is AHEAD of today (%s) -- refusing to run, stamp not overwritten -- exit 67\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMPED" "$TODAY"
+  exit 67
+fi
+
+if [ -n "$STAMPED" ] && [ "$STAMPED" = "$TODAY" ]; then
+  printf '%s [keel-live] stamp (%s) equals today (%s) -- already ran this UTC day -- skipping\n' \
     "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMPED" "$TODAY"
   exit 0
 fi
@@ -280,7 +350,14 @@ if [ "$STATUS" -eq 0 ]; then
   if { printf '%s\n' "$TODAY" >"$STAMP_TMP"; } 2>/dev/null \
       && mv -f "$STAMP_TMP" "$STAMP" 2>/dev/null \
       && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$TODAY" ]; then
-    : # stamped and verified
+    # A8, reset. A clean, VERIFIED stamp write means the detector is healthy again -- zero the
+    # consecutive-failure counter so a later, unrelated single failure starts counting from zero
+    # rather than continuing from wherever a much earlier, already-resolved outage left off. A
+    # missing counter file reads as 0 (see read_failcount), so `rm -f` IS the reset; guarded the
+    # same way as everything else touching $FAILCOUNT -- if the remove itself fails, the next
+    # escalation check simply starts from a stale (higher) count, which only means "alerts a little
+    # sooner than strictly necessary next time", never "misses" or "blocks" anything.
+    rm -f "$FAILCOUNT" 2>/dev/null || true
   else
     rm -f "$STAMP_TMP" 2>/dev/null || true
     notify "keel-live: the day-stamp write FAILED after a cycle already ran -- an order may already be placed. INVESTIGATE ${STAMP} IMMEDIATELY before the next trigger."
@@ -290,10 +367,46 @@ if [ "$STATUS" -eq 0 ]; then
   fi
 else
   # Only a clean cycle counts as "this UTC day is done"; anything else leaves the day open for
-  # one of the remaining hourly triggers to retry. Deliberately NOT a notification -- see
-  # NOTIFICATION POLICY at the top: a nonzero keel exit is an expected, self-healing condition
-  # (e.g. the venue has not published the bar yet), and the OUTLOG line is enough of a record.
+  # one of the remaining hourly triggers to retry. Deliberately NOT a notification by itself -- see
+  # NOTIFICATION POLICY at the top: a single nonzero keel exit is an expected, self-healing
+  # condition (e.g. the venue has not published the bar yet), and the OUTLOG line is enough of a
+  # record for that case.
   printf '%s [keel-live] cycle exited %d -- not stamping, will retry\n' \
     "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STATUS" >>"$OUTLOG"
+
+  # A8, increment (Defect 2, MED). A single failed trigger is expected and self-healing, but
+  # NOTHING ELSE in this script ever escalates a detector that keeps failing -- 23 consecutive
+  # nonzero exits in one UTC day would otherwise produce zero notifications, indistinguishable from
+  # a quiet day with no signals. Count consecutive failures and alert once the run is long enough
+  # that "publication lag" stops being a plausible explanation.
+  #
+  # The read-modify-write below is guarded end to end: `read_failcount` cannot return anything but
+  # a plain non-negative integer, and the write goes through the same temp-file-then-`mv -f` pattern
+  # as the day-stamp itself so a torn write can never leave $FAILCOUNT truncated into something
+  # read_failcount would misparse as a smaller number and under-count. If the write fails outright,
+  # this cycle's failure simply goes uncounted -- the counter under-reports rather than corrupts,
+  # and, critically, NONE of this can reach `exit`: a bug here must degrade to "the escalation alert
+  # is late or missing", never to "the retry did not happen" or "the exit status changed".
+  FAILS="$(($(read_failcount) + 1))"
+  FAILCOUNT_TMP="$FAILCOUNT.tmp.$$"
+  if { printf '%s\n' "$FAILS" >"$FAILCOUNT_TMP"; } 2>/dev/null \
+      && mv -f "$FAILCOUNT_TMP" "$FAILCOUNT" 2>/dev/null; then
+    : # counter persisted
+  else
+    rm -f "$FAILCOUNT_TMP" 2>/dev/null || true
+  fi
+
+  # Escalate on the Nth consecutive failure, and again on every FURTHER multiple of N (2N, 3N, ...)
+  # -- deliberately not once-and-done. A one-shot alert that then goes quiet forever would let a
+  # detector stuck for a week look, after the first night, exactly like one that self-healed after
+  # three tries: the operator has no way to tell "resolved" from "still broken, already told you"
+  # without going and checking. Repeating on a multiple keeps a genuinely stuck detector shouting
+  # for as long as it stays stuck, while the modulo means it still only fires once per N tries, not
+  # once per trigger -- 23 failures a day still produces a handful of alerts, not 23.
+  if [ "$((FAILS % ESCALATE_EVERY))" -eq 0 ]; then
+    notify "keel-live: ${FAILS} consecutive cycles have failed (latest exit ${STATUS}) -- this is no longer ordinary publication lag. Check ${OUTLOG}."
+    printf '%s [keel-live] escalation: %d consecutive failures -- notified\n' \
+      "$(date -u '+%Y-%m-%d %H:%M UTC')" "$FAILS" >>"$OUTLOG"
+  fi
 fi
 exit "$STATUS"
