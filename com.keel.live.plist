@@ -5,8 +5,10 @@
     <key>Label</key>
     <string>com.keel.live</string>
 
-    <!-- Daily SUPERVISED-LIVE detector. Runs one HEADLESS confirm-mode cycle (places nothing,
-         fails closed) to check whether a Turtle breakout fired, and notifies if so. Scheduled at
+    <!-- Daily SUPERVISED-LIVE cycle on the real money path. Runs one HEADLESS cycle to check
+         whether a Turtle breakout fired. Whether it PLACES the resulting order or merely notifies
+         depends on the AUTONOMY flag on the profile row, read fresh from the database each cycle
+         (see keel-live-run.sh's header) -- with autonomy ON it places, unattended. Scheduled at
          09:05 local -- just after the 09:00 paper-forward, so both see the fresh daily bar.
 
          Fires hourly at :05 through 20:05, plus on load (= login/boot), because launchd re-runs a
@@ -17,8 +19,11 @@
          after 09:00 with no stamp for today does the cycle, later ones are no-ops, and a FAILED
          cycle leaves no stamp so the next hour retries it.
 
-         This changes cadence only. The detector still places nothing: confirm mode fails closed
-         with no TTY, so approving remains a deliberate interactive `keel-live agent`. -->
+         This changes cadence only -- it does not change whether a cycle can place an order, which
+         is autonomy's job alone. This comment used to say "the detector still places nothing:
+         confirm mode fails closed with no TTY", which held only with autonomy OFF while the
+         deployment has run with it ON. Do not restore that wording without checking the profile
+         row first. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
