@@ -20,6 +20,7 @@ from typing import Any
 from click.testing import CliRunner
 
 import keel.cli as cli_module
+from keel import agent
 from keel.agent import RULE_REGISTRY, _build_rule
 from keel.cli import cli
 from keel.commands._common import DISCLAIMER
@@ -173,6 +174,110 @@ def test_agent_prints_paper_equity_and_drawdown_line(tmp_path, write_config, mon
     assert "drawdown 0 total / 0 weekly" in result.output
 
 
+# -- agent -- blocked entries (Finding 1, HIGH: duplicate real-money orders) -------------------
+
+
+def _seed_blocked_dca_scenario(db_path: Path, now_ts: int) -> None:
+    """A `dca` rule whose gating ONE_DAY bar is wildly stale, with a fresh ONE_HOUR bar so
+    `market_feed.is_fresh`'s STALE-FEED skip (checked against the FINEST configured
+    granularity) doesn't pre-empt the entry gate before it's ever reached. `cadence_days=1`
+    makes every stored bar a cadence hit regardless of ts, matching
+    `tests/test_agent.py::test_run_once_blocks_a_dca_entry_on_a_stale_daily_bar`, whose
+    reasoning this reuses one layer up, through the real CLI entrypoint.
+    """
+    product = "BTC-USD"
+    repo = _repo_at(db_path)
+    repo.set_state("kill_switch", False)
+
+    def _c(ts: int, price: str = "100") -> Candle:
+        p = Decimal(price)
+        return Candle(ts=ts, open=p, high=p, low=p, close=p, volume=Decimal("1"))
+
+    repo.upsert_candles(product, Granularity.ONE_DAY, [_c(0)])
+    repo.upsert_candles(product, Granularity.ONE_HOUR, [_c(now_ts - 60)])
+    repo.insert_rule("dca", {"product_id": product, "cadence_days": 1}, status="paper")
+
+
+def test_agent_exits_data_not_ready_when_an_entry_is_blocked(tmp_path, write_config, monkeypatch):
+    """CLI surface for Finding 1 (HIGH). A single-cycle `keel agent` must not exit `0` when
+    `run_once` withheld an entry on an unconfirmed bar -- a green exit code is exactly what lets
+    a cron/LaunchAgent wrapper stamp the day as done and never retry, turning a transient
+    publication lag into a silently-skipped trading day forever instead of the intended
+    `<= 60 minutes of delay` (see `agent.DATA_NOT_READY_EXIT`'s docstring).
+    """
+    from tests.conftest import VALID_CONFIG_YAML
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    # Drop FIFTEEN_MINUTE -- the live config's finest granularity -- so the market-data-wide
+    # STALE-FEED skip (`market_feed.is_fresh`, checked against the finest configured
+    # granularity) doesn't need its own fixture and can't mask the entry gate this test is about.
+    config_path = write_config(VALID_CONFIG_YAML.replace("    - FIFTEEN_MINUTE\n", ""))
+    db_path = tmp_path / "test.db"
+    now_ts = 5 * 86_400 + 2 * 3_600
+    _seed_blocked_dca_scenario(db_path, now_ts)
+    monkeypatch.setattr(cli_module.time, "time", lambda: now_ts)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["--db", str(db_path), "--config", str(config_path), "agent"])
+
+    assert result.exit_code == agent.DATA_NOT_READY_EXIT, result.output
+    assert "signals=0" in result.output
+    assert "blocked=1" in result.output
+
+
+def test_agent_exits_zero_and_reports_blocked_zero_when_nothing_is_blocked(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The counterweight to the test above: a normal cycle with nothing blocked exits `0`, and
+    the printed line carries `blocked=0` alongside `signals=` -- `_print_loop_result` must keep
+    emitting the `signals=[0-9]+` token the live runner greps out of its output (see the runner's
+    own `keel-live-run.sh`), and `blocked=0` proves the new token is additive, not a replacement.
+    """
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "signals=0" in result.output
+    assert "blocked=0" in result.output
+
+
+def test_agent_loop_does_not_exit_the_process_when_a_cycle_is_blocked(
+    tmp_path, write_config, monkeypatch
+):
+    """`--loop` must NEVER terminate the process on a blocked cycle -- a long-running loop is
+    supposed to skip the cycle and retry next interval, exactly like it does for any other
+    per-cycle condition (kill-switch, stale feed); dying on a usually-transient publication lag
+    would take the whole scheduled loop down over what a single-cycle runner recovers from in
+    one retry. Reuses the same blocked scenario as the single-cycle exit-code test above, but
+    through `--loop --max-cycles 1`.
+    """
+    from tests.conftest import VALID_CONFIG_YAML
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    config_path = write_config(VALID_CONFIG_YAML.replace("    - FIFTEEN_MINUTE\n", ""))
+    db_path = tmp_path / "test.db"
+    now_ts = 5 * 86_400 + 2 * 3_600
+    _seed_blocked_dca_scenario(db_path, now_ts)
+    monkeypatch.setattr(cli_module.time, "time", lambda: now_ts)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(config_path),
+            "agent", "--loop", "--max-cycles", "1", "--interval", "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "blocked=1" in result.output
 
 
 

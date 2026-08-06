@@ -2035,3 +2035,309 @@ def test_two_cycles_in_one_utc_day_reenter_the_same_turtle_breakout(repo, monkey
         "the second entry's bracket was vetoed -- the duplicate position is riding without an "
         "exchange-side stop, which is strictly worse than the duplicate entry this test pins"
     )
+
+
+# -- entry bar readiness gate (Finding 1, HIGH: duplicate real-money orders) -------------------
+#
+# The live LaunchAgent fires at :20 past every UTC hour; the runner gates on UTC hour >= 1, so
+# the first eligible trigger of the day is 01:20 UTC. `turtle_breakout.py::_completed_days`
+# withholds the just-closed ONE_DAY bar until the 00:00-01:00 UTC ONE_HOUR bar has closed at
+# 01:00 UTC -- normally a 20-minute margin. If the ONE_HOUR series is even one bar late (a
+# routine publication lag), or the ONE_DAY bar itself hasn't been fetched yet, `_completed_days`
+# withholds one MORE daily bar than it should and the rule re-evaluates a bar a PRIOR cycle
+# already traded. Nothing else on the live path dedupes an ENTRY (see this module's own
+# docstring above), so that re-evaluation is a DUPLICATE REAL-MONEY ORDER, not a delayed one.
+# `keel.data.freshness.entry_bar_ready` closes the gap; the tests below pin it at the
+# `agent.run_once` level, where the gate is actually wired.
+
+_DAY = 86_400
+_HOUR = 3_600
+
+# `turtle_breakout.py`'s own `_SMALL_PARAMS` (see `tests/strategy/test_turtle_breakout.py`),
+# reused so `min_needed` (`max(lookbacks) + 2 == 7`) stays well under the 11-candle series below.
+_TURTLE_PARAMS = {"entry_lookback": 5, "exit_lookback": 3, "adx_period": 5, "atr_period": 5}
+
+
+def _turtle_daily_series() -> list[Candle]:
+    """11 daily candles (epoch days 0-10): the zigzag base from
+    `tests/strategy/test_engine.py::_uptrend_candles` (days 0-8, verified `regime.detect_condition
+    == BULLISH` there -- a strictly monotonic series has no interior pivot and reads as CHOPPY,
+    see `test_two_cycles_in_one_utc_day_reenter_the_same_turtle_breakout`'s docstring above)
+    followed by TWO INDEPENDENT Donchian breakouts, day 9 and day 10 -- each verified directly
+    against `TurtleBreakout.detect()` (with `_TURTLE_PARAMS`) to clear every gate on its own
+    (Donchian high, ADX>threshold, kill-zone rr>=1) when it is the newest bar.
+
+    Two consecutive breakouts model the hazard this section pins: day 9's breakout is one a
+    correctly-anchored PRIOR cycle already traded (it was "yesterday's" freshly-closed bar
+    then); day 10's is the genuine fresh one due THIS cycle. `_completed_days`'s over-eager
+    two-bar drop hands day 9 back to `detect()` a second time -- there is nothing wrong with day
+    9 itself, only with re-serving it.
+    """
+
+    def _c(ts: int, price: str) -> Candle:
+        p = Decimal(price)
+        return Candle(
+            ts=ts,
+            open=p - Decimal("0.5"),
+            high=p + Decimal("0.5"),
+            low=p - Decimal("0.5"),
+            close=p,
+            volume=Decimal("1"),
+        )
+
+    base_prices = ["100", "105", "102", "108", "104", "112", "109", "118", "114"]
+    candles = [_c(i * _DAY, v) for i, v in enumerate(base_prices)]
+    candles.append(_c(9 * _DAY, "140"))  # day 9: the "already traded" breakout
+    candles.append(_c(10 * _DAY, "160"))  # day 10: the genuine fresh breakout
+    return candles
+
+
+def test_turtle_entry_is_blocked_when_the_hourly_series_has_not_crossed_the_day_close(repo):
+    """THE REGRESSION, hourly-lag shape. At 01:20 UTC on "day 11", day 10 is the newest COMPLETE
+    daily bar (`expected_last_ts`); the 00:00-01:00 UTC hourly bar (ts == day 11's 00:00) is
+    what `_completed_days` needs closed to release it. Here the hourly series is stamped one
+    bar SHORT of that -- a routine one-hour venue publication lag.
+
+    PRE-FIX: `_completed_days` sees the late hourly series and drops day 10 (correctly) AND day
+    9 (incorrectly), so `TurtleBreakout.detect()` fires on day 9's ALREADY-TRADED breakout --
+    demonstrated below by `enter_signals` being non-empty, which is this test's load-bearing
+    assertion; everything after it is the fixed behaviour.
+    POST-FIX: the entry-readiness gate blocks the rule before `engine.evaluate` ever sees it,
+    because the confirming hourly bar has not arrived -- independent of whatever
+    `_completed_days` itself would compute.
+    """
+    candles = _turtle_daily_series()
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, candles)
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, **_TURTLE_PARAMS}, status="live")
+
+    today_open = 11 * _DAY  # "day 11" 00:00 UTC -- the confirming hourly bar's ts if current
+    late_hourly = [_candle(today_open - _HOUR)]  # one bar SHORT of the boundary
+    repo.upsert_candles(PRODUCT, Granularity.ONE_HOUR, late_hourly)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): candles,
+            (PRODUCT, Granularity.ONE_HOUR): late_hourly,
+        }
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        )
+    )
+    now_ts = today_open + _HOUR + 20 * 60  # 01:20 UTC on day 11 -- the first live trigger
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    # THE BUG, stated as an assertion: pre-fix, this fires on day 9's already-traded breakout.
+    assert result.enter_signals == [], (
+        f"turtle_breakout fired on a bar this cycle's freshness could not confirm: "
+        f"{result.enter_signals!r}"
+    )
+    assert all(not r.placed for r in result.enter_results)
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+    assert len(result.blocked_entries) == 1
+    blocked = result.blocked_entries[0]
+    assert blocked.product == PRODUCT
+    assert blocked.rule_name == "turtle_breakout"
+    assert blocked.granularity == Granularity.ONE_DAY
+
+
+def test_turtle_entry_is_blocked_when_the_daily_bar_itself_has_not_been_fetched_yet(repo):
+    """THE REGRESSION, daily-lag shape. Here the ONE_HOUR confirming series IS current, but the
+    ONE_DAY series itself lags -- day 10's bar hasn't been fetched into the cache yet, so the
+    newest stored daily bar (day 9) is one bar behind `expected_last_ts`. `_completed_days`
+    drops nothing extra in this shape (there's nothing to drop -- day 10 was never there), but
+    the series' own newest bar is still the already-traded day 9 breakout.
+
+    Distinct failure mode from the hourly-lag test above (`bars_behind > 0` on the gated series
+    itself, vs. an unconfirmed FINER series) -- both must block, via different `BarReadiness`
+    reasons.
+    """
+    candles = _turtle_daily_series()
+    stored_daily = candles[:-1]  # day 10 not fetched yet -- only through day 9
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, stored_daily)
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, **_TURTLE_PARAMS}, status="live")
+
+    today_open = 11 * _DAY
+    current_hourly = [_candle(today_open)]  # the hourly series IS current this time
+    repo.upsert_candles(PRODUCT, Granularity.ONE_HOUR, current_hourly)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): stored_daily,
+            (PRODUCT, Granularity.ONE_HOUR): current_hourly,
+        }
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        )
+    )
+    now_ts = today_open + _HOUR + 20 * 60
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    # THE BUG: pre-fix, `_completed_days` doesn't drop anything here (the hourly series is
+    # current), so `detect()` sees day 9 as the newest bar and fires on it -- already traded.
+    assert result.enter_signals == [], (
+        f"turtle_breakout fired on day 9's bar while day 10's had not been fetched yet: "
+        f"{result.enter_signals!r}"
+    )
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+    assert len(result.blocked_entries) == 1
+    assert result.blocked_entries[0].granularity == Granularity.ONE_DAY
+
+
+def test_turtle_entry_is_evaluated_and_placed_when_both_series_are_current(repo):
+    """THE COUNTERWEIGHT to the two regression tests above: this gate must not become a blanket
+    "never trade". When both series genuinely are current -- the normal case, true for ~23 of
+    the 24 daily triggers -- the entry must fire and place exactly as it did before this gate
+    existed. Same day-11 01:20 UTC instant, differing only in that the hourly series HAS crossed
+    day 11's 00:00 close.
+    """
+    candles = _turtle_daily_series()
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, candles)
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, **_TURTLE_PARAMS}, status="live")
+
+    today_open = 11 * _DAY
+    current_hourly = [_candle(today_open)]
+    repo.upsert_candles(PRODUCT, Granularity.ONE_HOUR, current_hourly)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): candles,
+            (PRODUCT, Granularity.ONE_HOUR): current_hourly,
+        }
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        )
+    )
+    now_ts = today_open + _HOUR + 20 * 60
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    assert len(result.enter_signals) == 1
+    assert result.enter_signals[0].setup is not None
+    assert result.enter_signals[0].setup.entry == Decimal("160")  # day 10's genuine breakout
+    assert len(result.enter_results) == 1
+    assert result.enter_results[0].placed is True
+    assert result.blocked_entries == []
+    # `get_orders` also carries the bracket's SELL leg (`place_bracket`'s protective stop) --
+    # same convention `test_two_cycles_in_one_utc_day_reenter_the_same_turtle_breakout` above
+    # uses -- so the BUY count, not the raw row count, is what proves exactly one entry placed.
+    buy_orders = [o for o in repo.get_orders(mode="live", product_id=PRODUCT) if o["side"] == "BUY"]
+    assert len(buy_orders) == 1
+
+
+def test_exit_still_runs_while_a_different_rules_entry_is_blocked(repo):
+    """The exit path must never be held hostage by the entry gate: an open position's rule-driven
+    channel exit runs IN-PROCESS (unlike the protective stop, which rests at the broker), so it
+    has to fire on a stale-feed cycle exactly as it would on a fresh one. Staying in a losing
+    position an extra day because a DIFFERENT rule's confirming series lagged is strictly worse
+    than a delayed entry. Seeds a held position owned by `fake_exit` (always exits) alongside a
+    `turtle_breakout` rule blocked by the same late-hourly scenario as the first regression test
+    above, both for the SAME product, and asserts both effects land in the one cycle.
+    """
+    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000)
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    repo.set_state(f"position_rule:{PRODUCT}", "fake_exit")
+
+    candles = _turtle_daily_series()
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, candles)
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, **_TURTLE_PARAMS}, status="live")
+
+    today_open = 11 * _DAY
+    late_hourly = [_candle(today_open - _HOUR)]
+    repo.upsert_candles(PRODUCT, Granularity.ONE_HOUR, late_hourly)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): candles,
+            (PRODUCT, Granularity.ONE_HOUR): late_hourly,
+        }
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        )
+    )
+    now_ts = today_open + _HOUR + 20 * 60
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    assert len(result.exit_results) == 1
+    assert result.exit_results[0].placed is True
+    # THE BUG: pre-fix, turtle_breakout also fires here (it is blind to the same lag the exit
+    # correctly ignores) -- this is the load-bearing assertion for the "before" transcript.
+    assert result.enter_signals == [], (
+        f"turtle_breakout should have been blocked but fired anyway: {result.enter_signals!r}"
+    )
+    blocked_names = {b.rule_name for b in result.blocked_entries}
+    assert "turtle_breakout" in blocked_names
+    # `fake_exit` declares neither `granularity` nor `timeframe`, so it is ALSO gated on the
+    # coarsest configured granularity (ONE_DAY) and shows up here too -- harmlessly, since its
+    # `detect()` always returns `None` and it was never going to enter regardless. This test
+    # only asserts on turtle_breakout, which IS the hazard being pinned.
+
+
+def test_entry_gate_granularity_falls_back_to_the_coarsest_configured_granularity_for_dca():
+    """`Dca` declares neither `granularity` nor `timeframe`, yet `Dca.detect` reads
+    `candles_by_tf[Granularity.ONE_DAY]` directly and keys its cadence off
+    `latest.ts // 86400 % cadence_days` -- so a stale DAILY bar re-fires the same cadence hit
+    and buys twice. `strategy.engine._trading_granularity`'s FINEST fallback (built for CTS
+    *scoring*) is wrong here: gating DCA on FIFTEEN_MINUTE would miss the hazard entirely -- the
+    daily bar could be weeks stale while FIFTEEN_MINUTE stayed perfectly fresh. The COARSEST
+    configured granularity is the fallback that fails in the safe direction for any rule that
+    does not declare what it reads.
+    """
+    rule = Dca(product_id=PRODUCT)
+    granularities = [Granularity.ONE_DAY, Granularity.ONE_HOUR, Granularity.FIFTEEN_MINUTE]
+
+    assert agent._entry_gate_granularity(rule, granularities) == Granularity.ONE_DAY
+
+
+def test_run_once_blocks_a_dca_entry_on_a_stale_daily_bar(repo):
+    """The same gate, applied to a rule that declares no `granularity`/`timeframe` attribute at
+    all -- `Dca` reads `ONE_DAY` directly (see the `_entry_gate_granularity` test above), so a
+    stale daily bar must block it exactly like a declared-granularity rule, using the coarsest
+    fallback. `cadence_days=1` makes every stored bar a cadence hit regardless of its ts, so a
+    fire here can only be explained by the gate being absent, not by an off-cadence miss.
+    """
+    repo.insert_rule(
+        "dca",
+        {"product_id": PRODUCT, "cadence_days": 1},
+        status="live",
+    )
+    stale_daily = [_candle(0, "100")]  # epoch day 0 -- wildly behind
+    # Kept fresh so `market_feed.is_fresh`'s STALE-FEED skip (gated on the FINEST configured
+    # granularity) doesn't pre-empt this test before it ever reaches the entry gate.
+    fresh_hourly = [_candle(5 * _DAY + 60, "100")]
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, stale_daily)
+    repo.upsert_candles(PRODUCT, Granularity.ONE_HOUR, fresh_hourly)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): stale_daily,
+            (PRODUCT, Granularity.ONE_HOUR): fresh_hourly,
+        }
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_DAY, Granularity.ONE_HOUR], history_days=365
+        )
+    )
+    now_ts = 5 * _DAY + 2 * _HOUR
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    # THE BUG: pre-fix, DCA's cadence math fires off the stale day-0 bar regardless of how far
+    # behind it is -- nothing today checks the daily bar's own freshness before `detect()` runs.
+    assert result.enter_signals == [], f"dca fired on a stale daily bar: {result.enter_signals!r}"
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+    assert len(result.blocked_entries) == 1
+    assert result.blocked_entries[0].rule_name == "dca"
+    assert result.blocked_entries[0].granularity == Granularity.ONE_DAY

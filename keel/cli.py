@@ -1130,7 +1130,8 @@ def _print_loop_result(result: agent.LoopResult) -> None:
     click.echo(
         f"[{result.ts}] mode={result.mode} polled={result.polled} "
         f"products={result.products} stale={result.stale_products} "
-        f"signals={len(result.enter_signals)} entered={entered} exited={exited}"
+        f"signals={len(result.enter_signals)} blocked={len(result.blocked_entries)} "
+        f"entered={entered} exited={exited}"
     )
     if result.paper_equity is not None:
         click.echo(
@@ -1176,9 +1177,22 @@ def agent_cmd(
 
     if not loop:
         confirm_fn = _interactive_confirm
-        _print_loop_result(
-            agent.run_once(broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn)
+        result = agent.run_once(
+            broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn
         )
+        _print_loop_result(result)
+        if result.blocked_entries:
+            # Finding 1 (HIGH): a green exit here is exactly what lets a cron/LaunchAgent
+            # wrapper stamp the day as done and never retry -- see `agent.DATA_NOT_READY_EXIT`'s
+            # docstring for the mechanism this closes (duplicate order -> bounded delay).
+            for blocked in result.blocked_entries:
+                click.echo(
+                    f"blocked: {blocked.rule_name} on {blocked.product} needs a confirmed "
+                    f"{blocked.granularity.value} bar at {blocked.expected_ts} "
+                    f"(have {blocked.stored_ts}, reason={blocked.reason})",
+                    err=True,
+                )
+            ctx.exit(agent.DATA_NOT_READY_EXIT)
         return
 
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
@@ -1189,6 +1203,12 @@ def agent_cmd(
         _count[0] += 1
         return False
 
+    # Deliberately NO `ctx.exit(agent.DATA_NOT_READY_EXIT)` here, unlike the non-`--loop` branch
+    # above: a long-running loop process is supposed to skip a blocked cycle and try again next
+    # `interval`, exactly like it already does for a stale feed or the kill-switch -- exiting
+    # the process would take the whole scheduled loop down over what is usually a transient
+    # publication lag, and `agent.loop` has no supervisor watching for this exit code to restart
+    # it. `_print_loop_result`'s `blocked=N` token still surfaces it for whoever reads the log.
     confirm_fn = _interactive_confirm
     for result in agent.loop(broker, repo, config, interval, stop_flag, confirm_fn=confirm_fn):
         _print_loop_result(result)
