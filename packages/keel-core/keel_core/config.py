@@ -297,6 +297,19 @@ class Config:
     tiers: tuple[TierConfig, ...] = field(default_factory=_default_tiers)
     fees: FeesConfig = field(default_factory=FeesConfig)
     quote_currency: str = "USD"
+    # Where `keel assets propose`/the TUI's propose overlay look for an externally-produced
+    # shortlist JSON (see `keel/commands/admission.py::latest_shortlist`). This is a FIELD, not a
+    # constant baked into that module, for the same reason `settlement_currencies` is a field
+    # rather than a `guards.py` literal: a user-specific absolute path hardcoded into library code
+    # is untestable (every test would either write to it or monkeypatch it) and wrong for anyone
+    # else's machine. `~` is expanded by the READER (`Path(config.proposals_dir).expanduser()`)
+    # at USE time, never here at parse time -- expanding at parse would bake the parsing
+    # machine's home directory into a `Config` that a test fixture or a different operator's
+    # checkout might reasonably load, which is exactly the kind of environment-dependent value
+    # `load_config` is supposed to keep out of a `Config` object. Keeping it as the literal string
+    # `"~/keel/proposals"` is what makes the default portable across machines and safe to assert
+    # on directly in a test (see `test_load_config_proposals_dir_defaults_to_keel_proposals`).
+    proposals_dir: str = "~/keel/proposals"
     # Rail 18's allowed settlement legs -- the currencies an order may settle in, matched against
     # `quote_currency_of(product_id)`. NOT the same field as `quote_currency` above, which names
     # the ONE currency this deployment trades in (it screens candidates and excludes the
@@ -655,6 +668,18 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(quote_currency, str) or not quote_currency:
         raise ConfigError(f"quote_currency: must be a non-empty string, got {quote_currency!r}")
 
+    # Mirrors `quote_currency` immediately above: optional, but if present must be a non-empty
+    # string. No shape/existence check beyond that -- unlike `allowlist`/`settlement_currencies`,
+    # this is a filesystem path, not a venue identifier the rails compare against, so there is no
+    # "would silently veto every order" failure mode to catch here. A missing directory is handled
+    # by the reader (`latest_shortlist` returns `None` rather than raising) precisely because the
+    # directory legitimately does not exist yet on a fresh install.
+    proposals_dir = raw.get("proposals_dir", "~/keel/proposals")
+    if not isinstance(proposals_dir, str) or not proposals_dir:
+        raise ConfigError(
+            f"proposals_dir: must be a non-empty string, got {proposals_dir!r}"
+        )
+
     settlement_currencies = _parse_settlement_currencies(raw)
 
     # The two settings are independent knobs that describe the SAME leg, and a config that moves
@@ -758,6 +783,7 @@ def load_config(path: str | Path) -> Config:
         tiers=_parse_tiers(raw),
         fees=_parse_fees(raw),
         quote_currency=quote_currency,
+        proposals_dir=proposals_dir,
         settlement_currencies=settlement_currencies,
         logging=_parse_logging(raw),
         research=_parse_research(raw),
