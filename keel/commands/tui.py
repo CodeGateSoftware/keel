@@ -16,15 +16,39 @@ data (money-safe, no orders). `--once` stays a static, non-interactive snapshot.
 
 Two layers, mirroring `status.py`'s split:
 
-- `build_screen`, `build_help_screen`, `_visible_slice`, `_footer_lines`, `_freshness_style`,
-  `toggle_autonomy` and `_guarded` are all PURE (or take only injected fakes), directly
-  unit-testable without curses, a CliRunner, or the network. `render_plain` is the same, dropping
-  styles.
+- `build_screen`, `build_help_screen`, `_visible_slice`, `_scroll_offset`, `_footer_lines`,
+  `_freshness_style`, `toggle_autonomy` and `_guarded` are all PURE (or take only injected
+  fakes), directly unit-testable without curses, a CliRunner, or the network. `render_plain` is
+  the same, dropping styles.
 - `_paint` (curses rendering), `run_once` (single-frame, `--once`/pipes/CI), `run_live` (the
   auto-refreshing `curses.wrapper` loop), and `_confirm_arm_autonomy` (the cooked-mode typed-`yes`
   prompt) are the thin I/O layer. `curses` is imported lazily inside the functions that need it,
   so this module stays importable -- and the pure-function tests stay portable -- even where a
   real terminal is absent.
+
+v3 (this revision) wires the allowlist-admission workflow (`keel/commands/admission.py`, already
+fully built and covered by its own tests) into three more overlays, reusing that module's report
+builders/renderers VERBATIM rather than reimplementing any of it -- exactly the same discipline
+`i` insights already keeps toward `keel/commands/insights.py`:
+
+- `s` **screen** -- `build_admission_screen_overlay` over `build_screen_report`: the current
+  allowlist's admission verdicts. OFFLINE, DB reads only.
+- `p` **propose** -- `build_propose_overlay` over `build_propose_view`: screens the newest
+  shortlist file in `config.proposals_dir` (or names why there is none). OFFLINE, DB + local
+  filesystem reads only.
+- `d` **discover** -- `build_discover_overlay` over `build_discover_report`: proposes NEW
+  candidates from the venue's own product list. This is the one of the three that needs the
+  network, and it is the SECOND deliberate network exception in this dashboard (the first is `f`
+  fetch): opening the overlay makes no call at all (it renders an ARMED, not-yet-run
+  explanation), and only an explicit Enter keypress *inside* the overlay triggers
+  `_do_discover_report`'s one `_build_broker(config).list_products()` call. The result is then
+  HELD -- every following poll while the overlay stays open repaints the same cached result (or
+  error) rather than re-fetching, and closing the overlay discards it, so reopening is armed but
+  not yet run again.
+
+None of the three attests, admits, or trades -- `attest` (the human judgment the whole gate rests
+on) stays deliberately CLI-only, `keel assets attest`. `screen`/`propose`/`discover` only ever
+PROPOSE or REPORT; they cannot themselves put an asset on `allowlist` in `config.yaml`.
 """
 
 from __future__ import annotations
@@ -39,6 +63,17 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
+from keel.commands.admission import (
+    DiscoverReport,
+    ProposeView,
+    ScreenReport,
+    build_discover_report,
+    build_propose_view,
+    build_screen_report,
+    render_discover_report,
+    render_propose_view,
+    render_screen_report,
+)
 from keel.commands.status import StatusReport, _human_age, gather_status
 from keel.config import Config
 from keel.data.repository import Repository
@@ -264,12 +299,23 @@ def _subscription_lines(report: StatusReport) -> list[ScreenLine]:
 
 def _footer_lines() -> list[ScreenLine]:
     """The keybinding hint bar shown at the bottom of the normal-mode dashboard. Deliberately
-    interval-independent (see `build_screen`'s note) and pure, so it's directly testable."""
+    interval-independent (see `build_screen`'s note) and pure, so it's directly testable.
+
+    Two lines, not one: the first (kept byte-for-byte as it was before the admission overlays
+    existed, so nothing that already reads it needs to change) is already close to 80 columns,
+    and cramming `[s] screen [p] propose [d] discover` onto the end of it would either wrap on a
+    normal terminal or silently truncate (`_paint` clips every line to the window width). A
+    second line costs one more row of screen -- cheap, next to a footer line an operator can no
+    longer read."""
     return [
         ScreenLine(
             "keys: [q] quit  [h] help  [i] insights  [r] refresh  [a] autonomy  [f] fetch",
             "muted",
-        )
+        ),
+        ScreenLine(
+            "admission: [s] screen  [p] propose  [d] discover (network)",
+            "muted",
+        ),
     ]
 
 
@@ -336,6 +382,10 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  f            fetch all data (pull candles for every configured product)")
     _note("               can pull up to 5y of candles; the dashboard freezes until it finishes")
     _note("               (Ctrl-C aborts the whole TUI, not just the fetch)")
+    _row("  s            open the screen overlay (allowlist admission verdicts, read-only)")
+    _row("  p            open the propose overlay (screens the newest shortlist file, read-only)")
+    _row("  d            open the discover overlay (propose NEW candidates from the venue)")
+    _note("               armed, not run, on open -- see 'Discover overlay' below")
     lines.append(_blank())
     _row("Live balance")
     _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
@@ -356,6 +406,30 @@ def build_help_screen() -> list[ScreenLine]:
     _note("  promotion gate, an account summary, and a compact recent-trades tail -- the same")
     _note("  scrolling keys as help mode (up/k, down/j, PgUp/PgDn, Home/End).")
     _row("  q / Esc / i    close insights, back to the dashboard")
+    lines.append(_blank())
+    _row("Screen overlay (s)")
+    _note("  OFFLINE, read-only: runs the current allowlist through the SAME admission gate")
+    _note("  `keel assets screen` uses (`_screen_product`) -- ADMIT/REJECT per product, plus WHY.")
+    _note("  DB reads only; never builds a broker, never touches the network.")
+    _row("  q / Esc / s    close screen, back to the dashboard")
+    lines.append(_blank())
+    _row("Propose overlay (p)")
+    _note("  OFFLINE, read-only: screens the newest *.json shortlist file in config.proposals_dir")
+    _note("  (produced externally -- an LLM + web-search scout, or the discover overlay's output")
+    _note("  saved to disk) through the same admission gate. No shortlist yet is reported plainly,")
+    _note("  not as an error. DB + local filesystem reads only; never touches the network.")
+    _row("  q / Esc / p    close propose, back to the dashboard")
+    lines.append(_blank())
+    _row("Discover overlay (d)")
+    _note("  Opens ARMED, NOT yet run -- pressing 'd' makes NO network call. It explains what")
+    _note("  running it will do and that it is a LIVE call to the venue. Only Enter, pressed")
+    _note("  INSIDE this overlay, actually contacts the venue (`list_products`) and proposes")
+    _note("  candidates from the result -- the same cheap pre-filter `keel assets discover` runs.")
+    _note("  The result is then HELD: every poll while the overlay stays open repaints the same")
+    _note("  cached result, with NO further network calls, until Enter is pressed again. Closing")
+    _note("  the overlay discards the held result, so reopening it is armed-but-not-run again.")
+    _row("  Enter          run discover now (the ONE network call this overlay ever makes)")
+    _row("  q / Esc / d    close discover, back to the dashboard (discards the held result)")
     lines.append(_blank())
     _row("Safety notes")
     _note(
@@ -378,6 +452,27 @@ def build_help_screen() -> list[ScreenLine]:
         "  fetch is money-safe: it only pulls candle history from the venue's public market-data"
     )
     _note("  endpoints. It places no orders and touches no rails.")
+    lines.append(_blank())
+    _note("  screen and propose are fully OFFLINE: DB (and, for propose, local filesystem)")
+    _note("  reads only. Neither ever constructs a broker or touches the network.")
+    lines.append(_blank())
+    _note(
+        "  discover is the SECOND deliberate network exception in this dashboard (after fetch):"
+    )
+    _note("  it never fires on opening the overlay and never fires again on its own while the")
+    _note("  overlay stays open -- only an explicit Enter, pressed inside it, runs the one live")
+    _note("  venue call it ever makes.")
+    lines.append(_blank())
+    _note(
+        "  NONE of screen, propose or discover attests, admits, or trades. They can only PROPOSE"
+    )
+    _note(
+        "  or REPORT -- putting an asset on `allowlist` in config.yaml still needs a human to run"
+    )
+    _note(
+        "  `keel assets attest` with a source. attest is deliberately CLI-only, never a keypress"
+    )
+    _note("  here: it is the one step in this whole gate that rests on human judgment, not code.")
     lines.append(_blank())
     _row("Every action shows a one-line result at the bottom of the dashboard until the next")
     _row("action replaces it.")
@@ -448,6 +543,152 @@ def build_insights_screen(
     return lines
 
 
+def _admission_line_style(text: str) -> str:
+    """Style a single rendered line from `keel.commands.admission`'s renderers
+    (`render_screen_report`/`render_propose_view`/`render_discover_report` -- plain, unstyled
+    `str`s, exactly the shape `_insights_line_style` already keys off) by the textual conventions
+    those renderers already share with `keel assets screen`/`propose`/`discover`'s own CLI output.
+
+    `ADMIT`/`REJECT` are the screen's actual verdict, so they carry the strongest legible
+    contrast: reassuring green for an admit, a warning (never `"alert"` -- a reject is the system
+    working as intended, not an emergency) for a reject. A `✗ ` line is a real, FAILED admission
+    criterion -- `"warn"`. An `INVALID` line (`render_propose_view`'s malformed-shortlist-entry
+    report) is a data problem in a file on disk, not a live threat -- also `"warn"`, not `"alert"`.
+
+    The `! no local history` line -- and its MISSING-DATA continuation line from
+    `missing_history_lines` -- are deliberately `"muted"`, NOT `"warn"`/`"alert"`, even though the
+    first starts with the same `!` marker every other warning does. `keel.compliance.screen.
+    split_failures`'s entire reason for existing is that "never fetched" is not a verdict about
+    the asset (see `render_screen_report`'s own docstring: a candidate this deployment has simply
+    never fetched candles for must not read as indistinguishable from one genuinely too young) --
+    painting it in the same colour as a real rejection reason would visually assert the opposite
+    of what the text says. Every OTHER `! ` line is a genuine warning (`ScreenResult.warnings`,
+    e.g. a §65.5 bay' al-sarf note that applies even to an ADMITted asset) and stays `"warn"`.
+
+    `render_discover_report`'s closing `⚠️  These are PROPOSALS, not admissions` line is the one
+    line in this whole workflow that must never be missed -- discover is the network-touching
+    overlay, and every candidate it lists is unvetted -- so it is `"alert"`, the same weight
+    `_message_style` gives to arming autonomy ON."""
+    stripped = text.strip()
+    if stripped.startswith("ADMIT"):
+        return "ok"
+    if stripped.startswith("REJECT"):
+        return "warn"
+    if stripped.startswith("✗"):
+        return "warn"
+    if stripped.startswith("!"):
+        if "no local history" in stripped.lower():
+            return "muted"
+        return "warn"
+    if "missing-data" in stripped.lower():
+        return "muted"
+    if stripped.startswith("INVALID"):
+        return "warn"
+    if stripped.startswith("⚠"):
+        return "alert"
+    return "normal"
+
+
+def build_admission_screen_overlay(report: ScreenReport) -> list[ScreenLine]:
+    """A titled, scrollable, READ-ONLY overlay over an already-built `ScreenReport` -- PURE,
+    mirroring `build_insights_screen` exactly: the caller (`run_live`'s `screen` branch, via
+    `_do_screen_report`) does the OFFLINE work of building the report fresh each poll; this
+    function only styles the lines `render_screen_report` already rendered. Never touches the
+    repo, network, or broker itself, and never admits, attests, or trades -- see the module
+    docstring."""
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- screen", "heading"), _blank()]
+    for text in render_screen_report(report):
+        lines.append(ScreenLine(text, _admission_line_style(text)) if text else _blank())
+    lines.append(_blank())
+    lines.append(ScreenLine("Press s or Esc to return to the dashboard.", "muted"))
+    return lines
+
+
+def build_propose_overlay(view: ProposeView) -> list[ScreenLine]:
+    """Same shape as `build_admission_screen_overlay`, over an already-built `ProposeView`
+    (which itself NEVER raises -- every failure mode, a missing directory through a malformed
+    shortlist file, is already a calm `status`/`detail` pair; see its own docstring).
+    PURE -- only styles what `render_propose_view` already rendered."""
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- propose", "heading"), _blank()]
+    for text in render_propose_view(view):
+        lines.append(ScreenLine(text, _admission_line_style(text)) if text else _blank())
+    lines.append(_blank())
+    lines.append(ScreenLine("Press p or Esc to return to the dashboard.", "muted"))
+    return lines
+
+
+#: Named once so the ARMED explanation's own text and the actual keypress `run_live`'s discover
+#: branch checks for can't silently drift apart -- a mismatch here (the overlay says one key,
+#: the loop listens for another) would be worse than almost anywhere else in this module, since
+#: the whole point of the ARMED state is that the operator can trust what it says before it ever
+#: touches the network.
+_DISCOVER_RUN_KEY_HINT = "Enter"
+
+
+def build_discover_overlay(
+    report: DiscoverReport | None, error: str | None = None
+) -> list[ScreenLine]:
+    """A titled, scrollable overlay over `keel.commands.admission.build_discover_report` -- PURE,
+    but unlike `build_admission_screen_overlay`/`build_propose_overlay` it renders THREE distinct
+    states, not one, because `discover` is the one overlay of this trio that needs the network
+    (see the module docstring and `run_live`'s discover branch for the full gating story):
+
+    - `report is None and error is None`: **ARMED, not yet run.** This is the state the overlay
+      opens into on `d` -- no network call has happened yet, and this rendering is the proof of
+      that: it names what pressing `_DISCOVER_RUN_KEY_HINT` will do (fetch the venue's product
+      list and propose candidates from it, the same cheap pre-filter `keel assets discover`
+      runs), that it is a LIVE call to the venue, and which key runs it. A test asserting this
+      state renders (rather than, say, a blank or "loading" screen) is the test that proves
+      opening the overlay alone never touches the network.
+    - `error is not None`: the last Enter's fetch failed (broker construction, auth, a network
+      error) -- rendered as one readable line, never a raw traceback, with the same key hint so
+      the operator knows how to retry.
+    - `report is not None`: the HELD result of the last successful Enter, rendered via
+      `render_discover_report` exactly like the other two overlays reuse their own renderer.
+
+    Whichever state, `report`/`error` are furnished by the caller -- this function itself never
+    fetches, never re-fetches, and never decides staleness; it only styles whatever it is handed.
+    """
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- discover", "heading"), _blank()]
+    if error is not None:
+        lines.append(ScreenLine(f"discover failed: {error}", "alert"))
+        lines.append(_blank())
+        lines.append(
+            ScreenLine(f"Press {_DISCOVER_RUN_KEY_HINT} to contact the venue again.", "normal")
+        )
+    elif report is None:
+        lines.append(ScreenLine("ARMED -- no network call has been made yet.", "normal"))
+        lines.append(_blank())
+        lines.append(
+            ScreenLine(
+                f"Pressing {_DISCOVER_RUN_KEY_HINT} makes ONE live call to the venue "
+                "(list_products) and proposes candidates from it -- the same cheap pre-filter "
+                "`keel assets discover` runs, on the exact same data.",
+                "normal",
+            )
+        )
+        lines.append(
+            ScreenLine(
+                "This is the second deliberate network exception in this dashboard (the first "
+                "is [f] fetch): it never fires just from opening this overlay, and it never "
+                "fires again on its own while this overlay stays open.",
+                "normal",
+            )
+        )
+        lines.append(_blank())
+        lines.append(ScreenLine("Nothing here is admitted -- discover only proposes.", "muted"))
+        lines.append(_blank())
+        lines.append(
+            ScreenLine(f"Press {_DISCOVER_RUN_KEY_HINT} to contact the venue now.", "normal")
+        )
+    else:
+        for text in render_discover_report(report):
+            lines.append(ScreenLine(text, _admission_line_style(text)) if text else _blank())
+    lines.append(_blank())
+    lines.append(ScreenLine("Press d or Esc to return to the dashboard.", "muted"))
+    return lines
+
+
 def _visible_slice(lines: list[ScreenLine], offset: int, height: int) -> list[ScreenLine]:
     """The `height`-line window of `lines` starting at `offset`, clamped so `offset` never runs
     past what would leave a partial screen at the end (or before the start). PURE -- never raises
@@ -457,6 +698,39 @@ def _visible_slice(lines: list[ScreenLine], offset: int, height: int) -> list[Sc
     max_offset = max(0, len(lines) - height)
     offset = max(0, min(offset, max_offset))
     return lines[offset : offset + height]
+
+
+def _scroll_offset(ch: int, offset: int, height: int, total: int, curses_mod: Any) -> int:
+    """The new, clamped scroll offset for a keypress inside any of the five scrollable overlays
+    (help, insights, screen, propose, discover). Factored out of `run_live` because its help and
+    insights branches used to each hand-roll an identical ~8-line up/down/PgUp/PgDn/Home/End
+    chain -- copy-pasting that a further three times for the new overlays, onto a function that
+    was already long, would have made it worse rather than better.
+
+    PURE: takes `curses_mod` as a parameter rather than importing `curses` itself, for two
+    reasons that both matter here -- `curses` is imported lazily inside `run_live` (this module
+    must stay importable with no real terminal present, and the pure-function tests must stay
+    portable), and passing it in is what lets this function be unit-tested against the SAME fake
+    `curses` module the rest of the `run_live` test suite already builds, with no real terminal
+    or `curses.wrapper` involved.
+
+    `total` is the number of lines in the overlay being scrolled (`len(lines)`), used exactly the
+    way `help_offset`/`insights_offset` always were: `End` jumps toward the bottom (clamped, like
+    every other result, to the last full page) and every key's result is clamped to `[0, max(0,
+    total - height)]` so the view can never scroll past either end."""
+    if ch in (curses_mod.KEY_UP, ord("k")):
+        offset -= 1
+    elif ch in (curses_mod.KEY_DOWN, ord("j")):
+        offset += 1
+    elif ch == curses_mod.KEY_PPAGE:
+        offset -= max(height - 1, 1)
+    elif ch == curses_mod.KEY_NPAGE:
+        offset += max(height - 1, 1)
+    elif ch == curses_mod.KEY_HOME:
+        offset = 0
+    elif ch == curses_mod.KEY_END:
+        offset = total
+    return max(0, min(offset, max(0, total - height)))
 
 
 # -- actions (injectable, unit-testable without curses/network) ----------------------------------
@@ -687,28 +961,89 @@ def _do_fetch(open_state: OpenState, now_fn: NowFn) -> str:
     return f"fetch complete ({len(products)} products, {years}y history)"
 
 
+def _do_screen_report(open_state: OpenState) -> ScreenReport:
+    """Build a fresh `ScreenReport` for the current allowlist -- OFFLINE, DB reads only, rebuilt
+    every poll while the screen overlay is open, exactly like insights' per-poll rebuild.
+    `_screen_product` (THE single admission gate every candidate source must route through) lives
+    in `keel.cli`, which itself imports THIS module to wire up `tui_cmd`/`run_live` -- importing
+    it at module load time here would cycle, so it is lazy-imported inside this function, exactly
+    like `_do_fetch` lazy-imports `_SIM_GRANULARITIES` from the same module for the same reason.
+    Thin I/O -- not unit-tested directly, only smoke-tested via `run_live`."""
+    from keel.cli import _screen_product
+
+    repo, config = open_state()
+    return build_screen_report(repo, config, _screen_product)
+
+
+def _do_propose_view(open_state: OpenState) -> ProposeView:
+    """Build a fresh `ProposeView` over the newest shortlist in `config.proposals_dir` -- OFFLINE
+    (DB + local filesystem reads only), rebuilt every poll while the propose overlay is open.
+    `_screen_product` is lazy-imported for the identical reason `_do_screen_report` lazy-imports
+    it. `build_propose_view` itself never raises (see its docstring) -- any exception reaching
+    this function's caller can only come from `open_state()` (e.g. a locked DB), never from the
+    shortlist read itself."""
+    from keel.cli import _screen_product
+
+    repo, config = open_state()
+    return build_propose_view(repo, config, _screen_product)
+
+
+def _do_discover_report(open_state: OpenState) -> DiscoverReport:
+    """THE one network call anywhere in the discover overlay -- `_build_broker(config).
+    list_products()` -- followed by the PURE `build_discover_report`, which turns the venue's raw
+    product list into candidates. Called ONLY from `run_live`'s discover branch, and only from
+    its Enter-key handler: never on opening the overlay, never on an ordinary poll while it stays
+    open. `_build_broker` is lazy-imported from `keel.commands._common`, mirroring `_do_fetch`'s
+    own lazy broker import, so a test can monkeypatch `keel.commands._common._build_broker` (to
+    record calls, or to raise if called at all) and prove this function -- and therefore this
+    whole overlay -- was, or crucially was NOT, ever invoked. Thin I/O -- not unit-tested
+    directly, only smoke-tested via `run_live`."""
+    from keel.commands._common import _build_broker
+
+    _repo, config = open_state()
+    products = _build_broker(config).list_products()
+    return build_discover_report(products, config)
+
+
 def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     """The auto-refreshing, interactive dashboard: `curses.wrapper` a loop that re-opens the repo
     (via `open_state`) every poll -- so it reflects writes committed by a separate `keel agent`
     process -- gathers a fresh report, paints it, then waits up to `interval` seconds for a
     keypress.
 
-    Three modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
-    action), `help` (a scrolled window of `build_help_screen()`), and `insights` (a scrolled
-    window of `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
+    Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
+    action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
+    `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
     `build_journal_report`, rebuilt fresh each poll while open, fail-soft exactly like the
-    normal-mode status read below). All scrolling goes through `_visible_slice`.
-    Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `r` refresh now; `a`
-    toggle autonomy (`toggle_autonomy`, gated by `_confirm_arm_autonomy` on the OFF->ON direction
-    only); `f` fetch all data (`_do_fetch`, money-safe). `a` and `f` are both wrapped in
-    `_guarded` so a failure becomes a toast, never a crash. Help-mode and insights-mode keys both
-    scroll (`up`/`k`, `down`/`j`, `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on
-    `q`/`Esc`/`h`/`?` (help) or `q`/`Esc`/`i` (insights).
+    normal-mode status read below), `screen` and `propose` (the OFFLINE admission-workflow
+    overlays, `build_admission_screen_overlay`/`build_propose_overlay` over `_do_screen_report`/
+    `_do_propose_view`, rebuilt fresh each poll while open, fail-soft the same way insights is),
+    and `discover` (the one overlay that touches the network -- see below). All five scrollable
+    overlays share one scrolling helper, `_scroll_offset`.
+
+    Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `s` open screen; `p`
+    open propose; `d` open discover; `r` refresh now; `a` toggle autonomy (`toggle_autonomy`,
+    gated by `_confirm_arm_autonomy` on the OFF->ON direction only); `f` fetch all data
+    (`_do_fetch`, money-safe). `a` and `f` are both wrapped in `_guarded` so a failure becomes a
+    toast, never a crash. help/insights/screen/propose all scroll (`up`/`k`, `down`/`j`,
+    `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on `q`/`Esc`/<their own open key>.
+
+    `discover` is different on purpose, and is the whole reason this docstring calls out FIVE
+    overlays rather than treating them identically: it needs the network, and that network call
+    must never fire just from pressing `d`. Opening it renders an ARMED, not-yet-run explanation
+    (`build_discover_overlay(None)`) with NO call made. Only Enter (`10`/`13`/`curses.KEY_ENTER`),
+    pressed INSIDE the overlay, runs `_do_discover_report` -- the one
+    `_build_broker(config).list_products()` call in this entire workflow. The result (or error)
+    is then HELD in `discover_result`/`discover_error`: every later poll while the overlay stays
+    open just repaints what is held, with NO further network calls, until Enter is pressed again.
+    Closing the overlay (`q`/`Esc`/`d`) discards the held result, so reopening it is armed but not
+    yet run again. `discover` still scrolls with the same keys as the other four.
 
     Also refreshes the live "available to buy" balance (`_refresh_balance`) on its own slow
     cadence (`_BALANCE_REFRESH_SEC`, not every repaint -- it's a real broker call), and
-    immediately on `r`. This is the one other live-network read besides `f` fetch, and it is
-    likewise money-safe: `get_accounts` only, the exact same read rail 13 funds a buy against.
+    immediately on `r`. Between that automatic slow-cadence read, `f` fetch, and now `d`+Enter,
+    those are the only three places this whole dashboard ever touches the network -- everything
+    else, including all of `screen`/`propose`/`discover`'s own reads, is DB/filesystem-only.
 
     Quits on `q`/`Q` in normal mode; a `KeyboardInterrupt` (Ctrl-C) exits gracefully rather than
     dumping a traceback onto a terminal `curses.wrapper` may not have fully restored."""
@@ -737,6 +1072,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         mode = "normal"
         help_offset = 0
         insights_offset = 0
+        screen_offset = 0
+        propose_offset = 0
+        discover_offset = 0
+        discover_result: DiscoverReport | None = None
+        discover_error: str | None = None
         message: str | None = None
         message_ts = 0
         available: AvailableBalance | None = None
@@ -749,22 +1089,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 _paint(stdscr, _visible_slice(help_lines, help_offset, height))
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (curses.KEY_UP, ord("k")):
-                    help_offset -= 1
-                elif ch in (curses.KEY_DOWN, ord("j")):
-                    help_offset += 1
-                elif ch == curses.KEY_PPAGE:
-                    help_offset -= max(height - 1, 1)
-                elif ch == curses.KEY_NPAGE:
-                    help_offset += max(height - 1, 1)
-                elif ch == curses.KEY_HOME:
-                    help_offset = 0
-                elif ch == curses.KEY_END:
-                    help_offset = len(help_lines)
-                elif ch in (ord("q"), 27, ord("h"), ord("?")):
+                if ch in (ord("q"), 27, ord("h"), ord("?")):
                     mode = "normal"
                     help_offset = 0
-                help_offset = max(0, min(help_offset, max(0, len(help_lines) - height)))
+                else:
+                    help_offset = _scroll_offset(ch, help_offset, height, len(help_lines), curses)
                 continue
 
             if mode == "insights":
@@ -799,22 +1128,100 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 _paint(stdscr, _visible_slice(insights_lines, insights_offset, height))
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (curses.KEY_UP, ord("k")):
-                    insights_offset -= 1
-                elif ch in (curses.KEY_DOWN, ord("j")):
-                    insights_offset += 1
-                elif ch == curses.KEY_PPAGE:
-                    insights_offset -= max(height - 1, 1)
-                elif ch == curses.KEY_NPAGE:
-                    insights_offset += max(height - 1, 1)
-                elif ch == curses.KEY_HOME:
-                    insights_offset = 0
-                elif ch == curses.KEY_END:
-                    insights_offset = len(insights_lines)
-                elif ch in (ord("q"), 27, ord("i")):
+                if ch in (ord("q"), 27, ord("i")):
                     mode = "normal"
                     insights_offset = 0
-                insights_offset = max(0, min(insights_offset, max(0, len(insights_lines) - height)))
+                else:
+                    insights_offset = _scroll_offset(
+                        ch, insights_offset, height, len(insights_lines), curses
+                    )
+                continue
+
+            if mode == "screen":
+                # OFFLINE + fail-soft, mirroring the insights branch above: `_do_screen_report`
+                # only reads the DB (never a broker, never the network -- see its own docstring),
+                # and a transient read error paints an alert line and keeps polling instead of
+                # crashing the loop.
+                try:
+                    screen_report = _do_screen_report(open_state)
+                    screen_lines = build_admission_screen_overlay(screen_report)
+                except Exception as exc:
+                    screen_lines = [
+                        ScreenLine(f"screen read failed: {exc} -- retrying...", "alert")
+                    ]
+
+                height, _width = stdscr.getmaxyx()
+                _paint(stdscr, _visible_slice(screen_lines, screen_offset, height))
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("s")):
+                    mode = "normal"
+                    screen_offset = 0
+                else:
+                    screen_offset = _scroll_offset(
+                        ch, screen_offset, height, len(screen_lines), curses
+                    )
+                continue
+
+            if mode == "propose":
+                # OFFLINE + fail-soft, same shape as screen above. `_do_propose_view` itself
+                # never raises (`build_propose_view`'s own docstring) -- an exception here can
+                # only come from `open_state()` (e.g. a locked DB), never from the shortlist read.
+                try:
+                    propose_lines = build_propose_overlay(_do_propose_view(open_state))
+                except Exception as exc:
+                    propose_lines = [
+                        ScreenLine(f"propose read failed: {exc} -- retrying...", "alert")
+                    ]
+
+                height, _width = stdscr.getmaxyx()
+                _paint(stdscr, _visible_slice(propose_lines, propose_offset, height))
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("p")):
+                    mode = "normal"
+                    propose_offset = 0
+                else:
+                    propose_offset = _scroll_offset(
+                        ch, propose_offset, height, len(propose_lines), curses
+                    )
+                continue
+
+            if mode == "discover":
+                # NETWORK-GATED, on purpose -- see the module docstring and `build_discover_
+                # overlay`'s. Unlike every branch above, this one does NOT rebuild anything on an
+                # ordinary poll: `discover_result`/`discover_error` are HELD from the last Enter
+                # (both `None` if Enter has never been pressed since the overlay opened), and
+                # every poll just repaints whatever is currently held. The Enter-key check below
+                # is the ONLY place in this whole branch that calls `_do_discover_report`.
+                discover_lines = build_discover_overlay(discover_result, error=discover_error)
+
+                height, _width = stdscr.getmaxyx()
+                _paint(stdscr, _visible_slice(discover_lines, discover_offset, height))
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("d")):
+                    mode = "normal"
+                    discover_offset = 0
+                    # Discard the held result -- reopening the overlay is armed-but-not-run again.
+                    discover_result = None
+                    discover_error = None
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(stdscr, [ScreenLine("contacting venue... please wait", "normal")])
+                    try:
+                        discover_result = _do_discover_report(open_state)
+                        discover_error = None
+                    except Exception as exc:
+                        discover_result = None
+                        # Truncated for the same reason `_refresh_balance`'s error is: a stray
+                        # huge or sensitive blob (an HTTP error body, say) must never be painted
+                        # full-screen verbatim.
+                        discover_error = str(exc)[:200]
+                    discover_offset = 0
+                else:
+                    discover_offset = _scroll_offset(
+                        ch, discover_offset, height, len(discover_lines), curses
+                    )
                 continue
 
             # mode == "normal"
@@ -861,6 +1268,23 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
             if ch == ord("i"):
                 mode = "insights"
                 insights_offset = 0
+                continue
+            if ch == ord("s"):
+                mode = "screen"
+                screen_offset = 0
+                continue
+            if ch == ord("p"):
+                mode = "propose"
+                propose_offset = 0
+                continue
+            if ch == ord("d"):
+                mode = "discover"
+                discover_offset = 0
+                # Always opens ARMED, not yet run -- even if a previous visit left a held result,
+                # a fresh 'd' press starts over rather than silently showing stale data. (Closing
+                # the overlay already clears these too; this is belt-and-braces.)
+                discover_result = None
+                discover_error = None
                 continue
             if ch == ord("r"):
                 last_balance_ts = 0  # force the balance to re-fetch on the next iteration too
@@ -936,20 +1360,35 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
 
     A view over the same `gather_status` report `keel status` prints once: mode, kill-switch,
     autonomy, Rail 11 drawdown/equity state, open positions, rule counts, per-product data
-    freshness, and subscriptions, auto-refreshing on an interval. Never places an order and never
-    touches the network except when explicitly asked to (`f`). Press `h`/`?` for the in-app help
-    (every keybinding and the safety notes); `i` opens a browsable, READ-ONLY insights overlay
-    (per-rule track record, promotion-gate distance, account summary, and a recent-trades tail --
-    reusing `keel insights`' own pure builders/renderers verbatim); `a` toggles autonomy (turning
-    it OFF is instant, turning it ON needs a typed "yes" at the terminal, exactly like `keel
-    autonomy on`); `f` fetches fresh candle history for every configured product (money-safe: no
-    orders); `r` refreshes immediately. Quit with `q`.
+    freshness, and subscriptions, auto-refreshing on an interval. Never places an order.
+
+    Network touches are the exception, not the rule, and there are exactly three: an automatic
+    read of the real account's spendable balance every ~30s (`get_accounts`, the same read rail
+    13 funds a buy against -- see `run_live`'s docstring), `f` fetch (pulls candle history, no
+    orders), and `d`+Enter inside the discover overlay (pulls the venue's product list, no
+    orders). Everything else -- including the whole `s` screen / `p` propose / `d` discover
+    admission workflow up until that one Enter keypress -- is DB/filesystem reads only.
+
+    Press `h`/`?` for the in-app help (every keybinding and the safety notes); `i` opens a
+    browsable, READ-ONLY insights overlay (per-rule track record, promotion-gate distance,
+    account summary, and a recent-trades tail -- reusing `keel insights`' own pure
+    builders/renderers verbatim); `s` opens a READ-ONLY screen overlay (the allowlist's current
+    admission verdicts, reusing `keel assets screen`'s own gate); `p` opens a READ-ONLY propose
+    overlay (screens the newest shortlist file in `config.proposals_dir`); `d` opens the discover
+    overlay ARMED but not yet run -- it explains itself and waits for Enter before making its one
+    live venue call, then holds that result until Enter is pressed again or the overlay closes.
+    None of `screen`/`propose`/`discover` attests, admits, or trades -- `attest` (the human
+    judgment this whole gate rests on) stays deliberately CLI-only, `keel assets attest`. `a`
+    toggles autonomy (turning it OFF is instant, turning it ON needs a typed "yes" at the
+    terminal, exactly like `keel autonomy on`); `f` fetches fresh candle history for every
+    configured product (money-safe: no orders); `r` refreshes immediately. Quit with `q`.
 
     `--once` renders a single, static frame to stdout and exits without touching curses, for
     pipes/CI, matching `status`'s scripting-friendliness (and prints the disclaimer footer after
-    the frame) -- none of the interactive actions are available there. The default, interactive
-    path owns the whole screen via `curses.wrapper` and re-opens the repo every poll so it
-    reflects writes committed by a separate `keel agent` process.
+    the frame) -- none of the interactive actions (including `screen`/`propose`/`discover`) are
+    available there. The default, interactive path owns the whole screen via `curses.wrapper` and
+    re-opens the repo every poll so it reflects writes committed by a separate `keel agent`
+    process.
     """
     if interval <= 0:
         raise click.ClickException("--interval must be > 0")

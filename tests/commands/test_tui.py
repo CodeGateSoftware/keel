@@ -20,6 +20,7 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
+from keel.commands.admission import DiscoverReport
 from keel.commands.insights import (
     AccountSummary as InsightsAccountSummary,
 )
@@ -43,6 +44,7 @@ from keel.commands.tui import (
     _SHORT_VERSION,
     AvailableBalance,
     ScreenLine,
+    _admission_line_style,
     _available_lines,
     _confirm_arm_autonomy,
     _footer_lines,
@@ -52,18 +54,23 @@ from keel.commands.tui import (
     _message_style,
     _paint,
     _refresh_balance,
+    _scroll_offset,
     _short_version,
     _stdio_is_interactive,
     _style_attrs,
     _visible_slice,
+    build_admission_screen_overlay,
+    build_discover_overlay,
     build_help_screen,
     build_insights_screen,
+    build_propose_overlay,
     build_screen,
     render_plain,
     run_live,
     run_once,
     toggle_autonomy,
 )
+from keel.compliance import screen as screen_mod
 from keel.config import (
     AutoTradeConfig,
     Caps,
@@ -241,21 +248,37 @@ def test_build_screen_includes_subscriptions() -> None:
 
 
 def test_build_screen_footer_is_present_and_interval_independent() -> None:
+    """The footer is now TWO lines (`_footer_lines`); `build_screen` appends both as its last two
+    rows, and both must carry the original keybinding hints -- the second line does not replace
+    the first, it adds the admission keys the first line had no room for."""
     report = _base_report()
     lines = build_screen(report, NOW_TS)
-    footer = lines[-1]
-    assert footer.style == "muted"
-    assert "quit" in footer.text.lower()
-    assert "help" in footer.text.lower()
+    footer = lines[-2:]
+    assert all(line.style == "muted" for line in footer)
+    joined = " ".join(line.text.lower() for line in footer)
+    assert "quit" in joined
+    assert "help" in joined
 
 
 def test_footer_lines_contains_keybinding_hints() -> None:
+    """The FIRST footer line is kept byte-for-byte as it was before the admission overlays
+    existed (see `_footer_lines`'s docstring) -- every hint that used to live in the single line
+    must still be found there, not merely somewhere across the two lines."""
     lines = _footer_lines()
-    assert len(lines) == 1
-    footer = lines[0]
-    assert footer.style == "muted"
-    text = footer.text.lower()
+    assert len(lines) == 2
+    first = lines[0]
+    assert first.style == "muted"
+    text = first.text.lower()
     for hint in ("quit", "help", "refresh", "autonomy", "fetch", "insights"):
+        assert hint in text
+
+
+def test_footer_lines_second_line_documents_admission_keys() -> None:
+    lines = _footer_lines()
+    second = lines[1]
+    assert second.style == "muted"
+    text = second.text.lower()
+    for hint in ("screen", "propose", "discover"):
         assert hint in text
 
 
@@ -584,6 +607,7 @@ def _fake_curses(*, has_colors: bool = True) -> SimpleNamespace:
         KEY_NPAGE=1004,
         KEY_HOME=1005,
         KEY_END=1006,
+        KEY_ENTER=1007,
         error=_FakeCursesError,
         has_colors=lambda: has_colors,
         start_color=lambda: calls.append("start_color"),
@@ -880,6 +904,361 @@ def test_run_live_insights_survives_transient_read_error_and_keeps_polling(
     )
 
 
+# -- run_live: screen / propose overlays (offline, DB-only) ---------------------------------------
+
+
+def test_run_live_s_opens_screen_overlay_and_esc_closes_it(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_run_live_i_opens_insights_overlay_and_esc_closes_it`: 's' opens the screen
+    overlay, Esc closes it back to the dashboard."""
+    config = _config()
+    keys = [ord("s"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    screen_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- screen" in t)
+    dashboard_after_idx = next(
+        i for i, t in enumerate(painted_texts) if i > screen_idx and "paper mode" in t
+    )
+    assert dashboard_after_idx > screen_idx
+
+
+def test_run_live_p_opens_propose_overlay_and_esc_closes_it(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Mirrors the 's' test above, for 'p'. `proposals_dir` points at a tmp_path subdirectory
+    (rather than the config default, `~/keel/proposals`) so this test never reads a real
+    deployment's proposals directory."""
+    config = _config(proposals_dir=str(tmp_path / "proposals"))
+    keys = [ord("p"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    propose_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- propose" in t)
+    dashboard_after_idx = next(
+        i for i, t in enumerate(painted_texts) if i > propose_idx and "paper mode" in t
+    )
+    assert dashboard_after_idx > propose_idx
+
+
+def test_run_live_screen_survives_transient_read_error_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The screen branch has its OWN try/except, mirroring insights' -- a transient failure (e.g.
+    `database is locked`) must paint a `screen read failed` alert line, not crash or hang, and the
+    loop must still be able to close the overlay and keep running afterwards."""
+    config = _config()
+    # poll1: normal -> open_state call #1 (status) + #2 (balance refresh) both succeed; 's' opens
+    # screen. poll2: screen -> open_state call #3 (inside `_do_screen_report`) raises; Esc closes
+    # back to normal. poll3: normal -> open_state call #4 succeeds; 'q' quits (default).
+    keys = [ord("s"), 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    opens: list[int] = []
+
+    def open_state() -> tuple[Repository, Any]:
+        opens.append(1)
+        if len(opens) == 3:
+            raise RuntimeError("database is locked")
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    assert len(opens) >= 4
+    painted_texts = [call[2] for call in stdscr.calls]
+    failed_idx = next(i for i, t in enumerate(painted_texts) if "screen read failed" in t)
+    assert "database is locked" in painted_texts[failed_idx]
+    assert any(i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts))
+
+
+def test_run_live_propose_survives_transient_read_error_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Same shape as the screen version above, for 'p'."""
+    config = _config(proposals_dir=str(tmp_path / "proposals"))
+    keys = [ord("p"), 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    opens: list[int] = []
+
+    def open_state() -> tuple[Repository, Any]:
+        opens.append(1)
+        if len(opens) == 3:
+            raise RuntimeError("database is locked")
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    assert len(opens) >= 4
+    painted_texts = [call[2] for call in stdscr.calls]
+    failed_idx = next(i for i, t in enumerate(painted_texts) if "propose read failed" in t)
+    assert "database is locked" in painted_texts[failed_idx]
+    assert any(i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts))
+
+
+def test_run_live_screen_and_propose_never_construct_a_broker(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`screen`/`propose` are fully OFFLINE -- opening either, polling, and closing must never
+    reach `_build_broker` of their own accord. `_build_broker` IS still called once during this
+    run -- by `run_live`'s pre-existing, unrelated automatic "available to buy" balance refresh,
+    which (with a constant `now_fn`) fires exactly once, on the very first poll, and never again.
+    `len(calls) == 1` here is exactly that one call, proving screen/propose contributed zero
+    calls of their own -- the DIRECT proof (screen/propose never import `_build_broker` at all)
+    lives in `_do_screen_report`'s/`_do_propose_view`'s own source; this is the behavioural
+    cross-check."""
+    config = _config(proposals_dir=str(tmp_path / "proposals"))
+    calls: list[Any] = []
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        calls.append(cfg)
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 's'. poll2: screen, no key. poll3: Esc closes. poll4: normal -> 'p'.
+    # poll5: propose, no key. poll6: Esc closes. poll7: normal -> 'q' (post-exhaustion default).
+    keys = [ord("s"), -1, 27, ord("p"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    assert len(calls) == 1
+
+
+# -- run_live: discover overlay (the network-gated one) --------------------------------------------
+
+
+def test_run_live_discover_opens_armed_and_never_touches_the_network_until_enter(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE most important test in this batch. Pressing 'd', polling several times, then closing
+    must never call `list_products` -- the ONE network call this whole overlay can ever make is
+    gated behind an explicit Enter keypress, not behind opening the overlay or an ordinary poll.
+    (`_build_broker` itself is still called once by the pre-existing automatic balance refresh,
+    unrelated to discover -- see `test_run_live_screen_and_propose_never_construct_a_broker`'s
+    docstring for why that call doesn't confuse this assertion; `list_products` is the call that
+    is unique to, and gated by, discover, and it is the one this test pins to zero.)"""
+    config = _config()
+    list_products_calls: list[int] = []
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            list_products_calls.append(1)
+            return []
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 'd' opens discover, ARMED. poll2, poll3: no key -- repaint the armed state,
+    # no fetch. poll4: Esc closes. poll5: normal -> 'q' quits (post-exhaustion default).
+    keys = [ord("d"), -1, -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    assert list_products_calls == []
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("ARMED" in t for t in painted_texts)
+    assert any("paper mode" in t for t in painted_texts)  # closed back to the dashboard
+
+
+def test_run_live_discover_enter_calls_list_products_once_then_holds_the_result(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart to the gating test above: Enter DOES run the one network call, exactly
+    once -- and further polls while the overlay stays open repaint the HELD result rather than
+    re-fetching (no further `list_products` calls without another Enter)."""
+    config = _config()
+    list_products_calls: list[int] = []
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            list_products_calls.append(1)
+            return [
+                {
+                    "product_id": "SOL-USD",
+                    "quote_currency_id": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                    "is_disabled": False,
+                    "view_only": False,
+                    "quote_24h_volume": "9000000",
+                    "base_name": "Solana",
+                }
+            ]
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 'd'. poll2: discover ARMED -> Enter runs the one fetch. poll3, poll4: no
+    # key -- repaint the held result, no further call. poll5: Esc closes.
+    keys = [ord("d"), 10, -1, -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    assert len(list_products_calls) == 1
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("SOL-USD" in t for t in painted_texts)
+
+
+def test_run_live_discover_enter_raising_paints_readable_failure_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broker/network/auth failure on Enter must paint a readable `discover failed` line, not
+    crash the loop -- and Esc still closes the overlay afterwards, repainting the dashboard."""
+    config = _config()
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            raise RuntimeError("venue unreachable")
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    keys = [ord("d"), 10, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    failed_idx = next(i for i, t in enumerate(painted_texts) if "discover failed" in t)
+    assert "venue unreachable" in painted_texts[failed_idx]
+    assert any(i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts))
+
+
+def test_run_live_discover_closing_discards_the_held_result(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing the overlay (Esc) must discard the held result -- reopening it must be armed but
+    not yet run again, not silently show the previous run's stale candidates."""
+    config = _config()
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            return [
+                {
+                    "product_id": "SOL-USD",
+                    "quote_currency_id": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                    "is_disabled": False,
+                    "view_only": False,
+                    "quote_24h_volume": "9000000",
+                    "base_name": "Solana",
+                }
+            ]
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 'd'. poll2: discover ARMED -> Enter fetches SOL-USD. poll3: Esc closes
+    # (discards). poll4: normal -> 'd' reopens. poll5: discover -- must be ARMED again, no
+    # candidates carried over. poll6: Esc closes.
+    keys = [ord("d"), 10, 27, ord("d"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    sol_idx = next(i for i, t in enumerate(painted_texts) if "SOL-USD" in t)
+    # Every frame painted AFTER the SOL-USD result must be the armed re-explanation, not a
+    # repaint of the stale candidate list.
+    reopened_armed_idx = next(
+        i for i, t in enumerate(painted_texts) if i > sol_idx and "ARMED" in t
+    )
+    assert not any(
+        "SOL-USD" in t for t in painted_texts[reopened_armed_idx:]
+    )
+
+
 def test_run_live_read_error_does_not_swallow_keyboard_interrupt(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,7 +1284,21 @@ def test_build_help_screen_documents_every_key_and_safety_notes() -> None:
     text = " ".join(line.text.lower() for line in lines)
     for word in ("autonomy", "fetch", "quit", "scroll", "refresh", "help"):
         assert word in text
+    # v3: the admission workflow's three overlays and the CLI-only attest step.
+    for word in ("screen", "propose", "discover", "attest"):
+        assert word in text
     assert lines[0].style == "heading"
+
+
+def test_build_help_screen_documents_discover_network_gating_and_attest_is_cli_only() -> None:
+    """The safety notes must be explicit about the two things that make `discover` different
+    from `screen`/`propose`, and that `attest` -- the one step that actually changes the
+    allowlist -- is never reachable from here."""
+    lines = build_help_screen()
+    text = " ".join(line.text.lower() for line in lines)
+    assert "second deliberate network exception" in text
+    assert "cli-only" in text
+    assert "keel assets attest" in text
 
 
 def test_build_help_screen_is_longer_than_a_small_terminal() -> None:
@@ -1124,6 +1517,191 @@ def test_build_insights_screen_is_read_only_pure() -> None:
     first = build_insights_screen(report, journal)
     second = build_insights_screen(report, journal)
     assert [line.text for line in first] == [line.text for line in second]
+
+
+# -- _scroll_offset (pure, shared by help/insights/screen/propose/discover) ----------------------
+
+
+def test_scroll_offset_up_and_down_move_by_one() -> None:
+    fake_curses = _fake_curses()
+    assert _scroll_offset(fake_curses.KEY_UP, 5, height=10, total=50, curses_mod=fake_curses) == 4
+    assert _scroll_offset(ord("k"), 5, height=10, total=50, curses_mod=fake_curses) == 4
+    assert _scroll_offset(fake_curses.KEY_DOWN, 5, height=10, total=50, curses_mod=fake_curses) == 6
+    assert _scroll_offset(ord("j"), 5, height=10, total=50, curses_mod=fake_curses) == 6
+
+
+def test_scroll_offset_page_up_and_down_move_by_almost_a_screen() -> None:
+    fake_curses = _fake_curses()
+    result = _scroll_offset(fake_curses.KEY_PPAGE, 20, height=10, total=50, curses_mod=fake_curses)
+    assert result == 11
+    result = _scroll_offset(fake_curses.KEY_NPAGE, 20, height=10, total=50, curses_mod=fake_curses)
+    assert result == 29
+
+
+def test_scroll_offset_home_jumps_to_top() -> None:
+    fake_curses = _fake_curses()
+    result = _scroll_offset(fake_curses.KEY_HOME, 20, height=10, total=50, curses_mod=fake_curses)
+    assert result == 0
+
+
+def test_scroll_offset_end_jumps_to_the_last_full_page() -> None:
+    fake_curses = _fake_curses()
+    result = _scroll_offset(fake_curses.KEY_END, 0, height=10, total=50, curses_mod=fake_curses)
+    assert result == 40
+
+
+def test_scroll_offset_clamps_negative_to_zero() -> None:
+    fake_curses = _fake_curses()
+    assert _scroll_offset(fake_curses.KEY_UP, 0, height=10, total=50, curses_mod=fake_curses) == 0
+
+
+def test_scroll_offset_clamps_past_the_last_full_page() -> None:
+    fake_curses = _fake_curses()
+    result = _scroll_offset(fake_curses.KEY_DOWN, 40, height=10, total=50, curses_mod=fake_curses)
+    assert result == 40
+
+
+def test_scroll_offset_unrecognized_key_is_a_noop() -> None:
+    """A no-key poll (`getch()` returns `-1` on timeout) or any other unmapped keycode must leave
+    the offset exactly where it was (still clamped) -- this is what makes it safe to route EVERY
+    keypress in a scrollable overlay through this function, not just the six scroll keys."""
+    fake_curses = _fake_curses()
+    assert _scroll_offset(-1, 5, height=10, total=50, curses_mod=fake_curses) == 5
+
+
+# -- _admission_line_style (pure) -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("ADMIT   BTC      bars=2000 median_daily_volume=2000000 on-allowlist attested", "ok"),
+        ("REJECT  SOL      bars=0 median_daily_volume=0 not-on-allowlist UNATTESTED", "warn"),
+        ("    ✗ history: only 500 bars, need 1460", "warn"),
+        ("    ! sector unknown -- treated as non-yielding until attested", "warn"),
+        ("INVALID  missing asset: {'rationale': 'r'}", "warn"),
+        ("⚠️  These are PROPOSALS, not admissions. Nothing above has been screened.", "alert"),
+        ("some other plain line", "normal"),
+        ("shortlist: /home/user/keel/proposals/2026-08-01.json", "normal"),
+    ],
+)
+def test_admission_line_style_conventions(text: str, expected: str) -> None:
+    assert _admission_line_style(text) == expected
+
+
+def test_admission_line_style_missing_history_line_is_muted_not_alert_or_warn() -> None:
+    """`! no local history` -- and its MISSING-DATA continuation line from `missing_history_
+    lines` -- must NOT read as an alarm: `keel.compliance.screen.split_failures`'s whole reason
+    for existing is that "never fetched" is not a verdict about the asset (see
+    `render_screen_report`'s own docstring), so painting it `"warn"`/`"alert"`, the colours a
+    REAL rejection reason gets, would visually assert the opposite of what the text says."""
+    missing = (
+        "    ! no local history for SOL-USD -- run `keel fetch --products SOL-USD` first, "
+        "then re-screen."
+    )
+    style = _admission_line_style(missing)
+    assert style == "muted"
+    assert style not in ("alert", "warn")
+
+    continuation = (
+        "      This is a MISSING-DATA verdict, not a verdict about the asset: it is not too "
+        "young, we have simply never fetched candles for it."
+    )
+    style = _admission_line_style(continuation)
+    assert style == "muted"
+    assert style not in ("alert", "warn")
+
+
+# -- build_admission_screen_overlay / build_propose_overlay / build_discover_overlay (pure) ------
+
+
+def _fake_screen_fn(*, admitted: bool = True):
+    """A minimal `ScreenFn` stub -- deliberately NOT `_screen_product` itself, since these tests
+    exercise `build_admission_screen_overlay`/`build_propose_overlay` (pure styling over an
+    already-built report), not the admission gate's own logic (covered by
+    `tests/commands/test_admission.py`)."""
+
+    def _screen(repo: Repository, product: str, quote: str):
+        facts = screen_mod.MarketFacts(
+            asset=product.split("-")[0],
+            daily_bars=2000,
+            median_daily_volume=Decimal("2000000"),
+            quotable_in_settlement_currency=True,
+            product_id=product,
+        )
+        result = screen_mod.ScreenResult(asset=facts.asset, admitted=admitted)
+        return facts, result
+
+    return _screen
+
+
+def test_build_admission_screen_overlay_is_nonempty_titled_and_headed(repo: Repository) -> None:
+    from keel.commands.admission import build_screen_report
+
+    config = _config(allowlist=["BTC"])
+    report = build_screen_report(repo, config, _fake_screen_fn())
+
+    lines = build_admission_screen_overlay(report)
+
+    assert lines
+    assert lines[0].style == "heading"
+    assert lines[0].text == "keel tui -- screen"
+
+
+def test_build_propose_overlay_is_nonempty_titled_and_headed(repo: Repository, tmp_path) -> None:
+    from keel.commands.admission import build_propose_view
+
+    config = _config(proposals_dir=str(tmp_path / "proposals"))
+    view = build_propose_view(repo, config, _fake_screen_fn(), directory=tmp_path / "proposals")
+
+    lines = build_propose_overlay(view)
+
+    assert lines
+    assert lines[0].style == "heading"
+    assert lines[0].text == "keel tui -- propose"
+
+
+def test_build_discover_overlay_with_report_is_nonempty_titled_and_headed() -> None:
+    candidate = screen_mod.Candidate(
+        product_id="SOL-USD", asset="SOL", base_name="Solana", quote_24h_volume=Decimal("9000000")
+    )
+    report = DiscoverReport(
+        quote="USD",
+        venue_product_count=900,
+        candidates=[candidate],
+        min_quote_24h_volume=Decimal("5000000"),
+    )
+
+    lines = build_discover_overlay(report)
+
+    assert lines
+    assert lines[0].style == "heading"
+    assert lines[0].text == "keel tui -- discover"
+    assert any("SOL-USD" in line.text for line in lines)
+
+
+def test_build_discover_overlay_none_renders_armed_explanation_and_the_run_key() -> None:
+    """The state `build_discover_overlay(None)` renders is the proof that opening the discover
+    overlay makes NO network call -- it must say so plainly, name what Enter will do, and name
+    Enter itself, not just render a blank or "loading" screen."""
+    lines = build_discover_overlay(None)
+
+    assert lines[0].style == "heading"
+    assert lines[0].text == "keel tui -- discover"
+    text = " ".join(line.text for line in lines)
+    assert "ARMED" in text
+    assert "no network call" in text.lower()
+    assert "Enter" in text
+
+
+def test_build_discover_overlay_with_error_renders_readable_failure_not_a_traceback() -> None:
+    lines = build_discover_overlay(None, error="could not reach coinbase.com")
+
+    text = " ".join(line.text for line in lines)
+    assert "discover failed" in text.lower()
+    assert "could not reach coinbase.com" in text
+    failure_line = next(line for line in lines if "discover failed" in line.text.lower())
+    assert failure_line.style == "alert"
 
 
 # -- toggle_autonomy / _guarded (injectable actions, no curses/network) ---------------------------
