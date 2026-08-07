@@ -104,6 +104,13 @@
 #         "already ran" would silently disable the detector until the real clock catches up to the
 #         bogus stamp, which could be years. Distinct from 65 (stamp is not a date at all) so an
 #         operator can tell the two apart at a glance -- see A2, part two, below.
+#   68 -- the HALT SENTINEL ($STAMP.halt) is present: a PREVIOUS trigger's post-cycle stamp write
+#         failed AFTER that trigger's cycle had already run (see A3 layer two and A9 below). This
+#         is a deliberate DEAD STOP, not a retry -- a cycle may have placed an order and the script
+#         has no way to know whether it did, so it refuses on EVERY trigger, not just the one that
+#         hit the failure, until a human inspects and clears the sentinel. Distinct from 66 so an
+#         operator can tell "a stamp write just failed, this one trigger" (66) apart from "a
+#         previous failure is still blocking every trigger since" (68) at a glance.
 #
 # NOTIFICATION POLICY. A macOS notification fires for two kinds of thing:
 #   (a) a condition the machine cannot self-heal without a human touching it -- exit codes
@@ -146,6 +153,11 @@ STAMP="$DIR/logs/.keel-live-last-run"
 # also carry an integer. See the increment/reset sites near the bottom of this script and the
 # NOTIFICATION POLICY paragraph above.
 FAILCOUNT="$STAMP.failures"
+# A9 (Finding 1, MEDIUM). The HALT SENTINEL, next to $STAMP for the same reason $FAILCOUNT is:
+# dropped when the post-cycle stamp write fails AFTER a cycle has already run, and checked at the
+# very top of the script on every subsequent trigger. See A9 below (the top-of-script check) and
+# the write site near the bottom of this script for why this exists and what it bounds.
+HALT="$STAMP.halt"
 # The one seam every macOS notification in this script goes through. Same purpose as the `DIR=`
 # rewrite tests/test_schedule.py::_sandbox already relies on: it lets the schedule tests swap in a
 # recorder and assert BOTH that a machine-is-broken condition alerts and that an ordinary
@@ -214,6 +226,28 @@ if [ "$HOUR" -gt 23 ]; then
 fi
 TODAY="$TODAY_RAW"
 
+# A9 (Finding 1, MEDIUM), the HALT SENTINEL check. Deliberately the FIRST thing after the clock is
+# validated and BEFORE the stamp is even read: layers one and two below (the pre-flight probe and
+# the post-cycle readback) each close a window at a different point in the cycle, but $STAMP can
+# still become unreplaceable in the gap BETWEEN a passing pre-flight and the post-cycle write --
+# e.g. the volume drops to read-only mid-cycle, or something else starts holding $STAMP open. When
+# that happens a cycle has ALREADY RUN -- and, with autonomy ON, may have placed an order -- and
+# the day is left unstamped, so without this check the very next trigger would see "not yet done"
+# and run ANOTHER cycle, compounding the exact duplicate this whole file exists to prevent. The
+# write site near the bottom of this script drops $HALT the moment that residual-window failure is
+# detected; this is the other half, checked on every trigger from then on.
+#
+# This is a DEAD STOP, not a retry: only a human removing $HALT -- after confirming what actually
+# happened on the exchange -- clears it. That is the correct default because it bounds the damage
+# to the ONE cycle that already ran instead of up to 23 more that UTC day, and because a lost
+# trading day is recoverable where a duplicate live entry is not.
+if [ -e "$HALT" ]; then
+  notify "keel-live: HALTED by ${HALT} -- a previous trigger's day-stamp write failed AFTER its cycle already ran, and an order may already be placed. An operator must confirm what happened on the exchange, then remove ${HALT}, before this will run again."
+  printf '%s [keel-live] halt sentinel present (%s) -- refusing to run, every trigger, until a human clears it -- exit 68\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$HALT"
+  exit 68
+fi
+
 STAMPED="$(cat "$STAMP" 2>/dev/null || true)"
 
 # A2 (Finding 4, MED), part one. A non-empty stamp that is not a well-formed ISO date must never
@@ -281,24 +315,70 @@ if [ "$HOUR" -lt "$SCHED_HOUR" ]; then
 fi
 
 # A3 (Finding 2, HIGH), layer one: PRE-FLIGHT, before invoking keel at all. Prove the stamp is
-# PERSISTABLE by writing a throwaway probe file next to $STAMP, reading it back, and removing it.
-# Reproduced by the reviewer with a read-only logs dir: the OLD script ran the cycle, the stamp
-# write then failed SILENTLY, rc was 0, and the next trigger ran a SECOND full cycle. Exiting
-# nonzero AFTER a cycle has already run does not prevent that duplicate -- if autonomy is ON the
-# order is already placed, and the next trigger will still re-run because the write already
-# failed once and nothing detected it. The only way to turn "duplicate real order" into "no
-# trading plus a loud alert" is to refuse to trade when we cannot record that we traded. That is
-# failing CLOSED, and it is the correct direction here even though it costs a trading day: a
-# missed day is recoverable, a duplicate live entry is not.
+# REPLACEABLE by round-tripping through the EXACT path the real post-cycle write uses.
+#
+# An EARLIER version of this pre-flight wrote its probe to a DIFFERENT path ($STAMP.preflight.$$),
+# read that back, and removed it. That only proves the DIRECTORY is writable -- it says nothing
+# about whether $STAMP ITSELF can be replaced. The gap between those two is exactly how the
+# reviewer reproduced a live duplicate: with $STAMP made a DIRECTORY (a botched restore, or a
+# `mkdir` typo) or with `uchg` set on it, the directory-probe pre-flight passed every single time
+# -- it never touched $STAMP -- keel ran and PLACED ORDERS, and only the real post-cycle write,
+# which actually targets $STAMP, then failed. Five triggers in one UTC day reproduced as exit 66
+# five times over with FIVE cycles having already run, each placing real orders -- precisely the
+# "exiting nonzero AFTER a cycle already ran does not prevent the duplicate" pattern this
+# pre-flight exists to reject, just never closed for this particular case before now. Probing the
+# real path closes that gap by construction: if $STAMP cannot be replaced, this probe fails for
+# the identical reason the real write would have, before any cycle runs.
+#
+# First, reject outright a stamp that EXISTS but is not a REGULAR FILE. This is not just a cheap
+# shortcut for the directory case (though it is that): `mv -f` onto a directory does not replace
+# it, it silently MOVES the temp file INSIDE the directory, which could make the round-trip below
+# spuriously "succeed" (the readback could even find stale content left over from some earlier
+# probe) while never proving $STAMP itself is replaceable at all. Catching the wrong file TYPE
+# here, before ever attempting the round-trip, avoids that trap entirely.
+if [ -e "$STAMP" ] && [ ! -f "$STAMP" ]; then
+  notify "keel-live: the day-stamp path (${STAMP}) exists but is not a regular file -- refusing to run a cycle. An operator needs to inspect and fix ${STAMP} (e.g. a botched restore left a directory there, or clear an immutable flag)."
+  printf '%s [keel-live] pre-flight FAILED -- %s exists and is not a regular file -- refusing to run a cycle -- exit 66\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMP"
+  exit 66
+fi
+#
+# Then round-trip through $STAMP itself: write a temp file, `mv -f` it ONTO $STAMP (the identical
+# two steps the real post-cycle write below performs), and read $STAMP back. When a stamp already
+# exists, the probe payload is that stamp's OWN current contents ($STAMPED, already read and
+# validated above, before this point $STAMPED is either empty or a real ISO date strictly before
+# today) -- so a successful probe is a semantic NO-OP: $STAMP ends this block holding exactly what
+# it held going in. When there is no stamp yet, the probe payload is a throwaway marker, and a
+# successful probe removes it again so the day is left correctly UNSTAMPED, exactly as if this
+# pre-flight had never run.
+#
+# A crash between the `mv -f` and the cleanup/notify below is possible, but it is SAFE, not silent:
+# it would leave $STAMP holding the literal marker text, which is not an ISO date, so the very next
+# trigger hits the A2 malformed-stamp check above and refuses LOUDLY (exit 65) instead of treating
+# the marker as a real stamp. A rare failure turning into a loud, correctly-classified refusal on
+# the next trigger is the pattern this whole script is built around -- see the EXIT CODES header.
+#
+# (Note for anyone tempted to "simplify" this: a stamp with mode 000 must keep working, and does --
+# `mv -f` is a rename, which only needs WRITE permission on the containing directory, never on the
+# target file itself, so it replaces a mode-000 $STAMP exactly as readily as a normal one.)
+if [ -n "$STAMPED" ]; then
+  PREFLIGHT_PAYLOAD="$STAMPED"
+  PREFLIGHT_HAD_STAMP=1
+else
+  PREFLIGHT_PAYLOAD="preflight-probe-$$"
+  PREFLIGHT_HAD_STAMP=0
+fi
 PREFLIGHT_PROBE="$STAMP.preflight.$$"
-if { printf 'preflight-probe\n' >"$PREFLIGHT_PROBE"; } 2>/dev/null \
-    && [ "$(cat "$PREFLIGHT_PROBE" 2>/dev/null || true)" = "preflight-probe" ] \
-    && rm -f "$PREFLIGHT_PROBE" 2>/dev/null; then
-  : # persistable -- proceed
+if { printf '%s\n' "$PREFLIGHT_PAYLOAD" >"$PREFLIGHT_PROBE"; } 2>/dev/null \
+    && mv -f "$PREFLIGHT_PROBE" "$STAMP" 2>/dev/null \
+    && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$PREFLIGHT_PAYLOAD" ]; then
+  if [ "$PREFLIGHT_HAD_STAMP" -eq 0 ]; then
+    rm -f "$STAMP" 2>/dev/null || true
+  fi
 else
   rm -f "$PREFLIGHT_PROBE" 2>/dev/null || true
-  notify "keel-live: cannot persist the day-stamp (logs directory or disk problem near ${STAMP}) -- refusing to run a cycle, because an unstamped success would duplicate on the next trigger."
-  printf '%s [keel-live] pre-flight FAILED -- could not write/read/remove a probe file next to %s -- refusing to run a cycle -- exit 66\n' \
+  notify "keel-live: cannot persist the day-stamp (${STAMP} could not be replaced via the real write path) -- refusing to run a cycle, because an unstamped success would duplicate on the next trigger."
+  printf '%s [keel-live] pre-flight FAILED -- could not replace %s via the real write path -- refusing to run a cycle -- exit 66\n' \
     "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMP"
   exit 66
 fi
@@ -360,9 +440,15 @@ if [ "$STATUS" -eq 0 ]; then
     rm -f "$FAILCOUNT" 2>/dev/null || true
   else
     rm -f "$STAMP_TMP" 2>/dev/null || true
-    notify "keel-live: the day-stamp write FAILED after a cycle already ran -- an order may already be placed. INVESTIGATE ${STAMP} IMMEDIATELY before the next trigger."
-    printf '%s [keel-live] stamp write FAILED after a clean cycle -- %s does not read back as %s -- exit 66\n' \
-      "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMP" "$TODAY" >>"$OUTLOG"
+    # A9. The pre-flight above proved $STAMP replaceable BEFORE this cycle ran; something changed
+    # in the window between that check and this write, and a cycle has now run without us being
+    # able to record it. Dropping $HALT here, in the directory the pre-flight just proved is
+    # writable, is what stops every trigger from here on rather than just this one -- see the
+    # top-of-script check for what that buys.
+    : >"$HALT" 2>/dev/null || true
+    notify "keel-live: the day-stamp write FAILED after a cycle already ran -- an order may already be placed. INVESTIGATE ${STAMP} IMMEDIATELY before the next trigger. The detector is now HALTED (${HALT}) until a human clears it."
+    printf '%s [keel-live] stamp write FAILED after a clean cycle -- %s does not read back as %s -- HALT sentinel written to %s -- exit 66\n' \
+      "$(date -u '+%Y-%m-%d %H:%M UTC')" "$STAMP" "$TODAY" "$HALT" >>"$OUTLOG"
     exit 66
   fi
 else

@@ -560,6 +560,70 @@ def test_run_script_reads_the_clock_in_utc() -> None:
     assert re.search(r'^HOUR="\$\(\(10#\$HOUR_RAW\)\)"$', source, re.MULTILINE)
 
 
+def test_stamp_write_uses_atomic_temp_file_then_mv_with_readback() -> None:
+    """Finding 2 (HIGH), the SOURCE-level pin for the post-cycle stamp write's design.
+
+    Follows the precedent of `test_run_script_reads_the_clock_in_utc` above (which greps the
+    script rather than executing it): atomicity is a property of the SHAPE of the write, not of
+    any one outcome a behavioural test can force. The BEHAVIOURAL test right below,
+    `test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure`, demonstrates the stamp
+    survives a failed write, but its docstring now explains -- and this test exists precisely
+    because -- the only failure mode available on this hardware (`chflags
+    uchg`) fails at `open(2)` BEFORE any truncation would happen, so a plain truncating
+    `>"$STAMP"` passes that behavioural test identically. This is the same class of miss that let
+    an earlier regression through: a docstring asserting a discrimination the test did not
+    actually make. This test makes the discrimination the OTHER way -- by pinning the source shape
+    directly -- so nothing here can drift back into that tautology unnoticed.
+
+    Only lines of actual bash are searched (comment lines are stripped first): the header prose
+    a few lines above this design uses the literal text `> "$STAMP"` as a worked example of the
+    exact bug this design avoids, and a naive full-text search would flag that prose as a
+    violation of the very thing it is explaining.
+
+    Must kill all three of the mutations called out when this test was authored -- each was
+    performed against the shipped script, confirmed to turn this test red, then reverted and
+    confirmed green again:
+      1. reverting to a plain `printf ... >"$STAMP"` (no temp file, no `mv`, no readback);
+      2. keeping the temp file and `mv -f` but dropping the readback verification;
+      3. keeping the temp file and readback but replacing `mv -f` with something non-atomic
+         (e.g. `cp -f`), which drops the atomicity while looking superficially similar.
+    """
+    source = RUN_SCRIPT.read_text()
+    code_only = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    # Mutation 1's signature: no bare truncating redirect onto $STAMP anywhere in the actual code.
+    # This is the exact gap `chflags uchg` cannot probe (it fails at open(2), before truncation),
+    # so this is the ONLY thing in this file that actually rules a plain `>"$STAMP"` out.
+    assert not re.search(r'>\s*"\$STAMP"', code_only), (
+        'found a bare truncating redirect onto "$STAMP" in the script -- the stamp must only ever '
+        "be written via a temp file + `mv -f`, never opened directly, or a torn write can leave it "
+        "empty"
+    )
+
+    # The write goes to a $STAMP-derived temp path...
+    assert re.search(r'STAMP_TMP="\$STAMP\.tmp\.\$\$"', code_only), (
+        "the post-cycle stamp write must go to a $STAMP-derived temp path first, not $STAMP itself"
+    )
+    assert re.search(r"printf '%s\\n' \"\$TODAY\" >\"\$STAMP_TMP\"", code_only), (
+        "the temp file must be written with $TODAY as its payload"
+    )
+
+    # ...which is then mv -f'd ONTO $STAMP -- the atomic step itself (mutation 3's target)...
+    assert re.search(r'mv -f "\$STAMP_TMP" "\$STAMP"', code_only), (
+        "the temp file must be renamed onto $STAMP with `mv -f`, not copied or otherwise written "
+        "in a way that is not atomic within one filesystem"
+    )
+
+    # ...and the RESULT is read back and compared to $TODAY (mutation 2's target), not merely
+    # trusted because `mv` exited 0.
+    assert re.search(r'\[ "\$\(cat "\$STAMP" 2>/dev/null \|\| true\)" = "\$TODAY" \]', code_only), (
+        "the write must be verified by reading $STAMP back and comparing it to $TODAY -- a `mv` "
+        "that exits 0 is necessary but not sufficient evidence the stamp actually reads correctly"
+    )
+
+
 # -- harness: run the REAL script under a shimmed clock, with notifications recorded -----------
 #
 # Every test below this point executes `keel-live-run.sh` VERBATIM (only `DIR=` and the literal
@@ -609,9 +673,11 @@ def _run_script(script: Path, *, env: dict[str, str]) -> subprocess.CompletedPro
 
 def _install_date_shim(bin_dir: Path) -> None:
     """Install a `date` on `PATH` that reads its instant from `$KEEL_TEST_NOW` (epoch seconds)
-    instead of the wall clock, plus two failure modes A1 needs: `KEEL_TEST_DATE_MODE=empty`
-    (produces no output -- the empty-`date -u` case this hardware can produce) and `=garbage`
-    (produces non-date text).
+    instead of the wall clock, plus three failure modes: `KEEL_TEST_DATE_MODE=empty` (produces no
+    output -- the empty-`date -u` case this hardware can produce, needed for A1), `=garbage`
+    (produces non-date text, also A1), and `=bad_hour` (a well-formed DATE but an out-of-range
+    HOUR -- needed to reach the `-gt 23` check at all, since that line is only reachable once the
+    two-digit-shape regex in A1 has already passed).
 
     Honours ONLY the invocation forms `keel-live-run.sh` actually uses (`date -u '+FORMAT'`) --
     this is deliberately not a general `date(1)` replacement.
@@ -623,6 +689,10 @@ def _install_date_shim(bin_dir: Path) -> None:
         'case "${KEEL_TEST_DATE_MODE:-fixed}" in\n'
         "  empty) exit 0 ;;\n"
         '  garbage) printf "%s\\n" "${KEEL_TEST_DATE_GARBAGE:-not-a-date}"; exit 0 ;;\n'
+        '  bad_hour) case "$*" in\n'
+        '      *%H*) printf "%s\\n" "${KEEL_TEST_HOUR_GARBAGE:-99}" ;;\n'
+        '      *) exec /bin/date -u -r "$KEEL_TEST_NOW" "$@" ;;\n'
+        "    esac ;;\n"
         '  *) exec /bin/date -u -r "$KEEL_TEST_NOW" "$@" ;;\n'
         "esac\n"
     )
@@ -901,7 +971,7 @@ def test_unwritable_logs_dir_means_the_cycle_never_runs(tmp_path: Path) -> None:
     logs_dir.chmod(0o555)
     try:
         result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
-        assert result.returncode != 0, "an unpersistable stamp must not exit 0"
+        assert result.returncode == 66, "an unpersistable stamp must exit exactly 66 (pre-flight)"
         assert _count_lines(sb.invocations_log) == 0, "keel must never be invoked pre-flight"
         assert sb.calls_log.exists() and sb.calls_log.read_text().strip(), (
             "a condition the machine cannot self-heal must alert a human"
@@ -910,16 +980,137 @@ def test_unwritable_logs_dir_means_the_cycle_never_runs(tmp_path: Path) -> None:
         logs_dir.chmod(original_mode)
 
 
+def test_unreplaceable_stamp_directory_blocks_every_trigger_before_any_cycle_runs(
+    tmp_path: Path,
+) -> None:
+    """Finding 1 (MEDIUM), the reviewer's exact reproduction: the OLD pre-flight wrote its probe
+    to a DIFFERENT path (`$STAMP.preflight.$$`), which proves only that the DIRECTORY is writable
+    -- never that $STAMP ITSELF can be replaced. With $STAMP made a DIRECTORY (a botched restore,
+    or a `mkdir` typo), that pre-flight passed every single time, keel ran and PLACED ORDERS, and
+    only the unrelated post-cycle write -- which actually targets $STAMP -- then failed, five
+    triggers in a row:
+
+        exit codes: 66 66 66 66 66
+        CYCLES RUN: 5      <- each one places real orders
+        notifications: 5
+
+    That is precisely the "exiting nonzero AFTER a cycle already ran does not prevent the
+    duplicate" pattern the pre-flight's own comment already rejects for the read-only-directory
+    case (see `test_unwritable_logs_dir_means_the_cycle_never_runs` above) -- it just was never
+    true for THIS case before now. The fix makes the pre-flight round-trip through $STAMP itself
+    (write a temp file, `mv -f` it ONTO $STAMP, read $STAMP back), so it now fails BEFORE keel is
+    ever invoked, on every one of the five triggers, not just eventually.
+    """
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+    sb.stamp.mkdir(parents=True)
+
+    for day in (15, 16, 17, 18, 19):
+        result = _run(sb, datetime(2026, 6, day, 1, 20, tzinfo=UTC))
+        assert result.returncode == 66, f"day {day}: expected exit 66 (pre-flight failure)"
+
+    assert _count_lines(sb.invocations_log) == 0, (
+        "keel must NEVER be invoked while $STAMP cannot be replaced -- the old defect let all 5 "
+        "cycles run and place orders before the (unrelated) post-cycle write ever failed"
+    )
+    assert _count_lines(sb.calls_log) == 5, "every one of the 5 triggers must alert a human"
+
+
+def test_stamp_with_mode_000_is_still_replaceable_via_rename(tmp_path: Path) -> None:
+    """Finding 1 (MEDIUM), the explicit case the fix must NOT break: `mv -f` is a rename, and a
+    rename only ever needs WRITE permission on the containing DIRECTORY, never on the target file
+    itself. So a stamp with mode 000 -- unreadable and unwritable by its own permission bits --
+    must still be perfectly replaceable, and the pre-flight (which now round-trips through $STAMP
+    itself rather than a same-named probe) must not mistake "I cannot read/write this inode
+    directly" for "this path cannot be replaced". `cat` on a mode-000 file fails, so $STAMPED
+    reads as empty here (the same as "no stamp yet") -- which is a pre-existing, unrelated
+    property of how $STAMPED is read at the top of the script, not something this fix changes.
+    """
+    stamp_path = tmp_path / "logs" / ".keel-live-last-run"
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text("2026-06-14\n")
+    stamp_path.chmod(0o000)
+    try:
+        sb = _sandbox(tmp_path, keel_exit_code=0)
+        result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+        assert result.returncode == 0, "a mode-000 stamp must not block the pre-flight or the cycle"
+        assert _count_lines(sb.invocations_log) == 1, "the cycle must have actually run"
+        assert sb.stamp.read_text().strip() == "2026-06-15", (
+            "the real post-cycle write must succeed too, via the same rename mechanism"
+        )
+    finally:
+        stamp_path.chmod(0o644)
+
+
+def test_immutable_regular_file_stamp_is_caught_by_the_preflight_round_trip(
+    tmp_path: Path,
+) -> None:
+    """Finding 1 (MEDIUM): the case that pins the ROUND-TRIP specifically, rather than the
+    is-it-a-regular-file check that sits next to it.
+
+    Those two pre-flight guards are mutually redundant for the DIRECTORY case
+    (`test_unreplaceable_stamp_directory_blocks_every_trigger_before_any_cycle_runs`): remove
+    either one alone and the other still catches a directory, so neither is individually killed
+    by that test. Verified by mutation -- neutering the regular-file check alone, or the
+    round-trip alone, left the whole suite green; only neutering BOTH went red. A guard no test
+    can kill on its own is a guard that can be deleted by a future refactor without anything
+    noticing, which is exactly how the defect this fix closes got in.
+
+    An IMMUTABLE (`chflags uchg`) stamp is the discriminating case: it IS a regular file, so the
+    `[ ! -f ]` check passes it straight through, and only the round-trip -- which actually
+    attempts `mv -f` ONTO $STAMP -- discovers that the path cannot be replaced. Without the
+    round-trip the pre-flight would wave this through, keel would run and PLACE ORDERS, and only
+    the post-cycle write would fail, leaving the day unstamped for the next trigger to repeat --
+    the duplicate-order shape this whole fix exists to prevent.
+
+    Note this is the pre-flight's own detection, distinct from
+    `test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure` below, which sets `uchg`
+    MID-CYCLE to force the post-cycle write to fail after a legitimately passing pre-flight.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp_path = logs / ".keel-live-last-run"
+    stamp_path.write_text("2026-06-14\n")
+    subprocess.run(["chflags", "uchg", str(stamp_path)], check=False)
+    try:
+        sb = _sandbox(tmp_path, keel_exit_code=0)
+        for day in (15, 16, 17):
+            result = _run(sb, datetime(2026, 6, day, 1, 20, tzinfo=UTC))
+            assert result.returncode == 66, (
+                f"day {day}: an immutable stamp must fail the pre-flight with exit 66, not be "
+                "waved through to a cycle that places orders it cannot then record"
+            )
+        assert _count_lines(sb.invocations_log) == 0, (
+            "keel must NEVER be invoked while $STAMP cannot be replaced -- an immutable stamp is "
+            "a regular file, so ONLY the pre-flight's round-trip onto $STAMP can detect it"
+        )
+        assert _count_lines(sb.calls_log) == 3, "every trigger must alert a human"
+        assert stamp_path.read_text().strip() == "2026-06-14", (
+            "the pre-flight must not have altered the stamp it could not replace"
+        )
+    finally:
+        subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
+
+
 def test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure(tmp_path: Path) -> None:
     """Finding 2 (HIGH): a torn/failed post-cycle write must never leave the stamp EMPTY or PARTIAL.
 
-    Plain `> "$STAMP"` truncates before it writes, so a write that dies partway leaves an EMPTY
-    stamp -- and an empty stamp reads as "never ran", re-running a UTC day that already traded.
-    Here the write is forced to fail AFTER the pre-flight probe (a differently-named file) has
-    already passed, by making the stamp file itself immutable partway through the "cycle" -- and
-    the pre-existing YESTERDAY stamp must survive completely unchanged: not empty, not today, not
-    partial. That is what the temp-file-then-`mv -f` design buys: a rename either fully happens or
-    fully does not.
+    Forces the write to fail AFTER the pre-flight probe has already passed, by making the stamp
+    file itself immutable partway through the "cycle" -- and asserts the pre-existing YESTERDAY
+    stamp survives completely unchanged: not empty, not today, not partial.
+
+    This is a BEHAVIOURAL test, and that is ALL it proves. An earlier version of this docstring
+    additionally claimed it demonstrated the temp-file-then-`mv -f` design's ATOMICITY ("that is
+    what the ... design buys"). That claim was FALSE: the only failure mode available on this
+    hardware, `chflags uchg`, makes the write fail at `open(2)` -- BEFORE any truncation would ever
+    happen -- so a plain truncating `printf '%s\\n' "$TODAY" >"$STAMP"` preserves yesterday's stamp
+    here exactly as well as the real design does (verified: swapping the whole `STAMP_TMP` +
+    `mv -f` + readback block for that one line left this test, and all of this file's other
+    tests, green). A behavioural test cannot discriminate a design property from a coincidence of
+    its one available failure mode, no matter how the docstring reads -- do not "fix" this by
+    trying to force a different failure mode; on this hardware there isn't one. The actual pin for
+    the temp-file/`mv -f`/readback SHAPE is the source-level
+    `test_stamp_write_uses_atomic_temp_file_then_mv_with_readback` above, which greps the script's
+    source instead of trying to observe atomicity behaviourally.
     """
     stamp_path = tmp_path / "logs" / ".keel-live-last-run"
     yesterday = "2026-06-14"
@@ -927,7 +1118,7 @@ def test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure(tmp_path: 
     stamp_path.write_text(yesterday + "\n")
     try:
         result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
-        assert result.returncode != 0
+        assert result.returncode == 66, "a post-cycle stamp-write failure must exit exactly 66"
         assert stamp_path.read_text().strip() == yesterday, (
             "the stamp must never be corrupted by a failed write -- it must read exactly what it "
             "read before the cycle ran"
@@ -950,10 +1141,63 @@ def test_stamp_write_failure_is_not_swallowed(tmp_path: Path) -> None:
     stamp_path.write_text("2026-06-14\n")
     try:
         result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
-        assert result.returncode != 0, "a stamp write failure must not exit 0"
+        assert result.returncode == 66, "a post-cycle stamp-write failure must exit exactly 66"
         assert sb.calls_log.exists() and sb.calls_log.read_text().strip(), (
             "a stamp write failure must alert a human -- silence here IS the Finding-2 bug"
         )
+    finally:
+        subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
+
+
+def test_stamp_write_failure_halts_every_subsequent_trigger_until_cleared(tmp_path: Path) -> None:
+    """Finding 1 (MEDIUM), part (b): the HALT SENTINEL closes the RESIDUAL window neither
+    pre-flight layer can close -- $STAMP can still become unreplaceable in the gap BETWEEN a
+    passing pre-flight and the post-cycle write (e.g. a volume drops read-only mid-cycle). By the
+    time the post-cycle write discovers that, a cycle has ALREADY RUN, and with autonomy ON may
+    have placed an order. Without a sentinel, the very next trigger would see the day still
+    unstamped and run ANOTHER cycle, compounding the exact duplicate the day-stamp exists to
+    prevent. The sentinel bounds the damage to the ONE cycle that already ran: every trigger after
+    the failure must refuse outright and loudly, not just alert and move on, until a human clears
+    it.
+
+    Reuses the `chflags uchg` mid-cycle trick to force the post-cycle write to fail (the pre-flight
+    still passes, since the stamp is not yet immutable when it runs) -- the same mechanism the
+    Finding-2 tests above use, just followed through to its consequence for LATER triggers instead
+    of stopping at the first one.
+    """
+    stamp_path = tmp_path / "logs" / ".keel-live-last-run"
+    halt_path = tmp_path / "logs" / ".keel-live-last-run.halt"
+    sb = _sandbox(tmp_path, keel_exit_code=0, keel_stub_extra=f'chflags uchg "{stamp_path}"')
+    stamp_path.write_text("2026-06-14\n")
+    try:
+        first = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+        assert first.returncode == 66, "the post-cycle write failure itself still exits 66"
+        assert halt_path.exists(), "a post-cycle stamp-write failure must drop the halt sentinel"
+        ran_after_failure = _count_lines(sb.invocations_log)
+        assert ran_after_failure == 1, (
+            "exactly the one cycle that already ran is the damage this is meant to bound"
+        )
+
+        calls_before = _count_lines(sb.calls_log)
+        for day in (16, 17, 18):
+            again = _run(sb, datetime(2026, 6, day, 1, 20, tzinfo=UTC))
+            assert again.returncode == 68, f"day {day}: every trigger under the sentinel exits 68"
+        assert _count_lines(sb.invocations_log) == ran_after_failure, (
+            "the sentinel must block keel from ever being invoked again -- not just alert louder"
+        )
+        assert _count_lines(sb.calls_log) == calls_before + 3, (
+            "the halt must alert on EVERY trigger it blocks, not once and then go quiet"
+        )
+
+        # A human clears the sentinel (having first fixed the underlying cause -- here, the
+        # immutable flag). Uses a FRESH sandbox without the `chflags` stub so the next cycle can
+        # actually complete cleanly, exactly as an operator's next real trigger would.
+        subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
+        halt_path.unlink()
+        recovered_sb = _sandbox(tmp_path, keel_exit_code=0)
+        recovered = _run(recovered_sb, datetime(2026, 6, 19, 1, 20, tzinfo=UTC))
+        assert recovered.returncode == 0, "clearing the sentinel must restore normal operation"
+        assert recovered_sb.stamp.read_text().strip() == "2026-06-19"
     finally:
         subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
 
@@ -969,7 +1213,7 @@ def test_empty_clock_output_refuses_to_run(tmp_path: Path) -> None:
     """
     sb = _sandbox(tmp_path, keel_exit_code=0)
     result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC), date_mode="empty")
-    assert result.returncode != 0
+    assert result.returncode == 64, "an empty clock must exit exactly 64"
     assert _count_lines(sb.invocations_log) == 0, "a broken clock must never reach a cycle"
     assert not sb.stamp.exists(), "a broken clock must not be recorded as a completed day"
     assert "already ran" not in result.stdout, (
@@ -988,10 +1232,27 @@ def test_garbage_clock_output_refuses_to_run(tmp_path: Path) -> None:
     """
     sb = _sandbox(tmp_path, keel_exit_code=0)
     result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC), date_mode="garbage")
-    assert result.returncode != 0
+    assert result.returncode == 64, "a garbage clock must exit exactly 64, same as an empty one"
     assert _count_lines(sb.invocations_log) == 0
     assert not sb.stamp.exists()
     assert "already ran" not in result.stdout
+    assert sb.calls_log.exists() and sb.calls_log.read_text().strip()
+
+
+def test_out_of_range_hour_refuses_to_run(tmp_path: Path) -> None:
+    """LOW finding: pins the `-gt 23` hour-range check specifically.
+
+    Mutating that condition to `if false` survives the rest of the suite untouched, because every
+    OTHER clock test here produces HOUR_RAW that either fails the two-digit shape regex in A1
+    (`empty`/`garbage`, caught one check earlier) or is an ordinary, in-range hour. `99` is chosen
+    precisely because it PASSES `^[0-9]{2}$` -- so this is the only test in the file that actually
+    reaches the `-gt 23` line at all; nothing that is rejected earlier proves anything about it.
+    """
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC), date_mode="bad_hour")
+    assert result.returncode == 64, "an out-of-range hour must be rejected the same way as A1"
+    assert _count_lines(sb.invocations_log) == 0, "a broken clock must never reach a cycle"
+    assert not sb.stamp.exists(), "a broken clock must not be recorded as a completed day"
     assert sb.calls_log.exists() and sb.calls_log.read_text().strip()
 
 
@@ -1000,14 +1261,46 @@ def test_malformed_stamp_content_refuses_to_run(tmp_path: Path) -> None:
 
     `"garbage" < "2026-06-15"` is FALSE in a plain string compare, which reads exactly like
     "already ran" and disables the detector forever -- the same failure class as an unvalidated
-    empty clock, just entered from the stamp file instead of `date`.
+    empty clock, just entered from the stamp file instead of `date`. Uses "not-a-date", which
+    happens to sort ABOVE any real ISO date string -- the case where the malformed stamp sorts
+    BELOW today instead is the discriminating one for the exit-65 branch specifically, and is
+    covered separately by `test_malformed_stamp_that_sorts_below_today_still_refuses_to_run`.
     """
     sb = _sandbox(tmp_path, keel_exit_code=0)
     sb.stamp.write_text("not-a-date\n")
     result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
-    assert result.returncode != 0
+    assert result.returncode == 65, "a malformed (non-ISO) stamp must exit exactly 65"
     assert _count_lines(sb.invocations_log) == 0
     assert sb.stamp.read_text().strip() == "not-a-date", "a malformed stamp must not be overwritten"
+    assert sb.calls_log.exists() and sb.calls_log.read_text().strip()
+
+
+def test_malformed_stamp_that_sorts_below_today_still_refuses_to_run(tmp_path: Path) -> None:
+    """LOW finding: the discriminating case for the exit-65 branch existing at all.
+
+    `test_malformed_stamp_content_refuses_to_run` uses "not-a-date", which sorts ABOVE any real
+    ISO date string -- so it lands in the exit-67 (stamp-ahead-of-today) branch too, which also
+    refuses and alerts, EVEN IF the exit-65 branch were deleted outright. Asserting merely
+    `returncode != 0` on that test cannot tell the two branches apart, so deleting the exit-65
+    branch entirely survives the suite.
+
+    "1999-1-1" is different: it fails the `^[0-9]{4}-[0-9]{2}-[0-9]{2}$` shape check (single-digit
+    month/day) exactly like "not-a-date" does, but it SORTS BELOW "2026-06-15" as a plain string.
+    Without a dedicated exit-65 check ahead of the ahead/equal/before comparisons, this stamp would
+    fall through to "stamp is before today" and RUN A CYCLE on a corrupt stamp -- silently
+    re-evaluating who-knows-what bar. That is precisely the silent-comparison failure class the A2
+    comment in the script warns about, just for a malformed stamp instead of a well-formed one.
+    """
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+    sb.stamp.write_text("1999-1-1\n")
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+    assert result.returncode == 65, (
+        "a malformed stamp must exit exactly 65 regardless of how it happens to sort against today"
+    )
+    assert _count_lines(sb.invocations_log) == 0, (
+        "a malformed stamp must never let a cycle run, even one that sorts below today"
+    )
+    assert sb.stamp.read_text().strip() == "1999-1-1", "a malformed stamp must not be overwritten"
     assert sb.calls_log.exists() and sb.calls_log.read_text().strip()
 
 
@@ -1220,6 +1513,82 @@ def test_stuck_detector_escalates_after_consecutive_failures(tmp_path: Path) -> 
         "the counter reset means a single later failure is silent again, not counted onward from "
         "the earlier, already-resolved outage"
     )
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        "not-a-number",
+        "-5",
+        "3.5",
+        " 12",
+        "12 ",
+        "",
+    ],
+)
+def test_read_failcount_treats_non_numeric_or_malshaped_content_as_zero(
+    tmp_path: Path, garbage: str
+) -> None:
+    """LOW finding: pins `read_failcount`'s numeric validation.
+
+    Replacing `read_failcount` with a raw passthrough of `$FAILCOUNT`'s content survives every
+    OTHER test in this file, because every existing failcount scenario starts from a file that is
+    either MISSING (already reads as 0 through the `cat ... || true` fallback, not through the
+    `^[0-9]+$` guard) or already holds a clean integer the guard would pass through unchanged
+    either way. A raw passthrough only differs from the guarded version when the content is
+    non-numeric or out of shape -- exactly the cases here.
+
+    A raw passthrough is not merely "wrong", it is a crash risk: `$FAILS="$(($(read_failcount) +
+    1))"` is bash ARITHMETIC context, and arithmetic on a non-numeric operand is a hard error
+    there (unlike string comparison, which merely comes out false). A negative number like `-5`
+    would not crash but WOULD silently miscount (next value -4 instead of the guarded 1); a
+    decimal like `3.5` or a leading/trailing-whitespace value would either error out or silently
+    produce a bogus count depending on the shell. Either way this is exactly the degrade-gracefully
+    contract `read_failcount`'s own comment promises: a corrupt counter file must make escalation
+    late or wrong, never make the retry stop happening or the exit status change.
+    """
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    failcount = logs_dir / ".keel-live-last-run.failures"
+    failcount.write_text(garbage)
+
+    sb = _sandbox(tmp_path, keel_exit_code=3)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 3, "the script must surface keel's own exit code, not crash"
+    assert not sb.stamp.exists(), "a failing cycle must still leave the day open for retry"
+    assert _count_lines(sb.calls_log) == 0, (
+        "garbage must be read as count 0, not as 1 or higher -- so a single failure after it is "
+        "exactly as silent as the very first failure ever would be"
+    )
+    assert failcount.read_text().strip() == "1", (
+        "the garbage must be OVERWRITTEN with a clean count of 1 -- neither preserved verbatim "
+        "nor corrupted further by the increment"
+    )
+
+
+def test_read_failcount_handles_a_large_valid_count_without_crashing_or_miscounting(
+    tmp_path: Path,
+) -> None:
+    """LOW finding, the companion sanity check to the garbage-content test above: a large but
+    VALID (all-digit) failcount must be read, incremented, and escalated correctly -- proving the
+    numeric guard's job is to reject the wrong SHAPE, not to reject size, and that legitimately
+    large counts are not mistaken for corruption.
+    """
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    failcount = logs_dir / ".keel-live-last-run.failures"
+    failcount.write_text("119")  # one below the next ESCALATE_EVERY=3 multiple (120)
+
+    sb = _sandbox(tmp_path, keel_exit_code=3)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 3
+    assert failcount.read_text().strip() == "120", (
+        "a large valid count must be incremented normally, not reset -- it is not garbage"
+    )
+    assert _count_lines(sb.calls_log) == 1, "120 is a multiple of ESCALATE_EVERY=3 -- must alert"
+    assert "120 consecutive" in sb.calls_log.read_text()
 
 
 def test_pendlog_is_utc_labelled(tmp_path: Path) -> None:

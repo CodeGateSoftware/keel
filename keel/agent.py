@@ -942,13 +942,20 @@ def run_once(
         # to avoid an unbounded, unrecoverable duplication is the trade this whole module exists
         # to make.
         #
-        # This is also what makes the runner's retry IDEMPOTENT, which is the property that
-        # gives "<= 60 minutes of delay" its meaning: a blocked cycle places nothing and (via
-        # `keel-live-run.sh`'s exit-4 contract) leaves the day unstamped, so the retry an hour
-        # later starts from "nothing happened yet", not "something happened and needs to happen
-        # again". Without that idempotence, "delay" is just a duplicate that hasn't landed yet.
+        # This is also what makes the runner's retry IDEMPOTENT FOR ENTRIES, which is the
+        # property that gives "<= 60 minutes of delay" its meaning: a blocked cycle places NO
+        # entries and (via `keel-live-run.sh`'s exit-4 contract) leaves the day unstamped, so the
+        # retry an hour later starts from "no entry happened yet", not "an entry happened and
+        # needs to happen again". Without that idempotence, "delay" is just a duplicate entry
+        # that hasn't landed yet.
         #
-        # EXITS are deliberately exempt from all of this -- see the main pass below.
+        # A blocked cycle is NOT inert, though: EXITS are deliberately exempt from all of this --
+        # see the main pass below -- and still run for every non-stale product regardless of
+        # `entries_allowed`, so THIS SAME cycle can place a real SELL even while every entry was
+        # withheld. That exemption is correct on its own terms (the protective stop rests at the
+        # broker, but the rule-driven channel exit runs IN-PROCESS, and trapping a losing
+        # position an extra cycle is strictly worse than a delayed entry) -- the point here is
+        # only that "entries withheld" must never be misread as "this cycle placed nothing".
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
                 repo, product_id, finest, now_ts, max_age_sec

@@ -2617,3 +2617,84 @@ def test_a_stale_products_missing_feed_does_not_withhold_a_different_products_en
     orders = repo.get_orders(mode="live", product_id=PRODUCT)
     assert len(orders) == 1
     assert orders[0]["side"] == "BUY"
+
+
+def test_retry_after_a_blocked_cycle_does_not_duplicate_an_already_placed_exit(repo):
+    """THE PROPERTY THAT MAKES "the runner declines to stamp and retries" SAFE FOR EXITS. #174
+    turned "a nonzero exit runs after exits have already run this UTC day" from a rare,
+    exception-only path into a ROUTINE one: every blocked cycle now takes it, because a blocked
+    cycle still runs `_handle_exits` for every non-stale product (see the pre-pass comment in
+    `run_once`) and then exits 4, which makes `keel-live-run.sh` decline to stamp the day, and
+    one of the remaining hourly triggers re-runs the SAME cycle an hour later. If that retry
+    re-placed an already-placed exit, it would SELL a position that was already sold --
+    dumping it a second time into whatever the market happens to be doing an hour on.
+
+    Seeds a position on BTC-USD owned by `fake_exit` (`exit_signal` always fires) alongside a
+    blocked XLM-USD `dca` entry, so the FIRST cycle both places the exit AND reports
+    `blocked_entries` non-empty -- the exact shape #174 makes routine. It then re-runs `run_once`
+    at the SAME `now_ts` against the SAME repo/broker state, exactly as the retried hourly
+    trigger would, and asserts exactly ONE SELL order exists across both cycles.
+
+    CORRECTING THE STATED PREMISE, by mutation, not by inspection alone: this test was
+    commissioned to pin `_handle_exits` clearing `agent_state["position_rule:<product>"]` on
+    placement (~line 631) as THE mechanism that stops the duplicate. That is not what a mutation
+    test can honestly show. Un-clearing `position_rule:<product>` ALONE does NOT turn this test
+    red -- `_handle_exits`'s own `if qty <= 0: return []` (`_held_position`, the filled-orders
+    audit log) already reads the position as closed on the retry: an exit is always a market
+    order, so its own SELL is recorded `status="filled"` the instant it places, and net qty
+    (buys minus sells) is what BOTH `agent._handle_exits` AND, independently,
+    `execution.executor._build_intent`'s own separate `_held_position` check before either one
+    ever consults `position_rule` at all. The system is triple-redundant: that qty check in
+    `agent.py`, the same qty check (separately implemented) in `executor.py`, and the
+    `position_rule` clear each independently block the duplicate -- breaking any ONE OR TWO of
+    the three still leaves this test green, and only breaking all three at once produces a
+    second SELL. `position_rule` clearing is real and matters, but for a DIFFERENT reason (see
+    its own comment at the clear site: stale bracket state poisoning the NEXT position opened on
+    this product, not this retry) -- not for the property this test pins. The primary mechanism
+    for THIS property is the audit-log qty netting in `_held_position`: a placed exit is itself
+    a filled SELL, so the very next read of "what do we hold" already reflects it.
+    """
+    config = _blocked_cycle_config()
+    now_ts = 11 * _DAY
+
+    # BTC-USD holds a position owned by `fake_exit` (always exits).
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    repo.set_state(f"position_rule:{PRODUCT}", "fake_exit")
+    fresh_daily = [_candle(10 * _DAY, "100")]
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, fresh_daily)
+
+    # XLM-USD's dca entry is blocked -- withholds the WHOLE cycle's entries, exactly the
+    # scenario a real blocked cycle exits #174 makes ROUTINE.
+    repo.insert_rule("dca", {"product_id": _XLM, "cadence_days": 1}, status="live")
+    blocked_daily = [_candle(9 * _DAY, "100")]
+    repo.upsert_candles(_XLM, Granularity.ONE_DAY, blocked_daily)
+
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): fresh_daily,
+            (_XLM, Granularity.ONE_DAY): blocked_daily,
+        }
+    )
+
+    first = run_once(broker, repo, config, now_ts=now_ts)
+    assert first.blocked_entries != []
+    assert len(first.exit_results) == 1
+    assert first.exit_results[0].placed is True
+
+    # The retry: SAME `now_ts`, SAME repo/broker state -- exactly what the next hourly trigger
+    # runs, because the blocked cycle's exit-4 left the UTC day unstamped (`keel-live-run.sh`).
+    second = run_once(broker, repo, config, now_ts=now_ts)
+    # XLM-USD's data hasn't caught up between cycles (nothing in this test advances it), so the
+    # retry is blocked again too -- confirms this really is the SAME cycle re-running against
+    # the SAME unconfirmed bar, not a coincidentally-unblocked second attempt.
+    assert second.blocked_entries != []
+
+    orders = repo.get_orders(mode="live", product_id=PRODUCT)
+    sells = [o for o in orders if o["side"] == "SELL"]
+    assert len(sells) == 1, (
+        f"the retry duplicated the exit -- expected exactly one SELL across both cycles, "
+        f"got {len(sells)}: {sells!r}"
+    )
