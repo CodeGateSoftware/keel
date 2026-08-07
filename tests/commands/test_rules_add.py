@@ -368,14 +368,16 @@ def test_the_non_finite_refusal_states_the_reason_that_is_true_for_that_param(
         "--params", '{"volume_mult": 1e400}',
     )
 
-    assert "not valid JSON" not in decimal_param.output, (
+    assert "IS valid JSON" in decimal_param.output, (
         "the stored value is the string \"Infinity\", which IS valid JSON -- claiming otherwise "
         "for the very example the refusal cites is simply false"
     )
-    assert "Decimal" in decimal_param.output
+    assert '"Infinity"' in decimal_param.output, "the quoted, stored form is what it becomes"
+    assert "Decimal('Infinity')" in decimal_param.output, "and what it rebuilds into"
     assert "not valid JSON" in float_param.output, (
-        "a float param really does store a bare `Infinity` token"
+        "a float param really does store a bare `Infinity` token, and that one is unparseable"
     )
+    assert "`Infinity`" in float_param.output, "the bare token, unquoted"
 
 
 def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
@@ -673,6 +675,10 @@ def test_an_explicitly_empty_params_is_refused_not_read_as_the_defaults(
         )
         assert result.exit_code != 0, repr(empty)
         assert repo.get_rules() == [], "an empty --params must never write a defaults row"
+        assert "EMPTY string" in result.output, (
+            "and it must say so: a raw `Expecting value: line 1 column 1` leaves the operator "
+            "hunting for a JSON syntax error in a string that has no syntax"
+        )
 
     explicit = _add(
         tmp_path, valid_config_path,
