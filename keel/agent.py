@@ -29,9 +29,13 @@ a true holding must use `_held_position` (the filled-orders audit log) instead -
 trip through `json.dumps`/`json.loads`, so `params` on the way back out is JSON-plain (strings/
 numbers/lists) even though the real rule constructors want `Decimal`s, a `Granularity` enum, and
 tuples (`PullbackContinuation.granularity`/`buffer_ticks`/`ema_periods`,
-`RsiMeanReversion.timeframe`/its several `Decimal` fields). `RULE_REGISTRY` + `_build_rule` are
-the coercion boundary: a caller (this module, or a future CLI command that lists live rules)
-only ever deals in real `Rule` instances, never in raw JSON dicts.
+`RsiMeanReversion.timeframe`/its several `Decimal` fields). `RULE_REGISTRY` +
+`build_rule_from_params` are **the** coercion boundary: a caller (this module, `rules backtest`,
+`rules add`) only ever deals in real `Rule` instances, never in raw JSON dicts. `_build_rule` is
+the thin DB-row adapter over it. There is deliberately only ONE such table
+(`_DECIMAL_PARAMS`): a second copy living next to whichever command needed it would drift from
+this one silently, and the symptom of the drift is a `Decimal`/`float` `TypeError` raised deep
+inside a rule's arithmetic, at backtest or cycle time, far from the code that caused it.
 
 **Confirm mode places via a caller-supplied `confirm_fn`.** `run_once`/`loop` take an optional
 `confirm_fn`, which `executor.execute` calls with the broker preview. With `confirm_fn=None` --
@@ -120,14 +124,40 @@ _GRANULARITY_PARAMS: dict[str, str] = {
 }
 
 
-def _build_rule(row: dict[str, Any]) -> Rule:
-    """Reconstruct a real `Rule` instance from a `repo.get_rules()` row.
+def coerced_param_keys(kind: str) -> frozenset[str]:
+    """The params of `kind` that arrive JSON-plain as STRINGS and are converted on the way in.
+
+    Published so a caller validating operator-typed JSON (`keel rules add`) can tell the two
+    cases apart without a second copy of these tables: `"2.5"` is correct for `atr_stop_mult`
+    (a `Decimal`) and wrong for `oversold` (a `float`), and only these tables know which is
+    which. Anything not listed here reaches its constructor exactly as JSON produced it.
+    """
+    keys = set(_DECIMAL_PARAMS.get(kind, ()))
+    gran_key = _GRANULARITY_PARAMS.get(kind)
+    if gran_key is not None:
+        keys.add(gran_key)
+    return frozenset(keys)
+
+
+def build_rule_from_params(kind: str, params: dict[str, Any]) -> Rule:
+    """Construct a `Rule` of `kind` from JSON-plain `params` (the `rules.params` shape).
+
+    THE single JSON-plain -> constructor-kwarg coercion boundary, shared by every caller that
+    has a `(kind, params)` pair and wants a real rule: `_build_rule` (a stored row, for the
+    agent cycle and `rules backtest`) and `keel rules add` (an operator's `--params` JSON, for a
+    row not yet written). Both directions of that boundary have the identical problem -- JSON
+    has no `Decimal`, no enum and no tuple -- so both must use these tables. A command that
+    coerced its own would drift from this one the first time a rule gained a `Decimal` field,
+    and the drift would surface as a `Decimal`/`float` `TypeError` inside the rule's arithmetic,
+    mid-backtest, long after the params were accepted.
 
     Raises `ValueError` for a `kind` not in `RULE_REGISTRY` -- an unrecognized rule kind in the
     `live` set is a configuration error, not something to silently skip (consistent with this
     codebase's fail-loud posture elsewhere, e.g. `executor.execute`'s unknown-mode check).
+    Anything the rule's own constructor rejects (an unknown kwarg -> `TypeError`, an
+    out-of-range value -> `ValueError`) propagates unchanged; `rules add` relies on exactly that
+    to refuse a bad parameter set BEFORE it writes a row.
     """
-    kind = row["kind"]
     rule_cls = RULE_REGISTRY.get(kind)
     if rule_cls is None:
         raise ValueError(
@@ -135,7 +165,7 @@ def _build_rule(row: dict[str, Any]) -> Rule:
             f"{sorted(RULE_REGISTRY)!r}"
         )
 
-    kwargs = dict(row.get("params") or {})
+    kwargs = dict(params)
 
     for key in _DECIMAL_PARAMS.get(kind, ()):
         if key in kwargs and kwargs[key] is not None:
@@ -151,7 +181,17 @@ def _build_rule(row: dict[str, Any]) -> Rule:
         if "signal_patterns" in kwargs:
             kwargs["signal_patterns"] = tuple(kwargs["signal_patterns"])
 
-    rule = rule_cls(**kwargs)
+    return rule_cls(**kwargs)
+
+
+def _build_rule(row: dict[str, Any]) -> Rule:
+    """Reconstruct a real `Rule` instance from a `repo.get_rules()` row.
+
+    The DB-row adapter over `build_rule_from_params`: it adds the one thing a row has and a
+    bare params dict does not, the `rules.id`. See that function for the coercion rules and the
+    exceptions this can raise.
+    """
+    rule = build_rule_from_params(row["kind"], row.get("params") or {})
     # Thread the real `rules.id` onto the instance (additive `Rule.rule_id`, default `None`) so
     # it can flow onto emitted `Signal`s and, from there, into `orders.rule_id`/`signals.rule_id`
     # for audit -- `.get` rather than `row["id"]` so a hand-built row with no "id" (some tests)

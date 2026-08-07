@@ -3,9 +3,11 @@
 Wires the merged Phase 1-3 modules into a `click` CLI: `db import` (`data.csv_import.import_dir`),
 `monitor` (`data.market_feed`), `agent` (`agent.run_once`/`agent.loop`), `autonomy on|off|show`
 (the `profile` row `agent.run_once` itself re-reads each cycle),
-`rules list|backtest|promote|demote|disable|seed` (`data.repository` + `strategy.backtest`/
+`rules list|backtest|promote|demote|disable|seed|add` (`data.repository` + `strategy.backtest`/
 `promotion`; `seed` populates the otherwise-empty `rules` table from `agent.RULE_REGISTRY`,
-Issue #81), `pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
+Issue #81, and `add` inserts ONE `candidate` row from operator-supplied `--params` JSON so a
+proposed parameter set can reach `rules backtest` without hand-written Python),
+`pnl` (`analysis.pnl`), `kill`/`resume` (the `agent_state` kill-switch),
 `resume-entries` (clear an armed rail-16 consecutive-loss halt), `record-flow`
 (declare a deposit/withdrawal so rail 11 does not read it as P&L) and `reset-hwm`
 (reset rail 11's high-water mark),
