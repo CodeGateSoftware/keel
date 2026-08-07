@@ -424,10 +424,19 @@ def test_build_screen_title_shows_version_and_mode_without_datetime() -> None:
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        ("0.1.0", "v0.1"),
-        ("0.2.5", "v0.2"),
+        ("0.1.0", "v0.1.0"),
+        ("0.2.5", "v0.2.5"),
+        ("0.5.2", "v0.5.2"),
+        # Build metadata rides on the PATCH segment (`0.5.2+79f35b9e73d5`), so a naive
+        # `parts[2].isdigit()` is False and the patch would silently vanish -- which is exactly
+        # the shape `keel --version` emits, i.e. the common case, not the edge case.
+        ("10.34.1+abc", "v10.34.1"),
+        ("0.5.2+79f35b9e73d5", "v0.5.2"),
+        # No patch segment at all: show what exists rather than inventing a `.0`.
         ("2.0", "v2.0"),
-        ("10.34.1+abc", "v10.34"),
+        # A non-numeric patch (pre-release) degrades to major.minor -- still useful -- rather
+        # than to `v?`, which would throw away the two segments we did parse.
+        ("0.5.2rc1", "v0.5"),
         ("unknown", "v?"),
         ("1", "v?"),
         ("", "v?"),

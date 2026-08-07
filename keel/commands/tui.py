@@ -136,12 +136,34 @@ def _human_dt(ts: int) -> str:
 
 
 def _short_version(raw: str) -> str:
-    """`v<major>.<minor>` from a full version string (`0.1.0` -> `v0.1`). Falls back to `v?` for an
-    unknown or unparseable version, so the header never shows a bare `unknown` or raises."""
+    """`v<major>.<minor>.<patch>` from a full version string (`0.5.2` -> `v0.5.2`).
+
+    The patch segment is shown because major.minor alone cannot tell two deployments apart: every
+    release in the 0.5 line rendered as `v0.5`, so an operator glancing at the header could not
+    see whether the box was running the build they just shipped or the one before it.
+
+    Three degradations, each preferring the most information it can still vouch for:
+
+    * **Build metadata is stripped from the patch.** A release version is `0.5.2+79f35b9e73d5`, so
+      `parts[2]` is `2+79f35b9e73d5` -- not a digit. Taking it verbatim would print the whole
+      commit hash into a header line budgeted for a version; rejecting it would drop the patch on
+      precisely the shape a released build emits. Split on `+` and keep the numeric head.
+    * **No patch segment** (`2.0`) -> `v2.0`. Show what exists rather than inventing a `.0` the
+      version string never claimed.
+    * **A non-numeric patch** (`0.5.2rc1`) -> `v0.5`. Falling all the way back to `v?` would throw
+      away the two segments that did parse.
+
+    Falls back to `v?` only when major/minor themselves are unparseable, so the header never shows
+    a bare `unknown` and never raises.
+    """
     parts = raw.split(".")
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-        return f"v{parts[0]}.{parts[1]}"
-    return "v?"
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return "v?"
+    head = f"v{parts[0]}.{parts[1]}"
+    if len(parts) < 3:
+        return head
+    patch = parts[2].split("+", 1)[0]
+    return f"{head}.{patch}" if patch.isdigit() else head
 
 
 #: The short header version, resolved ONCE at import (it never changes within a run). Uses the
