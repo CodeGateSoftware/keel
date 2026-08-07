@@ -72,15 +72,31 @@ DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("5000000")
 # -- 2a. shortlist location (offline) ------------------------------------------------------------
 
 
-def latest_shortlist(directory: Path) -> Path | None:
-    """The newest `*.json` file under `directory` by mtime, or `None`.
+#: Filename convention a candidate shortlist must follow to be picked up. Selection is by
+#: CONVENTION rather than "newest `*.json`" because the proposals directory is shared: the scout
+#: that produces shortlists writes sibling outputs beside them (`<date>-param-proposals.json`,
+#: `<date>-research-briefs.md`). A bare `*.json` glob picked whichever sibling happened to be
+#: written last, and the overlay then told the operator their own strategy output was a malformed
+#: shortlist -- observed 2026-08-07, with `2026-08-07-param-proposals.json` shadowing the real
+#: shortlist by one minute of mtime.
+#:
+#: Deliberately NOT "prefer a shortlist, else fall back to any `*.json`": on a run that produced
+#: param proposals and no candidates, that fallback re-selects the sibling and reproduces the same
+#: confusing error in a rarer, harder-to-diagnose case. Strict matching means an absent shortlist
+#: reads as absent, which is the truth.
+SHORTLIST_GLOB = "*shortlist.json"
 
-    `None` covers three cases the dashboard must never be errored out by: `directory` does not
-    exist, `directory` exists but is not a directory (a stray file at that path), or it exists and
-    is empty of `*.json` files. **Never creates `directory`** -- a fresh install legitimately has
-    no proposals directory yet, and a read-only report screen must not have the side effect of
-    creating one. Any `OSError` encountered while probing the filesystem (a permissions problem, a
-    race where the directory is removed mid-call) is treated the same way, for the same reason.
+
+def latest_shortlist(directory: Path) -> Path | None:
+    """The newest `*shortlist.json` file under `directory` by mtime, or `None`.
+
+    `None` covers four cases the dashboard must never be errored out by: `directory` does not
+    exist, `directory` exists but is not a directory (a stray file at that path), it exists and is
+    empty, or it holds only files that do not follow `SHORTLIST_GLOB`. **Never creates
+    `directory`** -- a fresh install legitimately has no proposals directory yet, and a read-only
+    report screen must not have the side effect of creating one. Any `OSError` encountered while
+    probing the filesystem (a permissions problem, a race where the directory is removed mid-call)
+    is treated the same way, for the same reason.
 
     Ties in mtime are broken by filename (the alphabetically-last name wins), so the result is
     deterministic across repeated calls on the same directory contents rather than depending on
@@ -89,7 +105,7 @@ def latest_shortlist(directory: Path) -> Path | None:
     try:
         if not directory.is_dir():
             return None
-        candidates = list(directory.glob("*.json"))
+        candidates = list(directory.glob(SHORTLIST_GLOB))
         if not candidates:
             return None
         return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
@@ -259,8 +275,12 @@ def build_propose_view(
                 source=None,
                 status="no-shortlist",
                 detail=(
-                    f"{directory} has no *.json shortlist yet -- drop one there and reopen this "
-                    f"screen. {_PROPOSAL_SCHEMA_SUMMARY}"
+                    # Name the pattern, not just the directory: selection is by convention, so an
+                    # operator whose file is called `candidates.json` is one rename away and has
+                    # no way to discover that from "no shortlist yet".
+                    f"{directory} has no {SHORTLIST_GLOB} file yet -- drop one there (the name "
+                    f"must end in shortlist.json) and reopen this screen. "
+                    f"{_PROPOSAL_SCHEMA_SUMMARY}"
                 ),
                 report=None,
             )
