@@ -20,7 +20,7 @@ import logging
 import math
 import time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal, get_args, get_origin, get_type_hints
 
 import click
 from keel_core.telemetry import log_event
@@ -375,31 +375,80 @@ def _accepted_params(rule_cls: type) -> list[str]:
     return [name for name in inspect.signature(rule_cls).parameters if name != "self"]
 
 
+def _declared_choices(rule_cls: type) -> dict[str, tuple[Any, ...]]:
+    """{param: the values it may take}, for every kwarg `rule_cls` annotates as a `Literal`.
+
+    `stop_method: StopMethod` where `StopMethod = Literal["fixed", "atr"]` IS the rule's own
+    published statement of what it accepts, so the choices are read off the rule and never
+    re-listed here -- a kind that gains a `target_method` branch is covered with no change to
+    this command. Both shapes are picked up: a scalar (`entry_zone`) and the ELEMENT type of a
+    tuple param (`signal_patterns: tuple[SignalPattern, ...]`); a param is one or the other,
+    never both, so one dict serves both callers.
+
+    `typing.get_type_hints`, not `inspect.signature`: every rule module starts with
+    `from __future__ import annotations`, which leaves `param.annotation` the bare STRING
+    `'StopMethod'` -- unusable. `get_type_hints` resolves it against the defining module, and
+    handles the dataclass-generated `__init__` (`RsiMeanReversion`) as well as the hand-written
+    one. A rule whose annotations cannot be resolved at all yields no choices rather than an
+    exception: an un-checkable param is the status quo, a crashing `rules add` is not.
+    """
+    try:
+        hints = get_type_hints(rule_cls.__init__)
+    except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
+        return {}
+
+    choices: dict[str, tuple[Any, ...]] = {}
+    for name, hint in hints.items():
+        if get_origin(hint) is tuple:
+            element = next((arg for arg in get_args(hint) if arg is not Ellipsis), None)
+            if element is not None and get_origin(element) is Literal:
+                choices[name] = get_args(element)
+        elif get_origin(hint) is Literal:
+            choices[name] = get_args(hint)
+    return choices
+
+
 def _param_type_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) -> list[str]:
-    """Params whose JSON type cannot work with the rule, judged against the constructor default.
+    """Params whose JSON value cannot work with the rule, judged against the rule's own signature.
 
     Constructing the rule does NOT catch these, and the row they produce is the bad kind: it
-    stores, it rebuilds, and it then raises `TypeError` deep inside the rule's arithmetic the
-    first time a backtest calls `detect()` -- in a command nobody connects to the params they
-    typed. Two of keel's four rule kinds (`RsiMeanReversion`, `PullbackContinuation`) are plain
-    classes with no validation of their own, so construction is not a filter for them at all.
-    Three shapes, each demonstrated to kill a backtest:
+    stores, it rebuilds, and it then fails deep inside the rule's arithmetic the first time a
+    backtest calls `detect()` -- in a command nobody connects to the params they typed. Neither
+    `RsiMeanReversion` nor `PullbackContinuation` validates ANYTHING in its constructor, so
+    construction is not a filter for them; where `RsiMeanReversion` does check a value
+    (`stop_method`, in `_compute_stop`) it does so at `detect()` time, which is precisely the
+    too-late that this function exists to pull forward. Five shapes, each demonstrated to kill
+    or corrupt a backtest:
 
     - `{"oversold": "10.0"}` -- quoted, and `oversold` is a `float`: dies at `str < int`.
       Quoting is the likeliest typo in hand-copied JSON precisely BECAUSE it is correct for the
       `Decimal` params, so which params may be quoted is answered by `agent.coerced_param_keys`
       -- the coercion tables themselves -- rather than guessed at or re-listed here.
+    - `{"oversold": [1, 2]}` (or `{...}`) -- the SAME param and the same death as the quoted
+      case, in the one JSON shape a scalar/quoted-string check does not look at: it stores,
+      `rules backtest` rebuilds it, and `detect()` raises `TypeError: '<' not supported between
+      instances of 'float' and 'list'`.
     - `{"lookback_days": 90.5}` (or `1e400`, which JSON parses to `inf`) -- `lookback_days`
       indexes a candle list, and `candles[-90.5:]` raises "slice indices must be integers".
       A whole number for a `float` default is the harmless direction and stays allowed.
     - `{"oversold": null}` -- no rule param has a `None` default, and the coercion boundary
       passes `None` through untouched, so it reaches the constructor intact.
+    - `{"entry_zone": "banana"}` -- a value outside the `Literal` the rule declares for that
+      param (`_declared_choices`). This one does not crash, which is worse: `PullbackContinuation`
+      dispatches on `== "ema_touch"` and falls through to the `ema_band` branch, so the operator
+      is handed a DIFFERENT rule's numbers under the name they typed (measured on real BTC-USD
+      hourly candles: 7 trades with the same expectancy to the last digit as `ema_band`, where
+      `ema_touch` gives 11). `rules promote` re-runs the backtest against that same stored row,
+      so the row can advance toward `live` carrying a parameter nobody chose. Refusing it is the
+      same judgement already made for a param the row cannot carry (`granularity`).
 
-    Judged against the type of the constructor's OWN default, so a rule that changes a field's
-    type needs no change here. Nothing else is second-guessed: this is not a type checker, only
-    the mismatches that survive construction and reliably kill a backtest.
+    Judged against the constructor's OWN default and its OWN annotations, so a rule that changes
+    a field's type or gains a branch needs no change here. Nothing else is second-guessed: this
+    is not a type checker, only the mismatches that survive construction and reliably ruin a
+    backtest.
     """
     coerced = agent.coerced_param_keys(kind)
+    choices = _declared_choices(rule_cls)
     problems: list[str] = []
     for name, param in inspect.signature(rule_cls).parameters.items():
         if name not in supplied or name in coerced:
@@ -407,8 +456,24 @@ def _param_type_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) 
         default, value = param.default, supplied[name]
         if default is inspect.Parameter.empty:
             continue
+        # A tuple default means the param is a SEQUENCE; a JSON list is the right shape for it
+        # and its choices (if it declares any) apply to the elements, so both are
+        # `_sequence_problems`' business rather than the scalar checks below.
+        is_sequence = isinstance(default, tuple)
+        allowed = choices.get(name)
         if value is None and default is not None:
             problems.append(f"{name}=null is not a value {kind} can use (default {default!r})")
+        elif not is_sequence and isinstance(value, (list, dict)):
+            shape = "list" if isinstance(value, list) else "object"
+            problems.append(
+                f"{name}={value!r} is a JSON {shape}, but {kind} wants a single "
+                f"{type(default).__name__} here (default {default!r})"
+            )
+        elif not is_sequence and allowed is not None and value not in allowed:
+            problems.append(
+                f"{name}={value!r} is not one of the values {kind} declares for it: "
+                f"{list(allowed)!r} (default {default!r})"
+            )
         elif isinstance(default, str) and not isinstance(value, str):
             problems.append(f"{name}={value!r} should be a quoted string (default {default!r})")
         elif isinstance(default, (bool, int, float)) and isinstance(value, str):
@@ -425,8 +490,8 @@ def _param_type_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) 
                 f"{name}={value!r} must be a whole number -- {kind} counts bars with it "
                 f"(default {default!r})"
             )
-        elif isinstance(default, tuple) and default:
-            problems.extend(_sequence_problems(name, default, value))
+        elif is_sequence and default:
+            problems.extend(_sequence_problems(name, default, value, allowed))
     return problems
 
 
@@ -435,20 +500,28 @@ def _is_whole_number(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _sequence_problems(name: str, default: tuple[Any, ...], value: Any) -> list[str]:
+def _sequence_problems(
+    name: str, default: tuple[Any, ...], value: Any, allowed: tuple[Any, ...] | None = None
+) -> list[str]:
     """Why `value` cannot stand in for a tuple param such as `ema_periods`/`signal_patterns`.
 
     `build_rule_from_params` converts these with a blind `tuple(value)`, which is total and
-    therefore silent about two shapes that then kill a backtest:
+    therefore silent about three shapes that then ruin a backtest:
 
     - `"abc"` -- `tuple("abc")` CHAR-SPLITS into `('a', 'b', 'c')`, a plausible-looking
       three-EMA fan made of letters;
     - `["8", "20", "50"]` -- quoted numbers survive as strings, and `ema()`'s
-      `2.0 / (period + 1)` then raises `TypeError: can only concatenate str (not "int") to str`.
+      `2.0 / (period + 1)` then raises `TypeError: can only concatenate str (not "int") to str`;
+    - `["pin_bar", "hammmer"]` -- a misspelled pattern name. `_match_signal_pattern` compares
+      the name against each pattern it knows and matches none, so the typo does not raise: the
+      rule just never fires on it. `allowed` (the param's declared `Literal` element type, via
+      `_declared_choices`) is what makes that visible, and it comes from the rule itself.
 
     Element type is taken from the constructor's own default tuple, so a param that changes
     from ints to something else needs no change here. An empty list is refused too: it builds a
-    rule with no EMAs at all, which never signals and reads as a rule that simply does not work.
+    rule with no EMAs at all, which never signals and reads as a rule that simply does not work
+    -- and a list of names the rule cannot match is refused for that same reason, since it is
+    that same rule with extra steps.
     """
     element_type = type(default[0])
     check = _is_whole_number if element_type is int else lambda v: isinstance(v, element_type)
@@ -465,11 +538,19 @@ def _sequence_problems(name: str, default: tuple[Any, ...], value: Any) -> list[
             f"{name} has {bad!r} where {element_type.__name__} values belong "
             f"(default {list(default)!r})"
         ]
+    if allowed is not None:
+        unknown = [item for item in value if item not in allowed]
+        if unknown:
+            return [
+                f"{name} has {unknown!r}, which the rule never matches -- it would simply "
+                f"never fire on {'them' if len(unknown) > 1 else 'it'}. Declared values: "
+                f"{list(allowed)!r}"
+            ]
     return []
 
 
 def _nonfinite_params(params: dict[str, Any]) -> list[str]:
-    """Param names holding `Infinity`/`NaN` after coercion -- numbers that got away.
+    """Params holding `Infinity`/`NaN` after coercion -- numbers that got away, each with why.
 
     `json.loads` accepts JSON's non-standard `Infinity`/`NaN` literals, and the guards a rule
     does have let them past: `Decimal('Infinity') <= 0` is `False`, so `Dca`'s "budget must be
@@ -477,16 +558,35 @@ def _nonfinite_params(params: dict[str, Any]) -> list[str]:
     the input, so it catches such a value whichever way it arrived -- as a JSON float or as a
     quoted `"Infinity"` through the `Decimal` coercion.
 
-    Beyond the arithmetic, a non-finite value makes the stored row indefensible as data:
-    `json.dumps` writes a bare `Infinity`, which is not valid JSON and which no strict reader
-    (any consumer of this DB that is not Python) can parse back.
+    The reason is given PER PARAM because the two param types fail differently, and a single
+    blanket reason is false for half of them:
+
+    - a `float` param (`lookback_days`, `volume_mult`) is stored by `json.dumps` as a bare
+      `Infinity` token, which is not valid JSON and which no strict reader (any consumer of
+      this DB that is not Python) can parse back;
+    - a `_DECIMAL_PARAMS` param (`budget_usd`) is stored as the STRING `"Infinity"`, which is
+      perfectly valid JSON -- and that is worse, not better. It rebuilds silently into
+      `Decimal('Infinity')`, which no `> 0` guard rejects and which then propagates: an
+      infinite `budget_usd` yields `size_usd=Decimal('Infinity')` with nothing raising anywhere.
+
+    Either way no backtest can report on the value, so either way it is refused; only the
+    sentence explaining it differs.
     """
     bad: list[str] = []
     for name, value in params.items():
         if isinstance(value, float) and not math.isfinite(value):
-            bad.append(f"{name}={value!r}")
+            bad.append(
+                f"{name}={value!r} -- a float param, so the row would store the bare token "
+                f"`{json.dumps(value)}`, which is not valid JSON and which no strict reader "
+                f"can parse back"
+            )
         elif isinstance(value, Decimal) and not value.is_finite():
-            bad.append(f"{name}={value!r}")
+            bad.append(
+                f'{name}={value!r} -- a Decimal param, so the row would store the string "'
+                f'{value}", which IS valid JSON and therefore worse: it rebuilds silently into '
+                f"Decimal('{value}'), which no positivity guard rejects and which propagates "
+                f"into whatever the rule computes from it"
+            )
     return bad
 
 
@@ -498,14 +598,34 @@ def _params_delta(existing: dict[str, Any], added: dict[str, Any]) -> str:
     in full (as `rules list` does) would make the operator diff them by eye at precisely the
     moment they have to pick the right id for `rules backtest`. Both sides are the JSON-plain
     stored form, so `'2'` vs `2` is a real difference and is shown as one.
+
+    A key present on ONE side only is not a parameter difference and is not reported as one. A
+    row written before its kind grew a param simply has no such key, and a plain key-union diff
+    drowns the real answer in schema history -- measured against a real pre-existing row, four
+    of the five reported "differences" were params that did not exist when the row was written,
+    and they buried the `entry_lookback` the operator was choosing between. Those keys are still
+    named, because the two rows genuinely cannot be compared on them, but as a counted note
+    AFTER the differences rather than mixed in among them.
     """
-    keys = sorted(set(existing) | set(added))
-    diffs = [
-        f"{key}={existing.get(key, '<absent>')!r}"
-        for key in keys
-        if existing.get(key, "<absent>") != added.get(key, "<absent>")
-    ]
-    return ", ".join(diffs) if diffs else "(identical params)"
+    shared = sorted(set(existing) & set(added))
+    parts = [f"{key}={existing[key]!r}" for key in shared if existing[key] != added[key]]
+
+    only_added = sorted(set(added) - set(existing))
+    only_existing = sorted(set(existing) - set(added))
+    if not parts and not only_added and not only_existing:
+        return "(identical params)"
+
+    delta = ", ".join(parts) if parts else "(no differing param)"
+    if only_added:
+        delta += (
+            f" [+{len(only_added)} param(s) that row does not carry, so not comparable: "
+            f"{', '.join(only_added)}]"
+        )
+    if only_existing:
+        delta += (
+            f" [{len(only_existing)} param(s) only that row carries: {', '.join(only_existing)}]"
+        )
+    return delta
 
 
 @rules_group.command("add")
@@ -515,8 +635,9 @@ def _params_delta(existing: dict[str, Any], added: dict[str, Any]) -> str:
     "--params",
     "params_json",
     default=None,
-    help="Constructor params as a JSON object, e.g. '{\"entry_lookback\": 55}'. Omit to take "
-    "the kind's own defaults (a baseline row to compare a proposal against).",
+    help="Constructor params as a JSON object, e.g. '{\"entry_lookback\": 55}'. Omit the flag "
+    "(or pass '{}') to take the kind's own defaults -- a baseline row to compare a proposal "
+    "against. An EMPTY string is refused rather than read as the defaults.",
 )
 @click.pass_context
 @with_disclaimer
@@ -542,23 +663,37 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     actually used to construct `RULE_REGISTRY[kind](product_id=..., **params)` via the shared
     `agent.build_rule_from_params` coercion boundary (the one that turns JSON-plain values back
     into the `Decimal`s/enums/tuples the constructors want). If the rule refuses them -- an
-    unknown kwarg, or a value its own validation rejects, e.g. `Dca` on `cadence_days <= 0` --
-    this refuses too, names the problem, and writes NOTHING. What lands in the row is
+    unknown kwarg, or a value its `__init__` rejects, e.g. `Dca` on `cadence_days <= 0` -- this
+    refuses too, names the problem, and writes NOTHING. What lands in the row is
     `.describe()`'s params, not the raw JSON, so the stored row is exactly what
     `agent._build_rule` can reconstruct: a row that stores but cannot rebuild is worse than a
-    refusal, because it fails later, inside a backtest or an agent cycle. Construction alone
-    is NOT sufficient on its own -- two of the four rule kinds validate nothing in their
-    constructors -- so three further classes of bad params are refused here, each because it
-    writes a row that stores, rebuilds, and *then* fails:
+    refusal, because it fails later, inside a backtest or an agent cycle.
+
+    Construction is NOT sufficient on its own. Two of the four rule kinds (`RsiMeanReversion`,
+    `PullbackContinuation`) have no `__init__` validation at all, and where a rule does check a
+    value it may do so far too late to help here -- `RsiMeanReversion` raises
+    `unknown stop_method` from `_compute_stop`, i.e. at `detect()` time, on a row that has
+    already been written. So four further classes of bad params are refused here, each because
+    it writes a row that stores, rebuilds, and *then* fails or lies:
 
     - a value of the wrong JSON type for the field (`_param_type_mismatches`): a quoted number,
-      a fraction where the rule counts bars, a `null`, a char-splittable string or a list of
-      quoted numbers for `ema_periods`. These die inside `detect()`'s arithmetic, mid-backtest;
+      a fraction where the rule counts bars, a `null`, a JSON list/object where a single value
+      belongs, a char-splittable string or a list of quoted numbers for `ema_periods`. These
+      die inside `detect()`'s arithmetic, mid-backtest;
+    - a value outside the choices the param's own `Literal` declares (`_declared_choices`, same
+      check): `entry_zone="banana"` does not crash -- `PullbackContinuation` dispatches by
+      equality and falls through to the `ema_band` branch -- so the operator reads another
+      rule's numbers under the name they typed, and `rules promote` re-runs that same stored row
+      toward `paper`/`live`. Likewise a `signal_patterns` name the rule can never match;
     - `Infinity`/`NaN` (`_nonfinite_params`), which `json.loads` accepts, which `Dca`'s
       "budget must be positive" guard passes, and which no backtest can report on;
     - a kwarg the rule constructs with but does NOT persist in `describe()["params"]`
       (`PullbackContinuation(granularity=...)` -- accepted, dropped, and rebuilt at the default,
       so the backtest would silently measure a rule on a different candle series).
+
+    Every one of those is read off the rule itself -- its signature, its defaults, its
+    annotations, its `describe()` -- so a kind that changes a field's type, gains a
+    `target_method` branch or starts persisting a param needs no change here.
 
     What is NOT checked here is whether a value makes economic sense (a negative
     `atr_stop_mult`, say). That is the rule's own judgement to make, in its constructor, where
@@ -613,8 +748,25 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
         ctx.exit(1)
         return
 
+    # "flag absent" and "flag given but empty" are different intentions, and only `is None`
+    # tells them apart. An empty string is what a shell hands over when the proposal plumbing
+    # misfires -- `--params "$(jq -c .params proposal.json)"` yields `""` when the key is
+    # missing or jq errors -- and reading that as "the kind's own defaults" is the worst
+    # available outcome: an id is printed, the operator backtests it, and the numbers they read
+    # belong to the stock rule rather than to the proposal they believe they measured.
+    if params_json is not None and not params_json.strip():
+        raise click.BadParameter(
+            "was given as an EMPTY string, which is not the same as omitting the flag. This is "
+            "almost always a shell accident (`--params \"$(jq -c .params proposal.json)\"` "
+            "yields an empty string when the key is missing or jq fails), and taking it as "
+            "\"use the defaults\" would print a rule id for a row that is NOT the parameter set "
+            "you meant to measure. Pass '{}' to ask for the kind's defaults deliberately, or "
+            "omit --params entirely.",
+            param_hint="--params",
+        )
+
     try:
-        supplied: Any = json.loads(params_json) if params_json else {}
+        supplied: Any = json.loads(params_json) if params_json is not None else {}
     except json.JSONDecodeError as exc:
         raise click.BadParameter(f"not valid JSON ({exc})", param_hint="--params") from exc
     if not isinstance(supplied, dict):
@@ -667,9 +819,8 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     nonfinite = _nonfinite_params(rule.describe()["params"])
     if nonfinite:
         click.echo(
-            f"Error: {kind} was given a value that is not a finite number: "
-            f"{', '.join(nonfinite)}. No backtest can report on it, and the stored row would "
-            f"not be valid JSON.",
+            f"Error: {kind} was given a value that is not a finite number, which no backtest "
+            f"can report on:\n" + "\n".join(f"       - {problem}" for problem in nonfinite),
             err=True,
         )
         ctx.exit(1)

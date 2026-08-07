@@ -626,6 +626,50 @@ def test_build_rule_unknown_kind_raises():
         _build_rule({"kind": "not_a_real_rule_dca", "params": {}})
 
 
+# -- the published coercion table (`coerced_param_keys`) --------------------------------------
+
+
+def test_coerced_param_keys_names_every_param_that_arrives_as_a_string():
+    """The whole contract of this function: a caller validating operator-typed JSON (`keel
+    rules add`) asks it "may this param be quoted?" and must get a yes for EVERY param
+    `build_rule_from_params` converts from a string -- the `Decimal` fields AND the
+    `Granularity` field. Answering only for the `Decimal`s would leave a correct
+    `"timeframe": "ONE_DAY"` refused as "not a string param".
+    """
+    assert agent.coerced_param_keys("rsi_meanrev") == frozenset(
+        {
+            "atr_mult",
+            "fixed_stop_pct",
+            "fixed_rr",
+            "level_tolerance",
+            "support_proximity_pct",
+            "timeframe",
+        }
+    )
+    assert agent.coerced_param_keys("pullback_continuation") == frozenset(
+        {"buffer_ticks", "granularity"}
+    )
+    assert agent.coerced_param_keys("dca") == frozenset({"budget_usd", "dip_bonus_pct"})
+    assert agent.coerced_param_keys("turtle_breakout") == frozenset(
+        {"atr_stop_mult", "target_rr"}
+    )
+
+
+def test_coerced_param_keys_covers_exactly_what_build_rule_from_params_converts():
+    """Derived from the same two tables the coercion itself reads, so a rule that gains a
+    `Decimal` or `Granularity` field cannot be converted on the way in without also being
+    published here. A kind with no coerced params at all answers with an empty set, not a
+    `KeyError`.
+    """
+    for kind in agent.RULE_REGISTRY:
+        expected = set(agent._DECIMAL_PARAMS.get(kind, ()))
+        gran = agent._GRANULARITY_PARAMS.get(kind)
+        if gran is not None:
+            expected.add(gran)
+        assert agent.coerced_param_keys(kind) == expected, kind
+    assert agent.coerced_param_keys("not_a_real_kind") == frozenset()
+
+
 # -- loop() wrapper -----------------------------------------------------------------------------
 
 
