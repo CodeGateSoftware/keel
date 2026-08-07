@@ -64,6 +64,7 @@ import plistlib
 import re
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -73,6 +74,30 @@ import pytest
 
 from keel.strategy.rules.turtle_breakout import _completed_days
 from keel.types import Candle, Granularity
+
+#: Reason shared by the runtime guard and the marker below, so both say the same thing.
+_MACOS_ONLY_REASON = (
+    "the real-script tests are macOS-only: the artifact under test IS a macOS deployment "
+    "(launchd + `osascript`), and the harness itself needs `sandbox-exec`, BSD `date -r` and "
+    "`chflags`, none of which exist on Linux"
+)
+
+#: For tests that touch macOS-only tooling (`chflags`) BEFORE reaching `_run_script`, where the
+#: runtime guard inside that helper would come too late to prevent a `FileNotFoundError`.
+_macos_only = pytest.mark.skipif(sys.platform != "darwin", reason=_MACOS_ONLY_REASON)
+
+
+def _require_macos() -> None:
+    """Skip, rather than error, when the real-script harness cannot run on this platform.
+
+    The schedule INVARIANT (exactly one cycle per UTC date, across both DST transitions) is
+    proven by the pure-Python model tests in this file, which run everywhere. What is macOS-only
+    is executing the shipped `keel-live-run.sh` itself -- and that is not a coverage gap worth
+    solving portably, because the script only ever runs on the macOS box that owns the launchd
+    job. Erroring on Linux CI instead of skipping is what turned `main` red after #174.
+    """
+    if sys.platform != "darwin":
+        pytest.skip(_MACOS_ONLY_REASON)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLIST = REPO_ROOT / "com.keel.live.plist"
@@ -560,6 +585,7 @@ def test_run_script_reads_the_clock_in_utc() -> None:
     assert re.search(r'^HOUR="\$\(\(10#\$HOUR_RAW\)\)"$', source, re.MULTILINE)
 
 
+@_macos_only
 def test_stamp_write_uses_atomic_temp_file_then_mv_with_readback() -> None:
     """Finding 2 (HIGH), the SOURCE-level pin for the post-cycle stamp write's design.
 
@@ -656,13 +682,14 @@ _DENY_OSASCRIPT_PROFILE = (
     '(version 1)(allow default)(deny process-exec (literal "/usr/bin/osascript"))'
 )
 
-
 def _run_script(script: Path, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     """Run `script` the way launchd would, except sandboxed against ever notifying for real.
 
     Every real-script invocation in this file goes through here (via `_run`) rather than calling
-    `subprocess.run` directly, so there is exactly one place that could forget the sandbox.
+    `subprocess.run` directly, so there is exactly one place that could forget the sandbox --
+    and exactly one place that decides this platform cannot run the real script at all.
     """
+    _require_macos()
     return subprocess.run(
         [_SANDBOX_EXEC, "-p", _DENY_OSASCRIPT_PROFILE, "/bin/bash", str(script)],
         capture_output=True,
@@ -1041,6 +1068,7 @@ def test_stamp_with_mode_000_is_still_replaceable_via_rename(tmp_path: Path) -> 
         stamp_path.chmod(0o644)
 
 
+@_macos_only
 def test_immutable_regular_file_stamp_is_caught_by_the_preflight_round_trip(
     tmp_path: Path,
 ) -> None:
@@ -1091,6 +1119,7 @@ def test_immutable_regular_file_stamp_is_caught_by_the_preflight_round_trip(
         subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
 
 
+@_macos_only
 def test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure(tmp_path: Path) -> None:
     """Finding 2 (HIGH): a torn/failed post-cycle write must never leave the stamp EMPTY or PARTIAL.
 
@@ -1127,6 +1156,7 @@ def test_atomic_stamp_write_leaves_yesterdays_stamp_intact_on_failure(tmp_path: 
         subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
 
 
+@_macos_only
 def test_stamp_write_failure_is_not_swallowed(tmp_path: Path) -> None:
     """Finding 2 (HIGH): a failed stamp write must be LOUD, not swallowed.
 
@@ -1149,6 +1179,7 @@ def test_stamp_write_failure_is_not_swallowed(tmp_path: Path) -> None:
         subprocess.run(["chflags", "nouchg", str(stamp_path)], check=False)
 
 
+@_macos_only
 def test_stamp_write_failure_halts_every_subsequent_trigger_until_cleared(tmp_path: Path) -> None:
     """Finding 1 (MEDIUM), part (b): the HALT SENTINEL closes the RESIDUAL window neither
     pre-flight layer can close -- $STAMP can still become unreplaceable in the gap BETWEEN a
