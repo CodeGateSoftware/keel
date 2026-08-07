@@ -168,6 +168,10 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     # for that: (2) status, which is the only thing that still can, and (3) a pinned check on
     # the coincidence itself, so that if the operator ever moves the budget off the default, the
     # value check regains its old power and (3) is what tells them so.
+    #
+    # SCOPE: this asserts the COMMITTED FILE, not a deployment's database, so it catches a
+    # reseeded box's state being COMMITTED -- not the reseed itself. `rule_manifest.py apply`
+    # is what reports that drift against a live DB.
 
     # (1) AGREEMENT -- the manifest's budget must match config.dca.budget_usd, the value the live
     # executor actually spends.

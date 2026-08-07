@@ -62,7 +62,7 @@ from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
 from keel.config import Config
-from keel.data import market_feed
+from keel.data import freshness, market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
 from keel.execution import executor, guards, reconcile, streak
@@ -78,6 +78,17 @@ from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Granularity, Side
 
 logger = logging.getLogger(__name__)
+
+#: `keel agent` (single-cycle, non-`--loop`) exits with this status when `run_once` blocked at
+#: least one entry on `freshness.entry_bar_ready` (Finding 1, HIGH: a re-evaluated daily bar is
+#: a DUPLICATE REAL-MONEY ORDER, not a delayed one -- see `_entry_gate_granularity`/`run_once`
+#: below). `keel-live-run.sh` only stamps the UTC day as done on a ZERO exit, so this nonzero
+#: exit makes the runner decline to stamp, and one of the remaining 23 hourly LaunchAgent
+#: triggers retries an hour later -- converting "duplicate order" into "<= 60 minutes of delay".
+#: The `--loop` path never uses this (see `agent_cmd` in `keel/cli.py`): a long-running loop
+#: just skips the blocked cycle and tries again next interval: exiting the process would kill a
+#: healthy long-running loop over what is usually a transient publication lag.
+DATA_NOT_READY_EXIT = 4
 
 # -- rule reconstruction: DB row (kind, JSON-plain params) -> a real Rule instance -------------
 
@@ -165,6 +176,53 @@ def _finest_granularity(granularities: list[Granularity]) -> Granularity | None:
     if not granularities:
         return None
     return min(granularities, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
+
+
+def _entry_gate_granularity(rule: Rule, granularities: list[Granularity]) -> Granularity | None:
+    """Which granularity's freshness should gate `rule`'s ENTRIES (Finding 1, HIGH)?
+
+    A rule that DECLARES its trading timeframe (`self.granularity` on `TurtleBreakout`/
+    `PullbackContinuation`, `self.timeframe` on `RsiMeanReversion`) is gated on exactly that --
+    the same attribute `strategy.engine._trading_granularity` reads.
+
+    Absent a declaration, this falls back to the COARSEST configured granularity -- the ONE
+    place this deliberately diverges from `_trading_granularity`'s own fallback, which picks the
+    FINEST. That divergence is not an oversight: `Dca` (`strategy/rules/dca.py`) declares
+    neither attribute, yet `Dca.detect` reads `candles_by_tf[Granularity.ONE_DAY]` directly and
+    keys its cadence off `latest.ts // 86400 % cadence_days`, so a STALE daily bar re-fires the
+    same cadence hit and buys twice. Falling back to the finest configured granularity (as
+    `_trading_granularity` does, correctly, for its own job of picking CTS *scoring* data) would
+    gate DCA on FIFTEEN_MINUTE and miss that hazard entirely -- the daily bar could be weeks
+    stale while FIFTEEN_MINUTE stayed perfectly fresh. The coarsest granularity is the fallback
+    that fails in the safe direction for any rule that does not tell us what it actually reads:
+    it is the input most likely to be what a rule silent about its timeframe is keying off, per
+    this codebase's rules so far.
+
+    Returns `None` only when `granularities` itself is empty -- nothing to gate on at all.
+    """
+    for attr in ("granularity", "timeframe"):
+        value = getattr(rule, attr, None)
+        if isinstance(value, Granularity):
+            return value
+    if not granularities:
+        return None
+    return max(granularities, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
+
+
+@dataclass(frozen=True)
+class BlockedEntry:
+    """One rule's entry, withheld this cycle because its gating bar was not confirmed ready --
+    see `freshness.entry_bar_ready` and the gate in `run_once` below. Recorded on `LoopResult`
+    so a caller (the CLI, a log line, a test) can say exactly which bar was missing without
+    re-deriving it.
+    """
+
+    product: str
+    rule_name: str
+    granularity: Granularity
+    expected_ts: int
+    stored_ts: int | None
+    reason: str
 
 
 # -- held-position reconstruction (mirrors execution.executor._held_position) -----------------
@@ -655,6 +713,10 @@ class LoopResult:
     enter_signals: list[Signal] = field(default_factory=list)
     enter_results: list[ExecutionResult] = field(default_factory=list)
     exit_results: list[ExecutionResult] = field(default_factory=list)
+    # Finding 1 (HIGH): rules whose entry this cycle withheld because their gating bar wasn't
+    # confirmed ready (`freshness.entry_bar_ready`, applied in `run_once` below) -- see
+    # `BlockedEntry`. Defaulted so every existing `LoopResult(...)` construction stays valid.
+    blocked_entries: list[BlockedEntry] = field(default_factory=list)
     # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
     # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
     # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
@@ -758,6 +820,10 @@ def run_once(
         enter_results: list[ExecutionResult] = []
         exit_results: list[ExecutionResult] = []
         stale_products: list[str] = []
+        blocked_entries: list[BlockedEntry] = []
+        # Built once per product in the pre-pass below and reused by the main pass, so a
+        # product's series is read from the DB exactly once per cycle rather than twice.
+        candles_by_tf_by_product: dict[str, dict[Granularity, list[Any]]] = {}
 
         # Reconcile FIRST, before equity and before any entry. A bracket that filled since the
         # last cycle has already changed the position and the cash balance; reading equity or
@@ -849,10 +915,58 @@ def run_once(
         # not trading, so paper entries are skipped this cycle instead, below.
         paper_equity = equity_now if paper_trader is not None else None
 
+        # == PRE-PASS: decide entry admission for the WHOLE CYCLE, before any order goes out ====
+        #
+        # Finding 1 (HIGH) was closed at the wrong GRANULARITY: `entry_bar_ready` was correct,
+        # but it used to gate `ready_rules` PER PRODUCT, inside the very loop that also called
+        # `executor.execute` for that product's signals. A cycle could place a real order for
+        # product A and only THEN discover, a few iterations later, that product B's confirming
+        # bar hadn't arrived -- `blocked_entries` ended up correctly non-empty, but nothing had
+        # consulted it before A's order was already live.
+        #
+        # WHY this has to be whole-cycle, not per-product: `keel-live-run.sh` reads this cycle's
+        # exit status as a SINGLE bit and decides off that alone whether to stamp the UTC day --
+        # it has no way to ask "which orders, if any, did that cycle place". A's order placed
+        # plus a nonzero exit (because B was blocked) is the worst of both worlds: an order is
+        # live AND the day is left unstamped, so the next hourly trigger retries the WHOLE cycle
+        # against the SAME daily bar and re-enters everything that already traded, A included.
+        # Entry admission therefore has to be ATOMIC with the exit status that gates the
+        # day-stamp -- decided once, for every product, before `executor.execute`/`_paper_enter`
+        # runs for any of them, not resolved product-by-product as each reaches the front of the
+        # loop.
+        #
+        # THE COST, stated plainly: one lagging product now delays EVERY entry this cycle,
+        # including ones whose own data was perfectly fresh. That trade is deliberate -- a
+        # withheld entry is recovered by the very next hourly trigger, at most ~60 minutes
+        # later; a duplicate live entry is not recoverable at all. Paying a bounded, known delay
+        # to avoid an unbounded, unrecoverable duplication is the trade this whole module exists
+        # to make.
+        #
+        # This is also what makes the runner's retry IDEMPOTENT FOR ENTRIES, which is the
+        # property that gives "<= 60 minutes of delay" its meaning: a blocked cycle places NO
+        # entries and (via `keel-live-run.sh`'s exit-4 contract) leaves the day unstamped, so the
+        # retry an hour later starts from "no entry happened yet", not "an entry happened and
+        # needs to happen again". Without that idempotence, "delay" is just a duplicate entry
+        # that hasn't landed yet.
+        #
+        # A blocked cycle is NOT inert, though: EXITS are deliberately exempt from all of this --
+        # see the main pass below -- and still run for every non-stale product regardless of
+        # `entries_allowed`, so THIS SAME cycle can place a real SELL even while every entry was
+        # withheld. That exemption is correct on its own terms (the protective stop rests at the
+        # broker, but the rule-driven channel exit runs IN-PROCESS, and trapping a losing
+        # position an extra cycle is strictly worse than a delayed entry) -- the point here is
+        # only that "entries withheld" must never be misread as "this cycle placed nothing".
         for product_id in products:
             if finest is not None and not market_feed.is_fresh(
                 repo, product_id, finest, now_ts, max_age_sec
             ):
+                # Stale-product skip stays FIRST and still `continue`s past the product
+                # entirely, exactly as before this pre-pass existed -- load-bearing ordering,
+                # independently validated: a dead venue or a delisted product reads as stale
+                # here and is skipped WITHOUT ever reaching the readiness gate below, so it can
+                # never block the whole cycle's entries just by being permanently absent from
+                # the feed. Only a product that IS being polled, and is merely a bar or two
+                # behind, can withhold the cycle.
                 stale_products.append(product_id)
                 log_event(
                     logger,
@@ -866,10 +980,74 @@ def run_once(
 
             product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
             candles_by_tf = {g: repo.get_candles(product_id, g) for g in granularities}
+            candles_by_tf_by_product[product_id] = candles_by_tf
+
+            for rule in product_rules:
+                gate_gran = _entry_gate_granularity(rule, granularities)
+                if gate_gran is None:
+                    continue
+                readiness = freshness.entry_bar_ready(candles_by_tf, gate_gran, now_ts)
+                if readiness.ready:
+                    continue
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "agent.entry_bar_not_ready",
+                    product=product_id,
+                    rule=rule.name,
+                    granularity=gate_gran.value,
+                    expected_ts=readiness.expected_ts,
+                    stored_ts=readiness.stored_ts,
+                    bars_behind=readiness.bars_behind,
+                    reason=readiness.reason,
+                    blocked_by=None if readiness.blocked_by is None else readiness.blocked_by.value,
+                    blocked_by_ts=readiness.blocked_by_ts,
+                )
+                blocked_entries.append(
+                    BlockedEntry(
+                        product=product_id,
+                        rule_name=rule.name,
+                        granularity=gate_gran,
+                        expected_ts=readiness.expected_ts,
+                        stored_ts=readiness.stored_ts,
+                        reason=readiness.reason or "unknown",
+                    )
+                )
+
+        # The whole-cycle admission bit: ANY blocked rule, on ANY product, withholds EVERY entry
+        # this cycle -- see the pre-pass comment above for why this cannot be decided per-rule
+        # or per-product. `blocked_entries` is still recorded per-rule (for the operator log
+        # line and `LoopResult`), but what it GATES is binary.
+        entries_allowed = not blocked_entries
+        if not entries_allowed:
+            log_event(
+                logger,
+                logging.WARNING,
+                "agent.entries_withheld",
+                blocked_count=len(blocked_entries),
+                products=sorted({b.product for b in blocked_entries}),
+                rules=sorted({b.rule_name for b in blocked_entries}),
+            )
+
+        # == MAIN PASS: exits ALWAYS run; entries run ONLY when `entries_allowed` ================
+        for product_id in products:
+            if product_id in stale_products:
+                continue  # already recorded + logged in the pre-pass above -- not logged twice.
+
+            candles_by_tf = candles_by_tf_by_product[product_id]
+            product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
 
             if paper_trader is not None:
                 _paper_resolve_bars(paper_trader, product_id, candles_by_tf, granularities)
 
+            # EXITS are exempt from `entries_allowed` and always run, for every non-stale
+            # product, regardless of which (if any) product is withholding this cycle's
+            # entries. An open position's rule-driven channel exit runs IN-PROCESS (the
+            # protective stop rests at the broker, but the channel exit does not), so it must
+            # never be held hostage by a DIFFERENT product's lagging feed -- staying in a losing
+            # position an extra cycle is strictly worse than a delayed entry, and nothing about
+            # the duplicate-order hazard this gate exists for applies to a SELL that closes an
+            # existing position.
             product_exit_results = _handle_exits(
                 product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts,
                 confirm_fn=confirm_fn,
@@ -884,6 +1062,13 @@ def run_once(
                     reason=exit_result.reason,
                 )
             exit_results.extend(product_exit_results)
+
+            if not entries_allowed:
+                # Whole-cycle withholding (see the pre-pass comment above): evaluate NOTHING for
+                # entries on this product, even though its own rules may individually have been
+                # ready -- `engine.evaluate` is not even called, so no signal is scored,
+                # persisted, or logged, and `enter_signals` stays empty for the whole cycle.
+                continue
 
             product_signals = engine.evaluate(product_rules, candles_by_tf, repo=repo)
             log_event(
@@ -958,6 +1143,7 @@ def run_once(
             enter_signals=enter_signals,
             enter_results=enter_results,
             exit_results=exit_results,
+            blocked_entries=blocked_entries,
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,

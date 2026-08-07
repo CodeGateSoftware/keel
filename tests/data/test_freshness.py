@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from keel.data.freshness import (
     DEFAULT_TOLERANCE_BARS,
+    BarReadiness,
     Freshness,
     any_gaps,
     any_needs_fetch,
     assess,
+    entry_bar_ready,
     expected_last_ts,
 )
 from keel.data.history import CoverageInfo
-from keel.types import Granularity
+from keel.types import Candle, Granularity
 
 _DAY = 86400
 _HOUR = 3600
@@ -30,6 +34,11 @@ def _info(last_ts, *, n=100, gaps=0, granularity=Granularity.ONE_DAY, product="B
         requested_start_ts=0,
         gaps=gaps,
     )
+
+
+def _candle(ts: int, price: str = "100") -> Candle:
+    p = Decimal(price)
+    return Candle(ts=ts, open=p, high=p, low=p, close=p, volume=Decimal("1"))
 
 
 def test_expected_last_ts_is_the_bar_below_the_forming_one():
@@ -131,3 +140,148 @@ def test_any_needs_fetch_and_any_gaps_are_independent():
 def test_freshness_is_frozen():
     result = assess(_info(_NOW - _DAY), _NOW)
     assert isinstance(result, Freshness)
+
+
+# -- entry_bar_ready (the real-money entry gate; see keel/agent.py's wiring) -------------------
+#
+# This is deliberately a SEPARATE predicate from `assess`/`DEFAULT_TOLERANCE_BARS` -- that
+# tolerance exists so an operator-facing staleness ALERT does not fire on the normal
+# forming-bar lag. An entry gate on real money needs `bars_behind == 0`: a 1-bar-late hourly
+# series is exactly the condition that produces a duplicate order (Finding 1), and the alert
+# tolerance would wave it through.
+#
+# All the "01:20 UTC" scenarios below use `_NOW` as UTC day X's 00:00 -- so `_NOW + _HOUR +
+# 20*60` is X's 01:20, matching the live LaunchAgent's first eligible trigger.
+
+_AT_0120 = _NOW + _HOUR + 20 * 60  # UTC day X, 01:20 -- the first live trigger of the day.
+_AT_1420 = _NOW + 14 * _HOUR + 20 * 60  # UTC day X, 14:20 -- well into the trading day.
+
+# The ts `_completed_days` (turtle_breakout.py) waits for: the 00:00-01:00 UTC hourly bar's
+# OPEN ts. At `_AT_0120`, `expected_last_ts(ONE_DAY)` is `_NOW - _DAY` (day X-1's bar) and
+# `expected_ts + step` is `_NOW` (day X 00:00) -- exactly this.
+_DAY_CLOSE_HOURLY_TS = _NOW
+
+
+def test_entry_bar_ready_missing_when_nothing_stored():
+    """No cached bar at all for the gated granularity -- there is nothing to confirm, so this
+    must never read as "ready". Mirrors `assess`'s `missing`/`bars_behind=-1` convention.
+    """
+    result = entry_bar_ready({}, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is False
+    assert result.reason == "missing"
+    assert result.bars_behind == -1
+    assert result.stored_ts is None
+
+    # An explicitly-empty list reads the same as an absent key.
+    empty = entry_bar_ready({Granularity.ONE_DAY: []}, Granularity.ONE_DAY, _AT_0120)
+    assert empty.ready is False
+    assert empty.reason == "missing"
+
+
+def test_entry_bar_ready_behind_when_the_gated_series_itself_lags():
+    """The gated granularity's own bar is stale (bars_behind > 0) -- e.g. the daily fetch
+    itself hasn't run yet. This must block regardless of any finer series' state; `_completed_days`
+    would return an empty/short series in the equivalent live scenario.
+    """
+    candles_by_tf = {Granularity.ONE_DAY: [_candle(_NOW - 2 * _DAY)]}  # X-2: one bar behind
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is False
+    assert result.reason == "behind"
+    assert result.bars_behind == 1
+
+
+def test_entry_bar_ready_unconfirmed_when_the_finer_series_has_not_crossed_the_close():
+    """THE REGRESSION CASE. At 01:20 UTC, `_completed_days` withholds the just-closed daily bar
+    until the 00:00-01:00 UTC hourly bar has closed -- i.e. until an hourly bar stamped `_NOW`
+    (day X 00:00) exists. A one-bar-late hourly series (newest stamped `_NOW - _HOUR`, the
+    PRIOR day's last hour) has not crossed that boundary: `_completed_days` would drop an extra
+    daily bar and the rule would re-evaluate a bar already traded (Finding 1's duplicate order).
+    This predicate must call that exact condition "not ready".
+    """
+    candles_by_tf = {
+        Granularity.ONE_DAY: [_candle(_NOW - _DAY)],  # X-1: current, NOT itself behind
+        Granularity.ONE_HOUR: [_candle(_NOW - _HOUR)],  # one hour short of the day close
+    }
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is False
+    assert result.reason == "unconfirmed"
+    assert result.bars_behind == 0  # the daily bar itself is current -- the hourly is what blocks
+    assert result.blocked_by == Granularity.ONE_HOUR
+    assert result.blocked_by_ts == _NOW - _HOUR
+
+
+def test_entry_bar_ready_unconfirmed_when_the_finer_series_is_present_but_empty():
+    """A configured-but-empty finer series (e.g. the very first poll) must block exactly like a
+    late one -- there is nothing to confirm the daily bar closed against."""
+    candles_by_tf = {
+        Granularity.ONE_DAY: [_candle(_NOW - _DAY)],
+        Granularity.ONE_HOUR: [],
+    }
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is False
+    assert result.reason == "unconfirmed"
+    assert result.blocked_by == Granularity.ONE_HOUR
+    assert result.blocked_by_ts is None
+
+
+def test_entry_bar_ready_when_the_finer_series_has_crossed_the_day_close():
+    """The positive case this exists to unblock: the 00:00-01:00 UTC hourly bar (ts == `_NOW`)
+    has closed, so the daily bar it confirms is genuinely done -- this is `_completed_days`'s own
+    condition, generalized, and it must pass the instant that condition would."""
+    candles_by_tf = {
+        Granularity.ONE_DAY: [_candle(_NOW - _DAY)],
+        Granularity.ONE_HOUR: [_candle(_DAY_CLOSE_HOURLY_TS)],
+    }
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is True
+    assert result.reason is None
+    assert result.blocked_by is None
+
+
+def test_entry_bar_ready_with_no_finer_series_configured_is_ready():
+    """A config that only ever polls `ONE_DAY` (no hourly key at all) has nothing to confirm
+    against -- the gate must not invent a requirement the deployment never asked for."""
+    candles_by_tf = {Granularity.ONE_DAY: [_candle(_NOW - _DAY)]}
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is True
+    assert result.blocked_by is None
+
+
+def test_entry_bar_ready_is_not_over_strict_about_how_far_behind_the_finer_series_is():
+    """NOT the over-strict version: at 14:20 UTC an hourly series that is FIVE bars behind its
+    OWN expectation (last stamped 08:00, when 13:00 is expected) still confirms the daily bar,
+    because it has long since crossed the day-close boundary the daily bar needs. A
+    `bars_behind == 0` requirement on ONE_HOUR would have been far too strict -- the 01:20
+    trigger gives only 5 minutes of margin on a 15-minute bar -- and would block entries
+    routinely rather than only in the narrow post-midnight window this gate targets.
+    """
+    candles_by_tf = {
+        Granularity.ONE_DAY: [_candle(_NOW - _DAY)],
+        Granularity.ONE_HOUR: [_candle(_NOW + 8 * _HOUR)],  # 5 bars behind ONE_HOUR's own 13:00
+    }
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_1420)
+    assert result.ready is True
+    assert result.reason is None
+
+
+def test_entry_bar_ready_reports_the_coarsest_blocking_series_deterministically():
+    """When several finer series are all unconfirmed, the reported `blocked_by` must be
+    deterministic (same inputs -> same diagnostic) so an operator's alert doesn't flap between
+    two different "which bar is missing" messages across identical cycles. The COARSEST
+    offender is reported -- it is the one closest to actually confirming, so it is also the one
+    likely to clear soonest and is the most actionable to page on."""
+    candles_by_tf = {
+        Granularity.ONE_DAY: [_candle(_NOW - _DAY)],
+        Granularity.ONE_HOUR: [_candle(_NOW - _HOUR)],
+        Granularity.FIFTEEN_MINUTE: [_candle(_NOW - 15 * 60)],
+    }
+    result = entry_bar_ready(candles_by_tf, Granularity.ONE_DAY, _AT_0120)
+    assert result.ready is False
+    assert result.blocked_by == Granularity.ONE_HOUR
+
+
+def test_entry_bar_readiness_is_frozen():
+    result = entry_bar_ready(
+        {Granularity.ONE_DAY: [_candle(_NOW - _DAY)]}, Granularity.ONE_DAY, _AT_0120
+    )
+    assert isinstance(result, BarReadiness)
