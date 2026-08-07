@@ -9,6 +9,7 @@ freshness, or autonomy logic, only style `StatusReport` into `ScreenLine`s. Mirr
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import time
@@ -19,6 +20,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+import keel.commands.tui as tui_mod
 from keel.cli import cli
 from keel.commands.admission import DiscoverReport
 from keel.commands.insights import (
@@ -40,6 +42,8 @@ from keel.commands.status import (
     SubscriptionStatusRow,
 )
 from keel.commands.tui import (
+    _BALANCE_TIMEOUT_SEC,
+    _DISCOVER_TIMEOUT_SEC,
     _REFRESH_MESSAGE,
     _SHORT_VERSION,
     AvailableBalance,
@@ -69,6 +73,7 @@ from keel.commands.tui import (
     run_live,
     run_once,
     toggle_autonomy,
+    tui_cmd,
 )
 from keel.compliance import screen as screen_mod
 from keel.config import (
@@ -81,7 +86,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.types import Granularity
+from keel.types import Candle, Granularity
 
 NOW_TS = 1_800_000_000
 
@@ -960,6 +965,143 @@ def test_run_live_p_opens_propose_overlay_and_esc_closes_it(
     assert dashboard_after_idx > propose_idx
 
 
+def _seed_daily_history(repo: Repository, product: str, bars: int) -> None:
+    """Enough cached daily bars for `history` and `liquidity` to PASS the screen outright
+    (`volume * close` = 10,000,000 per bar, well over the 1,000,000 median floor), so a REJECT
+    from the gate can only be the shariah criterion the asset has no attestation for."""
+    repo.upsert_candles(
+        product,
+        Granularity.ONE_DAY,
+        [
+            Candle(
+                ts=i * 86400,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("100000"),
+            )
+            for i in range(bars)
+        ],
+    )
+
+
+def test_run_live_screen_overlay_paints_the_real_verdict_from_the_single_gate(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Design constraint 4 -- every candidate routes through `keel.cli._screen_product`, "so
+    nothing drifts onto a laxer gate" -- was convention-only exactly where it is WIRED. Replacing
+    `_screen_product` with an always-ADMIT stub in `_do_screen_report` left the entire suite
+    green, because the s/p overlay tests only assert that a title paints and Esc closes; not one
+    of them ever looked at a verdict.
+
+    So: BTC is seeded with ample history and liquidity but is never attested. The only thing that
+    can reject it is the shariah criterion, which only the real gate applies -- `screen_asset`
+    fails CLOSED on `attestation=None`. The overlay must therefore paint `REJECT` and name
+    `attestation: MISSING`. An always-ADMIT stub paints `ADMIT` with no failure lines and kills
+    both assertions."""
+    config = _config(allowlist=["BTC"])
+    _seed_daily_history(repo, "BTC-USD", 1500)
+    keys = [ord("s"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=40, width=120, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    overlay_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- screen" in t)
+    after = painted_texts[overlay_idx:]
+    assert any(t.startswith("REJECT") and "BTC" in t for t in after)
+    assert any("attestation: MISSING" in t for t in after)
+    # The premise: the data criteria really did pass, so REJECT above is the shariah gate's doing
+    # and not an incidental history/liquidity shortfall that any stub would also produce.
+    assert not any("✗ history" in t or "✗ liquidity" in t for t in after)
+
+
+def test_run_live_propose_overlay_paints_the_real_verdict_from_the_single_gate(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The `p` half of the same wiring gap the `s` test above closes -- `_do_propose_view` passes
+    `_screen_product` into `build_propose_view` on the same convention-only basis, and swapping it
+    for an always-ADMIT stub was equally invisible to the suite.
+
+    SOL is shortlisted with ample cached history and liquidity but no attestation, so the only
+    thing that can reject it is `screen_asset` failing CLOSED on `attestation=None` -- something
+    only the real gate does."""
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "shortlist.json").write_text(
+        json.dumps(
+            {"candidates": [{"asset": "SOL", "rationale": "r", "sources": ["https://x.invalid"]}]}
+        )
+    )
+    config = _config(proposals_dir=str(proposals))
+    _seed_daily_history(repo, "SOL-USD", 1500)
+    keys = [ord("p"), -1, 27]
+    stdscr = _KeySequenceStdscr(height=40, width=200, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    overlay_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- propose" in t)
+    after = painted_texts[overlay_idx:]
+    assert any(t.startswith("REJECT") and "SOL" in t for t in after)
+    assert any("attestation: MISSING" in t for t in after)
+    assert any("keel assets attest SOL" in t for t in after)  # the next step, not just a verdict
+    # The premise: the data criteria really did pass, so REJECT is the shariah gate's doing.
+    assert not any("✗ history" in t or "✗ liquidity" in t for t in after)
+
+
+def test_run_live_propose_overlay_reports_a_non_utf8_shortlist_calmly(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The TUI half of the `UnicodeDecodeError`-is-not-an-`OSError` fix. A UTF-16LE+BOM shortlist
+    escaped `build_propose_view`'s fail-soft branches entirely and was caught only by the propose
+    branch's broad `except Exception`, which repainted `propose read failed: 'utf-8' codec can't
+    decode byte 0xff...` on every poll forever -- naming no file and offering no next step. It
+    must render as the same calm, actionable `unreadable` overlay a permissions error renders
+    as."""
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "shortlist.json").write_bytes(
+        json.dumps(
+            {"candidates": [{"asset": "SOL", "rationale": "r", "sources": ["https://x.invalid"]}]}
+        ).encode("utf-16")
+    )
+    config = _config(proposals_dir=str(proposals))
+    keys = [ord("p"), -1, 27]
+    # Wide enough that `_paint`'s clip-to-window-width does not truncate the tmp_path before the
+    # filename this test is about -- the clipping is real terminal behaviour, not the bug here.
+    stdscr = _KeySequenceStdscr(height=40, width=400, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("could not read the shortlist file" in t for t in painted_texts)
+    assert any("shortlist.json" in t for t in painted_texts)  # WHICH file, by name
+    assert not any("propose read failed" in t for t in painted_texts)
+
+
 def test_run_live_screen_survives_transient_read_error_and_keeps_polling(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1202,11 +1344,21 @@ def test_run_live_discover_enter_raising_paints_readable_failure_and_keeps_polli
     assert any(i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts))
 
 
-def test_run_live_discover_closing_discards_the_held_result(
+def test_run_live_discover_reopening_after_a_run_is_armed_not_stale(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Closing the overlay (Esc) must discard the held result -- reopening it must be armed but
-    not yet run again, not silently show the previous run's stale candidates."""
+    """Reopening the overlay after a run must be ARMED again, never a silent repaint of the
+    previous run's stale candidates.
+
+    NAMED for what it actually pins, which is a DISJUNCTION, not a single line. Two independent
+    clears stand between the held result and the reopened overlay -- the close branch's
+    (`run_live`, discover mode, `q`/`Esc`/`d`) and the normal-mode `d` branch's self-labelled
+    belt-and-braces one -- and reaching the reopened overlay necessarily runs BOTH. Deleting
+    either one alone leaves this test green. It was previously called
+    `..._closing_discards_the_held_result`, which claimed to pin the close branch specifically;
+    nothing observable from outside `run_live` can distinguish the two, because `mode` only ever
+    becomes `discover` via the normal-mode `d` branch that also clears. Keeping both clears is
+    deliberate defence in depth; this test guards the property they jointly provide."""
     config = _config()
 
     class _FakeBroker:
@@ -1259,6 +1411,52 @@ def test_run_live_discover_closing_discards_the_held_result(
     )
 
 
+def test_run_live_discover_bounds_its_one_network_call_with_the_discover_timeout(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_DISCOVER_TIMEOUT_SEC` was correctly wired but had no test: dropping the `timeout=` kwarg
+    (or reusing `_BALANCE_TIMEOUT_SEC`) left the suite green. It exists because the operator waits
+    on this call with the screen frozen behind a "contacting venue" frame, so a hung connection
+    must fail and say so rather than freeze the dashboard until Ctrl-C. Pinned per-call, not
+    globally: the unrelated balance refresh in the same run uses its OWN, shorter bound, and this
+    test would not notice the two being collapsed into one if it only checked "some timeout was
+    passed"."""
+    config = _config()
+    timeouts: list[tuple[str, Any]] = []
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            return []
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        timeouts.append(("build", timeout))
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 'd'. poll2: discover ARMED -> Enter runs the one call. poll3: Esc closes.
+    keys = [ord("d"), 10, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    passed = [t for _, t in timeouts]
+    assert _DISCOVER_TIMEOUT_SEC in passed
+    # The balance refresh (the other broker build in this run) keeps its own, distinct bound.
+    assert _BALANCE_TIMEOUT_SEC in passed
+    assert _DISCOVER_TIMEOUT_SEC != _BALANCE_TIMEOUT_SEC
+
+
 def test_run_live_read_error_does_not_swallow_keyboard_interrupt(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1296,9 +1494,59 @@ def test_build_help_screen_documents_discover_network_gating_and_attest_is_cli_o
     allowlist -- is never reachable from here."""
     lines = build_help_screen()
     text = " ".join(line.text.lower() for line in lines)
-    assert "second deliberate network exception" in text
+    assert "third deliberate network exception" in text
     assert "cli-only" in text
     assert "keel assets attest" in text
+
+
+#: Every operator-facing place that counts this dashboard's network touches. The count is a
+#: SAFETY claim -- an operator deciding whether a keypress can reach the venue reads it and stops
+#: looking -- so an undercount is a bug, not a typo, and it must be pinned wherever it is stated.
+_NETWORK_COUNT_SURFACES = {
+    "module docstring": tui_mod.__doc__ or "",
+    "tui_cmd --help": tui_cmd.__doc__ or "",
+    "help overlay": "\n".join(line.text for line in build_help_screen()),
+    "ARMED discover overlay": "\n".join(
+        line.text for line in build_discover_overlay(None)
+    ),
+}
+
+
+@pytest.mark.parametrize("surface", sorted(_NETWORK_COUNT_SURFACES))
+def test_no_surface_undercounts_the_dashboards_network_touches(surface: str) -> None:
+    """`run_live` touches the network in exactly THREE places: the automatic ~30s live-balance
+    refresh (`_refresh_balance` -> `get_accounts`), `f` fetch, and `d`+Enter. Three surfaces --
+    including the operator-facing ARMED overlay, read at the moment of deciding whether to make
+    a live call -- used to call discover "the SECOND deliberate network exception", silently
+    forgetting the balance refresh that had been firing every 30 seconds since v3. Only
+    `tui_cmd`'s own docstring had it right. An operator who trusts "second" concludes that
+    closing the overlay leaves the dashboard offline; it does not."""
+    text = _NETWORK_COUNT_SURFACES[surface].lower()
+    assert "second deliberate network exception" not in text
+    # Either phrasing states the true count -- three surfaces frame it from discover's side
+    # ("the THIRD..."), `tui_cmd --help` from the dashboard's ("there are exactly three").
+    assert "third deliberate network exception" in text or "exactly three" in text
+    # Naming the other two is what makes the count checkable rather than a bare number, and it is
+    # specifically the balance refresh that every undercount forgot.
+    assert "balance" in text
+    assert "fetch" in text
+
+
+def test_help_says_the_live_balance_line_is_itself_a_venue_call() -> None:
+    """The help's own Safety notes tell the operator that screen and propose are offline and that
+    fetch/discover are the exceptions -- but the "Live balance" section only ever said the number
+    is "refreshed every ~30s", never that refreshing it CONTACTS THE VENUE. That omission is what
+    made "second deliberate network exception" read as plausible three sections later."""
+    balance_section: list[str] = []
+    lines = build_help_screen()
+    start = next(i for i, line in enumerate(lines) if line.text.strip() == "Live balance")
+    for line in lines[start:]:
+        if not line.text.strip():
+            break
+        balance_section.append(line.text.lower())
+    text = " ".join(balance_section)
+    assert "live call" in text or "network" in text
+    assert "get_accounts" in text
 
 
 def test_build_help_screen_is_longer_than_a_small_terminal() -> None:

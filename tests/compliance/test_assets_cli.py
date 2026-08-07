@@ -1100,6 +1100,29 @@ def test_propose_json_is_valid_and_has_no_trailing_prose(tmp_path, valid_config_
     assert payload["screened"][0]["asset"] == "SOL"
 
 
+def test_propose_json_tells_the_same_zero_bar_story_the_human_output_tells(
+    tmp_path, valid_config_path
+):
+    """End-to-end companion to `test_zero_cached_bars_never_prints_a_history_depth_failure_via_
+    propose`, through the REAL gate: the human surface suppresses `history: 0 daily bars < 1460
+    required` and prints the MISSING-DATA explanation, so `--json` -- the surface a script trusts
+    -- must not hand back that same line as an unflagged verdict about the asset."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # no candles seeded -- SOL has zero cached bars
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist), "--json"],
+    )
+
+    row = json.loads(result.output)["screened"][0]
+    assert row["daily_bars"] == 0
+    assert row["missing_history"] is True
+    assert not any(f.startswith("history") for f in row["failures"])
+    assert any(f.startswith("history") for f in row["not_assessable"])
+
+
 def test_propose_missing_file_is_a_clean_error(tmp_path, valid_config_path):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
@@ -1108,6 +1131,29 @@ def test_propose_missing_file_is_a_clean_error(tmp_path, valid_config_path):
               "assets", "propose", "--from", str(tmp_path / "nope.json")],
     )
     assert result.exit_code != 0
+
+
+def test_propose_non_utf8_shortlist_is_a_clean_error_not_a_traceback(tmp_path, valid_config_path):
+    """`UnicodeDecodeError` subclasses **ValueError, not OSError**, so the original
+    `except (OSError, json.JSONDecodeError)` did not catch it: a UTF-16LE+BOM shortlist (valid
+    JSON, and what a scout run on a Windows box writes) crashed out of `assets propose` with a
+    raw traceback instead of the `could not read/parse <file>` message every other unreadable
+    input gets. Exit code alone is not enough here -- an uncaught exception also exits non-zero,
+    which is why the message and the absence of a traceback are both pinned."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    shortlist = tmp_path / "shortlist.json"
+    shortlist.write_bytes(json.dumps({"candidates": [_SOL]}).encode("utf-16"))
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path),
+              "assets", "propose", "--from", str(shortlist)],
+    )
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "could not read/parse" in result.output
+    assert str(shortlist) in result.output
 
 
 def test_propose_hypothesis_never_admits(tmp_path, valid_config_path):

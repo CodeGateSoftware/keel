@@ -269,12 +269,27 @@ def split_failures(facts: MarketFacts, result: ScreenResult) -> tuple[list[str],
     there is exactly one place either can change.
 
     With `facts.daily_bars > 0` every failure is returned as `about_the_asset` and
-    `about_our_cache` is empty, UNSPLIT -- including a genuine `history` shortfall, because an
-    asset with some cached history that still falls short of the floor really is too young, and
-    that verdict must not be silenced. The split only ever happens at EXACTLY zero bars, which is
-    the one condition where `history` (and `liquidity`) measure our cache instead of the asset.
-    Original ordering is preserved within each returned list, so a caller that renders them in
-    order does not see failures reshuffled relative to how `screen_asset` produced them.
+    `about_our_cache` is empty, UNSPLIT -- including a `history` shortfall.
+
+    Be clear about what that does and does not mean. It does NOT mean a shallow cache proves the
+    asset is young. `MarketFacts` carries a bar COUNT and no first-bar timestamp, so this function
+    cannot distinguish "listed 18 months ago" from "we fetched an 18-month window": `keel fetch
+    --years 2`, a fetch that aborted partway, or a venue that simply does not serve the full
+    window all leave an OLD asset shallow (`keel/cli.py`'s `fetch` prints a note about exactly
+    that -- "some series are still short... an asset younger than the requested window"). Every
+    surface nonetheless renders `✗ history: 730 daily bars < 1460 required` as a verdict, because
+    a partial cache is genuinely ambiguous and the gate must fail closed on ambiguity rather than
+    admit on it.
+
+    So the operator reading a non-zero `history` failure should CHECK THE FETCH WINDOW before
+    concluding the asset is too young: `keel fetch --products <id> --years 5`, then re-screen. If
+    the count does not move, it is the asset.
+
+    The split is confined to EXACTLY zero bars because that is the only count where there is no
+    ambiguity to resolve: with no candles at all, `history` and `liquidity` are reporting the
+    emptiness of our cache and nothing whatsoever about the asset. Original ordering is preserved
+    within each returned list, so a caller that renders them in order does not see failures
+    reshuffled relative to how `screen_asset` produced them.
     """
     if facts.daily_bars > 0:
         return list(result.failures), []
@@ -304,11 +319,19 @@ def missing_history_lines(product_id: str, not_assessable: Sequence[str]) -> lis
     after the colon. Tags are deduplicated and sorted so two failures sharing a tag collapse to
     one mention and the order is stable regardless of how `screen_asset` happened to emit them.
     """
+    # The second line is the SEMANTIC one -- it says what a zero-bar report means -- and it is
+    # deliberately agnostic about the asset. It used to read "it is not too young, we have simply
+    # never fetched candles for it", which asserts something we cannot know: at exactly zero bars
+    # a listing three days old and one three years old are the same input, since `MarketFacts`
+    # carries no first-bar timestamp. Refusing to rule is the honest answer, and it is also the
+    # useful one -- it points at the fetch, which is the only thing that can resolve it.
+    # `test_missing_history_lines_claim_nothing_about_the_assets_age` pins this.
     lines = [
         f"no local history for {product_id} -- run `keel fetch --products {product_id}` first, "
         "then re-screen.",
-        "This is a MISSING-DATA verdict, not a verdict about the asset: it is not too young, "
-        "we have simply never fetched candles for it.",
+        "This is a MISSING-DATA verdict, not a verdict about the asset: with no candles at all "
+        "we cannot tell a genuinely young asset from one we have simply never fetched, so this "
+        "says nothing about its age either way.",
     ]
     if not_assessable:
         tags = sorted({f.split(":")[0] for f in not_assessable})

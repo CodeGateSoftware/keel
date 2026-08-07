@@ -332,6 +332,69 @@ def test_build_propose_view_unreadable_file_is_fail_soft(repo: Repository, tmp_p
     assert view.report is None
 
 
+def test_build_propose_view_non_utf8_shortlist_is_fail_soft(repo: Repository, tmp_path):
+    """A UTF-16LE+BOM shortlist -- valid JSON, and exactly what a scout run on a Windows box
+    writes -- makes `source.read_text()` raise `UnicodeDecodeError`, which subclasses
+    **ValueError, not OSError** (`issubclass(UnicodeDecodeError, OSError)` is False). The original
+    `except OSError` therefore let it escape a function whose docstring promises it never raises,
+    which in the TUI meant the propose overlay repainting `propose read failed: 'utf-8' codec
+    can't decode byte 0xff...` every poll forever, naming neither the file nor a next step. The
+    fail-soft branch must own this exactly like it owns a permissions error."""
+    config = _config()
+    directory = tmp_path / "proposals"
+    directory.mkdir()
+    path = directory / "shortlist.json"
+    path.write_bytes(json.dumps({"candidates": [_SOL_CANDIDATE]}).encode("utf-16"))
+
+    view = build_propose_view(repo, config, cli_module._screen_product, directory=directory)
+
+    assert view.status == "unreadable"
+    assert view.source == path
+    assert view.detail is not None
+    assert str(path) in view.detail  # the operator is told WHICH file, unlike the raw traceback
+    assert view.report is None
+
+
+def test_build_propose_view_defaults_the_directory_to_config_proposals_dir(
+    repo: Repository, tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Every other test in this file passes `directory=` explicitly, so the `directory is None`
+    branch -- `Path(config.proposals_dir).expanduser()` -- was never executed by the suite at all:
+    hardcoding any path there left 2062 tests green. It resolves to `~/keel/proposals` by default,
+    INSIDE the live deployment root, so a silent regression means the overlay quietly reads a
+    right-looking wrong place. `HOME` is redirected at `tmp_path` so this never touches a real
+    deployment."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # `expanduser` on Windows reads this instead
+    config = _config(proposals_dir="~/scout/shortlists")
+    shortlist = _write_shortlist(tmp_path / "scout" / "shortlists", [_SOL_CANDIDATE])
+
+    view = build_propose_view(repo, config, cli_module._screen_product)
+
+    assert view.status == "ok"
+    assert view.source == shortlist
+
+
+def test_build_propose_view_default_proposals_dir_is_keel_proposals_under_home(
+    repo: Repository, tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """The other half of the same branch: with `proposals_dir` left at its own default, the
+    directory actually looked in is `<home>/keel/proposals` -- `~` EXPANDED. A missing
+    `.expanduser()` would look in a literal `./~/keel/proposals` relative to the cwd, find
+    nothing, and report `no proposals directory` forever while the operator's real shortlists sat
+    untouched. Pinned via the reported path, which the overlay shows verbatim."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    config = _config()
+    assert config.proposals_dir == DEFAULT_PROPOSALS_DIR  # guards the premise of this test
+
+    view = build_propose_view(repo, config, cli_module._screen_product)
+
+    assert view.status == "no-directory"
+    assert view.detail is not None
+    assert str(tmp_path / "keel" / "proposals") in view.detail
+
+
 def test_build_propose_view_invalid_json_is_fail_soft(repo: Repository, tmp_path):
     config = _config()
     directory = tmp_path / "proposals"

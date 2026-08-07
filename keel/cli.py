@@ -848,7 +848,11 @@ def assets_propose(ctx: click.Context, from_file: str, as_json: bool) -> None:
     repo = _open_repo(ctx)
     try:
         raw = json.loads(Path(from_file).read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    # `UnicodeDecodeError` subclasses ValueError, NOT OSError, so it needs naming here or a
+    # non-UTF-8 shortlist (a scout run on Windows writes UTF-16LE+BOM -- valid JSON, undecodable
+    # as UTF-8) crashes out with a raw traceback instead of this message. Same fix, same reason,
+    # as `keel.commands.admission.build_propose_view`'s own read.
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise click.ClickException(f"could not read/parse {from_file}: {exc}") from exc
     try:
         parsed = parse_proposal(raw)

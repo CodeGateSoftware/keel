@@ -485,6 +485,42 @@ def test_missing_history_lines_omits_the_third_line_when_nothing_is_suppressed()
     assert not any("not assessable" in line for line in lines)
 
 
+def test_missing_history_lines_claim_nothing_about_the_assets_age():
+    """The SEMANTIC sentence -- the one that says what a zero-bar report actually means -- was
+    pinned by nothing. Every test around it asserted proxies at the call sites (`"no local
+    history" in text`, `"✗ history" not in text`), so the sentence could be reworded into
+    anything and the suite stayed green.
+
+    It used to read "it is not too young, we have simply never fetched candles for it", which
+    asserts a fact about the ASSET this function cannot possibly know: at exactly zero bars a
+    brand-new listing and a never-fetched veteran are the same input, and `MarketFacts` carries
+    no first-bar timestamp to tell them apart. Refusing to rule is the honest position, and it is
+    the one the explanation must state."""
+    lines = missing_history_lines("SOL-USD", ["history: 0 daily bars < 1460 required"])
+    semantic = lines[1]
+
+    assert "MISSING-DATA verdict, not a verdict about the asset" in semantic
+    assert "cannot tell" in semantic
+    assert "not too young" not in semantic
+
+
+def test_missing_history_lines_never_restate_a_suppressed_failure_verbatim():
+    """These lines are shown INSTEAD OF `not_assessable`, so leaking one back in verbatim would
+    reprint the very depth verdict the suppression exists to withhold -- and the call-site proxy
+    `"✗ history" not in text` would not catch it, because the leak carries no `✗`. Only the TAGS
+    survive, on the third line."""
+    suppressed = [
+        "history: 0 daily bars < 1460 required",
+        "liquidity: median daily volume 0 < 1000000 required",
+    ]
+    joined = "\n".join(missing_history_lines("SOL-USD", suppressed))
+
+    for failure in suppressed:
+        assert failure not in joined
+    assert "1460" not in joined
+    assert "0 daily bars" not in joined
+
+
 def test_missing_history_lines_dedupes_and_sorts_tags():
     """Two failures sharing a tag collapse to one mention, and the tags print in a stable,
     predictable order rather than whatever order `screen_asset` happened to emit them in."""

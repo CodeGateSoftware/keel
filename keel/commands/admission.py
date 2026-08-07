@@ -217,7 +217,8 @@ def build_propose_view(
     `Path(config.proposals_dir).expanduser()`.
 
     Every failure mode is FAIL-SOFT: a missing directory, an empty one, an unreadable file
-    (`OSError` -- e.g. a permissions problem, or the file vanishing mid-read), invalid JSON
+    (`OSError` -- a permissions problem, the file vanishing mid-read -- or `UnicodeDecodeError`,
+    which is NOT an `OSError` and needs naming separately; see the read below), invalid JSON
     (`json.JSONDecodeError`), or a malformed top-level shortlist (`ProposalError` from
     `parse_proposal`, e.g. `{"candidates": "nope"}`) each produce a `ProposeView` carrying the
     matching `status` and a plain-English `detail` -- never an exception. This function backs a
@@ -266,7 +267,14 @@ def build_propose_view(
 
     try:
         raw_text = source.read_text()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` subclasses **ValueError, not OSError** -- so `except OSError` alone
+        # let a non-UTF-8 shortlist escape this function entirely, breaking the "Never raises"
+        # contract above. It is not a hypothetical: a scout run on Windows writes UTF-16LE+BOM,
+        # which is perfectly valid JSON and unreadable here. Uncaught, the TUI's propose overlay
+        # repainted `'utf-8' codec can't decode byte 0xff...` every poll forever, naming neither
+        # the file nor a next step, and `keel assets propose --from` exited on a raw traceback.
+        # Both now get the same calm, file-naming `unreadable` report a permissions error gets.
         return ProposeView(
             source=source,
             status="unreadable",

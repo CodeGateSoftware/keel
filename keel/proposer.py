@@ -225,8 +225,27 @@ def render_proposal_report(report: ProposalReport) -> list[str]:
 
 
 def report_to_jsonable(report: ProposalReport) -> dict[str, Any]:
-    return {
-        "screened": [
+    """The `--json` shape -- and it must tell the SAME story `render_proposal_report` tells.
+
+    It used to emit `sc.result.failures` raw, so at zero cached bars the payload carried
+    `history: 0 daily bars < 1460 required` as a plain failure while every human surface
+    (`render_proposal_report` two functions up, `assets holdings --screen`, `assets screen`, the
+    TUI's screen/propose overlays) suppressed that exact line and printed the MISSING-DATA
+    explanation instead. One report, two surfaces, two different answers to "is this asset too
+    young?" -- the drift `screen.split_failures` exists to end, surviving in the one surface a
+    script reads and cannot argue with.
+
+    So the same `split_failures` the renderers call decides this too, and the split is made
+    EXPLICIT rather than merely applied: `failures` is what the human report prints with a `✗`
+    (verdicts about the asset), `not_assessable` is what it withholds at zero bars (statements
+    about the emptiness of OUR cache -- suppressed, never dropped, so a consumer that wants them
+    can still read them correctly labelled), and `missing_history` is the flag that says which
+    regime the row is in without the consumer having to infer it from `daily_bars == 0`.
+    """
+    rows: list[dict[str, Any]] = []
+    for sc in report.screened:
+        failures, not_assessable = split_failures(sc.facts, sc.result)
+        rows.append(
             {
                 "asset": sc.candidate.asset,
                 "product": sc.product,
@@ -238,11 +257,14 @@ def report_to_jsonable(report: ProposalReport) -> dict[str, Any]:
                 "admitted": sc.result.admitted,
                 "summary": sc.result.summary,
                 "daily_bars": sc.facts.daily_bars,
-                "failures": sc.result.failures,
+                "missing_history": sc.facts.daily_bars == 0,
+                "failures": failures,
+                "not_assessable": not_assessable,
                 "warnings": sc.result.warnings,
             }
-            for sc in report.screened
-        ],
+        )
+    return {
+        "screened": rows,
         "invalid": [{"reason": e.reason, "raw": e.raw} for e in report.invalid],
         "admitted_count": report.admitted_count,
     }
