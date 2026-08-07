@@ -1544,10 +1544,39 @@ def test_scroll_offset_home_jumps_to_top() -> None:
     assert result == 0
 
 
-def test_scroll_offset_end_jumps_to_the_last_full_page() -> None:
+@pytest.mark.parametrize(
+    ("height", "total", "expected"),
+    [
+        (10, 50, 40),  # the ordinary case: last full page
+        (10, 51, 41),  # +1 line of content moves the floor by exactly 1 (catches an off-by-one)
+        (10, 10, 0),   # content exactly fills the window -- nowhere to scroll
+        (10, 3, 0),    # content SHORTER than the window -- End must not scroll past the top
+        (1, 50, 49),   # a one-row terminal still lands on the true last line
+    ],
+)
+def test_scroll_offset_end_jumps_to_the_last_full_page(
+    height: int, total: int, expected: int
+) -> None:
+    """`End` sets the offset to `total` and lets the shared clamp bring it back to the last full
+    page.
+
+    Parametrized rather than asserted at a single point because one point does not pin the
+    RELATIONSHIP between window and content: the interesting cases are the boundaries, where
+    content exactly fills the window, is shorter than it (End must be a no-op, not a scroll into
+    blank space), or is one line longer than a page (the floor must move by exactly one).
+
+    Worth knowing before "tightening" this: `offset = total` is not the only correct
+    implementation. The trailing clamp is `min(offset, max(0, total - height))`, so ANY value at
+    or above `total - height` is indistinguishable from any other -- `total - 1` included. That
+    is not an off-by-one waiting to be caught, it is the same function; a test asserting `total`
+    specifically would be pinning an implementation detail rather than the behaviour. What these
+    cases do catch is an End that lands BELOW the floor (e.g. `total // 2`, or a forgotten clamp
+    letting it run past the end)."""
     fake_curses = _fake_curses()
-    result = _scroll_offset(fake_curses.KEY_END, 0, height=10, total=50, curses_mod=fake_curses)
-    assert result == 40
+    result = _scroll_offset(
+        fake_curses.KEY_END, 0, height=height, total=total, curses_mod=fake_curses
+    )
+    assert result == expected
 
 
 def test_scroll_offset_clamps_negative_to_zero() -> None:

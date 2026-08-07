@@ -730,6 +730,53 @@ def test_a_genuinely_young_asset_still_reports_history_as_a_real_verdict_via_hol
     assert "no local history" not in result.output
 
 
+def test_zero_cached_bars_never_prints_a_history_depth_failure_via_assets_screen(
+    tmp_path, valid_config_path
+):
+    """The same invariant as the `holdings --screen` and `propose` versions, for `assets screen`.
+
+    This command is the SIBLING of the TUI's `s` screen overlay -- both screen the same
+    `_default_sim_products(config)` set through the same `_screen_product` gate -- so if only one
+    of them explains a zero-bar cache, an operator gets two different stories about the same
+    allowlist depending on which surface they happened to look at. That is precisely the drift
+    `_screen_product`'s docstring exists to prevent, applied to the REPORTING of a verdict rather
+    than to the verdict itself.
+    """
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # no candles seeded at all
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "SOL-USD"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "✗ history" not in result.output
+    assert "no local history" in result.output
+    assert "keel fetch" in result.output
+    assert "not assessable until then" in result.output
+
+
+def test_assets_screen_still_reports_a_genuinely_short_history_as_a_real_verdict(
+    tmp_path, valid_config_path
+):
+    """The counterpart: the suppression is scoped to EXACTLY zero bars here too, so an asset that
+    really is too young still gets told so by `assets screen`."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "PAXG-USD"],
+    )
+
+    assert "✗ history" in result.output
+    assert "no local history" not in result.output
+
+
 def test_a_lowercase_settlement_currency_is_still_excluded(
     tmp_path, valid_config_path, monkeypatch
 ):

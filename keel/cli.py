@@ -795,7 +795,24 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
             f"\n{result.summary:<7} {asset:<8} bars={facts.daily_bars} "
             f"median_daily_volume={facts.median_daily_volume:.0f}"
         )
-        for failure in result.failures:
+        # Same zero-bars split `assets holdings --screen` and `assets propose` use, via the same
+        # two helpers in `screen.py`. This command is the SIBLING of the TUI's `s` screen overlay
+        # -- both screen `_default_sim_products(config)` through `_screen_product` -- so leaving
+        # only one of them able to explain an empty cache would hand an operator two different
+        # stories about the same allowlist depending on which surface they looked at. That is the
+        # drift `_screen_product` exists to prevent, applied to the REPORTING rather than to the
+        # verdict. At zero bars `history`/`liquidity` measure OUR CACHE, not the asset, so
+        # printing them as verdicts would say "too young" about something we simply never
+        # fetched. `settlement`/`spot_instrument` read the product id alone and never touch
+        # candles, so they stay real verdicts here -- which is exactly why this command may still
+        # be asked about an unvalidated `--products` id (see the note above).
+        failures, not_assessable = screen_mod.split_failures(facts, result)
+        if facts.daily_bars == 0:
+            explanation = screen_mod.missing_history_lines(product, not_assessable)
+            click.echo(f"    ! {explanation[0]}")
+            for extra_line in explanation[1:]:
+                click.echo(f"      {extra_line}")
+        for failure in failures:
             click.echo(f"    ✗ {failure}")
         for warning in result.warnings:
             click.echo(f"    ! {warning}")

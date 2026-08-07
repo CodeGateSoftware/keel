@@ -851,6 +851,14 @@ _BALANCE_REFRESH_SEC = 30
 #: background refresh, not something the operator is blocked waiting on) but finite.
 _BALANCE_TIMEOUT_SEC = 10
 
+#: Network timeout (seconds) bounding the discover overlay's one `list_products` call. TIGHTER
+#: than `_BALANCE_TIMEOUT_SEC`'s rationale would suggest is needed, because the operator is
+#: BLOCKED on this one: they pressed Enter, the screen is frozen behind a "contacting venue"
+#: frame, and there is no other feedback until the call returns. A hung venue must become a
+#: readable `discover failed:` line they can retry, never an indefinitely frozen dashboard whose
+#: only exit is Ctrl-C (which kills the whole TUI, not just the request).
+_DISCOVER_TIMEOUT_SEC = 20
+
 
 def _refresh_balance(
     open_state: OpenState, now_fn: NowFn, balance_fn: Callable[[Config], Decimal | None]
@@ -997,11 +1005,18 @@ def _do_discover_report(open_state: OpenState) -> DiscoverReport:
     own lazy broker import, so a test can monkeypatch `keel.commands._common._build_broker` (to
     record calls, or to raise if called at all) and prove this function -- and therefore this
     whole overlay -- was, or crucially was NOT, ever invoked. Thin I/O -- not unit-tested
-    directly, only smoke-tested via `run_live`."""
+    directly, only smoke-tested via `run_live`.
+
+    BOUNDED by `_DISCOVER_TIMEOUT_SEC`, for the reason `_refresh_balance` is bounded and `_do_fetch`
+    deliberately is not: this is a single, small metadata request the operator is actively waiting
+    on with the screen frozen behind a "contacting venue" frame, so a hung connection must fail and
+    say so rather than freeze the dashboard until Ctrl-C. (`f` fetch legitimately runs for minutes
+    pulling 5y of candles, which is why it is documented as freezing the dashboard instead of being
+    given a timeout that would abort honest work.)"""
     from keel.commands._common import _build_broker
 
     _repo, config = open_state()
-    products = _build_broker(config).list_products()
+    products = _build_broker(config, timeout=_DISCOVER_TIMEOUT_SEC).list_products()
     return build_discover_report(products, config)
 
 
