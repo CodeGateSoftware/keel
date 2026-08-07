@@ -288,6 +288,45 @@ def test_the_params_that_legitimately_take_strings_are_not_refused(tmp_path, val
     assert rule.params["timeframe"] == "ONE_DAY"
 
 
+def test_a_param_the_row_cannot_carry_is_refused_rather_than_silently_dropped(
+    tmp_path, valid_config_path
+):
+    """`PullbackContinuation(granularity=...)` constructs fine and `describe()["params"]` does
+    NOT carry it -- so the row would rebuild at the DEFAULT ONE_HOUR, and the operator would be
+    told their ONE_DAY rule was added and then read backtest numbers for a different rule than
+    the one they asked for. Accepting a param the round trip loses is worse than refusing it.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"granularity": "ONE_DAY"}',
+    )
+
+    assert result.exit_code != 0
+    assert "granularity" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_param_that_the_row_does_carry_is_still_accepted(tmp_path, valid_config_path):
+    """The same rule kind, via a param `describe()` does persist -- the check above must not
+    turn into a blanket refusal of `pullback_continuation`.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"ema_periods": [10, 20, 50], "buffer_ticks": "0.05"}',
+    )
+
+    assert result.exit_code == 0, result.output
+    rule = _build_rule(repo.get_rules()[0])
+    assert rule.params["ema_periods"] == (10, 20, 50), "a JSON list rebuilds as the tuple"
+    assert rule.params["buffer_ticks"] == Decimal("0.05")
+
+
 def test_an_unknown_kind_is_refused_naming_the_kinds_that_exist(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 

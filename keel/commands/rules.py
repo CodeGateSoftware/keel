@@ -467,9 +467,11 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     `.describe()`'s params, not the raw JSON, so the stored row is exactly what
     `agent._build_rule` can reconstruct: a row that stores but cannot rebuild is worse than a
     refusal, because it fails later, inside a backtest or an agent cycle. Construction alone
-    misses one class of bad params -- a quoted number for a field that is not a `Decimal`, which
-    a validation-free dataclass rule such as `RsiMeanReversion` accepts and then dies on inside
-    `detect()` -- so `_string_number_mismatches` refuses that too, for the same reason.
+    misses two classes of bad params, both refused here for the same reason: a quoted number for
+    a field that is not a `Decimal` (a validation-free dataclass rule such as `RsiMeanReversion`
+    accepts it and then dies inside `detect()`), and a kwarg the rule constructs with but does
+    NOT persist in `describe()["params"]` (`PullbackContinuation(granularity=...)` -- accepted,
+    dropped, and rebuilt at the default, so the backtest would measure a different rule).
 
     `--product` is validated exactly as `rules seed --products` is (`parse_products_option`,
     rails 18/19): a futures contract, an equity hash, a pair settling outside
@@ -574,6 +576,25 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     # every kind carries it in `describe()` (e.g. `TurtleBreakout` does not).
     params = _json_plain(rule.describe()["params"])
     params["product_id"] = product_id
+
+    # A constructor kwarg that `describe()` does not carry would be accepted, then LOST: the row
+    # rebuilds without it and the backtest measures a different rule than the one asked for.
+    # `PullbackContinuation(granularity=ONE_DAY)` is exactly this -- it constructs, `params` has
+    # no `granularity` key, and `_build_rule` rebuilds it at the ONE_HOUR default, on a different
+    # candle series. Silently trading a rule the operator did not ask for is worse than a
+    # refusal, so this is a refusal. Derived from the rule's own `describe()`, so a kind that
+    # starts persisting a field needs no change here.
+    dropped = sorted(set(supplied) - set(params))
+    if dropped:
+        click.echo(
+            f"Error: {kind} accepts {dropped!r} but does not persist "
+            f"{'them' if len(dropped) > 1 else 'it'} in the rule row, so the value would be "
+            f"silently lost when the rule is rebuilt for a backtest or a cycle. Refusing rather "
+            f"than storing a rule that is not the one you asked for.",
+            err=True,
+        )
+        ctx.exit(1)
+        return
 
     existing = [
         row
