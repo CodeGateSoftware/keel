@@ -227,8 +227,11 @@ def test_render_no_history_shows_missing_data_next_step():
     assert "no local history" in text
     assert "keel fetch --products SOL-USD" in text
     assert "MISSING-DATA verdict" in text
-    # the liquidity failure is suppressed as not-assessable-without-history
-    assert "not assessable without history" in text
+    # the liquidity failure is suppressed as not-assessable-until-then, and no longer printed
+    # per-tag as `· (liquidity: not assessable without history)` -- it is now one summary line,
+    # shared by construction with `keel/cli.py` via `screen.missing_history_lines`.
+    assert "not assessable until then: liquidity" in text
+    assert "✗ liquidity" not in text
 
 
 def test_render_unattested_reject_shows_attest_next_step():

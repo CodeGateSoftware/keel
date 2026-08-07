@@ -83,6 +83,9 @@ fees:
 # Non-default on purpose (the default is USD) -- see the `tiers` note above.
 quote_currency: USDC
 
+# Non-default on purpose (the default is ~/keel/proposals) -- see the `tiers` note above.
+proposals_dir: /var/keel/proposals-full-fixture
+
 # Rail 18's allowed settlement legs. Non-default on purpose (the default is [USD, USDC]) and
 # lowercase on purpose, so the golden pins the case-folding too.
 settlement_currencies:

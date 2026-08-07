@@ -95,7 +95,6 @@ from keel.commands.tui import tui_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
-from keel.compliance.screen import DATA_DERIVED_FAILURES as _DATA_DERIVED_FAILURES
 from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod
@@ -550,14 +549,6 @@ def _screen_product(
     return facts, screen_mod.screen_asset(facts, attestation, waived=waived)
 
 
-# Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
-# reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
-# `assets holdings` must not print it as a verdict. `settlement` is deliberately NOT here -- it
-# compares the product's quote leg to the settlement currency and never touches candles, so it
-# stays a real, assessable verdict even with zero bars. Single source of truth lives in
-# `screen.py` (it owns the failure tags); `keel/proposer.py` imports the same constant so the two
-# callers cannot silently drift apart.
-
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
 # a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
 # only cosmetic (an extra row), never an admission.
@@ -656,26 +647,30 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         facts, result = _screen_product(repo, product, quote)
         click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
 
-        failures = result.failures
+        # The likeliest misreading of this whole feature. With no cached bars, `history` and
+        # `liquidity` cannot say anything about the ASSET -- `0 daily bars, need 1460` measures
+        # the depth of OUR CACHE, and median volume is 0 *because* there are no bars -- so
+        # printing either as a finding would assert exactly what this message exists to deny: a
+        # candidate never fetched would read as indistinguishable from one genuinely too young.
+        # They are shown as derived-from-an-empty-cache, not as verdicts.
+        #
+        # The split and the explanation both live in `keel.compliance.screen` (`split_failures` /
+        # `missing_history_lines`), not here -- it owns `DATA_DERIVED_FAILURES`, the tag set that
+        # decides the split, so the decision and the tags cannot silently drift apart the way two
+        # independent per-caller copies could (and had, before `keel/proposer.py` and this
+        # function were unified onto the same two functions).
+        #
+        # NOTE: `settlement` is deliberately NOT suppressed. It compares the product's quote leg
+        # to the settlement currency and never reads candles, so it stays assessable at zero
+        # bars. Do not add it to `DATA_DERIVED_FAILURES` -- no test would catch that here (a
+        # derived product can never fail settlement), and it would hide a real verdict on any
+        # externally supplied product.
+        failures, not_assessable = screen_mod.split_failures(facts, result)
         if facts.daily_bars == 0:
-            # The likeliest misreading of this whole feature. With no cached bars `liquidity`
-            # cannot say anything about the asset -- median volume is 0 *because* there are no
-            # bars -- so printing it as a finding would assert about the asset exactly what this
-            # message exists to deny. It is shown as derived, not as a verdict.
-            # NOTE: `settlement` is deliberately NOT suppressed. It compares the product's quote
-            # leg to the settlement currency and never reads candles, so it stays assessable at
-            # zero bars. Do not add it to `_DATA_DERIVED_FAILURES` -- no test would catch that
-            # here (a derived product can never fail settlement), and it would hide a real
-            # verdict on any externally supplied product.
-            derived = [f for f in failures if f.split(":")[0] in _DATA_DERIVED_FAILURES]
-            failures = [f for f in failures if f not in derived]
-            click.echo(
-                f"      ! no local history -- run `keel fetch --products {product}` first, then "
-                "re-screen.\n"
-                "        This is a MISSING-DATA verdict, not a verdict about the asset."
-            )
-            for failure in derived:
-                click.echo(f"      · ({failure.split(':')[0]}: not assessable without history)")
+            explanation = screen_mod.missing_history_lines(product, not_assessable)
+            click.echo(f"      ! {explanation[0]}")
+            for extra_line in explanation[1:]:
+                click.echo(f"        {extra_line}")
         for failure in failures:
             click.echo(f"      ✗ {failure}")
         # Warnings carry compliance constraints that apply even to an ADMITted asset (§65.5's
@@ -800,7 +795,24 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
             f"\n{result.summary:<7} {asset:<8} bars={facts.daily_bars} "
             f"median_daily_volume={facts.median_daily_volume:.0f}"
         )
-        for failure in result.failures:
+        # Same zero-bars split `assets holdings --screen` and `assets propose` use, via the same
+        # two helpers in `screen.py`. This command is the SIBLING of the TUI's `s` screen overlay
+        # -- both screen `_default_sim_products(config)` through `_screen_product` -- so leaving
+        # only one of them able to explain an empty cache would hand an operator two different
+        # stories about the same allowlist depending on which surface they looked at. That is the
+        # drift `_screen_product` exists to prevent, applied to the REPORTING rather than to the
+        # verdict. At zero bars `history`/`liquidity` measure OUR CACHE, not the asset, so
+        # printing them as verdicts would say "too young" about something we simply never
+        # fetched. `settlement`/`spot_instrument` read the product id alone and never touch
+        # candles, so they stay real verdicts here -- which is exactly why this command may still
+        # be asked about an unvalidated `--products` id (see the note above).
+        failures, not_assessable = screen_mod.split_failures(facts, result)
+        if facts.daily_bars == 0:
+            explanation = screen_mod.missing_history_lines(product, not_assessable)
+            click.echo(f"    ! {explanation[0]}")
+            for extra_line in explanation[1:]:
+                click.echo(f"      {extra_line}")
+        for failure in failures:
             click.echo(f"    ✗ {failure}")
         for warning in result.warnings:
             click.echo(f"    ! {warning}")

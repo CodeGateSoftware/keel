@@ -54,6 +54,7 @@
     "min_trades": 42,
     "min_win_rate": "0.45"
   },
+  "proposals_dir": "/var/keel/proposals-full-fixture",
   "quote_currency": "USDC",
   "research": {
     "pbo_max": "0.1",

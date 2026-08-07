@@ -49,6 +49,7 @@
     "min_trades": 100,
     "min_win_rate": "0.55"
   },
+  "proposals_dir": "~/keel/proposals",
   "quote_currency": "USD",
   "research": {
     "pbo_max": "0.05",

@@ -10,7 +10,9 @@ from keel.compliance.screen import (
     AssetAttestation,
     MarketFacts,
     ScreenPolicy,
+    missing_history_lines,
     screen_asset,
+    split_failures,
 )
 
 
@@ -410,3 +412,88 @@ def test_discovery_matches_the_quote_currency_case_insensitively():
     assert discover_candidates(
         [_product(pid="SOL-USD", quote="USD")], DiscoveryPolicy(quote_currency="usd")
     ), "lowercase configured quote currency dropped everything"
+
+
+# -- split_failures / missing_history_lines -------------------------------------------------
+#
+# The single source of truth for "is a zero-bar `history` failure a lie about the asset, or a
+# fact about our cache" now lives here, not duplicated per-caller (`assets holdings`, `assets
+# propose`, and the TUI to come). These tests pin the split and the wording directly, so a
+# regression shows up here rather than as a re-appeared `✗ history: 0 daily bars` line three
+# call sites away.
+
+
+def test_split_failures_leaves_a_nonzero_history_asset_entirely_unsplit():
+    """With ANY cached bars, every failure -- including a genuine `history` shortfall for a
+    young asset -- is a real verdict about the asset. Nothing is downstream of the cache."""
+    facts = _facts(bars=400)
+    result = screen_asset(facts, _attestation())
+    about_asset, about_cache = split_failures(facts, result)
+    assert about_asset == result.failures
+    assert about_cache == []
+    assert any(f.startswith("history") for f in about_asset)
+
+
+def test_split_failures_splits_only_at_exactly_zero_bars():
+    """At zero bars, `history` and `liquidity` are downstream of having no cache -- they measure
+    OUR data, not the asset -- so both move to `about_cache`. `settlement` and `attestation`
+    keep being real verdicts about the asset regardless of bar count."""
+    facts = _facts(bars=0, volume="0", quotable=False)
+    result = screen_asset(facts, None)  # unattested too, so `attestation` also fails
+    about_asset, about_cache = split_failures(facts, result)
+
+    cache_tags = {f.split(":")[0] for f in about_cache}
+    asset_tags = {f.split(":")[0] for f in about_asset}
+    assert cache_tags == {"history", "liquidity"}
+    assert "settlement" in asset_tags
+    assert "attestation" in asset_tags
+
+
+def test_split_failures_preserves_original_ordering_in_both_lists():
+    """Callers render these lists in order; a silent reorder would scramble the report even
+    though the same failures are all still present somewhere in it."""
+    facts = _facts(bars=0, volume="0", quotable=False)
+    result = screen_asset(facts, None)
+    about_asset, about_cache = split_failures(facts, result)
+
+    def _positions(subset: list[str]) -> list[int]:
+        return [result.failures.index(f) for f in subset]
+
+    assert _positions(about_asset) == sorted(_positions(about_asset))
+    assert _positions(about_cache) == sorted(_positions(about_cache))
+
+
+def test_split_failures_keeps_settlement_assessable_at_zero_bars():
+    """`settlement` reads the product id, never a candle, so it must stay a real verdict even
+    when there is no cached history at all -- the one criterion this split must NOT catch."""
+    facts = _facts(bars=0, volume="0", quotable=False)
+    result = screen_asset(facts, _attestation())
+    about_asset, about_cache = split_failures(facts, result)
+    assert any(f.startswith("settlement") for f in about_asset)
+    assert not any(f.startswith("settlement") for f in about_cache)
+
+
+def test_missing_history_lines_omits_the_third_line_when_nothing_is_suppressed():
+    """A candidate that fails on shape/settlement/attestation alone (no derived failures at all)
+    gets the two-line MISSING-DATA explanation and nothing more -- a trailing "not assessable
+    until then:" with nothing after the colon would be worse than no line at all."""
+    lines = missing_history_lines("SOL-USD", [])
+    assert len(lines) == 2
+    assert "no local history" in lines[0]
+    assert "keel fetch --products SOL-USD" in lines[0]
+    assert "MISSING-DATA verdict" in lines[1]
+    assert not any("not assessable" in line for line in lines)
+
+
+def test_missing_history_lines_dedupes_and_sorts_tags():
+    """Two failures sharing a tag collapse to one mention, and the tags print in a stable,
+    predictable order rather than whatever order `screen_asset` happened to emit them in."""
+    lines = missing_history_lines(
+        "SOL-USD",
+        [
+            "liquidity: median daily volume 0 < 1000000 required",
+            "history: 0 daily bars < 1460 required",
+            "liquidity: a second liquidity-tagged failure, hypothetically",
+        ],
+    )
+    assert lines[2] == "not assessable until then: history, liquidity"

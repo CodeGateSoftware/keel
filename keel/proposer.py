@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from keel.commands._products import _history_product
 from keel.compliance import screen as screen_mod
-from keel.compliance.screen import DATA_DERIVED_FAILURES
+from keel.compliance.screen import missing_history_lines, split_failures
 from keel.data.repository import Repository
 
 ScreenFn = Callable[
@@ -189,17 +189,17 @@ def render_proposal_report(report: ProposalReport) -> list[str]:
             lines.append(
                 f"    UNVERIFIED hypothesis (never used for admission): {cand.shariah_hypothesis}"
             )
-        failures = list(sc.result.failures)
+        # The zero-bars split/explanation is decided ONCE, in `keel.compliance.screen` -- see
+        # `split_failures`'s docstring for why the decision cannot safely live here: this module
+        # and `keel/cli.py`'s `assets holdings` used to each keep their own copy of the same
+        # split, which could (and had) drift apart. `keel fetch --products {sc.product}` matches
+        # `test_render_no_history_shows_missing_data_next_step`'s exact-substring pin.
+        failures, not_assessable = split_failures(sc.facts, sc.result)
         if sc.facts.daily_bars == 0:
-            derived = [f for f in failures if f.split(":")[0] in DATA_DERIVED_FAILURES]
-            failures = [f for f in failures if f not in derived]
-            lines.append(
-                f"    ! no local history -- run `keel fetch --products {sc.product}` first, "
-                "then re-screen."
-            )
-            lines.append("      This is a MISSING-DATA verdict, not a verdict about the asset.")
-            for failure in derived:
-                lines.append(f"    · ({failure.split(':')[0]}: not assessable without history)")
+            explanation = missing_history_lines(sc.product, not_assessable)
+            lines.append(f"    ! {explanation[0]}")
+            for extra_line in explanation[1:]:
+                lines.append(f"      {extra_line}")
         for failure in failures:
             lines.append(f"    ✗ {failure}")
         for warning in sc.result.warnings:

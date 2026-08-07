@@ -240,6 +240,35 @@ def test_load_config_quote_currency_empty_raises_configerror(write_config):
         load_config(path)
 
 
+# -- proposals_dir (where `assets propose`/the TUI's propose overlay look for a shortlist) -----
+
+
+def test_load_config_proposals_dir_defaults_to_keel_proposals(valid_config_path):
+    """`VALID_CONFIG_YAML` has no `proposals_dir:` -- absent, it falls back to `~/keel/proposals`,
+    unexpanded (expansion is the READER's job, at use, not the parser's -- see the field's own
+    comment in `keel_core/config.py`)."""
+    config = load_config(valid_config_path)
+
+    assert config.proposals_dir == "~/keel/proposals"
+
+
+def test_load_config_proposals_dir_overridable(write_config):
+    text = VALID_CONFIG_YAML + "\nproposals_dir: /var/keel/shortlists\n"
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.proposals_dir == "/var/keel/shortlists"
+
+
+def test_load_config_proposals_dir_empty_raises_configerror(write_config):
+    text = VALID_CONFIG_YAML + "\nproposals_dir: ''\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="proposals_dir"):
+        load_config(path)
+
+
 # -- settlement_currencies (rail 18's allowed set) ------------------------------------------
 
 
