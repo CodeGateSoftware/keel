@@ -132,8 +132,8 @@ _SOL_CANDIDATE = {
 def test_latest_shortlist_picks_newest_by_mtime(tmp_path):
     directory = tmp_path / "proposals"
     directory.mkdir()
-    older = directory / "a.json"
-    newer = directory / "b.json"
+    older = directory / "a-shortlist.json"
+    newer = directory / "b-shortlist.json"
     older.write_text("{}")
     newer.write_text("{}")
     now = 1_800_000_000
@@ -146,8 +146,8 @@ def test_latest_shortlist_picks_newest_by_mtime(tmp_path):
 def test_latest_shortlist_ties_broken_by_name(tmp_path):
     directory = tmp_path / "proposals"
     directory.mkdir()
-    a = directory / "a.json"
-    z = directory / "z.json"
+    a = directory / "a-shortlist.json"
+    z = directory / "z-shortlist.json"
     a.write_text("{}")
     z.write_text("{}")
     same_ts = 1_800_000_000
@@ -155,6 +155,38 @@ def test_latest_shortlist_ties_broken_by_name(tmp_path):
     os.utime(z, (same_ts, same_ts))
 
     assert latest_shortlist(directory) == z
+
+
+def test_latest_shortlist_ignores_sibling_json_that_is_not_a_shortlist(tmp_path):
+    """The scout skill writes THREE files into the proposals directory, two of them JSON --
+    `<date>-shortlist.json`, `<date>-param-proposals.json` and `<date>-research-briefs.md`. A
+    `*.json` glob picked the param file whenever it happened to be newer, and the overlay then
+    reported the operator's own strategy output as a malformed shortlist. Observed on 2026-08-07.
+
+    Selection is by CONVENTION (`*-shortlist.json`), not by mtime alone, so a sibling written
+    seconds later can never win."""
+    directory = tmp_path / "proposals"
+    directory.mkdir()
+    shortlist = directory / "2026-08-07-shortlist.json"
+    param_proposals = directory / "2026-08-07-param-proposals.json"
+    shortlist.write_text("{}")
+    param_proposals.write_text("{}")
+    now = 1_800_000_000
+    os.utime(shortlist, (now, now))
+    # The sibling is NEWER -- under the old mtime-only rule it would have won.
+    os.utime(param_proposals, (now + 100, now + 100))
+
+    assert latest_shortlist(directory) == shortlist
+
+
+def test_latest_shortlist_returns_none_when_only_non_shortlist_json_is_present(tmp_path):
+    """A run that produced param proposals but no candidates must read as 'no shortlist', not as
+    a malformed one -- otherwise the operator is sent to debug a file that is doing its job."""
+    directory = tmp_path / "proposals"
+    directory.mkdir()
+    (directory / "2026-08-07-param-proposals.json").write_text("{}")
+
+    assert latest_shortlist(directory) is None
 
 
 def test_latest_shortlist_missing_directory_returns_none_and_creates_nothing(tmp_path):
