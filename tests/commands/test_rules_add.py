@@ -256,6 +256,26 @@ def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(
     assert repo.get_rules() == []
 
 
+def test_the_quotable_hint_names_the_granularity_param(tmp_path, valid_config_path):
+    """The refusal ends with "a quoted value is right only for [...]", printed straight from
+    `agent.coerced_param_keys`. `timeframe` is a `Granularity`, which subclasses `str`, so it
+    survives the type check whether or not the coercion table admits to it -- but it is stored
+    as a quoted `"ONE_DAY"` and MUST arrive quoted, so a hint that left it out would tell the
+    operator the exact opposite of the truth about it, in the same breath as correcting them.
+    """
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"oversold": "10.0"}',
+    )
+
+    assert result.exit_code != 0
+    hint = [ln for ln in result.output.splitlines() if "quoted value is right only for" in ln]
+    assert len(hint) == 1, result.output
+    assert "timeframe" in hint[0]
+    assert "atr_mult" in hint[0], "the Decimal params are named too, not instead"
+    assert "oversold" not in hint[0], "and a float param is not"
+
+
 def test_a_fractional_number_is_refused_where_the_rule_counts_bars(tmp_path, valid_config_path):
     """`lookback_days` indexes a candle list (`candles[-lookback_days:]`). A float there
     constructs, passes `> 0`, stores, rebuilds -- and raises `TypeError: slice indices must be

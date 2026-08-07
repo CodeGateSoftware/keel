@@ -633,8 +633,14 @@ def test_coerced_param_keys_names_every_param_that_arrives_as_a_string():
     """The whole contract of this function: a caller validating operator-typed JSON (`keel
     rules add`) asks it "may this param be quoted?" and must get a yes for EVERY param
     `build_rule_from_params` converts from a string -- the `Decimal` fields AND the
-    `Granularity` field. Answering only for the `Decimal`s would leave a correct
-    `"timeframe": "ONE_DAY"` refused as "not a string param".
+    `Granularity` field.
+
+    The `Granularity` half is easy to mistake for dead weight, since `Granularity` subclasses
+    `str` and a quoted `"ONE_DAY"` therefore survives `rules add`'s string check either way.
+    What it actually carries is the ANSWER: `rules add` prints this set verbatim as "a quoted
+    value is right only for [...]", and a hint that omitted `timeframe` would tell the operator
+    the opposite of the truth about the one param whose whole job is to arrive quoted. See
+    `test_the_quotable_hint_names_the_granularity_param` in tests/commands/test_rules_add.py.
     """
     assert agent.coerced_param_keys("rsi_meanrev") == frozenset(
         {
