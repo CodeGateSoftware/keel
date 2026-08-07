@@ -666,7 +666,13 @@ def test_derivative_failures_are_not_asserted_as_verdicts_without_history(
 ):
     """With zero cached bars, liquidity and settlement report on our DATA, not the asset:
     median volume is 0 because there are no bars. Printing them as findings would assert
-    exactly what the missing-data message exists to deny."""
+    exactly what the missing-data message exists to deny.
+
+    `history` used to be exempted from this and printed as `0 daily bars, need 1460` --
+    itself the same lie in different clothes: zero bars means we never fetched the asset, not
+    that it is too young. See `test_zero_cached_bars_never_prints_a_history_depth_failure`
+    below for that invariant asserted head-on; this test was updated (not just extended) to
+    stop asserting the old, wrong behaviour."""
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
@@ -676,8 +682,52 @@ def test_derivative_failures_are_not_asserted_as_verdicts_without_history(
     assert "no local history" in result.output
     assert "✗ settlement" not in result.output, "settlement is a naming artifact here"
     assert "✗ liquidity" not in result.output, "median volume is 0 only because bars are 0"
-    assert "not assessable without history" in result.output
-    assert "✗ history" in result.output  # the REAL, primary finding stays
+    assert "✗ history" not in result.output, "zero bars is a cache gap, not a history verdict"
+    assert "not assessable until then" in result.output
+
+
+def test_zero_cached_bars_never_prints_a_history_depth_failure(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The headline invariant for `keel assets holdings --screen`: at ZERO cached bars, the
+    output must never contain a `✗ history: 0 daily bars, need 1460` line. That line reads as
+    "this asset is too young" when the truth is "we have never fetched it" -- a candidate that
+    was never fetched must be indistinguishable, in the failure list, from one this deployment
+    has simply not pulled data for yet, and distinguishable from one that is genuinely too
+    young (see the 400-bar counterpart test below)."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # no candles seeded at all
+    _with_broker(monkeypatch, _FakeBroker([_account("SOL", "12")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "✗ history" not in result.output
+    assert "no local history" in result.output
+    assert "keel fetch" in result.output
+    assert "not assessable until then" in result.output
+
+
+def test_a_genuinely_young_asset_still_reports_history_as_a_real_verdict_via_holdings(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The counterpart to the zero-bars invariant above: the suppression must be scoped to
+    EXACTLY zero bars. An asset with SOME cached history that is still short of the 1460-bar
+    floor is genuinely too young, and `holdings --screen` must keep saying so -- proving the fix
+    closes one specific lie (zero bars misread as "too young") rather than becoming a blanket
+    silencer for every `history` verdict."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "PAXG-USD", bars=400)  # real bars, genuinely short of the floor
+    runner = CliRunner()
+    assert _attest(
+        runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}
+    ).exit_code == 0
+    _with_broker(monkeypatch, _FakeBroker([_account("PAXG", "3")]))
+
+    result = _holdings(db_path, valid_config_path, "--screen")
+
+    assert "✗ history" in result.output
+    assert "no local history" not in result.output
 
 
 def test_a_lowercase_settlement_currency_is_still_excluded(
@@ -711,10 +761,14 @@ def test_min_balance_rejects_garbage_and_non_finite_values(
 def test_the_derived_failure_tags_actually_match_screen_asset_output():
     """Pins the string coupling that the zero-bars suppression depends on.
 
-    `assets holdings` suppresses derivative failures by matching `failure.split(":")[0]` against
-    `_DATA_DERIVED_FAILURES`. Renaming a tag in `screen_asset` would silently stop the
+    `screen.split_failures` suppresses cache-derived failures by matching `failure.split(":")[0]`
+    against `DATA_DERIVED_FAILURES`. Renaming a tag in `screen_asset` would silently stop the
     suppression -- reintroducing 'data artifacts printed as verdicts about the asset' with a
     fully green suite. This asserts the tags are real.
+
+    Reads the constant from `screen.py` rather than through `keel.cli`: the split moved into
+    `screen.py` beside the tag set, so `cli.py` no longer names the constant at all, and an
+    alias kept alive purely to be asserted on here would prove nothing about live code.
     """
     from keel.compliance import screen as screen_mod
 
@@ -727,10 +781,10 @@ def test_the_derived_failure_tags_actually_match_screen_asset_output():
     )
     tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
 
-    missing = cli_module._DATA_DERIVED_FAILURES - tags
+    missing = screen_mod.DATA_DERIVED_FAILURES - tags
     assert not missing, (
-        f"{missing} no longer appear as failure tags in screen_asset -- the holdings "
-        "suppression is now silently inert; update _DATA_DERIVED_FAILURES"
+        f"{missing} no longer appear as failure tags in screen_asset -- the zero-bars "
+        "suppression is now silently inert; update DATA_DERIVED_FAILURES"
     )
 
 
@@ -924,6 +978,30 @@ def test_propose_rejects_an_unattested_candidate(tmp_path, valid_config_path):
     assert result.exit_code == 0
     assert "REJECT" in result.output
     assert "0/1 admitted" in result.output
+
+
+def test_zero_cached_bars_never_prints_a_history_depth_failure_via_propose(
+    tmp_path, valid_config_path
+):
+    """Same invariant as the `holdings --screen` version above, for `keel assets propose`: a
+    candidate with ZERO cached bars must not print a `✗ history: 0 daily bars, need 1460` line.
+    That line is exactly the lie the MISSING-DATA explanation two lines above it exists to
+    deny -- "too young" and "never fetched" must not be indistinguishable in the failure list."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # no candles seeded -- SOL has zero cached bars
+    shortlist = _write_shortlist(tmp_path, [_SOL])
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "propose", "--from", str(shortlist)],
+    )
+
+    assert result.exit_code == 0
+    assert "✗ history" not in result.output
+    assert "no local history" in result.output
+    assert "keel fetch" in result.output
+    assert "not assessable until then" in result.output
 
 
 def test_propose_and_screen_agree_for_the_same_asset(tmp_path, valid_config_path):

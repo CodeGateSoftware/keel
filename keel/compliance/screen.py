@@ -22,7 +22,7 @@ and unknown is a rejection. This mirrors `broker_subscriptions`, where an un-att
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -59,14 +59,17 @@ KNOWN_BACKINGS = frozenset({BACKING_AYN, BACKING_DAYN, BACKING_NATIVE})
 WAIVABLE_CRITERIA = frozenset({"history"})
 
 #: Failure classes that are DOWNSTREAM of having no cached history: with zero bars `liquidity`
-#: reports on our data (median volume is 0 *because* there are no bars), not on the asset, so
-#: callers presenting a zero-bar candidate (`assets holdings`, `assets propose`) must not print it
-#: as a verdict. `settlement` is deliberately NOT here -- it compares the product's quote leg to
-#: the settlement currency and never touches candles, so it stays a real, assessable verdict even
-#: with zero bars. This is the single source of truth for that tag set; callers import it rather
-#: than duplicating the string, so a tag rename here cannot silently disable the suppression
+#: reports on our data (median volume is 0 *because* there are no bars), not on the asset. `history`
+#: belongs here for the identical reason and was the bug this set used to miss: at zero bars,
+#: `history: 0 daily bars, need 1460` measures the depth of OUR CACHE, not the age of the asset --
+#: a candidate never fetched is indistinguishable from one genuinely too young unless this tag is
+#: suppressed exactly like `liquidity` is. `settlement` is deliberately NOT here -- it compares the
+#: product's quote leg to the settlement currency and never touches candles, so it stays a real,
+#: assessable verdict even with zero bars. This is the single source of truth for that tag set;
+#: callers import it (or, better, call `split_failures`/`missing_history_lines` below rather than
+#: reimplementing the split) so a tag rename here cannot silently disable the suppression
 #: elsewhere.
-DATA_DERIVED_FAILURES = frozenset({"liquidity"})
+DATA_DERIVED_FAILURES = frozenset({"history", "liquidity"})
 
 
 @dataclass(frozen=True)
@@ -252,6 +255,65 @@ def screen_asset(
         failures=failures,
         warnings=warnings,
     )
+
+
+def split_failures(facts: MarketFacts, result: ScreenResult) -> tuple[list[str], list[str]]:
+    """Partition `result.failures` into `(about_the_asset, about_our_cache)`.
+
+    This is the DECISION half of the zero-bar-history fix, kept in `screen.py` rather than in
+    each caller, because this module already owns `DATA_DERIVED_FAILURES` -- the tag set that
+    decides which failures are "downstream of an empty cache" in the first place. Duplicating the
+    split next to each caller (as `assets holdings` and `assets propose` used to, independently)
+    let the two copies drift: a tag rename here would silently stop suppressing one of them and
+    keep suppressing the other. Putting the split next to the tag set makes that impossible --
+    there is exactly one place either can change.
+
+    With `facts.daily_bars > 0` every failure is returned as `about_the_asset` and
+    `about_our_cache` is empty, UNSPLIT -- including a genuine `history` shortfall, because an
+    asset with some cached history that still falls short of the floor really is too young, and
+    that verdict must not be silenced. The split only ever happens at EXACTLY zero bars, which is
+    the one condition where `history` (and `liquidity`) measure our cache instead of the asset.
+    Original ordering is preserved within each returned list, so a caller that renders them in
+    order does not see failures reshuffled relative to how `screen_asset` produced them.
+    """
+    if facts.daily_bars > 0:
+        return list(result.failures), []
+    about_the_asset: list[str] = []
+    about_our_cache: list[str] = []
+    for failure in result.failures:
+        if failure.split(":")[0] in DATA_DERIVED_FAILURES:
+            about_our_cache.append(failure)
+        else:
+            about_the_asset.append(failure)
+    return about_the_asset, about_our_cache
+
+
+def missing_history_lines(product_id: str, not_assessable: Sequence[str]) -> list[str]:
+    """The MISSING-DATA explanation shown INSTEAD OF `not_assessable`'s raw failures.
+
+    Lives here, beside `split_failures`, for the same reason: the wording references the exact
+    tag set this module owns, so the explanation and the tags it explains cannot drift apart.
+    Formatting (indentation, bullets, `!`/`·` markers) is deliberately left to the caller instead
+    of baked in here -- `keel/proposer.py` and `keel/cli.py`'s `assets holdings` indent by
+    different amounts, and a third caller (the TUI) will have its own widget-native layout again.
+    This function returns plain, UNINDENTED lines; callers prepend whatever presentation they need.
+
+    The third line -- naming what is still unassessable -- is included only when `not_assessable`
+    is non-empty, so a candidate that fails purely on shape/settlement/attestation (nothing
+    downstream of the cache) does not get a trailing "not assessable until then:" with nothing
+    after the colon. Tags are deduplicated and sorted so two failures sharing a tag collapse to
+    one mention and the order is stable regardless of how `screen_asset` happened to emit them.
+    """
+    lines = [
+        f"no local history for {product_id} -- run `keel fetch --products {product_id}` first, "
+        "then re-screen.",
+        "This is a MISSING-DATA verdict, not a verdict about the asset: it is not too young, "
+        "we have simply never fetched candles for it.",
+    ]
+    if not_assessable:
+        tags = sorted({f.split(":")[0] for f in not_assessable})
+        lines.append(f"not assessable until then: {', '.join(tags)}")
+    return lines
 
 
 # -- discovery (candidate PROPOSAL, not admission) -----------------------------
