@@ -266,6 +266,58 @@ def test_jsonable_is_json_serializable_and_has_keys():
     assert "shariah_hypothesis" in row
 
 
+def _report_with_real_failure_strings(bars):
+    """A report whose failure strings are shaped like `screen_asset`'s real ones, so a test can
+    assert on the `history:` depth line the JSON surface used to leak. `_report` above emits no
+    `history` failure at zero bars, which is precisely why this asymmetry went unnoticed."""
+    parsed = parse_proposal({"candidates": [_entry(asset="SOL")]})
+
+    def screen_fn(repo, product, quote):
+        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD")
+        failures = [
+            f"history: {bars} daily bars < 1460 required",
+            "liquidity: median daily volume 0 < 1000000 required",
+            "attestation: MISSING. Sector and backing cannot be derived from price data",
+        ]
+        return facts, screen_mod.ScreenResult("SOL", admitted=False, failures=failures)
+
+    return build_proposal_report(parsed, _repo(), "USD", [], screen_fn)
+
+
+def test_jsonable_flags_zero_bar_failures_exactly_like_the_human_report_does():
+    """`--json` emitted `sc.result.failures` RAW, so at zero cached bars the payload carried
+    `history: 0 daily bars < 1460 required` with nothing marking it as a fact about OUR CACHE --
+    while `render_proposal_report`, `assets holdings --screen`, `assets screen` and the TUI
+    overlay all suppress that exact line and print the MISSING-DATA explanation instead. One
+    report, two surfaces, two different stories: the very drift `split_failures` was created to
+    end. `--json` is the surface a script trusts, so it is the worst one to leave unflagged."""
+    payload = report_to_jsonable(_report_with_real_failure_strings(bars=0))
+    row = payload["screened"][0]
+
+    assert row["missing_history"] is True
+    assert not any(f.startswith("history") for f in row["failures"])
+    assert not any(f.startswith("liquidity") for f in row["failures"])
+    assert any(f.startswith("attestation") for f in row["failures"])
+    # Suppressed, never DROPPED -- a consumer that wants them can still read them, correctly
+    # labelled as not-assessable-until-fetched rather than as verdicts about the asset.
+    assert sorted(f.split(":")[0] for f in row["not_assessable"]) == ["history", "liquidity"]
+    assert set(row["failures"]) | set(row["not_assessable"]) == {
+        f for f in _report_with_real_failure_strings(bars=0).screened[0].result.failures
+    }
+
+
+def test_jsonable_leaves_a_nonzero_bar_history_failure_in_failures():
+    """The other side of the split, so the fix cannot become "always hide `history`": with ANY
+    cached bars nothing moves, `missing_history` is False, and the depth failure stays a verdict
+    in `failures` where a consumer will act on it."""
+    payload = report_to_jsonable(_report_with_real_failure_strings(bars=400))
+    row = payload["screened"][0]
+
+    assert row["missing_history"] is False
+    assert row["not_assessable"] == []
+    assert any(f.startswith("history") for f in row["failures"])
+
+
 def test_data_derived_failures_tags_actually_match_screen_asset_output():
     """Pins the shared `DATA_DERIVED_FAILURES` constant to what `screen_asset` actually emits.
 

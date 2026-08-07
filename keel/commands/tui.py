@@ -37,14 +37,17 @@ builders/renderers VERBATIM rather than reimplementing any of it -- exactly the 
   shortlist file in `config.proposals_dir` (or names why there is none). OFFLINE, DB + local
   filesystem reads only.
 - `d` **discover** -- `build_discover_overlay` over `build_discover_report`: proposes NEW
-  candidates from the venue's own product list. This is the one of the three that needs the
-  network, and it is the SECOND deliberate network exception in this dashboard (the first is `f`
-  fetch): opening the overlay makes no call at all (it renders an ARMED, not-yet-run
-  explanation), and only an explicit Enter keypress *inside* the overlay triggers
-  `_do_discover_report`'s one `_build_broker(config).list_products()` call. The result is then
-  HELD -- every following poll while the overlay stays open repaints the same cached result (or
-  error) rather than re-fetching, and closing the overlay discards it, so reopening is armed but
-  not yet run again.
+  candidates from the venue's own product list. This is the one of the three overlays that needs
+  the network, and it is the THIRD deliberate network exception in this dashboard -- the other
+  two being the automatic ~30s live-balance refresh (`_refresh_balance`, a real `get_accounts`
+  call that has been firing on its own cadence since v3) and `f` fetch. Counting only fetch, as
+  this docstring used to, understates by one and tells an operator the dashboard is offline
+  between keypresses when it is not. Opening the overlay makes no call at all (it renders an
+  ARMED, not-yet-run explanation), and only an explicit Enter keypress *inside* the overlay
+  triggers `_do_discover_report`'s one `_build_broker(config).list_products()` call. The result
+  is then HELD -- every following poll while the overlay stays open repaints the same cached
+  result (or error) rather than re-fetching, and closing the overlay discards it, so reopening is
+  armed but not yet run again.
 
 None of the three attests, admits, or trades -- `attest` (the human judgment the whole gate rests
 on) stays deliberately CLI-only, `keel assets attest`. `screen`/`propose`/`discover` only ever
@@ -390,6 +393,9 @@ def build_help_screen() -> list[ScreenLine]:
     _row("Live balance")
     _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
     _note("  refreshed every ~30s and immediately on 'r' or 'f' -- so a deposit or sell shows up.")
+    _note("  Each refresh is a LIVE call to the venue (get_accounts) -- one of the three network")
+    _note("  touches this dashboard makes, and the only one that happens without a keypress. It")
+    _note("  is a read: it places no orders and changes nothing.")
     _note("  In paper mode, paper buys spend paper_cash_usdc instead -- not this balance.")
     lines.append(_blank())
     _row("Help mode (this screen)")
@@ -457,11 +463,12 @@ def build_help_screen() -> list[ScreenLine]:
     _note("  reads only. Neither ever constructs a broker or touches the network.")
     lines.append(_blank())
     _note(
-        "  discover is the SECOND deliberate network exception in this dashboard (after fetch):"
+        "  discover is the THIRD deliberate network exception in this dashboard. The other two"
     )
-    _note("  it never fires on opening the overlay and never fires again on its own while the")
-    _note("  overlay stays open -- only an explicit Enter, pressed inside it, runs the one live")
-    _note("  venue call it ever makes.")
+    _note("  are the automatic ~30s live-balance refresh above and [f] fetch -- three in total,")
+    _note("  and nothing else here ever leaves this machine. Discover never fires on opening the")
+    _note("  overlay and never fires again on its own while the overlay stays open -- only an")
+    _note("  explicit Enter, pressed inside it, runs the one live venue call it ever makes.")
     lines.append(_blank())
     _note(
         "  NONE of screen, propose or discover attests, admits, or trades. They can only PROPOSE"
@@ -669,9 +676,10 @@ def build_discover_overlay(
         )
         lines.append(
             ScreenLine(
-                "This is the second deliberate network exception in this dashboard (the first "
-                "is [f] fetch): it never fires just from opening this overlay, and it never "
-                "fires again on its own while this overlay stays open.",
+                "This is the third deliberate network exception in this dashboard -- the other "
+                "two are the automatic ~30s live-balance refresh and [f] fetch. It never fires "
+                "just from opening this overlay, and it never fires again on its own while this "
+                "overlay stays open.",
                 "normal",
             )
         )
@@ -987,9 +995,17 @@ def _do_propose_view(open_state: OpenState) -> ProposeView:
     """Build a fresh `ProposeView` over the newest shortlist in `config.proposals_dir` -- OFFLINE
     (DB + local filesystem reads only), rebuilt every poll while the propose overlay is open.
     `_screen_product` is lazy-imported for the identical reason `_do_screen_report` lazy-imports
-    it. `build_propose_view` itself never raises (see its docstring) -- any exception reaching
-    this function's caller can only come from `open_state()` (e.g. a locked DB), never from the
-    shortlist read itself."""
+    it.
+
+    `build_propose_view` is fail-soft about the shortlist FILE -- a missing directory, a
+    permissions error, a non-UTF-8 file, invalid JSON, a malformed top-level shape all come back
+    as a `status`/`detail` pair. That is not the same as "this function cannot raise", and the
+    earlier claim that any exception here could only come from `open_state()` was simply wrong:
+    it once let a `UnicodeDecodeError` from the read itself through (that specific hole is now
+    closed -- see `build_propose_view`'s own `except (OSError, UnicodeDecodeError)`), and
+    `build_propose_view` still SCREENS every parsed candidate afterwards, which means real DB
+    reads through `_screen_product`. A locked DB, mid-screen, surfaces here exactly like one from
+    `open_state()` does. The caller's `try/except` is load-bearing for both."""
     from keel.cli import _screen_product
 
     repo, config = open_state()
@@ -1026,7 +1042,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     process -- gathers a fresh report, paints it, then waits up to `interval` seconds for a
     keypress.
 
-    Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
+    Six modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
     action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
     `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
     `build_journal_report`, rebuilt fresh each poll while open, fail-soft exactly like the
@@ -1179,9 +1195,15 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 continue
 
             if mode == "propose":
-                # OFFLINE + fail-soft, same shape as screen above. `_do_propose_view` itself
-                # never raises (`build_propose_view`'s own docstring) -- an exception here can
-                # only come from `open_state()` (e.g. a locked DB), never from the shortlist read.
+                # OFFLINE + fail-soft, same shape as screen above. `build_propose_view` turns
+                # every SHORTLIST-FILE problem into a calm `status`/`detail` pair rather than an
+                # exception, so this handler is not what renders "no shortlist yet" or "not valid
+                # JSON" -- the overlay does. It catches what is left: a locked DB, either from
+                # `open_state()` or from the per-candidate screening `build_propose_view` runs
+                # after parsing. It is also the net that caught a `UnicodeDecodeError` escaping
+                # the read for a non-UTF-8 shortlist -- as an unreadable `'utf-8' codec can't
+                # decode byte 0xff...` toast, repainted every poll, naming no file. That hole is
+                # fixed at the source now; this stays as the backstop, not as the explanation.
                 try:
                     propose_lines = build_propose_overlay(_do_propose_view(open_state))
                 except Exception as exc:
