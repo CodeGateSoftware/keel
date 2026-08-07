@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import time
 from decimal import Decimal
 from typing import Any
@@ -374,23 +375,29 @@ def _accepted_params(rule_cls: type) -> list[str]:
     return [name for name in inspect.signature(rule_cls).parameters if name != "self"]
 
 
-def _string_number_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) -> list[str]:
-    """Params supplied as a string where the rule wants a number, or the reverse.
+def _param_type_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) -> list[str]:
+    """Params whose JSON type cannot work with the rule, judged against the constructor default.
 
     Constructing the rule does NOT catch these, and the row they produce is the bad kind: it
     stores, it rebuilds, and it then raises `TypeError` deep inside the rule's arithmetic the
-    first time a backtest calls `detect()`. `RsiMeanReversion` is a plain dataclass with no
-    validation of its own, so `{"oversold": "10.0"}` sails through construction and dies at
-    `str < int` an hour later, in a command nobody connects to the params they typed.
+    first time a backtest calls `detect()` -- in a command nobody connects to the params they
+    typed. Two of keel's four rule kinds (`RsiMeanReversion`, `PullbackContinuation`) are plain
+    classes with no validation of their own, so construction is not a filter for them at all.
+    Three shapes, each demonstrated to kill a backtest:
 
-    Quoting a number is the likeliest typo in hand-copied JSON precisely BECAUSE quoting is
-    correct for the `Decimal` params -- so the question "should this one be a string?" is
-    answered from `agent.coerced_param_keys`, the coercion tables themselves, rather than
-    guessed at or re-listed here.
+    - `{"oversold": "10.0"}` -- quoted, and `oversold` is a `float`: dies at `str < int`.
+      Quoting is the likeliest typo in hand-copied JSON precisely BECAUSE it is correct for the
+      `Decimal` params, so which params may be quoted is answered by `agent.coerced_param_keys`
+      -- the coercion tables themselves -- rather than guessed at or re-listed here.
+    - `{"lookback_days": 90.5}` (or `1e400`, which JSON parses to `inf`) -- `lookback_days`
+      indexes a candle list, and `candles[-90.5:]` raises "slice indices must be integers".
+      A whole number for a `float` default is the harmless direction and stays allowed.
+    - `{"oversold": null}` -- no rule param has a `None` default, and the coercion boundary
+      passes `None` through untouched, so it reaches the constructor intact.
 
-    Only the string/number confusion is checked, against the type of the constructor's OWN
-    default. Nothing else is second-guessed: this is not a type checker, it is the one
-    mismatch that survives construction and reliably kills a backtest.
+    Judged against the type of the constructor's OWN default, so a rule that changes a field's
+    type needs no change here. Nothing else is second-guessed: this is not a type checker, only
+    the mismatches that survive construction and reliably kill a backtest.
     """
     coerced = agent.coerced_param_keys(kind)
     problems: list[str] = []
@@ -400,14 +407,87 @@ def _string_number_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any
         default, value = param.default, supplied[name]
         if default is inspect.Parameter.empty:
             continue
-        if isinstance(default, str) and not isinstance(value, str):
+        if value is None and default is not None:
+            problems.append(f"{name}=null is not a value {kind} can use (default {default!r})")
+        elif isinstance(default, str) and not isinstance(value, str):
             problems.append(f"{name}={value!r} should be a quoted string (default {default!r})")
         elif isinstance(default, (bool, int, float)) and isinstance(value, str):
             problems.append(
                 f"{name}={value!r} is quoted, but {kind} wants a number here "
                 f"(default {default!r})"
             )
+        elif (
+            isinstance(default, int)
+            and not isinstance(default, bool)
+            and not _is_whole_number(value)
+        ):
+            problems.append(
+                f"{name}={value!r} must be a whole number -- {kind} counts bars with it "
+                f"(default {default!r})"
+            )
+        elif isinstance(default, tuple) and default:
+            problems.extend(_sequence_problems(name, default, value))
     return problems
+
+
+def _is_whole_number(value: Any) -> bool:
+    """A JSON int, and not a bool dressed as one (`True` is an `int` to `isinstance`)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _sequence_problems(name: str, default: tuple[Any, ...], value: Any) -> list[str]:
+    """Why `value` cannot stand in for a tuple param such as `ema_periods`/`signal_patterns`.
+
+    `build_rule_from_params` converts these with a blind `tuple(value)`, which is total and
+    therefore silent about two shapes that then kill a backtest:
+
+    - `"abc"` -- `tuple("abc")` CHAR-SPLITS into `('a', 'b', 'c')`, a plausible-looking
+      three-EMA fan made of letters;
+    - `["8", "20", "50"]` -- quoted numbers survive as strings, and `ema()`'s
+      `2.0 / (period + 1)` then raises `TypeError: can only concatenate str (not "int") to str`.
+
+    Element type is taken from the constructor's own default tuple, so a param that changes
+    from ints to something else needs no change here. An empty list is refused too: it builds a
+    rule with no EMAs at all, which never signals and reads as a rule that simply does not work.
+    """
+    element_type = type(default[0])
+    check = _is_whole_number if element_type is int else lambda v: isinstance(v, element_type)
+    if not isinstance(value, list):
+        return [
+            f"{name}={value!r} must be a JSON list of {element_type.__name__} "
+            f"(default {list(default)!r})"
+        ]
+    if not value:
+        return [f"{name}=[] is empty; {name} needs at least one {element_type.__name__}"]
+    bad = [item for item in value if not check(item)]
+    if bad:
+        return [
+            f"{name} has {bad!r} where {element_type.__name__} values belong "
+            f"(default {list(default)!r})"
+        ]
+    return []
+
+
+def _nonfinite_params(params: dict[str, Any]) -> list[str]:
+    """Param names holding `Infinity`/`NaN` after coercion -- numbers that got away.
+
+    `json.loads` accepts JSON's non-standard `Infinity`/`NaN` literals, and the guards a rule
+    does have let them past: `Decimal('Infinity') <= 0` is `False`, so `Dca`'s "budget must be
+    positive" check passes an infinite budget. Checked on the CONSTRUCTED params rather than on
+    the input, so it catches such a value whichever way it arrived -- as a JSON float or as a
+    quoted `"Infinity"` through the `Decimal` coercion.
+
+    Beyond the arithmetic, a non-finite value makes the stored row indefensible as data:
+    `json.dumps` writes a bare `Infinity`, which is not valid JSON and which no strict reader
+    (any consumer of this DB that is not Python) can parse back.
+    """
+    bad: list[str] = []
+    for name, value in params.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            bad.append(f"{name}={value!r}")
+        elif isinstance(value, Decimal) and not value.is_finite():
+            bad.append(f"{name}={value!r}")
+    return bad
 
 
 def _params_delta(existing: dict[str, Any], added: dict[str, Any]) -> str:
@@ -467,11 +547,24 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     `.describe()`'s params, not the raw JSON, so the stored row is exactly what
     `agent._build_rule` can reconstruct: a row that stores but cannot rebuild is worse than a
     refusal, because it fails later, inside a backtest or an agent cycle. Construction alone
-    misses two classes of bad params, both refused here for the same reason: a quoted number for
-    a field that is not a `Decimal` (a validation-free dataclass rule such as `RsiMeanReversion`
-    accepts it and then dies inside `detect()`), and a kwarg the rule constructs with but does
-    NOT persist in `describe()["params"]` (`PullbackContinuation(granularity=...)` -- accepted,
-    dropped, and rebuilt at the default, so the backtest would measure a different rule).
+    is NOT sufficient on its own -- two of the four rule kinds validate nothing in their
+    constructors -- so three further classes of bad params are refused here, each because it
+    writes a row that stores, rebuilds, and *then* fails:
+
+    - a value of the wrong JSON type for the field (`_param_type_mismatches`): a quoted number,
+      a fraction where the rule counts bars, a `null`, a char-splittable string or a list of
+      quoted numbers for `ema_periods`. These die inside `detect()`'s arithmetic, mid-backtest;
+    - `Infinity`/`NaN` (`_nonfinite_params`), which `json.loads` accepts, which `Dca`'s
+      "budget must be positive" guard passes, and which no backtest can report on;
+    - a kwarg the rule constructs with but does NOT persist in `describe()["params"]`
+      (`PullbackContinuation(granularity=...)` -- accepted, dropped, and rebuilt at the default,
+      so the backtest would silently measure a rule on a different candle series).
+
+    What is NOT checked here is whether a value makes economic sense (a negative
+    `atr_stop_mult`, say). That is the rule's own judgement to make, in its constructor, where
+    every caller gets it -- `Dca` already does. Re-stating it in a CLI command would be exactly
+    the second, drifting copy this command is otherwise careful not to create, and a `candidate`
+    rule with a nonsense parameter answers for itself in the backtest it must pass.
 
     `--product` is validated exactly as `rules seed --products` is (`parse_products_option`,
     rails 18/19): a futures contract, an equity hash, a pair settling outside
@@ -539,7 +632,7 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
             param_hint="--params",
         )
 
-    mismatches = _string_number_mismatches(kind, rule_cls, supplied)
+    mismatches = _param_type_mismatches(kind, rule_cls, supplied)
     if mismatches:
         quotable = sorted(agent.coerced_param_keys(kind))
         click.echo(
@@ -568,6 +661,17 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
         # that is not the type the coercion boundary expects (`Decimal("x")` -> InvalidOperation,
         # an `ArithmeticError`). Either way the params cannot make a rule, so no row.
         click.echo(f"Error: {kind} rejected these params: {exc}", err=True)
+        ctx.exit(1)
+        return
+
+    nonfinite = _nonfinite_params(rule.describe()["params"])
+    if nonfinite:
+        click.echo(
+            f"Error: {kind} was given a value that is not a finite number: "
+            f"{', '.join(nonfinite)}. No backtest can report on it, and the stored row would "
+            f"not be valid JSON.",
+            err=True,
+        )
         ctx.exit(1)
         return
 

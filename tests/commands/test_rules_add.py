@@ -255,6 +255,126 @@ def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(
     assert repo.get_rules() == []
 
 
+def test_a_fractional_number_is_refused_where_the_rule_counts_bars(tmp_path, valid_config_path):
+    """`lookback_days` indexes a candle list (`candles[-lookback_days:]`). A float there
+    constructs, passes `> 0`, stores, rebuilds -- and raises `TypeError: slice indices must be
+    integers` in `detect()`. `1e400` is the same bug wearing a hat: JSON parses it to `inf`,
+    which is positive, which is a float.
+    """
+    repo = _repo(tmp_path)
+
+    for value in ("90.5", "1e400"):
+        result = _add(
+            tmp_path, valid_config_path,
+            "--kind", "dca", "--product", "BTC-USD",
+            "--params", f'{{"lookback_days": {value}}}',
+        )
+        assert result.exit_code != 0, value
+        assert "lookback_days" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_list_param_is_refused_when_its_elements_are_the_wrong_type(
+    tmp_path, valid_config_path
+):
+    """`build_rule_from_params` does a blind `tuple(value)` for `ema_periods`. Quoted numbers
+    survive it as strings, and `ema()` then computes `2.0 / (period + 1)` on a `str`:
+    `TypeError: can only concatenate str (not "int") to str`, inside a backtest. Quoting the
+    numbers in a list is the same typo as quoting a scalar, and has to be refused the same way.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"ema_periods": ["8", "20", "50"]}',
+    )
+
+    assert result.exit_code != 0
+    assert "ema_periods" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_string_is_refused_where_a_list_param_is_expected(tmp_path, valid_config_path):
+    """The nastiest shape of that same blind `tuple(value)`: `tuple("abc")` does not raise, it
+    CHAR-SPLITS into `('a', 'b', 'c')` -- a plausible-looking three-EMA fan made of letters.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"ema_periods": "abc"}',
+    )
+
+    assert result.exit_code != 0
+    assert "ema_periods" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_non_finite_number_is_refused(tmp_path, valid_config_path):
+    """JSON's non-standard `Infinity` literal parses, and `Decimal('Infinity') <= 0` is `False`
+    -- so `Dca`'s budget guard passes it, and the row stores a JSON document (`"Infinity"`) that
+    a strict JSON reader cannot even parse. `TurtleBreakout` does not validate `target_rr` at
+    all, so nothing there stops it either. Infinity is not a parameter value under test; it is
+    a number that got away.
+    """
+    repo = _repo(tmp_path)
+
+    budget = _add(
+        tmp_path, valid_config_path,
+        "--kind", "dca", "--product", "BTC-USD", "--params", '{"budget_usd": Infinity}',
+    )
+    target = _add(
+        tmp_path, valid_config_path,
+        "--kind", "turtle_breakout", "--product", "BTC-USD",
+        "--params", '{"target_rr": Infinity}',
+    )
+
+    assert budget.exit_code != 0
+    assert "budget_usd" in budget.output
+    assert target.exit_code != 0
+    assert "target_rr" in target.output
+    assert repo.get_rules() == []
+
+
+def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
+    tmp_path, valid_config_path
+):
+    """No rule param has a `None` default, and the coercion boundary deliberately passes `None`
+    through untouched -- so `{"oversold": null}` reaches a validation-free dataclass intact and
+    dies comparing a float to `None`, at backtest time.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"oversold": null}',
+    )
+
+    assert result.exit_code != 0
+    assert "oversold" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_whole_number_is_still_fine_for_a_param_whose_default_is_a_float(
+    tmp_path, valid_config_path
+):
+    """`adx_threshold=25` for a `25.0` default is not a mistake -- Python treats them alike --
+    and refusing it would make the check an obstacle instead of a guard.
+    """
+    repo = _repo(tmp_path)
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "turtle_breakout", "--product", "BTC-USD",
+        "--params", '{"adx_threshold": 30, "volume_mult": 2}',
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _build_rule(repo.get_rules()[0]).params["adx_threshold"] == 30
+
+
 def test_a_number_is_refused_for_a_param_the_rule_declares_as_a_string(
     tmp_path, valid_config_path
 ):
