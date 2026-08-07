@@ -10,10 +10,17 @@ per source-02 §2.1; the periods are just a tunable parameter).
 
 from __future__ import annotations
 
+import inspect
+import re
 from decimal import Decimal
+from typing import get_args
 
 from keel.analysis import indicators
-from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.pullback_continuation import (
+    _DEFAULT_SIGNAL_PATTERNS,
+    PullbackContinuation,
+    SignalPattern,
+)
 from keel.types import Candle, Granularity
 
 _EMA_PERIODS = (3, 5, 8)
@@ -293,3 +300,23 @@ class TestDescribe:
         assert described["params"]["target_method"] == "swing"
         assert described["params"]["stop_method"] == "atr"
         assert described["params"]["ema_periods"] == _EMA_PERIODS
+
+
+class TestSignalPatternDeclaration:
+    def test_signal_pattern_declares_exactly_the_names_the_matcher_can_fire_on(self) -> None:
+        """`SignalPattern` is the rule's published statement of which pattern names mean
+        anything to it -- `keel rules add` reads it (via `typing.get_type_hints`) to refuse a
+        typo'd pattern that would otherwise never match and yield 0 trades forever. A name in
+        `_match_signal_pattern` that is missing from the Literal would be refused at the CLI
+        despite working, and a name in the Literal that the matcher does not handle would be
+        accepted and silently ignored. Pinned mechanically so neither can drift.
+        """
+        handled = set(
+            re.findall(
+                r'pattern == "([a-z_]+)"',
+                inspect.getsource(PullbackContinuation._match_signal_pattern),
+            )
+        )
+
+        assert handled == set(get_args(SignalPattern))
+        assert set(_DEFAULT_SIGNAL_PATTERNS) <= handled

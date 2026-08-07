@@ -13,6 +13,7 @@ property that makes that safe on a system trading real money:
 
 from __future__ import annotations
 
+import inspect
 import json
 from decimal import Decimal
 
@@ -22,7 +23,7 @@ from keel import agent
 from keel.agent import RULE_REGISTRY, _build_rule
 from keel.cli import cli
 from keel.commands import _common
-from keel.commands.rules import rules_add
+from keel.commands.rules import _declared_choices, rules_add
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 
@@ -255,6 +256,26 @@ def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(
     assert repo.get_rules() == []
 
 
+def test_the_quotable_hint_names_the_granularity_param(tmp_path, valid_config_path):
+    """The refusal ends with "a quoted value is right only for [...]", printed straight from
+    `agent.coerced_param_keys`. `timeframe` is a `Granularity`, which subclasses `str`, so it
+    survives the type check whether or not the coercion table admits to it -- but it is stored
+    as a quoted `"ONE_DAY"` and MUST arrive quoted, so a hint that left it out would tell the
+    operator the exact opposite of the truth about it, in the same breath as correcting them.
+    """
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"oversold": "10.0"}',
+    )
+
+    assert result.exit_code != 0
+    hint = [ln for ln in result.output.splitlines() if "quoted value is right only for" in ln]
+    assert len(hint) == 1, result.output
+    assert "timeframe" in hint[0]
+    assert "atr_mult" in hint[0], "the Decimal params are named too, not instead"
+    assert "oversold" not in hint[0], "and a float param is not"
+
+
 def test_a_fractional_number_is_refused_where_the_rule_counts_bars(tmp_path, valid_config_path):
     """`lookback_days` indexes a candle list (`candles[-lookback_days:]`). A float there
     constructs, passes `> 0`, stores, rebuilds -- and raises `TypeError: slice indices must be
@@ -314,10 +335,9 @@ def test_a_string_is_refused_where_a_list_param_is_expected(tmp_path, valid_conf
 
 def test_a_non_finite_number_is_refused(tmp_path, valid_config_path):
     """JSON's non-standard `Infinity` literal parses, and `Decimal('Infinity') <= 0` is `False`
-    -- so `Dca`'s budget guard passes it, and the row stores a JSON document (`"Infinity"`) that
-    a strict JSON reader cannot even parse. `TurtleBreakout` does not validate `target_rr` at
-    all, so nothing there stops it either. Infinity is not a parameter value under test; it is
-    a number that got away.
+    -- so `Dca`'s budget guard passes it. `TurtleBreakout` does not validate `target_rr` at all,
+    so nothing there stops it either. Infinity is not a parameter value under test; it is a
+    number that got away, and no backtest can report on it.
     """
     repo = _repo(tmp_path)
 
@@ -330,12 +350,54 @@ def test_a_non_finite_number_is_refused(tmp_path, valid_config_path):
         "--kind", "turtle_breakout", "--product", "BTC-USD",
         "--params", '{"target_rr": Infinity}',
     )
+    lookback = _add(
+        tmp_path, valid_config_path,
+        "--kind", "dca", "--product", "BTC-USD", "--params", '{"lookback_days": 1e400}',
+    )
 
     assert budget.exit_code != 0
     assert "budget_usd" in budget.output
     assert target.exit_code != 0
     assert "target_rr" in target.output
+    assert lookback.exit_code != 0
     assert repo.get_rules() == []
+
+
+def test_the_non_finite_refusal_states_the_reason_that_is_true_for_that_param(
+    tmp_path, valid_config_path
+):
+    """The two param types fail differently, and a refusal that gives the wrong reason for its
+    own worked example teaches the operator something false.
+
+    A FLOAT param stores as a bare `Infinity` token, which really is unparseable by a strict
+    JSON reader. A `_DECIMAL_PARAMS` param stores as the STRING `"Infinity"` -- perfectly valid
+    JSON, which is worse rather than better: it round-trips silently into an infinite `Decimal`
+    that no `<= 0` guard rejects, so `budget_usd: Infinity` yields `size_usd=Decimal('Infinity')`
+    without anything raising at all.
+    """
+    assert json.dumps({"budget_usd": str(Decimal("Infinity"))}) == '{"budget_usd": "Infinity"}'
+    json.loads(json.dumps({"budget_usd": str(Decimal("Infinity"))}))  # valid JSON, no raise
+
+    decimal_param = _add(
+        tmp_path, valid_config_path,
+        "--kind", "dca", "--product", "BTC-USD", "--params", '{"budget_usd": Infinity}',
+    )
+    float_param = _add(
+        tmp_path, valid_config_path,
+        "--kind", "turtle_breakout", "--product", "BTC-USD",
+        "--params", '{"volume_mult": 1e400}',
+    )
+
+    assert "IS valid JSON" in decimal_param.output, (
+        "the stored value is the string \"Infinity\", which IS valid JSON -- claiming otherwise "
+        "for the very example the refusal cites is simply false"
+    )
+    assert '"Infinity"' in decimal_param.output, "the quoted, stored form is what it becomes"
+    assert "Decimal('Infinity')" in decimal_param.output, "and what it rebuilds into"
+    assert "not valid JSON" in float_param.output, (
+        "a float param really does store a bare `Infinity` token, and that one is unparseable"
+    )
+    assert "`Infinity`" in float_param.output, "the bare token, unquoted"
 
 
 def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
@@ -354,6 +416,146 @@ def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
 
     assert result.exit_code != 0
     assert "oversold" in result.output
+    assert repo.get_rules() == []
+
+
+def test_a_json_container_is_refused_where_the_rule_wants_a_single_value(
+    tmp_path, valid_config_path
+):
+    """The same param and the same failure as `{"oversold": "10.0"}` and `{"oversold": null}`,
+    arriving in the one JSON shape neither of those checks looks at. `[1, 2]` for a float field
+    constructs, stores, rebuilds, and then raises `TypeError: '<' not supported between
+    instances of 'float' and 'list'` inside `detect()` -- reproduced end-to-end: `rules add
+    --kind rsi_meanrev --params '{"oversold": [1,2]}'` printed `added rule 28`, and `rules
+    backtest 28` died. A JSON object is the same hole wearing a different bracket.
+    """
+    repo = _repo(tmp_path)
+
+    cases = [
+        ("rsi_meanrev", '{"oversold": [1, 2]}', "oversold"),
+        ("rsi_meanrev", '{"oversold": {"a": 1}}', "oversold"),
+        ("rsi_meanrev", '{"require_divergence": [true]}', "require_divergence"),
+        ("turtle_breakout", '{"adx_threshold": []}', "adx_threshold"),
+    ]
+    for kind, params, name in cases:
+        result = _add(
+            tmp_path, valid_config_path, "--kind", kind, "--product", "BTC-USD",
+            "--params", params,
+        )
+        assert result.exit_code != 0, (kind, params, result.output)
+        assert name in result.output, params
+    assert repo.get_rules() == []
+
+
+def test_a_value_outside_a_params_declared_choices_is_refused(tmp_path, valid_config_path):
+    """`stop_method`/`target_method` are declared `Literal["fixed", "atr"]` -- the rule's own
+    statement of what it accepts. `RsiMeanReversion` does enforce them, but in
+    `_compute_stop`/`_compute_target`, i.e. at `detect()` time: `"banana"` constructs, stores,
+    rebuilds and then raises `ValueError: unknown stop_method: 'banana'` mid-backtest. The
+    declared choices are named in the refusal so the operator can see the spelling they meant.
+    """
+    repo = _repo(tmp_path)
+
+    stop = _add(
+        tmp_path, valid_config_path,
+        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"stop_method": "banana"}',
+    )
+    target = _add(
+        tmp_path, valid_config_path,
+        "--kind", "rsi_meanrev", "--product", "BTC-USD",
+        "--params", '{"target_method": "banana"}',
+    )
+
+    assert stop.exit_code != 0
+    assert "stop_method" in stop.output
+    assert "atr" in stop.output and "fixed" in stop.output, "the choices must be named"
+    assert target.exit_code != 0
+    assert "nearest_resistance" in target.output and "fixed_rr" in target.output
+    assert repo.get_rules() == []
+
+
+def test_a_typod_choice_is_refused_rather_than_backtesting_a_different_branch(
+    tmp_path, valid_config_path
+):
+    """`PullbackContinuation` validates NOTHING here: an unknown `entry_zone` picks the
+    `ema_band` branch by fallthrough and an unknown `stop_method` picks `atr`, both silently.
+    Measured on real candles: `entry_zone="banana"` produces 7 trades, byte-identical to
+    `ema_band`, where the `ema_touch` default gives 13; `stop_method="banana"` gives 15,
+    identical to `atr`. An operator who fat-fingers `ema_touch` is handed another rule's numbers
+    with no warning -- the same failure as the `granularity` param the row cannot carry.
+    """
+    repo = _repo(tmp_path)
+
+    zone = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"entry_zone": "banana"}',
+    )
+    stop = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"stop_method": "banana"}',
+    )
+
+    assert zone.exit_code != 0
+    assert "ema_touch" in zone.output and "ema_band" in zone.output
+    assert stop.exit_code != 0
+    assert "stop_method" in stop.output
+    assert repo.get_rules() == []
+
+
+def test_every_choice_a_rule_declares_is_accepted(tmp_path, valid_config_path):
+    """The choice check must be a guard, not an obstacle: every value the rule's own `Literal`
+    names has to go through, or a legitimate parameter sweep across `target_method` is blocked
+    by the very check meant to protect it. Read off the rule, so a kind that gains a branch
+    needs no change here or in the command.
+    """
+    repo = _repo(tmp_path)
+    kinds = {"pullback_continuation", "rsi_meanrev"}
+    checked = 0
+
+    for kind in kinds:
+        signature = inspect.signature(RULE_REGISTRY[kind]).parameters
+        for param, choices in _declared_choices(RULE_REGISTRY[kind]).items():
+            is_sequence = isinstance(signature[param].default, tuple)
+            for choice in choices:
+                result = _add(
+                    tmp_path, valid_config_path, "--kind", kind, "--product", "BTC-USD",
+                    "--params", json.dumps({param: [choice] if is_sequence else choice}),
+                )
+                assert result.exit_code == 0, (kind, param, choice, result.output)
+                checked += 1
+
+    assert checked >= 12, "all five Literal params of the two kinds must have been swept"
+    assert len(repo.get_rules()) == checked
+
+
+def test_an_unknown_signal_pattern_is_refused_like_an_empty_pattern_list(
+    tmp_path, valid_config_path
+):
+    """`signal_patterns: []` is already refused because "it never signals and reads as a rule
+    that simply does not work". `["nonexistent"]` produces exactly that -- `_match_signal_pattern`
+    compares the name against seven literals, matches none, and returns `None` on every bar
+    forever -- so it has to be refused for the same reason. The accepted names come from the
+    rule's own `SignalPattern` declaration, not a copy kept here.
+    """
+    repo = _repo(tmp_path)
+
+    empty = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"signal_patterns": []}',
+    )
+    unknown = _add(
+        tmp_path, valid_config_path,
+        "--kind", "pullback_continuation", "--product", "BTC-USD",
+        "--params", '{"signal_patterns": ["pin_bar", "nonexistent"]}',
+    )
+
+    assert empty.exit_code != 0
+    assert unknown.exit_code != 0
+    assert "nonexistent" in unknown.output
+    assert "hammer" in unknown.output, "the names it could have meant are listed"
     assert repo.get_rules() == []
 
 
@@ -472,6 +674,41 @@ def test_malformed_params_json_is_refused(tmp_path, valid_config_path):
     assert result.exit_code != 0
     assert "JSON" in result.output
     assert repo.get_rules() == []
+
+
+def test_an_explicitly_empty_params_is_refused_not_read_as_the_defaults(
+    tmp_path, valid_config_path
+):
+    """"Flag absent" and "flag given but empty" are different intentions and must not collapse
+    into the same defaults row. The empty string is what a shell hands over when the proposal
+    plumbing misfires -- `--params "$(jq -c .params proposal.json)"` yields `""` when the key
+    is missing or jq errors -- and the silent-default outcome is the worst one available: `added
+    rule 32` is printed, the operator backtests it, and the numbers they read are the stock
+    rule's, not their proposal's. `'{}'` remains the explicit way to ask for the defaults.
+    """
+    repo = _repo(tmp_path)
+
+    for empty in ("", "   "):
+        result = _add(
+            tmp_path, valid_config_path,
+            "--kind", "dca", "--product", "BTC-USD", "--params", empty,
+        )
+        assert result.exit_code != 0, repr(empty)
+        assert repo.get_rules() == [], "an empty --params must never write a defaults row"
+        assert "EMPTY string" in result.output, (
+            "and it must say so: a raw `Expecting value: line 1 column 1` leaves the operator "
+            "hunting for a JSON syntax error in a string that has no syntax"
+        )
+
+    explicit = _add(
+        tmp_path, valid_config_path,
+        "--kind", "dca", "--product", "BTC-USD", "--params", "{}",
+    )
+    omitted = _add(tmp_path, valid_config_path, "--kind", "dca", "--product", "ETH-USD")
+
+    assert explicit.exit_code == 0, explicit.output
+    assert omitted.exit_code == 0, omitted.output
+    assert len(repo.get_rules()) == 2
 
 
 def test_params_that_are_not_a_json_object_are_refused(tmp_path, valid_config_path):
@@ -625,6 +862,57 @@ def test_the_report_shows_how_an_existing_rule_DIFFERS_not_its_whole_params(
     assert len(report) == 1, second.output
     assert "entry_lookback=20" in report[0], "the param that differs must be named"
     assert "adx_period" not in report[0], "params identical to the new row are noise"
+
+
+def test_a_param_the_older_row_predates_is_not_reported_as_a_parameter_difference(
+    tmp_path, valid_config_path
+):
+    """A row written before `turtle_breakout` grew `s1_filter`/`min_volume_filter`/
+    `volume_ma_period`/`volume_mult` has no such keys, and a plain key-union diff calls all four
+    a difference. Against a real pre-existing row that read:
+
+        [10] status=paper entry_lookback=40, min_volume_filter='<absent>',
+             s1_filter='<absent>', volume_ma_period='<absent>', volume_mult='<absent>'
+
+    -- four of five "differences" are schema drift, and they bury `entry_lookback`, the one
+    parameter the operator is actually choosing between. The absent keys still get said (the
+    two rows are genuinely not comparable on them), but as their own, counted note.
+    """
+    repo = _repo(tmp_path)
+    old_id = repo.insert_rule(
+        "turtle_breakout",
+        {
+            "product_id": "BTC-USD",
+            "entry_lookback": 40,
+            "exit_lookback": 20,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
+            "atr_period": 20,
+            "atr_stop_mult": "2",
+            "use_macd_confirm": False,
+            "target_rr": "6",
+        },
+        status="paper",
+    )
+
+    result = _add(
+        tmp_path, valid_config_path,
+        "--kind", "turtle_breakout", "--product", "BTC-USD",
+        "--params", '{"entry_lookback": 55}',
+    )
+
+    assert result.exit_code == 0, result.output
+    report = [ln for ln in result.output.splitlines() if f"[{old_id}]" in ln]
+    assert len(report) == 1, result.output
+    assert "entry_lookback=40" in report[0], "the real difference must still be named"
+    assert "'<absent>'" not in report[0], (
+        "a param that row predates is not a parameter difference and must not read as one"
+    )
+    for grown in ("s1_filter", "min_volume_filter", "volume_ma_period", "volume_mult"):
+        assert grown in report[0], "the incomparable params are still disclosed, just apart"
+    assert report[0].index("entry_lookback=40") < report[0].index("s1_filter"), (
+        "the parameter under test comes first; the schema note follows it"
+    )
 
 
 def test_an_existing_rule_with_identical_params_is_reported_as_identical(

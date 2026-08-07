@@ -28,8 +28,24 @@ EntryZone = Literal["ema_touch", "ema_band"]
 StopMethod = Literal["fixed", "atr"]
 TargetMethod = Literal["measured_1to1", "swing", "fib_ext"]
 
+#: The pattern names `_match_signal_pattern` below can actually fire on -- declared as a
+#: `Literal` for the same reason `EntryZone`/`StopMethod`/`TargetMethod` are: it is this rule's
+#: own statement of what it accepts, in the one place that also implements it. A name outside
+#: this set is not an error the rule can raise (the matcher simply never matches it and the rule
+#: never signals, forever), so a caller taking operator-typed patterns -- `keel rules add` --
+#: reads the set off this annotation rather than keeping a second copy that would drift.
+SignalPattern = Literal[
+    "pin_bar",
+    "hammer",
+    "shooting_star",
+    "doji",
+    "marubozu",
+    "tweezer",
+    "three_bar_reversal",
+]
+
 _DEFAULT_EMA_PERIODS: tuple[int, ...] = (8, 20, 50)
-_DEFAULT_SIGNAL_PATTERNS: tuple[str, ...] = ("pin_bar",)
+_DEFAULT_SIGNAL_PATTERNS: tuple[SignalPattern, ...] = ("pin_bar",)
 _ATR_PERIOD = 14
 # source-07 §7.4: Fib 1.272/1.618 extension is a third target-method option; 1.272 (the
 # nearer, more conservative extension) is the default ratio used here.
@@ -50,7 +66,7 @@ class PullbackContinuation(Rule):
         granularity: Granularity = Granularity.ONE_HOUR,
         ema_periods: tuple[int, ...] = _DEFAULT_EMA_PERIODS,
         entry_zone: EntryZone = "ema_touch",
-        signal_patterns: tuple[str, ...] = _DEFAULT_SIGNAL_PATTERNS,
+        signal_patterns: tuple[SignalPattern, ...] = _DEFAULT_SIGNAL_PATTERNS,
         buffer_ticks: Decimal = Decimal("0.02"),
         stop_method: StopMethod = "fixed",
         target_method: TargetMethod = "measured_1to1",
