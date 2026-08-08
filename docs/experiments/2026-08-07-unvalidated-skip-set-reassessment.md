@@ -49,9 +49,10 @@ makes SOL/LTC/LINK inert is the absence of a `live`-status `rules` row.
 
 ## Gates 1 and 2: SOL/LTC/LINK passed, and have since 2026-07-23
 
-SOL, XLM, LTC and ADA were attested at the **same second** (2026-07-23 12:15:12, `attested_at`
-1784823312), same attestor, `pays_yield=0`, "bare unstaked spot only". LINK followed 160s later
-under the same governing source (KB source-86) — though LINK's attestation text is materially
+SOL, XLM, LTC and ADA were attested at the **same second** (`attested_at` 1784823312 =
+2026-07-23 16:15:12 UTC / 12:15:12 EDT), same attestor, `pays_yield=0`, "bare unstaked spot
+only". LINK followed 160s later under the same governing source (KB source-86) — though its
+attestation text is materially
 more qualified, classifying it as a **utility token** (ERC-20, `native` chosen only because the
 backing enum lacks a `utility` slot). That nuance is worth preserving; "same source" flattens it.
 
@@ -90,8 +91,9 @@ entry_lookback: int = 40,  # Donchian-high entry (days); walk-forward OOS defaul
 
 ## Gate 4: the live set didn't pass it either
 
-`keel-live.db` rules 1–5 (BTC/ETH/PAXG/ADA/XLM) were created in the same second on 2026-07-24
-13:42:24 at `status = live` with **`promoted_at IS NULL`** — seeded through the bypass
+`keel-live.db` rules 1–5 (BTC/ETH/PAXG/ADA/XLM) were created in the same second
+(`created_at` 1784914944 = 2026-07-24 17:42:24 UTC / 13:42:24 EDT) at `status = live` with
+**`promoted_at IS NULL`** — seeded through the bypass
 `rules seed` warns about in its own output:
 
 > ⚠️ seeded at LIVE status, bypassing the promotion gate. This is for the supervised live-order
@@ -121,25 +123,41 @@ have passed.
 ## The measurement nobody had run
 
 The original comment guessed. Running `keel rules backtest` — against a **copy** of `keel.db`,
-never the original — settles the direction in three commands:
+never the original — settles the direction. The three excluded rules first, then the five the
+sandbox actually trades, for contrast:
 
-| rule | asset | n_trades | win rate | expectancy | profit factor | max DD |
-|---|---|---:|---:|---:|---:|---:|
-| 21 | SOL | 13 | 23.08% | **−12.41** | 0.259 | 161.3 |
-| 23 | LTC | 5 | 0.00% | **−13.09** | 0.000 | 65.5 |
-| 25 | LINK | 15 | 20.00% | **−0.665** | 0.630 | 19.4 |
-| 22 | XLM | 8 | 37.50% | +0.056 | 11.44 | 0.04 |
-| 24 | ADA | 6 | 50.00% | +0.121 | 5.52 | 0.10 |
+| rule | asset | n_trades | win rate | expectancy | profit factor | max DD | |
+|---|---|---:|---:|---:|---:|---:|---|
+| 21 | SOL | 13 | 23.08% | −12.41 | **0.259** | 161.3 | excluded |
+| 23 | LTC | 5 | 0.00% | −13.09 | **0.000** | 65.5 | excluded |
+| 25 | LINK | 15 | 20.00% | −0.665 | **0.630** | 19.4 | excluded |
+| 22 | XLM | 8 | 37.50% | +0.056 | 11.44 | 0.04 | |
+| 24 | ADA | 6 | 50.00% | +0.121 | 5.52 | 0.10 | |
+| 10 | BTC | 13 | 46.15% | +1353.99 | 1.61 | 12177.6 | |
+| 11 | ETH | 13 | 30.77% | +45.72 | 1.21 | 1285.0 | |
+| 12 | PAXG | 4 | 50.00% | +212.15 | 3.25 | 377.1 | |
 
-All three excluded assets are negative-expectancy; LTC won none of five trades. So the earlier
-draft of this document was wrong to say "there is no negative result anywhere for SOL, LTC or
-LINK" — there is one, and it was ten seconds away in data already sitting in `keel.db`.
+**Compare on profit factor, not expectancy.** Expectancy is quote-currency per trade, so it
+tracks the asset's price — BTC's +1354 and XLM's +0.056 are not commensurable, and reading the
+column as a ranking would put BTC four orders of magnitude "ahead" of ADA purely because a
+bitcoin costs more. On the scale-free metric the split is clean: **every excluded asset is
+pf < 1 (losing), every included asset is pf > 1.** LTC won none of five trades.
 
-**Read it with the sample sizes in view.** n = 5–15 against `min_trades = 100`, in-sample, one
+So the earlier draft of this document was wrong to say "there is no negative result anywhere for
+SOL, LTC or LINK" — there is one, and it was ten seconds away in data already sitting in
+`keel.db`.
+
+**Read it with the sample sizes in view.** n = 4–15 against `min_trades = 100`, in-sample, one
 window, no walk-forward, and on candles six days stale for the excluded three. By this project's
 own standards (`2026-07-20-first-pbo-run.md` on why high PBO with a flat slope is the *good*
 shape; §79.13 on 47 of 55 assets failing `t = 1.65`) this is a cheap directional check, not
-validation. It cannot promote anything and should not. **None of the five clears the gate.**
+validation. It cannot promote anything and should not. **Not one of the eight rules above clears
+the gate** — the live five included, and ETH's 30.77% win rate also sits under the canonical
+`min_win_rate` of 0.55.
+
+Note the ordering of events: this measurement is dated 2026-08-07, roughly two weeks after the
+2026-07-24 exclusion. It is a **post-hoc vindication** of that decision, not the reason it was
+made. The reason it was made remains unrecorded.
 
 What it does do is remove the symmetry argument: the two groups are not indistinguishable on
 evidence, and the difference runs the way the original comment assumed.
@@ -172,12 +190,29 @@ status quo, and admission is the operator's call through the deterministic gate 
 2. **`keel-live.db` carries almost no compliance state.** Screening the live allowlist against a
    copy, **0 of 5 admit** — BTC/ETH/ADA/XLM reject on missing attestation, PAXG on attestation
    *and* history, because the attestations and the PAXG waiver exist only in `keel.db`.
-   Ironically **SOL is the only asset that DB admits** (attested there 2026-08-07 20:29:43).
    Operationally harmless — rail 1 reads `config.allowlist`, not the DB — but anyone running
    `keel assets screen` against the live DB gets the opposite of the comment's picture.
-3. **Live-seeded rules left in place 14 days**, against `rules seed`'s own instruction.
-4. **Stale candles.** `keel fetch` follows the allowlist, so SOL/LTC/LINK daily bars in `keel.db`
+3. **The one attestation `keel-live.db` does hold deserves a look, and it is not SOL's
+   `keel.db` one.** The row is:
+
+   ```
+   asset=SOL  sector='layer-1 smart-contract blockchain infrastructure'  backing=native
+   pays_yield=0  source='https://www.solana.com/staking'
+   attested_by='Elmehdi Aitbrahim'  attested_at=1786148983
+                                    (2026-08-08 00:29:43 UTC / 2026-08-07 20:29:43 EDT)
+   ```
+
+   Two things worth the operator's attention. **(a)** It is same-evening, written ~44 minutes
+   before this investigation's first commit — not historical state. It was not written by this
+   work (which touched only scratchpad copies; `~/keel/keel.db`'s mtime is unchanged and every
+   query here ran `mode=ro`), and `keel-live.db` is the live agent's own DB, so it is written
+   continuously. But its provenance should be confirmed rather than assumed. **(b)** Its
+   `source` is a **staking page**, which sits awkwardly against `pays_yield=0` and against every
+   `keel.db` attestation's "Attests bare unstaked spot only" framing — including SOL's own. That
+   is a compliance question independent of this document, and it is the operator's to settle.
+4. **Live-seeded rules left in place 14 days**, against `rules seed`'s own instruction.
+5. **Stale candles.** `keel fetch` follows the allowlist, so SOL/LTC/LINK daily bars in `keel.db`
    end 2026-07-31 vs 2026-08-06. Re-run the backtests above after a fetch before relying on them.
-5. **Two open attestation questions**, neither a defect: LINK's staking floor is funded from
+6. **Two open attestation questions**, neither a defect: LINK's staking floor is funded from
    emissions rather than user fees, and LTC has carried **MWEB** — opt-in confidential
    transactions — since May 2022, a narrower form of the ZEC privacy question.
