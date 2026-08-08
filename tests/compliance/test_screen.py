@@ -533,3 +533,43 @@ def test_missing_history_lines_dedupes_and_sorts_tags():
         ],
     )
     assert lines[2] == "not assessable until then: history, liquidity"
+
+
+# -- median_daily_quote_volume: the ONE definition of the liquidity statistic ------------------
+
+
+def _vol_candle(volume: str, close: str):
+    from keel.types import Candle
+
+    return Candle(
+        ts=0,
+        open=Decimal(close),
+        high=Decimal(close),
+        low=Decimal(close),
+        close=Decimal(close),
+        volume=Decimal(volume),
+    )
+
+
+def test_median_daily_quote_volume_is_the_median_of_volume_times_close():
+    """Quote volume, not base: a bar's contribution is `volume * close`.
+
+    `discover`'s pre-filter and `screen`'s criterion must compute the SAME statistic or the
+    sweep silently proposes assets the gate then rejects. This is that one definition.
+    """
+    from keel.compliance.screen import median_daily_quote_volume
+
+    candles = [
+        _vol_candle(volume="10", close="1"),  # 10
+        _vol_candle(volume="10", close="100"),  # 1000
+        _vol_candle(volume="10", close="10"),  # 100  <- median
+    ]
+
+    assert median_daily_quote_volume(candles) == Decimal("100")
+
+
+def test_median_daily_quote_volume_of_no_candles_is_zero():
+    """No bars is not high liquidity -- it is no evidence, and the screen treats 0 as failing."""
+    from keel.compliance.screen import median_daily_quote_volume
+
+    assert median_daily_quote_volume([]) == Decimal(0)

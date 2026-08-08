@@ -500,16 +500,24 @@ def assets_group() -> None:
     """Allowlist admission screening (KB §28.4/§65.5) -- a CURATION gate, not a per-trade rail."""
 
 
+#: Days of recent daily candles `--probe-liquidity` samples per candidate. Deliberately a RECENT
+#: window rather than the full history the screen medians over: the probe's job is to be one cheap
+#: request that tracks the criterion, not to reproduce it exactly. Recent is also the conservative
+#: direction for a *pre-filter* — it reflects the liquidity a new position would actually meet.
+_LIQUIDITY_PROBE_DAYS = 180
+
+
 def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.MarketFacts:
     """Everything the screen can compute for itself from data we already hold."""
     asset = product.split("-")[0]
     candles = repo.get_candles(product, Granularity.ONE_DAY)
-    volumes = sorted(c.volume * c.close for c in candles)
-    median = volumes[len(volumes) // 2] if volumes else Decimal(0)
     return screen_mod.MarketFacts(
         asset=asset,
         daily_bars=len(candles),
-        median_daily_volume=median,
+        # `screen_mod.median_daily_quote_volume` is the ONE definition of this statistic --
+        # `assets discover --probe-liquidity` pre-filters on the same call, so the sweep and the
+        # gate cannot disagree about what "liquid enough" means.
+        median_daily_volume=screen_mod.median_daily_quote_volume(candles),
         # A REAL check: does this product settle in the currency this deployment trades in?
         # The former `or bool(candles)` fallback made it vacuous -- every screened product is
         # `-USD`, so it always fell through to "do we have bars", which the history criterion
@@ -703,10 +711,25 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     "candidate that fails this can never clear the screen, so probing first avoids spending "
     "attestation effort on it.",
 )
+@click.option(
+    "--probe-liquidity",
+    is_flag=True,
+    default=False,
+    help="One extra request per candidate: sample recent daily candles and compute the SAME "
+    "median-quote-volume statistic the admission screen applies. The default 24h filter is a "
+    "one-day snapshot and can sit 100x above or 6x below an asset's typical day, so a candidate "
+    "can clear the sweep and then fail the gate on liquidity (or nearly be dropped when it would "
+    "have passed comfortably). Estimator, not a verdict -- see the note below the table.",
+)
 @click.pass_context
 @with_disclaimer
 def assets_discover(
-    ctx: click.Context, quote: str | None, min_volume_24h: str, limit: int, probe_history: bool
+    ctx: click.Context,
+    quote: str | None,
+    min_volume_24h: str,
+    limit: int,
+    probe_history: bool,
+    probe_liquidity: bool,
 ) -> None:
     """PROPOSE allowlist candidates from venue metadata. Admits nothing.
 
@@ -731,11 +754,17 @@ def assets_discover(
         f"(quote={policy.quote_currency}, 24h volume >= {policy.min_quote_24h_volume:,.0f}, "
         f"excluding the current allowlist)\n"
     )
+    screen_policy = screen_mod.ScreenPolicy()
     header = f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}"
-    click.echo(header + ("  4yr?  name" if probe_history else "  name"))
+    if probe_history:
+        header += "  4yr?"
+    if probe_liquidity:
+        header += f"  {'median daily (probe)':>21}"
+    click.echo(header + "  name")
 
     now_ts = int(time.time())
     four_years_ago = now_ts - 4 * _DAYS_PER_YEAR * 86400
+    liquidity_window_start = now_ts - _LIQUIDITY_PROBE_DAYS * 86400
     for index, candidate in enumerate(candidates[:limit], start=1):
         line = (
             f"{index:>3}  {candidate.product_id:<14} {candidate.asset:<8} "
@@ -753,6 +782,18 @@ def assets_discover(
             except Exception:  # noqa: BLE001 -- a probe failure is unknown, not a verdict
                 marker = "?   "
             line += f"  {marker}"
+        if probe_liquidity:
+            try:
+                sampled = client.get_candles(
+                    candidate.product_id, Granularity.ONE_DAY, liquidity_window_start, now_ts
+                )
+                median = screen_mod.median_daily_quote_volume(sampled)
+                # Same comparison `screen_asset` will make, against the same floor -- that is the
+                # entire point. A candidate marked LOW here is one the gate would reject.
+                verdict = "LOW" if median < screen_policy.min_median_daily_volume else "ok "
+                line += f"  {median:>17,.0f} {verdict}"
+            except Exception:  # noqa: BLE001 -- same rule as the history probe: unknown, not a no
+                line += f"  {'?':>17} ?  "
         click.echo(line + f"  {candidate.base_name}")
 
     click.echo(
@@ -760,6 +801,14 @@ def assets_discover(
         "or backing -- those cannot be derived from market data. Each one needs "
         "`keel assets attest` with a source before `keel assets screen` can admit it."
     )
+    if probe_liquidity:
+        click.echo(
+            f"\n'median daily (probe)' is the SAME statistic the screen applies (median of "
+            f"volume x close), floor {screen_policy.min_median_daily_volume:,.0f} -- but sampled "
+            f"over the last {_LIQUIDITY_PROBE_DAYS} days, where the screen medians over all "
+            "cached history. Treat LOW as 'the gate will reject this' and ok as 'worth pulling "
+            "candles for', never as the verdict itself. Run `keel assets screen` for that."
+        )
 
 
 @assets_group.command("screen")
