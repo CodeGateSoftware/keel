@@ -58,6 +58,41 @@ allowlist:
   - ADA
   - XLM
 
+# ---------------------------------------------------------------------------------------------
+# STANDING EXCEPTION: the five live rules bypassed the promotion gate, deliberately, and stay.
+#
+# keel-live.db rules 1-5 were seeded straight to `status=live` on 2026-07-24 with promoted_at
+# NULL. `keel rules seed` printed "Do not leave live-seeded rules in place afterwards." They have
+# been left in place. That is a decision, reviewed 2026-08-08 and recorded here rather than left
+# silent -- the same standard docs/experiments/2026-07-20-allowlist-screen-first-run.md set for
+# PAXG: "The one thing not to do is leave it silently exempt because it was already there."
+#
+# WHY KEEP THEM. The promotion floor is min_trades=100 PER RULE. This strategy cannot reach it.
+# Measured 2026-08-08 by backtesting each rule over ~5.02 years of daily bars:
+#   BTC  13 trades = 2.59/yr -> 100 trades in ~39 years
+#   ETH  13 trades = 2.59/yr -> ~39 years
+#   XLM   8 trades = 1.59/yr -> ~63 years
+#   ADA   6 trades = 1.19/yr -> ~84 years
+#   PAXG  4 trades = 3.20/yr -> ~31 years
+# Waiting for the gate is not a slower path to the same place; it is no path. The sandbox exists
+# to accumulate the live evidence the gate demands and cannot itself produce. Demoting these
+# rules would end the experiment without substituting anything for it.
+#
+# WHAT BOUNDS THE RISK. Not the promotion gate -- it never ran. Instead: the caps below
+# (max_exposure_usd 200 total at once, max_per_order_usd 100), the 18 un-overridable guards.py
+# rails, rail 1's allowlist above, and rail 14's monthly subscription allowance. The bypass is of
+# the EVIDENCE gate, not of the SAFETY rails, and those are separate mechanisms.
+#
+# WHAT THIS IS NOT. Not a precedent for adding assets (see the allowlist note above), not a
+# reason to raise caps, and not a claim these rules are validated -- they are not, and neither
+# `promoted_at` nor any backtest here says otherwise.
+#
+# REVISIT IF: caps are raised above this sandbox's few-dollars-of-damage scale; the rule set
+# changes; a rule starts trading materially more often than the table above; or this sandbox is
+# treated as evidence for anything beyond itself. Full working:
+# docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md and docs/go-live-runbook.md §3.
+# ---------------------------------------------------------------------------------------------
+
 target_weights:
   BTC: 0.30
   ETH: 0.20
