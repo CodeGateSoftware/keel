@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Any
 
 from keel_core.products import parse_spot_product_id
 
@@ -362,6 +363,28 @@ class DiscoveryPolicy:
 
     quote_currency: str = "USD"
     min_quote_24h_volume: Decimal = Decimal("5000000")
+
+
+def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
+    """Median of `volume * close` over `candles` -- the liquidity statistic, defined ONCE.
+
+    QUOTE volume, not base: `Candle.volume` is in base units, so a bar's contribution is scaled
+    by its own close. That makes the number comparable across assets and comparable to the
+    venue's reported quote volume.
+
+    **Both callers must use this.** `cli._market_facts` feeds it to `screen_asset`'s liquidity
+    criterion; `assets discover --probe-liquidity` uses it to pre-filter on the SAME statistic
+    the gate will later apply. A second copy next to whichever caller needed it would drift, and
+    the symptom of that drift is the one this function exists to prevent: a sweep that proposes
+    an asset the screen then rejects on liquidity, or quietly drops one it would have admitted.
+
+    Empty input is `Decimal(0)` -- no bars is no evidence of liquidity, and the criterion treats
+    0 as failing, which is the fail-closed direction.
+    """
+    if not candles:
+        return Decimal(0)
+    volumes = sorted(candle.volume * candle.close for candle in candles)
+    return volumes[len(volumes) // 2]
 
 
 def discover_candidates(

@@ -1181,3 +1181,58 @@ def test_propose_human_output_ends_with_the_disclaimer(tmp_path, valid_config_pa
               "assets", "propose", "--from", str(shortlist)],
     )
     assert DISCLAIMER in result.output
+
+
+class _VolumeVenue(_FakeVenue):
+    """Serves canned daily candles per product so the liquidity probe has something to measure."""
+
+    def __init__(self, products, quote_volume_for):
+        super().__init__(products)
+        self._quote_volume_for = quote_volume_for
+
+    def get_candles(self, product_id, granularity, start, end):
+        self.probe_calls.append(product_id)
+        per_bar = self._quote_volume_for.get(product_id)
+        if per_bar is None:
+            return []
+        return [
+            Candle(
+                ts=i * _DAY,
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal(per_bar),
+            )
+            for i in range(30)
+        ]
+
+
+def test_probe_liquidity_flags_a_candidate_whose_24h_snapshot_beats_its_median(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The BICO case: one spike day clears the sweep's floor while the typical day fails the gate.
+
+    BICO was shortlisted 2026-08-08 on a reported $12.81M/24h and then rejected by the screen at
+    a median daily volume of 108,004 -- 9x under the floor. The sweep and the gate were measuring
+    different statistics, so the pre-filter could not see it.
+    """
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    venue = _VolumeVenue(
+        [_venue_product("BICO-USD", "12810000"), _venue_product("SOL-USD", "50000000")],
+        quote_volume_for={"BICO-USD": "108004", "SOL-USD": "40000000"},
+    )
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "discover", "--probe-liquidity"],
+    )
+
+    assert result.exit_code == 0, result.output
+    bico_line = next(ln for ln in result.output.splitlines() if "BICO-USD" in ln)
+    sol_line = next(ln for ln in result.output.splitlines() if "SOL-USD" in ln)
+    assert "LOW" in bico_line, bico_line
+    assert "LOW" not in sol_line, sol_line
