@@ -202,14 +202,44 @@ status quo, and admission is the operator's call through the deterministic gate 
                                     (2026-08-08 00:29:43 UTC / 2026-08-07 20:29:43 EDT)
    ```
 
-   Two things worth the operator's attention. **(a)** It is same-evening, written ~44 minutes
-   before this investigation's first commit — not historical state. It was not written by this
-   work (which touched only scratchpad copies; `~/keel/keel.db`'s mtime is unchanged and every
-   query here ran `mode=ro`), and `keel-live.db` is the live agent's own DB, so it is written
-   continuously. But its provenance should be confirmed rather than assumed. **(b)** Its
-   `source` is a **staking page**, which sits awkwardly against `pays_yield=0` and against every
-   `keel.db` attestation's "Attests bare unstaked spot only" framing — including SOL's own. That
-   is a compliance question independent of this document, and it is the operator's to settle.
+   **Provenance: resolved, operator-typed.** `~/.zsh_history` records it at epoch 1786148982,
+   one second before the row's `attested_at`:
+
+   ```
+   ./.venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db \
+     assets attest --asset SOL --sector "layer-1 smart-contract blockchain infrastructure" \
+       --backing native --source "https://www.solana.com/staking" \
+       --attested-by "Elmehdi Aitbrahim"
+   ```
+
+   preceded by a placeholder attempt at 1786148907 and two `keel fetch --products SOL-USD` runs.
+   Hand-typed at the terminal — not an agent, not the daemon, and not this investigation (which
+   touched only scratchpad copies; `~/keel/keel.db`'s mtime is unchanged and every query ran
+   `mode=ro`).
+
+   **The staking-page source: defensible on the yield axis, thin on the ruling.** An earlier
+   draft of this item said the citation "sits awkwardly against `pays_yield=0`". Fetching the
+   page shows the opposite — it is direct evidence *for* `pays_yield=0`: *"In order to earn
+   staking rewards … the tokens in a stake account must be delegated to a validator,"* with no
+   rebasing and no automatic distribution to holders. Bare holding earns nothing, which is
+   exactly what the field asserts.
+
+   The real gap is the *kind* of source. `AssetAttestation.source` is documented as "where this
+   was established — a URL, a standard, a scholar's ruling." A vendor product page can establish
+   the mechanical fact; it cannot establish the *ruling* that a native L1 coin is `Mal Hukmi`,
+   lawful to own and trade. Every `keel.db` attestation carries both — KB source-86 plus the
+   three-layer screen reasoning and an explicit "Attests bare unstaked spot only." This row
+   carries only the mechanical half, and only implicitly. `screen_asset` cannot tell the
+   difference: `screen.py:249` checks `source.strip()` is non-empty and nothing more.
+
+   Two consequences for the operator. **(a)** SOL now has *two* attestations with different
+   evidentiary bases, and which one governs depends on which `--db` a command runs against.
+   **(b)** The page also notes ~8% initial inflation decaying to 1.5%, so a bare holder is
+   *diluted* rather than paid — not a riba yield to the holder, but whether that makes staking
+   economically quasi-compulsory is a scholarly question, not one this file can answer.
+
+   None of this is live-reachable: SOL is not in the live allowlist and has no rule in
+   `keel-live.db`, so rail 1 blocks any SOL intent regardless of the attestation.
 4. **Live-seeded rules left in place 14 days**, against `rules seed`'s own instruction.
 5. **Stale candles.** `keel fetch` follows the allowlist, so SOL/LTC/LINK daily bars in `keel.db`
    end 2026-07-31 vs 2026-08-06. Re-run the backtests above after a fetch before relying on them.
