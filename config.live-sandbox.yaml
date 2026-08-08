@@ -5,12 +5,28 @@
 # PREVIEWED and requires a typed `y`. Caps are deliberately tiny so a bad fill can lose only a
 # few dollars.
 #
-# Authored in the dev repo (gitignored). DEPLOYED to ~/keel at arm-time alongside its
-# OWN database keel-live.db. There it runs as:
+# Authored in the dev repo and TRACKED there since 183dcdb. DEPLOYED to ~/keel at arm-time
+# alongside its OWN database keel-live.db. There it runs as:
 #   .venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db agent   (interactive)
+# The repo copy is the backup of record: edit both, or they drift.
 
-# The 5-trend Turtle set (same as the paper-forward + the walk-forward/PBO analysis).
-# SOL/LTC/LINK are deliberately excluded -- they're the unvalidated skip set.
+# The 5 assets this sandbox trades. This is NOT a validated cohort, and an earlier version of
+# this comment claiming it matched "the walk-forward/PBO analysis" was wrong on every count --
+# see docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md. In short:
+#   - No walk-forward/PBO run has ever covered ADA or XLM. Every such run in docs/experiments/
+#     stopped at BTC/ETH/PAXG. The walk-forward that exists tuned a PARAMETER (entry_lookback
+#     20 -> 40), it did not validate a set of assets.
+#   - keel-live.db rules 1-5 were seeded straight to `live` (promoted_at IS NULL), i.e. through
+#     the documented `rules seed --status live` bypass, not through the promotion gate.
+#   - Nothing has traded: trade_outcomes and signals are empty for every product, so with
+#     min_trades=100 no asset here could have earned promotion on evidence.
+#
+# SOL/LTC/LINK are excluded because their turtle rules are still `candidate` and have never been
+# backtested -- NOT on compliance grounds, and NOT because anything about them failed. All three
+# were attested 2026-07-23 in the same batch as ADA/XLM (same attestor, same source) and ADMIT
+# `keel assets screen` against keel.db today, carrying MORE daily history (1827 bars) than PAXG
+# (456 native-USD bars, on the allowlist only via a documented screen_exceptions waiver).
+# Revisit this list once `keel rules backtest 21/23/25` has actually been run.
 allowlist:
   - BTC
   - ETH
