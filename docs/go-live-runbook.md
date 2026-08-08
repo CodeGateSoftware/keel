@@ -76,6 +76,46 @@ Once promoted, record the change: `python scripts/rule_manifest.py export --db <
 `deploy/live-rules.json`. A fresh deployment re-seeds from constructor defaults and will otherwise
 bring back a differently-sized rule (see `docs/RELEASING.md`).
 
+### Standing exception: the sandbox's five live-seeded rules
+
+This section covers the *act* of short-circuiting the gate. The supervised-live sandbox has been
+running in that state since **2026-07-24**, and that ongoing state is recorded here so it is a
+decision on the record rather than an oversight nobody re-examined.
+
+`keel-live.db` rules 1–5 (`turtle_breakout` on BTC/ETH/PAXG/ADA/XLM) carry `status = live` with
+**`promoted_at IS NULL`** — seeded directly, never promoted. `rules seed` printed *"Do not leave
+live-seeded rules in place afterwards."* They were left in place. **Reviewed 2026-08-08; kept
+deliberately.**
+
+**Why they are kept.** `min_trades` is 100 *per rule*, and this strategy cannot reach it.
+Backtesting each rule over ~5.02 years of daily bars on 2026-08-08:
+
+| rule | trades | rate | years to 100 trades |
+|---|---:|---:|---:|
+| BTC | 13 | 2.59/yr | ~39 |
+| ETH | 13 | 2.59/yr | ~39 |
+| XLM | 8 | 1.59/yr | ~63 |
+| ADA | 6 | 1.19/yr | ~84 |
+| PAXG | 4 | 3.20/yr | ~31 |
+
+Waiting for the gate is not a slower route to the same destination — it is no route. The sandbox
+exists to accumulate the live evidence the promotion gate demands and cannot itself generate.
+Demoting these rules would end that experiment without putting anything in its place.
+
+**What bounds the risk instead.** Not the promotion gate, which never ran. The caps
+(`max_exposure_usd` 200 total at once, `max_per_order_usd` 100), the eighteen un-overridable
+`guards.py` rails, rail 1's allowlist, and rail 14's monthly allowance. **The bypass is of the
+evidence gate, not the safety rails** — separate mechanisms, and only the first was skipped.
+
+**What it is not.** Not a precedent for admitting assets, not a reason to raise caps, and not a
+claim that these five rules are validated. They are not: no walk-forward or PBO run has ever
+covered ADA or XLM, and none of the five clears any promotion axis. See
+`docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md`.
+
+**Revisit if** caps rise above this sandbox's few-dollars-of-damage scale; the rule set changes; a
+rule begins trading materially more often than the table above; or this sandbox starts being
+treated as evidence for anything beyond itself.
+
 ## 4. Run one cycle, in confirm mode, and watch
 
 ```bash
