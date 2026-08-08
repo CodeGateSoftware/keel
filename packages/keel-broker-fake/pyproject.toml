@@ -1,6 +1,6 @@
 [project]
 name = "keel-broker-fake"
-version = "0.5.5"
+version = "0.5.6"
 description = "A deliberately divergent second broker adapter, to keep the port honest"
 requires-python = ">=3.14.4"
 dependencies = ["keel-core", "keel-broker-api"]
