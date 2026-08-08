@@ -5,12 +5,52 @@
 # PREVIEWED and requires a typed `y`. Caps are deliberately tiny so a bad fill can lose only a
 # few dollars.
 #
-# Authored in the dev repo (gitignored). DEPLOYED to ~/keel at arm-time alongside its
-# OWN database keel-live.db. There it runs as:
+# Authored in the dev repo and TRACKED there since 183dcdb. DEPLOYED to ~/keel at arm-time
+# alongside its OWN database keel-live.db. There it runs as:
 #   .venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db agent   (interactive)
+# The repo copy is the backup of record: edit both, or they drift.
 
-# The 5-trend Turtle set (same as the paper-forward + the walk-forward/PBO analysis).
-# SOL/LTC/LINK are deliberately excluded -- they're the unvalidated skip set.
+# The 5 assets this sandbox trades. Keeping SOL/LTC/LINK off this list is the RIGHT call -- but
+# an earlier version of this comment gave reasons that were not true, so the reasons are restated
+# here. Full working: docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md.
+#
+# What that comment got RIGHT: these 5 are exactly the `paper`-status rules in keel.db
+# (10/11/12 BTC/ETH/PAXG + 22 XLM + 24 ADA), so "same as the paper-forward" was accurate.
+#
+# What it got WRONG: it also credited "the walk-forward/PBO analysis". No walk-forward or PBO run
+# has ever covered ADA or XLM -- every such run in docs/experiments/ stopped at BTC/ETH/PAXG, and
+# the walk-forward that exists tuned a PARAMETER (turtle_breakout.py:113, entry_lookback 20 -> 40),
+# it never validated a set of assets. And these 5 did not clear the promotion gate: keel-live.db
+# rules 1-5 carry promoted_at IS NULL, seeded straight to `live` through the bypass `rules seed`
+# warns about. (Rule 6, the BTC dca, IS promoted -- and has a filled live order and an open
+# position, so this deployment is NOT inert.)
+#
+# The reason that DOES hold up -- established 2026-08-07 by running the backtest nobody had run,
+# so it is a post-hoc vindication of the 2026-07-24 exclusion, not the reason it was made.
+# `keel rules backtest` on a COPY of keel.db, in-sample, one window (SOL/LTC/LINK candles 6 days
+# stale; the allowlisted rows are current):
+#   21 SOL   n=13  win 23.1%  expectancy   -12.41   pf  0.26   <- excluded
+#   23 LTC   n= 5  win  0.0%  expectancy   -13.09   pf  0.00   <- excluded
+#   25 LINK  n=15  win 20.0%  expectancy    -0.66   pf  0.63   <- excluded
+#   22 XLM   n= 8  win 37.5%  expectancy    +0.06   pf 11.44
+#   24 ADA   n= 6  win 50.0%  expectancy    +0.12   pf  5.52
+#   10 BTC   n=13  win 46.2%  expectancy +1353.99   pf  1.61
+#   11 ETH   n=13  win 30.8%  expectancy   +45.72   pf  1.21
+#   12 PAXG  n= 4  win 50.0%  expectancy  +212.15   pf  3.25
+# COMPARE ON pf, NOT expectancy: expectancy is quote-currency per trade, so it tracks the asset's
+# price (BTC ~64k vs XLM ~0.30) and is meaningless across rows. On the scale-free metric the split
+# is clean -- every excluded asset is pf < 1 (losing), every included one is pf > 1.
+#
+# That is a real adverse result for SOL/LTC/LINK, and NOT a compliance one: all three were attested
+# 2026-07-23 alongside ADA/XLM under the same governing source (KB source-86; LINK's is more
+# carefully qualified, as a utility token), all three ADMIT `keel assets screen`, and all three
+# carry MORE daily history (1827 bars) than PAXG (456 native-USD bars, on this list only via a
+# documented screen_exceptions waiver).
+#
+# Read the numbers with the sample sizes in view: n=4..15 against min_trades=100. NOT ONE of the
+# eight rules above can clear the promotion gate on this evidence -- the live five included. The
+# split is directionally supported, not validated. Do not treat a positive pf here as a licence to
+# add an asset, and do not add SOL/LTC/LINK on the strength of their screen/attestation status.
 allowlist:
   - BTC
   - ETH
