@@ -10,23 +10,38 @@
 #   .venv/bin/keel --config config.live-sandbox.yaml --db keel-live.db agent   (interactive)
 # The repo copy is the backup of record: edit both, or they drift.
 
-# The 5 assets this sandbox trades. This is NOT a validated cohort, and an earlier version of
-# this comment claiming it matched "the walk-forward/PBO analysis" was wrong on every count --
-# see docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md. In short:
-#   - No walk-forward/PBO run has ever covered ADA or XLM. Every such run in docs/experiments/
-#     stopped at BTC/ETH/PAXG. The walk-forward that exists tuned a PARAMETER (entry_lookback
-#     20 -> 40), it did not validate a set of assets.
-#   - keel-live.db rules 1-5 were seeded straight to `live` (promoted_at IS NULL), i.e. through
-#     the documented `rules seed --status live` bypass, not through the promotion gate.
-#   - Nothing has traded: trade_outcomes and signals are empty for every product, so with
-#     min_trades=100 no asset here could have earned promotion on evidence.
+# The 5 assets this sandbox trades. Keeping SOL/LTC/LINK off this list is the RIGHT call -- but
+# an earlier version of this comment gave reasons that were not true, so the reasons are restated
+# here. Full working: docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md.
 #
-# SOL/LTC/LINK are excluded because their turtle rules are still `candidate` and have never been
-# backtested -- NOT on compliance grounds, and NOT because anything about them failed. All three
-# were attested 2026-07-23 in the same batch as ADA/XLM (same attestor, same source) and ADMIT
-# `keel assets screen` against keel.db today, carrying MORE daily history (1827 bars) than PAXG
-# (456 native-USD bars, on the allowlist only via a documented screen_exceptions waiver).
-# Revisit this list once `keel rules backtest 21/23/25` has actually been run.
+# What that comment got RIGHT: these 5 are exactly the `paper`-status rules in keel.db
+# (10/11/12 BTC/ETH/PAXG + 22 XLM + 24 ADA), so "same as the paper-forward" was accurate.
+#
+# What it got WRONG: it also credited "the walk-forward/PBO analysis". No walk-forward or PBO run
+# has ever covered ADA or XLM -- every such run in docs/experiments/ stopped at BTC/ETH/PAXG, and
+# the walk-forward that exists tuned a PARAMETER (turtle_breakout.py:113, entry_lookback 20 -> 40),
+# it never validated a set of assets. And these 5 did not clear the promotion gate: keel-live.db
+# rules 1-5 carry promoted_at IS NULL, seeded straight to `live` through the bypass `rules seed`
+# warns about. (Rule 6, the BTC dca, IS promoted -- and has a filled live order and an open
+# position, so this deployment is NOT inert.)
+#
+# The real reason SOL/LTC/LINK stay off, measured 2026-08-07 by running the backtest nobody had
+# run -- `keel rules backtest` on a COPY of keel.db, candles 6 days stale, in-sample, one window:
+#   21 SOL   n=13  win 23.1%  expectancy -12.41   pf 0.26
+#   23 LTC   n= 5  win  0.0%  expectancy -13.09   pf 0.00
+#   25 LINK  n=15  win 20.0%  expectancy  -0.66   pf 0.63
+#   22 XLM   n= 8  win 37.5%  expectancy  +0.06   pf 11.44
+#   24 ADA   n= 6  win 50.0%  expectancy  +0.12   pf 5.52
+# All three excluded assets are negative-expectancy; LTC won none of 5. That is a real adverse
+# result, NOT a compliance one -- all three were attested 2026-07-23 alongside ADA/XLM under the
+# same governing source (KB source-86; LINK's is more carefully qualified, as a utility token),
+# all three ADMIT `keel assets screen`, and all three carry MORE daily history (1827 bars) than
+# PAXG (456 native-USD bars, on this list only via a documented screen_exceptions waiver).
+#
+# Read those numbers with the sample sizes in view: n=5..15 against min_trades=100. NONE of the
+# five -- included or excluded -- can clear the promotion gate on this evidence. The split is
+# directionally supported, not validated. Do not treat a positive expectancy here as a licence to
+# add an asset, and do not add SOL/LTC/LINK on the strength of their screen/attestation status.
 allowlist:
   - BTC
   - ETH
