@@ -26,6 +26,7 @@ import pytest
 
 import keel.cli as cli_module
 from keel.commands.admission import (
+    DEFAULT_MIN_QUOTE_24H_VOLUME,
     DEFAULT_PROPOSALS_DIR,
     DiscoverReport,
     ProposeView,
@@ -651,11 +652,11 @@ def test_build_discover_report_applies_default_volume_floor_matching_assets_disc
         p for p in cli_module.assets_discover.params if p.name == "min_volume_24h"
     )
     default_floor = Decimal(cli_option.default)
-    assert default_floor == Decimal("5000000")
+    assert default_floor == Decimal("1000000")
 
     config = _config(allowlist=[])
-    below = _venue_product("DOGE", volume="4999999")
-    above = _venue_product("SHIB", volume="5000001")
+    below = _venue_product("DOGE", volume="999999")
+    above = _venue_product("SHIB", volume="1000001")
 
     report = build_discover_report([below, above], config)
 
@@ -712,3 +713,32 @@ def test_render_discover_report_never_includes_probe_history_marker():
     text = "\n".join(lines).lower()
 
     assert "4yr?" not in text
+
+
+def test_every_discovery_floor_default_agrees():
+    """Three modules carry this default; a drift between them is silent and changes the sweep.
+
+    `cli.assets_discover`'s option, `admission.DEFAULT_MIN_QUOTE_24H_VOLUME` and
+    `screen.DiscoveryPolicy` each name a floor. The first two were already pinned to each other;
+    `DiscoveryPolicy` was not, so a caller constructing one directly (as `cli.assets_discover`
+    does) could silently use a different floor from `build_discover_report`.
+    """
+    from keel.compliance.screen import DiscoveryPolicy
+
+    cli_option = next(p for p in cli_module.assets_discover.params if p.name == "min_volume_24h")
+
+    assert Decimal(cli_option.default) == DEFAULT_MIN_QUOTE_24H_VOLUME
+    assert DiscoveryPolicy().min_quote_24h_volume == DEFAULT_MIN_QUOTE_24H_VOLUME
+
+
+def test_the_discovery_floor_matches_the_admission_liquidity_floor():
+    """Discovery should not hide assets the gate would admit.
+
+    The sweep's floor is a 24h snapshot and the gate's is a median over history -- different
+    statistics (which is why `--probe-liquidity` exists). Pinning the two NUMBERS equal keeps the
+    pre-filter from being stricter than the criterion it screens for: at the old 5x-higher floor,
+    FET sat at $2.94M/24h and never appeared, while measuring 4.8x the admission floor.
+    """
+    from keel.compliance.screen import ScreenPolicy
+
+    assert DEFAULT_MIN_QUOTE_24H_VOLUME == ScreenPolicy().min_median_daily_volume

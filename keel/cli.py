@@ -699,8 +699,11 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
 @assets_group.command("discover")
 @click.option("--quote", default=None, help="Settlement currency (default: config.quote_currency).")
 @click.option(
-    "--min-volume-24h", default="5000000", show_default=True,
-    help="Cheap pre-filter on the venue's reported 24h quote volume.",
+    "--min-volume-24h", default="1000000", show_default=True,
+    help="Cheap pre-filter on the venue's reported 24h quote volume. Bounds the request count; it "
+    "is NOT a liquidity criterion -- a 24h snapshot is a different statistic from the median the "
+    "gate applies, so use --probe-liquidity for that. Set equal to the admission floor so "
+    "discovery cannot be stricter than the criterion it screens for.",
 )
 @click.option("--limit", default=25, show_default=True, help="Show at most this many candidates.")
 @click.option(

@@ -66,7 +66,18 @@ DEFAULT_PROPOSALS_DIR = "~/keel/proposals"
 #: create the cycle `cli -> tui -> admission -> cli`. `test_build_discover_report_applies_
 #: default_volume_floor_matching_assets_discover` reads the CLI option's own default and asserts
 #: it equals this constant, so the two cannot silently drift apart.
-DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("5000000")
+#: Discovery's 24h-volume pre-filter, pinned EQUAL to `ScreenPolicy.min_median_daily_volume` so a
+#: sweep can never be stricter than the gate it feeds. It bounds how many products get probed; it
+#: is not a liquidity verdict (that is `--probe-liquidity`, which computes the gate's own median).
+#:
+#: Was 5,000,000 until 2026-08-08. At that floor the sweep returned 9 candidates and exactly one
+#: unsettled survivor; at a lower floor, seven more cleared BOTH mechanical gates -- FET among them
+#: at $2.94M/24h, i.e. invisible to the sweep while measuring 4.8x the admission floor. The floor,
+#: not the market, was the binding constraint on the candidate pipeline.
+#:
+#: `tests/commands/test_admission.py` pins this to the CLI option, to `DiscoveryPolicy`'s default
+#: and to the admission floor; all four move together or the suite fails.
+DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("1000000")
 
 
 # -- 2a. shortlist location (offline) ------------------------------------------------------------

@@ -362,7 +362,7 @@ class DiscoveryPolicy:
     """
 
     quote_currency: str = "USD"
-    min_quote_24h_volume: Decimal = Decimal("5000000")
+    min_quote_24h_volume: Decimal = Decimal("1000000")
 
 
 def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
