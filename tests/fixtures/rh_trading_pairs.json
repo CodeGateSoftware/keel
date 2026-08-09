@@ -6,10 +6,9 @@
       "symbol": "BTC-USD",
       "asset_code": "BTC",
       "quote_code": "USD",
-      "asset_increment": "0.00000001",
-      "quote_increment": "0.01",
-      "max_order_size": "10.00000000",
-      "min_order_amount": "1.00",
+      "asset_increment": 0.00000001,
+      "quote_increment": 0.01,
+      "max_order_size": 10.00000000,
       "status": "tradable",
       "is_api_tradable": true
     }

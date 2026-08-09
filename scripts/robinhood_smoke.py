@@ -17,6 +17,14 @@ This script closes 1-3 without placing an order and without risking a cent. It i
 NOT a conformance suite and NOT part of the shipped wheel -- it is an operator tool, run by hand
 when a credential exists, and its only output is a shape report.
 
+The first run of it (#217) settled all three: ten requests, zero 401s, every endpoint path
+correct, `fee_tier_status` corroborated key for key -- and four fixture shapes wrong, one of them
+a live defect that left every market preview unpriced. It also produced five false positives of
+its own, which `fixture_shape` below exists to prevent recurring. What it still cannot reach is
+the ORDER lifecycle: `rh_order_open.json`, `rh_order_filled.json` and `rh_order_canceled.json`
+describe objects that only exist once a real order has been placed, and this script refuses to
+place one. Those three fixtures remain unverified against the venue.
+
 ## Why it cannot place an order
 
 `_ReadOnly` wraps the transport's request method and raises on any method other than GET, so the
@@ -50,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +87,18 @@ PROBE_SYMBOL = "BTC-USD"
 #: before the first request turns the most likely operator error -- pasting the public key, or a
 #: PEM, or a hex string -- into a precise message instead of a 401.
 _SEED_B64_LEN = 44
+
+#: The keys `RobinhoodTransport._paginate` consumes and does not pass on.
+#:
+#: Every probe below is a paginated read, so every probe's response reaches this script already
+#: resolved into `{"results": [...]}` with the cursor stripped -- that is what `_paginate` is FOR.
+#: The committed fixtures, by contrast, are single RAW pages and still carry both keys. The first
+#: live run compared the two directly and reported `next` and `previous` `MISSING AT VENUE` on all
+#: five probes, on a run where the venue had sent both every time. That was this script's bug, not
+#: a finding, and it buried four real findings underneath ten lines of noise. A report that cries
+#: wolf on every run is worse than no report at all, so the fixture is normalized to the shape a
+#: probe can actually be compared against before anything is compared.
+_PAGINATION_ENVELOPE_KEYS = frozenset({"next", "previous"})
 
 
 class ReadOnlyViolation(RuntimeError):
@@ -137,6 +158,30 @@ def shape_of(value: Any) -> Any:
     if value is None:
         return "null"
     return type(value).__name__
+
+
+def fixture_shape(path: Path) -> Any:
+    """The shape of a committed fixture, as a PROBE could ever observe it.
+
+    Two normalizations, and both exist because a probe's response has already been through the
+    transport by the time this script sees it, while the fixture on disk has not:
+
+    1. **The pagination envelope is dropped.** `_paginate` resolves `next`/`previous` and hands
+       back `{"results": [...]}`, so comparing a post-pagination aggregate against a raw single
+       page reports both keys missing from a venue that sent them -- see
+       `_PAGINATION_ENVELOPE_KEYS`. Only a payload that actually has `results` is normalized: an
+       order object is left alone, so a genuine `next` field on some future endpoint would still
+       be compared rather than silently eaten.
+    2. **Numbers are decoded with `parse_float=Decimal`,** matching `RobinhoodTransport._request`
+       exactly. Since #217 the fixtures quote nothing that the venue sends unquoted, so a plain
+       `json.loads` here would type every money field `float` while the live side reports
+       `Decimal` -- one `TYPE DIFFERS` line per money field per probe, which is the same
+       cry-wolf failure as the envelope, one layer down.
+    """
+    payload = json.loads(path.read_text(), parse_float=Decimal)
+    if isinstance(payload, dict) and "results" in payload:
+        payload = {k: v for k, v in payload.items() if k not in _PAGINATION_ENVELOPE_KEYS}
+    return shape_of(payload)
 
 
 def compare_shapes(live: Any, fixture: Any, path: str = "") -> list[str]:
@@ -242,9 +287,7 @@ def report(results: dict[str, Any], as_json: bool) -> int:
             failures += 1
             continue
 
-        fixture_path = FIXTURES / fixture_name
-        fixture_shape = shape_of(json.loads(fixture_path.read_text()))
-        diffs = compare_shapes(result["shape"], fixture_shape)
+        diffs = compare_shapes(result["shape"], fixture_shape(FIXTURES / fixture_name))
         if not diffs:
             print(f"  shape matches {fixture_name}")
         else:

@@ -5,8 +5,12 @@
     {
       "symbol": "BTC-USD",
       "side": "ask",
-      "price": "65482.30",
-      "quantity": "0.1"
+      "quantity": 0.1,
+      "timestamp": "2026-08-09T12:00:00Z",
+      "fee_ratio": 0.0025,
+      "est_fee": 16.370575,
+      "ask": 65482.30,
+      "est_total_cost": 6564.600575
     }
   ]
 }

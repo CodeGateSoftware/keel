@@ -7,15 +7,15 @@
   "type": "limit",
   "state": "open",
   "average_price": null,
-  "filled_asset_quantity": "0",
+  "filled_asset_quantity": 0,
   "created_at": "2026-08-09T12:00:00.000000Z",
   "updated_at": "2026-08-09T12:00:00.000000Z",
-  "fee_charged": "0",
-  "estimated_fee_remaining": "0.16",
+  "fee_charged": 0,
+  "estimated_fee_remaining": 0.16,
   "executions": [],
   "limit_order_config": {
-    "asset_quantity": "0.1",
-    "limit_price": "64000.00",
+    "asset_quantity": 0.1,
+    "limit_price": 64000.00,
     "time_in_force": "gtc"
   }
 }

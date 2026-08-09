@@ -45,7 +45,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, OrderSpec, StopLimitGTC
@@ -77,8 +79,16 @@ _CAPABILITIES = BrokerCapabilities(
     # There is no resting-market-order variant to be confused with. The port kind that WOULD be a
     # lie is the quote-sized one, and it is not declared.
     supported_orders=frozenset({"market_ioc_base", "limit_gtc", "stop_limit_gtc"}),
-    # No preview endpoint exists on this API, so every Preview this adapter returns is a number
-    # it computed itself and must label `synthetic=True`.
+    # No preview endpoint exists on this API, so every Preview this adapter returns must label
+    # itself `synthetic=True`.
+    #
+    # `/estimated_price/` is NOT a counter-example, and the first live run (#217) is why this
+    # comment now says so explicitly: that endpoint hands back `est_fee` and `est_total_cost`,
+    # which look exactly like a broker's own quote and are not one. It prices a QUANTITY. It does
+    # not validate the order, check buying power, check this account's own size bounds, or reserve
+    # anything -- an order it prices happily can be rejected the instant it is placed. Reading the
+    # venue's numbers instead of deriving our own makes a preview more ACCURATE; it does not make
+    # it a quote, and `Preview.synthetic` is the field that carries exactly that difference.
     supports_native_preview=False,
     synthesizes_preview=True,
     supports_fee_summary=True,
@@ -99,6 +109,55 @@ _NO_CANDLES = (
     "(only best_bid_ask and estimated_price), so no granularity can be served -- this venue is "
     "an execution venue for keel, and candle data must come from another source"
 )
+
+#: How far `est_total_cost` may sit from a candidate relation and still be taken as satisfying it,
+#: as an absolute floor and as a fraction of the notional (one cent, or one basis point, whichever
+#: is larger).
+#:
+#: A tolerance is required rather than fastidious: the venue rounds its own `est_fee` and
+#: `est_total_cost` to some undisclosed precision, so `price * quantity + est_fee` computed here
+#: at full `Decimal` precision will routinely miss the venue's rounded total by sub-cent amounts.
+#: Demanding exact equality would report every healthy response as unreconciled, and a check that
+#: fires on every run is a check nobody reads (see #217 F5 for what that costs).
+#:
+#: It is bounded in the other direction by what it must still catch: the readings it discriminates
+#: between differ by a whole `est_fee`, which at this venue's ~25bp taker rate is 25x a one-basis-
+#: point tolerance. A fee small enough to hide inside the tolerance is a fee too small to
+#: materially mis-state the order either way.
+_TOTAL_TOLERANCE_ABS = Decimal("0.01")
+_TOTAL_TOLERANCE_RATIO = Decimal("0.0001")
+
+
+@dataclass(frozen=True)
+class _VenueEstimate:
+    """One `/estimated_price/` row, reconciled into the terms `Preview` is defined in.
+
+    This exists because the endpoint answers with four related numbers (`ask`/`bid`, `quantity`,
+    `est_fee`, `est_total_cost`) and `Preview` has two slots for them, under a convention the port
+    fixes and the venue does not share: `est_quote_size` excludes the fee, and `est_fee` sits
+    beside it. Returning a bare `Decimal` price, as this used to, threw away the venue's own
+    statement of the fee and total and forced `preview_order` to re-derive both -- which is how a
+    preview ends up asserting arithmetic the venue never agreed to.
+
+    `errors` rides along rather than being raised: every one of them is a soft failure that still
+    leaves a usable (if less certain) estimate, and this runs on a path the executor uses while
+    unwinding a position, where a raise can trap it. `preview_order` folds them into
+    `Preview.errors`, which is the field the port defines for exactly this.
+    """
+
+    #: The unit price from the column named after the requested side. Never from `price`, which
+    #: this venue does not send (#217 F1).
+    price: Decimal
+    #: Fee-EXCLUSIVE notional, in quote currency. This is what `Preview.est_quote_size` means:
+    #: the limit path fills it with `base_size * limit_price`, and `est_fee` is a separate field.
+    quote_size: Decimal
+    #: The venue's own `est_fee`, or `None` when it did not state a usable one for this size.
+    fee: Decimal | None
+    #: The venue's own per-order `fee_ratio`, for `detail` only -- `fee` is never derived from it.
+    fee_ratio: Decimal | None
+    #: How `quote_size` was arrived at, verbatim into `Preview.detail["cost_basis"]`.
+    cost_basis: str
+    errors: tuple[str, ...]
 
 
 class RobinhoodAdapter:
@@ -236,11 +295,16 @@ class RobinhoodAdapter:
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Synthesise a preview. Always `synthetic=True` -- there is no preview endpoint here.
 
-        Coinbase answers `preview_order` with its own quote, so approving it is approving the
-        venue's arithmetic. Robinhood answers nothing, so every number below is this adapter's
-        arithmetic, and `Preview`'s docstring is explicit that "approving an estimate must never
-        look identical to approving a broker's own quote". `synthetic=True` is what carries that
-        distinction to whatever renders the confirm gate.
+        ⚠️ **`/estimated_price/` is not a preview and this method must never present it as one.**
+        It prices a QUANTITY on one side of the book. It does not validate the order, does not
+        check buying power, does not check this account's own size or increment bounds, and
+        reserves nothing -- an order it prices happily can be rejected the instant it is placed.
+        Coinbase's `preview_order` is a broker quote, so approving one is approving the venue's
+        arithmetic about THIS order; approving a Robinhood preview is approving an estimate that
+        the venue has never been asked to stand behind. `Preview`'s own docstring requires those
+        two never to look identical, and `synthetic=True` (with `supports_native_preview=False`)
+        is the field that carries the difference. Reading more of the venue's numbers, as this
+        method now does, makes the estimate more accurate and changes nothing about that.
 
         The three fields, and how firm each one actually is:
 
@@ -249,63 +313,97 @@ class RobinhoodAdapter:
         * `est_quote_size` for `limit_gtc`/`stop_limit_gtc` is `base_size * limit_price`. That is
           a BOUND, not a prediction: a limit order does not trade worse than its limit, so this
           is the most quote currency a sell can realise or the most a buy can spend. For
-          `market_ioc_base` there is no bound to quote, so it comes from `estimated_price` and
+          `market_ioc_base` there is no bound to quote, so it comes from `/estimated_price/` and
           is a genuine guess that the fill can and will miss.
-        * `est_fee` is `est_quote_size * fee_tier_status.fee_ratio`. When the account reports no
-          ratio it is `Decimal("0")` and `detail["fee_ratio"]` reads `"unknown"` -- a made-up
-          rate would be worse than a visible zero, because a plausible-looking fee is one nobody
-          checks. `detail["price_basis"]` names which of the two paths above produced the quote
-          size, so the reader can tell a bound from a guess without inferring it from the kind.
+        * `est_fee` is the venue's own `est_fee` when the response carries one, and only
+          otherwise `est_quote_size * fee_tier_status.fee_ratio`. Deriving a fee we were handed
+          would reproduce a number the response already contains, from an ACCOUNT-level rate
+          rather than the rate quoted against this order, and the two can disagree. When the
+          account reports no ratio either, `est_fee` is `Decimal("0")` and `detail["fee_ratio"]`
+          reads `"unknown"` -- a made-up rate would be worse than a visible zero, because a
+          plausible-looking fee is one nobody checks.
+
+        `detail` names every basis rather than leaving it to be inferred: `price_basis` (which
+        endpoint or field the unit price came from), `cost_basis` (how `est_quote_size` was
+        arrived at, including which reading of `est_total_cost` the venue's numbers supported),
+        and `fee_basis` (venue-stated vs account-derived).
 
         **Every path that could not price the order populates `errors`.** A zero from a failed
         `estimated_price` lookup, or a zero fee from a missing ratio, renders at the confirm gate
         as an order that costs nothing -- which is the single most approvable thing a preview can
         look like, and is indistinguishable from a genuinely free order unless the preview says
         otherwise. `detail` is free-form text a renderer may not show; `errors` is the field the
-        port defines for a soft failure, so an unpriced leg has to appear there.
+        port defines for a soft failure, so an unpriced leg has to appear there. The same applies
+        to a partially-understood one: an `est_total_cost` that reconciles with nothing is not a
+        pricing failure, but it is not a number to put in front of a human unqualified either.
 
         **The symbol is validated on every path, including the resting-order ones.** They price
         off `spec.limit_price` and have no other reason to call `to_symbol`, which is exactly how
         `ETH-USDC` used to preview cleanly and then raise `UnsupportedOrder` at placement -- after
         the human had already approved it, and with the port forbidding a caller from catching
         that and retrying. A preview must never approve what placement will refuse.
+
+        `GET /accounts/` is fetched only when it is actually needed -- that is, when the venue did
+        not state the fee itself. On the market path against a healthy response it is now not
+        fetched at all, which halves this method's request count on the one path the executor
+        calls while unwinding a position.
         """
         self._reject_unsupported(spec)
         to_symbol(spec.product_id)
         base_size = self._base_size(spec)
 
         errors: list[str] = []
+        estimate: _VenueEstimate | None = None
         if isinstance(spec, LimitGTC | StopLimitGTC):
-            price, basis = spec.limit_price, "limit_price"
+            price = spec.limit_price
+            quote_size = base_size * price
+            price_basis, cost_basis = "limit_price", "base_size_x_limit_price"
         else:
-            basis = "estimated_price"
-            estimated = self._estimated_price(spec)
-            if estimated is None:
+            price_basis = "estimated_price"
+            estimate = self._estimated_price(spec)
+            if estimate is None:
                 price = Decimal("0")
+                quote_size = Decimal("0")
+                cost_basis = "unpriced"
                 errors.append(
                     "robinhood returned no usable estimated price for this order; "
                     "est_quote_size and est_fee are NOT priced and must not be read as a cost"
                 )
             else:
-                price = estimated
+                price = estimate.price
+                quote_size = estimate.quote_size
+                cost_basis = estimate.cost_basis
+                errors.extend(estimate.errors)
 
-        quote_size = base_size * price
-        ratio = self._fee_ratio(self._account())
-        if ratio is None:
-            errors.append(
-                "robinhood reported no fee_tier_status.fee_ratio for this account; est_fee is "
-                "zero because the rate is UNKNOWN, not because this order trades free"
-            )
+        ratio: Decimal | None
+        if estimate is not None and estimate.fee is not None:
+            fee, fee_basis, ratio = estimate.fee, "venue_est_fee", estimate.fee_ratio
+        else:
+            fee_basis = "account_fee_ratio"
+            ratio = self._fee_ratio(self._account())
+            if ratio is None:
+                errors.append(
+                    "robinhood reported no fee_tier_status.fee_ratio for this account; est_fee is "
+                    "zero because the rate is UNKNOWN, not because this order trades free"
+                )
+                fee = Decimal("0")
+            else:
+                fee = quote_size * ratio
+
         return Preview(
             product_id=spec.product_id,
             side=spec.side,
             est_base_size=base_size,
             est_quote_size=quote_size,
-            est_fee=quote_size * ratio if ratio is not None else Decimal("0"),
+            est_fee=fee,
             synthetic=True,
             detail={
-                "price_basis": basis,
-                "price": str(price),
+                "price_basis": price_basis,
+                # `_render`, not `str`: `str(Decimal("1E-8"))` is `"1E-8"`, and this string is
+                # rendered to a human deciding whether to spend money.
+                "price": _render(price),
+                "cost_basis": cost_basis,
+                "fee_basis": fee_basis,
                 "fee_ratio": str(ratio) if ratio is not None else "unknown",
             },
             errors=tuple(errors),
@@ -323,13 +421,41 @@ class RobinhoodAdapter:
             return spec.base_size
         raise UnsupportedOrder(f"robinhood cannot size order kind {spec.kind!r} in base units")
 
-    def _estimated_price(self, spec: OrderSpec) -> Decimal | None:
-        """Robinhood's estimated price for this size, or `None` when it reports no usable one.
+    def _estimated_price(self, spec: OrderSpec) -> _VenueEstimate | None:
+        """Everything `GET /estimated_price/` states about this order, or `None` if it states no
+        usable price.
 
-        `side` is translated, not passed through: this endpoint answers in book terms
-        (`bid`/`ask`), not order terms (`buy`/`sell`), and a buyer is filled from the ASK. Asking
-        for the wrong side of the spread would understate the cost of every buy preview -- which
-        is exactly the direction of error a human at a confirm gate is least likely to catch.
+        ⚠️ **The unit price is read from the column named after the side that was ASKED for --
+        `ask` for a buy, `bid` for a sell -- and never from `price`.** The venue sends no `price`
+        field. This method read one for the whole life of the package, on the strength of the
+        documentation, and the first live run against a real credential (#217 F1) proved every
+        single market preview came back `est_quote_size = 0.000` with `errors` populated: confirm
+        mode was unusable against this venue. The observed row is::
+
+            {'symbol', 'side', 'quantity', 'timestamp',
+             'fee_ratio', 'est_fee', 'ask', 'est_total_cost'}
+
+        There is deliberately NO fallback to the other side's column. If a sell is answered with
+        only an `ask`, pricing it off that ask overstates the proceeds of an exit -- the exact
+        optimistic direction `to_price_side` exists to prevent -- so a row that does not carry the
+        requested side is treated as unpriced instead. Silence is recoverable; a flattering number
+        at a confirm gate is not.
+
+        **The venue's own `est_fee` and `est_total_cost` are read rather than derived**, but only
+        after checking they describe the order that was asked about. Two checks, both of which
+        can only be made because the venue sends four related numbers:
+
+        1. `quantity` must be the size that was requested. If the venue echoes a different one,
+           its `est_fee` and `est_total_cost` are answers about a different order; scaling them
+           would be precisely the "estimate that moves between the quote and the fill" this
+           package refuses everywhere else, so only the unit price is used and `errors` says so.
+        2. `est_total_cost` must reconcile with `price * quantity`, either exactly (fee-exclusive)
+           or offset by `est_fee` in one direction or the other. Nothing in Robinhood's
+           documentation settles which of those it is, and #217 could not settle it either, so
+           nothing here assumes: `_reconcile_total` reads it off the numbers in each response.
+           A total that fits none of the three is reported through `errors` rather than quietly
+           priced -- see `_reconcile_total` for why all three readings recover the same
+           fee-exclusive notional, and why that is the number `Preview.est_quote_size` wants.
 
         **`None`, never `Decimal("0")`.** This used to answer zero for "no rows", "unparseable
         price", and "the venue really did quote zero" alike, and `preview_order` had no way to
@@ -337,25 +463,56 @@ class RobinhoodAdapter:
         costs nothing. That is not a visible nonsense; it is the most approvable thing a preview
         can display. `None` forces the caller to decide, and `preview_order` turns it into a
         populated `Preview.errors` rather than a silent zero. A quoted price of zero is treated
-        as unusable for the same reason: nothing on this venue costs nothing.
+        as unusable for the same reason: nothing on this venue costs nothing. #217 is what proved
+        that fix load-bearing rather than theoretical -- it is the only reason a completely
+        unpriced preview was survivable at all.
 
         `quantity` renders through `translate._render`, not `str()` -- `str(Decimal("1E-8"))` is
         `"1E-8"`, and this value goes on a query string the signature is computed over, so an
         exponent here is both a malformed request and a signature mismatch.
         """
+        base_size = self._base_size(spec)
+        side = to_price_side(spec.side)
         response = self._require_transport().get_estimated_price(
-            symbol=to_symbol(spec.product_id),
-            side=to_price_side(spec.side),
-            quantity=_render(self._base_size(spec)),
+            symbol=to_symbol(spec.product_id), side=side, quantity=_render(base_size)
         )
         rows = _results(response)
         if not rows:
             return None
-        try:
-            price = Decimal(str(_field(rows[0], "price", "0") or "0"))
-        except (InvalidOperation, ValueError):
+        row = rows[0]
+
+        price = _decimal_or_none(_field(row, side))
+        if price is None or price <= 0:
             return None
-        return price if price > 0 else None
+
+        quantity = _decimal_or_none(_field(row, "quantity"))
+        if quantity is None or quantity != base_size:
+            quoted = "no quantity" if quantity is None else f"quantity {_render(quantity)}"
+            return _VenueEstimate(
+                price=price,
+                quote_size=price * base_size,
+                fee=None,
+                fee_ratio=None,
+                cost_basis="price_x_base_size",
+                errors=(
+                    f"robinhood's estimated_price row carries {quoted} for a requested size of "
+                    f"{_render(base_size)}; its est_fee and est_total_cost describe a different "
+                    f"order and are NOT used -- est_quote_size is price x the requested size",
+                ),
+            )
+
+        fee = _positive_or_none(_decimal_or_none(_field(row, "est_fee")), allow_zero=True)
+        ratio = _positive_or_none(_decimal_or_none(_field(row, "fee_ratio")), allow_zero=True)
+        total = _positive_or_none(_decimal_or_none(_field(row, "est_total_cost")))
+        quote_size, cost_basis, errors = _reconcile_total(price * quantity, total, fee)
+        return _VenueEstimate(
+            price=price,
+            quote_size=quote_size,
+            fee=fee,
+            fee_ratio=ratio,
+            cost_basis=cost_basis,
+            errors=errors,
+        )
 
     def place_order(self, spec: OrderSpec) -> PlaceResult:
         """Place a live order. A fresh `client_order_id` per call; the returned `state` is read.
@@ -560,6 +717,95 @@ _REJECTED_PLACEMENT_STATES: frozenset[str] = frozenset({"failed", "canceled"})
 #: only in `translate.STATE_TO_PORT_STATUS`, and reading the port's spelling here would silently
 #: never match, turning every confirmed cancel into a `False`.
 _CANCELED = "canceled"
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    """Parse one JSON leaf as a `Decimal`, or `None` if it is absent or not a number.
+
+    `Decimal(str(value))` handles both shapes this venue produces without a branch: since #194 the
+    transport decodes with `parse_float=Decimal`, so an unquoted `65482.30` already arrives as a
+    `Decimal` (and `str()` of one round-trips exactly), while a quoted `"65482.30"` arrives as a
+    `str`. #217 confirmed the venue sends the unquoted form for every money field, but a `str`
+    remains possible on any field and costs nothing to accept.
+
+    `None` rather than a zero default, everywhere. A zero here would flow into a preview as a real
+    price, a real fee, or a real cost, and this whole module is built on the principle that an
+    absent number and a zero number must never be the same value.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _positive_or_none(value: Decimal | None, *, allow_zero: bool = False) -> Decimal | None:
+    """Drop a value the venue cannot have meant. A negative fee or a zero total is not data."""
+    if value is None:
+        return None
+    if value < 0 or (value == 0 and not allow_zero):
+        return None
+    return value
+
+
+def _reconcile_total(
+    notional: Decimal, total: Decimal | None, fee: Decimal | None
+) -> tuple[Decimal, str, tuple[str, ...]]:
+    """Work out what `est_total_cost` MEANS from the venue's own numbers, rather than assuming.
+
+    Robinhood's documentation does not say whether `est_total_cost` includes `est_fee`, and the
+    live run behind #217 did not settle it either -- so this does not choose. The response states
+    `price`, `quantity`, `est_fee` and `est_total_cost`, which is one equation with one unknown,
+    and exactly one of three readings fits any self-consistent response:
+
+    ============================ ===================================== ======================
+    reading                      relation                              fee-exclusive notional
+    ============================ ===================================== ======================
+    ``est_total_cost``           ``total == notional``                 ``total``
+    ``est_total_cost_less_...``  ``total == notional + fee``           ``total - fee``
+    ``est_total_cost_plus_...``  ``total == notional - fee``           ``total + fee``
+    ============================ ===================================== ======================
+
+    The third is not padding. A BUY's "total cost" plausibly adds the fee while a SELL's plausibly
+    nets it out of the proceeds, and this endpoint answers both sides -- and #217 observed only
+    the `ask` side, so the sell convention is genuinely unknown.
+
+    All three recover the same fee-exclusive notional, which is the number `Preview.est_quote_size`
+    is defined to carry (the limit path fills it with `base_size * limit_price`, and `est_fee` is
+    a separate field beside it). Assigning a fee-INCLUSIVE `est_total_cost` straight into
+    `est_quote_size` would double-count the fee at the confirm gate: once inside the quote size and
+    once in `est_fee`. The venue's own arithmetic is still what is returned -- `total`, `total -
+    fee`, `total + fee` -- rather than the locally multiplied `notional`, so whatever precision or
+    rounding Robinhood applied survives.
+
+    **A total fitting none of the three returns it unchanged AND an error.** That combination is
+    the point: refusing to price would degrade an exit preview over a number that is probably
+    right, while pricing it silently would put a cost in front of a human with an unverified
+    relationship to the order they are approving. The port has a field for exactly this middle
+    case, and it is `Preview.errors`.
+    """
+    if total is None:
+        return notional, "price_x_quantity", ()
+
+    tolerance = max(_TOTAL_TOLERANCE_ABS, abs(notional) * _TOTAL_TOLERANCE_RATIO)
+    if abs(total - notional) <= tolerance:
+        return total, "est_total_cost", ()
+    if fee is not None:
+        if abs(total - (notional + fee)) <= tolerance:
+            return total - fee, "est_total_cost_less_est_fee", ()
+        if abs(total - (notional - fee)) <= tolerance:
+            return total + fee, "est_total_cost_plus_est_fee", ()
+    return (
+        total,
+        "est_total_cost_unreconciled",
+        (
+            f"robinhood's est_total_cost ({total}) matches neither price x quantity "
+            f"({notional}) nor that notional offset by est_fee ({fee}); est_quote_size is the "
+            f"venue's est_total_cost exactly as sent, and whether it already includes the fee "
+            f"is UNVERIFIED -- do not read est_quote_size + est_fee as this order's total",
+        ),
+    )
 
 
 def _confirms_cancel(order: object, order_id: str) -> bool:

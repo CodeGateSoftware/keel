@@ -26,8 +26,20 @@ FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
 
 def load_fixture(name: str) -> dict[str, Any]:
+    """Decode a fixture the way `RobinhoodTransport._request` decodes a live response.
+
+    `parse_float=Decimal` is not a stylistic flourish here, it is the whole point of the fixture.
+    The first live run against a real credential (#217) established that **every money value on
+    this venue arrives as an UNQUOTED JSON number** -- `"ask": 65482.30`, not `"ask": "65482.30"`
+    -- and the transport parses those with `parse_float=Decimal` precisely so the original digits
+    reach the adapter instead of whatever a binary `float` rounded them to. A fixture decoded with
+    a plain `json.load` would hand the adapter `float`s the live path can never produce, so the
+    suite would be exercising a code path that does not exist in production and leaving the one
+    that does untested. It also silently weakens equality assertions: `Decimal(0.00000001)` is
+    `1.00000000000000002092256083497e-8`, which is not `Decimal("0.00000001")`.
+    """
     with (FIXTURES_DIR / name).open() as f:
-        data: dict[str, Any] = json.load(f)
+        data: dict[str, Any] = json.load(f, parse_float=Decimal)
     return data
 
 
@@ -271,16 +283,239 @@ def test_preview_order_market_ioc_base_prices_off_the_estimated_price_endpoint()
         estimated_price=load_fixture("rh_estimated_price.json"),
     )
     adapter = RobinhoodAdapter(transport)
-    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
 
     preview = adapter.preview_order(spec)
 
-    price = Decimal(load_fixture("rh_estimated_price.json")["results"][0]["price"])
+    price = Decimal(load_fixture("rh_estimated_price.json")["results"][0]["ask"])
     assert preview.synthetic is True
     assert preview.est_base_size == Decimal("0.1")
     assert preview.est_quote_size == Decimal("0.1") * price
     assert preview.detail["price_basis"] == "estimated_price"
     assert transport.calls["get_estimated_price"]["symbol"] == "BTC-USD"
+
+
+def test_preview_order_reads_the_ask_column_because_the_venue_sends_no_price_field() -> None:
+    """The #217 F1 blocker, pinned as a test: the row has no `price` key at all.
+
+    `_estimated_price` read `_field(rows[0], "price", "0")`, which the documentation supported and
+    the venue does not. The first live run proved every market preview came back
+    `est_quote_size = 0.000` with `errors` populated -- confirm mode was unusable against this
+    venue, and the only reason it was survivable is the #194 S1 change that turned an unpriced
+    lookup into `None` rather than a silent `Decimal("0")`.
+
+    Asserting the fixture carries no `price` key is deliberate. Without it, someone could
+    "fix" this by reading `price` with an `ask` fallback, the fixture would keep both keys, and
+    the suite would go on passing against a shape the venue never sends.
+    """
+    row = load_fixture("rh_estimated_price.json")["results"][0]
+    assert "price" not in row, "the venue sends no 'price' on estimated_price -- see #217 F1"
+    assert "ask" in row
+
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.errors == (), "a fully-priced venue response must not report a pricing failure"
+    assert preview.est_quote_size == Decimal("0.1") * Decimal(row["ask"])
+
+
+def test_preview_order_reads_the_column_named_after_the_side_it_asked_for() -> None:
+    """A SELL is priced from `bid` and a BUY from `ask` -- never whichever column happens to
+    be present.
+
+    The endpoint is asked for one side (`to_price_side`: buy -> ask, sell -> bid) and names the
+    price column after it. Falling back to the *other* column when the requested one is absent
+    would price a sell off the ask, overstating the proceeds of every exit -- the optimistic
+    direction `to_price_side`'s docstring exists to prevent, and the one a human at a confirm gate
+    is least likely to catch. So a row carrying only the wrong side is treated as UNPRICED.
+    """
+    ask_only = load_fixture("rh_estimated_price.json")
+    bid_row = dict(ask_only["results"][0])
+    bid_row["side"] = "bid"
+    bid_row["bid"] = bid_row.pop("ask")
+    accounts = load_fixture("rh_accounts.json")
+
+    sell = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+    priced = RobinhoodAdapter(
+        FakeTransport(accounts=accounts, estimated_price={"results": [bid_row]})
+    ).preview_order(sell)
+    assert priced.errors == ()
+    assert priced.est_quote_size == Decimal("0.1") * Decimal(bid_row["bid"])
+
+    unpriced = RobinhoodAdapter(
+        FakeTransport(accounts=accounts, estimated_price=ask_only)
+    ).preview_order(sell)
+    assert unpriced.errors, "a sell priced off an ask-only row must not be reported as priced"
+
+
+def test_preview_order_takes_the_fee_from_the_venue_rather_than_deriving_it() -> None:
+    """`est_fee` comes back on the row, so deriving one from the account's tier is second-hand.
+
+    The venue states the fee it will charge for THIS quantity on THIS side. Multiplying our own
+    notional by `fee_tier_status.fee_ratio` reproduces a number the response already contains, and
+    the two can disagree -- the account tier is an account-level rate, while the row's `fee_ratio`
+    is the one quoted against this order. When the venue states it, the venue wins, and
+    `detail["fee_basis"]` records which of the two was used so a reader never has to guess.
+    """
+    row = load_fixture("rh_estimated_price.json")["results"][0]
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.est_fee == Decimal(row["est_fee"])
+    assert preview.detail["fee_basis"] == "venue_est_fee"
+    assert preview.detail["fee_ratio"] == str(Decimal(row["fee_ratio"]))
+
+
+def test_preview_order_splits_a_fee_inclusive_est_total_cost_back_out() -> None:
+    """`est_total_cost` is reconciled against the venue's own numbers, not assumed either way.
+
+    `Preview` carries `est_quote_size` and `est_fee` as SEPARATE fields, and the limit path fills
+    `est_quote_size` with `base_size * limit_price` -- a notional that excludes the fee. So a
+    fee-INCLUSIVE `est_total_cost` assigned straight into `est_quote_size` would double-count the
+    fee at the confirm gate (once inside the quote size, once in `est_fee`).
+
+    Nobody can settle from the documentation which of the two `est_total_cost` is, so nothing here
+    assumes: the row carries `ask`, `quantity`, `est_fee` and `est_total_cost`, which is one
+    equation with a single unknown. The committed fixture encodes the fee-INCLUSIVE reading
+    (`est_total_cost == ask * quantity + est_fee`), and if a future live run contradicts that, the
+    adapter reconciles the response it actually received instead of quietly mispricing it.
+    """
+    row = load_fixture("rh_estimated_price.json")["results"][0]
+    notional = Decimal(row["ask"]) * Decimal(row["quantity"])
+    assert Decimal(row["est_total_cost"]) == notional + Decimal(row["est_fee"]), (
+        "the committed fixture must encode a self-consistent fee-inclusive total, so a live run "
+        "that disagrees falsifies it"
+    )
+
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.est_quote_size == notional
+    assert preview.est_quote_size + preview.est_fee == Decimal(row["est_total_cost"])
+    assert preview.detail["cost_basis"] == "est_total_cost_less_est_fee"
+
+
+def test_preview_order_accepts_a_fee_exclusive_est_total_cost_unchanged() -> None:
+    """The other reading of the same field, and the adapter must not force one onto the other.
+
+    If `est_total_cost` turns out to be the fee-EXCLUSIVE notional, subtracting `est_fee` from it
+    would understate the order by exactly one fee. The reconciliation is what tells the two apart,
+    and `detail["cost_basis"]` reports which relation the venue's own numbers satisfied.
+    """
+    fixture = load_fixture("rh_estimated_price.json")
+    row = dict(fixture["results"][0])
+    row["est_total_cost"] = Decimal(row["ask"]) * Decimal(row["quantity"])
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.errors == ()
+    assert preview.est_quote_size == row["est_total_cost"]
+    assert preview.detail["cost_basis"] == "est_total_cost"
+
+
+def test_preview_order_reports_a_total_that_reconciles_with_nothing() -> None:
+    """A total matching neither the notional nor the notional +/- the fee is not understood.
+
+    This is the case that must never pass silently: the adapter has four numbers from the venue
+    and no interpretation of `est_total_cost` that fits them. Rendering that as an ordinary
+    preview would put a cost in front of a human with an unverified relationship to the order.
+    `Preview.errors` is the port's channel for a soft failure, so the unreconciled total surfaces
+    there rather than in `detail`, which a renderer is free not to show.
+    """
+    fixture = load_fixture("rh_estimated_price.json")
+    row = dict(fixture["results"][0])
+    row["est_total_cost"] = Decimal("9999.99")
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.errors
+    assert any("est_total_cost" in error for error in preview.errors)
+    assert preview.est_quote_size == Decimal("9999.99")
+    assert preview.detail["cost_basis"] == "est_total_cost_unreconciled"
+
+
+def test_preview_order_falls_back_to_price_times_quantity_without_a_total() -> None:
+    """No `est_total_cost` on the row is not a failure -- the price and the size still price it."""
+    fixture = load_fixture("rh_estimated_price.json")
+    row = {k: v for k, v in fixture["results"][0].items() if k != "est_total_cost"}
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.errors == ()
+    assert preview.est_quote_size == Decimal("0.1") * Decimal(row["ask"])
+    assert preview.detail["cost_basis"] == "price_x_quantity"
+
+
+def test_preview_order_refuses_venue_totals_quoted_for_a_different_quantity() -> None:
+    """`est_fee` and `est_total_cost` describe the quantity the VENUE echoed, not ours.
+
+    If the echoed `quantity` is not the size that was asked for, the row's totals are answers to a
+    different question and must not be read as this order's cost -- scaling them would be exactly
+    the "estimate that moves between the quote and the fill" this package refuses everywhere else.
+    The unit price still prices the order, so the preview degrades to `price * base_size` and says
+    why, rather than failing outright on an EXIT path.
+    """
+    fixture = load_fixture("rh_estimated_price.json")
+    row = dict(fixture["results"][0])
+    row["quantity"] = Decimal("0.001")
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    preview = RobinhoodAdapter(transport).preview_order(spec)
+
+    assert preview.est_quote_size == Decimal("0.1") * Decimal(row["ask"])
+    assert preview.detail["cost_basis"] == "price_x_base_size"
+    assert preview.detail["fee_basis"] == "account_fee_ratio"
+    assert any("quantity" in error for error in preview.errors)
+
+
+def test_preview_order_is_never_a_native_preview_however_much_the_venue_states() -> None:
+    """Reading the venue's own `est_fee`/`est_total_cost` does NOT make this a broker quote.
+
+    `/estimated_price/` prices a QUANTITY. It does not validate the order, check buying power,
+    check the venue's own size bounds, or reserve anything -- an order this endpoint prices
+    happily can still be rejected the instant it is placed. That gap is exactly what
+    `Preview.synthetic` exists to carry, so it stays `True` and `supports_native_preview` stays
+    `False` no matter how many of the numbers came from the venue.
+    """
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+    )
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+
+    assert adapter.capabilities().supports_native_preview is False
+    assert adapter.preview_order(spec).synthetic is True
 
 
 def test_place_order_market_ioc_base_sends_asset_quantity_and_no_time_in_force() -> None:
@@ -669,7 +904,7 @@ def test_preview_order_on_a_fully_priced_order_reports_no_errors() -> None:
         estimated_price=load_fixture("rh_estimated_price.json"),
     )
     adapter = RobinhoodAdapter(transport)
-    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
 
     assert adapter.preview_order(spec).errors == ()
 
@@ -749,3 +984,97 @@ def test_place_order_returns_a_domain_type() -> None:
     result = adapter.place_order(spec)
 
     assert isinstance(result, PlaceResult)
+
+
+# ---------------------------------------------------------------------------------------------
+# The fixtures themselves, held to the shapes the first live run actually observed (#217).
+#
+# These assert on `tests/fixtures/rh_*.json` rather than on adapter behaviour, which is unusual
+# and deliberate. Robinhood ships no sandbox, so a fixture is the ONLY statement this repository
+# makes about what the venue sends -- and #217 found three of them stating things it does not:
+# an `estimated_price.price` that made every market preview unpriced, a `trading_pairs`
+# minimum-order field that does not exist, and a `best_bid_ask` row that was invented outright.
+# A wrong fixture is not a test-data nit here; it is a false claim about a live-money venue that
+# the rest of the suite then confirms.
+# ---------------------------------------------------------------------------------------------
+
+#: Every fixture field whose value the venue sends as an unquoted JSON number, per the #217 live
+#: run. Keyed by fixture file; the paths are `results[]`-relative for the paginated reads and
+#: top-level for the order objects.
+_NUMERIC_FIELDS: dict[str, tuple[str, ...]] = {
+    "rh_accounts.json": ("buying_power",),
+    "rh_holdings.json": ("total_quantity", "quantity_available_for_trading"),
+    "rh_trading_pairs.json": ("asset_increment", "quote_increment", "max_order_size"),
+    "rh_best_bid_ask.json": ("bid", "ask"),
+    "rh_estimated_price.json": ("quantity", "fee_ratio", "est_fee", "ask", "est_total_cost"),
+}
+
+
+@pytest.mark.parametrize(("fixture_name", "fields"), sorted(_NUMERIC_FIELDS.items()))
+def test_money_and_size_fixtures_are_unquoted_json_numbers(
+    fixture_name: str, fields: tuple[str, ...]
+) -> None:
+    """Every money value arrives from this venue UNQUOTED, so every fixture must too.
+
+    This is what makes #194's `parse_float=Decimal` load-bearing rather than defensive: with the
+    values quoted, `Decimal(str(v))` operated on a `str` that was already exact and the parser
+    setting was never exercised. Unquoted, the same value is a JSON number, and any decoder that
+    is not told otherwise routes it through a binary `float` before a `Decimal` ever sees it.
+
+    The assertion is on the DECODED type, not on the file's bytes, because that is the property
+    the adapter depends on -- and it fails loudly if `load_fixture` ever loses its `parse_float`.
+    """
+    rows = load_fixture(fixture_name)["results"]
+    assert rows
+    for field_name in fields:
+        value = rows[0][field_name]
+        assert isinstance(value, Decimal), f"{fixture_name}:{field_name} decoded as {type(value)}"
+
+
+def test_the_account_fee_tier_status_is_numeric_throughout() -> None:
+    """`fee_tier_status` is the shape #216 called the most load-bearing guess in the package; the
+    live run corroborated every key name and contradicted every value's quoting."""
+    tier = load_fixture("rh_accounts.json")["results"][0]["fee_tier_status"]
+    assert set(tier) == {
+        "fee_ratio",
+        "thirty_day_volume",
+        "next_fee_tier_ratio",
+        "next_fee_tier_threshold",
+    }
+    assert all(isinstance(value, Decimal) for value in tier.values())
+
+
+def test_trading_pairs_publishes_no_minimum_order_field() -> None:
+    """#217 F3: the venue sends neither `min_order_amount` nor `min_order_size`.
+
+    The fixture invented `min_order_amount`, and `transport.get_trading_pairs`' docstring named it
+    as an input for the pre-flight sizing check proposed in #198. There is no source for a minimum
+    on this endpoint, so that half of the check has no basis -- `asset_increment`/`quote_increment`
+    rounding and `max_order_size` remain, a minimum does not. Keeping the invented key would let
+    that follow-up be written against a field that will simply be absent at runtime.
+    """
+    pair = load_fixture("rh_trading_pairs.json")["results"][0]
+    assert "min_order_amount" not in pair
+    assert "min_order_size" not in pair
+    assert set(pair) == {
+        "symbol",
+        "asset_code",
+        "quote_code",
+        "asset_increment",
+        "quote_increment",
+        "max_order_size",
+        "status",
+        "is_api_tradable",
+    }
+
+
+def test_best_bid_ask_carries_a_bid_and_an_ask_and_nothing_invented() -> None:
+    """#217 F4: the previous fixture was invented almost in full.
+
+    It carried `price`, `buy_spread`, `sell_spread`, `ask_inclusive_of_buy_spread` and
+    `bid_inclusive_of_sell_spread` -- five keys, none of which the venue sends. Nothing read them,
+    which is why it survived; the danger was entirely in what would be written against them next.
+    """
+    row = load_fixture("rh_best_bid_ask.json")["results"][0]
+    assert set(row) == {"symbol", "bid", "ask"}
+    assert row["bid"] < row["ask"], "a bid at or above the ask would invert every spread check"
