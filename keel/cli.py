@@ -1252,11 +1252,19 @@ def _read_preview(preview: Any) -> tuple[bool, dict[str, Any], tuple[str, ...], 
             ),
             None,
         )
+        # `== 0`, NOT `<= 0`, and the difference is deliberate. A zero size is unambiguous: the
+        # order has no size and its cost is unknown. A NEGATIVE one is not -- it could just as
+        # easily be Coinbase reporting a SELL's `order_total` as signed proceeds, and that
+        # convention has not been verified against a real sell preview. Guessing wrong in the
+        # `<= 0` direction would demand a typed phrase on EVERY live sell, which trains the
+        # operator to type it by reflex and destroys the signal on the previews that need it.
+        # Sign-agnostic here until a live probe settles it; the `Preview` branch above owns its
+        # own types and can afford to be stricter.
         return (
             bool(preview.get("synthetic", False)),
             dict(preview),
             tuple(str(error) for error in errors),
-            sized is None or sized <= 0,
+            sized is None or sized == 0,
             True,
         )
 

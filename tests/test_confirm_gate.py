@@ -250,6 +250,34 @@ def test_legacy_dict_errs_are_promoted_out_of_the_key_value_list(
     assert "INSUFFICIENT_FUND" in out
 
 
+@pytest.mark.parametrize("order_total", [Decimal("5.00"), Decimal("-5.00")])
+def test_a_signed_dict_order_total_does_not_manufacture_friction(
+    monkeypatch, at_a_terminal, order_total
+):
+    """Whether Coinbase reports a SELL's `order_total` as signed proceeds is UNVERIFIED. If it
+    does and the gate read `<= 0` as unpriced, every live sell would demand the typed phrase --
+    which trains the operator to type it by reflex and destroys the signal on the previews that
+    actually need it. Only a genuine zero means "no size". Revisit if a live probe settles it."""
+    _answers(monkeypatch, confirm=True)
+    monkeypatch.setattr(
+        cli_module.click,
+        "prompt",
+        lambda *a, **k: pytest.fail("a priced order must not demand a typed phrase"),
+    )
+    assert cli_module._interactive_confirm({"order_total": order_total, "errs": []}) is True
+
+
+def test_a_zero_dict_order_total_is_still_unpriced(monkeypatch, at_a_terminal):
+    """The sign-agnostic rule above must not soften the case it exists for."""
+    _answers(monkeypatch, prompt="")
+    monkeypatch.setattr(
+        cli_module.click,
+        "confirm",
+        lambda *a, **k: pytest.fail("a zero-sized preview must not take a bare y/n"),
+    )
+    assert cli_module._interactive_confirm({"order_total": Decimal("0"), "errs": []}) is False
+
+
 def test_a_dict_that_declares_itself_synthetic_is_believed(monkeypatch, capsys, at_a_terminal):
     """Defense in depth: dicts are assumed to be Coinbase's native shape, but a dict that says
     otherwise is taken at its word rather than dressed up as a broker quote."""
