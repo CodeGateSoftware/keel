@@ -33,8 +33,9 @@ separation earns its keep, because the three disagree there. (1) **Measured by p
 category now carries **two dates that must not be merged.** The 2026-08-05 measurements are
 inherited from the committed, re-runnable
 `docs/experiments/2026-08-05-coinbase-asset-class-probe.py` and the study it produced
-(`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`). **That same committed script
-was then re-run against the production CDP key on 2026-08-09** — read-only and POST-guarded,
+(`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`). **That committed script was
+re-run, alongside ad-hoc read-only queries written for the fact-check, against the production CDP
+key on 2026-08-09** — read-only and POST-guarded,
 `create_order` never called — as part of an adversarial fact-check of this document. Every
 2026-08-09 measurement below carries that date explicitly; where the two runs disagree, **both are
 printed and the disagreement is itself the finding** (§1a). (2) **Verified against the working
@@ -45,14 +46,18 @@ tree rather than copied forward. (3) **Read in vendor docs on 2026-08-09** — t
 and broker claims, each carrying a URL and that read-date.
 
 ⚠️ **A note on how category (3) was disciplined, because it changed what this document is willing to
-print.** The externally-sourced claims went through **three** passes: delegated research, then
+print.** The externally-sourced claims went through **four** passes: delegated research, then
 direct verification of the load-bearing ones, then an adversarial fact-check that re-opened the
-sources a fourth time and re-ran the probe. **No pass simply confirmed the one before it.** The
+sources and re-ran the probe, then an independent review of the merged document. **No pass simply
+confirmed the one before it.** The
 second refuted two claims the brief supplied and reduced several the first had asserted with
 confident specificity — occurrence counts, an enum's value list, a regulator's file number, a press
 quotation. The third then went the other way on two of those withdrawals: the Coinbase-for-Agents
 roadmap wording and the equity trading-session enum both **turned out to be readable at source**,
-and are restored below with their verbatim text and their URLs (§1d, §5/E3). Everything still
+and are restored below with their verbatim text and their URLs (§1d, §5/E3). The fourth restored
+two more on the same grounds — the spec's "equity" occurrence count and its named equity-specific
+error codes — and narrowed the trading-session retraction, which had itself over-reached (§1b,
+§5/E3). Everything still
 unconfirmed is **withdrawn and printed nowhere**, even where it is probably true, and the
 withdrawals are itemised in the caveats. Where a source is silent this document says "docs silent";
 where a claim could not be confirmed it says **"unverified"** or withdraws it outright; and where an
@@ -87,12 +92,12 @@ CAPABILITY, not the instrument. Stocks are "not yet", where a CFD is "never".**
 |---|---|---|---|
 | **Coinbase venue** | is there an equities order path on Advanced Trade? | ⚠️ **YES — the brief said no and was wrong.** Equity orders route through the ordinary create-order endpoint, addressed by `product_id`, with `equity_order_metadata` carrying the session and time in force | corrected in §1b. **Not the blocker.** |
 | **Coinbase, as measured** | could keel's own account actually use it? | **NO, and the 2026-08-09 re-probe made it worse, not better.** Preview refused 403 with a **product-class** message, and **zero market data on every surface tried** — no candles over a 30-day window, no closes on regular trading days, empty price strings on all 1000 products | **re-measured, no longer "stale". Independently decisive** |
-| **Coinbase market data** | can an algo price an equity at any granularity? | **NO — the vacuum is total.** `get_candles` ONE_DAY over 30 days returns **n=0** across 21 trading days on both quote legs; `recent_trading_days` returns empty open/close for regular sessions; book and trades 500; **zero equities mentions in any WebSocket channel doc** (2026-08-09) | **not a rollout artifact and not a weekend artifact.** A second, self-standing refusal |
+| **Coinbase market data** | can an algo price an equity at any granularity? | **NO — the vacuum is total.** `get_candles` ONE_DAY over 30 days returns **n=0** across 21 trading days on both quote legs; `recent_trading_days` returns empty open/close for regular sessions; book and trades 500; **the WebSocket channel docs are silent on equities** (2026-08-09) | **not a rollout artifact and not a weekend artifact.** A second refusal, independent of the first but Coinbase-specific |
 | **Coinbase, for keel specifically** | do the documented equity rules fit keel's execution model? | **NO — three conflicts.** No preview (fatal to `executor.py:445`), no attached orders (breaks `place_bracket`), no `quote_size` outside the normal session (breaks `MarketIOCByQuote`) | real, and survives however the row above resolves |
 | **Charter — §71.6** | may keel hold an instrument representing equity in an issuer? | **NO — reject BY CAPABILITY.** Share-style *business and financial* screening is mandatory and keel performs none | **capability gap, not a prohibition.** The true blocker. Buildable. |
 | **Screen schema** | can `asset_attestations` even express the answer? | **NO** — the row is `(asset, sector, backing ∈ {ayn,dayn,native}, pays_yield, source)`; there is no vocabulary for debt ÷ market cap | schema change; part of the capability gap |
-| **Rail 19 (`spot_instrument`)** | is the id a spot `BASE-QUOTE` shape? | **NO for any equity id** — and there is deliberately **no config field to widen it** | keel's own charter code. Mandatory, safety-critical change. |
-| **Rail 18 (`settlement_currency`)** | does the settlement leg parse to a configured currency? | depends on the adapter's id spelling — `AAPL-USD` would pass | not a defence here; rail 19 is |
+| **Rail 19 (`spot_instrument`)** | is the id a spot `BASE-QUOTE` shape? | **NO for Coinbase's equity id** (a 64-char hash with no hyphen) — but a sane adapter's `AAPL-USD` **passes**. It is a grammar check, not a semantic equity gate (§5/E2). There is deliberately **no config field to widen it** | keel's own charter code. Mandatory, safety-critical change. |
+| **Rail 18 (`settlement_currency`)** | does the settlement leg parse to a configured currency? | **NO for Coinbase's equity id** — `quote_currency_of` returns `None` on a hash, which is what actually rejects it today. `AAPL-USD` would pass | **this is the rail that catches Coinbase equities**, per `guards.py`'s own comment. Neither rail is a semantic equity gate |
 | **Broker port on the live path** | can any adapter actually trade? | **NO** — `executor.py` types `broker: Any` and calls raw `CoinbaseClient` signatures; `_common.py` constructs `CoinbaseClient` directly and never calls `load_broker()`; no `broker:` key in any config | temporary, scheduled (Phase B). Two migrations, not one. |
 | **Session calendar** | does keel know a market can be closed? | **NO** — no `is_market_open`, no exchange calendar anywhere in the tree. A closed market currently reads as a **stale feed** | new subsystem. Observability defect, not a safety hole |
 | **Existing Robinhood adapter** | does keel's second adapter reach stocks? | **NO** — it is built against the Robinhood **Crypto** Trading API v2, and there is still no official Robinhood **REST** equities API. ⚠️ Robinhood *did* ship official MCP-based equities agentic trading on 2026-05-27 — a separate funded account and a tool surface, not a `Broker` (§4) | a common and expensive misconception, and the brief's version of it was also out of date |
@@ -103,15 +108,18 @@ equities, keel's account measurably could not use them, and a better venue exist
 The thing actually standing between keel and a stock is a shariah financial-ratio screen nobody has
 built, which no choice of broker fixes and no probe can measure.**
 
-**Two independent refusals, and each is sufficient on its own. They should be read separately, not
-stacked.**
+**Two refusals, and they are independent of each other but not equally broad. Read them separately,
+not stacked.** Refusal 1 answers the question as asked and the verdict rests on it alone. Refusal 2
+disqualifies **Coinbase specifically** and would be answered by a different venue — it narrows the
+*how*, not the *whether*.
 
 1. **The charter gate (§2).** keel performs no share-style *financial* screening, §71.6 requires it,
    and that is a **capability keel does not have**. It is broker-independent, it is unaffected by
    anything a probe can return, and it is the reason the answer is no.
 2. **The Coinbase surface is unusable for an algo, on market data alone (§1a, 2026-08-09).** There
-   are no bars, no closes, no quotes and no stream — on any endpoint tried, for any of 1000
-   products, over a 30-day window covering 21 trading days. Every rule in `keel/strategy/rules/`
+   are no bars, no closes, no quotes and no stream — on any endpoint tried, for every product on
+   the first 1000-id page, over a 30-day window covering 21 trading days. Every rule in
+   `keel/strategy/rules/`
    takes `candles_by_tf`. **A venue that cannot be priced is not a venue at any price**, regardless
    of what its order endpoint documents. This one is Coinbase-specific and would be answered by
    choosing Alpaca; it does not touch reason 1.
@@ -134,9 +142,14 @@ conservative than its own precedent, and both are stated in full and left open a
 
 ### (a) keel's own committed probe — measured 2026-08-05, **re-measured 2026-08-09**
 
-Same script both times:
-`docs/experiments/2026-08-05-coinbase-asset-class-probe.py` — read-only, POST-guarded,
-`create_order` never called — run against the production account's own CDP key. The 2026-08-05 run
+Two runs, and **not the same instrument both times.** The 2026-08-05 measurements come from the
+committed, re-runnable `docs/experiments/2026-08-05-coinbase-asset-class-probe.py` — read-only,
+POST-guarded, `create_order` never called. The 2026-08-09 re-run executed that same committed script
+**and additional ad-hoc read-only queries written for the fact-check** (`recent_trading_days`,
+`equity_trading_flags`, and the per-product price/volume fields), under the same read-only discipline
+but **not committed**. Findings sourced to those ad-hoc queries are marked ⚠️ *ad-hoc, not
+re-runnable* below and are the one class of evidence in this document a future reader cannot
+reproduce from the tree. The 2026-08-05 run
 and the study it produced (`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`) are
 **inherited**; the 2026-08-09 run is **new to this document** and was performed by an adversarial
 fact-check of an earlier draft. Both dates are printed. Where they disagree, the disagreement is the
@@ -177,13 +190,16 @@ session:
 - `recent_trading_days` for **2026-08-05, 2026-08-06 and 2026-08-07**, each returned by Coinbase
   itself as `TRADE_DATE_TYPE_REGULAR`, carries `market_open_price: ''` and `market_close_price: ''`.
   **Coinbase's own product payload says those were regular US trading days and then declines to say
-  what the stock opened or closed at.**
+  what the stock opened or closed at.** ⚠️ *ad-hoc, not re-runnable*
 - `last_market_day_close_price`, `open_price`, `volume_today`, `price`, `best_bid_price`,
-  `mid_market_price` and `volume_24h` are **empty strings on all 1000 products**.
+  `mid_market_price` and `volume_24h` are **empty strings on all 1000 products** — that is the first
+  1000-product page, i.e. ~5% of the 19 188-id universe measured in correction 2 below; no
+  per-product field was sampled beyond it. ⚠️ *ad-hoc, not re-runnable*
 - `get_product_book` and `get_market_trades` return **HTTP 500**; `get_best_bid_ask` returns
   `{"pricebooks": []}`.
-- **Zero mentions of equities in any WebSocket channel documentation** — there is no streaming path
-  either.
+- **The WebSocket channel documentation is silent on equities** — there is no streaming path
+  either. ⚠️ *ad-hoc, not re-runnable*; stated as silence rather than as an occurrence count, since
+  no URL or read-date was recorded for the check.
 
 **There is no granularity, no historical depth, no snapshot and no stream. This is not a rollout
 artifact, a weekend artifact or a fault: it is the absence of a market-data product.** Every rule in
@@ -193,8 +209,11 @@ stands entirely independently of the charter argument in §2.**
 
 **2. ⚠️ Correction against the 2026-08-05 study: the "non-deterministically enumerable universe"
 finding is GONE.** Re-measured 2026-08-09, the listing is **stable**: four identical calls produced
-**zero drift**, and a clean cursor walk advanced **+1000 ids per page** to a terminating total of
-**19 188 distinct ids**. Whatever produced the 2026-08-05 instability — a paginator bug, a rollout
+**zero drift**, and a clean cursor walk advanced **+1000 ids per page** to **19 188 distinct ids
+over the script's 20-page limit** (`probe.py:231`, `while pages < 20`), up from 13 089 across the
+same 20 pages on 2026-08-05. **The walk hit the page cap, so whether the universe terminates there
+is not established** — what is established is that the same walk now returns 47% more distinct ids
+with zero drift. Whatever produced the 2026-08-05 instability — a paginator bug, a rollout
 in progress — has been fixed. **The 2026-08-05 study's enumeration finding should not be carried
 forward by anyone, and the id-instability line in this document's own §1c is retired with it.** The
 64-char-hash identity problem is unaffected and still stands.
@@ -218,7 +237,10 @@ as finding 1: the surface is listed, not launched.
 failure this document is trying to avoid.** `equity_trading_flags`, read across all 1000 equity
 products on 2026-08-09, returns **`tradable: true, buy_enabled: true, sell_enabled: true` on
 998 of 1000**, with `view_only: false`, `trading_disabled: false`, `liquidate_only: false` and
-`trading_halted: false`. **The products declare themselves tradable.** Taken with §1b's documented
+`trading_halted: false`. ⚠️ *ad-hoc, not re-runnable* — and ⚠️ the raw output for this specific
+six-field read was not re-confirmed; the committed script's same-shaped `view_only` count at
+`probe.py:98` is a possible source of confusion. **The products declare themselves tradable.**
+Taken with §1b's documented
 order path, the honest reading is that the *order* half of this surface may well work and nobody has
 called it; what is missing is not permission to trade but anything to trade *on*. That is a
 different — and for keel, equally fatal — problem.
@@ -294,12 +316,17 @@ separate passes and by separate fetches.**
   payload, with subtypes and a four-session `trading_day_info` block — so the equity surface is
   threaded through products, orders and fills rather than bolted to one endpoint.
 
-⚠️ **One item withdrawn by an earlier pass is now RESTORED, and one stays withdrawn.** Restored: the
-trading-session enum, which is directly readable on the create-order reference and is quoted with
-its real spelling in §5/E3 below — the earlier draft's version of it was wrong in both its type name
-and its value spellings, which is why it was pulled. Still withdrawn and printed nowhere: an
-**occurrence count** for "equity" in the spec, and **named equity-specific error codes**. Neither
-could be confirmed on any pass, and neither is load-bearing.
+⚠️ **Three items withdrawn by earlier passes are now RESTORED.** Restored first: the trading-session
+enum, which is directly readable on the create-order reference and is quoted with its real spelling
+in §5/E3 below — the earlier draft's version of it was wrong in its value spellings — though **not**
+in its type name, which was correct — which is why it was pulled.
+
+Both items an earlier pass withdrew as unconfirmable are in fact **directly greppable in the same
+spec file** and are restored here. The string `equit` (case-insensitive) occurs **150 times**. Named
+equity-specific error codes exist on both enums: **`INVALID_EQUITY_TRADING_SESSION`** on create-order
+and **`PREVIEW_INVALID_EQUITY_TRADING_SESSION`** on preview. Neither is load-bearing for the verdict,
+but the withdrawal was wrong for the same reason the other two were: the source was open the whole
+time.
 
 **What produced the wrong premise is worth recording, because it will mislead the next reader too —
 and the honest reading of it has changed.** The API's own introduction page describes it as
@@ -312,10 +339,11 @@ Derivatives**, and **International Derivatives (INTX, deprecated)**. No equities
 That is not established, and the documentation pattern points the other way.** Equity support
 appears **only** inside auto-generated per-endpoint OpenAPI schema blocks — the ones carrying
 internal protobuf names like `coinbase.public_api.authed.retail_brokerage_api.*`. The hand-written
-surfaces are silent: the REST introduction, the API overview, the orders guide, the FAQ, and the
-changelog, which contains **zero occurrences of the string "equit"**. So the split is not
-prose-lagging-schema; it is **generated-artifacts-lagging-editorial-intent**, which is the opposite
-inference. Taken with the live 403 and the market-data vacuum in §1a, **the introduction page
+surfaces are **silent**: the REST introduction, the API overview, the orders guide, the FAQ, and the
+changelog. ⚠️ *Stated as silence, not as an occurrence count — no URL or read-date was recorded for
+the changelog check.* So the split is not prose-lagging-schema; it is
+**generated-artifacts-running-ahead-of-editorial-intent**, which is the opposite inference. Taken
+with the live 403 and the market-data vacuum in §1a, **the introduction page
 describes what is *usable* more accurately than the schema describes what is *shipped*.** Read both,
 and treat the schema as evidence of what exists rather than of what works.
 
@@ -356,11 +384,19 @@ however that resolves:**
    during the normal session**, and whole-share `base_size` would be mandatory otherwise, which is
    C6 (no lot rounding) becoming a blocking defect rather than a latent one.
 
+The spec confirms all three in machine-readable form rather than only in prose: alongside
+`INVALID_EQUITY_TRADING_SESSION` and `PREVIEW_INVALID_EQUITY_TRADING_SESSION` it carries
+`MARKET_ORDERS_PROHIBITED_DURING_NON_CORE_SESSION`,
+`NOTIONAL_ORDERS_PROHIBITED_DURING_NON_CORE_SESSION`,
+`NOTIONAL_SIZE_BREACHES_FRACTIONAL_MINIMUM`, `NBBO_NOT_PROVIDED`,
+`MAX_SHARES_PER_ORDER_BREACHED_15C35_CHECK` and `MAX_NOTIONAL_PER_ORDER_BREACHED_15C35_CHECK`.
+
 Plus the identity problem the probe already found and the docs now confirm in their own words —
 *"Use the canonical `product_id` returned by the Products API, not the display ticker"* — which is
 the 64-char hash. ⚠️ **Earlier drafts added "on a listing that is not deterministically enumerable";
 that half is retired.** The 2026-08-09 re-probe found the listing stable and cleanly walkable to
-19 188 ids (§1a). The hash-not-ticker problem is real; the enumeration problem is not, any more.
+19 188 ids over the script's 20-page cap (§1a). The hash-not-ticker problem is real; the enumeration
+problem is not, any more.
 
 **Zero market data remains the decisive keel-side fact, and the 2026-08-09 re-probe made it
 stronger rather than weaker.** Every rule in `keel/strategy/rules/` takes `candles_by_tf`; with no
@@ -475,6 +511,9 @@ represent**, and rules per type
 | **Equity instruments** | **equity in the issuer — votes, dividends, beneficial interest** | ***"similar to purchasing shares"*; requires the same share-screening methodology** |
 | Buy-back-dependent | appreciation backed by issuer repurchase-and-destroy | ⚠️ contract combination — hard reject |
 
+⚠️ *Abridged — the source classifies **six** token types; two of them (work tokens, asset-backed
+tokens) are not reproduced here.*
+
 And the rule the KB extracted from it, in its own words:
 
 > **⭐ Function screening is not sufficient for *any* token carrying a claim on an issuer.** SRB
@@ -571,19 +610,20 @@ because a quarter closed. A financial-ratio screen is a **per-reporting-period**
 numbers that move every period — debt is refinanced, cash balances swing, and a company can cross a
 threshold without doing anything a headline would report.
 
-**And under the standard keel has chosen it is worse than per-period, for a reason specific to that
-standard: SS 21's denominator is market capitalisation** (§3), so the *denominator moves every time
-the price does. A company's compliance can change on a price move alone, with an unchanged balance
-sheet.** That is not true of MSCI's total-assets basis, and it is the sharpest recurring-cost
-consequence of the §3 decision. (SS 21 mitigates it slightly by specifying no averaging window at
-all — clause 3/4/5's *"last budget or verified financial position"* — so the ratio is struck
-point-in-time rather than tracked continuously; but *when* it is struck then becomes a policy
-choice keel must make and defend.)
+**And under the standard keel has chosen there is a further wrinkle specific to that standard: SS
+21's denominator is market capitalisation** (§3), which is a price. SS 21 strikes the ratio
+point-in-time off the *"last budget or verified financial position"* (clause 3/4/5 — no averaging
+window at all), so price drift between two strikes changes nothing by itself. **What the market-cap
+denominator actually does is make *when* the ratio is struck a policy choice keel must make and
+defend — and the more often it is struck, the more price-sensitive the screen becomes.** That is not
+true of MSCI's total-assets basis, and it is the sharpest recurring-cost consequence of the §3
+decision.
 
 Consequences, stated plainly because they are design constraints and not caveats:
 
 - An admitted stock can become **inadmissible while held** — through a filing, or (per the above)
-  through a price move alone. The screen needs an *exit* semantics the crypto screen has never
+  through a price move, on the next strike of the ratio. The screen needs an *exit* semantics the
+  crypto screen has never
   needed. **SS 21 clause 3/4/8 supplies the requirement** — *"it is obligatory to give up such
   investment"* — so this is no longer an open question of policy, only of mechanism (§3 item 4).
 - `attested_at` is currently a timestamp nothing expires on. A ratio screen needs a **staleness
@@ -626,7 +666,7 @@ implementation detail, and one this document deliberately does not resolve.
 
 **AAOIFI publishes the full English text of SS 21 on its own site**, so the following is quoted from
 the standard rather than from a secondary summary:
-https://aaoifi.com/wp-content/uploads/2020/08/SS-21-Financial-Paper-Shares-and-Bonds.pdf (a 28-page
+https://aaoifi.com/wp-content/uploads/2020/08/SS-21-Financial-Paper-Shares-and-Bonds.pdf (a 27-page
 extract of the compiled *Shari'ah Standards* volume, book pagination 557–583, AAOIFI-hosted since
 August 2020; catalogue page https://aaoifi.com/ss-21-financial-paper-shares-and-bonds/?lang=en).
 Issued **20 May 2004** (30 Rabi' I 1425 A.H.), adopted at Shari'ah Board meeting No. 12,
@@ -655,11 +695,20 @@ widespread practice."* This materially changes §3.1 and is picked up there.
 | **3/4/2** | interest-bearing debt, long- or short-term | **30%** | *"of the **market capitalization** of the corporation"* |
 | **3/4/3** | **interest-taking deposits** | **30%** | *"of the **market capitalization of total equity**"* |
 | **3/4/4** | income from a prohibited component | **5%** | *"of the **total income** of the corporation"* |
-| **3/19** | tangible assets, benefits and rights | **≥ 30%** | *"of the **total assets** value of the corporation"* |
+| **3/19** | tangible assets, benefits and rights — ⚠️ **a regime selector, not a fourth admission ratio** (see below) | **≥ 30%** | *"of the **total assets** value of the corporation"* |
 | — | accounts receivable | **no such test exists in SS 21** | — |
 
 The only percentages anywhere in the standard are 30% (three times) and 5% (once). **There is no
 33% and no receivables screen.**
+
+⚠️ **Clause 3/19 is not an admission test, and reading it as one is the easiest mistake in the
+standard.** What it provides is that trading in shares is permissible *"without taking into account
+the rules of Sarf or transactions in debts"* when tangible assets, benefits and rights are at least
+30% of total assets. Falling below that floor does **not** forbid the share — it means the sarf and
+debt rules must be observed instead. The Appendix (p. 576) says so outright: *"it is not permitted
+to deal in the shares, **except by observing the rules of Sarf or transactions in debts**."* 3/19
+selects **which fiqh regime governs the trade**; 3/4/2, 3/4/3 and 3/4/4 are the admission ratios,
+and there is no fourth.
 
 **Four details that a DJIM-shaped implementation would get wrong:**
 
@@ -671,16 +720,20 @@ The only percentages anywhere in the standard are 30% (three times) and 5% (once
    both say *Total Revenue*. Not interchangeable.
 3. **There is no averaging window at all.** Clause **3/4/5**: *"For the determination of these
    percentages, recourse is to be had to the **last budget or verified financial position**."*
-   Point-in-time, off the latest verified financials. Every commercial index uses a trailing average
-   (DJIM 24-month, MSCI M-Series and S&P 36-month); **AAOIFI uses none**, and anyone citing "AAOIFI's
-   12-month average" is importing it from elsewhere. ⚠️ **This corrects a claim made earlier in this
-   document's own §2**, where the recurring-cost argument leaned on a continuously-moving average
-   denominator — see the correction there.
-4. **⚠️ SS 21 contradicts itself on the 3/19 floor.** Clause 3/19 says **30%**, but footnote (1) to
-   3/1 says *"should not be less than **one-third**"* and the Appendix says *"less than a third."*
-   The footnote even carries AAOIFI's own hedge: *"(This explanatory note is intended to complete
-   the text of the Standard for implementing subsequent amending procedures, God willing)."*
-   **Do not present that floor as unambiguous.**
+   Point-in-time, off the latest verified financials. The commercial indices average where AAOIFI
+   does not — DJIM over 24 months, S&P over 36. ⚠️ **MSCI's M-Series window is unverified here**,
+   and the comparison table below records MSCI as screening off the latest report rather than a
+   trailing average; this document does not assert either. **AAOIFI uses none**, and anyone citing
+   "AAOIFI's 12-month average" is importing it from elsewhere.
+4. **⚠️ The 3/19 floor is stated at two numbers, on two different measures.** Clause 3/19 says
+   **30%** of total assets, counting *"assets, benefits and rights"* — with cash in the
+   *denominator*. Footnote (1) to 3/1 sets its floor on a different numerator, *"tangible and cash
+   assets"*, and says it *"should not be less than **one-third**"*; the Appendix says *"less than a
+   third."* The footnote even carries AAOIFI's own hedge: *"(This explanatory note is intended to
+   complete the text of the Standard for implementing subsequent amending procedures, God
+   willing)."* The 30%-vs-one-third gap is real, but the two clauses are not measuring the same
+   quantity, so this is a discrepancy rather than cleanly a self-contradiction. **Do not present
+   that floor as unambiguous.**
 
 **Ongoing obligation — and it answers a question this document raised as open.** Clause **3/4/8**:
 
@@ -719,28 +772,40 @@ selling; **3/9** no share lending; **3/11** no Salam; **3/12** no futures; **3/1
 **3/14** no swaps; **3/15** no renting of shares. keel is long-only spot with settled cash — it
 clears all eight without a line of code.
 
-**How SS 21 compares to the index families it was chosen over** (all methodologies read 2026-08-09):
+⚠️ **Three clauses are neither satisfied by construction nor covered above, and a screen built to
+this section's spec would ship without them:** **3/17** (shares of a corporation whose assets are
+cash only), **3/18** — *"not permissible to undertake trading in the shares of a corporation if the
+entire assets of the corporation are composed of debts, unless the rules for dealing in debts are
+observed"* — and **3/20** (the anti-device rule). They are asset-composition and intent questions
+the three admission ratios do not answer, and they belong in the attestation spec below.
+
+**How SS 21 compares to the index families it was chosen over** (AAOIFI read at source 2026-08-09;
+the three index rows are from secondary summaries and the editions named in the caveats —
+spglobal.com refuses automated fetching):
 
 | | Debt | Cash / deposits | Receivables | Impermissible income | Denominator | Window |
 |---|---|---|---|---|---|---|
 | **AAOIFI SS 21** | **30%** | **30%** (deposits) | **none** | **5% of total income** | **market cap** | **none** |
-| DJIM (May 2025) | 33% | **screen retired 09/2023** | **screen retired 03/2023** | 5% of total revenue | 24-mo avg market cap | 24-mo |
+| DJIM (May 2025) | 33% | **screen retired 2023** | **screen retired 2023** | 5% of total revenue | 24-mo avg market cap | 24-mo |
 | MSCI Islamic | 33.33% | 33.33% | 33.33% | 5% of revenue | **total assets** | latest report |
-| S&P Shariah | 33% | 33% | 49% | 5% of revenue | market value of equity | 36-mo |
+| S&P Shariah ⚠️ *possibly superseded by the same 2023 change-set* | 33% | 33% | 49% | 5% of revenue | market value of equity | 36-mo |
 
 ⚠️ **Two corrections this table forces on §65.10's material, which is the KB's only screening
 reference today.** First, **§65.10's three-ratio DJIM description is out of date**: S&P DJI retired
-the receivables screen effective 2023-03-17 and the cash/interest-bearing-securities screen
-effective 2023-09-15, leaving DJIM with a **single** accounting screen. A keel screen built against
-§65.10's DJIM form would be implementing a methodology its own author retired three years ago.
+the receivables screen and the cash/interest-bearing-securities screen **during 2023** (S&P DJI
+Index Announcement of 2023-08-04; exact effective dates not confirmed at source), leaving DJIM with
+a **single** accounting screen. A keel screen built against §65.10's DJIM form would be implementing
+a methodology its own author retired three years ago.
 Second, **§65.10 records the DJIM denominator as a 12-month average; current DJIM uses 24 months** —
-Ayub's book predates the change. Neither correction affects the *verdict*, and neither is a defect
+Ayub's 2007 text predates DJIM's move to a 24-month window, which is unrelated to the 2023 screen
+retirements above. Neither correction affects the *verdict*, and neither is a defect
 in §65.10, which faithfully records what its source said; both are reasons the KB entry needs a
 refresh whenever SS 21 is read in.
 
 **MSCI is the real outlier and the comparison worth keeping:** a **total-assets** denominator is
-price-insensitive, where AAOIFI's **market-cap** denominator means a company can fail the debt
-screen on a price drawdown alone, with an unchanged balance sheet. **For a trading agent that is a
+price-insensitive, where AAOIFI's **market-cap** denominator makes the answer depend on the price on
+the day the ratio is struck — so a company can fail the debt screen after a drawdown, with an
+unchanged balance sheet, whenever the ratio is next struck. **For a trading agent that is a
 genuinely awkward interaction** — the moment a holding's price falls hardest is the moment it is
 most likely to breach a market-cap-denominated leverage screen, which is also the moment keel's
 stop is closest. A forced-disposal obligation (3/4/8) and a stop-loss exit would fire together, for
@@ -843,9 +908,12 @@ Sketched, not designed. Enumerated so the cost estimate below has something to p
    departure — carrying: core business line; **interest-bearing debt ÷ market cap (3/4/2, 30%)**;
    **interest-taking deposits ÷ market cap (3/4/3, 30%)** — note the numerator is *deposits*, not
    cash; **prohibited income ÷ total income (3/4/4, 5%)**; **tangible assets ÷ total assets (3/19,
-   ≥30%, ⚠️ stated inconsistently in the standard)**; plus the verified financial position each was
-   taken from (3/4/5 — point-in-time, no averaging) and the filing it came from. **No receivables
-   field: SS 21 has no such test.**
+   ≥30%, ⚠️ stated at two numbers on two measures in the standard — and a *regime selector*, not a
+   fourth admission ratio: below the floor the sarf and debt rules apply, the share is not
+   refused)**; **the 3/17 cash-only, 3/18 debts-only and 3/20 anti-device tests**, which are
+   asset-composition and intent questions none of the ratios above answer; plus the verified
+   financial position each was taken from (3/4/5 — point-in-time, no averaging) and the filing it
+   came from. **No receivables field: SS 21 has no such test.**
 3. **A thresholds policy object**, versioned, with keel's divergences from SS 21 recorded the way
    §65.10 asks — because after §3.1 the interesting question is not "does keel implement AAOIFI"
    but "where does keel deviate, in which direction, and why".
@@ -882,9 +950,12 @@ fidelity, fill behaviour, rate limits and corporate-action reporting are therefo
 **unmeasured**, and the recommendation below is a paper judgement. Some vendor doc hosts
 (`docs.alpaca.markets`, `docs.tradier.com`) block automated fetching; where a finding rests on
 search-indexed official documentation rather than a directly loaded page, it is flagged in the
-prose. ⚠️ **Correction: an earlier draft listed `developer.schwab.com` among the blocked hosts. It
-is not** — its terms-and-conditions page loads fine and was read directly (see the Schwab note
-below); what is gated is the Individual Developer Agreement behind login.
+prose. ⚠️ **Correction, twice over: an earlier draft listed `developer.schwab.com` among the blocked
+hosts, and a later one said its terms-and-conditions page "loads fine and was read directly".
+Neither is right** — that page returns 200 but is a JavaScript shell that renders no contract text
+to a fetcher; the terms themselves are served as plain text from `contentdelivery.schwab.com` and
+were read there (see the Schwab note below). What is gated is the Individual Developer Agreement
+behind login.
 
 | Venue | Official equities API | Auth | Free paper sandbox | Fractional | Market data | Official Python SDK | Fit for keel |
 |---|---|---|---|---|---|---|---|
@@ -907,9 +978,13 @@ Three of keel's own defects decide this, and they point the same way.
   Investment Advisor"* — a self-directed retail developer cannot place notional equity orders at all
   — and IBKR documents that *"Stock orders submitted using Cash Quantity field through the API will
   round down to the nearest whole share."*
-- **keel's entry model is quote-sized.** Entries are `MarketIOCByQuote` — "spend $N" — which is
-  exactly Alpaca's notional-order shape ($1 minimum, market orders only, long only). keel is
-  long-only by type (`Setup.direction: Literal["long"]`), so every one of those restrictions is
+- **keel's entry model is quote-sized.** Entries are `MarketIOCByQuote` — "spend $N" — which fits
+  Alpaca's notional-order shape ($1 minimum, long only; market **and limit** orders since 2024-02,
+  plus stop/stop-limit and extended hours —
+  https://alpaca.markets/blog/fractional-shares-trading-supports-limit-orders-and-extended-hours/).
+  The real constraints are narrower and different: TIF must be `day` (no GTC), `notional` is capped
+  at 2 decimal places, and notional orders cannot be replaced. keel is
+  long-only by type (`Setup.direction: Literal["long"]`), so the long-only restriction is
   already keel's own posture. **The one adapter constraint that broke Robinhood-for-crypto — no
   quote-sized market orders, so it "cannot open positions under keel's current entry model"
   (`packages/keel-broker-robinhood/README.md`) — does not recur here.**
@@ -989,24 +1064,33 @@ challenge, not a 404 and not a marketing page.
 
 The brief asserted that Schwab's commercial-approval review *"explicitly scrutinizes automated or
 AI-driven functionality"* — a real risk for an unattended bot, if true. **It is not Schwab's
-wording, and it is not printed here as a finding.** Schwab's publicly-readable developer terms
-(https://developer.schwab.com/terms-and-conditions, read 2026-08-09 — 16.6 KB of real contract text,
-not a login wall) contain **zero matches** for `AI`, `artificial intelligence`, `machine learning`,
-or `advisory`. The app registration form collects four fields and an order limit, with no automation
-or AI attestation anywhere.
+wording, and it is not printed here as a finding.** Schwab's developer terms — served publicly from
+`https://contentdelivery.schwab.com/api/content/rtcontent/asset/dev-portal-user-registration-terms-and-conditions`,
+since `developer.schwab.com/terms-and-conditions` is a JS shell that renders no text to a fetcher;
+16,455 bytes of real contract text, last updated 2023-02-14 — contain **zero matches** for `AI`,
+`artificial intelligence`, `machine learning`, or `advisory`. The app registration form collects
+four fields and an order limit, with no automation or AI attestation anywhere. ⚠️ **Two things to
+hold alongside that refutation:** the terms are **three years stale**, and they *do* carry an
+automation clause — just not an AI one — *"You may not use automated systems (e.g., robots,
+spiders, etc.) to access the Site"*, which governs the website, not the API.
 
-**The wording traces to five interlinked articles on a single domain, `mylinedchart.com`, whose
-registration record dates to 2026-04-20** and whose own disclaimer states it is *"not affiliated
+**The wording traces to six interlinked articles on a single domain, `mylinedchart.com`, four of
+them using the "AI-driven functionality" phrasing, whose registration record dates to 2026-04-20**
+and whose own disclaimer states it is *"not affiliated
 with or endorsed by Charles Schwab."* The articles paraphrase rather than quote, cite no Schwab
 document, and describe the *Commercial* track rather than the Individual one — and they now rank
-highly enough that AI search summaries restate them as policy. **A five-page cross-linked cluster on
+highly enough that AI search summaries restate them as policy. **A six-page cross-linked cluster on
 one four-month-old domain reads as corroboration and is a single source.**
 
 ⚠️ **Caveat on that refutation, preserved deliberately:** Schwab's **Individual Developer Agreement**
 is gated and could not be read. So this is refuted **across every publicly-readable Schwab page**,
-not disproven absolutely. The documented gate is mundane: *"Most requests are reviewed within two
-business days"*, individuals are limited to one app, and the dashboard shows `Approved - Pending`
-before an app is actually usable (`Ready For Use` is the state to wait for). **Schwab is ruled out
+not disproven absolutely. The documented gate is mundane: individuals are limited to one app, and
+the dashboard shows `Approved - Pending` before an app is actually usable (`Ready For Use` is the
+state to wait for). ⚠️ **The *"Most requests are reviewed within two business days"* line an earlier
+draft offered as the app-approval gate is verbatim but misattributed** — it governs API-product and
+line-of-business *access* requests. Schwab's own wording for app promotion is *"Promoting an App
+from Sandbox to Production may require manual approval from an LOB admin and may take several
+days."* **Schwab is ruled out
 below on its 7-day refresh token, which is a documented mechanism, not on any AI-policy claim.**
 
 This is recorded at length for one reason: it is a live example of the failure mode this repo's
@@ -1062,7 +1146,8 @@ warrants its own plan."* (`docs/superpowers/plans/2026-07-19-keel-broker-port-ph
 **An equities adapter written before Phase B lands is dead code by construction** — exactly the
 state `packages/keel-broker-robinhood/README.md` documents for the adapter already in the tree.
 
-**E2. Rails 18 and 19 veto every equity id, and rail 19 has no widening knob.**
+**E2. Rails 18 and 19 veto Coinbase's equity id shape — but not every equity id — and rail 19 has
+no widening knob.**
 `keel/execution/guards.py:668-757`, read 2026-08-09. Rail 19's check is:
 
 ```python
@@ -1118,15 +1203,17 @@ crypto calendar. It is not wrong for equities so much as meaningless — 14 of t
 have nothing to do.
 
 **And a session model is not optional at the venue either, which §1b makes concrete.**
-⚠️ **This paragraph previously named a type `EquityTradingSession` with five bare values; that
-spelling was invented and is corrected here against the source.** The real field is
+⚠️ **This paragraph previously named a type `EquityTradingSession` with five bare values. The type
+name was right — `coinbase.public_api.authed.retail_brokerage_api.EquityTradingSession` is the
+spec's actual schema name — but the five value spellings were invented, and are corrected here
+against the source.** The real field is
 `equity_order_metadata.equity_trading_session`, and its enum, read directly from the create-order
 reference on 2026-08-09
 (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/create-order), is
 **six** prefixed values:
 
 ```
-UNKNOWN_EQUITY_TRADING_SESSION      (the documented default value)
+UNKNOWN_EQUITY_TRADING_SESSION      (the schema's declared `default:`)
 EQUITY_TRADING_SESSION_NORMAL
 EQUITY_TRADING_SESSION_PRE_MARKET
 EQUITY_TRADING_SESSION_AFTER_HOURS
@@ -1137,7 +1224,10 @@ EQUITY_TRADING_SESSION_MULTI_SESSION
 **A second correction in the same paragraph: the field is optional, not required.** Coinbase's own
 description reads *"Defaults to `EQUITY_TRADING_SESSION_NORMAL` when omitted. Market orders are
 supported only in the normal session. Any non-normal session requires a limit order with a positive
-whole-share `base_size`; `quote_size` and fractional sizing are not supported."*
+whole-share `base_size`; `quote_size` and fractional sizing are not supported."* ⚠️ **Both quotations
+are exact and they are not in conflict:** `UNKNOWN_EQUITY_TRADING_SESSION` is the schema's declared
+`default:` for the enum, while *"Defaults to `EQUITY_TRADING_SESSION_NORMAL` when omitted"* is the
+field description's statement of behaviour on an absent field. The two describe different things.
 
 So the accurate statement is weaker than the earlier one and still sufficient: **the session is not
 a required field, but it is a field whose default silently confines keel to one session, and whose
@@ -1244,10 +1334,11 @@ Ordered by dependency, and by which is the true blocker.
 | **P4 — Equities adapter** | `packages/keel-broker-alpaca/`, conformance suite, paper-account integration tests | **8–15** | the venue. Cheap *only because* P0–P3 did the hard parts |
 | **P5 — T+1, settled cash, corporate actions** | settled-vs-unsettled on `Balance`, a corporate-actions ingestion path, position reconciliation against the broker rather than the audit log, dividend purification wiring | **10–20** | correctness of the books. Deferrable at first, not indefinitely |
 
-**Total: roughly 65–130 engineer-days**, plus the unbounded standards item and the recurring
-screening cost. Call it **four to seven months of one engineer**, and treat the low end as
-optimistic — the range is wide because P1's true size depends on a fundamentals data decision
-nobody has made and a standards read nobody has done.
+**Total: roughly 65–130 engineer-days — of which 50–100 are equity-specific**, since P0 is owed
+regardless. Call it **three to six months** of one engineer, plus the unbounded standards item and
+the recurring screening cost, and treat the low end as optimistic — the range is wide because P1's
+true size depends on a fundamentals data decision nobody has made and a standards read nobody has
+done.
 
 **Three properties of that ordering matter more than the totals, and they are the part of this
 section worth remembering:**
@@ -1375,61 +1466,80 @@ which would clear one has not been designed.
 
 ## The research-integrity lesson
 
-Three research passes went into §1 and §4. **Each one reduced the pass before it, and the second one
-over-corrected.** The first produced confident, well-formed, specific claims — an occurrence count,
+Four research passes went into §1 and §4. **The first two each reduced the pass before them, and the
+second over-corrected.** The first produced confident, well-formed, specific claims — an occurrence count,
 an enum with named values, a regulator's file number, a press quotation — that direct verification
 could not support, and they were withdrawn. The second withdrew two things it should have kept: the
 Coinbase-for-Agents roadmap wording, which was sitting readable on `docs.cdp.coinbase.com` while the
 pass was checking `coinbase.com` and getting a 403, and the trading-session enum, which is printed
-in full on the create-order reference. **It also left a fabricated version of that enum standing in
-§5/E3 while announcing its withdrawal in §1b** — a retraction that did not survive a `grep` of the
-document making it. The third pass re-opened every source and re-ran the probe, and turned up the
+in full on the create-order reference. **It also left a fabricated version of that enum's values
+standing in §5/E3 while announcing its withdrawal in §1b** — a retraction that did not survive a
+`grep` of the document making it, and one that also retracted a type name that was correct. The
+third pass re-opened every source and re-ran the probe, and turned up the
 single most decisive fact in the document, which no amount of reasoning would have produced: there
-is no equity market data.
+is no equity market data. **The fourth — an independent review of the merged document — found two
+more withdrawals that were `grep`-able in a spec file that had been open the whole time, and found
+that the third pass's retraction had itself retracted something true.**
 
-Three rules fall out of that, and they are cheap:
+Four rules fall out of that, and they are cheap:
 
 1. **A claim is only as good as the source someone actually opened.** Not searched, not summarised,
    not inferred from a schema — opened. This is the same rule §4 arrives at independently from the
-   Schwab case, where five cross-linked pages on one four-month-old domain read as corroboration and
+   Schwab case, where six cross-linked pages on one four-month-old domain read as corroboration and
    were a single source.
 2. **A withdrawal is a claim too, and needs the same standard.** "Could not be confirmed" often means
-   "was looked for in the wrong place." Two of this document's withdrawals were wrong.
+   "was looked for in the wrong place." Four of this document's withdrawals were wrong.
 3. **A retraction is not done until the retracted text is gone.** Announce it in the caveats *and*
    `grep` for it in the body. The confidence of a claim is uncorrelated with its truth, and a
    document that says so about its sources owes the same scepticism to itself.
+4. **Retract exactly what failed checking, and no more.** The `EquityTradingSession` retraction
+   above — the exemplar for rule 3 — withdrew a correct type name along with five invented values.
+   A retraction has a scope, and the scope needs a source read the same way the claim did.
 
 ## Caveats and what is UNVERIFIED
 
 - **The probe was re-run on 2026-08-09** (read-only, POST-guarded, `create_order` never called), so
-  the Coinbase measurements are current rather than four days stale. **This removes what an earlier
-  draft called the document's weakest point** and replaces it with a narrower one: the re-run
-  measured the *product surface*, not the order endpoint, which remains untested by design.
+  the Coinbase measurements are current rather than four days stale. **That does not fully remove
+  what an earlier draft called the document's weakest point; it changes its shape.** The re-run
+  measured the *product surface*, not the order endpoint, which remains untested by design — and it
+  used **ad-hoc read-only queries that were not committed** alongside the committed script, so an
+  unmeasured claim has partly been replaced by an unreproducible one. The findings that rest on
+  those queries are marked ⚠️ *ad-hoc, not re-runnable* in §1a.
 - ⚠️ **Two claims from this document's brief were REFUTED and are corrected in place, not silently:**
   that Advanced Trade exposes no securities endpoint (§1b), and that Schwab's approval review
-  scrutinizes AI-driven functionality (§4 — traced to five interlinked pages on one non-affiliated
+  scrutinizes AI-driven functionality (§4 — traced to six interlinked pages on one non-affiliated
   domain registered 2026-04-20). A third, that Robinhood offers no sanctioned programmatic equities
   access, is materially out of date (§4).
 - ⚠️ **Two corrections run against the 2026-08-05 study itself, and are attributed and dated rather
   than quietly fixed** (§1a, both from the 2026-08-09 re-run): its **"non-deterministically
   enumerable universe"** finding no longer reproduces — the listing is now stable, zero drift across
-  four calls, a clean cursor walk to 19 188 ids — and its **"the order path is refused by design"**
+  four calls, a clean cursor walk to 19 188 ids over the script's 20-page cap, which the walk hit,
+  so whether the universe terminates there is **not established** — and its **"the order path is
+  refused by design"**
   conclusion was never established, because it rested solely on a preview 403 and `create_order` was
   never called. Neither is a defect in that study's method; the first is a venue that changed, the
   second is an over-generalisation this document repeated before catching it.
-- ⚠️ **Two claims withdrawn by an earlier pass have been RESTORED, and the withdrawals were the
+- ⚠️ **Four claims withdrawn by earlier passes have been RESTORED, and the withdrawals were the
   error:** the **"Coinbase for Agents" roadmap wording**, which is quotable verbatim from
   `docs.cdp.coinbase.com` and uses the word "equities" under an explicit "Coming soon" header (§1d —
-  the earlier pass checked the 403-gated `coinbase.com` instead), and the **equity trading-session
+  the earlier pass checked the 403-gated `coinbase.com` instead); the **equity trading-session
   enum**, which is printed in full on the create-order reference and is quoted with its real
-  six-value spelling in §5/E3. ⚠️ **The related brief claim that the "planned for the future" line
+  six-value spelling in §5/E3; the **"equity" occurrence count in the spec** (the string `equit`,
+  case-insensitive, occurs **150 times**); and the **named equity-specific error codes**
+  (`INVALID_EQUITY_TRADING_SESSION` on create-order, `PREVIEW_INVALID_EQUITY_TRADING_SESSION` on
+  preview). The last two were `grep`-able in the same 422,237-byte spec file the rest of §1b was
+  read from (§1b). ⚠️ **The related brief claim that the "planned for the future" line
   was CoinDesk's paraphrase rather than Coinbase's own wording is REFUTED**: only the exact CoinDesk
-  sentence was the journalist's construction.
+  sentence was the journalist's construction. ⚠️ **And one retraction over-reached:** the
+  trading-session retraction withdrew the type name `EquityTradingSession` along with the five
+  invented value spellings, but the type name was correct —
+  `coinbase.public_api.authed.retail_brokerage_api.EquityTradingSession` is the spec's own schema
+  name (§5/E3).
 - ⚠️ **Still withdrawn and printed nowhere, because no pass could confirm them:** the brokerage
   launch chronology and its FINRA/SEC/Apex filing citations (§1a — `coinbase.com` and
-  `help.coinbase.com` return HTTP 403 to automated fetching), the tokenized-equity press citations
-  (§1e), an **occurrence count** for "equity" in the spec, and **named equity-specific error codes**.
-  **An earlier draft printed several of these as verified.** None is load-bearing: §1b settles the
+  `help.coinbase.com` return HTTP 403 to automated fetching), and the tokenized-equity press
+  citations (§1e).
+  **An earlier draft printed several of these as verified.** Neither is load-bearing: §1b settles the
   venue question from a directly-readable source, and the "real US shares on venue CCM with Apex
   clearing" finding those citations were decorating is independently established by keel's own
   committed probe.
@@ -1445,8 +1555,9 @@ Three rules fall out of that, and they are cheap:
 - ⚠️ **"The introduction page is merely stale" is NOT established, and an earlier draft asserted it.**
   Equity support appears only inside auto-generated per-endpoint OpenAPI schema blocks carrying
   internal protobuf names (`coinbase.public_api.authed.retail_brokerage_api.*`). The hand-written
-  surfaces — REST introduction, overview, orders guide, FAQ, changelog (**zero occurrences of
-  "equit"**) — are silent. Given the live 403 and the data vacuum, **the introduction describes what
+  surfaces — REST introduction, overview, orders guide, FAQ, changelog — are **silent** (stated as
+  silence, not as an occurrence count: no URL or read-date was recorded for the changelog check).
+  Given the live 403 and the data vacuum, **the introduction describes what
   is usable more accurately than the schema describes what is shipped** (§1b).
 - **§71.6 applied to real US shares is an INFERENCE**, not a direct citation. Stated above; restated
   here because the whole verdict rests on it.
@@ -1465,18 +1576,26 @@ Three rules fall out of that, and they are cheap:
   revision exists is UNVERIFIED** — none was found, none was ruled out, since AAOIFI's e-standards
   portal is paywalled. Neither affects the verdict; both should be checked before the standard is
   written into the KB.
-- ⚠️ **SS 21 contradicts itself on the clause 3/19 tangible-assets floor** — 30% in the clause,
-  one-third in footnote (1) to 3/1 and in the Appendix, with AAOIFI's own note that the footnote
-  anticipates *"subsequent amending procedures"*. Recorded, not resolved.
+- ⚠️ **SS 21 states the clause 3/19 tangible-assets floor at two numbers, on two different
+  measures** — 30% of total assets in the clause, counting *"assets, benefits and rights"* with cash
+  in the denominator; one-third in footnote (1) to 3/1 and in the Appendix, on a *"tangible and cash
+  assets"* numerator — with AAOIFI's own note that the footnote anticipates *"subsequent amending
+  procedures"*. Recorded, not resolved, and **not cleanly a self-contradiction**, since the two are
+  not the same quantity. ⚠️ **Clause 3/19 is also a regime selector, not an admission ratio**:
+  below the floor the sarf and debt rules must be observed, and the share is not refused (§3).
 - ⚠️ **Two claims in §65.10 are now out of date, through no fault of the entry**, which faithfully
-  records its source: DJIM retired its receivables screen (2023-03-17) and its cash screen
-  (2023-09-15) and now has a **single** accounting ratio, and its window is **24 months**, not the
+  records its source: DJIM retired its receivables screen and its cash screen **during 2023** (S&P
+  DJI Index Announcement of 2023-08-04; **exact effective dates not confirmed at source**) and now
+  has a **single** accounting ratio, and its window is **24 months**, not the
   12 §65.10 records. A screen built against §65.10's DJIM description would implement a retired
   methodology. This matters only because §65.10 is the KB's sole screening entry today.
 - **The current S&P Shariah (2026) and DJIM (2026) methodologies were not read directly** —
-  spglobal.com refuses automated fetching. The verified editions are DJIM May 2025 and S&P Shariah
-  January 2015; DJIM's own change log shows no accounting-screen change after 2023-09-15, so the
-  comparison table is high-confidence but not certified current.
+  spglobal.com refuses automated fetching (both PDFs refuse `curl` and a fetcher alike), so the
+  three index rows in §3's comparison table come from secondary summaries and the editions named
+  here. The verified editions are DJIM May 2025 and S&P Shariah **January 2015** — which is old
+  enough that the S&P row may itself have been superseded by the same 2023 change-set; DJIM's own
+  change log shows no accounting-screen change after 2023, so the comparison table is
+  high-confidence for DJIM but not certified current for S&P.
 - **Day estimates are judgement, not measurement**, and the range is deliberately wide. P1 in
   particular could be much larger — or could be correctly refused.
 - **The recurring per-period screening cost is an operating cost that is not in the day estimate
