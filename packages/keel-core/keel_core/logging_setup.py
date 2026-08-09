@@ -24,6 +24,7 @@ import logging
 import logging.handlers
 from pathlib import Path
 
+from keel_core.alerting import install_alerting, resolve_webhook_url
 from keel_core.config import LoggingConfig
 from keel_core.telemetry import JsonFormatter
 
@@ -54,6 +55,12 @@ def configure_logging(cfg: LoggingConfig) -> logging.Logger:
 
     logger.setLevel(logging.INFO if cfg.verbose else logging.ERROR)
     logger.propagate = False
+
+    # CRITICAL escalations off this machine, when a webhook is configured. A no-op otherwise, so
+    # an offline-first install makes no network call it did not ask for. Attached here because
+    # this is already the one place handlers are owned and de-duplicated; the level lives on the
+    # handler, so `cfg.verbose` cannot turn the alert channel into a firehose.
+    install_alerting(logger, resolve_webhook_url())
 
     return logger
 

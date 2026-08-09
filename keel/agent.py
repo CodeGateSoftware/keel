@@ -671,6 +671,10 @@ def _handle_exits(
         repo.set_state(f"position_rule:{product_id}", None)
         repo.set_state(f"open_stop:{product_id}", None)
         repo.set_state(f"open_target:{product_id}", None)
+        # Same reasoning for the unprotected-bracket retry record: the position it described is
+        # out, so a surviving record would have the next cycle place a protective SELL against
+        # inventory that is no longer held.
+        repo.set_state(f"{executor.UNBRACKETED_PREFIX}{product_id}", None)
     return [result]
 
 
@@ -870,6 +874,13 @@ def run_once(
         # sizing a new entry against stale `pending` state would mark sold inventory as still
         # held and compute rail 11's drawdown off a position that no longer exists.
         reconcile.reconcile_open_orders(broker, repo, config, now_ts)
+
+        # Then protect anything still holding without a bracket. AFTER the pass above, which may
+        # itself have healed a dead bracket or closed a position out -- running it first would
+        # re-place brackets for tranches that were about to be resolved anyway. This is the only
+        # thing that ever revisits a bracket that was never placed at all: it owns no `pending`
+        # row, so the pass above cannot see it (issue #195).
+        reconcile.reconcile_unbracketed_positions(broker, repo, config, now_ts)
 
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to

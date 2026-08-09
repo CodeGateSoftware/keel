@@ -995,6 +995,40 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
 
 
+def test_run_once_brackets_a_tranche_whose_bracket_was_never_placed(repo: Repository) -> None:
+    """The wiring guard for the unbracketed sweep, and the reason it matters more than most.
+
+    Every test in tests/execution/test_reconcile.py calls `reconcile_unbracketed_positions`
+    directly and would pass in full while `run_once` never invoked it -- leaving the exact hole
+    the pass was written to close wide open (issue #195). A fix that is not on the cycle path
+    protects nothing.
+    """
+    _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=1_000)
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": "turtle_breakout", "opened_at": 1_000,
+    })
+    # A tranche naming NO bracket: the entry filled, the protective order was refused.
+    position_id = repo.open_position(
+        product_id=PRODUCT, rule_name="turtle_breakout", opened_at=1_000, qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"), entry_fee=Decimal("3"), bracket_order_id=None,
+    )
+    repo.set_state(f"unbracketed:{PRODUCT}", {
+        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
+    })
+    broker = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    )
+
+    run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    tranche = [p for p in repo.get_open_positions(PRODUCT) if p["id"] == position_id]
+    assert tranche, "the tranche was closed rather than protected"
+    assert tranche[0]["bracket_order_id"] is not None, (
+        "run_once left a held tranche with no bracket -- the sweep is not on the cycle path"
+    )
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is None
+
+
 def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:
     """The other half of the per-tranche ledger, and the half the plan originally left behind.
 
