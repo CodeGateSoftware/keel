@@ -1,0 +1,12 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "account_number": "AB1234567890",
+      "asset_code": "BTC",
+      "total_quantity": "0.53219871",
+      "quantity_available_for_trading": "0.50000000"
+    }
+  ]
+}

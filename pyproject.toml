@@ -45,6 +45,7 @@ keel-core = { workspace = true }
 keel-broker-api = { workspace = true }
 keel-broker-coinbase = { workspace = true }
 keel-broker-fake = { workspace = true }
+keel-broker-robinhood = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -54,6 +55,16 @@ dev = [
     # Dev-only on purpose: the fake venue exists to exert design pressure on the port and to
     # prove two-plugin discovery. A production engine must never have it installed.
     "keel-broker-fake",
+    # Dev-only for a different reason: Robinhood is an OPTIONAL venue, not one keel needs in
+    # order to run. Making it a runtime dependency of `keel-trader` would put an Ed25519 stack
+    # (pynacl) into every install for an adapter the live path cannot even reach today --
+    # nothing constructs it, `keel/commands/_common.py` still builds `CoinbaseClient` directly,
+    # and the broker-port migration has not landed. Coinbase is a hard dependency only because
+    # `keel/` still imports its SDK directly; no such import exists for this one, so the
+    # workspace entry above plus this line is the whole wiring. It is here rather than nowhere
+    # so the conformance suite actually runs against it in CI. Users who want the venue install
+    # `keel-broker-robinhood` themselves and entry-point discovery picks it up.
+    "keel-broker-robinhood",
 ]
 
 # Ruff config lives in ruff.toml at the repo root. A ruff.toml takes precedence over
@@ -69,6 +80,7 @@ module = [
     "keel_broker_api.*",
     "keel_broker_coinbase.*",
     "keel_broker_fake.*",
+    "keel_broker_robinhood.*",
 ]
 strict = true
 

@@ -1,0 +1,12 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "symbol": "BTC-USD",
+      "side": "ask",
+      "price": "65482.30",
+      "quantity": "0.1"
+    }
+  ]
+}
