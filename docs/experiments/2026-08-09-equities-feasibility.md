@@ -91,7 +91,7 @@ CAPABILITY, not the instrument. Stocks are "not yet", where a CFD is "never".**
 | Gate | What it asks | Result | Kind of blocker |
 |---|---|---|---|
 | **Coinbase venue** | is there an equities order path on Advanced Trade? | ⚠️ **YES — the brief said no and was wrong.** Equity orders route through the ordinary create-order endpoint, addressed by `product_id`, with `equity_order_metadata` carrying the session and time in force | corrected in §1b. **Not the blocker.** |
-| **Coinbase, as measured** | could keel's own account actually use it? | **NO, and the 2026-08-09 re-probe made it worse, not better.** Preview refused 403 with a **product-class** message, and **zero market data on every surface tried** — no candles over a 30-day window, no closes on regular trading days, empty price strings on all 1000 products | **re-measured, no longer "stale". Independently decisive** |
+| **Coinbase, as measured** | could keel's own account actually use it? | **NO, and the 2026-08-09 re-probe made it worse, not better.** Preview refused 403 with a **product-class** message, and **zero market data on every surface tried** — no candles over a 30-day window, no closes on regular trading days, empty price strings across the first-page 1000 (~5% sample) | **re-measured, no longer "stale". Independently decisive** |
 | **Coinbase market data** | can an algo price an equity at any granularity? | **NO — the vacuum is total.** `get_candles` ONE_DAY over 30 days returns **n=0** across 21 trading days on both quote legs; `recent_trading_days` returns empty open/close for regular sessions; book and trades 500; **the WebSocket channel docs are silent on equities** (2026-08-09) | **not a rollout artifact and not a weekend artifact.** A second refusal, independent of the first but Coinbase-specific |
 | **Coinbase, for keel specifically** | do the documented equity rules fit keel's execution model? | **NO — three conflicts.** No preview (fatal to `executor.py:445`), no attached orders (breaks `place_bracket`), no `quote_size` outside the normal session (breaks `MarketIOCByQuote`) | real, and survives however the row above resolves |
 | **Charter — §71.6** | may keel hold an instrument representing equity in an issuer? | **NO — reject BY CAPABILITY.** Share-style *business and financial* screening is mandatory and keel performs none | **capability gap, not a prohibition.** The true blocker. Buildable. |
@@ -142,7 +142,7 @@ conservative than its own precedent, and both are stated in full and left open a
 
 ### (a) keel's own committed probe — measured 2026-08-05, **re-measured 2026-08-09**
 
-Two runs, and **not the same instrument both times.** The 2026-08-05 measurements come from the
+Two runs, and **not the same instrumentation both times.** The 2026-08-05 measurements come from the
 committed, re-runnable `docs/experiments/2026-08-05-coinbase-asset-class-probe.py` — read-only,
 POST-guarded, `create_order` never called. The 2026-08-09 re-run executed that same committed script
 **and additional ad-hoc read-only queries written for the fact-check** (`recent_trading_days`,
@@ -165,7 +165,8 @@ finding.
 - **Zero market data at any granularity.** `get_candles` returns `n=0` at ONE_HOUR *and* ONE_DAY,
   on both the USDC-quoted id and its `alias` USD-quoted twin. `get_best_bid_ask` returns
   `{"pricebooks": []}`. `price`, `best_bid_price`, `best_ask_price`, `mid_market_price` and
-  `volume_24h` are **empty strings on all 1000 products**. Book and trades return HTTP 500 —
+  `volume_24h` are **empty strings on all 1000 products of the first page** (~5% of the 19 188-id
+  universe; no per-product field was sampled beyond it). Book and trades return HTTP 500 —
   corroborating only, since a fault can be fixed.
 - **Not a market-hours artifact.** The identical calls were re-run five minutes into the `NORMAL`
   session across `SPY`/`QQQ`/`AAPL`/`NVDA`/`TSLA`, on both quote legs, ten products: identical
@@ -234,9 +235,9 @@ equities message names the *product class*, not the caller. That materially weak
 as finding 1: the surface is listed, not launched.
 
 **5. ⚠️ And a finding that cuts the other way, recorded because suppressing it would be exactly the
-failure this document is trying to avoid.** `equity_trading_flags`, read across all 1000 equity
-products on 2026-08-09, returns **`tradable: true, buy_enabled: true, sell_enabled: true` on
-998 of 1000**, with `view_only: false`, `trading_disabled: false`, `liquidate_only: false` and
+failure this document is trying to avoid.** `equity_trading_flags`, read across the first page of
+1000 equity products on 2026-08-09 (~5% of the universe), returns **`tradable: true, buy_enabled:
+true, sell_enabled: true` on 998 of those 1000**, with `view_only: false`, `trading_disabled: false`, `liquidate_only: false` and
 `trading_halted: false`. ⚠️ *ad-hoc, not re-runnable* — and ⚠️ the raw output for this specific
 six-field read was not re-confirmed; the committed script's same-shaped `view_only` count at
 `probe.py:98` is a possible source of confusion. **The products declare themselves tradable.**
@@ -356,9 +357,9 @@ more than either.
 | What | Status |
 |---|---|
 | Equity order path exists in the documented API | **yes** — spec + create-order reference, read 2026-08-09 |
-| Equity products declare themselves tradable | **yes** — `equity_trading_flags` `tradable/buy_enabled/sell_enabled: true` on **998 of 1000**, measured 2026-08-09 |
+| Equity products declare themselves tradable | **yes** — `equity_trading_flags` `tradable/buy_enabled/sell_enabled: true` on **998 of the first-page 1000** (~5% sample), measured 2026-08-09 |
 | keel's account could preview an equity order | **no** — 403 `"API order preview is not available for equities products"`, measured 2026-08-05 **and again 2026-08-09** |
-| Equity market data on this account | **none** — no daily bars over 21 trading days, no open/close on regular trading days, empty price strings on all 1000 products, no WebSocket channel. Measured 2026-08-05 and, more thoroughly, 2026-08-09 |
+| Equity market data on this account | **none** — no daily bars over 21 trading days, no open/close on regular trading days, empty price strings across the first-page 1000 (~5% sample), no WebSocket channel. Measured 2026-08-05 and, more thoroughly, 2026-08-09 |
 | **`create_order` on an equity** | **never called.** Deliberately, then and now |
 
 So the accurate statement is **not** "Coinbase has no equities API," and it is no longer "we do not
@@ -1337,8 +1338,9 @@ Ordered by dependency, and by which is the true blocker.
 **Total: roughly 65–130 engineer-days — of which 50–100 are equity-specific**, since P0 is owed
 regardless. Call it **three to six months** of one engineer, plus the unbounded standards item and
 the recurring screening cost, and treat the low end as optimistic — the range is wide because P1's
-true size depends on a fundamentals data decision nobody has made and a standards read nobody has
-done.
+true size depends on a fundamentals data decision nobody has made and on turning §3's read of SS 21
+into an implementable KB entry — the standard itself is read and quoted (§3); what is undone is the
+authoring step that turns it into rules a screen can execute.
 
 **Three properties of that ordering matter more than the totals, and they are the part of this
 section worth remembering:**
@@ -1544,8 +1546,9 @@ Four rules fall out of that, and they are cheap:
   clearing" finding those citations were decorating is independently established by keel's own
   committed probe.
 - ⚠️ **A finding that cuts against this document's conclusion, recorded rather than buried:**
-  `equity_trading_flags` returns `tradable/buy_enabled/sell_enabled: true` on **998 of 1000** equity
-  products, with no halt, view-only or liquidate-only state (2026-08-09). The products declare
+  `equity_trading_flags` returns `tradable/buy_enabled/sell_enabled: true` on **998 of the first-page
+  1000** equity products (~5% sample), with no halt, view-only or liquidate-only state (2026-08-09).
+  The products declare
   themselves tradable. It does not change the verdict — §2 is broker-independent and the market-data
   vacuum is separately fatal — but anyone arguing the surface is dead should know it is the products
   themselves saying otherwise.
