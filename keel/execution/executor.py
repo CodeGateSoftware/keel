@@ -58,11 +58,12 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Literal
 
+from keel_broker_api.results import Preview
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
@@ -88,7 +89,10 @@ class ExecutionResult:
     placed: bool
     order_id: int | None
     vetoed_by: list[str]
-    preview: dict[str, Any] | None
+    # Whatever `broker.preview_order` handed back, verbatim. A dict from the pre-port
+    # `CoinbaseClient` today; a `Preview` once Phase B migrates the call. Anything reading money
+    # out of this must branch on the shape -- see `ConfirmFn` below and `_run_order`'s `fee`.
+    preview: Preview | dict[str, Any] | None
     reason: str
     # The local `orders.id` of the exit bracket this entry left resting, when one was placed.
     # `execute` places the bracket itself, so this is the ONLY way a caller can learn its id --
@@ -99,7 +103,13 @@ class ExecutionResult:
     bracket_order_id: int | None = None
 
 
-ConfirmFn = Callable[[dict[str, Any]], bool]
+#: The human confirm gate for `mode="confirm"`. Takes BOTH shapes on purpose: `broker` here is
+#: still the pre-port `CoinbaseClient`, whose `preview_order` returns a dict, but the port's
+#: `Preview` is what carries `synthetic` -- the flag that tells a human whether they are
+#: approving a venue's quote or an estimate keel computed. A gate typed to `dict` alone has
+#: nowhere to render that (issue #199), and one typed to `Preview` alone breaks the only venue
+#: that trades today. Both, until Phase B makes `preview_order` return `Preview` everywhere.
+ConfirmFn = Callable[[Preview | Mapping[str, Any]], bool]
 
 
 # -- main entry point -----------------------------------------------------------------------

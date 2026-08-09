@@ -126,17 +126,34 @@ Autonomy is **off** by default, so this is what you should see:
 
 ```
 Rails PASSED. Coinbase order preview:
+  ========================================================================
+  BROKER QUOTE -- the venue priced this order itself.
+  ========================================================================
     order_total: 5.00
     ...
 Place this order? [y/N]:
 ```
 
-**Read the preview before answering.** It is the broker's own numbers, not keel's estimate. Check
-the product, the side, and the total. If anything surprises you, answer `N` — declining places
-nothing and costs nothing.
+**Read the banner first, then the numbers.** The `=` rule above means Coinbase priced this order
+itself — those are the venue's own figures. Check the product, the side, and the total. If
+anything surprises you, answer `N`; declining places nothing and costs nothing.
 
 The rails have already passed at this point. The prompt is an **additional** human gate, never a
 replacement for them.
+
+**A `!` block instead of the `=` rule means stop and read.** The gate shouts in three cases, and
+none of them should appear against Coinbase today:
+
+- `SYNTHETIC ESTIMATE -- NOT A BROKER QUOTE` — the figures are keel's own estimate from a price
+  lookup. The venue has priced, validated and reserved nothing, and is bound by none of them.
+  Only a venue with no preview endpoint produces this; Coinbase has one.
+- `UNPRICED -- this preview carries no usable size` — a zero here is **not** a cheap order, it is
+  an order whose cost could not be determined.
+- `PREVIEW ERRORS (n)` — the venue or the adapter reported a problem with this specific order.
+
+The last two replace `[y/N]` with a typed `place anyway`. That is friction, not a wall: it stays
+possible on purpose so a broken pricing endpoint can never trap you out of *closing* a position.
+If you are opening one, the right answer to a shouting gate is almost always to decline.
 
 **If you instead see `signals=0` and no preview**, no rule produced a setup this cycle — the
 cycle itself ran fine. With a DCA test vehicle this is almost always the cadence gotcha (see
