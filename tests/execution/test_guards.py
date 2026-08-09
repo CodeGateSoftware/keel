@@ -1508,3 +1508,96 @@ def test_offline_still_honours_the_kill_switch(repo: Repository) -> None:
 def test_a_clean_intent_passes_offline_without_live_state(repo: Repository) -> None:
     intent = _intent(available_quote=None, withdrawals_enabled=None)
     assert check(intent, repo, _config(), NOW_TS, offline=True).ok is True
+
+
+# -- rail 9 and the protective bracket (issue #206) -------------------------------------------
+#
+# A bracket's stop travels as `entry` with `stop=None` (see `place_bracket`), because the order
+# TRIGGERS at that price -- it is not an entry protected by a stop somewhere else. Rail 9's
+# `intent.stop is not None` guard therefore skipped every bracket ever placed, so the one rail
+# that enforces ratchet-only saw only entries. `protective_stop` is the field that makes the
+# bracket's own trigger visible to it.
+#
+# It is deliberately a SEPARATE field rather than reusing `stop`: rail 7 (min-move) computes
+# `abs(entry - stop) / entry`, and a bracket has `entry == stop` by construction, so populating
+# `stop` would compute a 0% move and veto EVERY protective bracket on the anti-scalping floor.
+
+
+def test_rail9_sees_a_protective_brackets_own_stop(repo):
+    """The gap. A replacement bracket trying to trigger BELOW the recorded stop is widening the
+    position's risk, and before `protective_stop` nothing checked it -- `_roll_stop` has its own
+    ratchet guard, but it has no production caller, so on the live path this was unenforced."""
+    repo.set_state("open_stop:BTC-USD", Decimal("49500"))
+    intent = _intent(
+        side=Side.SELL,
+        entry=Decimal("49000"),
+        stop=None,
+        protective_stop=Decimal("49000"),  # below the recorded 49500 -- widening
+        rule_kind="turtle_breakout",
+    )
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert "no_stop_widening" in _keys(result)
+
+
+def test_rail9_allows_a_bracket_that_ratchets_toward_profit(repo):
+    repo.set_state("open_stop:BTC-USD", Decimal("49000"))
+    intent = _intent(
+        side=Side.SELL,
+        entry=Decimal("49500"),
+        stop=None,
+        protective_stop=Decimal("49500"),
+        rule_kind="turtle_breakout",
+    )
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert "no_stop_widening" not in _keys(result)
+
+
+def test_rail9_allows_re_placing_a_bracket_at_the_SAME_stop(repo):
+    """The case that must not regress. Re-bracketing after a bracket dies or is rejected
+    re-places at the recorded level (`_rebracket_or_escalate` and
+    `reconcile_unbracketed_positions` both do exactly this), so an off-by-one to `<=` here would
+    veto every recovery and strand the position naked -- the failure #195 just closed."""
+    repo.set_state("open_stop:BTC-USD", Decimal("49000"))
+    intent = _intent(
+        side=Side.SELL,
+        entry=Decimal("49000"),
+        stop=None,
+        protective_stop=Decimal("49000"),
+        rule_kind="turtle_breakout",
+    )
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert "no_stop_widening" not in _keys(result)
+
+
+def test_a_protective_bracket_is_not_vetoed_by_the_min_move_floor(repo):
+    """Why `protective_stop` is a separate field and not just `stop`. Rail 7 measures
+    entry-to-stop distance; a bracket's are the same price, so reusing `stop` would read as a 0%
+    move and veto every protective order keel places."""
+    intent = _intent(
+        side=Side.SELL,
+        entry=Decimal("49000"),
+        stop=None,
+        protective_stop=Decimal("49000"),
+        rule_kind="turtle_breakout",
+    )
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert "min_move_anti_scalping" not in _keys(result)
+
+
+def test_an_entry_intent_still_uses_its_own_stop_for_rail9(repo):
+    """`protective_stop` must not shadow the entry path rail 9 already covered."""
+    repo.set_state("open_stop:BTC-USD", Decimal("49500"))
+    intent = _intent(stop=Decimal("49000"))  # a BUY, widening
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert _keys(result) == {"no_stop_widening"}

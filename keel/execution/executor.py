@@ -766,6 +766,9 @@ def place_bracket(
         qty=qty,
         entry=stop,
         stop=None,
+        # The trigger price again, this time where rail 9 can read it. `stop` stays None so rail
+        # 7 does not measure a 0% entry-to-stop move and veto the bracket (issue #206).
+        protective_stop=stop,
         notional=sizing.spend(qty, stop),
         is_dca=False,
         rule_kind=rule_name,
@@ -920,6 +923,9 @@ def _roll_stop(
         qty=qty,
         entry=new_stop,
         stop=None,
+        # Belt and braces: this function already refuses a widening roll above, but that check is
+        # local and overridable by a future caller, whereas rail 9 is not (issue #206).
+        protective_stop=new_stop,
         notional=sizing.spend(qty, new_stop),
         is_dca=False,
         rule_kind=rule_name,
