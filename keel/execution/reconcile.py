@@ -113,6 +113,126 @@ def reconcile_open_orders(
 
 
 
+def reconcile_unbracketed_positions(
+    broker: Any, repo: Repository, config: Config, now_ts: int
+) -> list[int]:
+    """Give a bracket to every held tranche that has none, or escalate. Returns healed ids.
+
+    `_rebracket_or_escalate` below heals a bracket that WAS accepted and later died. It cannot
+    reach a bracket that was never placed at all, because it is driven from
+    `reconcile_open_orders`, which iterates `status="pending"` rows: a broker rejection writes
+    `rejected` and a rails veto writes no row whatsoever (the insert happens after the guard
+    gate). Neither is `pending`, so before this pass nothing revisited the tranche and the
+    position stayed naked for a full cycle -- one per UTC day -- behind a WARNING (issue #195).
+
+    Driven from the `positions` ledger rather than from `orders`, because the ledger is the only
+    place that knows a tranche is HELD. A tranche is considered protected only while its bracket
+    is still `pending`; `filled` means the position is on its way out, and any other status means
+    nothing is resting at the exchange.
+
+    A tranche with no recorded `unbracketed:` levels is skipped SILENTLY, not escalated. That is
+    DCA's correct resting state -- it carries no stop by design -- and escalating it would fire a
+    CRITICAL for every DCA tranche on every cycle, which trains the alert to be ignored.
+    """
+    healed: list[int] = []
+
+    for position in repo.get_open_positions():
+        product_id = position["product_id"]
+        if _has_resting_bracket(repo, position):
+            continue
+
+        intent = repo.get_state(f"{executor.UNBRACKETED_PREFIX}{product_id}")
+        if not intent:
+            continue
+
+        # Stale ledger state, not an exposure. A protective SELL with nothing to sell would be a
+        # naked short -- a shape keel cannot hold -- so the record is retired rather than acted on.
+        held_qty, _avg_cost = _held_position(repo, product_id)
+        if held_qty <= 0:
+            repo.set_state(f"{executor.UNBRACKETED_PREFIX}{product_id}", None)
+            continue
+
+        # Size from the TRANCHE, matching `_rebracket_or_escalate`: the recorded `qty` is what the
+        # failed attempt tried, but the ledger is what is actually held now.
+        qty = position["qty"]
+
+        # Per-position isolation, for the same reason the status fetch has it: placing an order
+        # reaches the network, and one unreachable product must not abandon the rest of the sweep
+        # -- nor swallow the escalation below, which would leave the position naked AND silent.
+        try:
+            new_id = executor.place_bracket(
+                broker,
+                repo,
+                config,
+                product_id=product_id,
+                qty=qty,
+                stop=intent["stop"],
+                target=intent["target"],
+                rule_name=position.get("rule_name") or "rebracket",
+                now_ts=now_ts,
+            )
+        except Exception:
+            log_exception(
+                logger,
+                "reconcile.rebracket_failed",
+                position_id=position["id"],
+                product=product_id,
+            )
+            new_id = None
+
+        if new_id is None:
+            # `place_bracket` has re-written the `unbracketed:` record on its way out, so the
+            # retry survives to the next cycle rather than being stranded here.
+            _escalate_unprotected_position(
+                position, qty, "bracket placement was vetoed or rejected again"
+            )
+            continue
+
+        repo.set_position_bracket(position["id"], new_id)
+        healed.append(position["id"])
+        log_event(
+            logger,
+            logging.WARNING,
+            "reconcile.unbracketed_position_protected",
+            product=product_id,
+            position_id=position["id"],
+            new_order_id=new_id,
+            stop=intent["stop"],
+            target=intent["target"],
+        )
+
+    return healed
+
+
+def _has_resting_bracket(repo: Repository, position: dict[str, Any]) -> bool:
+    """Whether this tranche still has a bracket working at the exchange."""
+    bracket_id = position.get("bracket_order_id")
+    if bracket_id is None:
+        return False
+    order = repo.get_order(bracket_id)
+    if order is None:
+        return False
+    return str(order["status"]) in {"pending", "filled"}
+
+
+def _escalate_unprotected_position(
+    position: dict[str, Any], qty: Decimal, why: str
+) -> None:
+    log_event(
+        logger,
+        logging.CRITICAL,
+        "reconcile.position_unprotected",
+        product=position["product_id"],
+        position_id=position["id"],
+        held_qty=str(qty),
+        reason=why,
+        detail=(
+            "this tranche is held with NO protective stop at the exchange and a replacement "
+            "could not be placed -- re-place one or close it before trading on"
+        ),
+    )
+
+
 def _rebracket_or_escalate(
     broker: Any, repo: Repository, config: Config, row: dict[str, Any], now_ts: int
 ) -> None:
@@ -351,6 +471,7 @@ def _record_fill(
         repo.set_state(f"position_rule:{product_id}", None)
         repo.set_state(f"open_stop:{product_id}", None)
         repo.set_state(f"open_target:{product_id}", None)
+        repo.set_state(f"{executor.UNBRACKETED_PREFIX}{product_id}", None)
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:

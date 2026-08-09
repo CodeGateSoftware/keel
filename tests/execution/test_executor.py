@@ -1572,3 +1572,44 @@ def test_quote_fetch_keeps_a_real_broker_error_at_error_with_its_traceback(caplo
     assert result is None
     assert payload["level"] == "ERROR"
     assert "Traceback" in payload["exc"]
+
+
+def test_a_bracket_that_could_not_be_placed_records_the_levels_it_failed_at(repo):
+    """The entry has already filled by the time the bracket is attempted, so a refusal leaves a
+    real position with no stop at the exchange. `open_stop`/`open_target` are deliberately NOT
+    written here -- they mean "this is resting at the exchange" and rail 9 reads them as its
+    no-widening reference. The retry needs the levels anyway, so they go somewhere of their own.
+
+    Without this record there is nothing to retry FROM: reconcile refuses to invent a stop, and
+    inventing one would re-risk the position on a level no rule produced (issue #195).
+    """
+    broker = FakeBroker(place_success=False)
+
+    order_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert order_id is None
+    assert repo.get_state("open_stop:BTC-USD") is None
+    assert repo.get_state("open_target:BTC-USD") is None
+    assert repo.get_state("unbracketed:BTC-USD") == {
+        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
+    }
+
+
+def test_a_placed_bracket_clears_an_earlier_unprotected_record(repo):
+    """A retry that succeeds must retire the trigger that drove it, or the sweep re-places a
+    bracket the position already holds on every subsequent cycle."""
+    repo.set_state("unbracketed:BTC-USD", {
+        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
+    })
+
+    place_bracket(
+        FakeBroker(), repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    assert repo.get_state("unbracketed:BTC-USD") is None

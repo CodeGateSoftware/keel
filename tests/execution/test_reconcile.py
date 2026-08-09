@@ -614,3 +614,181 @@ def test_the_outcome_uses_the_OBSERVED_filled_size_not_the_orders_original_qty(r
     assert outcome["qty"] == Decimal("0.008")
     # (48900 - 50000) * 0.008 - 2.34 exit - 3 entry
     assert outcome["pnl_net"] == Decimal("-14.14")
+
+
+# -- the never-placed bracket (issue #195) ----------------------------------------------------
+#
+# `_rebracket_or_escalate` above heals a bracket that WAS accepted and later died: it is reached
+# from the `_DEAD` branch of `reconcile_open_orders`, which only ever iterates `status="pending"`
+# rows. A bracket that was never placed at all has no such row -- a broker rejection writes
+# `rejected`, and a rails veto writes nothing, because the insert happens after the guard gate.
+# Neither is `pending`, so nothing revisited the tranche and the position stayed naked for a full
+# cycle (~24h, one per UTC day) behind a WARNING. These cover the ledger-driven sweep that closes
+# that hole.
+
+
+class _RejectingRebracketBroker(_RebracketingBroker):
+    """Placement reaches the exchange and comes back refused -- min-size, precision, a venue
+    error. The reachable cause of a never-placed bracket, and the one no rail can prevent."""
+
+    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+        self.placed.append({"product_id": product_id, "side": side,
+                            "order_configuration": order_configuration})
+        return {"success": False, "error": "PREVIEW_INVALID_BASE_SIZE"}
+
+
+def _seed_unbracketed_tranche(
+    repo: Repository,
+    *,
+    rule_name: str = "turtle_breakout",
+    with_intent: bool = True,
+    bracket_order_id: int | None = None,
+) -> int:
+    """A filled entry whose protective bracket never made it to the exchange.
+
+    The entry BUY is `filled` (so `_held_position` sees inventory) but the tranche names no
+    resting bracket. `with_intent=False` models a DCA tranche, which has no stop by design and
+    must never be swept.
+    """
+    repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.BUY.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=Decimal("50000"), status="filled",
+             fee=Decimal("3"), expected_fill=Decimal("50000"), actual_fill=Decimal("50000"),
+             created_at=NOW - 1000, updated_at=NOW - 1000)
+    )
+    repo.set_state(f"position_rule:{PRODUCT}", {
+        "rule_name": rule_name, "opened_at": NOW - 1000,
+    })
+    position_id = repo.open_position(
+        product_id=PRODUCT, rule_name=rule_name, opened_at=NOW - 1000,
+        qty=Decimal("0.01"), entry_fill=Decimal("50000"), entry_fee=Decimal("3"),
+        bracket_order_id=bracket_order_id,
+    )
+    if with_intent:
+        repo.set_state(f"unbracketed:{PRODUCT}", {
+            "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
+        })
+    return position_id
+
+
+def test_a_tranche_whose_bracket_was_never_placed_is_bracketed_next_cycle(repo):
+    """The hole this closes. Nothing reached this tranche before: it owns no `pending` row, so
+    `reconcile_open_orders` never looked at it, and no other pass scans held positions."""
+    position_id = _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+    broker = _RebracketingBroker()
+
+    reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert broker.placed, "the unprotected tranche was left without a bracket"
+    leg = broker.placed[-1]["order_configuration"]["trigger_bracket_gtc"]
+    # The levels the ORIGINAL trade was risk-sized against, not invented ones.
+    assert leg["stop_trigger_price"] == "49000"
+    assert leg["limit_price"] == "53000"
+
+    placed_id = repo.get_orders(mode="live", product_id=PRODUCT, status="pending")[-1]["id"]
+    owner = repo.get_position_for_bracket(placed_id)
+    assert owner is not None and owner["id"] == position_id
+
+
+def test_a_bracketed_tranche_clears_the_unprotected_record(repo):
+    """The record is the retry trigger. Left behind after a successful placement it would make
+    every later cycle re-place a bracket the position already has."""
+    _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+
+    reconcile.reconcile_unbracketed_positions(
+        _RebracketingBroker(), repo, _config(), now_ts=NOW
+    )
+
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is None
+
+
+def test_a_dca_tranche_with_no_bracket_is_left_alone(repo, caplog):
+    """DCA carries no stop by design (`agent.py`: "`None` for DCA (no stop, so no bracket)"), so
+    a NULL bracket is its correct resting state. Sweeping it would invent a stop no rule
+    produced, and escalating it would cry wolf on every DCA tranche every cycle."""
+    _seed_unbracketed_tranche(repo, rule_name="dca", with_intent=False)
+    _allow_orders(repo)
+    broker = _RebracketingBroker()
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert not broker.placed, "a DCA tranche was given a bracket it should never have"
+    assert "position_unprotected" not in caplog.text
+
+
+def test_a_tranche_that_still_cannot_be_bracketed_escalates_loudly(repo, caplog):
+    """Second placement attempt, second refusal. The position is genuinely naked and a human has
+    to know -- this is the one state the whole pass exists to make impossible to sit in quietly."""
+    _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_unbracketed_positions(
+            _RejectingRebracketBroker(), repo, _config(), now_ts=NOW
+        )
+
+    assert "reconcile.position_unprotected" in caplog.text
+
+
+def test_a_tranche_that_could_not_be_bracketed_keeps_its_record_for_the_next_cycle(repo):
+    """A failed retry must stay retryable. Clearing the record on failure would strand the
+    position permanently -- exactly the resting-state bug this pass was written to end."""
+    _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+
+    reconcile.reconcile_unbracketed_positions(
+        _RejectingRebracketBroker(), repo, _config(), now_ts=NOW
+    )
+
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is not None
+
+
+def test_a_tranche_with_a_resting_bracket_is_left_alone(repo):
+    """Already protected. Re-placing would commit inventory the resting bracket already holds
+    and be refused for insufficient funds -- turning a healthy position into a naked one."""
+    _seed_bracket(repo)
+    _allow_orders(repo)
+    broker = _RebracketingBroker()
+
+    reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert not broker.placed
+
+
+def test_a_tranche_whose_bracket_was_REJECTED_is_swept_too(repo):
+    """A broker rejection DOES write an order row, just not a `pending` one. Keying the sweep on
+    the row's existence rather than its status would skip exactly the reachable case."""
+    rejected_id = repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=None, status="rejected",
+             fee=None, expected_fill=Decimal("49000"), actual_fill=None,
+             created_at=NOW - 1000, updated_at=NOW - 1000)
+    )
+    _seed_unbracketed_tranche(repo, bracket_order_id=rejected_id)
+    _allow_orders(repo)
+    broker = _RebracketingBroker()
+
+    reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert broker.placed, "a tranche whose bracket was rejected was treated as protected"
+
+
+def test_a_sold_out_product_is_not_re_bracketed(repo):
+    """No inventory left means the tranche is stale ledger state, not an exposure. Placing a
+    protective SELL here would be a naked short -- structurally impossible for keel to hold."""
+    _seed_unbracketed_tranche(repo)
+    repo.insert_order(
+        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
+             qty=Decimal("0.01"), limit_price=None, status="filled",
+             fee=Decimal("2"), expected_fill=Decimal("49000"), actual_fill=Decimal("49000"),
+             created_at=NOW - 500, updated_at=NOW - 500)
+    )
+    _allow_orders(repo)
+    broker = _RebracketingBroker()
+
+    reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert not broker.placed

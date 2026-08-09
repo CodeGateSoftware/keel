@@ -726,6 +726,17 @@ def _bracket_order_configuration(
 
 # -- exit bracket ------------------------------------------------------------------------------
 
+#: `agent_state` key prefix for a bracket that was ATTEMPTED and refused, holding the levels the
+#: retry needs (`{"stop", "target", "qty"}`).
+#:
+#: ⚠️ Deliberately NOT `open_stop:`/`open_target:`. Those mean "this is resting at the exchange"
+#: -- rail 9 reads `open_stop` as its no-widening reference and `_roll_stop` re-places from the
+#: pair -- so writing them for an order that does not exist would tell rail 9 a stop is protecting
+#: a position when none is, and would let a later roll "replace" a bracket that was never there.
+#: The retry still needs the levels, because `_rebracket_or_escalate` refuses to invent them
+#: ("silently re-risk the position on a level no rule produced"), so they get a key of their own.
+UNBRACKETED_PREFIX = "unbracketed:"
+
 
 def place_bracket(
     broker: Any,
@@ -770,6 +781,15 @@ def place_bracket(
         order_configuration=_bracket_order_configuration(qty, target, stop),
     )
     if not result.placed:
+        # The entry has ALREADY filled by the time we get here, so this is a real position with
+        # no stop at the exchange -- not a trade that simply did not happen. Record the levels so
+        # `reconcile.reconcile_unbracketed_positions` can retry next cycle from the numbers the
+        # rule actually produced; without them the retry has nothing to place and the position
+        # stays naked until a human intervenes (issue #195).
+        repo.set_state(
+            f"{UNBRACKETED_PREFIX}{product_id}",
+            {"stop": stop, "target": target, "qty": qty},
+        )
         log_event(
             logger,
             logging.WARNING,
@@ -782,6 +802,10 @@ def place_bracket(
 
     repo.set_state(f"open_stop:{product_id}", stop)
     repo.set_state(f"open_target:{product_id}", target)
+    # Retire the retry trigger, if this call WAS the retry. Left set, the sweep would re-place a
+    # bracket the position already holds on every later cycle -- rejected for insufficient funds,
+    # since the resting bracket already commits the inventory.
+    repo.set_state(f"{UNBRACKETED_PREFIX}{product_id}", None)
     log_event(
         logger,
         logging.INFO,
