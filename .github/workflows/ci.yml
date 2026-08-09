@@ -1,13 +1,28 @@
 name: CI
 
-# The release workflow refuses to publish unless tests pass. That guarantee is only worth
-# something if tests also run on the way IN -- otherwise `main` can drift red between releases
-# and the gate discovers it at the worst moment.
+# Runs on `pull_request` only -- that is the gate that actually protects merges, and for a tool
+# that moves money it is the one worth paying for. It used to also run on `push` to `main`, but
+# that re-ran the exact same suite against the exact same content minutes after the PR run had
+# already passed it, roughly doubling Actions minutes for zero new information.
+#
+# Dropping the push trigger is safe because `release.yml` re-runs `ruff` + `pytest` itself as its
+# own gate before it will build an artifact, so `main` still cannot ship red even though nothing
+# runs automatically on push. The residual risk this accepts: a PR that was green against an
+# older `main` can merge and turn out to be red against the `main` it actually landed on -- a
+# semantic conflict between two independently-green changes. Previously CI would have caught that
+# on the next push; now it surfaces at release time instead of immediately. Branch protection's
+# "require branches to be up to date before merging" would close that gap by forcing every PR to
+# re-test against latest `main` before merge, but that is deliberately not being relied on here --
+# it would put the double-run cost right back, just moved earlier. `workflow_dispatch` is kept so
+# the suite can still be run on demand against `main` (e.g. to sanity-check before cutting a
+# release, or after changing branch protection settings) without needing a throwaway PR.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
+# `github.ref` is `refs/pull/<n>/merge` for `pull_request` runs and `refs/heads/<branch>` for a
+# manual `workflow_dispatch` run, so concurrent runs of the same PR still cancel each other and a
+# manual `main` run doesn't collide with anything else.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
