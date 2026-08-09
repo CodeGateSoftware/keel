@@ -105,19 +105,140 @@ def test_stop_limit_gtc_body() -> None:
     }
 
 
-def test_decimals_are_rendered_as_exact_strings_not_floats() -> None:
-    """A float round-trip here would silently change an order's size, price, or stop on the
-    live-money path."""
+#: Decimal inputs paired with the exact positional text Robinhood's JSON order body must carry.
+#:
+#: `str(Decimal)` is NOT a positional renderer. It switches to scientific notation whenever the
+#: value's adjusted exponent leaves a narrow band, so `str(Decimal("0.00000001"))` is `"1E-8"` --
+#: and Robinhood's order body has no exponent form. This is not a contrived edge case: BTC's
+#: `asset_increment` is exactly `0.00000001` (see `tests/fixtures/rh_trading_pairs.json`), which
+#: makes one satoshi the SMALLEST ORDER THIS VENUE ACCEPTS and therefore a size a dust-sized exit
+#: genuinely produces. `format(d, "f")` renders positionally at every magnitude.
+#:
+#: The first three entries all render wrongly under `str()`; the last two already rendered
+#: correctly and are kept so this parametrisation also proves the fix does not perturb the
+#: ordinary case.
+_EXPONENT_HAZARDS: list[tuple[str, str]] = [
+    # One satoshi -- the venue's own minimum increment for BTC. `str()` gives "1E-8".
+    ("0.00000001", "0.00000001"),
+    # Sub-satoshi precision, to prove the fix is about the exponent form and not about a single
+    # magic value. `str()` gives "1.2345E-8".
+    ("0.000000012345", "0.000000012345"),
+    # A value carrying a POSITIVE exponent. `Decimal("1E+2")` is 100, and `str()` gives "1E+2".
+    # Nobody writes this literal, but arithmetic inside the engine -- a size divided by a price
+    # and re-multiplied, say -- produces exactly this shape without anyone intending it.
+    ("1E+2", "100"),
+    ("0.123456789", "0.123456789"),
+    ("64000.10", "64000.10"),
+]
+
+
+def _rendered_values(body: dict[str, object]) -> list[str]:
+    """Every string leaf inside `body`'s `*_order_config` block.
+
+    Reaching into the config block rather than naming fields one at a time means a money or size
+    field added to a body later is covered by the exponent assertion below automatically, instead
+    of silently escaping it until a dust-sized order is rejected on the live-money path.
+    """
+    config = next(v for k, v in body.items() if k.endswith("_order_config"))
+    assert isinstance(config, dict)
+    return [v for v in config.values() if isinstance(v, str)]
+
+
+@pytest.mark.parametrize(("raw", "expected"), _EXPONENT_HAZARDS)
+def test_market_order_size_renders_positionally_never_in_scientific_notation(
+    raw: str, expected: str
+) -> None:
+    """A size rendered as `"1E-8"` is a malformed order body, not a rounding nuisance.
+
+    Robinhood's `asset_quantity` is parsed as a decimal string with no exponent form. A dust-sized
+    exit -- one satoshi, which is exactly BTC's `asset_increment` -- would go out as `"1E-8"` and
+    be rejected, and a rejected EXIT is a position that stays open when the engine believes it
+    closed. `str()` cannot be trusted to render a `Decimal` positionally; `format(d, "f")` can.
+    """
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal(raw))
+    body = to_order_body(spec, client_order_id="c1")
+
+    assert body["market_order_config"] == {"asset_quantity": expected}
+
+
+@pytest.mark.parametrize(("raw", "expected"), _EXPONENT_HAZARDS)
+def test_limit_order_size_and_price_render_positionally(raw: str, expected: str) -> None:
+    """Both the size and the limit price ride through the same renderer, so both must be pinned.
+
+    A limit PRICE in exponent form is the more dangerous of the two: rejected outright it is
+    merely a failed take-profit, but it is also the field a venue is most likely to parse
+    leniently and differently than intended."""
     spec = LimitGTC(
         product_id="BTC-USD",
         side=Side.BUY,
-        base_size=Decimal("0.123456789"),
-        limit_price=Decimal("64000.10"),
+        base_size=Decimal(raw),
+        limit_price=Decimal(raw),
     )
     body = to_order_body(spec, client_order_id="c1")
 
-    assert body["limit_order_config"]["asset_quantity"] == "0.123456789"
-    assert body["limit_order_config"]["limit_price"] == "64000.10"
+    assert body["limit_order_config"] == {
+        "asset_quantity": expected,
+        "limit_price": expected,
+        "time_in_force": "gtc",
+    }
+
+
+@pytest.mark.parametrize(("raw", "expected"), _EXPONENT_HAZARDS)
+def test_stop_limit_order_size_price_and_stop_render_positionally(
+    raw: str, expected: str
+) -> None:
+    """The protective-stop path, which is the one that must never be malformed.
+
+    A stop-limit rejected for a malformed `stop_price` leaves a position with NO protective stop
+    at the venue while the engine's local state records one. That is the worst shape this bug can
+    take, so the stop leg gets its own assertion rather than riding on the limit test."""
+    spec = StopLimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal(raw),
+        stop_price=Decimal(raw),
+        limit_price=Decimal(raw),
+    )
+    body = to_order_body(spec, client_order_id="c1")
+
+    assert body["stop_limit_order_config"] == {
+        "asset_quantity": expected,
+        "limit_price": expected,
+        "stop_price": expected,
+        "time_in_force": "gtc",
+    }
+
+
+@pytest.mark.parametrize(("raw", "_expected"), _EXPONENT_HAZARDS)
+def test_no_rendered_order_field_ever_contains_an_exponent_marker(
+    raw: str, _expected: str
+) -> None:
+    """The property itself, asserted structurally across all three body shapes.
+
+    The tests above pin exact strings, which is what catches a regression precisely. This one
+    catches a money or size field added to a body LATER that quietly reintroduces `str()` -- it
+    reads every string leaf of the config block and refuses any `e`/`E`, which no legitimate
+    positional decimal rendering ever contains.
+    """
+    value = Decimal(raw)
+    specs = [
+        MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=value),
+        LimitGTC(
+            product_id="BTC-USD", side=Side.BUY, base_size=value, limit_price=value
+        ),
+        StopLimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=value,
+            stop_price=value,
+            limit_price=value,
+        ),
+    ]
+    for spec in specs:
+        for rendered in _rendered_values(to_order_body(spec, client_order_id="c1")):
+            assert "e" not in rendered.lower(), (
+                f"{spec.kind} rendered {rendered!r} with an exponent"
+            )
 
 
 def test_market_ioc_by_quote_is_refused_with_the_real_reason() -> None:

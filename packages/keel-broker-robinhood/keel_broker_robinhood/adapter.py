@@ -54,6 +54,7 @@ from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResul
 from keel_core.types import Candle, Granularity
 
 from keel_broker_robinhood.translate import (
+    _render,
     to_order_body,
     to_port_status,
     to_price_side,
@@ -191,15 +192,25 @@ class RobinhoodAdapter:
         accounts = _results(self._require_transport().get_accounts())
         return accounts[0] if accounts else {}
 
-    def _fee_ratio(self) -> Decimal | None:
+    def _fee_ratio(self, account: object) -> Decimal | None:
         """The account's fee ratio, or `None` when the venue did not report one.
 
         `None` is distinct from `Decimal("0")` on purpose and the two must not be collapsed:
         zero is a claim that this account trades free, and nothing in the payload supports that
         claim when the field is simply absent. Callers turn `None` into a zero fee ESTIMATE only
-        where they also label the estimate's basis as unknown.
+        where they also label the estimate's basis as unknown AND say so in `Preview.errors`.
+
+        `account` is a PARAMETER rather than a `self._account()` call inside this method, which
+        is what keeps a single public call to one `GET /accounts/` round trip. It previously
+        fetched its own, so `get_fee_summary` -- which also needs the account for
+        `thirty_day_volume` -- spent two requests to answer one question, and `preview_order`
+        spent one more on top of its `estimated_price` call. Robinhood allows 100 requests/minute
+        sustained and this transport does not throttle, so duplicated reads are not free. The
+        account is deliberately NOT memoized on the instance: `get_balances` reads `buying_power`
+        off the same payload, and a stale buying power would misreport available capital to
+        anything sizing an order from it. Per call, not per adapter.
         """
-        tier = _field(self._account(), "fee_tier_status") or {}
+        tier = _field(account, "fee_tier_status") or {}
         raw = _field(tier, "fee_ratio")
         if raw is None:
             return None
@@ -245,17 +256,46 @@ class RobinhoodAdapter:
           rate would be worse than a visible zero, because a plausible-looking fee is one nobody
           checks. `detail["price_basis"]` names which of the two paths above produced the quote
           size, so the reader can tell a bound from a guess without inferring it from the kind.
+
+        **Every path that could not price the order populates `errors`.** A zero from a failed
+        `estimated_price` lookup, or a zero fee from a missing ratio, renders at the confirm gate
+        as an order that costs nothing -- which is the single most approvable thing a preview can
+        look like, and is indistinguishable from a genuinely free order unless the preview says
+        otherwise. `detail` is free-form text a renderer may not show; `errors` is the field the
+        port defines for a soft failure, so an unpriced leg has to appear there.
+
+        **The symbol is validated on every path, including the resting-order ones.** They price
+        off `spec.limit_price` and have no other reason to call `to_symbol`, which is exactly how
+        `ETH-USDC` used to preview cleanly and then raise `UnsupportedOrder` at placement -- after
+        the human had already approved it, and with the port forbidding a caller from catching
+        that and retrying. A preview must never approve what placement will refuse.
         """
         self._reject_unsupported(spec)
+        to_symbol(spec.product_id)
         base_size = self._base_size(spec)
 
+        errors: list[str] = []
         if isinstance(spec, LimitGTC | StopLimitGTC):
             price, basis = spec.limit_price, "limit_price"
         else:
-            price, basis = self._estimated_price(spec), "estimated_price"
+            basis = "estimated_price"
+            estimated = self._estimated_price(spec)
+            if estimated is None:
+                price = Decimal("0")
+                errors.append(
+                    "robinhood returned no usable estimated price for this order; "
+                    "est_quote_size and est_fee are NOT priced and must not be read as a cost"
+                )
+            else:
+                price = estimated
 
         quote_size = base_size * price
-        ratio = self._fee_ratio()
+        ratio = self._fee_ratio(self._account())
+        if ratio is None:
+            errors.append(
+                "robinhood reported no fee_tier_status.fee_ratio for this account; est_fee is "
+                "zero because the rate is UNKNOWN, not because this order trades free"
+            )
         return Preview(
             product_id=spec.product_id,
             side=spec.side,
@@ -268,6 +308,7 @@ class RobinhoodAdapter:
                 "price": str(price),
                 "fee_ratio": str(ratio) if ratio is not None else "unknown",
             },
+            errors=tuple(errors),
         )
 
     def _base_size(self, spec: OrderSpec) -> Decimal:
@@ -282,44 +323,67 @@ class RobinhoodAdapter:
             return spec.base_size
         raise UnsupportedOrder(f"robinhood cannot size order kind {spec.kind!r} in base units")
 
-    def _estimated_price(self, spec: OrderSpec) -> Decimal:
-        """Robinhood's estimated price for this size, or `Decimal("0")` if it reports none.
+    def _estimated_price(self, spec: OrderSpec) -> Decimal | None:
+        """Robinhood's estimated price for this size, or `None` when it reports no usable one.
 
         `side` is translated, not passed through: this endpoint answers in book terms
         (`bid`/`ask`), not order terms (`buy`/`sell`), and a buyer is filled from the ASK. Asking
         for the wrong side of the spread would understate the cost of every buy preview -- which
         is exactly the direction of error a human at a confirm gate is least likely to catch.
 
-        A zero on a missing price is a visible nonsense that surfaces as a zero-cost preview,
-        rather than an exception thrown mid-confirm; `errors` on `Preview` is the port's channel
-        for a soft failure and the price basis in `detail` says where the number came from.
+        **`None`, never `Decimal("0")`.** This used to answer zero for "no rows", "unparseable
+        price", and "the venue really did quote zero" alike, and `preview_order` had no way to
+        tell them apart -- so a pricing FAILURE rendered at the confirm gate as an order that
+        costs nothing. That is not a visible nonsense; it is the most approvable thing a preview
+        can display. `None` forces the caller to decide, and `preview_order` turns it into a
+        populated `Preview.errors` rather than a silent zero. A quoted price of zero is treated
+        as unusable for the same reason: nothing on this venue costs nothing.
+
+        `quantity` renders through `translate._render`, not `str()` -- `str(Decimal("1E-8"))` is
+        `"1E-8"`, and this value goes on a query string the signature is computed over, so an
+        exponent here is both a malformed request and a signature mismatch.
         """
         response = self._require_transport().get_estimated_price(
             symbol=to_symbol(spec.product_id),
             side=to_price_side(spec.side),
-            quantity=str(self._base_size(spec)),
+            quantity=_render(self._base_size(spec)),
         )
         rows = _results(response)
         if not rows:
-            return Decimal("0")
+            return None
         try:
-            return Decimal(str(_field(rows[0], "price", "0") or "0"))
+            price = Decimal(str(_field(rows[0], "price", "0") or "0"))
         except (InvalidOperation, ValueError):
-            return Decimal("0")
+            return None
+        return price if price > 0 else None
 
     def place_order(self, spec: OrderSpec) -> PlaceResult:
-        """Place a live order. A fresh `client_order_id` per call gives Robinhood idempotency.
+        """Place a live order. A fresh `client_order_id` per call; the returned `state` is read.
 
-        The uuid is required by the API, not optional as it is on some venues, and it must be
-        fresh per ATTEMPT rather than per spec: reusing one across a retry is how a caller asks
-        the venue to deduplicate, and generating one per spec would silently deduplicate two
-        orders a strategy genuinely meant to place twice.
+        ⚠️ **A fresh uuid per call means NO placement retry is ever deduplicated.** The id is
+        required by this API, and minting one per ATTEMPT is what stops two orders a strategy
+        genuinely meant to place twice from collapsing into one. The cost of that choice is the
+        opposite failure: a caller that retries after a timeout -- where the first request may
+        well have reached the venue -- places a SECOND live order, because the retry carries a
+        different id and Robinhood has nothing to match it against. Neither default is safe in
+        both directions and the port has no "retry of" concept to disambiguate them, so the
+        behaviour is documented rather than silently chosen (README, "must fix before wiring").
 
-        Robinhood signals failure with an HTTP error rather than the success/error envelope
-        Coinbase returns, so a placement that comes back at all came back as an order. The one
-        thing still worth checking is that it carries an `id`: a `PlaceResult(success=True,
-        broker_order_id=None)` would be an order nobody can later reconcile or cancel, which is
-        worse than a reported failure.
+        **Two things are checked, not one.** An `id` must come back -- a `success=True` with no
+        id is an order nobody can later reconcile or cancel. But the `id` alone is not evidence
+        the order is live, and treating it as such was the bug this docstring used to justify:
+        Robinhood does NOT signal every rejection with an HTTP error. It answers a rejected order
+        on the happy path, 200, with a real order object whose `state` reads `failed`. So a
+        protective `StopLimitGTC` could return `{"id": ..., "state": "failed"}` and be recorded as
+        a resting stop that does not exist at the venue -- the position it protects running naked,
+        with nothing to contradict the belief until the stop fails to fire.
+
+        Only the states Robinhood documents as not-live (`_REJECTED_PLACEMENT_STATES`) are
+        rejections. An UNRECOGNISED state resolves to success, which is the opposite of what
+        `get_order` does with one, and the asymmetry is deliberate: reporting failure for an order
+        that is actually live invites the caller to place it again, and a duplicate live order has
+        no recovery, whereas reporting success hands back the id and lets reconciliation poll --
+        where `to_port_status` maps the same unknown state to `PENDING` and keeps it observed.
         """
         self._reject_unsupported(spec)
         body = to_order_body(spec, client_order_id=str(uuid.uuid4()))
@@ -331,6 +395,20 @@ class RobinhoodAdapter:
                 success=False,
                 broker_order_id=None,
                 reason="robinhood accepted the request but returned no order id",
+            )
+        state = str(_field(response, "state", "") or "")
+        if state in _REJECTED_PLACEMENT_STATES:
+            # `broker_order_id` is None here, matching `CoinbaseAdapter.place_order`'s failure
+            # path: a caller that reads a non-None id as "there is a live order to manage" must
+            # not be handed one for an order that is not live. The id rides in `reason` so it
+            # survives for debugging without being mistaken for a handle on a resting order.
+            return PlaceResult(
+                success=False,
+                broker_order_id=None,
+                reason=(
+                    f"robinhood returned order {order_id} in state {state!r}: the venue rejected "
+                    f"this order, so it is not resting and must not be recorded as placed"
+                ),
             )
         return PlaceResult(success=True, broker_order_id=str(order_id))
 
@@ -359,9 +437,11 @@ class RobinhoodAdapter:
         "no fees were charged". Closing this properly means paging order history and summing
         `fee_charged`, which is a follow-up with its own rate-limit design.
         """
+        # One `GET /accounts/` for this whole method: the account is resolved once and passed to
+        # `_fee_ratio`, which used to fetch its own and made this two round trips for one answer.
         account = self._account()
         tier = _field(account, "fee_tier_status") or {}
-        ratio = self._fee_ratio() or Decimal("0")
+        ratio = self._fee_ratio(account) or Decimal("0")
         return FeeSummary(
             venue=_VENUE,
             taker_rate=ratio,
@@ -424,20 +504,56 @@ class RobinhoodAdapter:
 
         An id the venue never issued returns `False` rather than raising, per the port docstring:
         absence of a refusal is not a confirmation, and neither is a 404.
+
+        **A venue error also returns `False` rather than propagating.** The transport raises for
+        every failure that is not a 404 -- a 5xx, a timeout, a dropped connection -- and this
+        method runs on the EXIT path, where `executor._cancel_at_exchange` calls it while
+        unwinding a position. This adapter already writes the rule down at `_account`: "a raise on
+        the way out of a position can trap it." An exception escaping here can abort an unwind
+        partway through and leave both the position and the resting orders it was clearing live,
+        which is strictly worse than a `False`.
+
+        Nothing is claimed by swallowing it. The port's contract is already "`True` ONLY when the
+        venue CONFIRMS", and an exception is definitionally not a confirmation -- so `False` is
+        the same answer this method would give for any other unconfirmed cancel, and it keeps the
+        caller believing the order may still be resting, which is the belief that keeps it
+        watching. The failure is not hidden either: the order stays in local state as
+        possibly-live and the next reconciliation poll re-reads it from the venue.
         """
         transport = self._require_transport()
 
-        response = transport.cancel_order(order_id)
-        if response is None:
-            return False
-        if _confirms_cancel(response, order_id):
-            return True
+        try:
+            response = transport.cancel_order(order_id)
+            if response is None:
+                return False
+            if _confirms_cancel(response, order_id):
+                return True
 
-        polled = transport.get_order(order_id)
+            polled = transport.get_order(order_id)
+        # Intentionally broad. The transport raises whatever the HTTP stack raises -- a
+        # `requests` exception, a socket timeout, a JSON decode error -- and narrowing this to a
+        # guessed list would let the one unguessed type escape onto the exit path, which is the
+        # exact failure this catch exists to prevent. See the docstring for why `False` claims
+        # nothing the port does not already treat as "unconfirmed".
+        except Exception:
+            return False
         if polled is None:
             return False
         return _confirms_cancel(polled, order_id)
 
+
+#: Robinhood order states that mean a just-placed order is NOT resting at the venue.
+#:
+#: Robinhood answers a rejected order on the HAPPY HTTP path -- 200, with a real order object
+#: whose `state` says it never became live -- so `place_order` cannot infer success from the
+#: absence of an HTTP error. Both spellings here come from the v2 docs' order-state enum
+#: (https://docs.robinhood.com/crypto/trading/, "Get Orders" `state` filter: `open`, `canceled`,
+#: `filled`, `failed`, `pending`), and Robinhood's `canceled` is the American single-`l` spelling
+#: -- the port's `CANCELLED` must never be compared against raw venue JSON.
+#:
+#: Deliberately NOT a denylist of everything unfamiliar: an unrecognised state resolves to
+#: success. See `place_order` for why that asymmetry with `get_order` is the safe direction.
+_REJECTED_PLACEMENT_STATES: frozenset[str] = frozenset({"failed", "canceled"})
 
 #: Robinhood's own spelling of the terminal cancelled state. Compared against raw venue JSON,
 #: so it is the venue's single-`l` spelling and NOT the port's `"CANCELLED"` -- the two meet
