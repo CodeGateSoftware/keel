@@ -20,10 +20,20 @@ when a credential exists, and its only output is a shape report.
 The first run of it (#217) settled all three: ten requests, zero 401s, every endpoint path
 correct, `fee_tier_status` corroborated key for key -- and four fixture shapes wrong, one of them
 a live defect that left every market preview unpriced. It also produced five false positives of
-its own, which `fixture_shape` below exists to prevent recurring. What it still cannot reach is
-the ORDER lifecycle: `rh_order_open.json`, `rh_order_filled.json` and `rh_order_canceled.json`
-describe objects that only exist once a real order has been placed, and this script refuses to
-place one. Those three fixtures remain unverified against the venue.
+its own, which `fixture_shape` below exists to prevent recurring. What it still cannot fully
+reach is the ORDER lifecycle. The `orders` probe added for #197 stays inside the read-only
+guarantee -- it is a GET, so `_ReadOnly` still enforces it at the request layer -- and it DOES
+verify the list endpoint's path, that the signature is accepted, and the pagination envelope.
+What it verifies only conditionally is the order OBJECT's field names: that happens **only if
+the account happens to have order history**. On an account that has never traded crypto on
+Robinhood, `results` comes back empty, and `compare_shapes` skips comparing a list whose rows
+are `<empty>` -- so a bare account reports a shape match it has not actually earned, and an
+operator reading the report needs to know that a match there is not corroboration.
+`fee_charged`'s JSON quoting -- a quoted string vs an unquoted number, the exact ambiguity #197
+turns on -- is precisely what the probe would settle if a single order row came back. So
+`rh_order_open.json`, `rh_order_filled.json` and `rh_order_canceled.json` remain unverified
+whenever the account has no order history; placing an order is still the only way to guarantee
+an observation.
 
 ## Why it cannot place an order
 
@@ -82,6 +92,7 @@ PROBES: tuple[tuple[str, str], ...] = (
     ("best_bid_ask", "rh_best_bid_ask.json"),
     ("estimated_price", "rh_estimated_price.json"),
     ("holdings", "rh_holdings.json"),
+    ("orders", "rh_orders.json"),
 )
 
 #: The symbol every marketdata probe is run against. BTC-USD is the one pair we can be confident
@@ -267,6 +278,7 @@ def run_probes(transport: _ReadOnly, symbol: str) -> dict[str, Any]:
         "best_bid_ask": lambda: transport.get_best_bid_ask(symbol),
         "estimated_price": lambda: transport.get_estimated_price(symbol, "ask", "0.001"),
         "holdings": lambda: transport.get_holdings(),
+        "orders": lambda: transport.get_orders(),
     }
     for name, call in calls.items():
         try:

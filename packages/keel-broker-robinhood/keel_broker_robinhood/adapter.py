@@ -46,6 +46,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -127,6 +128,24 @@ _NO_CANDLES = (
 _TOTAL_TOLERANCE_ABS = Decimal("0.01")
 _TOTAL_TOLERANCE_RATIO = Decimal("0.0001")
 
+#: How far back `get_fee_summary` sums `fee_charged`, in seconds.
+#:
+#: Thirty days, and it is not a tunable: it is pinned to the window `volume_usd` already reports.
+#: `FeeSummary` carries ONE `volume_window` for both figures, so a fee total covering a different
+#: span than `fee_tier_status.thirty_day_volume` would be mislabelled by the very field that
+#: exists to stop a caller comparing incompatible windows (see `FeeSummary`'s own docstring). Any
+#: change here is a change to `volume_window`'s truthfulness, not a knob.
+_FEE_WINDOW_SECONDS = 30 * 24 * 60 * 60
+
+#: How the fee window's start is rendered for `updated_at_start`.
+#:
+#: The v2 docs specify ISO 8601 for this parameter. Seconds precision with an explicit `Z` is the
+#: unambiguous form: no offset to be misread as local time, and no fractional part for the venue
+#: to parse differently than we wrote it. `datetime.isoformat()` is deliberately not used -- it
+#: renders UTC as `+00:00`, and that `+` on a SIGNED query string is the exact hazard
+#: `transport._request` documents at `quote_via=quote` (a raw `+` decodes server-side as a space).
+_WINDOW_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 
 @dataclass(frozen=True)
 class _VenueEstimate:
@@ -167,9 +186,10 @@ class RobinhoodAdapter:
     v1's cancel endpoint answers `text/plain` "Cancel request was submitted", which is an
     acknowledgement of a REQUEST and cannot satisfy `cancel_order`'s "return `True` only when the
     venue confirms the cancellation for THIS order id"; and v1 carries neither the per-order
-    `fee_charged` that `get_order` needs for observed economics nor the `fee_tier_status` that
-    `get_fee_summary` is built from. An adapter written against v1 would have to guess at all
-    three, and guessing is the thing the port exists to prevent.
+    `fee_charged` that `get_order` needs for observed economics -- and that `get_fee_summary` now
+    sums into a real `fees_usd` (#197) -- nor the `fee_tier_status` its rates come from. An
+    adapter written against v1 would have to guess at all three, and guessing is the thing the
+    port exists to prevent.
     """
 
     def __init__(self, transport: Transport | None = None) -> None:
@@ -577,7 +597,7 @@ class RobinhoodAdapter:
         return PlaceResult(success=True, broker_order_id=str(order_id))
 
     def get_fee_summary(self) -> FeeSummary:
-        """Map v2's `fee_tier_status` to a `FeeSummary`. Read the `fees_usd` note below.
+        """Map v2's `fee_tier_status` to a `FeeSummary`, with `fees_usd` summed from order history.
 
         `volume_window` is `"trailing_30d"`, and unlike Coinbase's `"unknown"` that is a
         statement the docs actually support: the field is literally named `thirty_day_volume`.
@@ -591,17 +611,35 @@ class RobinhoodAdapter:
         to both cases. The alternative, zeroing `maker_rate`, would claim resting orders trade
         free, which nothing supports.
 
-        ⚠️ `fees_usd` is always `Decimal("0")`, and this is a REAL GAP, not a formality. The v2
-        API exposes per-order `fee_charged` but no account-level fees-paid total, and this method
-        has no order history to sum. `FeeSummary`'s docstring says subscription lapse detection
-        leans on `fees_usd` -- specifically, a fee charged while the user claims a fee-free
-        allowance contradicts the claim. A constant zero can never contradict anything, so
-        against this venue that test is inert and detection falls back to attestation alone.
-        Anything consuming this must treat a Robinhood `fees_usd` as "not reported", never as
-        "no fees were charged". Closing this properly means paging order history and summing
-        `fee_charged`, which is a follow-up with its own rate-limit design.
+        **`fees_usd` used to be a hardcoded `Decimal("0")` and is now observed (#197).** That
+        constant was not a cosmetic gap. `FeeSummary`'s docstring names subscription lapse
+        detection as its consumer, and the contradiction it looks for is a fee charged while the
+        user claims a fee-free allowance. A constant zero can never contradict anything, so the
+        check did not error against this venue -- it silently PASSED, for every account, every
+        time. A rail that always passes is worse than an absent one, because it reads as coverage.
+
+        The v2 API still publishes no account-level fees-paid total, so the number is built the
+        only way the API allows: `GET /orders/` filtered to the same trailing 30 days
+        `thirty_day_volume` covers, with each order's `fee_charged` summed. See `_fees_paid` for
+        the window, the cost, and the two places this total can be wrong.
+
+        **One reading of the clock feeds both the window and `fetched_at`.** Calling `time.time()`
+        twice would let the window the fees were summed over drift away from the timestamp the
+        summary is reported against, for no benefit -- and a consumer comparing `fees_usd` to
+        `volume_usd` has no way to notice that drift.
+
+        ⚠️ **This method can now raise, and that is deliberate.** `_fees_paid` lets a failed or
+        non-terminating sweep propagate rather than returning a partial sum. That inverts the rule
+        `_account` and `cancel_order` follow ("a raise on the way out of a position can trap it"),
+        and the inversion is safe for one specific reason: `get_fee_summary` is a reconciliation
+        read, not a step in an unwind. Nothing calls it while a position is being closed. On the
+        exit path a raise costs a trapped position; here it costs an error message, and the
+        alternative -- an under-reported total -- costs exactly the false negative this issue is
+        about.
         """
-        # One `GET /accounts/` for this whole method: the account is resolved once and passed to
+        # One reading of the clock for the window and the reported timestamp. See the docstring.
+        fetched_at = int(time.time())
+        # One `GET /accounts/` for the rate and volume: the account is resolved once and passed to
         # `_fee_ratio`, which used to fetch its own and made this two round trips for one answer.
         account = self._account()
         tier = _field(account, "fee_tier_status") or {}
@@ -611,10 +649,90 @@ class RobinhoodAdapter:
             taker_rate=ratio,
             maker_rate=ratio,
             volume_usd=Decimal(str(_field(tier, "thirty_day_volume", "0") or "0")),
-            fees_usd=Decimal("0"),
+            fees_usd=self._fees_paid(fetched_at - _FEE_WINDOW_SECONDS),
             volume_window="trailing_30d",
-            fetched_at=int(time.time()),
+            fetched_at=fetched_at,
         )
+
+    def _fees_paid(self, since: int) -> Decimal:
+        """Total `fee_charged` across every order the venue reports touched since `since`.
+
+        This is the whole of #197's fix, and it is worth reading for what it can still get wrong
+        as much as for what it does.
+
+        **Window: `updated_at`, not `created_at`, and the choice is load-bearing.** Both filters
+        are documented and either would compile. A fee is charged when an execution happens, and
+        an execution necessarily bumps `updated_at` -- so the `updated_at_start` result set is a
+        SUPERSET of the orders carrying an in-window fee and can never omit one. `created_at_start`
+        has no such property: a `StopLimitGTC` resting for forty days and filling this morning was
+        created outside the window and charged its fee inside it, so filtering on creation drops a
+        real charge. keel rests GTC brackets by design, so that is this engine's normal case
+        rather than a corner. Under-reporting is the false negative this issue exists to close, so
+        between two imperfect filters the correct one is the one that cannot under-report.
+
+        **Every state is counted, and no `state` filter is sent.** `state` is the obvious-looking
+        narrowing and it is a trap: an order that partially fills and is then cancelled ends
+        `canceled` while having been charged a real fee on the part that executed, and `filled`
+        would drop it. No filter is needed anyway, because `fee_charged` is documented as "the
+        total fee amount that was charged for this order based on executed fills" -- the field is
+        already its own state filter, reading zero on an order that never traded. A state filter
+        layered on top could only remove real charges.
+
+        **`estimated_fee_remaining` is never read.** The neighbouring v2 field is the fee that
+        will be charged on an order's UNFILLED remainder, explicitly conditional and explicitly an
+        estimate. `fees_usd` is consumed as an observation contradicting a fee-free claim, and an
+        estimate cannot honestly contradict anything.
+
+        **Cost: 1 + N requests, where N is the number of history pages in the window.** Against a
+        100 req/min sustained limit and a transport with no backoff, the bound matters: the
+        account read is one request and the sweep is `RobinhoodTransport._paginate`'s page walk,
+        capped at `_MAX_PAGES` (20). So the worst case is 21 requests per call, and the realistic
+        case for a keel account trading a handful of times a month is 2. The server-side window
+        filter is what keeps that from growing with the account's total age.
+
+        **A sweep that cannot complete RAISES rather than returning what it collected.**
+        `_paginate` already raises past `_MAX_PAGES` and this method does not catch it. There is
+        no field on `FeeSummary` to mark a total as partial -- `fees_usd` is a bare `Decimal` --
+        so a truncated sum is indistinguishable from a complete one and would be consumed as an
+        observation. That is the same always-passing false negative in a new costume. An exception
+        is visible; a confidently wrong number is not.
+
+        ⚠️ **The one thing this cannot get exactly right: an order straddling the window edge.**
+        `fee_charged` is an ORDER-level total, and the v2 `executions[]` rows carry only
+        `effective_price`, `quantity` and `timestamp` -- no per-execution fee. So a fee cannot be
+        split across the boundary even in principle. An order that filled partially before `since`
+        and again after it contributes its WHOLE fee. That over-counts, never under-counts, which
+        is the survivable direction: an over-count makes lapse detection point at a fee that was
+        genuinely charged, merely slightly earlier than the window claims, whereas an under-count
+        hides one entirely.
+
+        ⚠️ **Nor is the window provably identical to the venue's own.** `thirty_day_volume`'s
+        boundary is not documented -- it may be calendar-day aligned, it may exclude today -- while
+        this window is cut from the local clock. The two match in LENGTH and intent; they are not
+        guaranteed to match to the second. `fees_usd` and `volume_usd` are therefore comparable as
+        magnitudes over the same nominal window and must not be used to derive an exact effective
+        rate.
+
+        A negative `fee_charged` is skipped rather than subtracted. Nothing documents this field
+        going negative, so a negative is a rebate or a venue bug -- and under both readings,
+        letting it net out a real charge would hide the very thing being looked for.
+        """
+        started = datetime.fromtimestamp(since, tz=UTC).strftime(_WINDOW_FORMAT)
+        rows = _results(self._require_transport().get_orders(updated_at_start=started))
+
+        total = Decimal("0")
+        for row in rows:
+            # `_decimal_or_none` reads a quoted string and an unquoted number identically, which
+            # is required rather than merely tolerant here: this venue mixes the two (#217 F6) and
+            # `fee_charged`'s own quoting has never been observed, because observing an order
+            # object requires placing a real order and there is no sandbox. The v2 schema types it
+            # as an unquoted number and types the neighbouring `executions[].effective_price` as a
+            # quoted decimal string, so the documentation does not settle it either.
+            fee = _decimal_or_none(_field(row, "fee_charged"))
+            if fee is None or fee <= 0:
+                continue
+            total += fee
+        return total
 
     def get_order(self, order_id: str) -> OrderStatus:
         """Observed state of a previously placed order, normalized to `Decimal` money fields.
