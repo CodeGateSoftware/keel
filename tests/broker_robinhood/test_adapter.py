@@ -151,6 +151,41 @@ class _ReCancelTransport(FakeTransport):
         return order
 
 
+class _RaisingCancelTransport(FakeTransport):
+    """A transport whose `cancel_order` raises the way a 5xx or a dropped connection does.
+
+    `RobinhoodTransport._request` deliberately raises for every failure that is not a 404, so this
+    is the realistic shape of a venue outage during a cancel -- and `cancel_order` runs on the
+    EXIT path, where a raise can trap a position.
+    """
+
+    def cancel_order(self, order_id: str) -> Any:
+        self._record("cancel_order", order_id=order_id)
+        raise RuntimeError("503 Server Error: Service Unavailable")
+
+
+class _RaisingRepollTransport(FakeTransport):
+    """Cancel answers ambiguously (still `open`), and the mandatory re-poll is what blows up."""
+
+    def cancel_order(self, order_id: str) -> Any:
+        self._record("cancel_order", order_id=order_id)
+        order = dict(self._order or {})
+        order["id"] = order_id
+        order["state"] = "open"
+        return order
+
+    def get_order(self, order_id: str) -> Any:
+        self._record("get_order", order_id=order_id)
+        raise RuntimeError("503 Server Error: Service Unavailable")
+
+
+def _placed_with_state(state: str) -> dict[str, Any]:
+    """An order-placement response carrying `state`, otherwise shaped like a real one."""
+    placed = load_fixture("rh_order_open.json")
+    placed["state"] = state
+    return placed
+
+
 def test_capabilities_declare_robinhood() -> None:
     """The engine gates live spend on these declarations, so each clause here is a promise the
     rest of the suite must keep: no native preview, a synthesized one instead, fee summaries
@@ -507,6 +542,201 @@ def test_entry_point_discovery_finds_the_robinhood_adapter() -> None:
     from keel_broker_api.registry import load_broker
 
     assert load_broker("robinhood").__name__ == "RobinhoodAdapter"
+
+
+@pytest.mark.parametrize("state", ["failed", "canceled"])
+def test_place_order_reports_failure_when_the_venue_rejected_the_order(state: str) -> None:
+    """An HTTP 200 carrying `"state": "failed"` is a REJECTION, not a placement.
+
+    Robinhood answers a rejected order on the happy HTTP path -- 200, with a real order object
+    whose `state` says it never became live. Checking only that an `id` came back therefore
+    reports `success=True` for an order the venue refused. The concrete failure: a protective
+    `StopLimitGTC` answered `{"id": ..., "state": "failed"}` makes the engine record a stop that
+    does not exist at the venue, so the position it believes is protected is running naked, and
+    nothing will contradict that belief until the stop fails to fire.
+
+    `canceled` is treated the same way. A placement that comes back already cancelled is equally
+    not a resting order, and recording it as one has the identical consequence.
+
+    `broker_order_id` is `None` on this path, matching `CoinbaseAdapter.place_order`: a caller
+    that reads a non-`None` id as "there is a live order to manage" must not be handed one for an
+    order that is not live. The id is named in `reason` instead, so it survives for debugging.
+    """
+    transport = FakeTransport(placed=_placed_with_state(state))
+    adapter = RobinhoodAdapter(transport)
+    spec = StopLimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("0.1"),
+        stop_price=Decimal("60000"),
+        limit_price=Decimal("59900"),
+    )
+
+    result = adapter.place_order(spec)
+
+    assert result.success is False
+    assert result.broker_order_id is None
+    assert result.reason is not None
+    assert state in result.reason
+
+
+@pytest.mark.parametrize("state", ["open", "filled", "pending", "partially_filled"])
+def test_place_order_reports_success_for_a_state_that_is_or_may_become_live(state: str) -> None:
+    """The mirror of the rejection test: a live or in-flight state must still be a success.
+
+    `partially_filled` is in this list on purpose -- it appears in Robinhood's v1 state enum but
+    not v2's, and a partially filled order is unambiguously a real order that was placed.
+    """
+    transport = FakeTransport(placed=_placed_with_state(state))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    result = adapter.place_order(spec)
+
+    assert result.success is True
+    assert result.broker_order_id == load_fixture("rh_order_open.json")["id"]
+
+
+def test_place_order_treats_an_unrecognised_state_as_placed_not_rejected() -> None:
+    """An unknown `state` means the adapter does not know the outcome -- and here, unlike
+    `get_order`, "I don't know" must resolve to SUCCESS rather than failure.
+
+    The asymmetry is deliberate and follows the consequences. Reporting `success=False` for an
+    order that is actually live invites the caller to place it again, and a duplicate live order
+    is unrecoverable. Reporting `success=True` hands back the id, and reconciliation then polls
+    `get_order`, which maps the same unrecognised state to `PENDING` and keeps the order under
+    observation until the venue says something the adapter understands. Only the two states
+    Robinhood documents as not-live (`failed`, `canceled`) are treated as rejections.
+    """
+    transport = FakeTransport(placed=_placed_with_state("a_future_state_this_adapter_predates"))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    result = adapter.place_order(spec)
+
+    assert result.success is True
+    assert result.broker_order_id is not None
+
+
+def test_preview_order_reports_an_error_when_the_venue_returned_no_price() -> None:
+    """A preview that could not be priced must SAY so, not render as a free order.
+
+    `_estimated_price` falls back to zero when the endpoint answers nothing, and a zero price
+    makes `est_quote_size` and `est_fee` both zero. At the human confirm gate that is
+    indistinguishable from an order that genuinely costs nothing -- the single most approvable
+    thing a preview can look like. `Preview.errors` is the port's channel for exactly this, and
+    leaving it empty is what makes the failure invisible.
+    """
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": []}
+    )
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    preview = adapter.preview_order(spec)
+
+    assert preview.errors, "an unpriced preview must not come back with empty errors"
+    assert any("price" in e.lower() for e in preview.errors)
+
+
+def test_preview_order_reports_an_error_when_the_account_reports_no_fee_ratio() -> None:
+    """`est_fee` of zero, from a missing `fee_ratio`, is a claim this account trades free.
+
+    `_fee_ratio` already distinguishes `None` from `Decimal("0")` precisely so this claim is never
+    made by accident, and `detail["fee_ratio"]` says `"unknown"`. But `detail` is free-form text a
+    renderer may not show, while `errors` is the field the port defines for a soft failure -- so
+    the unpriced fee has to surface there too.
+    """
+    accounts = load_fixture("rh_accounts.json")
+    del accounts["results"][0]["fee_tier_status"]
+    transport = FakeTransport(accounts=accounts)
+    adapter = RobinhoodAdapter(transport)
+    spec = LimitGTC(
+        product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"), limit_price=Decimal("65000")
+    )
+
+    preview = adapter.preview_order(spec)
+
+    assert preview.errors
+    assert any("fee" in e.lower() for e in preview.errors)
+    assert preview.detail["fee_ratio"] == "unknown"
+
+
+def test_preview_order_on_a_fully_priced_order_reports_no_errors() -> None:
+    """The control case: `errors` must stay empty when everything priced, or it means nothing."""
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+    )
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    assert adapter.preview_order(spec).errors == ()
+
+
+@pytest.mark.parametrize("kind", ["limit", "stop_limit"])
+def test_preview_order_refuses_a_non_usd_symbol_on_every_path(kind: str) -> None:
+    """`preview_order` must not approve a symbol `place_order` will refuse.
+
+    The resting-order paths price off `spec.limit_price` and never call `to_symbol`, so
+    `ETH-USDC` previews cleanly and then raises `UnsupportedOrder` at placement. That ordering is
+    the problem: the human has already approved at the confirm gate by then, and the port
+    explicitly forbids catching `UnsupportedOrder` and retrying with a different spec -- so the
+    approved order simply cannot be placed. Validating the symbol on every preview path moves the
+    refusal to before the human is asked.
+    """
+    spec: LimitGTC | StopLimitGTC
+    if kind == "limit":
+        spec = LimitGTC(
+            product_id="ETH-USDC",
+            side=Side.SELL,
+            base_size=Decimal("1"),
+            limit_price=Decimal("3000"),
+        )
+    else:
+        spec = StopLimitGTC(
+            product_id="ETH-USDC",
+            side=Side.SELL,
+            base_size=Decimal("1"),
+            stop_price=Decimal("2900"),
+            limit_price=Decimal("2890"),
+        )
+    adapter = RobinhoodAdapter(FakeTransport(accounts=load_fixture("rh_accounts.json")))
+
+    with pytest.raises(UnsupportedOrder, match="USDC"):
+        adapter.preview_order(spec)
+
+
+def test_cancel_order_returns_false_instead_of_raising_when_the_venue_errors() -> None:
+    """A 5xx during a cancel must fail safe to `False`, never propagate out of this method.
+
+    This adapter already writes the rule down at `_account`: "a raise on the way out of a position
+    can trap it". `cancel_order` is the method most exposed to it -- `executor._cancel_at_exchange`
+    calls it while unwinding, and an exception there can abort the unwind partway through, leaving
+    the position AND the resting orders it was trying to clear both live.
+
+    `False` is the honest answer regardless of what went wrong, because the port's contract is
+    already "`True` ONLY when the venue CONFIRMS" -- and an exception is definitionally not a
+    confirmation. Nothing is claimed here that was not observed; the caller keeps believing the
+    order may still be resting, which is the belief that keeps it watching.
+    """
+    fixture = load_fixture("rh_order_open.json")
+    transport = _RaisingCancelTransport(order=fixture)
+    transport._issued_order_ids.add(fixture["id"])
+    adapter = RobinhoodAdapter(transport)
+
+    assert adapter.cancel_order(fixture["id"]) is False
+
+
+def test_cancel_order_returns_false_when_the_mandatory_re_poll_raises() -> None:
+    """Same rule, one layer deeper: the re-poll is on the exit path too and cannot be allowed to
+    escape as an exception either."""
+    fixture = load_fixture("rh_order_open.json")
+    transport = _RaisingRepollTransport(order=fixture)
+    transport._issued_order_ids.add(fixture["id"])
+    adapter = RobinhoodAdapter(transport)
+
+    assert adapter.cancel_order(fixture["id"]) is False
 
 
 def test_place_order_returns_a_domain_type() -> None:

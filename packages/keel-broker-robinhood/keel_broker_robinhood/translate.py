@@ -12,12 +12,14 @@ module worth reading closely rather than skimming as a copy:
    port spells it `CANCELLED`. `STATE_TO_PORT_STATUS` is the one place those two spellings meet,
    so nobody downstream has to remember which venue uses which.
 
-Decimals render via `str()` everywhere in this module so an order's size, price, or stop can
-never be perturbed by a float round-trip on the live-money path.
+Money and size values render through `_render`, never `str()` and never `float`. Keeping them as
+`Decimal` end to end is only half the requirement -- see `_render`'s docstring for why `str()` on
+a `Decimal` is itself unsafe here, which is the half that is easy to miss.
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, assert_never
 
 from keel_broker_api.orders import (
@@ -54,6 +56,35 @@ STATE_TO_PORT_STATUS: dict[str, str] = {
     "failed": "FAILED",
     "pending": "PENDING",
 }
+
+
+def _render(value: Decimal) -> str:
+    """Render a money or size `Decimal` positionally, for a JSON field that has no exponent form.
+
+    **`str()` is wrong here, and it is wrong in the one case that matters most.** `str(Decimal)`
+    follows the decimal spec's `to-scientific-string`: once a value's adjusted exponent leaves a
+    narrow band it switches to scientific notation. `str(Decimal("0.00000001"))` is `"1E-8"`, not
+    `"0.00000001"`. Robinhood's `asset_quantity` / `limit_price` / `stop_price` are decimal
+    strings with no exponent form at all, so that renders a MALFORMED ORDER BODY.
+
+    This is not a hypothetical magnitude. BTC's `asset_increment` is exactly `0.00000001` (see
+    `tests/fixtures/rh_trading_pairs.json`), so one satoshi is the smallest order this venue
+    accepts -- precisely the size a dust-sized exit produces. The failure it causes is the bad
+    kind: a rejected EXIT leaves a position open while the engine records it closed, and a
+    rejected STOP-LIMIT leaves a position with no protective stop at the venue while local state
+    says there is one. Neither surfaces as a wrong number a human might notice; both surface as a
+    venue rejection at the exact moment the order mattered.
+
+    `format(value, "f")` is the fixed-point renderer: positional at every magnitude, no exponent
+    ever, and -- unlike `f"{value:.8f}"` or any quantize-based approach -- it neither truncates
+    nor rounds, so the string still carries the caller's exact value. It preserves trailing zeros
+    (`Decimal("64000.10")` stays `"64000.10"`), which is correct: those digits are the caller's
+    stated precision, and Robinhood parses the value numerically regardless.
+
+    The float ban the rest of this module observes still applies and is a separate concern:
+    `float` loses precision, while `str()` keeps the precision and mangles the SHAPE.
+    """
+    return format(value, "f")
 
 
 def to_symbol(product_id: str) -> str:
@@ -101,8 +132,9 @@ def to_price_side(side: Side) -> str:
 def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
     """Render `spec` as the JSON body for `POST /api/v2/crypto/trading/orders/`.
 
-    Decimals render via `str()`, never float, so no order size, limit price, or stop price can be
-    perturbed by a float round-trip between here and the wire.
+    Every money and size field renders through `_render` (`format(d, "f")`), never `str()` and
+    never `float`. See `_render`'s docstring: `str(Decimal)` emits scientific notation at small
+    magnitudes, and `"1E-8"` in an `asset_quantity` is a malformed body, not a rounding nuisance.
     """
     match spec:
         case MarketIOCByQuote():
@@ -124,7 +156,7 @@ def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
                 "client_order_id": client_order_id,
                 "side": to_side(spec.side),
                 "type": "market",
-                "market_order_config": {"asset_quantity": str(spec.base_size)},
+                "market_order_config": {"asset_quantity": _render(spec.base_size)},
             }
         case LimitGTC():
             return {
@@ -133,8 +165,8 @@ def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
                 "side": to_side(spec.side),
                 "type": "limit",
                 "limit_order_config": {
-                    "asset_quantity": str(spec.base_size),
-                    "limit_price": str(spec.limit_price),
+                    "asset_quantity": _render(spec.base_size),
+                    "limit_price": _render(spec.limit_price),
                     "time_in_force": TIME_IN_FORCE,
                 },
             }
@@ -145,9 +177,9 @@ def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
                 "side": to_side(spec.side),
                 "type": "stop_limit",
                 "stop_limit_order_config": {
-                    "asset_quantity": str(spec.base_size),
-                    "limit_price": str(spec.limit_price),
-                    "stop_price": str(spec.stop_price),
+                    "asset_quantity": _render(spec.base_size),
+                    "limit_price": _render(spec.limit_price),
+                    "stop_price": _render(spec.stop_price),
                     "time_in_force": TIME_IN_FORCE,
                 },
             }

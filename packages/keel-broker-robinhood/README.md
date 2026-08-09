@@ -67,6 +67,49 @@ Installing this package registers `robinhood` as a discoverable broker plugin (s
 currently constructs or calls a `RobinhoodAdapter`. This is deliberate: the adapter is built and
 tested ahead of the migration that will use it, not wired in early.
 
+### Must fix BEFORE wiring this to the live path
+
+The gaps above are capability limits -- things this venue cannot do, which the adapter refuses
+honestly. The list below is different: these are places where wiring this adapter up **as it
+stands** would degrade a safety property keel already has. Phase B must trip over this section.
+
+1. **`fees_usd` is always zero, so subscription-lapse detection is inert AND always-passing
+   against this venue.** This is not merely "a missing number". `FeeSummary.fees_usd` is the
+   field lapse detection reads to notice a fee charged while the user claims a fee-free
+   allowance. A constant zero can never contradict the claim, so the check does not fail
+   loudly -- it *passes*, every time, for every account. Anything consuming a Robinhood
+   `FeeSummary` must treat `fees_usd` as "not reported", never as "no fees were charged", and
+   the migration must decide whether an always-passing check is acceptable or whether the venue
+   should be excluded from that check by name. Closing it properly means paging order history
+   and summing per-order `fee_charged`, which needs its own rate-limit design.
+
+2. **A fresh `client_order_id` per `place_order` call means no retry is ever deduplicated.**
+   The uuid is minted per ATTEMPT, so a caller that retries after a timeout -- exactly when the
+   first request may already have reached the venue -- places a **second live order**. Robinhood
+   has nothing to match the retry against, because the id differs. The current behaviour is the
+   right default for the opposite hazard (an id minted per spec would silently collapse two
+   orders a strategy genuinely meant to place twice), and the port has no "retry of" concept to
+   disambiguate the two. So this is a documented tradeoff, not a solved problem: whatever calls
+   `place_order` in Phase B must not retry placement blindly.
+
+3. **`Preview.synthetic` is invisible at the confirm gate on today's CLI path.**
+   `keel/cli.py`'s `_interactive_confirm` takes a raw `dict` and renders it by iterating
+   `.items()` -- it has no `Preview` field to read and nowhere to display `synthetic`. Every
+   preview this adapter produces is `synthetic=True` (there is no native preview endpoint here),
+   and `Preview`'s own docstring requires that "approving an estimate must never look identical
+   to approving a broker's own quote". Until that CLI path is migrated to the port's `Preview`
+   type, approving a Robinhood estimate looks exactly like approving a Coinbase quote. The same
+   applies to `Preview.errors`, which this adapter populates whenever it could not price an
+   order -- an unpriced preview currently renders as a normal one.
+
+4. **No rate limiting or backoff.** Robinhood allows 100 requests/minute sustained (300 burst)
+   and this transport does not throttle or retry. Per-call account caching keeps each public
+   adapter method to a single `GET /accounts/`, but nothing bounds the engine's aggregate rate.
+
+5. **No candle source is composed.** Point 1 of "What does NOT work" means this adapter cannot
+   be a venue's sole broker; Phase B has to decide how an engine pairs an execution venue that
+   serves no bars with a separate market-data source.
+
 ## Credentials
 
 Robinhood authenticates with an Ed25519 keypair, not an API secret. Robinhood's API credential

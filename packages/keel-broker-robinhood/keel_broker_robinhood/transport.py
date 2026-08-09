@@ -27,7 +27,9 @@ from __future__ import annotations
 import base64
 import json
 import time
+from decimal import Decimal
 from typing import Any, Protocol
+from urllib.parse import quote, urlencode
 
 
 class Transport(Protocol):
@@ -265,7 +267,21 @@ class RobinhoodTransport:
         if params:
             # Sorted for a deterministic string: dict insertion order is an implementation detail
             # that must not silently change what gets signed from one call to the next.
-            query = "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
+            #
+            # `quote_via=quote`, NOT the `urlencode` default of `quote_plus`: `quote_plus` encodes
+            # a space as `+`, and `+` is itself a character that must survive round-tripping here.
+            # A raw `+` on the wire decodes server-side as a SPACE, so a value like `1E+2` would
+            # be verified against the signature as `1E+2` and then parsed as `1E 2` -- the
+            # signature check passes and the venue acts on a different value than was signed.
+            # (`translate._render` now keeps exponent forms out of sizes and prices, so that
+            # specific pairing is closed at the source too; this is the second gate.)
+            #
+            # `safe=""` so nothing is left unencoded on the assumption it is harmless.
+            query = "?" + urlencode(
+                [(k, v) for k, v in sorted(params.items()) if v is not None],
+                quote_via=quote,
+                safe="",
+            )
         full_path = f"{path}{query}"
 
         body_str = "" if body is None else json.dumps(body)
@@ -291,7 +307,14 @@ class RobinhoodTransport:
         response.raise_for_status()
         if not response.content:
             return None
-        json_response: Any = response.json()
+        # `json.loads(..., parse_float=Decimal)`, never `response.json()`. `requests`' own decoder
+        # parses an UNQUOTED JSON number as a `float`, and every money field on this venue --
+        # price, quantity, fee -- can arrive unquoted. By the time the adapter runs its
+        # `Decimal(str(value))` the precision is already gone: it would faithfully preserve
+        # whatever the float rounded to, not what Robinhood sent. Converting inside the parser is
+        # the only place the original digits still exist. Every fixture in this repository quotes
+        # its numbers, which is exactly why this could not have been caught by fixtures alone.
+        json_response: Any = json.loads(response.text, parse_float=Decimal)
         return json_response
 
     def _paginate(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -317,18 +340,40 @@ class RobinhoodTransport:
                 )
             page = self._request("GET", next_path, params=next_params)
             results.extend(_results(page))
-            cursor = _field(page, "next")
+            next_path = self._next_path(_field(page, "next"))
             # After the first page, `next` is already a full absolute URL Robinhood hands back --
             # not a path this transport built -- so params are folded into it already and must
             # not be re-appended on the next iteration.
-            if cursor:
-                if cursor.startswith(self._base_url):
-                    cursor = cursor[len(self._base_url) :]
-                next_path = cursor
-                next_params = None
-            else:
-                next_path = None
+            next_params = None
         return {"results": results}
+
+    def _next_path(self, cursor: Any) -> str | None:
+        """Turn a `next` cursor into a same-host path, or `None` to stop paginating.
+
+        `cursor` is typed `Any` because it comes straight out of a JSON payload, and this method
+        exists to stop that `Any` from becoming a crash or, worse, a request to somewhere else.
+        Two hazards, both of which are server-controlled input:
+
+        1. **A non-string `next`.** A `null` is already handled as "stop", but a number, a list,
+           or an object would previously reach `.startswith` and raise `AttributeError` out of a
+           read the adapter has no reason to expect can fail that way. Anything that is not a
+           string is treated as "no further pages": one truncated list is a far better outcome
+           than an exception surfacing from `get_holdings` mid-reconciliation.
+        2. **An absolute URL on a DIFFERENT host.** The old code stripped `self._base_url` only
+           when the cursor started with it, and otherwise used the value as a path -- so a
+           `next` of `https://evil.example/x` would be concatenated onto `self._base_url` and
+           requested as `https://trading.robinhood.com/https://evil.example/x`. That is a
+           malformed request rather than a leak, but this transport signs every request with the
+           account's credentials, so the rule worth enforcing is simple and absolute: a cursor
+           either points at this venue or pagination stops. It is never followed off-host.
+        """
+        if not isinstance(cursor, str) or not cursor:
+            return None
+        if cursor.startswith(self._base_url):
+            return cursor[len(self._base_url) :]
+        if cursor.startswith("/"):
+            return cursor
+        return None
 
     def get_accounts(self) -> Any:
         return self._paginate("/api/v2/crypto/trading/accounts/")
@@ -339,15 +384,53 @@ class RobinhoodTransport:
         )
 
     def get_trading_pairs(self, symbol: str | None = None) -> Any:
+        """The venue's per-pair trading rules. **Deliberately not called by the adapter yet.**
+
+        This method and `get_best_bid_ask` are the only two on this transport that `adapter.py`
+        never invokes, which is a fair thing to challenge in review, so the reason is written
+        down here rather than left to inference.
+
+        They exist because they are the inputs the obvious next feature needs: `asset_increment`,
+        `quote_increment`, `min_order_amount`, and `max_order_size` are what would let this
+        package round a size to the venue's tick LOCALLY instead of discovering the violation as
+        a rejection. That work is deliberately not done here, and the reason is the same principle
+        that shapes `cancel_order` and `_account`: a pre-flight check that runs before every
+        placement is also a check that runs before every EXIT, and one that raises -- or merely
+        blocks on an extra round trip during an outage -- can trap a position it was meant to
+        protect. Sizing validation must therefore be designed to degrade to "place it anyway"
+        rather than bolted on as a gate, and that design is a follow-up, not a nit fix.
+
+        They are exercised by the transport tests (endpoint path, signature, response shape), so
+        they are not untested code -- only uncalled code, on purpose, with a named successor.
+        """
         params = {"symbol": symbol} if symbol is not None else None
         return self._paginate("/api/v2/crypto/trading/trading_pairs/", params=params)
 
     def get_best_bid_ask(self, symbol: str) -> Any:
+        # `marketdata`, not `trading` -- see `get_estimated_price` below for why these two
+        # neighbouring endpoints genuinely sit under different namespaces in v2.
         return self._paginate(
             "/api/v2/crypto/marketdata/best_bid_ask/", params={"symbol": symbol}
         )
 
     def get_estimated_price(self, symbol: str, side: str, quantity: str) -> Any:
+        # ⚠️ `trading`, NOT `marketdata`. This looks like a copy-paste error next to
+        # `get_best_bid_ask` above and it is not -- Robinhood's v2 API really does split these
+        # two market-data reads across two namespaces. Verified against the primary source,
+        # https://docs.robinhood.com/crypto/trading/, which lists them verbatim as:
+        #
+        #     get/api/v2/crypto/trading/estimated_price/
+        #     get/api/v2/crypto/marketdata/best_bid_ask/
+        #
+        # The v1 API is the consistent one (`/api/v1/crypto/marketdata/estimated_price/`), which
+        # is very likely where the instinct to "fix" this path comes from. Do not change it to
+        # `marketdata` on symmetry grounds: a wrong path here is a 404, `_request` turns a 404
+        # into `None`, and `_estimated_price` then reports an unpriced preview -- a silent
+        # degradation of the confirm gate rather than an error anyone would notice.
+        #
+        # Required query params, per the same page: `symbol`, `side` (`bid`/`ask`/`both`), and
+        # `quantity` -- all three marked required.
+        #
         # Not paginated in practice (one symbol, one side, one quantity produces at most a
         # handful of rows), but routed through `_paginate` anyway so its shape matches every
         # other read here and the adapter never has to special-case one endpoint.
@@ -372,8 +455,23 @@ class RobinhoodTransport:
         a terminal FAILED status one layer up. Reporting FAILED because of a network blip rather
         than because Robinhood actually said "no such order" would tell the engine a resting
         order is gone when it is still live on the venue.
+
+        `account_number` rides on the query string, exactly as `create_order` sends it.
+        Robinhood's own v2 sample client (https://docs.robinhood.com/crypto/trading/, "Making
+        your first API call") builds this call as:
+
+            params = {"account_number": account_number}
+            path = f"/api/v2/crypto/trading/orders/{order_id}/{query_params}"
+
+        Omitting it risks a 404 -- and a 404 on THIS method is the quiet corruption described
+        above, not a loud failure: `_request` turns it into `None`, and `adapter.get_order` turns
+        that into a terminal FAILED with zeroed money for an order still resting at the venue.
         """
-        return self._request("GET", f"/api/v2/crypto/trading/orders/{order_id}/")
+        return self._request(
+            "GET",
+            f"/api/v2/crypto/trading/orders/{order_id}/",
+            params={"account_number": self._account()},
+        )
 
     def cancel_order(self, order_id: str) -> Any:
         """Cancel one order; `None` only if Robinhood's 404 says this id does not exist.
@@ -383,6 +481,18 @@ class RobinhoodTransport:
         else -- including a successful response whose `state` is not `"canceled"` -- as evidence
         to re-poll, precisely because a resting order that failed to cancel is still live money
         and must never be reported as gone on the strength of a raised exception it didn't get.
+
+        Unlike `create_order` and `get_order`, this endpoint sends NO `account_number`, and that
+        asymmetry is deliberate rather than an oversight. Robinhood's v2 reference documents this
+        endpoint with a path parameter `id` and no query-parameter section at all --
+        `post/api/v2/crypto/trading/orders/{id}/cancel/`, per
+        https://docs.robinhood.com/crypto/trading/ --
+        and their own v2 sample client builds it as a bare
+        `f"/api/v2/crypto/trading/orders/{order_id}/cancel/"` with no params -- while the same
+        sample DOES pass `account_number` for placing and fetching. Adding an undocumented param
+        here for the sake of looking consistent would be a guess, and every extra byte on the
+        query string is also signed, so a guess that the venue rejects is a 401 on the cancel
+        path. The order id alone identifies the order.
         """
         return self._request("POST", f"/api/v2/crypto/trading/orders/{order_id}/cancel/")
 
