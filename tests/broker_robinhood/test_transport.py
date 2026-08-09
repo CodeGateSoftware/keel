@@ -31,9 +31,29 @@ _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_fixture(name: str) -> dict[str, Any]:
+    """A decoded fixture, for tests that only need a value out of it (an `account_number`).
+
+    Deliberately NOT `parse_float=Decimal`, unlike `tests/broker_robinhood/test_adapter.py`'s
+    loader: the results of this one are handed back to `_FakeResponse(payload=...)`, which
+    re-serializes them with `json.dumps` -- and `json.dumps` cannot encode a `Decimal`. A test
+    that needs the venue's exact digits must use `_fixture_text` instead.
+    """
     with (_FIXTURES_DIR / name).open() as f:
         data: dict[str, Any] = json.load(f)
     return data
+
+
+def _fixture_text(name: str) -> str:
+    """A fixture's raw bytes, for replaying through the transport's own decoder.
+
+    `_FakeResponse(text=...)` puts this string where a live `response.text` would be, so
+    `_request` parses it with `json.loads(..., parse_float=Decimal)` exactly as it parses the
+    venue. That is the only way to assert on the values a live response would actually produce:
+    decoding the fixture here and re-encoding it into `payload=` sends every unquoted number
+    through a binary `float` first, which is the precise loss `parse_float=Decimal` exists to
+    prevent.
+    """
+    return (_FIXTURES_DIR / name).read_text()
 
 
 #: Throwaway Ed25519 test seed. Generated once for this file with
@@ -483,30 +503,54 @@ def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: An
     """The two reads the adapter does not call yet still have to return usable rows.
 
     `get_trading_pairs` and `get_best_bid_ask` are implemented but uninvoked -- see
-    `get_trading_pairs`' docstring for why local tick/minimum validation is a follow-up rather
-    than something to bolt onto the exit path. Uncalled code with unasserted fixtures is how a
-    method quietly rots into something that no longer works by the time the feature needing it
-    arrives, so this pins the fields that feature will read: `asset_increment` (the rounding
-    unit), `min_order_amount` / `max_order_size` (the bounds a rejected order would violate), and
-    the bid/ask legs a spread check would compare.
+    `get_trading_pairs`' docstring for why local tick validation is a follow-up rather than
+    something to bolt onto the exit path. Uncalled code with unasserted fixtures is how a method
+    quietly rots into something that no longer works by the time the feature needing it arrives,
+    so this pins the fields that feature will read: `asset_increment` (the rounding unit),
+    `max_order_size` (a bound a rejected order would violate), and the bid/ask legs a spread check
+    would compare.
 
-    `asset_increment` is `0.00000001` for BTC, which is the same value that makes
-    `translate._render` necessary -- one satoshi is a real order size on this venue, not a
-    rounding artefact.
+    There is deliberately **no minimum-order assertion**. The fixture used to carry
+    `min_order_amount` and the venue sends no such field, nor `min_order_size` (#217 F3) -- so a
+    pre-flight minimum check has no source on this endpoint, and asserting an invented bound here
+    would keep pointing #198 at one.
+
+    The fixture's raw bytes are replayed rather than a re-serialized decode of them, so the values
+    reach the assertions through the same `json.loads(..., parse_float=Decimal)` the live path
+    uses. Round-tripping through `float` on the way in would defeat the exactness being asserted:
+    `asset_increment` is `0.00000001` for BTC, the same value that makes `translate._render`
+    necessary, and one satoshi is a real order size on this venue rather than a rounding artefact.
+
+    ⚠️ **Both of these endpoints QUOTE their money values, and `estimated_price` does not**
+    (#217 F6). That is why each value is put through `Decimal(...)` here rather than compared
+    directly: this venue is not internally consistent about quoting, so `str` is what these two
+    reads produce today and nothing about the API guarantees it stays that way. The pairing of
+    `parse_float=Decimal` in the transport with `Decimal(str(v))` in the adapter is what makes
+    both forms land on the same number, and it is the only read in this package that is safe
+    against a venue that mixes them.
     """
-    http(_FakeResponse(payload=_load_fixture("rh_trading_pairs.json")))
+    http(_FakeResponse(text=_fixture_text("rh_trading_pairs.json")))
     pair = _results(_transport().get_trading_pairs(symbol="BTC-USD"))[0]
     assert pair["symbol"] == "BTC-USD"
+    assert isinstance(pair["asset_increment"], str), "this endpoint quotes its numbers -- #217 F6"
     assert Decimal(pair["asset_increment"]) == Decimal("0.00000001")
-    assert Decimal(pair["min_order_amount"]) > 0
     assert Decimal(pair["max_order_size"]) > 0
+    assert "min_order_amount" not in pair
+    assert "min_order_size" not in pair
 
-    http(_FakeResponse(payload=_load_fixture("rh_best_bid_ask.json")))
+    http(_FakeResponse(text=_fixture_text("rh_best_bid_ask.json")))
     quote_row = _results(_transport().get_best_bid_ask(symbol="BTC-USD"))[0]
     assert quote_row["symbol"] == "BTC-USD"
-    bid = Decimal(quote_row["bid_inclusive_of_sell_spread"])
-    ask = Decimal(quote_row["ask_inclusive_of_buy_spread"])
-    assert bid < ask, "a bid at or above the ask would invert every spread-based check"
+    assert quote_row["timestamp"], "the venue timestamps every quote row -- #217 F8"
+    # `Decimal`, never a lexical comparison: these arrive quoted, and `"9" > "10"` as strings.
+    assert Decimal(quote_row["bid"]) < Decimal(quote_row["ask"]), (
+        "a bid at or above the ask would invert every spread-based check"
+    )
+
+    # The contrast, in one place: the same transport, the same decoder, a different endpoint.
+    http(_FakeResponse(text=_fixture_text("rh_estimated_price.json")))
+    priced = _results(_transport().get_estimated_price("BTC-USD", "ask", "0.001"))[0]
+    assert isinstance(priced["ask"], Decimal), "this endpoint does NOT quote its numbers"
 
 
 # ---------------------------------------------------------------------------------------------

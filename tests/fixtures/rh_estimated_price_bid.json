@@ -4,13 +4,12 @@
   "results": [
     {
       "symbol": "BTC-USD",
-      "side": "ask",
+      "side": "bid",
       "quantity": 0.001,
       "timestamp": "2026-08-09T22:42:19.194164275Z",
       "fee_ratio": 0.0095,
-      "est_fee": 0.61726991,
-      "ask": 64975.78,
-      "est_total_cost": 65.59304991
+      "est_fee": 0.61728758,
+      "bid": 64977.64
     }
   ]
 }

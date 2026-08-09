@@ -8,6 +8,7 @@ worth pinning. Everything here runs offline with a stub transport.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,15 @@ from scripts.robinhood_smoke import (
     ReadOnlyViolation,
     _ReadOnly,
     compare_shapes,
+    fixture_shape,
     load_credentials,
     run_probes,
     shape_of,
 )
 
 _VALID_SEED_B64 = "A" * 44  # a base64 32-byte Ed25519 seed is 44 characters
+
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 class _StubTransport:
@@ -196,9 +200,70 @@ def test_a_wellformed_credential_is_returned(tmp_path: Path) -> None:
 
 def test_every_probe_names_a_fixture_that_exists() -> None:
     """A renamed fixture must break here, not halfway through a live run."""
-    fixtures = Path(__file__).resolve().parents[1] / "fixtures"
     for name, fixture_name in PROBES:
-        assert (fixtures / fixture_name).is_file(), f"{name} points at a missing {fixture_name}"
+        assert (_FIXTURES / fixture_name).is_file(), f"{name} points at a missing {fixture_name}"
+
+
+@pytest.mark.parametrize(("probe", "fixture_name"), PROBES)
+def test_a_probe_response_matches_its_fixture_after_pagination(
+    probe: str, fixture_name: str
+) -> None:
+    """The false positive #217 F5 reports, pinned so it cannot come back.
+
+    Every one of the five probes goes through `RobinhoodTransport._paginate`, which resolves the
+    cursor and hands back `{"results": [...]}` -- `next` and `previous` are consumed there and
+    never reach a caller, by design. The fixtures are single RAW pages and still carry both. The
+    script compared the two directly, so the very first live run reported `next` and `previous`
+    `MISSING AT VENUE` on all five probes: five differences, on a clean run, against a venue that
+    sends both fields. A report that cries wolf every time is worse than no report, because the
+    real findings in that same run (F1 through F4) had to be read past it.
+
+    This simulates the venue answering each fixture as its single page and asserts the comparison
+    the script actually performs is clean. It fails on both halves of the bug: an unstripped
+    envelope, and a fixture that has genuinely drifted from what the adapter reads.
+    """
+    payload = json.loads((_FIXTURES / fixture_name).read_text(), parse_float=Decimal)
+    after_pagination = {"results": payload["results"]}
+
+    diffs = compare_shapes(shape_of(after_pagination), fixture_shape(_FIXTURES / fixture_name))
+
+    assert diffs == [], f"{probe} reports differences against its own fixture: {diffs}"
+
+
+def test_a_fixture_number_is_decoded_the_way_the_live_transport_decodes_it() -> None:
+    """An unquoted fixture number (#217 F2) must not be shape-reported as a `float`.
+
+    `RobinhoodTransport._request` parses with `parse_float=Decimal`, so a live unquoted `64975.78`
+    reaches `shape_of` as a `Decimal`. A fixture decoded with a plain `json.loads` reaches it as a
+    `float`, and the script would then report `TYPE DIFFERS ... fixture='float' venue='Decimal'`
+    on every unquoted money field of every probe -- the same cry-wolf failure as F5, in a
+    different place.
+    """
+    shape = fixture_shape(_FIXTURES / "rh_estimated_price.json")
+    assert shape["results"][0]["ask"] == "Decimal"
+
+
+def test_a_quoted_fixture_value_is_still_reported_as_a_string() -> None:
+    """The other half of #217 F6: this venue quotes SOME money and not others.
+
+    `parse_float=Decimal` must not be mistaken for "everything becomes a `Decimal`". It converts
+    JSON numbers only, so a quoted `"0.00000001"` stays a `str` -- which is what `trading_pairs`
+    and `best_bid_ask` actually send. If this ever reported `Decimal`, the fixtures would have
+    been normalized to a uniformity the venue does not have, and the probe would report
+    `TYPE DIFFERS` against a live run.
+    """
+    assert fixture_shape(_FIXTURES / "rh_trading_pairs.json")["results"][0]["asset_increment"] == (
+        "str"
+    )
+    assert fixture_shape(_FIXTURES / "rh_best_bid_ask.json")["results"][0]["bid"] == "str"
+
+
+def test_the_pagination_envelope_is_stripped_only_from_a_paginated_shape() -> None:
+    """`next`/`previous` are dropped because `_paginate` consumes them -- not because the keys are
+    unwelcome. A payload with no `results` (an order object) is left exactly as it is, so a real
+    key named `next` on some future endpoint would still be compared rather than silently eaten."""
+    assert fixture_shape(_FIXTURES / "rh_order_open.json")["state"] == "str"
+    assert "next" not in fixture_shape(_FIXTURES / "rh_accounts.json")
 
 
 def test_a_failing_probe_does_not_abort_the_others() -> None:

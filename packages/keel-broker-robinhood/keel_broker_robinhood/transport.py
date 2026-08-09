@@ -308,12 +308,30 @@ class RobinhoodTransport:
         if not response.content:
             return None
         # `json.loads(..., parse_float=Decimal)`, never `response.json()`. `requests`' own decoder
-        # parses an UNQUOTED JSON number as a `float`, and every money field on this venue --
-        # price, quantity, fee -- can arrive unquoted. By the time the adapter runs its
-        # `Decimal(str(value))` the precision is already gone: it would faithfully preserve
-        # whatever the float rounded to, not what Robinhood sent. Converting inside the parser is
-        # the only place the original digits still exist. Every fixture in this repository quotes
-        # its numbers, which is exactly why this could not have been caught by fixtures alone.
+        # parses an UNQUOTED JSON number as a `float`, and money fields on this venue DO arrive
+        # unquoted. By the time the adapter runs its `Decimal(str(value))` the precision is
+        # already gone: it would faithfully preserve whatever the float rounded to, not what
+        # Robinhood sent. Converting inside the parser is the only place the original digits still
+        # exist.
+        #
+        # This was a defensive change when it landed (#194 S3) and is no longer.
+        #
+        # ⚠️ **This venue is NOT internally consistent about quoting** (#217 F6), which is the
+        # part worth remembering -- it is not "Robinhood sends numbers":
+        #
+        #     unquoted: estimated_price.{ask,bid,quantity,fee_ratio,est_fee,est_total_cost}
+        #               accounts.fee_tier_status.*
+        #               holdings.{total_quantity,quantity_available_for_trading}
+        #     quoted:   accounts.buying_power
+        #               trading_pairs.{asset_increment,quote_increment,max_order_size}
+        #               best_bid_ask.{bid,ask}
+        #
+        # `accounts` sends `buying_power` quoted and `fee_tier_status.fee_ratio` unquoted in the
+        # SAME object. So no field anywhere may be assumed to be one or the other, and no
+        # `isinstance` branch is safe: `parse_float=Decimal` here plus `Decimal(str(value))` in
+        # the adapter is what makes both forms land on the same exact number, and both halves are
+        # required. The fixtures now mirror the venue field for field, so the suite exercises both
+        # paths rather than a uniformity that does not exist.
         json_response: Any = json.loads(response.text, parse_float=Decimal)
         return json_response
 
@@ -391,9 +409,19 @@ class RobinhoodTransport:
         down here rather than left to inference.
 
         They exist because they are the inputs the obvious next feature needs: `asset_increment`,
-        `quote_increment`, `min_order_amount`, and `max_order_size` are what would let this
-        package round a size to the venue's tick LOCALLY instead of discovering the violation as
-        a rejection. That work is deliberately not done here, and the reason is the same principle
+        `quote_increment`, and `max_order_size` are what would let this package round a size to
+        the venue's tick LOCALLY instead of discovering the violation as a rejection.
+
+        ⚠️ **A minimum order size is NOT among them: this endpoint publishes none.** The rows
+        carry `symbol`, `asset_code`, `quote_code`, `asset_increment`, `quote_increment`,
+        `max_order_size`, `status` and `is_api_tradable`, and that is all -- there is no
+        `min_order_amount` and no `min_order_size` (#217 F3, observed live across four cursor
+        pages). This docstring named `min_order_amount` until that run, and the fixture invented
+        it, which between them gave the pre-flight minimum-size check proposed in #198 a source
+        that does not exist. Increment rounding and an upper bound can be checked locally against
+        this endpoint; a lower bound cannot be checked at all without a different source.
+
+        That work is deliberately not done here, and the reason is the same principle
         that shapes `cancel_order` and `_account`: a pre-flight check that runs before every
         placement is also a check that runs before every EXIT, and one that raises -- or merely
         blocks on an extra round trip during an outage -- can trap a position it was meant to
@@ -409,6 +437,13 @@ class RobinhoodTransport:
     def get_best_bid_ask(self, symbol: str) -> Any:
         # `marketdata`, not `trading` -- see `get_estimated_price` below for why these two
         # neighbouring endpoints genuinely sit under different namespaces in v2.
+        #
+        # Rows carry `symbol`, `bid` and `ask`. Nothing else, and specifically not the `price`,
+        # `buy_spread`, `sell_spread`, `ask_inclusive_of_buy_spread` or
+        # `bid_inclusive_of_sell_spread` the fixture invented before #217 F4 replaced it -- five
+        # keys, none of which this venue sends. No caller reads them today, which is the only
+        # reason that cost nothing; the risk was entirely in whatever got written against them
+        # next.
         return self._paginate(
             "/api/v2/crypto/marketdata/best_bid_ask/", params={"symbol": symbol}
         )

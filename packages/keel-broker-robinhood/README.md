@@ -20,6 +20,45 @@ no `time_in_force` field at all, which is why `market_ioc_base` is declared desp
 name saying IOC. That is a naming impedance, not a capability lie -- a market order is immediate
 by construction, and there is no resting-market variant here to confuse it with.
 
+### What a preview reads, and why it is still synthetic
+
+A market preview prices off `GET /api/v2/crypto/trading/estimated_price/`. The row that endpoint
+actually returns was confirmed against a real credential in #217:
+
+```
+{'symbol', 'side', 'quantity', 'timestamp', 'fee_ratio', 'est_fee', 'ask', 'est_total_cost'}
+```
+
+There is **no `price` field**. The unit price is in the column named after the side that was asked
+for -- `ask` for a buy, `bid` for a sell. The adapter read `price` until #217, and the consequence
+was total: every market preview against the real venue came back `est_quote_size = 0.000` with
+`errors` populated, so confirm mode was unusable on this venue. It is read from the requested
+side's column only, with no fallback to the other one: pricing a sell off an `ask` overstates the
+proceeds of an exit, and a row that does not carry the requested side is treated as unpriced.
+
+The adapter also reads the venue's own `est_fee` instead of multiplying by the account's fee tier,
+and reconciles `est_total_cost` against `price * quantity` and `est_fee` on every response.
+Whether `est_total_cost` includes the fee is **not documented**. All three self-consistent
+readings (`total == notional`, `total == notional + fee`, `total == notional - fee`) recover the
+same fee-exclusive notional, which is what `Preview.est_quote_size` is defined to carry, and
+`Preview.detail["cost_basis"]` reports which one this response satisfied. A total satisfying none
+of them is priced from the venue's number as sent *and* reported through `Preview.errors`.
+
+A live ask-side row settles the reading empirically -- `64975.78 * 0.001 + 0.61726991 ==
+65.59304991`, so the total is **fee-inclusive** there, and assigning it straight into
+`est_quote_size` would have double-counted the fee at the confirm gate. The relation is still
+re-derived per response rather than hardcoded, because:
+
+**`est_total_cost` is sent on the ask side only.** A `side=bid` row carries `bid`, `quantity`,
+`fee_ratio` and `est_fee` and no total at all. That is a complete answer, not a degraded one: a
+sell prices from `bid * quantity` with the venue's own `est_fee` beside it, `errors` stays empty,
+and `cost_basis` reads `price_x_quantity`.
+
+**None of that makes the preview a broker quote.** `/estimated_price/` prices a *quantity*: it
+does not validate the order, check buying power, check the account's own size bounds, or reserve
+anything, so an order it prices happily can still be rejected the instant it is placed.
+`supports_native_preview` stays `False` and `synthetic` stays `True`.
+
 ## What does NOT work
 
 ### No candles
@@ -42,6 +81,37 @@ on the live-money path, and it would do so silently. `translate.to_order_body` r
 `UnsupportedOrder` for `MarketIOCByQuote` with this reasoning in the message, as a second gate
 behind the adapter's capability declaration.
 
+### This venue is not internally consistent about quoting money
+
+Some endpoints send money as unquoted JSON numbers and others send the same kinds of value as
+quoted strings, and `accounts` does **both in the same object**:
+
+| | fields |
+| --- | --- |
+| unquoted numbers | `estimated_price.{ask,bid,quantity,fee_ratio,est_fee,est_total_cost}`, `accounts.fee_tier_status.*`, `holdings.{total_quantity,quantity_available_for_trading}` |
+| quoted strings | `accounts.buying_power`, `trading_pairs.{asset_increment,quote_increment,max_order_size}`, `best_bid_ask.{bid,ask}` |
+
+There is therefore no venue-wide rule to code against and no field that may be assumed to be one
+form or the other. Two things together make every read safe, and **both** are required:
+`json.loads(..., parse_float=Decimal)` in the transport, so an unquoted number never passes
+through a binary `float`; and `Decimal(str(value))` in the adapter, which is exact for a `str` and
+a round-trip no-op for a `Decimal`. Do not "simplify" either into `Decimal(value)`, and do not add
+an `isinstance` branch — there is nothing stable to branch on. The fixtures mirror the venue field
+for field, mixed quoting included, so the suite exercises both paths.
+
+### No published minimum order size
+
+`GET /api/v2/crypto/trading/trading_pairs/` publishes `asset_increment`, `quote_increment` and
+`max_order_size`, and **no minimum of any kind** -- neither `min_order_amount` nor
+`min_order_size`. This was confirmed live across four cursor pages in #217; the fixture had
+invented `min_order_amount`, and `transport.get_trading_pairs`' docstring named it as an input.
+
+The consequence is for the pre-flight sizing check proposed in #198: increment rounding and an
+upper bound can be validated locally against this endpoint, and a **lower** bound cannot be
+validated at all, because the venue never states one. An undersized order is discoverable only as
+a rejection at placement. Anything designing that check must not assume a minimum is available
+here.
+
 ### No sandbox
 
 Robinhood ships no test environment for this API. Every test in this repository's
@@ -49,6 +119,16 @@ Robinhood ships no test environment for this API. Every test in this repository'
 exercise this adapter end to end without placing a real order with real money, which is why the
 conformance suite against the fake transport is the only signal this package has before a human
 runs it live.
+
+`scripts/robinhood_smoke.py` narrows that gap without placing anything: it is a read-only,
+GET-only probe that compares each endpoint's live shape against the committed fixture. After the
+first run of it (#217), the five READ fixtures -- `rh_accounts.json`, `rh_holdings.json`,
+`rh_trading_pairs.json`, `rh_best_bid_ask.json`, `rh_estimated_price.json` -- match observed
+responses. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
+`rh_order_canceled.json`) remain unverified against the venue**, because observing an order
+object requires placing a real order, which that script refuses by construction. Their field
+names are still read from the documentation alone, and `place_order` / `get_order` /
+`cancel_order` all depend on them.
 
 ### `fees_usd` is always zero
 

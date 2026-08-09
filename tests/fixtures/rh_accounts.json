@@ -10,10 +10,10 @@
       "account_type": "individual",
       "is_api_tradable": true,
       "fee_tier_status": {
-        "fee_ratio": "0.0025",
-        "thirty_day_volume": "12480.55",
-        "next_fee_tier_ratio": "0.0020",
-        "next_fee_tier_threshold": "50000.00"
+        "fee_ratio": 0.0095,
+        "thirty_day_volume": 12480.55,
+        "next_fee_tier_ratio": 0.0085,
+        "next_fee_tier_threshold": 50000.00
       }
     }
   ]
