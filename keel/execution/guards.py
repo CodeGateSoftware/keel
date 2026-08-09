@@ -19,7 +19,11 @@ before the executor/money_mgmt modules that would normally produce some of these
 - Rail 9 (no stop-loss widening) reads an `agent_state` key `open_stop:<product_id>` holding the
   last-known protective stop for that product; the executor (Task 4) is expected to keep it
   current as brackets are placed/rolled. No prior stop recorded means there is nothing to widen
-  against, so the rail passes (an intent's *first* stop is never "widening").
+  against, so the rail passes (an intent's *first* stop is never "widening"). It compares an
+  ENTRY's `stop` or a PROTECTIVE order's `protective_stop` — a bracket carries its trigger price
+  in `entry` and leaves `stop` unset, so keying on `stop` alone silently skipped every bracket
+  keel placed. Rail 7 (min-move) still reads `stop` only, and is therefore inert on a bracket by
+  design: entry and stop are the same price there, so there is no move to measure.
 - Rail 11 (drawdown breaker) reads precomputed `agent_state` keys `drawdown_total_pct` /
   `drawdown_weekly_pct` (owned by `money_mgmt`/`pnl`, later phases) rather than recomputing an
   equity curve here — guards is a pure checker, not a P&L engine.
@@ -158,6 +162,18 @@ class OrderIntent:
     # operator's attestation and any broker-reported restriction -- guards has no broker or
     # clock access of its own. `None` means "unknown" and fails the BUY closed.
     withdrawals_enabled: bool | None = None
+
+    # Rail 9, for a PROTECTIVE order (`place_bracket`/`_roll_stop`): the price this order
+    # triggers at. A bracket carries that price in `entry` and leaves `stop` unset, because it is
+    # not an entry protected by a stop elsewhere -- it IS the stop. Rail 9 keys on
+    # `stop is not None`, so before this field it skipped every bracket keel ever placed and the
+    # ratchet-only invariant went unenforced on the live path (issue #206).
+    #
+    # ⚠️ Deliberately NOT expressed by populating `stop`. Rail 7 (min-move/anti-scalping) measures
+    # `abs(entry - stop) / entry`, and a bracket's entry and stop are the SAME price by
+    # construction -- so reusing `stop` would read as a 0% move and veto every protective order
+    # on the anti-scalping floor. Two rails, two different questions, two fields.
+    protective_stop: Decimal | None = None
 
 
 #: Rails whose inputs describe the LIVE ACCOUNT and therefore cannot be evaluated offline:
@@ -469,12 +485,17 @@ def check(
                 )
 
     # 9. No stop-loss widening — stops only ratchet toward profit vs. the last recorded stop.
-    if intent.stop is not None:
+    #    Reads an ENTRY's `stop` or a PROTECTIVE order's `protective_stop`: a bracket carries its
+    #    trigger price in `entry` and leaves `stop` unset, so keying on `stop` alone skipped every
+    #    bracket. Strictly `<`, never `<=` -- re-placing at the SAME level is how a dead or
+    #    rejected bracket is recovered, and vetoing that would strand the position naked.
+    proposed_stop = intent.stop if intent.stop is not None else intent.protective_stop
+    if proposed_stop is not None:
         prior_stop = repo.get_state(f"open_stop:{intent.product_id}")
-        if prior_stop is not None and intent.stop < prior_stop:
+        if prior_stop is not None and proposed_stop < prior_stop:
             violations.append(
-                f"no_stop_widening: proposed stop {intent.stop} is wider (lower) than the prior "
-                f"stop {prior_stop}"
+                f"no_stop_widening: proposed stop {proposed_stop} is wider (lower) than the "
+                f"prior stop {prior_stop}"
             )
 
     # 10. Sell-only-on-rule — no arbitrary liquidation; every SELL must cite a defined rule.
