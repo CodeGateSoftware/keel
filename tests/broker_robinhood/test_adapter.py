@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,7 @@ class FakeTransport:
         estimated_price: dict[str, Any] | None = None,
         placed: dict[str, Any] | None = None,
         order: dict[str, Any] | None = None,
+        orders: dict[str, Any] | None = None,
     ) -> None:
         self._accounts = accounts
         self._holdings = holdings
@@ -102,6 +104,7 @@ class FakeTransport:
         self._estimated_price = estimated_price
         self._placed = placed
         self._order = order
+        self._orders = orders
         self.calls: dict[str, dict[str, Any]] = {}
         #: How many times each method was actually called, keyed by method name. Kept separate
         #: from `self.calls` (which only remembers the latest kwargs, matching the Coinbase fake)
@@ -141,6 +144,18 @@ class FakeTransport:
         if issued_id is not None:
             self._issued_order_ids.add(issued_id)
         return self._placed
+
+    def get_orders(self, updated_at_start: str | None = None) -> Any:
+        """The order-history list, returned WHOLE regardless of `updated_at_start`.
+
+        Deliberately not filtered here. `updated_at_start` is a SERVER-side filter in the real
+        API, so an adapter that trusted a client-side reimplementation of it in this fake would
+        be tested against a filter that does not exist in production. What the adapter owes is
+        that it sends the right window, and that is asserted directly against
+        `calls["get_orders"]["updated_at_start"]` instead.
+        """
+        self._record("get_orders", updated_at_start=updated_at_start)
+        return self._orders
 
     def get_order(self, order_id: str) -> Any:
         self._record("get_order", order_id=order_id)
@@ -835,15 +850,194 @@ def test_get_fee_summary_declares_a_trailing_30d_window_by_name() -> None:
     assert adapter.get_fee_summary().volume_window == "trailing_30d"
 
 
-def test_get_fee_summary_reports_zero_fees_paid() -> None:
-    """Robinhood's `fee_tier_status` exposes a rate and a volume, but no account-level
-    fees-PAID total -- so `fees_usd` must be `Decimal("0")` rather than derived (rate * volume
-    would be an estimate dressed up as an observation). Subscription lapse detection reads this
-    field, and a nonzero value here that was never actually charged could mask a real lapse."""
-    transport = FakeTransport(accounts=load_fixture("rh_accounts.json"))
-    adapter = RobinhoodAdapter(transport)
+def _fee_summary_adapter(orders: dict[str, Any] | None = None) -> tuple[Any, RobinhoodAdapter]:
+    """A transport carrying the real accounts fixture plus an order history, and its adapter."""
+    transport = FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        orders=load_fixture("rh_orders.json") if orders is None else orders,
+    )
+    return transport, RobinhoodAdapter(transport)
+
+
+def test_get_fee_summary_sums_fee_charged_across_the_order_history() -> None:
+    """`fees_usd` must be OBSERVED, not pinned at zero (#197).
+
+    A constant zero cannot contradict anything, so subscription-lapse detection -- whose whole
+    job is to notice a fee charged while the user claims a fee-free allowance -- did not merely
+    fail to run against this venue, it silently PASSED every time. That is worse than an absent
+    rail, because it reads as coverage.
+
+    The expected total is summed off the fixture rather than written as a literal, so the day
+    that fixture is re-captured from a live order this test still states the property (every
+    charged fee is counted) instead of a stale number.
+    """
+    _, adapter = _fee_summary_adapter()
+
+    expected = sum(
+        (Decimal(str(row["fee_charged"])) for row in load_fixture("rh_orders.json")["results"]),
+        Decimal("0"),
+    )
+    assert expected > 0, "the fixture must carry a real charged fee or this proves nothing"
+    assert adapter.get_fee_summary().fees_usd == expected
+
+
+def test_get_fee_summary_counts_a_fee_charged_on_a_canceled_order() -> None:
+    """Filtering the sweep to `state == "filled"` would UNDER-report, and an under-report is a
+    lapse-detection false negative -- exactly the failure #197 is about.
+
+    An order that partially fills and is then cancelled ends in state `canceled` while having
+    been charged a real fee on the part that executed. `fee_charged` is documented as "the total
+    fee amount that was charged for this order based on EXECUTED FILLS", so the field is already
+    its own state filter: it reads zero on an order that never traded. Adding a state filter on
+    top of it can only remove real charges.
+    """
+    _, adapter = _fee_summary_adapter()
+
+    rows = load_fixture("rh_orders.json")["results"]
+    canceled = [r for r in rows if r["state"] == "canceled" and Decimal(str(r["fee_charged"])) > 0]
+    assert canceled, "the fixture must carry a charged-but-cancelled order or this proves nothing"
+
+    filled_only = sum(
+        (Decimal(str(r["fee_charged"])) for r in rows if r["state"] == "filled"), Decimal("0")
+    )
+    fees = adapter.get_fee_summary().fees_usd
+    assert fees > filled_only
+    assert fees == filled_only + sum(
+        (Decimal(str(r["fee_charged"])) for r in canceled), Decimal("0")
+    )
+
+
+def test_get_fee_summary_never_counts_estimated_fee_remaining() -> None:
+    """`estimated_fee_remaining` is a fee that has NOT been charged, and counting it would invent
+    a contradiction of a fee-free claim out of an order that has not traded yet.
+
+    The v2 docs describe it as "the estimated fee amount that will be charged on the remaining
+    unfilled quantity", explicitly conditional and explicitly an estimate. `fees_usd` is read as
+    an observation, so an estimate must never reach it.
+    """
+    _, adapter = _fee_summary_adapter()
+
+    rows = load_fixture("rh_orders.json")["results"]
+    estimated = sum((Decimal(str(r["estimated_fee_remaining"])) for r in rows), Decimal("0"))
+    assert estimated > 0, "the fixture must carry an un-charged estimate or this proves nothing"
+
+    charged = sum((Decimal(str(r["fee_charged"])) for r in rows), Decimal("0"))
+    assert adapter.get_fee_summary().fees_usd == charged
+
+
+def test_get_fee_summary_sweeps_the_same_thirty_day_window_volume_usd_reports() -> None:
+    """`fees_usd` and `volume_usd` must describe the SAME window or they cannot be compared.
+
+    `volume_usd` is the venue's own `thirty_day_volume`, so the fee sweep asks the venue for
+    exactly 30 days, cut from the same instant the summary reports as `fetched_at`. Equality
+    (rather than "roughly 30 days ago") is the assertion because the two must come from ONE
+    reading of the clock: taking `time.time()` twice would let the window and the timestamp it is
+    reported against drift apart for no reason.
+    """
+    transport, adapter = _fee_summary_adapter()
+
+    summary = adapter.get_fee_summary()
+
+    sent = transport.calls["get_orders"]["updated_at_start"]
+    start = datetime.strptime(sent, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    assert int(start.timestamp()) == summary.fetched_at - 30 * 24 * 60 * 60
+    assert summary.volume_window == "trailing_30d"
+
+
+def test_get_fee_summary_filters_on_updated_at_not_created_at() -> None:
+    """The window is cut on `updated_at`, and the choice is load-bearing rather than arbitrary.
+
+    A fee is charged when an execution happens, and an execution always bumps `updated_at`. So
+    the `updated_at_start` result set is a SUPERSET of the orders carrying an in-window fee --
+    it can never omit one. `created_at_start` has no such property: a GTC stop resting for forty
+    days and filling today was created outside the window and charged its fee inside it, so
+    filtering on creation drops a real charge. Under-reporting is the false negative #197 exists
+    to close, so the filter that cannot under-report is the correct one.
+    """
+    transport, adapter = _fee_summary_adapter()
+
+    adapter.get_fee_summary()
+
+    assert set(transport.calls["get_orders"]) == {"updated_at_start"}
+
+
+@pytest.mark.parametrize("quoted", [True, False])
+def test_get_fee_summary_reads_fee_charged_whether_the_venue_quotes_it_or_not(
+    quoted: bool,
+) -> None:
+    """`fee_charged`'s JSON quoting is UNVERIFIED, so both shapes have to land on the same number.
+
+    This venue is not internally consistent about quoting (#217 F6) -- `accounts` sends
+    `buying_power` quoted beside an unquoted `fee_tier_status.fee_ratio` in the SAME object -- and
+    no order object has ever been observed live, because observing one requires placing a real
+    order and there is no sandbox. The v2 schema types `fee_charged` as an unquoted `number`, but
+    it types the neighbouring `executions[].effective_price` as a quoted decimal STRING, so the
+    documentation does not settle it either. Reading both is required, not defensive breadth.
+    """
+    raw = "1.6355"
+    orders = {"results": [{"state": "filled", "fee_charged": raw if quoted else Decimal(raw)}]}
+    _, adapter = _fee_summary_adapter(orders)
+
+    assert adapter.get_fee_summary().fees_usd == Decimal(raw)
+
+
+def test_get_fee_summary_does_not_let_a_negative_fee_cancel_out_a_real_charge() -> None:
+    """A negative `fee_charged` is not a fee charged, and must not net a real one back to zero.
+
+    Nothing in the v2 docs says this field can go negative, so a negative is either a rebate or a
+    venue bug -- and under both readings, letting it subtract would hide a charge that really did
+    happen from the one check that exists to notice it.
+    """
+    orders = {
+        "results": [
+            {"state": "filled", "fee_charged": Decimal("1.6355")},
+            {"state": "filled", "fee_charged": Decimal("-5.00")},
+        ]
+    }
+    _, adapter = _fee_summary_adapter(orders)
+
+    assert adapter.get_fee_summary().fees_usd == Decimal("1.6355")
+
+
+def test_get_fee_summary_reports_zero_only_when_the_venue_reported_no_charges() -> None:
+    """Zero is still a legitimate answer -- but now it is an OBSERVATION rather than a constant.
+
+    An account that has traded nothing in thirty days genuinely paid nothing, and that zero does
+    contradict nothing for the right reason. The difference from the old behaviour is the whole
+    point of #197: this zero moves when the venue's answer moves.
+    """
+    _, adapter = _fee_summary_adapter({"results": []})
 
     assert adapter.get_fee_summary().fees_usd == Decimal("0")
+
+
+def test_get_fee_summary_propagates_a_truncated_sweep_instead_of_under_reporting() -> None:
+    """An incomplete sweep must raise, because `FeeSummary` has nowhere to say "partial".
+
+    `RobinhoodTransport._paginate` raises once a list refuses to terminate within `_MAX_PAGES`,
+    and `get_fee_summary` deliberately does NOT catch it. `fees_usd` is a bare `Decimal` with no
+    companion field for confidence, so a truncated sum is indistinguishable from a complete one
+    and would be read as an observation -- a silent under-report, which is the same
+    always-passing false negative #197 is about, merely arrived at by a different route. An
+    exception is visible; a confidently wrong number is not.
+
+    This is the opposite of the rule `_account`/`cancel_order` follow, and the asymmetry is the
+    point: those run on the EXIT path, where a raise can trap a position. `get_fee_summary` is a
+    reconciliation read on no position's critical path, so failing loudly costs nothing here.
+    """
+
+    class _TruncatingTransport(FakeTransport):
+        def get_orders(self, updated_at_start: str | None = None) -> Any:
+            self._record("get_orders", updated_at_start=updated_at_start)
+            raise RuntimeError(
+                "robinhood pagination did not terminate within 20 pages following "
+                "'/api/v2/crypto/trading/orders/'; refusing to loop further"
+            )
+
+    adapter = RobinhoodAdapter(_TruncatingTransport(accounts=load_fixture("rh_accounts.json")))
+
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        adapter.get_fee_summary()
 
 
 def test_a_transportless_adapter_refuses_network_calls_clearly() -> None:

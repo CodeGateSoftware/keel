@@ -56,6 +56,9 @@ class _StubTransport:
     def get_holdings(self) -> Any:
         return self._request("GET", "/api/v2/crypto/trading/holdings/")
 
+    def get_orders(self, updated_at_start: str | None = None) -> Any:
+        return self._request("GET", "/api/v2/crypto/trading/orders/")
+
 
 # --- the read-only guarantee ---------------------------------------------------------------
 
@@ -92,9 +95,16 @@ def test_get_requests_pass_through_and_are_recorded() -> None:
 
 def test_running_every_probe_issues_only_gets() -> None:
     guard = _ReadOnly(_StubTransport())
-    run_probes(guard, "BTC-USD")
+    results = run_probes(guard, "BTC-USD")
     assert guard.calls, "probes issued no requests at all"
     assert {method for method, _ in guard.calls} == {"GET"}
+    # Every probe must also have SUCCEEDED, not merely have issued a GET. `run_probes` records a
+    # failure per probe rather than aborting, so a probe calling a transport method that does not
+    # exist is swallowed into `{"ok": False}` -- which the read-only assertion above cannot see.
+    # Adding the `orders` probe (#197) hit exactly that: it was silently inert here until the stub
+    # grew a `get_orders`, and a probe nothing exercises is a probe that can rot unnoticed.
+    assert {name for name, result in results.items() if not result["ok"]} == set()
+    assert set(results) == {name for name, _ in PROBES}
 
 
 # --- shapes --------------------------------------------------------------------------------

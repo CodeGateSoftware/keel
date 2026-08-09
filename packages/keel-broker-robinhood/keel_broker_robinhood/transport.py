@@ -55,6 +55,8 @@ class Transport(Protocol):
 
     def create_order(self, body: dict[str, Any]) -> Any: ...
 
+    def get_orders(self, updated_at_start: str | None = None) -> Any: ...
+
     def get_order(self, order_id: str) -> Any: ...
 
     def cancel_order(self, order_id: str) -> Any: ...
@@ -480,6 +482,46 @@ class RobinhoodTransport:
             "/api/v2/crypto/trading/orders/",
             params={"account_number": self._account()},
             body=body,
+        )
+
+    def get_orders(self, updated_at_start: str | None = None) -> Any:
+        """List this account's orders, newest-first, with every page already concatenated.
+
+        This exists for `adapter.get_fee_summary`, which sums each order's `fee_charged` to
+        produce a real `fees_usd` (#197). The v2 order LIST endpoint is the only place that total
+        can come from: the API publishes a fee *rate* and a trailing volume at the account level
+        and no fees-paid figure anywhere.
+
+        **`updated_at_start` is a real, documented, SERVER-side filter and that is what makes the
+        sweep affordable.** https://docs.robinhood.com/crypto/trading/ documents this endpoint
+        with `account_number` (required), `cursor`, `created_at_start`, `created_at_end`,
+        `updated_at_start`, `updated_at_end`, `symbol`, `side`, `type` and `state`. Without a
+        server-side window the caller would have to page the account's ENTIRE order history on
+        every fee summary and discard most of it client-side, which against a 100 req/min limit
+        and a transport with no backoff is a cost that grows with the account's age forever. With
+        it, the sweep is bounded by how much the account traded in the window instead.
+
+        Only the one filter is threaded through, deliberately. Every other documented parameter
+        would NARROW the result set, and this is the one caller for whom a narrower set is a
+        wrong answer: `state` in particular looks like the obvious filter and would drop a
+        partially-filled-then-cancelled order, whose fee was really charged. See
+        `adapter._fees_paid` for why `updated_at` rather than `created_at`.
+
+        ⚠️ **Neither this endpoint nor any order object it returns has ever been observed live.**
+        `scripts/robinhood_smoke.py` can now probe it read-only, but until an operator with a real
+        credential runs that, the envelope shape, the page size, and every field name below the
+        `results` key are read from the documentation alone -- the same standing on which the
+        `rh_order_*.json` fixtures sit, and the same standing that #217 proved wrong four times
+        over on the endpoints that COULD be probed.
+
+        `limit` is not sent: the docs' pagination section says only "some of our endpoints support
+        this query parameter" and directs the reader to each endpoint's own parameter list, and
+        this endpoint's list does not carry it. An unsupported param is not free here -- it is
+        signed, so a guess the venue rejects is a 401 rather than a helpful 400.
+        """
+        return self._paginate(
+            "/api/v2/crypto/trading/orders/",
+            params={"account_number": self._account(), "updated_at_start": updated_at_start},
         )
 
     def get_order(self, order_id: str) -> Any:

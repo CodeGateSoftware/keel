@@ -10,7 +10,7 @@ API v2.
 | Balances     | Per-holding `Balance` plus one for the account's `buying_power`.              |
 | Order status | `get_order` normalizes a Robinhood order object to `OrderStatus`.            |
 | Cancel       | `cancel_order` confirms from the venue's returned order, with one re-poll.    |
-| Fee summary  | Rates from `fee_tier_status.fee_ratio`, `volume_usd` from `thirty_day_volume`. |
+| Fee summary  | Rates from `fee_tier_status.fee_ratio`, `volume_usd` from `thirty_day_volume`, `fees_usd` summed from 30 days of order history. |
 | Preview      | Synthetic only (`synthetic=True`) -- there is no native preview endpoint.     |
 
 Three order kinds are supported: `MarketIOCByBase` (market, sized in the asset), `LimitGTC`
@@ -58,6 +58,71 @@ and `cost_basis` reads `price_x_quantity`.
 does not validate the order, check buying power, check the account's own size bounds, or reserve
 anything, so an order it prices happily can still be rejected the instant it is placed.
 `supports_native_preview` stays `False` and `synthetic` stays `True`.
+
+### How `fees_usd` is built, and what it can still get wrong
+
+`get_fee_summary().fees_usd` used to be a hardcoded `Decimal("0")`. That was not a cosmetic gap
+(#197). `FeeSummary`'s own docstring names subscription-lapse detection as its consumer, and the
+contradiction it looks for is *a fee charged while the user claims a fee-free allowance*. A
+constant zero can never contradict anything, so against this venue the check did not fail loudly
+-- it **passed, every time, for every account**. A rail that always passes is worse than an
+absent one, because it reads as coverage.
+
+The v2 API still publishes no account-level fees-paid total, so the number is built the only way
+the API allows: `GET /api/v2/crypto/trading/orders/`, filtered to the same trailing 30 days
+`thirty_day_volume` covers, with each order's `fee_charged` summed.
+
+Four decisions in that sentence are load-bearing:
+
+**The window filter is `updated_at_start`, not `created_at_start`.** Both are documented and
+either would compile. A fee is charged when an execution happens, and an execution necessarily
+bumps `updated_at` -- so the `updated_at_start` result set is a *superset* of the orders carrying
+an in-window fee and can never omit one. `created_at_start` has no such property: a `StopLimitGTC`
+resting for forty days and filling this morning was created outside the window and charged its fee
+inside it. keel rests GTC brackets by design, so that is this engine's normal case, not a corner.
+Under-reporting is the false negative #197 exists to close, so between two imperfect filters the
+correct one is the one that cannot under-report.
+
+**No `state` filter is sent, and every state is counted.** `state` is the obvious narrowing and it
+is a trap: an order that partially fills and is then cancelled ends `canceled` while having been
+charged a real fee on the part that executed, and filtering to `filled` would drop it. No filter is
+needed anyway -- `fee_charged` is documented as the fee charged *based on executed fills*, so the
+field is already its own state filter, reading zero on an order that never traded.
+
+**`estimated_fee_remaining` is never read.** The neighbouring v2 field is the fee that *will* be
+charged on an order's unfilled remainder -- explicitly conditional, explicitly an estimate.
+`fees_usd` is consumed as an observation, and an estimate cannot honestly contradict anything.
+
+**An incomplete sweep raises rather than returning a partial sum.** `FeeSummary` has no field to
+mark a total as partial (`fees_usd` is a bare `Decimal`), so a truncated sum is indistinguishable
+from a complete one and would be read as an observation -- the same always-passing false negative
+in a new costume. `RobinhoodTransport._paginate` already raises past `_MAX_PAGES`, and
+`get_fee_summary` does not catch it. This inverts the rule `_account` and `cancel_order` follow
+("a raise on the way out of a position can trap it"), and safely: `get_fee_summary` is a
+reconciliation read, never a step in an unwind.
+
+Cost is **1 + N requests**, N being the history pages in the window: one `GET /accounts/` plus the
+page walk, capped at 20. Worst case 21 per call against a 100 req/min limit with no backoff in the
+transport; realistically 2 for an account trading a handful of times a month. The server-side
+window filter is what stops that growing with the account's total age forever.
+
+Two things this still cannot get exactly right, both stated so nobody reads more into the number
+than it carries:
+
+- **An order straddling the window edge contributes its whole fee.** `fee_charged` is an
+  *order*-level total, and v2's `executions[]` rows carry only `effective_price`, `quantity` and
+  `timestamp` -- no per-execution fee -- so a fee cannot be split at the boundary even in
+  principle. This over-counts, never under-counts, which is the survivable direction: an
+  over-count points lapse detection at a fee that was genuinely charged, just slightly earlier
+  than the window claims; an under-count hides one.
+- **The window is not provably identical to the venue's own.** `thirty_day_volume`'s boundary is
+  undocumented (it may be calendar-day aligned, it may exclude today) while this window is cut
+  from the local clock. The two match in length and intent, not necessarily to the second. Treat
+  `fees_usd` and `volume_usd` as comparable magnitudes over the same nominal window; do not divide
+  one by the other to derive an exact effective rate.
+
+⚠️ **No order object, and no response from the orders LIST endpoint, has ever been observed
+live** -- see "No sandbox" below. Every field name above is read from the documentation alone.
 
 ## What does NOT work
 
@@ -130,13 +195,15 @@ object requires placing a real order, which that script refuses by construction.
 names are still read from the documentation alone, and `place_order` / `get_order` /
 `cancel_order` all depend on them.
 
-### `fees_usd` is always zero
-
-`get_fee_summary().fees_usd` is hardcoded to `Decimal("0")`. The API exposes a fee *rate*
-(`fee_tier_status.fee_ratio`) and a trailing volume figure, but no account-level total of fees
-actually paid. keel's subscription-lapse detection reads `fees_usd` to notice a fee charged while
-the user claims a fee-free allowance; against this venue that check cannot fire, and lapse
-detection here has to fall back on the venue subscription attestation alone.
+The script gained a sixth probe with #197, against the orders LIST endpoint and
+`rh_orders.json`. It is a GET, so it stays inside the read-only guarantee, and it does verify the
+list endpoint's path, that the signature is accepted, and the pagination envelope. **It verifies
+the order OBJECT's field names only if the account happens to have order history.** On an account
+that has never traded crypto here, `results` comes back empty and `compare_shapes` skips a list
+whose rows are `<empty>` -- so the report prints a shape match it has not earned. An operator
+reading a clean `orders` line must check whether any row came back before treating it as
+corroboration. `fee_charged`'s JSON quoting -- quoted string or unquoted number, unknown at this
+venue and undecided by its own docs -- is exactly what one real row would settle.
 
 ## Not wired to the live path
 
@@ -153,15 +220,15 @@ The gaps above are capability limits -- things this venue cannot do, which the a
 honestly. The list below is different: these are places where wiring this adapter up **as it
 stands** would degrade a safety property keel already has. Phase B must trip over this section.
 
-1. **`fees_usd` is always zero, so subscription-lapse detection is inert AND always-passing
-   against this venue.** This is not merely "a missing number". `FeeSummary.fees_usd` is the
-   field lapse detection reads to notice a fee charged while the user claims a fee-free
-   allowance. A constant zero can never contradict the claim, so the check does not fail
-   loudly -- it *passes*, every time, for every account. Anything consuming a Robinhood
-   `FeeSummary` must treat `fees_usd` as "not reported", never as "no fees were charged", and
-   the migration must decide whether an always-passing check is acceptable or whether the venue
-   should be excluded from that check by name. Closing it properly means paging order history
-   and summing per-order `fee_charged`, which needs its own rate-limit design.
+1. **`fees_usd` is now summed from order history (#197), but the sum has never been checked
+   against a real order.** The always-zero constant is gone, so subscription-lapse detection is
+   no longer inert-and-always-passing here -- that item is closed. What replaces it is narrower
+   and must not be skipped: the sum is built from field names (`fee_charged`, `updated_at`, the
+   list envelope) that no live response has ever corroborated, because observing an order object
+   requires placing a real order. If `fee_charged` is spelled differently at the venue, every
+   row parses to `None` and the total silently returns to zero -- the original failure, arrived
+   at from a different direction. Run `scripts/robinhood_smoke.py` against an account with order
+   history before trusting the number, and confirm the `orders` probe actually returned a row.
 
 2. **A fresh `client_order_id` per `place_order` call means no retry is ever deduplicated.**
    The uuid is minted per ATTEMPT, so a caller that retries after a timeout -- exactly when the
@@ -184,7 +251,10 @@ stands** would degrade a safety property keel already has. Phase B must trip ove
 
 4. **No rate limiting or backoff.** Robinhood allows 100 requests/minute sustained (300 burst)
    and this transport does not throttle or retry. Per-call account caching keeps each public
-   adapter method to a single `GET /accounts/`, but nothing bounds the engine's aggregate rate.
+   adapter method to a single `GET /accounts/`, but nothing bounds the engine's aggregate rate --
+   and `get_fee_summary` is no longer a single-request method: its order-history sweep is 1 + N
+   requests, bounded at 21 by `_MAX_PAGES`. Whatever calls it in Phase B should call it on a
+   schedule, not per order.
 
 5. **No candle source is composed.** Point 1 of "What does NOT work" means this adapter cannot
    be a venue's sole broker; Phase B has to decide how an engine pairs an execution venue that

@@ -438,6 +438,12 @@ _ENDPOINTS: list[tuple[str, str, str, str]] = [
         "/api/v2/crypto/trading/estimated_price/",
         "quantity=0.1&side=ask&symbol=BTC-USD",
     ),
+    (
+        "get_orders",
+        "GET",
+        "/api/v2/crypto/trading/orders/",
+        "account_number=AB1234567890&updated_at_start=2026-07-10T12%3A00%3A00Z",
+    ),
     ("create_order", "POST", "/api/v2/crypto/trading/orders/", "account_number=AB1234567890"),
     (
         "get_order",
@@ -450,6 +456,7 @@ _ENDPOINTS: list[tuple[str, str, str, str]] = [
 
 _CALL_ARGS: dict[str, dict[str, Any]] = {
     "get_best_bid_ask": {"symbol": "BTC-USD"},
+    "get_orders": {"updated_at_start": "2026-07-10T12:00:00Z"},
     "get_estimated_price": {"symbol": "BTC-USD", "side": "ask", "quantity": "0.1"},
     "create_order": {"body": {"symbol": "BTC-USD"}},
     "get_order": {"order_id": "order-id-1"},
@@ -497,6 +504,41 @@ def test_get_order_sends_the_account_number_that_create_order_sends(http: Any) -
     created, fetched = recorder.calls[0], recorder.calls[1]
     assert account_of(created) == "AB1234567890"
     assert account_of(fetched) == account_of(created)
+
+
+def test_get_orders_omits_the_window_filter_entirely_when_none_is_asked_for(http: Any) -> None:
+    """An absent `updated_at_start` must vanish from the query string, not ride as `"None"`.
+
+    Every query param is SIGNED, so a stray literal `updated_at_start=None` is not a param the
+    venue ignores -- it is either a 400 or, worse, a filter matching nothing, which would empty
+    the fee sweep and report `fees_usd` as zero. That is the precise always-passing failure #197
+    exists to close, reintroduced through the query string.
+    """
+    recorder = http(_FakeResponse(payload={"results": [], "next": None}))
+    _transport().get_orders()
+
+    assert _path_of(recorder.calls[0]["url"]) == (
+        "/api/v2/crypto/trading/orders/?account_number=AB1234567890"
+    )
+    _assert_signature_covers_what_was_sent(recorder.calls[0])
+
+
+def test_get_orders_paginates_so_the_fee_sweep_never_sees_a_page_boundary(http: Any) -> None:
+    """A truncated order history is a silent under-report of `fees_usd`, so `get_orders` has to
+    resolve every page before the adapter sees it -- and a history that refuses to terminate has
+    to RAISE rather than hand back what it managed to collect."""
+    page_one = _FakeResponse(
+        payload={
+            "results": [{"id": "o1", "fee_charged": 1.5}],
+            "next": f"{_BASE_URL}/api/v2/crypto/trading/orders/?cursor=page2",
+        }
+    )
+    page_two = _FakeResponse(payload={"results": [{"id": "o2", "fee_charged": 0.25}], "next": None})
+    http([page_one, page_two])
+
+    rows = _results(_transport().get_orders())
+
+    assert [row["id"] for row in rows] == ["o1", "o2"]
 
 
 def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: Any) -> None:

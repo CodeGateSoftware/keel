@@ -25,5 +25,12 @@ class TestRobinhoodConformance(BrokerConformanceTests):
                 estimated_price=load_fixture("rh_estimated_price.json"),
                 placed=load_fixture("rh_order_open.json"),
                 order=load_fixture("rh_order_open.json"),
+                # Wired so `test_fee_summary_matches_its_declaration` exercises the real
+                # order-history sweep `fees_usd` is summed from (#197). Leaving it out would let
+                # the conformance run assert against an EMPTY sweep -- which returns
+                # `Decimal("0")` and is indistinguishable from the hardcoded zero that issue
+                # closed, so the one suite held out as this venue's end-to-end signal would pass
+                # just as happily on the bug as on the fix.
+                orders=load_fixture("rh_orders.json"),
             )
         )
