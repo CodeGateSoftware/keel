@@ -308,17 +308,30 @@ class RobinhoodTransport:
         if not response.content:
             return None
         # `json.loads(..., parse_float=Decimal)`, never `response.json()`. `requests`' own decoder
-        # parses an UNQUOTED JSON number as a `float`, and every money field on this venue --
-        # price, quantity, fee -- DOES arrive unquoted. By the time the adapter runs its
-        # `Decimal(str(value))` the precision is already gone: it would faithfully preserve
-        # whatever the float rounded to, not what Robinhood sent. Converting inside the parser is
-        # the only place the original digits still exist.
+        # parses an UNQUOTED JSON number as a `float`, and money fields on this venue DO arrive
+        # unquoted. By the time the adapter runs its `Decimal(str(value))` the precision is
+        # already gone: it would faithfully preserve whatever the float rounded to, not what
+        # Robinhood sent. Converting inside the parser is the only place the original digits still
+        # exist.
         #
-        # This was a defensive change when it landed (#194 S3) and is no longer: the first live
-        # run against a real credential (#217 F2) found EVERY money value unquoted, on every one
-        # of the five endpoints probed. The fixtures quoted all of them, which is why no test
-        # could have caught it -- they have since been corrected to unquoted numbers so the suite
-        # exercises this path rather than one the venue never produces.
+        # This was a defensive change when it landed (#194 S3) and is no longer.
+        #
+        # ⚠️ **This venue is NOT internally consistent about quoting** (#217 F6), which is the
+        # part worth remembering -- it is not "Robinhood sends numbers":
+        #
+        #     unquoted: estimated_price.{ask,bid,quantity,fee_ratio,est_fee,est_total_cost}
+        #               accounts.fee_tier_status.*
+        #               holdings.{total_quantity,quantity_available_for_trading}
+        #     quoted:   accounts.buying_power
+        #               trading_pairs.{asset_increment,quote_increment,max_order_size}
+        #               best_bid_ask.{bid,ask}
+        #
+        # `accounts` sends `buying_power` quoted and `fee_tier_status.fee_ratio` unquoted in the
+        # SAME object. So no field anywhere may be assumed to be one or the other, and no
+        # `isinstance` branch is safe: `parse_float=Decimal` here plus `Decimal(str(value))` in
+        # the adapter is what makes both forms land on the same exact number, and both halves are
+        # required. The fixtures now mirror the venue field for field, so the suite exercises both
+        # paths rather than a uniformity that does not exist.
         json_response: Any = json.loads(response.text, parse_float=Decimal)
         return json_response
 

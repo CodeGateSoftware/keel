@@ -70,6 +70,12 @@ FIXTURES = REPO_ROOT / "tests" / "fixtures"
 #: Read-only probes, in dependency order: `accounts` first because it resolves the account
 #: number every later call needs, and because it is the cheapest possible proof that the
 #: signature is accepted.
+#:
+#: `estimated_price` is probed on the ASK side only, so `tests/fixtures/rh_estimated_price_bid.json`
+#: is deliberately absent from this list. The two sides do not answer with the same shape -- the
+#: bid side omits `est_total_cost` entirely (#217 F7) -- so probing both would need a sixth entry
+#: keyed by side rather than by endpoint. The bid shape is pinned by the adapter's tests against
+#: that fixture instead; adding a side-aware probe here is a follow-up, not a nit.
 PROBES: tuple[tuple[str, str], ...] = (
     ("accounts", "rh_accounts.json"),
     ("trading_pairs", "rh_trading_pairs.json"),

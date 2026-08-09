@@ -450,12 +450,19 @@ class RobinhoodAdapter:
            would be precisely the "estimate that moves between the quote and the fill" this
            package refuses everywhere else, so only the unit price is used and `errors` says so.
         2. `est_total_cost` must reconcile with `price * quantity`, either exactly (fee-exclusive)
-           or offset by `est_fee` in one direction or the other. Nothing in Robinhood's
-           documentation settles which of those it is, and #217 could not settle it either, so
-           nothing here assumes: `_reconcile_total` reads it off the numbers in each response.
-           A total that fits none of the three is reported through `errors` rather than quietly
-           priced -- see `_reconcile_total` for why all three readings recover the same
-           fee-exclusive notional, and why that is the number `Preview.est_quote_size` wants.
+           or offset by `est_fee` in one direction or the other. Robinhood's documentation settles
+           none of this, so nothing here assumes: `_reconcile_total` reads the relation off the
+           numbers in each response. A total that fits none of the three is reported through
+           `errors` rather than quietly priced -- see `_reconcile_total` for why all three
+           readings recover the same fee-exclusive notional, and why that is the number
+           `Preview.est_quote_size` wants.
+
+        ⚠️ **`est_total_cost` is sent on the ASK side only** (#217 F7). The bid row carries
+        `bid`, `quantity`, `fee_ratio` and `est_fee` and simply has no total. That is a complete
+        answer, not a degraded one, and the sell path must not treat it as a failure: `price *
+        quantity` prices the order and the venue's own `est_fee` sits beside it, so `errors` stays
+        empty and `cost_basis` reads `price_x_quantity`. An exit preview that reported a problem
+        on every single call is an exit preview nobody would read.
 
         **`None`, never `Decimal("0")`.** This used to answer zero for "no rows", "unparseable
         price", and "the venue really did quote zero" alike, and `preview_order` had no way to
@@ -723,10 +730,15 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     """Parse one JSON leaf as a `Decimal`, or `None` if it is absent or not a number.
 
     `Decimal(str(value))` handles both shapes this venue produces without a branch: since #194 the
-    transport decodes with `parse_float=Decimal`, so an unquoted `65482.30` already arrives as a
-    `Decimal` (and `str()` of one round-trips exactly), while a quoted `"65482.30"` arrives as a
-    `str`. #217 confirmed the venue sends the unquoted form for every money field, but a `str`
-    remains possible on any field and costs nothing to accept.
+    transport decodes with `parse_float=Decimal`, so an unquoted `64975.78` already arrives as a
+    `Decimal` (and `str()` of one round-trips exactly), while a quoted `"64975.78"` arrives as a
+    `str`.
+
+    Accepting both is not defensive breadth here, it is required: **this venue mixes the two**
+    (#217 F6). `estimated_price` sends every money field unquoted; `trading_pairs` and
+    `best_bid_ask` quote every one of theirs; and `accounts` does both at once, sending
+    `buying_power` quoted beside an unquoted `fee_tier_status.fee_ratio`. There is no rule to
+    branch on, so this does not branch.
 
     `None` rather than a zero default, everywhere. A zero here would flow into a preview as a real
     price, a real fee, or a real cost, and this whole module is built on the principle that an
@@ -754,10 +766,10 @@ def _reconcile_total(
 ) -> tuple[Decimal, str, tuple[str, ...]]:
     """Work out what `est_total_cost` MEANS from the venue's own numbers, rather than assuming.
 
-    Robinhood's documentation does not say whether `est_total_cost` includes `est_fee`, and the
-    live run behind #217 did not settle it either -- so this does not choose. The response states
-    `price`, `quantity`, `est_fee` and `est_total_cost`, which is one equation with one unknown,
-    and exactly one of three readings fits any self-consistent response:
+    Robinhood's documentation does not say whether `est_total_cost` includes `est_fee`, so this
+    does not choose. The response states `price`, `quantity`, `est_fee` and `est_total_cost`,
+    which is one equation with one unknown, and exactly one of three readings fits any
+    self-consistent response:
 
     ============================ ===================================== ======================
     reading                      relation                              fee-exclusive notional
@@ -767,9 +779,17 @@ def _reconcile_total(
     ``est_total_cost_plus_...``  ``total == notional - fee``           ``total + fee``
     ============================ ===================================== ======================
 
-    The third is not padding. A BUY's "total cost" plausibly adds the fee while a SELL's plausibly
-    nets it out of the proceeds, and this endpoint answers both sides -- and #217 observed only
-    the `ask` side, so the sell convention is genuinely unknown.
+    A live ask-side row (#217) satisfies the SECOND reading exactly::
+
+        64975.78 * 0.001 + 0.61726991 == 65.59304991
+
+    so `est_total_cost` is fee-INCLUSIVE there, and assigning it straight into
+    `Preview.est_quote_size` would have double-counted the fee at the confirm gate. That is one
+    symbol, one side, one moment, and the venue does not send the field on the bid side at all
+    (#217 F7) -- which is exactly why the relation is re-derived per response rather than being
+    hardcoded now that it is known once. The third reading is not padding either: a BUY's "total
+    cost" plausibly adds the fee while a SELL's plausibly nets it out of the proceeds, and if the
+    venue ever starts answering `bid` with a total, this is what will read it correctly.
 
     All three recover the same fee-exclusive notional, which is the number `Preview.est_quote_size`
     is defined to carry (the limit path fills it with `base_size * limit_price`, and `est_fee` is
@@ -785,6 +805,10 @@ def _reconcile_total(
     relationship to the order they are approving. The port has a field for exactly this middle
     case, and it is `Preview.errors`.
     """
+    # No total is the NORMAL bid-side answer, not an edge case: this venue sends `est_total_cost`
+    # on the ask side only (#217 F7). `price * quantity` with the venue's own `est_fee` beside it
+    # is a complete estimate, so this returns no error -- every sell preview would carry one
+    # otherwise, and an error on every call is an error nobody reads.
     if total is None:
         return notional, "price_x_quantity", ()
 

@@ -520,22 +520,37 @@ def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: An
     uses. Round-tripping through `float` on the way in would defeat the exactness being asserted:
     `asset_increment` is `0.00000001` for BTC, the same value that makes `translate._render`
     necessary, and one satoshi is a real order size on this venue rather than a rounding artefact.
+
+    ⚠️ **Both of these endpoints QUOTE their money values, and `estimated_price` does not**
+    (#217 F6). That is why each value is put through `Decimal(...)` here rather than compared
+    directly: this venue is not internally consistent about quoting, so `str` is what these two
+    reads produce today and nothing about the API guarantees it stays that way. The pairing of
+    `parse_float=Decimal` in the transport with `Decimal(str(v))` in the adapter is what makes
+    both forms land on the same number, and it is the only read in this package that is safe
+    against a venue that mixes them.
     """
     http(_FakeResponse(text=_fixture_text("rh_trading_pairs.json")))
     pair = _results(_transport().get_trading_pairs(symbol="BTC-USD"))[0]
     assert pair["symbol"] == "BTC-USD"
-    assert pair["asset_increment"] == Decimal("0.00000001")
-    assert isinstance(pair["asset_increment"], Decimal)
-    assert pair["max_order_size"] > 0
+    assert isinstance(pair["asset_increment"], str), "this endpoint quotes its numbers -- #217 F6"
+    assert Decimal(pair["asset_increment"]) == Decimal("0.00000001")
+    assert Decimal(pair["max_order_size"]) > 0
     assert "min_order_amount" not in pair
     assert "min_order_size" not in pair
 
     http(_FakeResponse(text=_fixture_text("rh_best_bid_ask.json")))
     quote_row = _results(_transport().get_best_bid_ask(symbol="BTC-USD"))[0]
     assert quote_row["symbol"] == "BTC-USD"
-    assert quote_row["bid"] < quote_row["ask"], (
+    assert quote_row["timestamp"], "the venue timestamps every quote row -- #217 F8"
+    # `Decimal`, never a lexical comparison: these arrive quoted, and `"9" > "10"` as strings.
+    assert Decimal(quote_row["bid"]) < Decimal(quote_row["ask"]), (
         "a bid at or above the ask would invert every spread-based check"
     )
+
+    # The contrast, in one place: the same transport, the same decoder, a different endpoint.
+    http(_FakeResponse(text=_fixture_text("rh_estimated_price.json")))
+    priced = _results(_transport().get_estimated_price("BTC-USD", "ask", "0.001"))[0]
+    assert isinstance(priced["ask"], Decimal), "this endpoint does NOT quote its numbers"
 
 
 # ---------------------------------------------------------------------------------------------

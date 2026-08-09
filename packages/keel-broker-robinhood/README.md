@@ -38,12 +38,21 @@ proceeds of an exit, and a row that does not carry the requested side is treated
 
 The adapter also reads the venue's own `est_fee` instead of multiplying by the account's fee tier,
 and reconciles `est_total_cost` against `price * quantity` and `est_fee` on every response.
-Whether `est_total_cost` includes the fee is **not documented and not assumed**. All three
-self-consistent readings (`total == notional`, `total == notional + fee`, `total == notional -
-fee`) recover the same fee-exclusive notional, which is what `Preview.est_quote_size` is defined
-to carry, and `Preview.detail["cost_basis"]` reports which one this response satisfied. A total
-satisfying none of them is priced from the venue's number as sent *and* reported through
-`Preview.errors`.
+Whether `est_total_cost` includes the fee is **not documented**. All three self-consistent
+readings (`total == notional`, `total == notional + fee`, `total == notional - fee`) recover the
+same fee-exclusive notional, which is what `Preview.est_quote_size` is defined to carry, and
+`Preview.detail["cost_basis"]` reports which one this response satisfied. A total satisfying none
+of them is priced from the venue's number as sent *and* reported through `Preview.errors`.
+
+A live ask-side row settles the reading empirically -- `64975.78 * 0.001 + 0.61726991 ==
+65.59304991`, so the total is **fee-inclusive** there, and assigning it straight into
+`est_quote_size` would have double-counted the fee at the confirm gate. The relation is still
+re-derived per response rather than hardcoded, because:
+
+**`est_total_cost` is sent on the ask side only.** A `side=bid` row carries `bid`, `quantity`,
+`fee_ratio` and `est_fee` and no total at all. That is a complete answer, not a degraded one: a
+sell prices from `bid * quantity` with the venue's own `est_fee` beside it, `errors` stays empty,
+and `cost_basis` reads `price_x_quantity`.
 
 **None of that makes the preview a broker quote.** `/estimated_price/` prices a *quantity*: it
 does not validate the order, check buying power, check the account's own size bounds, or reserve
@@ -71,6 +80,24 @@ an estimate taken moments before placement, instead of the size the caller actua
 on the live-money path, and it would do so silently. `translate.to_order_body` raises
 `UnsupportedOrder` for `MarketIOCByQuote` with this reasoning in the message, as a second gate
 behind the adapter's capability declaration.
+
+### This venue is not internally consistent about quoting money
+
+Some endpoints send money as unquoted JSON numbers and others send the same kinds of value as
+quoted strings, and `accounts` does **both in the same object**:
+
+| | fields |
+| --- | --- |
+| unquoted numbers | `estimated_price.{ask,bid,quantity,fee_ratio,est_fee,est_total_cost}`, `accounts.fee_tier_status.*`, `holdings.{total_quantity,quantity_available_for_trading}` |
+| quoted strings | `accounts.buying_power`, `trading_pairs.{asset_increment,quote_increment,max_order_size}`, `best_bid_ask.{bid,ask}` |
+
+There is therefore no venue-wide rule to code against and no field that may be assumed to be one
+form or the other. Two things together make every read safe, and **both** are required:
+`json.loads(..., parse_float=Decimal)` in the transport, so an unquoted number never passes
+through a binary `float`; and `Decimal(str(value))` in the adapter, which is exact for a `str` and
+a round-trip no-op for a `Decimal`. Do not "simplify" either into `Decimal(value)`, and do not add
+an `isinstance` branch — there is nothing stable to branch on. The fixtures mirror the venue field
+for field, mixed quoting included, so the suite exercises both paths.
 
 ### No published minimum order size
 

@@ -231,15 +231,31 @@ def test_a_probe_response_matches_its_fixture_after_pagination(
 
 
 def test_a_fixture_number_is_decoded_the_way_the_live_transport_decodes_it() -> None:
-    """Fixture money is unquoted (#217 F2) and must not be shape-reported as a `float`.
+    """An unquoted fixture number (#217 F2) must not be shape-reported as a `float`.
 
-    `RobinhoodTransport._request` parses with `parse_float=Decimal`, so a live `65482.30` reaches
-    `shape_of` as a `Decimal`. A fixture decoded with a plain `json.loads` reaches it as a
+    `RobinhoodTransport._request` parses with `parse_float=Decimal`, so a live unquoted `64975.78`
+    reaches `shape_of` as a `Decimal`. A fixture decoded with a plain `json.loads` reaches it as a
     `float`, and the script would then report `TYPE DIFFERS ... fixture='float' venue='Decimal'`
-    on every money field of every probe -- the same cry-wolf failure as F5, in a different place.
+    on every unquoted money field of every probe -- the same cry-wolf failure as F5, in a
+    different place.
     """
     shape = fixture_shape(_FIXTURES / "rh_estimated_price.json")
     assert shape["results"][0]["ask"] == "Decimal"
+
+
+def test_a_quoted_fixture_value_is_still_reported_as_a_string() -> None:
+    """The other half of #217 F6: this venue quotes SOME money and not others.
+
+    `parse_float=Decimal` must not be mistaken for "everything becomes a `Decimal`". It converts
+    JSON numbers only, so a quoted `"0.00000001"` stays a `str` -- which is what `trading_pairs`
+    and `best_bid_ask` actually send. If this ever reported `Decimal`, the fixtures would have
+    been normalized to a uniformity the venue does not have, and the probe would report
+    `TYPE DIFFERS` against a live run.
+    """
+    assert fixture_shape(_FIXTURES / "rh_trading_pairs.json")["results"][0]["asset_increment"] == (
+        "str"
+    )
+    assert fixture_shape(_FIXTURES / "rh_best_bid_ask.json")["results"][0]["bid"] == "str"
 
 
 def test_the_pagination_envelope_is_stripped_only_from_a_paginated_shape() -> None:
