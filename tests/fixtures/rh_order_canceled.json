@@ -1,0 +1,21 @@
+{
+  "id": "5c6d7e8f-9a0b-1c2d-3e4f-5a6b7c8d9e0f",
+  "account_number": "AB1234567890",
+  "symbol": "BTC-USD",
+  "client_order_id": "2b3c4d5e-6f7a-8b9c-0d1e-2f3a4b5c6d7e",
+  "side": "buy",
+  "type": "limit",
+  "state": "canceled",
+  "average_price": null,
+  "filled_asset_quantity": "0",
+  "created_at": "2026-08-09T11:40:00.000000Z",
+  "updated_at": "2026-08-09T11:45:00.000000Z",
+  "fee_charged": "0",
+  "estimated_fee_remaining": "0",
+  "executions": [],
+  "limit_order_config": {
+    "asset_quantity": "0.1",
+    "limit_price": "64000.00",
+    "time_in_force": "gtc"
+  }
+}

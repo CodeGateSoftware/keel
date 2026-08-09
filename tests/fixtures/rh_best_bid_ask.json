@@ -1,0 +1,15 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "symbol": "BTC-USD",
+      "price": "65430.00",
+      "bid_inclusive_of_sell_spread": "65380.00",
+      "sell_spread": "0.05",
+      "ask_inclusive_of_buy_spread": "65480.00",
+      "buy_spread": "0.05",
+      "timestamp": "2026-08-09T12:00:00Z"
+    }
+  ]
+}
