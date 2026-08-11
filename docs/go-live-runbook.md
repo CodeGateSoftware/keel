@@ -15,6 +15,7 @@ exchange, correctly, and we have a record of it".
 | | check | why |
 |---|---|---|
 | ☐ | `keel --version` reports `[release]`, no `DIRTY`, no `[checkout]` | a build that matches no commit is not reproducible; do not run it against funds |
+| ☐ | `keel versions` exits **0** | `--version` speaks for the `keel-trader` distribution alone. This one checks every keel distribution in the venv and fails on a partial upgrade — new engine, old libraries — which `--version` cannot see |
 | ☐ | you have a **trade-enabled** CDP key (the read-only one cannot place orders) | |
 | ☐ | `.env` holds `CDP_API_KEY` / `CDP_API_SECRET`, and `.env` is git-ignored | credentials live only here — there is no vault |
 | ☐ | you are at a real terminal | confirmation and every halt-releasing command fail closed off a TTY |

@@ -15,10 +15,19 @@ Two sources, in priority order:
 
 Falls back to `unknown` rather than raising: failing to identify the build is a reason to warn
 loudly, not a reason to prevent the tool from starting.
+
+**One build identity is not enough.** `BuildInfo` describes the `keel-trader` distribution only,
+and keel is installed as *several* distributions (`keel-core`, `keel-broker-*`). A deployment
+upgraded by installing the `keel_trader` wheel alone leaves the rest at whatever version they
+were -- `~/keel` ran `keel-trader 0.5.7` against `keel-core 0.5.5` for two releases, and
+`keel --version` reported the new number throughout, because that is all it can see. So this
+module also reports the *install*: `check_install()` reads every `keel-*` distribution present in
+the running interpreter's environment, which is the only view that can show a partial upgrade.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
@@ -140,4 +149,117 @@ def build_info() -> BuildInfo:
         # treat that as dirty, because "we could not tell" must not read as "clean".
         dirty=status is None or bool(status),
         source="checkout",
+    )
+
+
+# -- the whole install, not just this distribution ----------------------------------------------
+
+#: Everything the workspace publishes is named `keel-<something>`, so a prefix match enumerates
+#: the install without a hand-maintained list that a new package would silently fall out of. The
+#: bare name `keel` is excluded on purpose: it belongs to an unrelated PyPI project (see
+#: `DISTRIBUTION`), and folding a stranger's version number into this check would be nonsense.
+_FAMILY_PREFIX = "keel-"
+
+#: Distributions that must not exist in a deployment. `keel-broker-fake` is a dev-only fake venue
+#: (see the `dev` group in `pyproject.toml`) whose reason to exist is proving two-plugin
+#: discovery -- it registers a `fake` entry under `keel.brokers`, so an engine that has it
+#: installed advertises a venue that trades nothing. It was found installed in `~/keel`. Nothing
+#: calls `load_broker()` today, so it is inert; "inert" is a property of this release, not of the
+#: package, and is not a reason to leave it on a box that moves money.
+DEV_ONLY_DISTRIBUTIONS = frozenset({"keel-broker-fake"})
+
+
+def _canonical(name: str) -> str:
+    """PEP 503 normalisation: `keel_broker_api` and `Keel-Broker-API` are the same distribution."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+@dataclass(frozen=True)
+class InstallReport:
+    """Every `keel-*` distribution visible to the running interpreter, and what is wrong with it.
+
+    A pure value: `check_install()` builds it from the environment, everything else here is
+    derived, so the rules below are testable without installing anything.
+    """
+
+    #: canonical distribution name -> version, e.g. `{"keel-core": "0.6.0"}`.
+    distributions: dict[str, str]
+    #: `build_info().source` at the time of the check; `"release"` means a deployment.
+    source: str = "unknown"
+
+    @property
+    def versions(self) -> list[str]:
+        return sorted(set(self.distributions.values()))
+
+    @property
+    def is_consistent(self) -> bool:
+        """False when the distributions disagree -- i.e. a partial upgrade.
+
+        An empty install is vacuously consistent: running from a source checkout with nothing
+        installed is a legitimate state, and it is not this check's job to invent a failure.
+        """
+        return len(self.versions) <= 1
+
+    @property
+    def dev_only_installed(self) -> list[str]:
+        return sorted(n for n in self.distributions if n in DEV_ONLY_DISTRIBUTIONS)
+
+    @property
+    def problems(self) -> list[str]:
+        """Every reason this install must not be trusted, worst first. Empty means healthy.
+
+        A dev-only package is a problem in a **release** build only: a checkout is exactly where
+        `keel-broker-fake` is supposed to be, and a check that cried wolf on every developer's
+        machine would be ignored by the time it mattered. Build state (`DIRTY`, `[checkout]`) is
+        deliberately NOT a problem here -- `describe()` already says it, and this report is about
+        what is installed, not about which commit it came from.
+        """
+        found: list[str] = []
+        if not self.is_consistent:
+            found.append(
+                f"PARTIAL INSTALL: {len(self.distributions)} keel distributions at "
+                f"{len(self.versions)} different versions ({', '.join(self.versions)}). "
+                "`keel --version` reports keel-trader's version alone and cannot see this. "
+                "Reinstall every wheel by path (README, 'Deploying a new version')."
+            )
+        if self.source == "release":
+            for name in self.dev_only_installed:
+                found.append(
+                    f"{name} is installed. It is a dev-only package that registers a venue "
+                    "entry point and must not exist in a deployment. Remove it: "
+                    f"`uv pip uninstall --python .venv {name}`."
+                )
+        return found
+
+
+def installed_distributions() -> dict[str, str]:
+    """Canonical name -> version for every installed `keel-*` distribution. Never raises.
+
+    Scoped to the interpreter that is running, so `.venv/bin/keel` reports that venv -- which is
+    what makes this answerable in a deployment with no repository and no git.
+    """
+    found: dict[str, str] = {}
+    try:
+        dists = list(metadata.distributions())
+    except Exception:  # pragma: no cover -- a broken environment must not stop the CLI
+        return found
+    for dist in dists:
+        try:
+            name = _canonical(dist.metadata["Name"] or "")
+            version = dist.version
+        except Exception:  # pragma: no cover -- one unreadable dist must not hide the rest
+            continue
+        if not name.startswith(_FAMILY_PREFIX):
+            continue
+        # First occurrence wins: that is the copy the import machinery resolves, so it is the
+        # code that would actually run. A second copy further down `sys.path` is unreachable.
+        found.setdefault(name, version)
+    return found
+
+
+def check_install(source: str | None = None) -> InstallReport:
+    """Read the environment into an `InstallReport`. `source` defaults to this build's."""
+    return InstallReport(
+        distributions=installed_distributions(),
+        source=build_info().source if source is None else source,
     )

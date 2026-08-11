@@ -18,6 +18,11 @@ commit hash (`+` is the semver / PEP 440 build-metadata separator). The version 
 this". A build reporting `(DIRTY)` or `[checkout]` corresponds to no commit and **must not be run
 against live funds**; `keel --version` warns loudly when so.
 
+It answers for the `keel-trader` distribution **only**, though, and keel installs as six of them.
+`keel versions` reports every one and exits non-zero if they disagree — that is the check a
+deployment runs (README, "Deploying a new version"), and the release workflow runs it too against
+the wheels it just built.
+
 ## Cutting a release
 
 1. **Bump the version in a reviewed PR.** Edit `version` in `pyproject.toml`. The release workflow
@@ -36,7 +41,8 @@ against live funds**; `keel --version` warns loudly when so.
 | asset | what it is |
 |---|---|
 | `keel_trader-<version>-py3-none-any.whl` | the CLI. Install **by path**, never by bare name. |
-| `keel_core-*`, `keel_broker_*` wheels | workspace members `keel` depends on; download them all. |
+| `keel_core-*`, `keel_broker_api-*`, `keel_broker_coinbase-*` | what `keel-trader` depends on, pinned `==` to this same version. Install all four wheels by path. |
+| `keel_broker_fake-*`, `keel_broker_robinhood-*` | built by `--all-packages` and published, but **not** part of a deployment: the fake is a dev-only venue, Robinhood is optional (and drags in an Ed25519 stack). Do not install them into one. |
 | `config.yaml` | the **production** config: real allowlist/caps in `auto_trade.mode: confirm`. |
 
 `config.yaml` is `keel/templates/config.live.yaml`, committed and reviewed like any other code.

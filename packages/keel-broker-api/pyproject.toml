@@ -3,7 +3,9 @@ name = "keel-broker-api"
 version = "0.6.0"
 description = "Broker port, domain types, capability model, and conformance suite for keel"
 requires-python = ">=3.14.4"
-dependencies = ["keel-core"]
+# Pinned `==`: see the note in the root `pyproject.toml`. An unpinned sibling is satisfied by
+# whatever is already installed, which is how a deployment ends up running mixed versions.
+dependencies = ["keel-core==0.6.0"]
 
 [project.optional-dependencies]
 conformance = ["pytest>=9.1.1"]
