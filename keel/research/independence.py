@@ -43,12 +43,21 @@ class IndependenceReport:
     median_entry_distance: int | None
 
 
-def _pearson(xs: Sequence[Decimal], ys: Sequence[Decimal]) -> Decimal:
+def pearson(xs: Sequence[Decimal], ys: Sequence[Decimal]) -> Decimal:
     """Pearson correlation. Returns 0 when either series is constant.
 
     A constant series has no variance to correlate against, so the coefficient is undefined
     rather than zero -- but every caller here wants "no measurable relationship", and raising
     would abort a whole matrix over one degenerate pair. Documented, not silent.
+
+    **Public deliberately (issue #208).** It was `_pearson` while `compare()` was its only
+    caller. `research/cts_factors.py` measures correlation between BOOLEAN factor-presence
+    vectors, where the fast exact form is the phi coefficient computed from 2x2 contingency
+    counts rather than a running covariance -- but phi and Pearson-on-{0,1} are the same
+    number, so this function is that module's test ORACLE. An oracle imported through a
+    private name is an oracle one refactor away from silently disappearing, and importing
+    `_pearson` across modules is exactly the wart `sim/portfolio_sim.py` already carries
+    against `engine._assemble_cts_context`. Promoted rather than duplicated.
     """
     n = len(xs)
     if n < 2 or n != len(ys):
@@ -119,10 +128,10 @@ def compare(
         b_active=sum(b_positions),
         both_active=sum(1 for x, y in zip(a_positions, b_positions) if x and y),
         jaccard=jaccard(a_positions, b_positions),
-        position_correlation=_pearson(
+        position_correlation=pearson(
             [Decimal(v) for v in a_positions], [Decimal(v) for v in b_positions]
         ),
-        pnl_correlation=_pearson(a_pnl, b_pnl),
+        pnl_correlation=pearson(a_pnl, b_pnl),
         entry_distances=distances,
         median_entry_distance=_median(distances),
     )

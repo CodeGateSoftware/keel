@@ -139,7 +139,7 @@ def evaluate(
                 )
                 continue
 
-        context = _assemble_cts_context(setup, trading_candles)
+        context = assemble_cts_context(setup, trading_candles)
         cts_result = indicators_cts.score(context, weights)
         technique = indicators_cts.entry_technique(cts_result.total)
 
@@ -242,7 +242,7 @@ def _trading_granularity(rule: Rule, candles_by_tf: dict[Granularity, list[Candl
 # ---------------------------------------------------------------------------
 
 
-def _assemble_cts_context(setup: Setup, candles: list[Candle]) -> dict[str, Any]:
+def assemble_cts_context(setup: Setup, candles: list[Candle]) -> dict[str, Any]:
     """Build the 11-key `indicators_cts.score()` context from `analysis.*` + `setup`.
 
     Every flag is computed fresh from `analysis.regime`/`analysis.indicators`/
@@ -251,6 +251,15 @@ def _assemble_cts_context(setup: Setup, candles: list[Candle]) -> dict[str, Any]
     checks -- not lifted verbatim from `setup.context`, whose keys are each rule's own
     explainability shape (e.g. `pattern` vs. `candlestick_pattern`) and aren't guaranteed to
     line up with the CTS context's documented key names (see `indicators_cts.py`'s docstring).
+
+    **Public deliberately (issue #208).** This is a PURE function of `(setup, candles)` --
+    no I/O, no repo, no clock -- which makes it the one piece of the live scoring path that
+    can be replayed offline over historical candles. Two modules outside `strategy/` do
+    exactly that: `sim/portfolio_sim._record_cts_telemetry` (which was already reaching
+    through the `_` prefix) and `research/cts_factors`, which replays it bar-by-bar to test
+    whether the 11 factors carry independent evidence (issue #208). Only `setup.entry` is
+    read from the setup; `stop`/`target`/`context` are not consulted, so an offline replay
+    can present a synthetic entry price without inventing a risk model.
     """
     if len(candles) < 2:
         return {}
