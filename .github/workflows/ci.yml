@@ -1,37 +1,35 @@
 name: CI
 
-# MANUAL ONLY. This suite runs when a human dispatches it and at no other time. The `push` to
-# `main` trigger went first (it re-ran the same content the PR run had already passed, for no new
-# information); `pull_request` has now gone too, so the automatic half of this workflow is empty.
+# ON EVERY MERGE, and on demand. A push to `main` is what a merge looks like from Actions' side,
+# so every merged PR now re-runs lint, the suite, and the build-identity check against the tree
+# that actually resulted from the merge.
 #
-# Be clear about what that costs: NOTHING VERIFIES A PULL REQUEST BEFORE IT MERGES ANY MORE. There
-# is no lint, no suite, and no build-identity check standing between a branch and `main`. Nor does
-# branch protection compensate. There IS a repository ruleset named `main`, and it does list
-# required status checks, but it currently matches no refs at all -- its `ref_name.include` is
-# empty, and `GET /repos/:owner/:repo/rules/branches/main` returns `[]`, meaning zero rules are in
-# force on the branch. Its two required contexts ("Lint, Unit tests, Build" and "Integration
-# Tests") also match no job this repo defines. So there is no required status check a merge could
-# fail on: a PR merges because a human decided to merge it, and that decision is the only gate at
-# merge time.
+# That last phrase is the point, and it is why this is NOT the redundant run it was once called.
+# A `pull_request` run tests the PR head; a `push` run tests `main` after the merge landed. Those
+# differ whenever two independently-green branches conflict semantically -- each passes alone, the
+# merge of them does not. Only the post-merge run can see that.
 #
-# What survives is the gate inside `release.yml`. That workflow is itself manual, but every run of
-# it re-runs `ruff` + `pytest` automatically before it will build an artifact -- so a red `main`
-# still cannot ship. That is the safety net that matters most for a tool that moves money: broken
-# code can reach `main`, but it cannot reach a wheel, a tag, or a release asset without the suite
-# passing first.
+# What this does NOT do, stated plainly so nobody mistakes it for a gate: it runs AFTER the merge.
+# It cannot block one. A broken PR still reaches `main`; this workflow's job is to make sure
+# nobody has to wonder for long, not to prevent it. Blocking a merge needs two things this repo
+# does not currently have -- a `pull_request` trigger, and a repository ruleset that actually
+# matches `main` and requires the `test` context. The ruleset named `main` exists but matches no
+# refs (`ref_name.include` is empty; `GET /repos/:owner/:repo/rules/branches/main` returns `[]`),
+# and its two required contexts ("Lint, Unit tests, Build", "Integration Tests") match no job this
+# repo defines. Both halves have to be fixed together: pointing that ruleset at `main` while its
+# contexts still name jobs that never report would block every PR forever.
 #
-# The accepted consequence, stated plainly: a breakage introduced by a merge is discovered at
-# release time, or whenever somebody next dispatches this workflow -- not at merge time. The
-# window between "merged" and "found" is now however long passes before one of those two happens.
-# Dispatching this suite against `main` after a batch of merges, and before cutting a release, is
-# what closes that window. Restoring `pull_request:` below is a one-line change if the trade stops
-# being worth it.
+# `release.yml` remains the gate that matters for money: it re-runs `ruff` + `pytest` itself before
+# it will build an artifact, so a red `main` cannot become a wheel, a tag, or a release asset.
+# This workflow shortens the time to discovery; that one prevents the consequence.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
-# `github.ref` is `refs/heads/<branch>` for a `workflow_dispatch` run -- the only kind of run this
-# workflow now has -- so the group keys on the branch that was dispatched. Two dispatches of the
-# same branch cancel each other; dispatches of different branches run side by side.
+# `github.ref` is `refs/heads/main` for the push runs and `refs/heads/<branch>` for a dispatch, so
+# the group keys on the branch either way. Back-to-back merges to `main` therefore cancel the
+# older run -- which is correct here: the newest `main` is the only one whose result still matters.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
