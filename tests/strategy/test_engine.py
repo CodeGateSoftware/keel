@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from decimal import Decimal
 
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.strategy.engine import DEFAULT_RR_FLOOR, evaluate
+from keel.strategy import indicators_cts
+from keel.strategy.engine import DEFAULT_RR_FLOOR, assemble_cts_context, evaluate
 from keel.strategy.rules.base import Action, Rule, Setup
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
@@ -155,19 +157,48 @@ class TestHighCtsAggressiveEntry:
         assert signal.setup is not None
         assert signal.setup.direction == "long"
 
-    def test_default_weights_on_same_fixture_yields_signal_candle_tier(self) -> None:
+    def test_default_weights_on_same_fixture_yields_confirm_3bar_tier(self) -> None:
         # Sanity check against the *default* CTS weights (spec §9): this fixture earns
-        # condition_aligned(2) + in_pullback(1) + round_number_proximity(1) +
-        # candlestick_pattern(1) = 5, which lands in the mid ("signal_candle") tier, not
-        # "aggressive" -- confirming the engine doesn't silently inflate the real score.
+        # condition_aligned(2) + in_pullback(1) + candlestick_pattern(1) = 4, which lands in
+        # the low ("confirm_3bar") tier -- confirming the engine doesn't silently inflate the
+        # real score.
+        #
+        # ⚠️ This expectation was 5 / "signal_candle" before #225, and the missing point is
+        # `round_number_proximity`. The fixture enters at 128.02, which is 2.02 away from the
+        # nearest round handle (130, on a 10-wide grid at that magnitude) -- it is not near a
+        # magnet level and never was. It scored present only because the old
+        # `levels.is_round_number` compared against an ABSOLUTE `step=Decimal("0.005")` and
+        # 128.02 is an exact multiple of half a cent, as every 2dp price is. So this test is
+        # also the smallest end-to-end demonstration of the bug's consequence: removing one
+        # spurious point moved this setup across `entry_technique`'s `low=5` edge and down a
+        # posture rung. The companion test below shows the point is still earned when the
+        # entry genuinely sits on a handle.
         rule = _pullback_rule()
         candles_by_tf = {Granularity.ONE_HOUR: _bullish_pullback_candles()}
 
         signals = evaluate(rules=[rule], candles_by_tf=candles_by_tf)
 
         assert len(signals) == 1
-        assert signals[0].cts_score == 5
-        assert signals[0].entry_technique == "signal_candle"
+        assert signals[0].cts_score == 4
+        assert signals[0].entry_technique == "confirm_3bar"
+
+    def test_round_number_point_is_earned_when_the_entry_sits_on_a_handle(self) -> None:
+        # The other half of #225: the factor must still fire when it should. Same fixture,
+        # same everything, with the entry nudged onto the 130 handle -- the point comes back
+        # and the tier returns to "signal_candle". Asserted through `assemble_cts_context`
+        # rather than `evaluate` because the entry is a function of the fixture's candles and
+        # cannot be set independently through the rule.
+        rule = _pullback_rule()
+        candles = _bullish_pullback_candles()
+        setup = rule.detect({Granularity.ONE_HOUR: candles})
+        assert setup is not None
+
+        off_handle = assemble_cts_context(setup, candles)
+        on_handle = assemble_cts_context(replace(setup, entry=Decimal("130.00")), candles)
+
+        assert off_handle["round_number_proximity"] is False
+        assert on_handle["round_number_proximity"] is True
+        assert indicators_cts.score(on_handle).total == indicators_cts.score(off_handle).total + 1
 
 
 class TestLowCtsConfirm3Bar:
