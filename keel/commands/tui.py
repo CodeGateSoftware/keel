@@ -52,6 +52,35 @@ builders/renderers VERBATIM rather than reimplementing any of it -- exactly the 
 None of the three attests, admits, or trades -- `attest` (the human judgment the whole gate rests
 on) stays deliberately CLI-only, `keel assets attest`. `screen`/`propose`/`discover` only ever
 PROPOSE or REPORT; they cannot themselves put an asset on `allowlist` in `config.yaml`.
+
+v4 (this revision) adds `v` **activity** -- `build_activity_overlay` over
+`keel.commands.activity.build_activity_feed`, reusing that module's pure grouping/summarising
+VERBATIM exactly as `i`/`s`/`p`/`d` reuse theirs. It answers the one question none of the other
+five could: *what has keel been DOING*. Every overlay above this one reports STATE, and state is
+what looks dead when nothing trades -- a deployment that has run flawlessly for three weeks and
+correctly declined every setup shows exactly the same zeroes as one that died on day one. The
+activity feed is the narrative instead: one row per engine cycle, newest first, expandable to the
+events inside it, so a run of quiet cycles reads as the positive observation it is rather than as
+an absence.
+
+Its source is the structured JSONL engine log -- NOT the database, and not a new table. See
+`keel/commands/activity.py`'s own docstring for the full argument, but the short of it is that a
+new table would start EMPTY on the very deployment this exists to explain, while the log is
+already months deep. No schema change, no migration, no engine change.
+
+**That makes `v` the one overlay that reads a file rather than the DB, so it is worth saying
+plainly why it is admissible.** This dashboard's iron rule -- stated for `s` screen above -- is
+"DB reads only; never builds a broker, never touches the network." Reading a local log file is
+NEITHER of the two things that rule forbids: no broker is constructed, no socket opened, no name
+resolved. The rule exists so that opening an overlay can never place an order, spend money, or
+block on a remote host, and a bounded read of a file on the same disk violates none of that. It
+is the same latitude `p` propose already takes to read `config.proposals_dir`, and the network
+exception count in this module stands unchanged at three.
+
+The read is BOUNDED -- 1 MiB of the log's tail, 5000 lines, 200 cycles, all named constants in
+`activity.py` -- because the log grows without limit and this overlay rebuilds every poll. A
+dashboard whose responsiveness degrades with how long the deployment has been running would be a
+worse bug than the one this feature fixes.
 """
 
 from __future__ import annotations
@@ -66,6 +95,17 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
+from keel.commands.activity import (
+    ACTIVITY_HEADER,
+    ActivityFeed,
+    build_activity_feed,
+    cycle_style,
+    describe_status,
+    event_style,
+    footer_notes,
+    render_cycle_row,
+    render_event_row,
+)
 from keel.commands.admission import (
     DiscoverReport,
     ProposeView,
@@ -331,14 +371,19 @@ def _footer_lines() -> list[ScreenLine]:
     and cramming `[s] screen [p] propose [d] discover` onto the end of it would either wrap on a
     normal terminal or silently truncate (`_paint` clips every line to the window width). A
     second line costs one more row of screen -- cheap, next to a footer line an operator can no
-    longer read."""
+    longer read.
+
+    That second line was labelled `admission:` while all three keys on it belonged to the
+    admission workflow. v4's `v` activity does not, so the label is now the accurate
+    `overlays:` -- a footer that mis-files a key is worse than one that groups it loosely, since
+    an operator hunting for the activity feed would not think to look under "admission"."""
     return [
         ScreenLine(
             "keys: [q] quit  [h] help  [i] insights  [r] refresh  [a] autonomy  [f] fetch",
             "muted",
         ),
         ScreenLine(
-            "admission: [s] screen  [p] propose  [d] discover (network)",
+            "overlays: [s] screen  [p] propose  [d] discover (network)  [v] activity",
             "muted",
         ),
     ]
@@ -411,6 +456,8 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  p            open the propose overlay (screens the newest shortlist file, read-only)")
     _row("  d            open the discover overlay (propose NEW candidates from the venue)")
     _note("               armed, not run, on open -- see 'Discover overlay' below")
+    _row("  v            open the activity feed (what keel has been DOING, cycle by cycle)")
+    _note("               reads the engine log, offline -- see 'Activity overlay' below")
     lines.append(_blank())
     _row("Live balance")
     _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
@@ -459,6 +506,36 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  Enter          run discover now (the ONE network call this overlay ever makes)")
     _row("  q / Esc / d    close discover, back to the dashboard (discards the held result)")
     lines.append(_blank())
+    _row("Activity overlay (v)")
+    _note("  OFFLINE, read-only: a chronological feed of what the agent has actually been doing,")
+    _note("  newest first, ONE ROW PER ENGINE CYCLE, grouped by the cycle_id every event carries.")
+    _note("  Every other overlay here reports STATE -- and state is what looks dead when nothing")
+    _note("  trades, because a deployment that ran flawlessly for three weeks and correctly")
+    _note("  declined every setup shows the same zeroes as one that died on day one. This shows")
+    _note("  the narrative instead. A QUIET cycle still gets a row: the run of quiet cycles IS")
+    _note("  the answer to 'is it alive'.")
+    _note("  Each row: local time, mode, and sig/blk/ent/exi/err (signals, blocked, entered,")
+    _note("  exited, errors), then what was notable -- a rail veto and its rule, the gate that")
+    _note("  rejected a setup, the reason an entry was not placed. Colour follows the same")
+    _note("  convention as the rest of the dashboard: quiet is muted, withheld/vetoed is a")
+    _note("  warning, a real fill is green, and an ERROR-level run is an alert.")
+    _note("  Source: the structured JSONL engine log at `logging.file` in config.yaml (default")
+    _note("  `logs/keel.log`, resolved against the WORKING DIRECTORY -- so run keel tui from the")
+    _note("  deployment root). Not the database: a new table would start empty on exactly the")
+    _note("  deployment this feed exists to explain, while the log is already months deep.")
+    _note("  Reading a local file is neither a broker nor the network, so this overlay keeps the")
+    _note("  same offline guarantee s and p do -- the three network exceptions above are still")
+    _note("  the only three.")
+    _note("  The read is BOUNDED (newest 1 MiB / 5000 lines / 200 cycles) so a log that grows for")
+    _note("  months can never slow the dashboard down; the feed says when the bound bit.")
+    _note("  A missing, empty, unreadable or unparseable log is explained in plain words -- never")
+    _note("  a traceback, and never a blank screen.")
+    _row("  up / k         select the previous (newer) cycle")
+    _row("  down / j       select the next (older) cycle")
+    _row("  Enter / Space  expand or collapse the selected cycle's events")
+    _row("  PgUp / PgDn / Home / End    move the selection by a page, or to either end")
+    _row("  q / Esc / v    close activity, back to the dashboard")
+    lines.append(_blank())
     _row("Safety notes")
     _note(
         "  autonomy OFF is immediate and ungated -- de-risking must never be obstructed, so"
@@ -481,8 +558,8 @@ def build_help_screen() -> list[ScreenLine]:
     )
     _note("  endpoints. It places no orders and touches no rails.")
     lines.append(_blank())
-    _note("  screen and propose are fully OFFLINE: DB (and, for propose, local filesystem)")
-    _note("  reads only. Neither ever constructs a broker or touches the network.")
+    _note("  screen, propose and activity are fully OFFLINE: DB reads, plus (for propose and")
+    _note("  activity) local filesystem reads. None constructs a broker or touches the network.")
     lines.append(_blank())
     _note(
         "  discover is the THIRD deliberate network exception in this dashboard. The other two"
@@ -717,6 +794,148 @@ def build_discover_overlay(
     lines.append(_blank())
     lines.append(ScreenLine("Press d or Esc to return to the dashboard.", "muted"))
     return lines
+
+
+#: The lines the activity overlay renders when the log parsed fine but held no cycle at all --
+#: distinct from `describe_status`'s cases, which are about the FILE. A readable log with zero
+#: cycles in the window is a real, if unusual, state (a log holding only uncorrelated errors from
+#: a build predating `cycle_id`, say), and it must say so rather than render an empty screen.
+_ACTIVITY_NO_CYCLES = "No cycles in the window -- the log was read, but held no grouped events."
+
+
+def _activity_lines(
+    feed: ActivityFeed, *, cursor: int = 0, expanded: frozenset[str] = frozenset()
+) -> tuple[list[ScreenLine], int]:
+    """The activity overlay's lines, PLUS the index of the line the cursor currently sits on.
+
+    Returning both from ONE function is deliberate, and is why `build_activity_overlay` is a thin
+    wrapper over this rather than the other way round. This overlay is the only one of the six
+    with a *cursor* -- the others scroll a fixed body, but a feed of collapsible rows needs a
+    selected row to collapse. Keeping the cursor's screen position as a separate function would
+    mean a second copy of the layout arithmetic ("a row is 1 line, plus one per event when
+    expanded, plus a note line when events were dropped"), and the two copies would drift the
+    first time the layout changed -- with the symptom being a cursor that scrolls to the wrong
+    row, which is exactly the class of bug that is invisible in a unit test of either half alone.
+
+    PURE: `feed` is already built by the caller (`run_live`, via `build_activity_feed`), and this
+    only styles what `keel.commands.activity`'s renderers already rendered -- the same discipline
+    `build_insights_screen` and `build_admission_screen_overlay` keep toward their own modules.
+    Never raises, and never returns an empty body: a broken log renders `describe_status`'s
+    explanation, which is the whole point (a blank overlay would look exactly like the dead
+    dashboard this feature exists to disprove)."""
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- activity", "heading"), _blank()]
+    # Clamped here as well as in `run_live`, which already clamps it every poll against a feed
+    # that can shrink underneath it. Belt and braces for the same reason `_visible_slice` clamps
+    # its own offset: an out-of-range `cursor` would otherwise mark no row as selected while
+    # `cursor_line` still reported the first row's position, and the view would scroll to a row
+    # nothing appears to have selected.
+    cursor = max(0, min(cursor, max(0, len(feed.cycles) - 1)))
+
+    if feed.status != "ok":
+        for text in describe_status(feed):
+            lines.append(ScreenLine(text, "warn") if text else _blank())
+        lines.append(_blank())
+        lines.append(ScreenLine("Press v or Esc to return to the dashboard.", "muted"))
+        return lines, 0
+
+    lines.append(ScreenLine(ACTIVITY_HEADER, "heading"))
+    cursor_line = len(lines)
+
+    if not feed.cycles:
+        lines.append(ScreenLine(_ACTIVITY_NO_CYCLES, "warn"))
+    for index, cycle in enumerate(feed.cycles):
+        is_open = cycle.key in expanded
+        selected = index == cursor
+        if selected:
+            cursor_line = len(lines)
+        lines.append(
+            ScreenLine(
+                render_cycle_row(cycle, selected=selected, expanded=is_open), cycle_style(cycle)
+            )
+        )
+        if not is_open:
+            continue
+        if cycle.events_dropped:
+            lines.append(
+                ScreenLine(
+                    f"      ... {cycle.events_dropped} earlier event(s) in this cycle are not "
+                    "retained (per-cycle cap) -- the counts above still cover all of them",
+                    "muted",
+                )
+            )
+        for ev in cycle.events:
+            lines.append(ScreenLine(render_event_row(ev), event_style(ev)))
+
+    lines.append(_blank())
+    for text in footer_notes(feed):
+        lines.append(ScreenLine(text, "muted"))
+    lines.append(_blank())
+    lines.append(
+        ScreenLine(
+            "up/k down/j move · Enter/Space expand or collapse · PgUp/PgDn/Home/End · "
+            "q/Esc/v close",
+            "muted",
+        )
+    )
+    return lines, cursor_line
+
+
+def build_activity_overlay(
+    feed: ActivityFeed, *, cursor: int = 0, expanded: frozenset[str] = frozenset()
+) -> list[ScreenLine]:
+    """The activity overlay's lines alone -- the pure, directly-testable surface, matching the
+    shape of every other `build_*_overlay` in this module. `run_live` uses `_activity_lines`
+    instead, because it also needs the cursor's screen position to scroll it into view."""
+    return _activity_lines(feed, cursor=cursor, expanded=expanded)[0]
+
+
+def _activity_cursor(ch: int, cursor: int, height: int, total: int, curses_mod: Any) -> int:
+    """The new, clamped SELECTED-ROW index for a keypress in the activity overlay -- the cursor
+    analogue of `_scroll_offset`, taking `curses_mod` as a parameter for the identical reasons
+    (lazy `curses` import; testable against the suite's existing fake curses module).
+
+    The same keys move it that scroll the other five overlays, on purpose: an operator should not
+    have to remember that this one overlay rebound up/down. What differs is what they move -- a
+    row, not a line -- because a row here can be one line or seventy, and scrolling by lines
+    through an expanded cycle would make selecting the next cycle a matter of counting its
+    events. `_follow_cursor` then does the scrolling, so the view still moves.
+
+    `total` is the number of CYCLES. A page is `height - 3` rows (leaving the title, blank and
+    header rows in view), floored at 1 so a two-line terminal still advances."""
+    if total <= 0:
+        return 0
+    page = max(height - 3, 1)
+    if ch in (curses_mod.KEY_UP, ord("k")):
+        cursor -= 1
+    elif ch in (curses_mod.KEY_DOWN, ord("j")):
+        cursor += 1
+    elif ch == curses_mod.KEY_PPAGE:
+        cursor -= page
+    elif ch == curses_mod.KEY_NPAGE:
+        cursor += page
+    elif ch == curses_mod.KEY_HOME:
+        cursor = 0
+    elif ch == curses_mod.KEY_END:
+        cursor = total - 1
+    return max(0, min(cursor, total - 1))
+
+
+def _follow_cursor(offset: int, cursor_line: int, height: int) -> int:
+    """The smallest change to `offset` that brings `cursor_line` back into a `height`-line
+    window -- scroll up to it if it is above, down to it if it is below, leave the view exactly
+    where it is otherwise. PURE, and total: a zero or negative `height` (a terminal mid-resize)
+    returns the offset unchanged rather than dividing by anything.
+
+    "Smallest change" is the behaviour that matters: recentring on every keypress would make the
+    whole feed jump under the operator's eyes each time they moved one row, which is precisely
+    what makes a scrolling list unreadable."""
+    if height <= 0:
+        return max(0, offset)
+    if cursor_line < offset:
+        return max(0, cursor_line)
+    if cursor_line >= offset + height:
+        return max(0, cursor_line - height + 1)
+    return max(0, offset)
 
 
 def _visible_slice(lines: list[ScreenLine], offset: int, height: int) -> list[ScreenLine]:
@@ -1064,25 +1283,34 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     process -- gathers a fresh report, paints it, then waits up to `interval` seconds for a
     keypress.
 
-    Six modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
+    Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
     action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
     `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
     `build_journal_report`, rebuilt fresh each poll while open, fail-soft exactly like the
     normal-mode status read below), `screen` and `propose` (the OFFLINE admission-workflow
     overlays, `build_admission_screen_overlay`/`build_propose_overlay` over `_do_screen_report`/
     `_do_propose_view`, rebuilt fresh each poll while open, fail-soft the same way insights is),
-    and `discover` (the one overlay that touches the network -- see below). All five scrollable
-    overlays share one scrolling helper, `_scroll_offset`.
+    `discover` (the one overlay that touches the network -- see below), and `activity` (the
+    chronological, one-row-per-cycle feed over the engine LOG rather than the DB -- also OFFLINE,
+    also rebuilt each poll, and also fail-soft, though `build_activity_feed` is itself total so
+    the handler's `try` only ever catches `open_state()` failing). Five of the six scrollable
+    overlays share one scrolling helper, `_scroll_offset`; `activity` is the exception, driving
+    `_activity_cursor` + `_follow_cursor` instead because its up/down keys move a SELECTED ROW
+    (which may be one line or seventy) rather than one line of a fixed body.
 
     Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `s` open screen; `p`
-    open propose; `d` open discover; `r` refresh now; `a` toggle autonomy (`toggle_autonomy`,
+    open propose; `d` open discover; `v` open activity; `r` refresh now; `a` toggle autonomy
+    (`toggle_autonomy`,
     gated by `_confirm_arm_autonomy` on the OFF->ON direction only); `f` fetch all data
     (`_do_fetch`, money-safe). `a` and `f` are both wrapped in `_guarded` so a failure becomes a
     toast, never a crash. help/insights/screen/propose all scroll (`up`/`k`, `down`/`j`,
     `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on `q`/`Esc`/<their own open key>.
+    `activity` binds the same keys to moving its selected row, and adds Enter/Space to expand or
+    collapse that row's cycle into its individual events.
 
-    `discover` is different on purpose, and is the whole reason this docstring calls out FIVE
-    overlays rather than treating them identically: it needs the network, and that network call
+    `discover` is different on purpose, and is the whole reason this docstring calls out the
+    overlays individually rather than treating them identically: it needs the network, and that
+    network call
     must never fire just from pressing `d`. Opening it renders an ARMED, not-yet-run explanation
     (`build_discover_overlay(None)`) with NO call made. Only Enter (`10`/`13`/`curses.KEY_ENTER`),
     pressed INSIDE the overlay, runs `_do_discover_report` -- the one
@@ -1128,6 +1356,13 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         screen_offset = 0
         propose_offset = 0
         discover_offset = 0
+        activity_offset = 0
+        activity_cursor = 0
+        # Keyed by `ActivityCycle.key`, NOT by row index: the feed is rebuilt from the log every
+        # poll, so a new cycle appearing at the top would silently shift every index down one and
+        # expand the wrong row. The key is stable across rebuilds, so an expanded cycle stays
+        # expanded even as the feed grows underneath it.
+        activity_expanded: frozenset[str] = frozenset()
         discover_result: DiscoverReport | None = None
         discover_error: str | None = None
         message: str | None = None
@@ -1246,6 +1481,59 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     )
                 continue
 
+            if mode == "activity":
+                # OFFLINE + fail-soft, like screen/propose above -- but reading a FILE, not the
+                # DB (see the module docstring for why that is admissible under this dashboard's
+                # own iron rule). `build_activity_feed` is itself total: a missing, empty,
+                # unreadable or unparseable log already comes back as a status this overlay
+                # explains in plain words. This `try` therefore catches only what is left --
+                # `open_state()` itself failing, e.g. a locked DB from a concurrent `keel agent`
+                # writer -- and turns it into the same kind of readable feed rather than a crash.
+                try:
+                    _activity_repo, activity_config = open_state()
+                    activity_feed = build_activity_feed(activity_config)
+                    # Re-clamp every poll, not just on a keypress: the feed is rebuilt from a
+                    # file another process is writing, so it can SHRINK between polls (a rotation
+                    # empties it) and leave the cursor past the end.
+                    activity_cursor = max(
+                        0, min(activity_cursor, max(0, len(activity_feed.cycles) - 1))
+                    )
+                    activity_lines, activity_cursor_line = _activity_lines(
+                        activity_feed, cursor=activity_cursor, expanded=activity_expanded
+                    )
+                except Exception as exc:
+                    # The RENDER is inside this `try`, not just the feed build, and that is
+                    # load-bearing rather than tidy: `build_activity_feed` is total, but the
+                    # renderers it feeds are handed values written by another process (a `ts` a
+                    # bad clock put in the year 5,000,000, say). Guarding only the build would
+                    # leave the one call that actually formats those values outside the net, and
+                    # an exception there would escape `curses.wrapper` and kill the dashboard.
+                    activity_feed = ActivityFeed(
+                        status="unreadable", source="", detail=str(exc)[:200]
+                    )
+                    activity_lines, activity_cursor_line = _activity_lines(activity_feed)
+
+                height, _width = stdscr.getmaxyx()
+                activity_offset = _follow_cursor(activity_offset, activity_cursor_line, height)
+                _paint(stdscr, _visible_slice(activity_lines, activity_offset, height))
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("v")):
+                    mode = "normal"
+                    activity_offset = 0
+                    activity_cursor = 0
+                    activity_expanded = frozenset()
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    if 0 <= activity_cursor < len(activity_feed.cycles):
+                        activity_expanded = activity_expanded ^ {
+                            activity_feed.cycles[activity_cursor].key
+                        }
+                else:
+                    activity_cursor = _activity_cursor(
+                        ch, activity_cursor, height, len(activity_feed.cycles), curses
+                    )
+                continue
+
             if mode == "discover":
                 # NETWORK-GATED, on purpose -- see the module docstring and `build_discover_
                 # overlay`'s. Unlike every branch above, this one does NOT rebuild anything on an
@@ -1335,6 +1623,14 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
             if ch == ord("p"):
                 mode = "propose"
                 propose_offset = 0
+                continue
+            if ch == ord("v"):
+                mode = "activity"
+                activity_offset = 0
+                activity_cursor = 0
+                # Opens fully collapsed: the feed's value is the shape of the WHOLE run, and an
+                # overlay that reopened with one cycle already exploded would bury it.
+                activity_expanded = frozenset()
                 continue
             if ch == ord("d"):
                 mode = "discover"
@@ -1435,7 +1731,12 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     admission verdicts, reusing `keel assets screen`'s own gate); `p` opens a READ-ONLY propose
     overlay (screens the newest shortlist file in `config.proposals_dir`); `d` opens the discover
     overlay ARMED but not yet run -- it explains itself and waits for Enter before making its one
-    live venue call, then holds that result until Enter is pressed again or the overlay closes.
+    live venue call, then holds that result until Enter is pressed again or the overlay closes;
+    `v` opens the READ-ONLY activity feed -- a chronological, newest-first, one-row-per-cycle
+    account of what the agent has actually been doing, read (offline, and boundedly) from the
+    structured engine log rather than the DB, and expandable to the individual events inside any
+    cycle. It is the answer to "keel has not traded -- is it even alive?", which the state-only
+    dashboard cannot give: a quiet cycle still gets a row, and the run of them is the answer.
     None of `screen`/`propose`/`discover` attests, admits, or trades -- `attest` (the human
     judgment this whole gate rests on) stays deliberately CLI-only, `keel assets attest`. `a`
     toggles autonomy (turning it OFF is instant, turning it ON needs a typed "yes" at the
