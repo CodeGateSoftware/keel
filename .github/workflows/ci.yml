@@ -1,28 +1,37 @@
 name: CI
 
-# Runs on `pull_request` only -- that is the gate that actually protects merges, and for a tool
-# that moves money it is the one worth paying for. It used to also run on `push` to `main`, but
-# that re-ran the exact same suite against the exact same content minutes after the PR run had
-# already passed it, roughly doubling Actions minutes for zero new information.
+# MANUAL ONLY. This suite runs when a human dispatches it and at no other time. The `push` to
+# `main` trigger went first (it re-ran the same content the PR run had already passed, for no new
+# information); `pull_request` has now gone too, so the automatic half of this workflow is empty.
 #
-# Dropping the push trigger is safe because `release.yml` re-runs `ruff` + `pytest` itself as its
-# own gate before it will build an artifact, so `main` still cannot ship red even though nothing
-# runs automatically on push. The residual risk this accepts: a PR that was green against an
-# older `main` can merge and turn out to be red against the `main` it actually landed on -- a
-# semantic conflict between two independently-green changes. Previously CI would have caught that
-# on the next push; now it surfaces at release time instead of immediately. Branch protection's
-# "require branches to be up to date before merging" would close that gap by forcing every PR to
-# re-test against latest `main` before merge, but that is deliberately not being relied on here --
-# it would put the double-run cost right back, just moved earlier. `workflow_dispatch` is kept so
-# the suite can still be run on demand against `main` (e.g. to sanity-check before cutting a
-# release, or after changing branch protection settings) without needing a throwaway PR.
+# Be clear about what that costs: NOTHING VERIFIES A PULL REQUEST BEFORE IT MERGES ANY MORE. There
+# is no lint, no suite, and no build-identity check standing between a branch and `main`. Nor does
+# branch protection compensate. There IS a repository ruleset named `main`, and it does list
+# required status checks, but it currently matches no refs at all -- its `ref_name.include` is
+# empty, and `GET /repos/:owner/:repo/rules/branches/main` returns `[]`, meaning zero rules are in
+# force on the branch. Its two required contexts ("Lint, Unit tests, Build" and "Integration
+# Tests") also match no job this repo defines. So there is no required status check a merge could
+# fail on: a PR merges because a human decided to merge it, and that decision is the only gate at
+# merge time.
+#
+# What survives is the gate inside `release.yml`. That workflow is itself manual, but every run of
+# it re-runs `ruff` + `pytest` automatically before it will build an artifact -- so a red `main`
+# still cannot ship. That is the safety net that matters most for a tool that moves money: broken
+# code can reach `main`, but it cannot reach a wheel, a tag, or a release asset without the suite
+# passing first.
+#
+# The accepted consequence, stated plainly: a breakage introduced by a merge is discovered at
+# release time, or whenever somebody next dispatches this workflow -- not at merge time. The
+# window between "merged" and "found" is now however long passes before one of those two happens.
+# Dispatching this suite against `main` after a batch of merges, and before cutting a release, is
+# what closes that window. Restoring `pull_request:` below is a one-line change if the trade stops
+# being worth it.
 on:
-  pull_request:
   workflow_dispatch:
 
-# `github.ref` is `refs/pull/<n>/merge` for `pull_request` runs and `refs/heads/<branch>` for a
-# manual `workflow_dispatch` run, so concurrent runs of the same PR still cancel each other and a
-# manual `main` run doesn't collide with anything else.
+# `github.ref` is `refs/heads/<branch>` for a `workflow_dispatch` run -- the only kind of run this
+# workflow now has -- so the group keys on the branch that was dispatched. Two dispatches of the
+# same branch cancel each other; dispatches of different branches run side by side.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
