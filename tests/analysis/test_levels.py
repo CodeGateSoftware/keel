@@ -175,17 +175,97 @@ def test_find_levels_includes_level_touched_twice_when_min_touches_two():
     assert support_levels[0].touches == 2
 
 
-def test_is_round_number_true_on_even_handle():
-    assert is_round_number(Decimal("1.10000"), step=Decimal("0.005")) is True
+def test_is_round_number_false_on_two_decimal_price_away_from_a_handle():
+    """The #225 regression: every 2dp price is an exact multiple of the old absolute
+    `step=0.005`, so the check could never fail on BTC/ETH/PAXG and handed those three
+    assets a constant +1 CTS point. 64,975.78 is a quarter of the way into a 1,000-wide
+    BTC handle interval and must score absent.
+    """
+    assert is_round_number(Decimal("64975.78")) is False
 
 
-def test_is_round_number_false_off_handle():
-    assert is_round_number(Decimal("1.10237"), step=Decimal("0.005")) is False
+def test_is_round_number_false_across_the_two_decimal_allowlist_scales():
+    """No 2dp-quoted price may score present merely for being quoted to 2dp.
+
+    Every value here is an exact multiple of the old absolute `step=0.005` and so returned
+    `True` before #225. Note the asymmetry that falls out of a relative grid and is correct:
+    below 1.00 the two-decimal quote grid IS the two-significant-figure handle grid, so `0.01`
+    and `0.38` are genuine handles and must keep scoring present. The bug was never "2dp
+    prices"; it was that an absolute step cannot see scale at all.
+    """
+    for price in ("64975.78", "103412.99", "3421.07", "4127.53", "12.34", "1.23"):
+        assert is_round_number(Decimal(price)) is False, price
+    for handle in ("0.01", "0.38"):
+        assert is_round_number(Decimal(handle)) is True, handle
 
 
-def test_is_round_number_default_step():
-    assert is_round_number(Decimal("100.000")) is True
-    assert is_round_number(Decimal("100.00317")) is False
+def test_is_round_number_true_on_even_handle_at_every_scale():
+    """The same relative position on the handle grid scores the same at 65,000 and at 0.38."""
+    for price in ("65000", "65000.00", "3400.00", "0.38", "0.0071", "1.10"):
+        assert is_round_number(Decimal(price)) is True, price
+
+
+def test_is_round_number_is_scale_invariant():
+    """Multiplying by a power of ten moves the grid with the price, so the answer is
+    unchanged -- the property the absolute-step version could not have.
+    """
+    for digits in ("64975.78", "65000", "38200", "1", "7.5"):
+        base = Decimal(digits)
+        expected = is_round_number(base)
+        for exponent in (-8, -3, 3, 8):
+            assert is_round_number(base.scaleb(exponent)) is expected, f"{digits}e{exponent}"
+
+
+def test_is_round_number_near_a_handle_at_small_scale():
+    """ADA/XLM scale: 0.3801 is inside 0.38's band, 0.3835 is not."""
+    assert is_round_number(Decimal("0.3801")) is True
+    assert is_round_number(Decimal("0.3835")) is False
+    assert is_round_number(Decimal("0.070008")) is True
+    assert is_round_number(Decimal("0.073451")) is False
+
+
+def test_is_round_number_boundary_is_inclusive():
+    """`tolerance` is a fraction of the handle spacing; at exactly the band edge the
+    factor is present, one ulp outside it is not.
+    """
+    # 65,000 sits on a 1,000-wide grid, so the default 0.02 band is +/- 20.
+    assert is_round_number(Decimal("65020")) is True
+    assert is_round_number(Decimal("65020.01")) is False
+    assert is_round_number(Decimal("64980")) is True
+    assert is_round_number(Decimal("64979.99")) is False
+
+
+def test_is_round_number_tolerance_is_relative_not_absolute():
+    """A wider `tolerance` widens the band in proportion to the grid, at every scale."""
+    assert is_round_number(Decimal("64975.78"), tolerance=Decimal("0.1")) is True
+    assert is_round_number(Decimal("0.3897"), tolerance=Decimal("0.1")) is True
+    assert is_round_number(Decimal("64975.78"), tolerance=Decimal("0")) is False
+    assert is_round_number(Decimal("65000"), tolerance=Decimal("0")) is True
+
+
+def test_is_round_number_degenerate_prices_do_not_divide_by_zero():
+    """Zero has no order of magnitude and negatives are not prices: both score absent
+    rather than raising or taking a modulo by zero.
+    """
+    assert is_round_number(Decimal("0")) is False
+    assert is_round_number(Decimal("-0")) is False
+    assert is_round_number(Decimal("-65000")) is False
+    assert is_round_number(Decimal("NaN")) is False
+    assert is_round_number(Decimal("Infinity")) is False
+
+
+def test_is_round_number_survives_extreme_magnitudes():
+    """No overflow, no context error, no modulo-by-zero at either end of the range.
+
+    `3.7e28` and `3.7e-28` ARE handles (two significant figures); `3.75e28` is not. The point
+    of the pair is that the grid tracks the exponent for 60 orders of magnitude.
+    """
+    assert is_round_number(Decimal("1E-30")) is True
+    assert is_round_number(Decimal("3.7E-28")) is True
+    assert is_round_number(Decimal("3.75E-28")) is False
+    assert is_round_number(Decimal("1E+30")) is True
+    assert is_round_number(Decimal("3.7E+28")) is True
+    assert is_round_number(Decimal("3.75E+28")) is False
 
 
 def test_role_reversed_true_when_prior_resistance_now_holds_as_support():

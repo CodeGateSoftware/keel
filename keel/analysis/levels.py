@@ -134,13 +134,84 @@ def find_levels(
     return [level for level in levels if level.touches >= min_touches]
 
 
-def is_round_number(price: Decimal, step: Decimal = Decimal("0.005")) -> bool:
-    """True if `price` is close to a multiple of `step` (an "even handle"), within
-    10% of the step size.
+#: Significant figures that define a round handle. Two is not a tuning knob, it is what the
+#: words mean: 65,000 and 0.38 are handles, 65,100 and 0.381 are not, and both pairs stand in
+#: exactly the same relation to their own price. Three would push the grid down onto ADA's and
+#: XLM's quote increment -- measured, it lifts ADA's presence rate to 0.30 against BTC's 0.19
+#: purely from tick quantization, which is the same class of artifact this function is being
+#: fixed to remove.
+_HANDLE_SIGNIFICANT_FIGURES = 2
+
+#: Half-width of the "at the handle" band, as a fraction of the SPACING BETWEEN HANDLES (not of
+#: price). See `is_round_number` for why that denominator is the load-bearing choice.
+DEFAULT_HANDLE_TOLERANCE = Decimal("0.02")
+
+
+def _handle_spacing(price: Decimal) -> Decimal:
+    """Distance between adjacent round handles at `price`'s own order of magnitude.
+
+    `10 ** (floor(log10(price)) - 1)`, computed from `Decimal.adjusted()` so it is exact
+    integer arithmetic on the exponent -- no float `log10`, which would misplace the grid for
+    prices sitting a few ulps under a power of ten. Returns a spacing such that
+    `price / spacing` always lands in `[10, 100)`, i.e. the handles are the two-significant-
+    figure prices: 1,000 at BTC's 65,000; 100 at ETH's 3,400; 0.01 at ADA's 0.38.
     """
-    remainder = price % step
-    distance = min(remainder, step - remainder)
-    return distance <= step * Decimal("0.1")
+    return Decimal((0, (1,), price.adjusted() - (_HANDLE_SIGNIFICANT_FIGURES - 1)))
+
+
+def is_round_number(price: Decimal, tolerance: Decimal = DEFAULT_HANDLE_TOLERANCE) -> bool:
+    """True if `price` sits at a psychological round handle for its own order of magnitude.
+
+    A magnet level is a number enough people are watching that orders pile up on it, and what
+    makes a number watchable is having few significant figures — 65,000, 3,400, 0.38. That is a
+    property of the price *relative to its own scale*, so the handle grid has to be derived
+    from the price and cannot be a constant.
+
+    ⚠️ **This function used to take an absolute `step=Decimal("0.005")` and it could not fail
+    (issue #225).** Coinbase quotes BTC, ETH and PAXG to two decimals, and every 2dp value is an
+    exact multiple of half a cent because `0.01 = 2 * 0.005`. So `price % step` was always
+    exactly zero and the answer was always `True`: measured over the daily history in the candle
+    cache, P(present) was **1.0000 on BTC-USD, ETH-USD and PAXG-USD** against 0.217 on ADA-USD
+    and 0.190 on XLM-USD. Because `round_number_proximity` is weight 1 of `DEFAULT_WEIGHTS`'
+    14, three of the five live allowlist assets were carrying an unconditional +1 on every CTS
+    score — a constant, which is worse than a redundant factor, because a redundant factor at
+    least varies. It also broke cross-asset comparability of the total: any threshold read
+    against CTS meant something different on BTC than on XLM by exactly one point.
+
+    **`tolerance` is a fraction of the handle SPACING, not of price, and the denominator is the
+    whole argument.** Both denominators scale with the instrument, so both fix the bug; they
+    differ in what they hold constant. A fraction-of-price band makes the presence rate depend
+    on where in the decade the price happens to sit — the spacing is 10% of price just above a
+    power of ten and 1% of it just below, so the same rule would fire ten times as often on BTC
+    at 99,000 as at 10,500, and the factor would silently change meaning as an asset trended
+    through a decade. A fraction-of-spacing band makes P(present) identically `2 * tolerance`
+    for any price series that is smooth on the scale of the grid, which is precisely the
+    property #225 asks for: the factor must mean the same thing at 65,000 as at 0.38. Measured
+    on the same daily history, it does — 0.037 / 0.036 / 0.041 / 0.044 / 0.043 across the five
+    allowlist assets, a 1.22x spread where the old code's was 5.3x.
+
+    The default `0.02` puts the band at +/- 2% of the gap to the next handle (+/- 20 dollars on
+    BTC's 1,000-wide grid), giving a ~4% presence rate — rarer than `candlestick_pattern`
+    (0.203) and commoner than `rsi_extreme` (0.023), so it sits inside the existing spread of
+    CTS factor base rates rather than dominating or vanishing. It is deliberately tighter than
+    the 10% the original docstring claimed: at 10% the band on BTC is +/- 100 and 64,975.78
+    scores present, which #225 names as a case that must score absent. That is the one genuinely
+    free parameter here and the write-up carries the sensitivity ladder for it.
+
+    Degenerate inputs score absent rather than raising. Zero has no order of magnitude (and
+    `_handle_spacing` would hand back a meaningless grid), negatives are not prices, and
+    NaN/Infinity have no `adjusted()` worth trusting — none of them is a round handle, and a
+    pure predicate on the live scoring path should not be able to throw. Extreme magnitudes are
+    safe without a guard: `price / spacing` is always in `[10, 100)`, so the `%` below never
+    needs more than two digits of integer quotient and cannot trip the Decimal context.
+    """
+    if not price.is_finite() or price <= 0:
+        return False
+
+    spacing = _handle_spacing(price)
+    remainder = price % spacing
+    distance = min(remainder, spacing - remainder)
+    return distance <= spacing * tolerance
 
 
 def role_reversed(
