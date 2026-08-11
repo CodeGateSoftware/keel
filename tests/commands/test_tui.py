@@ -1575,6 +1575,68 @@ def test_build_help_screen_is_longer_than_a_small_terminal() -> None:
     assert len(lines) > 24
 
 
+def _help_section(heading_prefix: str) -> str:
+    """The lowercased body of one help section -- from the line starting `heading_prefix` up to
+    the next blank -- so a glossary assertion cannot be satisfied by a word appearing three
+    sections away. Mirrors `test_help_says_the_live_balance_line_is_itself_a_venue_call`."""
+    lines = build_help_screen()
+    start = next(i for i, line in enumerate(lines) if line.text.startswith(heading_prefix))
+    body: list[str] = []
+    for line in lines[start:]:
+        if not line.text.strip():
+            break
+        body.append(line.text.lower())
+    return " ".join(body)
+
+
+def test_help_screen_glossary_defines_every_field_name_the_dashboard_prints() -> None:
+    """`_equity_lines` and the activity overlay print keel's INTERNAL field names verbatim --
+    `equity_state_mode`, `high_water_mark`, `rail11`, `paper_cash_usdc`, `sig blk ent exi err`.
+    Nothing on the dashboard explains any of them, so the help must, by name."""
+    text = _help_section("Glossary")
+    for term in (
+        "cycle",
+        "signal",
+        "sig / blk / ent / exi / err",
+        "paper_cash_usdc",
+        "equity_state_mode",
+        "high_water_mark",
+        "drawdown",
+        "rail11",
+    ):
+        assert term in text, term
+
+
+def test_help_screen_glossary_distinguishes_no_setup_from_a_vetoed_setup() -> None:
+    """The distinction the whole glossary exists for: `sig 0` (found nothing) and `sig 1 blk 1`
+    (found something, a rail stopped it) look equally idle on a dashboard of zeroes, and an
+    operator who conflates them reads a correctly-declining deployment as a dead one."""
+    text = _help_section("Glossary")
+    assert "`sig 1 blk 1`" in text
+    assert "`sig 0`" in text
+    assert "rail vetoes" in text
+    # A cycle that finds nothing is the normal case, not a fault -- said in those terms.
+    assert "one cycle per day" in text
+    assert "normal case, not a fault" in text
+
+
+def test_help_screen_glossary_says_paper_cash_is_synthetic_and_paper_only() -> None:
+    """`paper_cash_usdc: 11000` is the single most mistakable number on the dashboard: it reads
+    like a broker balance. It is neither real nor present in live mode."""
+    text = _help_section("Glossary")
+    assert "not a real broker balance" in text
+    assert "only in paper mode" in text
+    # The two equity accounts are separate histories, not two views of one account.
+    assert "separate accounts with separate histories" in text
+
+
+def test_help_screen_glossary_sources_the_drawdown_ceilings_to_config() -> None:
+    """The parenthesised ceilings on the `drawdown:` line are config values, not live readings --
+    an operator who thinks they are measurements has no idea where to change them."""
+    text = _help_section("Glossary")
+    assert "come from config" in text
+
+
 def test_visible_slice_clamps_too_large_offset() -> None:
     lines = [ScreenLine(str(i), "normal") for i in range(50)]
     result = _visible_slice(lines, offset=1000, height=10)
