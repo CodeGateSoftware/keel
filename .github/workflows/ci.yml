@@ -9,27 +9,32 @@ name: CI
 # differ whenever two independently-green branches conflict semantically -- each passes alone, the
 # merge of them does not. Only the post-merge run can see that.
 #
-# What this does NOT do, stated plainly so nobody mistakes it for a gate: it runs AFTER the merge.
-# It cannot block one. A broken PR still reaches `main`; this workflow's job is to make sure
-# nobody has to wonder for long, not to prevent it. Blocking a merge needs two things this repo
-# does not currently have -- a `pull_request` trigger, and a repository ruleset that actually
-# matches `main` and requires the `test` context. The ruleset named `main` exists but matches no
-# refs (`ref_name.include` is empty; `GET /repos/:owner/:repo/rules/branches/main` returns `[]`),
-# and its two required contexts ("Lint, Unit tests, Build", "Integration Tests") match no job this
-# repo defines. Both halves have to be fixed together: pointing that ruleset at `main` while its
-# contexts still name jobs that never report would block every PR forever.
+# `pull_request` is here for a specific, load-bearing reason: it is what makes this job report a
+# status named `test` on a PR, and the `main` ruleset REQUIRES that context before a merge is
+# allowed (issue #236). The two are a matched pair and must be changed together -- removing this
+# trigger while the ruleset still requires `test` would leave every PR waiting forever on a check
+# that can never report, which is precisely the broken state #236 was filed to fix. That is not a
+# hypothetical: the ruleset previously required "Lint, Unit tests, Build" and "Integration Tests",
+# names no job here has ever produced.
 #
-# `release.yml` remains the gate that matters for money: it re-runs `ruff` + `pytest` itself before
-# it will build an artifact, so a red `main` cannot become a wheel, a tag, or a release asset.
-# This workflow shortens the time to discovery; that one prevents the consequence.
+# The context string is `test` because the job below is `test:` and declares no `name:`. Renaming
+# that job, or giving it a `name:`, silently changes the context and breaks the ruleset the same
+# way. If you rename it, update the ruleset in the same change.
+#
+# So the two triggers do different jobs: `pull_request` GATES the merge, `push` VERIFIES the result
+# of it. `release.yml` remains the gate that matters for money -- it re-runs `ruff` + `pytest`
+# itself before it will build an artifact, so a red `main` cannot become a wheel, a tag, or a
+# release asset even if both of these were removed.
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
 
-# `github.ref` is `refs/heads/main` for the push runs and `refs/heads/<branch>` for a dispatch, so
-# the group keys on the branch either way. Back-to-back merges to `main` therefore cancel the
-# older run -- which is correct here: the newest `main` is the only one whose result still matters.
+# `github.ref` is `refs/pull/<n>/merge` for PR runs, `refs/heads/main` for the post-merge push, and
+# `refs/heads/<branch>` for a dispatch -- distinct keys, so a PR run never cancels the post-merge
+# run. Pushes to the same PR do cancel each other, and back-to-back merges cancel the older `main`
+# run -- correct in both cases: only the newest result matters.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
