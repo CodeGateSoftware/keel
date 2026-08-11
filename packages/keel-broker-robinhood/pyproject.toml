@@ -7,7 +7,7 @@ requires-python = ">=3.14.4"
 # Ed25519 key, which no other venue keel talks to requires. Keeping it a dependency of this
 # package alone means an engine that never installs this adapter never installs the crypto stack
 # either -- the whole point of adapters being separate distributions.
-dependencies = ["keel-core", "keel-broker-api", "pynacl>=1.5.0", "requests>=2.32.0"]
+dependencies = ["keel-core==0.6.0", "keel-broker-api==0.6.0", "pynacl>=1.5.0", "requests>=2.32.0"]
 
 [project.entry-points."keel.brokers"]
 robinhood = "keel_broker_robinhood:RobinhoodAdapter"

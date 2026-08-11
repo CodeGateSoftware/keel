@@ -13,11 +13,20 @@ dependencies = [
     # them any more (config parsing and secret loading both moved into keel-core), so they
     # arrive transitively via the `keel-core` dependency below. Re-add them here only if
     # `keel/` starts importing them directly again.
-    "keel-core",
-    "keel-broker-api",
+    # ⚠️ The workspace siblings are pinned `==` to this exact version, and every workspace
+    # pyproject does the same. Unpinned, an ALREADY-INSTALLED older sibling satisfies the
+    # requirement, so installing the new `keel_trader` wheel upgrades nothing else and leaves a
+    # deployment running new code against old libraries -- `~/keel` ran `keel-trader 0.5.7`
+    # against `keel-core 0.5.5` for two releases exactly that way. These are not third-party
+    # dependencies with independent release cycles: they are cut from this repo, at this version,
+    # in one build, so `==` states a fact rather than guessing at compatibility. The cost is that
+    # a version bump must move these numbers too -- the bump already edits every package's
+    # `version`, and `tests/test_packaging.py` fails the build if a pin is left behind.
+    "keel-core==0.6.0",
+    "keel-broker-api==0.6.0",
     # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
     # on the adapter keeps it available transitively. Phase B deletes those imports and this.
-    "keel-broker-coinbase",
+    "keel-broker-coinbase==0.6.0",
 ]
 
 [project.scripts]

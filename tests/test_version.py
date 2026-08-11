@@ -170,3 +170,128 @@ def test_describe_still_flags_dirty_and_source():
     assert "DIRTY" in dirty and "checkout" in dirty
     clean = BuildInfo(version="0.1.0", commit="abc", dirty=False, source="release").describe()
     assert "DIRTY" not in clean and "release" in clean
+
+
+# -- the whole install (InstallReport) ------------------------------------------------------
+
+
+def _report(dists, source="release"):
+    return version_mod.InstallReport(distributions=dict(dists), source=source)
+
+
+def test_an_install_at_one_version_is_healthy():
+    report = _report({"keel-trader": "0.6.0", "keel-core": "0.6.0"})
+    assert report.is_consistent is True
+    assert report.problems == []
+    assert report.versions == ["0.6.0"]
+
+
+def test_the_real_deployment_failure_is_caught():
+    """`keel-trader 0.5.7` against `keel-core 0.5.5` -- what `--version` could not see."""
+    report = _report({"keel-trader": "0.5.7", "keel-core": "0.5.5", "keel-broker-api": "0.5.5"})
+    assert report.is_consistent is False
+    assert len(report.problems) == 1
+    assert "PARTIAL INSTALL" in report.problems[0]
+    assert "0.5.5, 0.5.7" in report.problems[0]
+
+
+def test_an_empty_install_is_not_invented_into_a_failure():
+    """A source checkout with nothing installed is a legitimate state, not a partial upgrade."""
+    report = _report({})
+    assert report.is_consistent is True
+    assert report.problems == []
+
+
+def test_the_dev_only_fake_venue_fails_a_RELEASE_build():
+    report = _report({"keel-trader": "0.6.0", "keel-broker-fake": "0.6.0"}, source="release")
+    assert report.is_consistent is True  # versions agree; the package itself is the problem
+    assert [p for p in report.problems if "keel-broker-fake" in p]
+
+
+def test_the_dev_only_fake_venue_is_fine_in_a_CHECKOUT():
+    """A checkout is exactly where it belongs; crying wolf there would train the check away."""
+    report = _report({"keel-trader": "0.6.0", "keel-broker-fake": "0.6.0"}, source="checkout")
+    assert report.dev_only_installed == ["keel-broker-fake"]
+    assert report.problems == []
+
+
+def test_a_dirty_or_checkout_build_is_NOT_an_install_problem():
+    """`describe()` already reports build state; this report is about what is installed."""
+    assert _report({"keel-trader": "0.6.0"}, source="checkout").problems == []
+    assert _report({"keel-trader": "0.6.0"}, source="unknown").problems == []
+
+
+def test_distribution_names_are_canonicalised():
+    assert version_mod._canonical("Keel_Broker_API") == "keel-broker-api"
+
+
+def test_only_the_keel_family_is_enumerated(monkeypatch):
+    """The bare name `keel` on PyPI is a stranger's project -- its version means nothing here."""
+
+    class FakeDist:
+        def __init__(self, name, ver):
+            self.metadata = {"Name": name}
+            self.version = ver
+
+    monkeypatch.setattr(
+        version_mod.metadata,
+        "distributions",
+        lambda: [
+            FakeDist("keel_trader", "0.6.0"),
+            FakeDist("keel-core", "0.6.0"),
+            FakeDist("keel", "9.9.9"),  # the unrelated PyPI project
+            FakeDist("click", "8.4.2"),
+        ],
+    )
+    assert version_mod.installed_distributions() == {"keel-trader": "0.6.0", "keel-core": "0.6.0"}
+
+
+def test_the_first_copy_on_the_path_wins(monkeypatch):
+    """A second copy further down `sys.path` is unreachable, so it must not be reported."""
+
+    class FakeDist:
+        def __init__(self, name, ver):
+            self.metadata = {"Name": name}
+            self.version = ver
+
+    monkeypatch.setattr(
+        version_mod.metadata,
+        "distributions",
+        lambda: [FakeDist("keel-core", "0.6.0"), FakeDist("keel-core", "0.1.0")],
+    )
+    assert version_mod.installed_distributions() == {"keel-core": "0.6.0"}
+
+
+def test_enumeration_never_raises(monkeypatch):
+    """A broken environment is a reason to report nothing, not to stop the CLI."""
+
+    def boom():
+        raise RuntimeError("no metadata here")
+
+    monkeypatch.setattr(version_mod.metadata, "distributions", boom)
+    assert version_mod.installed_distributions() == {}
+
+
+def test_version_flag_warns_when_the_rest_of_the_install_disagrees(monkeypatch):
+    """The whole point: the line still says 0.6.0, but it no longer says it alone."""
+    monkeypatch.setattr(
+        "keel.cli.build_info",
+        lambda: BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="release"),
+    )
+    monkeypatch.setattr(
+        "keel.cli.check_install",
+        lambda source=None: _report({"keel-trader": "0.6.0", "keel-core": "0.5.5"}),
+    )
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 0  # still a diagnostic; `keel versions` is the gate
+    assert "keel 0.6.0+deadbeef [release]" in result.output
+    assert "PARTIAL INSTALL" in result.output
+
+
+def test_version_flag_says_nothing_extra_when_the_install_agrees(monkeypatch):
+    monkeypatch.setattr(
+        "keel.cli.check_install",
+        lambda source=None: _report({"keel-trader": "0.6.0", "keel-core": "0.6.0"}),
+    )
+    result = CliRunner().invoke(cli, ["--version"])
+    assert "PARTIAL INSTALL" not in result.output

@@ -103,6 +103,13 @@ jobs:
             echo "::error::artifact is not stamped as a release build"; exit 1; }
           printf '%s' "$OUT" | grep -q "DIRTY" && {
             echo "::error::artifact reports a dirty tree"; exit 1; } || true
+          # `--version` speaks for the keel-trader distribution ALONE, so it cannot see a
+          # sibling left behind at an older version -- the failure that had `~/keel` running
+          # keel-trader 0.5.7 against keel-core 0.5.5. `keel versions` checks every keel
+          # distribution in the venv and exits non-zero when they disagree, which also proves
+          # the `==` pins in the wheels actually pulled the siblings from dist/.
+          /tmp/verify/bin/keel versions || {
+            echo "::error::the installed wheels do not agree on a version"; exit 1; }
 
       # The release ships a ready-for-live config as a downloadable asset. It must be in
       # `confirm` mode: a config that trades unattended straight off a download is exactly what
@@ -168,7 +175,12 @@ jobs:
             echo "\`keel_trader\` wheel **by path**:"
             echo
             echo '    pip install --find-links . ./keel_trader-${{ inputs.version }}-py3-none-any.whl'
-            echo "    keel --version"
+            echo "    keel versions"
+            echo
+            echo "\`keel versions\` — not \`keel --version\` — is the check: it reports **every**"
+            echo "keel distribution in the venv and exits non-zero if a sibling was left behind at"
+            echo "an older version, which \`--version\` cannot see. Upgrading an existing"
+            echo "deployment: see \"Deploying a new version\" in the README."
             echo
             echo "⚠️ **Never install by bare name.** The distribution is \`keel-trader\`; the name"
             echo "\`keel\` on PyPI belongs to an unrelated project, so \`pip install keel\` fetches"

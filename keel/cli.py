@@ -57,10 +57,11 @@ to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroke
 broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
 `_build_broker` seam, and the remaining top-level commands. The broker-free command groups live
 in `keel/commands/*` and are registered here via `cli.add_command(...)`: `db`, `trials`,
-`withdrawals`, `autonomy`, `rules`, `subscription`. The shared seams (`with_disclaimer`, the
-confirmation gate, `_open_repo`/`_load_cfg`/`_build_broker`) live in `keel.commands._common` and
-are re-imported here; `_is_interactive` is reached as `_common._is_interactive()` so a single
-patch point in `keel.commands._common` drives every gate wherever its command is defined.
+`withdrawals`, `autonomy`, `rules`, `subscription`, `versions`. The shared seams
+(`with_disclaimer`, the confirmation gate, `_open_repo`/`_load_cfg`/`_build_broker`) live in
+`keel.commands._common` and are re-imported here; `_is_interactive` is reached as
+`_common._is_interactive()` so a single patch point in `keel.commands._common` drives every gate
+wherever its command is defined.
 """
 
 from __future__ import annotations
@@ -103,6 +104,7 @@ from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
 from keel.commands.trials import trials_group
 from keel.commands.tui import tui_cmd
+from keel.commands.versions import versions_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
@@ -123,7 +125,7 @@ from keel.sim import report as report_mod
 from keel.sim import tiers as tiers_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Candle, Granularity
-from keel.version import build_info
+from keel.version import build_info, check_install
 
 # -- root group ---------------------------------------------------------------------------------
 
@@ -134,6 +136,12 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
     Prints the working-tree state too. For a tool that can place orders, "0.1.0 (abc123, DIRTY)"
     and "0.1.0 (abc123)" are materially different claims -- the first corresponds to no commit
     and cannot be reproduced.
+
+    The line describes the `keel-trader` distribution ONLY, which is exactly how a deployment came
+    to run `keel-trader 0.5.7` against `keel-core 0.5.5` while this reported the new number. It
+    cannot be widened without changing what `--version` means, so instead it warns when the rest
+    of the install disagrees and points at `keel versions`, which reports all of them and exits
+    non-zero. The warning goes to stderr so the string this prints stays exactly what it was.
     """
     if not value or ctx.resilient_parsing:
         return
@@ -143,6 +151,12 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
         click.echo(
             "warning: this build is NOT reproducible -- it does not correspond to a commit. "
             "Do not run it against live funds.",
+            err=True,
+        )
+    if not check_install(source=info.source).is_consistent:
+        click.echo(
+            "warning: PARTIAL INSTALL -- this line reports the keel-trader distribution only, "
+            "and the other keel distributions do not agree with it. Run `keel versions`.",
             err=True,
         )
     ctx.exit()
@@ -2157,6 +2171,14 @@ cli.add_command(tui_cmd)
 # A pure VIEW over `gather_status`/`StatusReport`, the repository read methods, and the
 # promotion/track-record machinery -- defined in `keel.commands.insights` and registered here.
 cli.add_command(insights_group)
+
+
+# -- versions (the deploy check: every keel distribution, not just this one) ---------------------
+
+# `--version` above answers for `keel-trader` alone and therefore cannot see a partial upgrade;
+# this reports the whole install and exits non-zero when it disagrees with itself. Defined in
+# `keel.commands.versions` and registered here.
+cli.add_command(versions_cmd)
 
 
 # -- kill / resume ------------------------------------------------------------------------------

@@ -129,24 +129,60 @@ Cutting a release is `docs/RELEASING.md`. Installing one into a deployment (e.g.
 commands, run **from the deployment directory** — every path below is relative to it:
 
 ```bash
-gh release download v0.3.1 --repo CodeGateSoftware/keel --pattern '*.whl' --dir Release/
-uv pip install --python .venv --find-links Release Release/keel_trader-0.3.1-py3-none-any.whl
-.venv/bin/keel --version
+V=0.6.0
+gh release download "v$V" --repo CodeGateSoftware/keel --pattern '*.whl' --dir Release/
+uv pip install --python .venv --find-links Release \
+  Release/keel_core-$V-py3-none-any.whl \
+  Release/keel_broker_api-$V-py3-none-any.whl \
+  Release/keel_broker_coinbase-$V-py3-none-any.whl \
+  Release/keel_trader-$V-py3-none-any.whl
+.venv/bin/keel versions
 .venv/bin/keel status
 ```
 
-Substitute the version being deployed in both of the first two lines. `--find-links Release` is
-what lets the single `keel_trader` wheel resolve its `keel-core` / `keel-broker-*` siblings from
-that same directory — which is why step 1 downloads them all. Installing **by path** rather than
-by bare name is deliberate: `keel` on PyPI is an unrelated project, so `pip install keel` fetches a
-stranger's code (see `keel/version.py`).
+Set `V` to the version being deployed; nothing else changes between releases.
 
-Step 3 is the check that matters. It must report the version you just installed, bound to a
-commit, from source `[release]`:
+**Every wheel is named, and that is the fix for a real bug.** Installing `keel_trader` alone
+upgraded *only* `keel_trader`: its siblings were required without a version, so the `keel-core`
+already on disk satisfied `keel-core` and stayed put. `~/keel` ran `keel-trader 0.5.7` against
+`keel-core 0.5.5` for two releases that way. A wheel **path** is a direct requirement — that exact
+file is installed whatever is already there — so naming all four is what actually moves them.
+The wheels now also pin their siblings exactly (`Requires-Dist: keel-core==0.6.0`), which forces
+the upgrade even for someone who installs `keel_trader` alone; the four paths are the same
+guarantee stated where the operator can see it.
+
+**Not `Release/*.whl`.** The release ships *every* workspace wheel, two of which a deployment must
+not have: `keel_broker_fake`, a dev-only fake venue that registers a `fake` entry point under
+`keel.brokers`, and `keel_broker_robinhood`, an optional venue that pulls an Ed25519 stack
+(`pynacl`, `cffi`) in for an adapter nothing constructs. The four named wheels are production's
+whole dependency closure. `--find-links Release` still points at that directory so the pinned
+siblings resolve locally rather than from PyPI, where they do not exist — which is why step 1
+downloads them all. Installing **by path** rather than by bare name is deliberate and unchanged:
+`keel` on PyPI is an unrelated project, so `pip install keel` fetches a stranger's code (see
+`keel/version.py`).
+
+Step 3 is the check that matters, and it is `keel versions` — **not** `keel --version`, which
+could not fail. `--version` reports the `keel-trader` distribution's version and nothing else, so
+it printed `0.6.0` while `keel-core` sat at `0.5.5`: a verification step blind to the failure mode,
+which is worse than none, because it is trusted. `keel versions` prints the same build identity,
+then every keel distribution in that venv, and **exits non-zero** when they disagree:
 
 ```
-keel 0.3.1+deb8fa7e978d [release]
+keel 0.6.0+deb8fa7e978d [release]
+
+keel-broker-api       0.6.0
+keel-broker-coinbase  0.6.0
+keel-core             0.6.0
+keel-trader           0.6.0
+
+ok: 4 keel distributions, all at 0.6.0.
 ```
+
+A partial upgrade fails it, with the numbers: `error: PARTIAL INSTALL: 4 keel distributions at 2
+different versions (0.5.5, 0.6.0)`. So does finding `keel-broker-fake` installed — it was, at
+`0.5.5`, in `~/keel`. Remove it: `uv pip uninstall --python .venv keel-broker-fake`. Nothing calls
+`load_broker()` today so it is inert, but that is a property of this release, not of the package,
+and no reason to leave a fake venue registered on the box that moves money.
 
 A build reporting `(DIRTY)` or `[checkout]` corresponds to no commit and **must not be run against
 live funds**. Step 4 is a read-only snapshot — no orders, no writes — confirming the new build
