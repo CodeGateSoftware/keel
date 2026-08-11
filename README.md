@@ -109,6 +109,64 @@ If the deployment runs on a schedule (LaunchAgents, cron), a new build takes eff
 cycle with nothing to restart — each cycle is a fresh process. A **long-running** process is the
 exception: a `keel tui` left open keeps the build it started with until you quit and relaunch it.
 
+## Paper vs. live
+
+A deployment such as `~/keel` runs **two of them side by side**, and they share nothing: separate
+configs, separate databases, separate allowlists, separate caps, separate schedules, separate
+histories. **A figure from one says nothing about the other.** Checking a paper position size
+against live account equity — or a live cap against paper cash — yields a confident wrong answer,
+and has already produced one. Establish which account a number came from before reasoning about it.
+
+| | paper | live |
+| --- | --- | --- |
+| config | `config.paperforward.yaml` | `config.live-sandbox.yaml` |
+| database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) |
+| `auto_trade.mode` | `paper` | `confirm` |
+| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) |
+| `caps.max_exposure_usd` | 5000 | 200 |
+| money spent | synthetic `paper_cash_usdc` | the real broker balance |
+| sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy |
+| rail 14 allowance | $500/month (Basic tier) | $200/month |
+| `equity_state_mode` | `paper` | `live` |
+| launchd job | `com.keel.paperforward` | `com.keel.live` |
+
+**Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`) the
+`equity_state_mode` line names the account the equity, high-water mark and drawdown figures
+describe, and `paper_cash_usdc` is printed in paper mode only. On the command line it is the
+`--config`/`--db` pair — and `--db` is the one that bites, because `keel.db` is its default, so a
+live command that omits it silently reads the **paper** database and answers about the wrong
+account. Live commands always carry both:
+
+```bash
+keel --config config.live-sandbox.yaml --db keel-live.db status
+```
+
+**Placing an order is gated differently.** Paper places freely against synthetic cash — nothing is
+asked and nothing real moves, which is the point. Live runs `mode: confirm`: each order is
+previewed and waits for a typed `y` at a terminal, so a headless live cycle **fails closed** and
+places nothing — *unless autonomy is armed*, which is exactly what makes an unattended live cycle
+place. Autonomy changes who is asked, never what is allowed (see **Confirm vs. autonomy** above);
+check the flag before assuming a live cycle is supervised, rather than inferring it from `confirm`.
+
+**Both fire hourly; both run once a day.** Each launchd job has a list of hourly triggers plus
+`RunAtLoad`, and each runner is day-stamped: the first eligible trigger that finds no stamp for
+today runs the cycle and writes the stamp, and every later trigger that day is a no-op. The
+trigger count is **catch-up breadth, not cadence** — launchd re-runs a calendar interval missed
+while asleep but *not* one that passed while the machine was off, so the extra triggers are what
+stop a shutdown over the scheduled hour from losing the day outright. A cycle that **fails** leaves
+no stamp, so the next hour retries it, which also covers waking with no network. The two jobs
+differ only in anchor: paper fires 09:00–20:00 local and stamps the local date; live fires hourly
+at :20 and gates and stamps on the **UTC** date, because a daily bar is not visible until the
+00:00–01:00 UTC hourly candle has closed. On live the stamp is a correctness mechanism, not tidiness
+— nothing on that path dedupes an entry, so two cycles in one UTC day means two entries off one
+daily bar (`tests/test_schedule.py` pins it).
+
+**Sizing is a different calculation on each.** Paper sizes off its own synthetic equity, passed to
+`_build_intent` as `equity_override`; the live path has no equity reading there and falls back to
+`caps.max_exposure_usd` as a proxy (`keel/execution/executor.py`). The same rule, the same setup and
+the same day therefore produce different quantities on the two accounts, and neither is an estimate
+of the other. The settings behind those numbers are covered under **How much money moves** above.
+
 ## Before trading live
 
 Read `docs/operator-runbook.md`. It lists the compliance obligations **no rail can enforce** — chiefly
