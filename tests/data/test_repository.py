@@ -483,6 +483,87 @@ def test_profile_readable_reports_damage_that_get_profile_hides(repo):
     assert repo.get_profile().autonomous is False  # still fails closed, still no exception
 
 
+# -- instrument attestations --------------------------------------------------
+
+
+def test_upsert_instrument_attestation_round_trips_through_get(repo):
+    repo.upsert_instrument_attestation(
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="https://x.invalid",
+        attested_by="tester",
+        attested_at=1_800_000_000,
+    )
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD") == {
+        "venue": "coinbase",
+        "product_id": "BTC-USD",
+        "wrapper": "spot",
+        "source": "https://x.invalid",
+        "attested_by": "tester",
+        "attested_at": 1_800_000_000,
+    }
+
+
+def test_upsert_instrument_attestation_on_conflict_replaces_rather_than_duplicates(repo):
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
+        attested_by="alice", attested_at=1_000,
+    )
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="perpetual", source="s2",
+        attested_by="bob", attested_at=2_000,
+    )
+
+    row = repo.get_instrument_attestation("coinbase", "BTC-USD")
+    assert row["wrapper"] == "perpetual"
+    assert row["attested_by"] == "bob"
+    assert row["attested_at"] == 2_000
+    assert repo.get_instrument_attestations() == [row]
+
+
+def test_same_product_id_on_two_venues_are_independent_rows(repo):
+    """The whole point of the composite key: one venue's BTC-USD spot listing must not collide
+    with another venue's BTC-USD listing of a different wrapper."""
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
+        attested_by="a", attested_at=1,
+    )
+    repo.upsert_instrument_attestation(
+        venue="kraken", product_id="BTC-USD", wrapper="cfd", source="s2",
+        attested_by="a", attested_at=1,
+    )
+
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD")["wrapper"] == "spot"
+    assert repo.get_instrument_attestation("kraken", "BTC-USD")["wrapper"] == "cfd"
+
+
+def test_get_instrument_attestation_returns_none_for_an_unknown_key(repo):
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD") is None
+
+
+def test_get_instrument_attestations_lists_all_rows_ordered_by_venue_then_product(repo):
+    repo.upsert_instrument_attestation(
+        venue="kraken", product_id="BTC-USD", wrapper="cfd", source="s", attested_by="a",
+        attested_at=1,
+    )
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="ETH-USD", wrapper="spot", source="s", attested_by="a",
+        attested_at=1,
+    )
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s", attested_by="a",
+        attested_at=1,
+    )
+
+    rows = repo.get_instrument_attestations()
+    assert [(r["venue"], r["product_id"]) for r in rows] == [
+        ("coinbase", "BTC-USD"),
+        ("coinbase", "ETH-USD"),
+        ("kraken", "BTC-USD"),
+    ]
+
+
 # -- screen exceptions --------------------------------------------------------
 
 

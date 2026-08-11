@@ -58,6 +58,22 @@ def _attest(runner, db_path, config_path, asset, **over):
     )
 
 
+def _attest_instrument(runner, db_path, config_path, product, **over):
+    args = {
+        "--product": product,
+        "--wrapper": "spot",
+        "--source": "coinbase product spec",
+        "--attested-by": "tester",
+    }
+    args.update(over)
+    flat = [item for pair in args.items() for item in pair]
+    return runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path),
+         "assets", "attest-instrument", *flat],
+    )
+
+
 def test_an_unattested_asset_is_rejected_even_with_perfect_market_data(
     tmp_path, valid_config_path
 ):
@@ -84,6 +100,9 @@ def test_attesting_admits_an_otherwise_clean_asset(tmp_path, valid_config_path):
     runner = CliRunner()
     for asset in ("BTC", "ETH", "PAXG"):
         assert _attest(runner, db_path, valid_config_path, asset).exit_code == 0
+        assert _attest_instrument(
+            runner, db_path, valid_config_path, f"{asset}-USD"
+        ).exit_code == 0
 
     result = runner.invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "screen"]
@@ -186,6 +205,9 @@ def test_exempt_admits_a_history_failing_asset_and_screen_prints_WAIVED(
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
+    assert _attest_instrument(
+        runner, db_path, valid_config_path, "PAXG-USD"
+    ).exit_code == 0
 
     # Before the exception: REJECT on history.
     before = runner.invoke(
@@ -247,6 +269,9 @@ def test_exempt_normalizes_a_lowercase_asset_so_screening_still_finds_the_waiver
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
+    assert _attest_instrument(
+        runner, db_path, valid_config_path, "PAXG-USD"
+    ).exit_code == 0
 
     result = _exempt(runner, db_path, valid_config_path, **{"--asset": "paxg"})
     assert result.exit_code == 0, result.output
@@ -283,6 +308,9 @@ def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
+    assert _attest_instrument(
+        runner, db_path, valid_config_path, "PAXG-USD"
+    ).exit_code == 0
     assert _exempt(runner, db_path, valid_config_path).exit_code == 0
 
     admitted = runner.invoke(
@@ -562,6 +590,7 @@ def test_holdings_screen_agrees_with_assets_screen_for_the_same_asset(
     _seed_history(repo, "BTC-USD")
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
     _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5")]))
 
     screened = runner.invoke(
@@ -825,6 +854,7 @@ def test_the_derived_failure_tags_actually_match_screen_asset_output():
         median_daily_volume=Decimal(0),
         quotable_in_settlement_currency=False,
         product_id="SOL-EUR",
+        venue="coinbase",
     )
     tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
 
@@ -845,6 +875,7 @@ def test_a_lowercase_holding_is_screened_as_the_attested_uppercase_asset(
     _seed_history(repo, "BTC-USD")
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
     _with_broker(monkeypatch, _FakeBroker([_account("btc", "0.5")]))
 
     result = _holdings(db_path, valid_config_path, "--screen")
@@ -985,6 +1016,7 @@ def test_screen_still_ADMITS_a_well_formed_spot_pair(tmp_path, valid_config_path
     _seed_history(repo, "BTC-USD")
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
 
     result = runner.invoke(
         cli,
@@ -995,6 +1027,162 @@ def test_screen_still_ADMITS_a_well_formed_spot_pair(tmp_path, valid_config_path
     assert result.exit_code == 0, result.output
     assert "ADMIT" in result.output
     assert "spot_instrument" not in result.output
+
+
+# -- instrument attestations (issue #202): the LISTING is a separate claim from the ASSET --------
+#
+# `keel assets attest` says what the underlying is; `keel assets attest-instrument` says what
+# CONTRACT this venue listing actually is. Admission now needs both, and the point of splitting
+# them is that a spot-admissible underlying says nothing about a CFD/perp/future wrapped around
+# it -- leverage, swap financing and counterparty exposure are properties of the CONTRACT.
+
+
+def test_screen_REJECTS_a_fully_asset_attested_product_with_no_instrument_attestation(
+    tmp_path, valid_config_path
+):
+    """The fail-closed default has to be ACTIONABLE, not just correct. An operator who has done
+    the asset-side work (sector, backing, source) and sees REJECT must be told the ONE remaining
+    thing they owe -- the exact command, not just the word 'unattested' -- or the fail-closed
+    default becomes a dead end instead of a checklist."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REJECT" in result.output
+    assert "instrument_wrapper" in result.output
+    assert "keel assets attest-instrument" in result.output, (
+        "a missing instrument attestation must name the exact remedy, not just say 'unattested'"
+    )
+
+
+def test_asset_and_spot_instrument_attestation_together_ADMIT(tmp_path, valid_config_path):
+    """The two attestations are complementary, not redundant -- both must be present to admit,
+    and both present with `--wrapper spot` is precisely the case that should clear the gate."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ADMIT" in result.output
+
+
+def test_a_cfd_wrapper_on_an_admissible_underlying_still_REJECTS(tmp_path, valid_config_path):
+    """Issue #202's acceptance case at the CLI level: the underlying (BTC, spot-admissible) is
+    fully attested and would ADMIT as spot, but this listing is attested as a CFD. The contract,
+    not the underlying, is what this criterion polices -- leverage, swap financing and
+    counterparty exposure survive any care taken over the asset attestation, so ADMIT here would
+    be exactly the leak issue #202 was filed to close."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(
+        runner, db_path, valid_config_path, "BTC-USD", **{"--wrapper": "cfd"}
+    ).exit_code == 0
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REJECT" in result.output
+    assert "instrument_wrapper" in result.output
+    assert "'cfd'" in result.output, "the verdict must name the wrapper it refused"
+
+
+def test_attest_instrument_rejects_an_unknown_wrapper_at_the_cli_boundary(
+    tmp_path, valid_config_path
+):
+    """`--wrapper` is a `click.Choice` driven by `screen_mod.KNOWN_WRAPPERS` -- a made-up wrapper
+    name must be refused at the keyboard, the same boundary `assets attest --backing` and `assets
+    exempt --criterion` already enforce for their own Choice-typed options, rather than being
+    recorded and only failing later at screen time."""
+    from keel.compliance import screen as screen_mod
+
+    assert "banana" not in screen_mod.KNOWN_WRAPPERS, "fixture must actually be an unknown value"
+
+    # The Choice must be DRIVEN by `screen_mod.KNOWN_WRAPPERS`, not a second, hardcoded list that
+    # could silently drift from it -- inspect the live Click param rather than assuming.
+    attest_instrument_cmd = cli.commands["assets"].commands["attest-instrument"]
+    wrapper_param = next(p for p in attest_instrument_cmd.params if p.name == "wrapper")
+    assert set(wrapper_param.type.choices) == screen_mod.KNOWN_WRAPPERS
+
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+
+    result = _attest_instrument(
+        CliRunner(), db_path, valid_config_path, "BTC-USD", **{"--wrapper": "banana"}
+    )
+
+    assert result.exit_code != 0
+    assert "--wrapper" in result.output
+
+
+def test_assets_list_renders_an_instrument_attestation(tmp_path, valid_config_path):
+    """Both KINDS of attestation must be visible from `assets list`, or an operator reading only
+    the asset half sees a fully-attested allowlist that still screens REJECT for a reason the
+    listing never shows them."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "list"]
+    )
+
+    assert "instruments:" in result.output
+    assert "BTC-USD" in result.output
+    assert "coinbase" in result.output
+    assert "spot" in result.output
+
+
+def test_attest_instrument_normalizes_a_lowercase_product_so_screening_still_finds_it(
+    tmp_path, valid_config_path
+):
+    """Mirrors `test_exempt_normalizes_a_lowercase_asset_so_screening_still_finds_the_waiver`: a
+    `--product btc-usd` statement must not silently no-op against the uppercase `BTC-USD` that
+    `_screen_product` looks the row up by -- an operator who typed the id in lowercase must not
+    be told UNATTESTED for a statement they already recorded."""
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_history(repo, "BTC-USD")
+    runner = CliRunner()
+    assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+
+    result = _attest_instrument(
+        runner, db_path, valid_config_path, "btc-usd"
+    )
+    assert result.exit_code == 0, result.output
+    assert "BTC-USD" in result.output
+
+    screened = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "screen", "--products", "BTC-USD"],
+    )
+    assert "ADMIT" in screened.output
 
 
 # -- assets propose -----------------------------------------------------------------------------
@@ -1058,6 +1246,7 @@ def test_propose_and_screen_agree_for_the_same_asset(tmp_path, valid_config_path
     _seed_history(repo, "BTC-USD")
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
     shortlist = _write_shortlist(
         tmp_path, [{"asset": "BTC", "rationale": "reserve asset", "sources": ["https://bitcoin.org"]}]
     )

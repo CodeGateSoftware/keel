@@ -245,6 +245,7 @@ def test_build_screen_report_routes_every_allowlist_product_through_injected_scr
             median_daily_volume=Decimal("2000000"),
             quotable_in_settlement_currency=True,
             product_id=product,
+            venue="coinbase",
         )
         result = screen_mod.ScreenResult(asset=facts.asset, admitted=True)
         return facts, result

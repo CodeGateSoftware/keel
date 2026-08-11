@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -239,6 +239,17 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS instrument_attestations (
+        venue        TEXT NOT NULL,
+        product_id   TEXT NOT NULL,
+        wrapper      TEXT NOT NULL,
+        source       TEXT NOT NULL,
+        attested_by  TEXT NOT NULL,
+        attested_at  INTEGER NOT NULL,
+        PRIMARY KEY (venue, product_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS screen_exceptions (
         asset       TEXT NOT NULL,
         criterion   TEXT NOT NULL,
@@ -420,6 +431,26 @@ def _migrate_v9_screen_exceptions(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v10_instrument_attestations(conn: sqlite3.Connection) -> None:
+    """v10 adds `instrument_attestations`. Table creation is handled by `_SCHEMA_STATEMENTS`;
+    there is deliberately NO backfill.
+
+    A row asserts a human established what CONTRACT a given venue listing actually is (spot,
+    CFD, perpetual, ...) against a named source. Seeding `spot` rows for the currently-allowlisted
+    products would fabricate exactly the claim this gap exists to demand -- and would do it for
+    the products the project is most likely to stop questioning.
+
+    Like v9, this is a genuine no-op migration: `migrate()` runs every `_SCHEMA_STATEMENTS`
+    statement (all `IF NOT EXISTS`) before the version loop below, so a database already stamped
+    at v9 picks the table up from that pass alone. This step only exists to advance the stamp.
+
+    An empty table correctly says nothing has been attested yet -- which, because the screen
+    fails closed on a missing instrument attestation, means every product reports REJECT until
+    the operator runs `keel assets attest-instrument`. That is the intended fail-closed default,
+    not a regression.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -429,6 +460,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_v7_profile,
     8: _migrate_v8_autonomy_expiry,
     9: _migrate_v9_screen_exceptions,
+    10: _migrate_v10_instrument_attestations,
 }
 
 

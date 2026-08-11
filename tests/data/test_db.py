@@ -103,11 +103,11 @@ def test_agent_state_table_has_key_primary_key():
     assert pk_columns == {"key"}
 
 
-def test_schema_version_is_9():
+def test_schema_version_is_10():
     """Deliberate tripwire: bump this literal consciously on every schema change."""
     from keel.data.db import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
 
 
 def test_a_v6_database_migrates_up_and_gains_the_profile_table(tmp_path):
@@ -209,6 +209,55 @@ def test_migrating_a_v8_database_twice_is_idempotent(tmp_path):
     conn = connect(str(tmp_path / "v8_twice.db"))
     migrate(conn)
     conn.execute("UPDATE schema_version SET version = 8")
+    conn.commit()
+    migrate(conn)
+    migrate(conn)  # must not raise
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+
+
+def test_a_fresh_database_has_the_instrument_attestations_table():
+    conn = connect(":memory:")
+
+    migrate(conn)
+
+    named = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_attestations'"
+    ).fetchone()
+    assert named is not None
+
+
+def test_a_v9_database_migrates_up_and_gains_the_instrument_attestations_table(tmp_path):
+    """v10 is a documented no-op migration, same shape as v9: `_SCHEMA_STATEMENTS` (IF NOT
+    EXISTS) already creates the new table on an existing v9 DB before the version loop runs, so
+    the migration step itself has nothing to do."""
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "v9.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 9")
+    conn.commit()
+
+    migrate(conn)
+
+    assert int(conn.execute("SELECT version FROM schema_version").fetchone()["version"]) == (
+        SCHEMA_VERSION
+    )
+    named = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_attestations'"
+    ).fetchone()
+    assert named is not None, "v10 must add the instrument_attestations table"
+    (count,) = conn.execute("SELECT COUNT(*) FROM instrument_attestations").fetchone()
+    assert count == 0, "no backfill: seeding rows would fabricate an attestation nobody made"
+
+
+def test_migrating_a_v9_database_twice_is_idempotent(tmp_path):
+    from keel.data.db import SCHEMA_VERSION, connect, migrate
+
+    conn = connect(str(tmp_path / "v9_twice.db"))
+    migrate(conn)
+    conn.execute("UPDATE schema_version SET version = 9")
     conn.commit()
     migrate(conn)
     migrate(conn)  # must not raise
