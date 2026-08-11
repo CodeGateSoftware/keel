@@ -154,7 +154,7 @@ quoted strings, and `accounts` does **both in the same object**:
 | | fields |
 | --- | --- |
 | unquoted numbers | `estimated_price.{ask,bid,quantity,fee_ratio,est_fee,est_total_cost}`, `accounts.fee_tier_status.*`, `holdings.{total_quantity,quantity_available_for_trading}` |
-| quoted strings | `accounts.buying_power`, `trading_pairs.{asset_increment,quote_increment,max_order_size}`, `best_bid_ask.{bid,ask}` |
+| quoted strings | `accounts.buying_power`, `trading_pairs.{asset_increment,quote_increment,max_order_size,min_order_amount}`, `best_bid_ask.{bid,ask}` |
 
 There is therefore no venue-wide rule to code against and no field that may be assumed to be one
 form or the other. Two things together make every read safe, and **both** are required:
@@ -164,18 +164,24 @@ a round-trip no-op for a `Decimal`. Do not "simplify" either into `Decimal(value
 an `isinstance` branch — there is nothing stable to branch on. The fixtures mirror the venue field
 for field, mixed quoting included, so the suite exercises both paths.
 
-### No published minimum order size
+### The minimum order size is published, but only on some pairs
 
-`GET /api/v2/crypto/trading/trading_pairs/` publishes `asset_increment`, `quote_increment` and
-`max_order_size`, and **no minimum of any kind** -- neither `min_order_amount` nor
-`min_order_size`. This was confirmed live across four cursor pages in #217; the fixture had
-invented `min_order_amount`, and `transport.get_trading_pairs`' docstring named it as an input.
+`GET /api/v2/crypto/trading/trading_pairs/` publishes `asset_increment`, `quote_increment`,
+`max_order_size` -- and `min_order_amount` on **63 of the 89 pairs**, including BTC-USD (`0.1`)
+and ETH-USD. The other 26 pairs omit the key entirely. `min_order_size` does not exist on any pair.
 
-The consequence is for the pre-flight sizing check proposed in #198: increment rounding and an
-upper bound can be validated locally against this endpoint, and a **lower** bound cannot be
-validated at all, because the venue never states one. An undersized order is discoverable only as
-a rejection at placement. Anything designing that check must not assume a minimum is available
-here.
+⚠️ **This section previously said the venue publishes no minimum of any kind, and that was
+false.** #217 F3 reached it from a probe run, and #218 deleted `min_order_amount` from
+`tests/fixtures/rh_trading_pairs.json` on the strength of it. The probe's `shape_of` reduced a
+list to its FIRST element, and `results[0]` is BILL-USD -- one of the 26 pairs that genuinely lack
+the field. A run across all four cursor pages was still a run that read one row. #230 fixed the
+probe to merge every element and restored the field.
+
+The consequence for the pre-flight sizing check proposed in #198: increment rounding, an upper
+bound **and** a lower bound can all be validated locally against this endpoint for the assets keel
+trades. The lower bound must be read as optional per pair -- absent means "the venue states none
+for this pair", and an undersized order there is still discoverable only as a rejection at
+placement.
 
 ### No sandbox
 
@@ -189,7 +195,14 @@ runs it live.
 GET-only probe that compares each endpoint's live shape against the committed fixture. After the
 first run of it (#217), the five READ fixtures -- `rh_accounts.json`, `rh_holdings.json`,
 `rh_trading_pairs.json`, `rh_best_bid_ask.json`, `rh_estimated_price.json` -- match observed
-responses. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
+responses.
+
+⚠️ **Read that sentence with #230 in mind.** Until then the probe summarised a list by its FIRST
+element, so "matches observed responses" meant "matches `results[0]`" -- which is how a field on
+63 of 89 trading pairs was declared non-existent and deleted. The probe now merges every element
+of a list and marks a partially present key `key (63/89)`, so the claim means what it says; but a
+probe run still only corroborates what the account's own data exercises, and a fixture is only as
+corroborated as its most recent run. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
 `rh_order_canceled.json`) remain unverified against the venue**, because observing an order
 object requires placing a real order, which that script refuses by construction. Their field
 names are still read from the documentation alone, and `place_order` / `get_order` /

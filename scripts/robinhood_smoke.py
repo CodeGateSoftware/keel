@@ -17,6 +17,23 @@ This script closes 1-3 without placing an order and without risking a cent. It i
 NOT a conformance suite and NOT part of the shipped wheel -- it is an operator tool, run by hand
 when a credential exists, and its only output is a shape report.
 
+## What "the shape matched" is worth, exactly
+
+A collection is validated across ALL of its elements, not sampled. `shape_of` unions the keys of
+every element of a list and marks a key carried by only some of them `key (63/89)`, so a field
+that 71% of `trading_pairs` rows carry can no longer hide behind a `results[0]` that lacks it.
+That is not a hypothetical: it is #230. Until it was fixed this script reported 5/5 and then 6/6
+matched while blind to `min_order_amount`, a field BTC-USD and ETH-USD both carry, and #218
+deleted that field from the fixture believing the report.
+
+⚠️ **A run corroborates only what the account's own data exercises.** The probe cannot validate
+field names it never receives, and no report line distinguishes "the venue has no such field"
+from "this account produced no row carrying it". The `orders` probe is the standing example: on
+an account with no crypto order history `results` comes back empty, so that probe proves the
+path, the signature and the pagination envelope and **nothing whatsoever about field names**. The
+same caveat applies in miniature to any endpoint whose rows vary -- a key absent from all 89 rows
+this account can see is absent from THIS observation, which is weaker than absent from the API.
+
 The first run of it (#217) settled all three: ten requests, zero 401s, every endpoint path
 correct, `fee_tier_status` corroborated key for key -- and four fixture shapes wrong, one of them
 a live defect that left every market preview unpriced. It also produced five false positives of
@@ -68,6 +85,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -157,24 +175,135 @@ class _ReadOnly:
         return self._inner(method, path, **kwargs)
 
 
+def _annotate(text: str, note: str) -> str:
+    """Attach a human note to a shape token without changing what the token IS.
+
+    Everything a shape carries beyond the bare structure -- `(63/89)` on a partially present key,
+    the per-type tally on a key the venue quotes inconsistently -- lives in a trailing ` (...)`
+    suffix, and `_bare` below strips it. That split is the single place where "how many elements
+    carried this" is decided to be INFORMATION rather than a difference: `compare_shapes` compares
+    bare tokens, so a fixture that carries the key matches a venue that sends it on 63 of 89 rows,
+    while the count still reaches the operator's terminal and the `--json` output verbatim.
+
+    The suffix is stored in the token rather than in a parallel structure so it survives
+    `json.dumps` and so a partially present key whose value is an OBJECT is annotated the same way
+    as one whose value is a leaf -- the note rides on the key, which every value type has.
+    """
+    return f"{text} ({note})"
+
+
+def _bare(token: Any) -> Any:
+    """A shape token with its ` (...)` note removed, which is the form comparisons use."""
+    if isinstance(token, str):
+        return token.split(" (", 1)[0]
+    return token
+
+
+def _kind(item: Any) -> str:
+    """One word for what an element IS, for the mixed-type tally: a type name, or the container."""
+    if isinstance(item, dict):
+        return "object"
+    if isinstance(item, list):
+        return "array"
+    return shape_of(item)
+
+
+def _merged(items: list[Any]) -> Any:
+    """Summarise what EVERY element of a list looks like, as one element-shaped value.
+
+    This is the fix for #230 D1. The previous implementation reduced a list to
+    `[shape_of(value[0]), "... N items"]`, so every probe validated one element and reported a
+    match for the whole collection. `trading_pairs` returns 89 pairs in two distinct key-sets --
+    63 carry `min_order_amount`, 26 do not, and `results[0]` is one of the 26 -- so the probe
+    reported 6/6 matched while blind to a field present on every asset keel trades. A field
+    carried by SOME elements is an ordinary API shape; the probe has to model it, not collapse it.
+
+    Three merges, by what the elements are:
+
+    * **objects** -> the UNION of their keys. A key present on only some of them is annotated
+      `key (63/89)`, which makes partial presence visible without dropping the key from the shape
+      or claiming it is always there. The key is still in the union, so a fixture that omits it
+      is reported `NEW AT VENUE` -- which is exactly the miss #218 shipped.
+    * **lists** -> the elements are flattened and merged as one population. A nested list is
+      summarised across the whole parent collection rather than per parent, because the question
+      is still "what can a row look like".
+    * **anything else** -> the distinct type names, joined with `|` and tallied, e.g.
+      `Decimal|str (77 str, 12 Decimal)`. Taking the first element's type instead would hide a
+      real venue inconsistency at a venue that has already been caught quoting the same kind of
+      value two ways in one object (#217 F6), so a mixed type is deliberately NOT equal to either
+      of its halves and reports as a `TYPE DIFFERS`.
+
+    Only ONE shape comes back however long the list is: an 89-pair response prints one merged row
+    and a count, never 89 rows.
+    """
+    total = len(items)
+
+    if all(isinstance(item, dict) for item in items):
+        merged: dict[str, Any] = {}
+        for key in sorted({key for item in items for key in item}):
+            present = [item[key] for item in items if key in item]
+            label = key if len(present) == total else _annotate(key, f"{len(present)}/{total}")
+            merged[label] = _merged(present)
+        return merged
+
+    if all(isinstance(item, list) for item in items):
+        flattened = [element for item in items for element in item]
+        if not flattened:
+            return ["<empty>"]
+        return [_merged(flattened), f"... {len(flattened)} items"]
+
+    tallies = Counter(_kind(item) for item in items)
+    if len(tallies) == 1:
+        return next(iter(tallies))
+    counts = ", ".join(f"{count} {kind}" for kind, count in tallies.most_common())
+    return _annotate("|".join(sorted(tallies)), counts)
+
+
 def shape_of(value: Any) -> Any:
     """Reduce a decoded JSON value to its structure, discarding every leaf.
 
-    A list collapses to a single-element summary rather than one entry per item: the question is
-    what an element looks like, and a 90-pair `trading_pairs` response would otherwise bury the
-    answer in 90 identical copies. An empty list is reported as such, since "the venue returned
-    nothing" is itself a finding -- it is how an unfunded account presents, and it is what would
-    make a shape comparison vacuously pass.
+    A list collapses to ONE summary of all of its elements plus a count, rather than one entry per
+    item: the question is what an element can look like, and a 89-pair `trading_pairs` response
+    would otherwise bury the answer in 89 near-identical copies. That summary is a union, not a
+    sample -- see `_merged` for why the difference cost this repository a real field. An empty list
+    is reported as such, since "the venue returned nothing" is itself a finding: it is how an
+    unfunded account presents, and it is what would make a shape comparison vacuously pass.
     """
     if isinstance(value, dict):
         return {key: shape_of(val) for key, val in sorted(value.items())}
     if isinstance(value, list):
         if not value:
             return ["<empty>"]
-        return [shape_of(value[0]), f"... {len(value)} items"]
+        return [_merged(value), f"... {len(value)} items"]
     if value is None:
         return "null"
     return type(value).__name__
+
+
+def annotations_in(shape: Any, path: str = "") -> list[str]:
+    """Every note `shape_of` attached, as report lines -- partial presence and mixed types.
+
+    These are NOT differences, and printing them among the differences would be the cry-wolf
+    failure `_PAGINATION_ENVELOPE_KEYS` exists to avoid, one layer up. They are what the operator
+    needs to read a clean run honestly: "the shape matched" plus "and `min_order_amount` was on 63
+    of the 89 rows" is a true statement about the venue, where either half alone is not.
+    """
+    where = path or "<root>"
+    if isinstance(shape, str):
+        if shape == _bare(shape):
+            return []
+        return [f"  note: {where}  mixed types across elements: {shape}"]
+    if isinstance(shape, dict):
+        notes: list[str] = []
+        for key, val in shape.items():
+            child = f"{path}.{_bare(key)}" if path else _bare(key)
+            if key != _bare(key):
+                notes.append(f"  note: {child}  present on {key.split(' (', 1)[1][:-1]} elements")
+            notes.extend(annotations_in(val, child))
+        return notes
+    if isinstance(shape, list) and shape:
+        return annotations_in(shape[0], f"{path}[]")
+    return []
 
 
 def fixture_shape(path: Path) -> Any:
@@ -208,23 +337,39 @@ def compare_shapes(live: Any, fixture: Any, path: str = "") -> list[str]:
     venue does not send is the dangerous one -- that is a field the adapter may already be
     reading -- but a key the venue sends and the fixture omits is how a capability gets missed,
     and `fees_usd` (issue #197) is exactly that shape of miss.
+
+    Both sides are compared through `_bare`, which drops the ` (...)` notes `shape_of` attaches.
+    That is the decision #230 turns on, and it cuts two ways deliberately:
+
+    * A key the venue sends on only SOME elements is compared as an ordinary key. A fixture is one
+      representative object and cannot say "63 of 89", so the fixture is expected to carry the
+      UNION of the keys the venue can send -- `rh_trading_pairs.json`'s single row is BTC-USD, and
+      BTC-USD is sent `min_order_amount`. A fixture that carries it matches cleanly; a fixture
+      that omits it is reported `NEW AT VENUE`, which is precisely the #218 regression this
+      restores the ability to catch. The `63/89` itself reaches the operator through
+      `annotations_in`, as information rather than as a difference.
+    * A key the venue types INCONSISTENTLY across elements is not bare-equal to either of its
+      types, so `Decimal|str` against a fixture's `str` still reports `TYPE DIFFERS` -- with both
+      tallies in the message, because at this venue that is a finding and not a formatting detail.
     """
     diffs: list[str] = []
     if isinstance(fixture, dict) and isinstance(live, dict):
-        for key in sorted(set(fixture) | set(live)):
+        live_by_key = {_bare(key): val for key, val in live.items()}
+        fixture_by_key = {_bare(key): val for key, val in fixture.items()}
+        for key in sorted(set(fixture_by_key) | set(live_by_key)):
             where = f"{path}.{key}" if path else key
-            if key not in live:
-                diffs.append(f"  MISSING AT VENUE  {where}  (fixture has {fixture[key]!r})")
-            elif key not in fixture:
-                diffs.append(f"  NEW AT VENUE      {where}  (venue sends {live[key]!r})")
+            if key not in live_by_key:
+                diffs.append(f"  MISSING AT VENUE  {where}  (fixture has {fixture_by_key[key]!r})")
+            elif key not in fixture_by_key:
+                diffs.append(f"  NEW AT VENUE      {where}  (venue sends {live_by_key[key]!r})")
             else:
-                diffs.extend(compare_shapes(live[key], fixture[key], where))
+                diffs.extend(compare_shapes(live_by_key[key], fixture_by_key[key], where))
         return diffs
     if isinstance(fixture, list) and isinstance(live, list):
         if fixture and live and fixture[0] != "<empty>" and live[0] != "<empty>":
             diffs.extend(compare_shapes(live[0], fixture[0], f"{path}[]"))
         return diffs
-    if live != fixture:
+    if _bare(live) != _bare(fixture):
         diffs.append(f"  TYPE DIFFERS      {path or '<root>'}  fixture={fixture!r} venue={live!r}")
     return diffs
 
@@ -313,6 +458,11 @@ def report(results: dict[str, Any], as_json: bool) -> int:
             for line in diffs:
                 print(line)
             failures += 1
+        # Printed on a clean probe too, and after the differences rather than among them: a key on
+        # 63 of 89 rows is a true fact about the venue, not a fault, and a match is only honestly
+        # readable next to it.
+        for note in annotations_in(result["shape"]):
+            print(note)
 
     print(
         f"\n{len(PROBES) - failures}/{len(PROBES)} probes matched their fixture."

@@ -414,14 +414,18 @@ class RobinhoodTransport:
         `quote_increment`, and `max_order_size` are what would let this package round a size to
         the venue's tick LOCALLY instead of discovering the violation as a rejection.
 
-        ⚠️ **A minimum order size is NOT among them: this endpoint publishes none.** The rows
-        carry `symbol`, `asset_code`, `quote_code`, `asset_increment`, `quote_increment`,
-        `max_order_size`, `status` and `is_api_tradable`, and that is all -- there is no
-        `min_order_amount` and no `min_order_size` (#217 F3, observed live across four cursor
-        pages). This docstring named `min_order_amount` until that run, and the fixture invented
-        it, which between them gave the pre-flight minimum-size check proposed in #198 a source
-        that does not exist. Increment rounding and an upper bound can be checked locally against
-        this endpoint; a lower bound cannot be checked at all without a different source.
+        ⚠️ **The rows are not all the same shape.** Every row carries `symbol`, `asset_code`,
+        `quote_code`, `asset_increment`, `quote_increment`, `max_order_size`, `status` and
+        `is_api_tradable`. `min_order_amount` is carried by 63 of the 89 pairs -- BTC-USD (`0.1`)
+        and ETH-USD among them -- and absent from the other 26, so anything reading it must treat
+        it as optional per pair rather than assume the endpoint is uniform. `min_order_size` does
+        not exist at all.
+
+        #217 F3 recorded that no minimum of any kind existed, and #218 removed `min_order_amount`
+        from the fixture on that basis. Both were wrong: the probe that produced F3 inspected
+        `results[0]` only, and `results[0]` is BILL-USD, one of the 26 (#230). The pre-flight
+        minimum-size check proposed in #198 therefore DOES have a lower-bound source for every
+        asset keel trades -- with the caveat that it is per pair and may be missing.
 
         That work is deliberately not done here, and the reason is the same principle
         that shapes `cancel_order` and `_account`: a pre-flight check that runs before every

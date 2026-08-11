@@ -1274,10 +1274,14 @@ def test_place_order_returns_a_domain_type() -> None:
 # These assert on `tests/fixtures/rh_*.json` rather than on adapter behaviour, which is unusual
 # and deliberate. Robinhood ships no sandbox, so a fixture is the ONLY statement this repository
 # makes about what the venue sends -- and #217 found three of them stating things it does not:
-# an `estimated_price.price` that made every market preview unpriced, a `trading_pairs`
-# minimum-order field that does not exist, and a `best_bid_ask` row that was invented outright.
-# A wrong fixture is not a test-data nit here; it is a false claim about a live-money venue that
-# the rest of the suite then confirms.
+# an `estimated_price.price` that made every market preview unpriced and a `best_bid_ask` row that
+# was invented outright. A wrong fixture is not a test-data nit here; it is a false claim about a
+# live-money venue that the rest of the suite then confirms.
+#
+# It cuts the other way too, and #230 is the proof: #217 F3 read `results[0]` alone, concluded the
+# venue publishes no minimum order size, and #218 deleted a REAL field from `rh_trading_pairs.json`
+# on the strength of it. A fixture can be wrong by omission, and a probe that samples one row will
+# not tell you.
 # ---------------------------------------------------------------------------------------------
 
 #: Money and size fields the venue sends as UNQUOTED JSON numbers, keyed by fixture. Paths are
@@ -1292,7 +1296,12 @@ _NUMERIC_FIELDS: dict[str, tuple[str, ...]] = {
 #: minute -- see `test_this_venue_is_not_internally_consistent_about_quoting`.
 _QUOTED_FIELDS: dict[str, tuple[str, ...]] = {
     "rh_accounts.json": ("buying_power",),
-    "rh_trading_pairs.json": ("asset_increment", "quote_increment", "max_order_size"),
+    "rh_trading_pairs.json": (
+        "asset_increment",
+        "quote_increment",
+        "max_order_size",
+        "min_order_amount",
+    ),
     "rh_best_bid_ask.json": ("bid", "ask"),
 }
 
@@ -1366,17 +1375,26 @@ def test_the_account_fee_tier_status_is_numeric_throughout() -> None:
     assert all(isinstance(value, Decimal) for value in tier.values())
 
 
-def test_trading_pairs_publishes_no_minimum_order_field() -> None:
-    """#217 F3: the venue sends neither `min_order_amount` nor `min_order_size`.
+def test_trading_pairs_publishes_a_minimum_order_amount_for_the_assets_keel_trades() -> None:
+    """⚠️ #230 D2, reversing #217 F3 -- which was wrong, and this file asserted it for two PRs.
 
-    The fixture invented `min_order_amount`, and `transport.get_trading_pairs`' docstring named it
-    as an input for the pre-flight sizing check proposed in #198. There is no source for a minimum
-    on this endpoint, so that half of the check has no basis -- `asset_increment`/`quote_increment`
-    rounding and `max_order_size` remain, a minimum does not. Keeping the invented key would let
-    that follow-up be written against a field that will simply be absent at runtime.
+    `min_order_amount` **exists**, and BTC-USD carries it (`0.1`). #217 F3 concluded otherwise, and
+    #218 deleted the field from this fixture, because the probe that "confirmed it live across
+    four cursor pages" only ever inspected `results[0]` -- which is BILL-USD, one of the 26 pairs
+    of 89 that genuinely lack the field. The other 63, BTC-USD and ETH-USD among them, carry it.
+
+    So the venue publishes a minimum for every asset keel trades, the pre-flight sizing check
+    proposed in #198 does have a lower-bound source, and a fixture missing it is a fixture missing
+    a field the venue sends on the only row it claims to represent. `min_order_size` really is
+    absent -- that half of F3 held up.
+
+    The fixture's single row is BTC-USD deliberately: `scripts/robinhood_smoke.py` compares a
+    merged shape of all 89 live rows against this one object, so the object has to carry the union
+    of what a row can hold or the probe reports a difference it should not.
     """
     pair = load_fixture("rh_trading_pairs.json")["results"][0]
-    assert "min_order_amount" not in pair
+    assert pair["symbol"] == "BTC-USD"
+    assert pair["min_order_amount"] == "0.1"
     assert "min_order_size" not in pair
     assert set(pair) == {
         "symbol",
@@ -1385,6 +1403,7 @@ def test_trading_pairs_publishes_no_minimum_order_field() -> None:
         "asset_increment",
         "quote_increment",
         "max_order_size",
+        "min_order_amount",
         "status",
         "is_api_tradable",
     }
