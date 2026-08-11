@@ -118,3 +118,5 @@ inspects an order, so account-level obligations are invisible to all of them and
 Note keel ships **inert**: rail 14 refuses live BUYs until a subscription is attested with
 `keel subscription attest --venue coinbase --tier <tier>`. That one is enforced in code and needs no
 checklist.
+
+# ruleset probe -- delete me
