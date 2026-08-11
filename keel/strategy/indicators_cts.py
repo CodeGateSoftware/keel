@@ -2,13 +2,30 @@
 
 Implements the Confluence Trading Score (CTS, spec §9): additive points across a
 fixed set of confluence factors, producing a `CTSResult` used by the evaluation
-engine (Task 7) to pick one of the 4 graded entry techniques (spec §9/§17.1):
+engine (Task 7) to select an `entry_technique` label (spec §9/§17.1) naming the
+confluence tier a signal scored into:
 
-| CTS score | Entry technique | Posture |
+| CTS score | Entry technique | Meaning |
 |---|---|---|
-| Low       | `confirm_3bar`  | 3-bar-reversal confirmation, smaller size, wider stop |
-| Mid       | `signal_candle` | wait for the single signal candle, base size |
-| High      | `aggressive`    | market/limit on level touch, larger size, tighter stop |
+| Low       | `confirm_3bar`  | low-confluence tier label |
+| Mid       | `signal_candle` | mid-confluence tier label |
+| High      | `aggressive`    | high-confluence tier label |
+
+**The label is recorded, not acted on.** Spec §17.1 describes this as a graded
+*posture* ladder -- smaller size / wider stop at the low tier, larger size / tighter
+stop at the high tier -- but no code in this repo reads `entry_technique` to change
+a position's size or a stop's distance. It is attached to `Signal.entry_technique`
+(`engine.py`), then reaches exactly two destinations: the `signals` audit payload
+and a `technique=` field on an `agent.enter_evaluated` log line. Verified
+exhaustively (`git grep -nE "technique (==|!=|in )" -- '*.py'`, tests excluded):
+nothing branches on it. A CTS total of 2 and a CTS total of 12 place the identical
+order. Wiring the ladder into sizing/stops would be a live money-path change --
+it needs backtest evidence that graded sizing beats flat sizing, plus a rails
+review (sizing interacts with the per-order and per-day caps), before it earns a
+claim like the one this docstring used to make. Until that happens, `entry_technique`
+exists for audit and later analysis: it names which tier produced a signal so the
+question "does grading help" can eventually be answered from data instead of
+asserted from a docstring.
 
 `score()` takes a plain `context: dict` (the same shape as `Setup.context`,
 spec/base.py) so callers (rules, the engine, tests) don't need to depend on any
@@ -154,12 +171,16 @@ def score(context: dict, weights: dict[str, int] | None = None) -> CTSResult:
 def entry_technique(
     total: int, low: int = 5, high: int = 8
 ) -> Literal["confirm_3bar", "signal_candle", "aggressive"]:
-    """Map a CTS total to the graded entry technique ladder (spec §9/§17.1).
+    """Map a CTS total to a confluence-tier label (spec §9/§17.1).
 
-    `total < low` -> `confirm_3bar` (3-bar-reversal confirmation, smaller size,
-    wider stop). `low <= total < high` -> `signal_candle` (wait for the single
-    signal candle, base size). `total >= high` -> `aggressive` (market/limit on
-    level touch, larger size toward the cap, tighter stop).
+    `total < low` -> `confirm_3bar`. `low <= total < high` -> `signal_candle`.
+    `total >= high` -> `aggressive`. These names describe *what the signal looked
+    like* at detection time, not what happens to it afterward: the returned label
+    is recorded (`Signal.entry_technique`, the `signals` audit payload, the
+    `agent.enter_evaluated` log line) but nothing sizes a position or places a
+    stop off of it -- see the module docstring for the full account of why. Do not
+    rename `confirm_3bar` / `signal_candle` / `aggressive`: they are persisted in
+    the `signals` table and a rename would orphan existing history.
     """
     if total < low:
         return "confirm_3bar"
