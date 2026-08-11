@@ -1520,6 +1520,33 @@ def test_build_help_screen_documents_discover_network_gating_and_attest_is_cli_o
     assert "keel assets attest" in text
 
 
+def test_help_says_which_account_is_on_screen_and_how_to_switch() -> None:
+    """paper and live render in an IDENTICAL layout, so nothing on the dashboard itself says which
+    account a number belongs to -- and reading a paper figure as a live one is the most expensive
+    confusion this project has. The help must name the field that disambiguates, and the
+    `--config`/`--db` pair that changes it, including that `--db` defaults to the PAPER database:
+    an operator who omits it gets paper numbers under a live-looking command. Scoped to the
+    section, like `test_help_says_the_live_balance_line_is_itself_a_venue_call`, so a word three
+    sections away cannot satisfy it."""
+    section: list[str] = []
+    lines = build_help_screen()
+    start = next(
+        i for i, line in enumerate(lines) if line.text.strip() == "Which account is this?"
+    )
+    for line in lines[start:]:
+        if not line.text.strip():
+            break
+        section.append(line.text.lower())
+    text = " ".join(section)
+    assert "separate" in text
+    assert "equity_state_mode" in text
+    assert "--config" in text
+    assert "--db" in text
+    assert "keel-live.db" in text
+    # The default is the trap, not a detail: omitting --db reads keel.db and reports on paper.
+    assert "defaults to keel.db" in text
+
+
 #: Every operator-facing place that counts this dashboard's network touches. The count is a
 #: SAFETY claim -- an operator deciding whether a keypress can reach the venue reads it and stops
 #: looking -- so an undercount is a bug, not a typo, and it must be pinned wherever it is stated.
