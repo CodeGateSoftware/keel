@@ -50,14 +50,41 @@ most informative thing in one real deployment's log (64 consecutive account-fetc
 are instead gathered into synthetic groups: a contiguous run of uncorrelated events whose
 neighbours are within `_UNCORRELATED_GAP_SEC` of each other becomes one row, which is what such
 events actually are -- one failed attempt at something.
+
+**The default view is TODAY, and that is delicate.** The feed answers "what has keel been doing",
+and the honest default answer is "what it has done today" -- an operator opening the dashboard at
+lunchtime wants this morning, not a fortnight of scrollback. So `build_activity_feed` scopes to
+the local CALENDAR day by default (`scope_start_ts`, midnight-to-now in the same local clock
+`_stamp` renders timestamps in -- NOT a rolling 24 hours, which would put "yesterday 09:00" and
+"today 09:00" on the same screen every morning and neither on it every afternoon).
+
+The delicacy is that the real deployment runs ONCE A DAY, at 09:00. "Today" therefore holds at
+most one row, and before 09:00 it holds none -- and a blank panel is worse than the dead-looking
+dashboard this whole feature exists to fix. Two things follow, and both are load-bearing:
+
+* `apply_scope` retains the newest cycle that fell OUTSIDE the scope as
+  `ActivityFeed.last_cycle_before_scope`, so the empty state can say *when keel last ran* and
+  when the next run is due. That is one status line answering "is it alive", not a history feed --
+  the distinction the "today only" requirement actually cares about.
+* Scope is a parameter, never a persisted preference. `apply_scope` can widen it to `"7d"` or
+  `"all"` on demand (the overlay's `t` key), but every fresh open starts at `"today"` again.
+
+**Today interacts with the bounded read, and the interaction is reported.** The window is a
+bounded TAIL, so in principle a day's cycles could sit outside it -- a busy log could push even
+this morning past the 1 MiB / 5000-line cap. A feed that filtered such a window to "today" and
+came back empty would be asserting something it cannot know. `ActivityFeed.scope_fully_covered`
+records whether the window PROVED it reached back past the scope boundary (it did if it saw any
+cycle older than that boundary, or if it read the file whole), and `footer_notes` says so out
+loud when it did not, rather than letting an unread morning read as a quiet one.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +146,74 @@ _ENVELOPE_KEYS = frozenset({"ts", "level", "logger", "event", "cycle_id", "venue
 #: config.yaml, so a deployment that writes its log somewhere else is already configurable and
 #: needs no new setting.
 _DEFAULT_LOG_PATH = "logs/keel.log"
+
+
+# -- scope (see the module docstring) ------------------------------------------------------------
+
+#: The scopes the feed can be built at, in the order the overlay's `t` key cycles them. `"today"`
+#: is first because it is both the default and the state every fresh open returns to.
+ACTIVITY_SCOPES: tuple[str, ...] = ("today", "7d", "all")
+
+#: What `build_activity_feed` scopes to unless told otherwise, and what the overlay reopens at
+#: every single time. Deliberately NOT persisted: a widened scope is an answer to one question
+#: an operator asked once, not a new default for a dashboard they will next open tomorrow.
+DEFAULT_ACTIVITY_SCOPE = "today"
+
+#: How many local calendar days each bounded scope spans, counting the current one. `"7d"` is
+#: therefore today plus the six days before it -- seven DAYS, not seven times 24 hours, for the
+#: same reason `"today"` is a calendar day: the deployment's unit of work is one daily cycle, so
+#: a boundary that fell mid-morning would split a day's single row off from its own date.
+_SCOPE_DAYS: dict[str, int] = {"today": 1, "7d": 7}
+
+
+def normalise_scope(scope: str) -> str:
+    """Any unrecognised scope collapses to the default rather than raising or filtering to
+    nothing -- this value can arrive from a caller, and an empty screen is the one outcome this
+    module is built to never produce."""
+    return scope if scope in ACTIVITY_SCOPES else DEFAULT_ACTIVITY_SCOPE
+
+
+def next_activity_scope(scope: str) -> str:
+    """The scope `t` moves to: `today` -> `7d` -> `all` -> `today`. Cycles rather than toggles so
+    one key covers all three without a modifier."""
+    try:
+        index = ACTIVITY_SCOPES.index(scope)
+    except ValueError:
+        return DEFAULT_ACTIVITY_SCOPE
+    return ACTIVITY_SCOPES[(index + 1) % len(ACTIVITY_SCOPES)]
+
+
+def scope_start_ts(scope: str, now_ts: float) -> float | None:
+    """The epoch second a scope begins at -- LOCAL midnight of the first calendar day it covers --
+    or `None` for `"all"`, which has no lower bound.
+
+    `now_ts` is a parameter, not a `time.time()` call buried in here, so the boundary is
+    injectable and every test of it is deterministic on whatever day it happens to run.
+
+    **Local, and derived from the same clock the rows render in.** `datetime.fromtimestamp` with
+    no tzinfo yields naive LOCAL time and `.timestamp()` converts it back through the local zone,
+    so the boundary lands on the same civil midnight `_stamp`'s `time.localtime` would print --
+    which is the only way "today" can mean what the operator reading the timestamps thinks it
+    means.
+
+    **DST is handled, and handled in the safe direction.** Going through `date` -> naive midnight
+    -> `.timestamp()` uses the offset in force on THAT day, so a 23- or 25-hour day still starts
+    where the civil day starts (a fixed `now_ts - 86400` would drift an hour twice a year). In
+    the few zones whose transition happens AT midnight, so that 00:00 does not exist, the naive
+    conversion resolves to the instant an hour before the nominal wall reading -- i.e. slightly
+    EARLIER than the true day boundary. That direction is deliberate: a boundary that errs early
+    can only ever include a cycle that belongs to today, never exclude one.
+
+    Never raises: a `now_ts` outside the platform's `time_t` returns `None`, which degrades to an
+    unfiltered feed rather than an empty one."""
+    days = _SCOPE_DAYS.get(scope)
+    if days is None:
+        return None
+    try:
+        day = datetime.datetime.fromtimestamp(now_ts).date() - datetime.timedelta(days=days - 1)
+        return datetime.datetime.combine(day, datetime.time.min).timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 # -- the parsed model ----------------------------------------------------------------------------
@@ -209,7 +304,13 @@ class ActivityFeed:
     `lines_skipped` counts lines that were read but could not be used -- the partial JSON a crash
     mid-write leaves behind, a line that is valid JSON but not an object, a record with no usable
     timestamp. It is surfaced in the overlay rather than swallowed: silently discarding input is
-    how a feed comes to under-report reality while looking healthy."""
+    how a feed comes to under-report reality while looking healthy.
+
+    The `scope_*` fields describe the day-scoping `apply_scope` applied (see the module
+    docstring). They default to an UNSCOPED feed -- `scope="all"`, nothing hidden, coverage
+    trivially complete -- so that `feed_from_lines` stays exactly the "parse everything in the
+    window" function it was, and scoping is a separate, separately-testable pass over its
+    result."""
 
     status: str
     source: str
@@ -219,6 +320,31 @@ class ActivityFeed:
     lines_skipped: int = 0
     window_truncated: bool = False
     cycles_dropped: int = 0
+
+    #: Which scope produced `cycles` -- one of `ACTIVITY_SCOPES`.
+    scope: str = "all"
+
+    #: Local midnight the scope begins at, or `None` for `"all"` (and for a `now_ts` so broken
+    #: that no boundary could be computed, which degrades to showing everything).
+    scope_start_ts: float | None = None
+
+    #: The "now" the scope was computed against. Carried so the empty state can say how long ago
+    #: the last cycle was without re-reading a clock that has moved on since the feed was built.
+    now_ts: float | None = None
+
+    #: Cycles the window held that fall BEFORE the scope -- hidden, not lost. Nonzero is the
+    #: normal state of a "today" view on a deployment with any history at all.
+    cycles_out_of_scope: int = 0
+
+    #: The newest cycle before the scope boundary, kept for ONE purpose: so an empty "today" can
+    #: name when keel last ran. That is a status line, not a history feed -- it is what turns a
+    #: blank panel into "keel has not run yet today; last cycle yesterday 09:00".
+    last_cycle_before_scope: ActivityCycle | None = None
+
+    #: Whether the bounded read PROVED it reached back past the scope boundary. False means the
+    #: window may not cover the whole scope, so an empty or short feed cannot be read as "the
+    #: scope was quiet" -- `footer_notes` and the empty state both say so when it is False.
+    scope_fully_covered: bool = True
 
 
 @dataclass(frozen=True)
@@ -688,12 +814,80 @@ def feed_from_lines(
     )
 
 
+def apply_scope(
+    feed: ActivityFeed, scope: str = DEFAULT_ACTIVITY_SCOPE, *, now_ts: float | None = None
+) -> ActivityFeed:
+    """Narrow an already-built feed to a scope. PURE, and a SEPARATE pass over `feed_from_lines`'s
+    result rather than a parameter threaded through it -- which keeps "parse the window" and
+    "decide which days to show" independently testable, and keeps `feed_from_lines` the unscoped
+    function every existing caller and test already relies on.
+
+    `now_ts` is injected (defaulting to `time.time()` only at this one seam) so every test of the
+    day boundary is deterministic regardless of the day it runs on.
+
+    Three things are recorded besides the filtered `cycles`, and each exists because dropping it
+    would let the overlay assert something it cannot know:
+
+    * `cycles_out_of_scope` -- how much was hidden, so the header can say so instead of
+      implying the window is the whole log.
+    * `last_cycle_before_scope` -- the NEWEST cycle just outside the boundary, the one fact that
+      turns an empty "today" into an answer to "is keel alive".
+    * `scope_fully_covered` -- True if the window contained anything older than the boundary (so
+      the boundary itself was inside the window and nothing before it can be missing), or if the
+      read was not truncated at all. False means the bounded tail begins somewhere inside the
+      scope, and an empty result there means "not seen", not "did not happen".
+
+    Filtering is on `started_ts`, the timestamp the row itself renders, and the boundary is
+    INCLUSIVE (`>= start`) so a cycle at exactly local midnight belongs to the day beginning
+    then -- the same convention every calendar uses, and the only one under which two adjacent
+    days cannot both claim it or both disown it.
+
+    There is deliberately NO upper bound at `now_ts`. "Today" is the calendar day, and in live
+    use `now_ts` is the current instant, so midnight-to-now and midnight-to-midnight contain
+    exactly the same records -- the only thing an upper bound could ever exclude is a record
+    stamped in the future, i.e. one written by a process whose clock is ahead. Hiding that would
+    be the wrong call in this module of all modules: an operator is far better served by seeing
+    the anomalous row, with its odd timestamp on display, than by a panel that quietly shrinks
+    and offers no hint why."""
+    scope = normalise_scope(scope)
+    if now_ts is None:
+        now_ts = time.time()
+    start = scope_start_ts(scope, now_ts)
+    if start is None:
+        return replace(
+            feed,
+            scope=scope,
+            scope_start_ts=None,
+            now_ts=now_ts,
+            cycles_out_of_scope=0,
+            last_cycle_before_scope=None,
+            scope_fully_covered=True,
+        )
+
+    in_scope = tuple(c for c in feed.cycles if c.started_ts >= start)
+    # `feed.cycles` is newest-first, so the first cycle below the boundary is the most recent one
+    # outside the scope -- exactly the "when did it last run" the empty state needs.
+    before = [c for c in feed.cycles if c.started_ts < start]
+    return replace(
+        feed,
+        cycles=in_scope,
+        scope=scope,
+        scope_start_ts=start,
+        now_ts=now_ts,
+        cycles_out_of_scope=len(before),
+        last_cycle_before_scope=before[0] if before else None,
+        scope_fully_covered=bool(before) or not feed.window_truncated,
+    )
+
+
 def build_activity_feed(
     config: Any,
     *,
     max_bytes: int = _MAX_BYTES,
     max_lines: int = _MAX_LINES,
     max_cycles: int = _MAX_CYCLES,
+    scope: str = DEFAULT_ACTIVITY_SCOPE,
+    now_ts: float | None = None,
 ) -> ActivityFeed:
     """Resolve the log path from config, read its bounded tail, and build the feed. The thin I/O
     seam over `feed_from_lines`.
@@ -702,21 +896,35 @@ def build_activity_feed(
     live loop's repaint path, where an escaping exception would take the dashboard down for a
     problem in a file this process does not own. `read_log_window` already turns every
     `OSError` into a status; this catches whatever a config object shaped differently than
-    expected could still throw, and turns it into the same kind of readable sentence."""
+    expected could still throw, and turns it into the same kind of readable sentence.
+
+    `scope` defaults to TODAY -- the local calendar day -- because that is what "what has keel
+    been doing" means to someone opening the dashboard now. `now_ts` is injectable so the day
+    boundary is a parameter of this call rather than a hidden clock read, which is what makes the
+    whole scoping layer deterministic under test. A non-ok window is scope-stamped too, so the
+    overlay's header reads the same whether the log parsed or not."""
+    scope = normalise_scope(scope)
     try:
+        if now_ts is None:
+            now_ts = time.time()
         path = resolve_log_path(config)
         window = read_log_window(path, max_bytes=max_bytes, max_lines=max_lines)
         if window.status != "ok":
-            return ActivityFeed(status=window.status, source=str(path), detail=window.detail)
-        return feed_from_lines(
-            window.lines,
-            source=str(path),
-            truncated=window.truncated,
-            max_cycles=max_cycles,
-        )
+            base = ActivityFeed(status=window.status, source=str(path), detail=window.detail)
+        else:
+            base = feed_from_lines(
+                window.lines,
+                source=str(path),
+                truncated=window.truncated,
+                max_cycles=max_cycles,
+            )
+        return apply_scope(base, scope, now_ts=now_ts)
     except Exception as exc:
         return ActivityFeed(
-            status="unreadable", source="", detail=f"{type(exc).__name__}: {str(exc)[:160]}"
+            status="unreadable",
+            source="",
+            detail=f"{type(exc).__name__}: {str(exc)[:160]}",
+            scope=scope,
         )
 
 
@@ -1010,12 +1218,202 @@ def describe_status(feed: ActivityFeed) -> list[str]:
     ]
 
 
+# -- scope rendering, and the empty state that must never be blank -------------------------------
+
+
+#: What the feed says when it is scoped to everything and STILL has nothing -- a readable log
+#: holding no groupable event at all. Distinct from `describe_status`'s cases, which are about the
+#: FILE rather than its contents.
+_NO_CYCLES_AT_ALL = "No cycles in the window -- the log was read, but held no grouped events."
+
+
+def scope_label(scope: str, start_ts: float | None) -> str:
+    """The scope named the way an operator would say it, with the date it actually begins at.
+    Naming the DATE matters: "today" is ambiguous next to a row stamped `2026-08-11 09:00`
+    unless the header says which day "today" is."""
+    if scope == "today":
+        return f"today ({_safe_strftime('%Y-%m-%d', start_ts, 10)})" if start_ts else "today"
+    if scope == "7d":
+        return (
+            f"last 7 days (from {_safe_strftime('%Y-%m-%d', start_ts, 10)})"
+            if start_ts
+            else "last 7 days"
+        )
+    return "all history in the window"
+
+
+def _scope_noun(scope: str) -> str:
+    """The scope as it reads mid-sentence -- "not run yet TODAY", "cycles from THE LAST 7 DAYS"."""
+    return "today" if scope == "today" else "the last 7 days"
+
+
+def scope_headline(feed: ActivityFeed) -> str:
+    """The one line under the overlay's title: what is being shown, how much of it, how much is
+    being withheld by the scope, and the key that widens it. All four are needed together --
+    "1 cycle" alone would look like a truncated log rather than a deliberate day filter."""
+    shown = len(feed.cycles)
+    parts = [
+        f"scope: {scope_label(feed.scope, feed.scope_start_ts)}",
+        f"{shown} cycle" if shown == 1 else f"{shown} cycles",
+    ]
+    if feed.cycles_out_of_scope:
+        parts.append(f"{feed.cycles_out_of_scope} older hidden")
+    parts.append("press t to widen")
+    return "  ·  ".join(parts)
+
+
+def _elapsed_phrase(seconds: float) -> str:
+    """A duration at the precision an operator actually reads: `47m`, `2h 14m`, `3d 4h`. Never
+    negative (a clock that stepped backwards reads "less than a minute", not "-3h")."""
+    minutes = int(max(0.0, seconds) // 60)
+    if minutes < 1:
+        return "less than a minute"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _day_phrase(then_ts: float, now_ts: float) -> str:
+    """`yesterday` / `3 days ago` / `earlier today`, by LOCAL CALENDAR DAY rather than by elapsed
+    hours -- 23 hours ago can be yesterday or the day before, and the calendar answer is the one
+    that matches the date printed beside it."""
+    try:
+        delta = (
+            datetime.datetime.fromtimestamp(now_ts).date()
+            - datetime.datetime.fromtimestamp(then_ts).date()
+        ).days
+    except (OSError, OverflowError, ValueError):
+        return "at an unreadable time"
+    if delta <= 0:
+        return "earlier today"
+    if delta == 1:
+        return "yesterday"
+    return f"{delta} days ago"
+
+
+def _next_due_lines(last_ts: float, now_ts: float) -> list[str]:
+    """When the next cycle is expected, inferred from the TIME OF DAY the last one started.
+
+    This is the line that turns "nothing here" into "nothing here YET". The deployment runs once
+    a day on a fixed schedule, so the previous cycle's wall-clock time is a good estimate of the
+    next one's, and it is drawn from the log itself rather than from a schedule setting this
+    module would otherwise have to be taught about (and could then disagree with).
+
+    The two cases are genuinely different news, so they read differently: still to come is
+    reassurance, already overdue is a prompt to go and look."""
+    try:
+        last = datetime.datetime.fromtimestamp(last_ts)
+        today = datetime.datetime.fromtimestamp(now_ts).date()
+        due = datetime.datetime.combine(
+            today, datetime.time(last.hour, last.minute)
+        ).timestamp()
+    except (OSError, OverflowError, ValueError):
+        return []
+    clock = f"{last.hour:02d}:{last.minute:02d}"
+    if due > now_ts:
+        return [f"Next cycle due today around {clock} local -- in {_elapsed_phrase(due - now_ts)}."]
+    return [
+        f"Its usual start time today ({clock} local) passed {_elapsed_phrase(now_ts - due)} ago.",
+        "If no row appears here shortly, check that the agent's schedule is still running.",
+    ]
+
+
+def _coverage_caveat(scope: str) -> list[str]:
+    """Said whenever the bounded window could not prove it reached back to the scope boundary.
+    Without it, "no cycles today" would be claiming the day was quiet when the truth is only that
+    the read did not go back far enough -- the one way this panel could actively mislead."""
+    noun = _scope_noun(scope)
+    return [
+        f"CAVEAT: the bounded read (newest {_MAX_BYTES // 1024} KiB / {_MAX_LINES} lines) begins",
+        f"inside {noun}, so cycles from {noun} may exist in the log but sit outside what was",
+        "read. This panel cannot show that nothing happened -- only that it saw nothing.",
+    ]
+
+
+def describe_empty_scope(feed: ActivityFeed) -> list[str]:
+    """The lines shown when the log read fine but the SCOPE holds no cycle -- the single most
+    important thing in the day-scoping change, and the reason it is safe at all.
+
+    On a deployment that runs one cycle a day at 09:00, a "today" view is empty every morning
+    before 09:00. A blank panel there would be strictly worse than the state dashboard this whole
+    feature exists to fix, because a blank panel and a dead agent look identical. So this always
+    answers "is keel alive" first, and it answers it with a FACT -- the timestamp of the last
+    cycle the window saw -- rather than with reassurance.
+
+    Naming that one timestamp is not a breach of "today only": it is a status line, not a feed.
+    No historical row is rendered, nothing scrolls, and nothing about what happened on that day
+    is shown beyond when it began."""
+    scope = feed.scope
+    now_ts = feed.now_ts if feed.now_ts is not None else time.time()
+
+    if scope not in _SCOPE_DAYS or feed.scope_start_ts is None:
+        return [
+            _NO_CYCLES_AT_ALL,
+            "",
+            "Every record in the window was either unusable or carried no event that could be",
+            "grouped into a cycle. The file was read -- there is simply nothing in it to show.",
+        ]
+
+    last = feed.last_cycle_before_scope
+    lines: list[str] = []
+
+    if last is None:
+        lines.append(f"keel has not run {_scope_noun(scope)}, and this window holds no earlier")
+        lines.append("cycle either.")
+        lines.append("")
+        lines.append("The engine log was read successfully -- it just contains no cycle at all.")
+        lines.append("That is what a brand-new deployment looks like, and also what one looks")
+        lines.append("like when `logging.verbose: false` (the default) keeps everything except")
+        lines.append("errors out of the log.")
+    else:
+        lines.append(
+            "keel has not run yet today."
+            if scope == "today"
+            else "keel has not run in the last 7 days."
+        )
+        lines.append(
+            f"Last cycle: {_stamp(last.started_ts)} -- {_day_phrase(last.started_ts, now_ts)}, "
+            f"{_elapsed_phrase(now_ts - last.started_ts)} ago."
+        )
+        if scope == "today":
+            lines.extend(_next_due_lines(last.started_ts, now_ts))
+        lines.append("")
+        lines.append(
+            f"That one line is all the history this panel shows: it is scoped to "
+            f"{_scope_noun(scope)}."
+        )
+
+    lines.append("Press t to widen the scope: today -> 7 days -> all history in the window.")
+
+    if not feed.scope_fully_covered:
+        lines.append("")
+        lines.extend(_coverage_caveat(scope))
+    return lines
+
+
 def footer_notes(feed: ActivityFeed) -> list[str]:
     """The honest small print under a rendered feed: what the bounded read did NOT show, and what
     it could not parse. Reported rather than swallowed -- a feed that quietly under-reports while
     looking complete is worse than one that admits its window."""
     notes: list[str] = []
     notes.append(f"source: {feed.source}  ({feed.lines_read} records in window)")
+    if feed.cycles_out_of_scope:
+        notes.append(
+            f"scope {scope_label(feed.scope, feed.scope_start_ts)}: "
+            f"{feed.cycles_out_of_scope} older cycle(s) in the window are hidden -- "
+            "press t to widen"
+        )
+    if feed.scope in _SCOPE_DAYS and not feed.scope_fully_covered:
+        noun = _scope_noun(feed.scope)
+        notes.append(
+            f"COVERAGE UNPROVEN: the bounded read begins inside {noun}, so earlier cycles from "
+            f"{noun} may exist in the log but outside what was read -- this is NOT evidence that "
+            f"{noun} was quiet"
+        )
     if feed.window_truncated:
         notes.append(
             f"window BOUNDED: newest {_MAX_BYTES // 1024} KiB / {_MAX_LINES} lines / "
@@ -1032,22 +1430,31 @@ def footer_notes(feed: ActivityFeed) -> list[str]:
 
 __all__ = [
     "ACTIVITY_HEADER",
+    "ACTIVITY_SCOPES",
+    "DEFAULT_ACTIVITY_SCOPE",
     "ActivityCycle",
     "ActivityEvent",
     "ActivityFeed",
     "LogWindow",
+    "apply_scope",
     "build_activity_feed",
     "cycle_style",
+    "describe_empty_scope",
     "describe_status",
     "event_style",
     "feed_from_lines",
     "footer_notes",
     "group_cycles",
+    "next_activity_scope",
+    "normalise_scope",
     "parse_events",
     "read_log_window",
     "render_cycle_row",
     "render_event_detail",
     "render_event_row",
     "resolve_log_path",
+    "scope_headline",
+    "scope_label",
+    "scope_start_ts",
     "summarise_cycle",
 ]
