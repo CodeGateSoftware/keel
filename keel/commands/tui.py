@@ -81,6 +81,17 @@ The read is BOUNDED -- 1 MiB of the log's tail, 5000 lines, 200 cycles, all name
 `activity.py` -- because the log grows without limit and this overlay rebuilds every poll. A
 dashboard whose responsiveness degrades with how long the deployment has been running would be a
 worse bug than the one this feature fixes.
+
+v5 SCOPES that feed to the current local calendar day by default, with `t` inside the overlay
+cycling `today` -> `7 days` -> `all`. "What has keel been doing" means today unless asked
+otherwise, and a fortnight of scrollback is not an answer to it. Two consequences are handled in
+`activity.py` rather than here, and both are the point of the change rather than trimming around
+it: the scope is a parameter that RESETS to `today` on every open (a widened view answers one
+question once; it does not become tomorrow's default), and an empty "today" -- the normal state
+of a once-a-day deployment every morning before 09:00 -- renders `describe_empty_scope`, which
+names when keel last ran and when the next cycle is due. A blank panel there would be worse than
+the dead-looking state dashboard the whole feature exists to fix, since a blank panel and a dead
+agent look exactly alike.
 """
 
 from __future__ import annotations
@@ -97,14 +108,18 @@ import click
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands.activity import (
     ACTIVITY_HEADER,
+    DEFAULT_ACTIVITY_SCOPE,
     ActivityFeed,
     build_activity_feed,
     cycle_style,
+    describe_empty_scope,
     describe_status,
     event_style,
     footer_notes,
+    next_activity_scope,
     render_cycle_row,
     render_event_row,
+    scope_headline,
 )
 from keel.commands.admission import (
     DiscoverReport,
@@ -458,6 +473,7 @@ def build_help_screen() -> list[ScreenLine]:
     _note("               armed, not run, on open -- see 'Discover overlay' below")
     _row("  v            open the activity feed (what keel has been DOING, cycle by cycle)")
     _note("               reads the engine log, offline -- see 'Activity overlay' below")
+    _note("               opens scoped to TODAY; press t inside it to widen")
     lines.append(_blank())
     _row("Live balance")
     _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
@@ -514,6 +530,16 @@ def build_help_screen() -> list[ScreenLine]:
     _note("  declined every setup shows the same zeroes as one that died on day one. This shows")
     _note("  the narrative instead. A QUIET cycle still gets a row: the run of quiet cycles IS")
     _note("  the answer to 'is it alive'.")
+    _note("  SCOPED TO TODAY by default -- the local calendar day, midnight to now, in the same")
+    _note("  clock the rows are stamped in. 'What has keel been doing' means today unless you")
+    _note("  ask otherwise; t cycles the scope today -> 7 days -> all, and the scope goes back")
+    _note("  to today every time the overlay is reopened (a widened view is never remembered).")
+    _note("  When today holds no cycle yet -- the normal state of a once-a-day deployment every")
+    _note("  morning before its run -- the panel is NOT blank: it says keel has not run yet")
+    _note("  today, names when the last cycle was and when the next one is due, and tells you")
+    _note("  which key widens the window. A quiet cycle that DID run is still a row.")
+    _note("  If the bounded read cannot prove it reached back to midnight, the footer says so,")
+    _note("  rather than letting an unread morning read as a quiet one.")
     _note("  Each row: local time, mode, and sig/blk/ent/exi/err (signals, blocked, entered,")
     _note("  exited, errors), then what was notable -- a rail veto and its rule, the gate that")
     _note("  rejected a setup, the reason an entry was not placed. Colour follows the same")
@@ -533,8 +559,9 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  up / k         select the previous (newer) cycle")
     _row("  down / j       select the next (older) cycle")
     _row("  Enter / Space  expand or collapse the selected cycle's events")
+    _row("  t              cycle the scope: today -> last 7 days -> all history in the window")
     _row("  PgUp / PgDn / Home / End    move the selection by a page, or to either end")
-    _row("  q / Esc / v    close activity, back to the dashboard")
+    _row("  q / Esc / v    close activity, back to the dashboard (scope resets to today)")
     lines.append(_blank())
     _row("Safety notes")
     _note(
@@ -796,13 +823,6 @@ def build_discover_overlay(
     return lines
 
 
-#: The lines the activity overlay renders when the log parsed fine but held no cycle at all --
-#: distinct from `describe_status`'s cases, which are about the FILE. A readable log with zero
-#: cycles in the window is a real, if unusual, state (a log holding only uncorrelated errors from
-#: a build predating `cycle_id`, say), and it must say so rather than render an empty screen.
-_ACTIVITY_NO_CYCLES = "No cycles in the window -- the log was read, but held no grouped events."
-
-
 def _activity_lines(
     feed: ActivityFeed, *, cursor: int = 0, expanded: frozenset[str] = frozenset()
 ) -> tuple[list[ScreenLine], int]:
@@ -823,7 +843,7 @@ def _activity_lines(
     Never raises, and never returns an empty body: a broken log renders `describe_status`'s
     explanation, which is the whole point (a blank overlay would look exactly like the dead
     dashboard this feature exists to disprove)."""
-    lines: list[ScreenLine] = [ScreenLine("keel tui -- activity", "heading"), _blank()]
+    lines: list[ScreenLine] = [ScreenLine("keel tui -- activity", "heading")]
     # Clamped here as well as in `run_live`, which already clamps it every poll against a feed
     # that can shrink underneath it. Belt and braces for the same reason `_visible_slice` clamps
     # its own offset: an out-of-range `cursor` would otherwise mark no row as selected while
@@ -832,17 +852,31 @@ def _activity_lines(
     cursor = max(0, min(cursor, max(0, len(feed.cycles) - 1)))
 
     if feed.status != "ok":
+        # No scope line here on purpose: when the FILE could not be read, "scope: today" would
+        # invite an operator to press `t`, and widening a window over a log that does not exist
+        # changes nothing. `describe_status` owns this screen.
+        lines.append(_blank())
         for text in describe_status(feed):
             lines.append(ScreenLine(text, "warn") if text else _blank())
         lines.append(_blank())
         lines.append(ScreenLine("Press v or Esc to return to the dashboard.", "muted"))
         return lines, 0
 
-    lines.append(ScreenLine(ACTIVITY_HEADER, "heading"))
+    # WHAT is being shown, directly under the title and before what happened in it. Without this
+    # line a one-row "today" view is indistinguishable from a log that only had one row in it,
+    # and the `t` key that would settle the question is invisible.
+    lines.append(ScreenLine(scope_headline(feed), "normal"))
+    lines.append(_blank())
+
+    # The column header belongs over columns. When the scope holds no cycle there are none, and
+    # `describe_empty_scope`'s prose sits directly under the scope line instead.
+    if feed.cycles:
+        lines.append(ScreenLine(ACTIVITY_HEADER, "heading"))
     cursor_line = len(lines)
 
     if not feed.cycles:
-        lines.append(ScreenLine(_ACTIVITY_NO_CYCLES, "warn"))
+        for text in describe_empty_scope(feed):
+            lines.append(ScreenLine(text, "warn") if text else _blank())
     for index, cycle in enumerate(feed.cycles):
         is_open = cycle.key in expanded
         selected = index == cursor
@@ -872,8 +906,7 @@ def _activity_lines(
     lines.append(_blank())
     lines.append(
         ScreenLine(
-            "up/k down/j move · Enter/Space expand or collapse · PgUp/PgDn/Home/End · "
-            "q/Esc/v close",
+            "up/k down/j · Enter/Space expand · t scope · PgUp/PgDn/Home/End · q/Esc/v close",
             "muted",
         )
     )
@@ -1306,7 +1339,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     toast, never a crash. help/insights/screen/propose all scroll (`up`/`k`, `down`/`j`,
     `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on `q`/`Esc`/<their own open key>.
     `activity` binds the same keys to moving its selected row, and adds Enter/Space to expand or
-    collapse that row's cycle into its individual events.
+    collapse that row's cycle into its individual events, plus `t` to cycle the day scope
+    (`today` -> `7d` -> `all`). `t` was free: `q Q h ? i r a f s p d v` are the dashboard's keys,
+    `k`/`j`/Enter/Space the in-overlay ones, and nothing bound `t` anywhere. The scope is reset to
+    `today` both when `v` opens the overlay and when any close key leaves it, so it can never
+    become sticky across visits.
 
     `discover` is different on purpose, and is the whole reason this docstring calls out the
     overlays individually rather than treating them identically: it needs the network, and that
@@ -1358,6 +1395,10 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         discover_offset = 0
         activity_offset = 0
         activity_cursor = 0
+        # ALWAYS reset to `today` on open (below), never carried across one -- see this module's
+        # docstring. A widened scope answers a question the operator asked once; making it sticky
+        # would quietly turn "what is keel doing" back into "here is a fortnight of scrollback".
+        activity_scope = DEFAULT_ACTIVITY_SCOPE
         # Keyed by `ActivityCycle.key`, NOT by row index: the feed is rebuilt from the log every
         # poll, so a new cycle appearing at the top would silently shift every index down one and
         # expand the wrong row. The key is stable across rebuilds, so an expanded cycle stays
@@ -1491,7 +1532,13 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 # writer -- and turns it into the same kind of readable feed rather than a crash.
                 try:
                     _activity_repo, activity_config = open_state()
-                    activity_feed = build_activity_feed(activity_config)
+                    # `now_ts` comes from the SAME `now_fn` the dashboard clocks everything else
+                    # with, rather than from a `time.time()` inside the feed builder: the day
+                    # boundary is then a value this loop owns and a test can pin, and it can
+                    # never disagree with the timestamps the rest of the screen is showing.
+                    activity_feed = build_activity_feed(
+                        activity_config, scope=activity_scope, now_ts=float(now_fn())
+                    )
                     # Re-clamp every poll, not just on a keypress: the feed is rebuilt from a
                     # file another process is writing, so it can SHRINK between polls (a rotation
                     # empties it) and leave the cursor past the end.
@@ -1522,12 +1569,20 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     mode = "normal"
                     activity_offset = 0
                     activity_cursor = 0
+                    activity_scope = DEFAULT_ACTIVITY_SCOPE
                     activity_expanded = frozenset()
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     if 0 <= activity_cursor < len(activity_feed.cycles):
                         activity_expanded = activity_expanded ^ {
                             activity_feed.cycles[activity_cursor].key
                         }
+                elif ch == ord("t"):
+                    # Widen (or wrap back to today). The cursor and scroll go back to the top
+                    # because every row under them is about to change: leaving the selection on
+                    # row 40 of a scope that now holds one row would land it somewhere arbitrary.
+                    activity_scope = next_activity_scope(activity_scope)
+                    activity_cursor = 0
+                    activity_offset = 0
                 else:
                     activity_cursor = _activity_cursor(
                         ch, activity_cursor, height, len(activity_feed.cycles), curses
@@ -1628,6 +1683,8 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 mode = "activity"
                 activity_offset = 0
                 activity_cursor = 0
+                # Opens scoped to TODAY every single time, whatever the last visit widened it to.
+                activity_scope = DEFAULT_ACTIVITY_SCOPE
                 # Opens fully collapsed: the feed's value is the shape of the WHOLE run, and an
                 # overlay that reopened with one cycle already exploded would bury it.
                 activity_expanded = frozenset()
@@ -1736,7 +1793,10 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     account of what the agent has actually been doing, read (offline, and boundedly) from the
     structured engine log rather than the DB, and expandable to the individual events inside any
     cycle. It is the answer to "keel has not traded -- is it even alive?", which the state-only
-    dashboard cannot give: a quiet cycle still gets a row, and the run of them is the answer.
+    dashboard cannot give: a quiet cycle still gets a row, and the run of them is the answer. It
+    opens scoped to TODAY (the local calendar day) and `t` inside it widens to 7 days or to all
+    the history the bounded read covers; a day with no cycle yet says when keel last ran and when
+    the next run is due rather than showing an empty panel.
     None of `screen`/`propose`/`discover` attests, admits, or trades -- `attest` (the human
     judgment this whole gate rests on) stays deliberately CLI-only, `keel assets attest`. `a`
     toggles autonomy (turning it OFF is instant, turning it ON needs a typed "yes" at the

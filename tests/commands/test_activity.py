@@ -20,6 +20,7 @@ So this file is deliberately heavy on two things:
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from typing import Any
@@ -31,23 +32,32 @@ from keel.commands.activity import (
     _MAX_EVENTS_PER_CYCLE,
     _UNCORRELATED_GAP_SEC,
     ACTIVITY_HEADER,
+    ACTIVITY_SCOPES,
+    DEFAULT_ACTIVITY_SCOPE,
     ActivityCycle,
     ActivityEvent,
     ActivityFeed,
     _short_num,
+    _stamp,
+    apply_scope,
     build_activity_feed,
     cycle_style,
+    describe_empty_scope,
     describe_status,
     event_style,
     feed_from_lines,
     footer_notes,
     group_cycles,
+    next_activity_scope,
+    normalise_scope,
     parse_events,
     read_log_window,
     render_cycle_row,
     render_event_detail,
     render_event_row,
     resolve_log_path,
+    scope_headline,
+    scope_start_ts,
     summarise_cycle,
 )
 
@@ -896,7 +906,10 @@ def test_build_activity_feed_end_to_end(tmp_path: Any) -> None:
         + "\n"
     )
 
-    feed = build_activity_feed(_FakeConfig(str(path)))
+    # `scope="all"`: this test is about the read+parse+group pipeline, and the two fixture cycles
+    # are deliberately a day apart. The day-scoping that `build_activity_feed` applies by default
+    # has its own end-to-end test below.
+    feed = build_activity_feed(_FakeConfig(str(path)), scope="all")
 
     assert feed.status == "ok"
     assert feed.source == str(path.resolve())
@@ -1366,3 +1379,547 @@ def test_a_read_window_holding_no_whole_record_is_not_reported_as_empty(tmp_path
     text = " ".join(describe_status(feed))
     assert "empty" not in text
     assert "No complete record" in text
+
+
+# ==================================================================================================
+# Day scoping -- `apply_scope`, the default `today` view, and the empty state that must never be
+# blank.
+#
+# Every test below pins its own "now" and derives every fixture timestamp from it through
+# `_local_midnight`, so the whole section is deterministic in any timezone and on any day it
+# happens to run -- which is the entire reason `scope_start_ts`/`apply_scope`/`build_activity_feed`
+# take `now_ts` as a parameter instead of reading a clock internally.
+# ==================================================================================================
+
+
+def _local_midnight(now_ts: float, days_ago: int = 0) -> float:
+    """Local midnight `days_ago` calendar days before the local day containing `now_ts`.
+
+    Calendar arithmetic, not `- days * 86400`: that is what makes these fixtures land on the
+    intended civil day across a DST transition, which is exactly the property the production
+    boundary claims and these tests would otherwise be unable to hold it to."""
+    day = datetime.datetime.fromtimestamp(now_ts).date() - datetime.timedelta(days=days_ago)
+    return datetime.datetime.combine(day, datetime.time.min).timestamp()
+
+
+#: The instant the scope tests measure from: 14:00 LOCAL on the local day containing a fixed UTC
+#: epoch. Anchoring through `_local_midnight` rather than to the raw epoch keeps "today" the same
+#: civil day whether the suite runs in UTC, New York or Tokyo.
+_SCOPE_NOW = _local_midnight(1_786_212_000.0) + 14 * 3600
+
+#: The same day, but 07:00 -- BEFORE the deployment's 09:00 daily cycle. This is the case the
+#: whole empty-state design exists for: "today" is legitimately empty every single morning.
+_SCOPE_NOW_EARLY = _local_midnight(_SCOPE_NOW) + 7 * 3600
+
+
+def _cycle_at(ts: float, cycle_id: str) -> list[str]:
+    """One quiet cycle starting at `ts`."""
+    return _quiet_cycle_lines(cycle_id, ts)
+
+
+def _scoped(lines: list[str], scope: str, now_ts: float, **kwargs: Any) -> ActivityFeed:
+    return apply_scope(
+        feed_from_lines(lines, source="/tmp/keel.log", **kwargs), scope, now_ts=now_ts
+    )
+
+
+# -- the boundary itself ---------------------------------------------------------------------------
+
+
+def test_scope_start_ts_for_today_is_local_midnight_of_the_current_calendar_day() -> None:
+    start = scope_start_ts("today", _SCOPE_NOW)
+
+    assert start == _local_midnight(_SCOPE_NOW)
+    # ...and it renders as 00:00:00 in the SAME local clock the rows are stamped in, which is the
+    # property that makes "today" mean what the operator reading those stamps thinks it means.
+    assert start is not None
+    assert time.strftime("%H:%M:%S", time.localtime(start)) == "00:00:00"
+
+
+def test_scope_start_ts_for_today_is_not_a_rolling_24_hours() -> None:
+    """The distinction the requirement turns on. At 14:00 the boundary is 14 hours back, not 24 --
+    a rolling window would put yesterday's 09:00 cycle on screen every morning and drop it every
+    afternoon, so the same day's feed would change shape depending on when it was opened."""
+    start = scope_start_ts("today", _SCOPE_NOW)
+
+    assert start is not None
+    assert _SCOPE_NOW - start == pytest.approx(14 * 3600, abs=3600)
+    assert start != _SCOPE_NOW - 86400
+
+
+def test_scope_start_ts_for_7d_covers_today_plus_the_six_days_before_it() -> None:
+    start = scope_start_ts("7d", _SCOPE_NOW)
+
+    assert start == _local_midnight(_SCOPE_NOW, days_ago=6)
+
+
+def test_scope_start_ts_for_all_has_no_lower_bound() -> None:
+    assert scope_start_ts("all", _SCOPE_NOW) is None
+
+
+@pytest.mark.parametrize("bad_now", [float("inf"), float("nan"), 1e30, -1e30])
+def test_scope_start_ts_on_an_unusable_clock_degrades_to_unbounded_not_to_a_crash(
+    bad_now: float,
+) -> None:
+    """`None` means "show everything". A clock this module cannot read must widen the view, never
+    empty it -- an empty screen is the one outcome the whole module is built to avoid."""
+    assert scope_start_ts("today", bad_now) is None
+
+
+def test_next_activity_scope_cycles_today_then_7d_then_all_then_back() -> None:
+    assert next_activity_scope("today") == "7d"
+    assert next_activity_scope("7d") == "all"
+    assert next_activity_scope("all") == "today"
+
+
+def test_next_activity_scope_of_something_unrecognised_lands_on_the_default() -> None:
+    assert next_activity_scope("last tuesday") == DEFAULT_ACTIVITY_SCOPE
+
+
+def test_normalise_scope_falls_back_to_today_rather_than_filtering_to_nothing() -> None:
+    assert normalise_scope("7d") == "7d"
+    assert normalise_scope("") == DEFAULT_ACTIVITY_SCOPE
+    assert normalise_scope("yesterday") == DEFAULT_ACTIVITY_SCOPE
+
+
+def test_the_default_scope_is_today() -> None:
+    """Stated as a test because it is the requirement, not an implementation detail."""
+    assert DEFAULT_ACTIVITY_SCOPE == "today"
+    assert ACTIVITY_SCOPES[0] == "today"
+
+
+# -- what `today` actually shows -------------------------------------------------------------------
+
+
+def test_today_shows_several_cycles_from_today_and_hides_every_earlier_day() -> None:
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "old-3"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "old-1"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 11 * 3600, "today-b"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-c"),
+    ]
+
+    feed = _scoped(lines, "today", _SCOPE_NOW)
+
+    assert [c.cycle_id for c in feed.cycles] == ["today-c", "today-b", "today-a"]
+    assert feed.cycles_out_of_scope == 2
+    assert feed.scope == "today"
+    assert feed.scope_start_ts == _local_midnight(_SCOPE_NOW)
+    # The newest thing OUTSIDE the scope is kept -- and it is the newest, not the oldest.
+    assert feed.last_cycle_before_scope is not None
+    assert feed.last_cycle_before_scope.cycle_id == "old-1"
+
+
+def test_today_shows_exactly_one_cycle_when_the_day_holds_exactly_one() -> None:
+    """The real deployment's normal afternoon: one cycle a day, at 09:00. One row is the correct,
+    complete answer -- and the header must say "1 cycle", not look like a truncated log."""
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+    ]
+
+    feed = _scoped(lines, "today", _SCOPE_NOW)
+
+    assert [c.cycle_id for c in feed.cycles] == ["today"]
+    assert feed.cycles_out_of_scope == 1
+    assert "1 cycle" in scope_headline(feed)
+    assert "1 cycles" not in scope_headline(feed)
+
+
+def test_a_quiet_cycle_that_ran_today_is_still_a_row_not_an_empty_state() -> None:
+    """A quiet cycle is the positive observation "it looked and there was nothing to do". Scoping
+    to today must not turn that into a blank day."""
+    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "today", _SCOPE_NOW)
+
+    (cycle,) = feed.cycles
+    assert cycle.is_quiet
+    assert "quiet -- looked, nothing to do" in render_cycle_row(cycle)
+
+
+def test_today_holds_nothing_before_the_daily_run_but_the_last_run_is_remembered() -> None:
+    """07:00 on a deployment that runs at 09:00 -- the case that would otherwise render blank."""
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=2) + 9 * 3600, "old"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday"),
+    ]
+
+    feed = _scoped(lines, "today", _SCOPE_NOW_EARLY)
+
+    assert feed.status == "ok"  # the LOG is fine; it is the DAY that is empty
+    assert feed.cycles == ()
+    assert feed.cycles_out_of_scope == 2
+    assert feed.last_cycle_before_scope is not None
+    assert feed.last_cycle_before_scope.cycle_id == "yesterday"
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected_ids"),
+    [
+        ("today", ["today-b", "today-a"]),
+        ("7d", ["today-b", "today-a", "d1", "d3", "d6"]),
+        ("all", ["today-b", "today-a", "d1", "d3", "d6", "d9", "d40"]),
+    ],
+)
+def test_every_scope_returns_the_cycles_it_promises(scope: str, expected_ids: list[str]) -> None:
+    """One fixture, three scopes, exact counts -- `7d` must include the sixth day back and exclude
+    the ninth, and `all` must reach the 40-day-old one."""
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=40) + 9 * 3600, "d40"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=9) + 9 * 3600, "d9"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=6) + 9 * 3600, "d6"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "d3"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
+    ]
+
+    feed = _scoped(lines, scope, _SCOPE_NOW)
+
+    assert [c.cycle_id for c in feed.cycles] == expected_ids
+    assert feed.cycles_out_of_scope == 7 - len(expected_ids)
+
+
+def test_a_cycle_at_exactly_local_midnight_belongs_to_the_day_that_begins_then() -> None:
+    """The boundary is inclusive on the lower side, so midnight belongs to the day it starts --
+    the calendar's own convention, and the only one under which two adjacent days can neither
+    both claim a cycle nor both disown it."""
+    midnight = _local_midnight(_SCOPE_NOW)
+    lines = [
+        *_cycle_at(midnight - 1, "one-second-before"),
+        *_cycle_at(midnight, "exactly-midnight"),
+    ]
+
+    today = _scoped(lines, "today", _SCOPE_NOW)
+    assert [c.cycle_id for c in today.cycles] == ["exactly-midnight"]
+
+    # ...and the excluded one is not lost, it is the previous day's newest.
+    assert today.last_cycle_before_scope is not None
+    assert today.last_cycle_before_scope.cycle_id == "one-second-before"
+
+    # Seen from the following day, the same midnight cycle is out of scope again -- the boundary
+    # moves with the day rather than the cycle being permanently "today's".
+    tomorrow = _scoped(lines, "today", _SCOPE_NOW + 86400)
+    assert tomorrow.cycles == ()
+    assert tomorrow.last_cycle_before_scope is not None
+    assert tomorrow.last_cycle_before_scope.cycle_id == "exactly-midnight"
+
+
+def test_apply_scope_leaves_a_feed_alone_under_all() -> None:
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+    ]
+    unscoped = feed_from_lines(lines, source="/tmp/keel.log")
+
+    feed = apply_scope(unscoped, "all", now_ts=_SCOPE_NOW)
+
+    assert feed.cycles == unscoped.cycles
+    assert feed.cycles_out_of_scope == 0
+    assert feed.last_cycle_before_scope is None
+    assert feed.scope_start_ts is None
+
+
+def test_apply_scope_does_not_read_the_clock_when_now_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The injection is the point: no test in this file may depend on the day it runs on."""
+
+    def _boom() -> float:  # pragma: no cover - being called IS the failure
+        raise AssertionError("apply_scope read the wall clock instead of using now_ts")
+
+    monkeypatch.setattr(time, "time", _boom)
+
+    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "today", _SCOPE_NOW)
+
+    assert len(feed.cycles) == 1
+
+
+def test_apply_scope_on_an_unrecognised_scope_shows_today_rather_than_nothing() -> None:
+    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "since tuesday",
+                   _SCOPE_NOW)
+
+    assert feed.scope == "today"
+    assert len(feed.cycles) == 1
+
+
+# -- the empty state: the line that answers "is keel alive" ----------------------------------------
+
+
+def test_empty_today_names_the_last_run_and_when_the_next_one_is_due() -> None:
+    """The most important wording in this change. Before 09:00 the panel is legitimately empty,
+    and a blank panel is indistinguishable from a dead agent -- so it must say, in plain words,
+    that keel has not run YET, when it last ran, and when the next run is expected."""
+    lines = _cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday")
+
+    feed = _scoped(lines, "today", _SCOPE_NOW_EARLY)
+    said = describe_empty_scope(feed)
+    text = " ".join(said)
+
+    assert said  # never blank
+    assert said[0] == "keel has not run yet today."
+    assert "Last cycle:" in text
+    assert "yesterday" in text
+    # The last run's actual stamp, not a vague "recently".
+    assert feed.last_cycle_before_scope is not None
+    assert _stamp(feed.last_cycle_before_scope.started_ts) in text
+    # ...and the forward-looking half: 09:00 is still two hours away at 07:00.
+    assert "Next cycle due today around 09:00 local" in text
+    assert "in 2h 00m" in text
+    assert "Press t to widen the scope" in text
+
+
+def test_empty_today_after_the_usual_time_says_the_run_is_overdue() -> None:
+    """Different news, so it reads differently: at 14:00 with nothing since yesterday 09:00, the
+    schedule has been missed and the operator should be told to go and look."""
+    lines = _cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday")
+
+    text = " ".join(describe_empty_scope(_scoped(lines, "today", _SCOPE_NOW)))
+
+    assert "keel has not run yet today." in text
+    assert "Its usual start time today (09:00 local) passed 5h 00m ago." in text
+    assert "check that the agent's schedule is still running" in text
+
+
+def test_empty_today_with_no_history_at_all_still_explains_itself() -> None:
+    """A brand-new deployment: no cycle today, and none before it either. There is no last run to
+    name, so it says so rather than leaving the operator to infer it from silence."""
+    feed = ActivityFeed(
+        status="ok",
+        source="/tmp/keel.log",
+        scope="today",
+        scope_start_ts=_local_midnight(_SCOPE_NOW),
+        now_ts=_SCOPE_NOW,
+    )
+
+    said = describe_empty_scope(feed)
+    text = " ".join(said)
+
+    assert said
+    assert "keel has not run today" in text
+    assert "no earlier" in text
+    assert "logging.verbose" in text
+    assert "Press t to widen the scope" in text
+
+
+def test_an_entirely_empty_log_is_still_an_empty_log_under_the_today_default() -> None:
+    """Scoping must not swallow the FILE-level statuses: an empty log still reports `empty`, with
+    the same `logging.verbose` advice it always had, not "keel has not run yet today"."""
+    feed = apply_scope(feed_from_lines([]), "today", now_ts=_SCOPE_NOW)
+
+    assert feed.status == "empty"
+    assert feed.cycles == ()
+    assert "verbose" in " ".join(describe_status(feed))
+
+
+@pytest.mark.parametrize("scope", ["today", "7d", "all"])
+def test_the_empty_state_is_never_blank_for_any_scope(scope: str) -> None:
+    """The invariant the whole design rests on -- there is no combination of scope and history
+    that renders zero lines."""
+    feed = apply_scope(feed_from_lines([], source="/tmp/keel.log"), scope, now_ts=_SCOPE_NOW)
+
+    said = describe_empty_scope(feed)
+
+    assert said
+    assert any(line.strip() for line in said)
+
+
+def test_describe_empty_scope_under_all_keeps_the_original_no_cycles_wording() -> None:
+    """`all` is not a day filter, so the answer there is about the LOG holding nothing groupable
+    -- the pre-scoping wording, unchanged."""
+    feed = apply_scope(
+        ActivityFeed(status="ok", source="/tmp/keel.log"), "all", now_ts=_SCOPE_NOW
+    )
+
+    assert "No cycles in the window" in describe_empty_scope(feed)[0]
+
+
+def test_empty_7d_does_not_claim_to_know_when_the_next_run_is_due() -> None:
+    """The next-run estimate is inferred from a DAILY cadence and only makes sense for today."""
+    lines = _cycle_at(_local_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient")
+
+    text = " ".join(describe_empty_scope(_scoped(lines, "7d", _SCOPE_NOW)))
+
+    assert "keel has not run in the last 7 days." in text
+    assert "Last cycle:" in text
+    assert "due today" not in text
+
+
+# -- coverage: the bounded window versus the day boundary ------------------------------------------
+
+
+def test_coverage_is_proven_when_the_window_reaches_past_the_boundary() -> None:
+    """A window that contains a cycle from BEFORE midnight has demonstrably seen the whole day,
+    truncated or not."""
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+    ]
+
+    feed = _scoped(lines, "today", _SCOPE_NOW, truncated=True)
+
+    assert feed.scope_fully_covered
+    assert not any("COVERAGE UNPROVEN" in note for note in footer_notes(feed))
+
+
+def test_coverage_is_proven_when_the_whole_file_was_read() -> None:
+    lines = _cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today")
+
+    feed = _scoped(lines, "today", _SCOPE_NOW, truncated=False)
+
+    assert feed.scope_fully_covered
+
+
+def test_coverage_is_unproven_when_the_bounded_window_begins_inside_today() -> None:
+    """The interaction the read bounds create: a truncated window whose OLDEST record is already
+    today cannot show that nothing happened earlier today -- only that it did not see it."""
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 11 * 3600, "today-a"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
+    ]
+
+    feed = _scoped(lines, "today", _SCOPE_NOW, truncated=True)
+
+    assert not feed.scope_fully_covered
+    notes = footer_notes(feed)
+    assert any("COVERAGE UNPROVEN" in note for note in notes)
+    assert any("NOT evidence that today was quiet" in note for note in notes)
+
+
+def test_an_empty_today_in_an_unproven_window_says_so_instead_of_implying_a_quiet_day() -> None:
+    """The empty state cannot say "nothing happened today" when the read never reached midnight.
+    Constructed directly, because a window that is both truncated and empty of today's cycles is
+    exactly the combination a fixture cannot produce by writing a small file."""
+    feed = ActivityFeed(
+        status="ok",
+        source="/tmp/keel.log",
+        scope="today",
+        scope_start_ts=_local_midnight(_SCOPE_NOW),
+        now_ts=_SCOPE_NOW,
+        window_truncated=True,
+        scope_fully_covered=False,
+    )
+
+    text = " ".join(describe_empty_scope(feed))
+
+    assert "CAVEAT" in text
+    assert "cannot show that nothing happened" in text
+
+
+def test_all_scope_never_reports_coverage_doubt() -> None:
+    """There is no boundary to fall short of, so the caveat would be meaningless noise."""
+    feed = _scoped(
+        _cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "all", _SCOPE_NOW,
+        truncated=True,
+    )
+
+    assert not any("COVERAGE UNPROVEN" in note for note in footer_notes(feed))
+
+
+def test_footer_reports_how_much_the_scope_hid() -> None:
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=2) + 9 * 3600, "d2"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+    ]
+
+    notes = " ".join(footer_notes(_scoped(lines, "today", _SCOPE_NOW)))
+
+    assert "2 older cycle(s) in the window are hidden" in notes
+    assert "press t to widen" in notes
+
+
+# -- the header line -------------------------------------------------------------------------------
+
+
+def test_scope_headline_names_the_day_the_count_the_hidden_and_the_key() -> None:
+    lines = [
+        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+    ]
+
+    headline = scope_headline(_scoped(lines, "today", _SCOPE_NOW))
+
+    assert "scope: today (" in headline
+    assert time.strftime("%Y-%m-%d", time.localtime(_SCOPE_NOW)) in headline
+    assert "1 cycle" in headline
+    assert "1 older hidden" in headline
+    assert "press t to widen" in headline
+    # It has to survive an 80-column terminal to be worth writing.
+    assert len(headline) <= 80
+
+
+@pytest.mark.parametrize(
+    ("scope", "fragment"),
+    [("today", "today ("), ("7d", "last 7 days (from "), ("all", "all history in the window")],
+)
+def test_scope_headline_names_every_scope(scope: str, fragment: str) -> None:
+    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), scope, _SCOPE_NOW)
+
+    assert fragment in scope_headline(feed)
+
+
+# -- build_activity_feed: the default really is today ----------------------------------------------
+
+
+def test_build_activity_feed_defaults_to_today(tmp_path: Any) -> None:
+    """The requirement, end to end from a real file: only today's cycle comes back, and the one
+    from yesterday is hidden rather than dropped."""
+    path = tmp_path / "keel.log"
+    path.write_text(
+        "\n".join(
+            [
+                *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+                *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+            ]
+        )
+        + "\n"
+    )
+
+    feed = build_activity_feed(_FakeConfig(str(path)), now_ts=_SCOPE_NOW)
+
+    assert feed.scope == "today"
+    assert [c.cycle_id for c in feed.cycles] == ["today"]
+    assert feed.cycles_out_of_scope == 1
+    assert feed.last_cycle_before_scope is not None
+    assert feed.last_cycle_before_scope.cycle_id == "yesterday"
+
+
+def test_build_activity_feed_widens_on_request(tmp_path: Any) -> None:
+    path = tmp_path / "keel.log"
+    path.write_text(
+        "\n".join(
+            [
+                *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+                *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+            ]
+        )
+        + "\n"
+    )
+
+    feed = build_activity_feed(_FakeConfig(str(path)), scope="all", now_ts=_SCOPE_NOW)
+
+    assert [c.cycle_id for c in feed.cycles] == ["today", "yesterday"]
+    assert feed.cycles_out_of_scope == 0
+
+
+def test_build_activity_feed_stamps_the_scope_even_on_a_missing_log(tmp_path: Any) -> None:
+    """So the overlay's header reads identically whether or not the file was there."""
+    feed = build_activity_feed(_FakeConfig(str(tmp_path / "gone.log")), now_ts=_SCOPE_NOW)
+
+    assert feed.status == "missing"
+    assert feed.scope == "today"
+    assert describe_status(feed)  # the file-level explanation is untouched by scoping
+
+
+def test_today_has_no_upper_bound_so_a_clock_skewed_row_is_shown_not_hidden() -> None:
+    """A record stamped later today than "now" can only come from a writer whose clock is ahead.
+    This module shows it -- with its odd timestamp visible -- rather than shrinking the panel and
+    giving the operator nothing to go on. Pinned as a test because it is a decision, not an
+    accident: "today" is the calendar day, and `now` is only ever its lower-bound anchor."""
+    lines = _cycle_at(_local_midnight(_SCOPE_NOW) + 20 * 3600, "later-today")  # 20:00 vs now 14:00
+
+    feed = _scoped(lines, "today", _SCOPE_NOW)
+
+    assert [c.cycle_id for c in feed.cycles] == ["later-today"]
+    assert feed.cycles_out_of_scope == 0

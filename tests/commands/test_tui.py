@@ -22,7 +22,13 @@ from click.testing import CliRunner
 
 import keel.commands.tui as tui_mod
 from keel.cli import cli
-from keel.commands.activity import ActivityFeed, feed_from_lines
+from keel.commands.activity import (
+    ACTIVITY_HEADER,
+    ActivityFeed,
+    apply_scope,
+    feed_from_lines,
+    scope_start_ts,
+)
 from keel.commands.admission import DiscoverReport
 from keel.commands.insights import (
     AccountSummary as InsightsAccountSummary,
@@ -2325,24 +2331,36 @@ def _activity_line(event: str, ts: float, cycle_id: str | None = "cyc-1", **fiel
 #: guard violation, and an entry that was not placed.
 _ACTIVITY_TS = 1_786_194_006.0
 
+#: The same fixture re-anchored onto NOW_TS's OWN local calendar day, for the `run_live` tests --
+#: which now build a TODAY-scoped feed, so a fixture stamped 2026-08-08 would (correctly) render
+#: the "keel has not run yet today" empty state instead of the rows those tests are about. Both
+#: cycles land inside the one local day, two hours apart, so they stay two rows in newest-first
+#: order. Derived from `scope_start_ts` and the fixed `NOW_TS` rather than from a live clock, so
+#: it is exactly as deterministic as the constant it is built from.
+_ACTIVITY_TODAY_TS = (scope_start_ts("today", float(NOW_TS)) or 0.0) + 9 * 3600
 
-def _activity_log_lines() -> list[str]:
+
+def _activity_log_lines(base: float = _ACTIVITY_TS, gap: float = 86400.0) -> list[str]:
+    """A quiet cycle at `base`, then a rail-vetoed one `gap` seconds later. `gap` is a parameter
+    so the same shapes can be laid out across two days (the default -- what the real deployment
+    does) or inside one (`_today_activity_log_lines`)."""
+    later = base + gap
     return [
-        _activity_line("agent.cycle_start", _ACTIVITY_TS, "quiet-1"),
-        _activity_line("agent.mode_resolved", _ACTIVITY_TS + 1, "quiet-1", mode="paper"),
+        _activity_line("agent.cycle_start", base, "quiet-1"),
+        _activity_line("agent.mode_resolved", base + 1, "quiet-1", mode="paper"),
         _activity_line(
             "agent.signals_evaluated",
-            _ACTIVITY_TS + 2,
+            base + 2,
             "quiet-1",
             product="BTC-USD",
             rule_count=1,
             signal_count=0,
         ),
-        _activity_line("agent.cycle_start", _ACTIVITY_TS + 86400, "veto-1"),
-        _activity_line("agent.mode_resolved", _ACTIVITY_TS + 86401, "veto-1", mode="paper"),
+        _activity_line("agent.cycle_start", later, "veto-1"),
+        _activity_line("agent.mode_resolved", later + 1, "veto-1", mode="paper"),
         _activity_line(
             "engine.setup_detected",
-            _ACTIVITY_TS + 86402,
+            later + 2,
             "veto-1",
             rule="turtle_breakout",
             product="PAXG-USD",
@@ -2354,7 +2372,7 @@ def _activity_log_lines() -> list[str]:
         ),
         _activity_line(
             "agent.signals_evaluated",
-            _ACTIVITY_TS + 86402,
+            later + 2,
             "veto-1",
             product="PAXG-USD",
             rule_count=1,
@@ -2362,7 +2380,7 @@ def _activity_log_lines() -> list[str]:
         ),
         _activity_line(
             "guards.check_failed",
-            _ACTIVITY_TS + 86402,
+            later + 2,
             "veto-1",
             product="PAXG-USD",
             side="BUY",
@@ -2373,7 +2391,7 @@ def _activity_log_lines() -> list[str]:
         ),
         _activity_line(
             "agent.enter_evaluated",
-            _ACTIVITY_TS + 86402,
+            later + 2,
             "veto-1",
             product="PAXG-USD",
             rule="turtle_breakout",
@@ -2385,10 +2403,15 @@ def _activity_log_lines() -> list[str]:
     ]
 
 
-def _write_activity_log(tmp_path: Any) -> str:
+def _today_activity_log_lines() -> list[str]:
+    """Both cycles inside NOW_TS's local calendar day -- what the TODAY-scoped overlay shows."""
+    return _activity_log_lines(base=_ACTIVITY_TODAY_TS, gap=7200.0)
+
+
+def _write_activity_log(tmp_path: Any, lines: list[str] | None = None) -> str:
     path = tmp_path / "logs" / "keel.log"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(_activity_log_lines()) + "\n")
+    path.write_text("\n".join(_today_activity_log_lines() if lines is None else lines) + "\n")
     return str(path)
 
 
@@ -2747,7 +2770,7 @@ def test_run_live_activity_survives_a_log_record_whose_timestamp_cannot_be_rende
     path.write_text(
         "\n".join(
             [
-                *_activity_log_lines(),
+                *_today_activity_log_lines(),
                 json.dumps({"ts": 1e20, "event": "agent.cycle_start", "cycle_id": "from-mars"}),
             ]
         )
@@ -2768,3 +2791,241 @@ def test_run_live_activity_survives_a_log_record_whose_timestamp_cannot_be_rende
     painted_texts = [call[2] for call in stdscr.calls]
     assert any("keel tui -- activity" in t for t in painted_texts)
     assert any("rail veto" in t for t in painted_texts)
+
+
+# -- activity overlay: day scoping ---------------------------------------------------------------
+#
+# The pure boundary/empty-state logic is exercised exhaustively in
+# `tests/commands/test_activity.py`. These tests are about the OVERLAY and the live loop: that the
+# scope is visible on screen, that `t` widens it, and that it is reset to `today` on every open.
+
+
+def _yesterday_activity_log_lines() -> list[str]:
+    """One quiet cycle on the local day BEFORE NOW_TS's -- the history a `today` scope hides.
+
+    The previous day's midnight is taken from `scope_start_ts` rather than by subtracting 86400
+    from today's, so this lands on the intended civil day even across a DST transition."""
+    ts = (scope_start_ts("today", float(NOW_TS) - 86400) or 0.0) + 9 * 3600
+    return [
+        _activity_line("agent.cycle_start", ts, "yesterday-1"),
+        _activity_line("agent.mode_resolved", ts + 1, "yesterday-1", mode="paper"),
+        # A gate rejection, so this cycle's COLLAPSED row names XLM-USD -- which is what makes
+        # "is yesterday on screen?" answerable from the painted text alone. A quiet cycle would
+        # render only "1 products" and be indistinguishable from today's.
+        _activity_line(
+            "engine.setup_rejected",
+            ts + 2,
+            "yesterday-1",
+            rule="turtle_breakout",
+            product="XLM-USD",
+            gate="choppy_regime",
+        ),
+    ]
+
+
+def _scoped_activity_feed(scope: str = "today") -> Any:
+    """The two-cycles-today fixture plus one from yesterday, scoped as the overlay would."""
+    return apply_scope(
+        feed_from_lines(
+            [*_yesterday_activity_log_lines(), *_today_activity_log_lines()],
+            source="/tmp/keel.log",
+        ),
+        scope,
+        now_ts=float(NOW_TS),
+    )
+
+
+def test_activity_overlay_header_states_the_scope_under_the_title() -> None:
+    """A one-row "today" view and a one-row log look identical without this line -- and the key
+    that would settle it would be invisible."""
+    texts = [line.text for line in build_activity_overlay(_scoped_activity_feed())]
+
+    assert texts[0] == "keel tui -- activity"
+    assert texts[1].startswith("scope: today (")
+    assert "1 older hidden" in texts[1]
+    assert "press t to widen" in texts[1]
+
+
+def test_activity_overlay_scoped_to_today_hides_yesterdays_row() -> None:
+    texts = [line.text for line in build_activity_overlay(_scoped_activity_feed("today"))]
+    joined = " ".join(texts)
+
+    assert "rail veto: per_asset_concentration_cap" in joined  # today's vetoed cycle
+    assert "XLM-USD" not in joined  # yesterday's, which only names XLM
+
+
+def test_activity_overlay_widened_to_all_shows_the_earlier_day_again() -> None:
+    texts = [line.text for line in build_activity_overlay(_scoped_activity_feed("all"))]
+
+    rows = [t for t in texts if t.startswith((" ▸", ">▸"))]
+    assert len(rows) == 3
+    assert "all history in the window" in texts[1]
+
+
+def test_activity_overlay_with_nothing_today_is_never_blank_and_names_the_last_run() -> None:
+    """The morning case, on screen: the panel must answer "is keel alive" without a single row."""
+    feed = apply_scope(
+        feed_from_lines(_yesterday_activity_log_lines(), source="/tmp/keel.log"),
+        "today",
+        now_ts=float(NOW_TS),
+    )
+
+    lines = build_activity_overlay(feed)
+    texts = [line.text for line in lines]
+    joined = " ".join(texts)
+
+    assert len(texts) > 3
+    assert "keel has not run yet today." in texts
+    assert "Last cycle:" in joined
+    assert "yesterday" in joined
+    assert "Press t to widen the scope" in joined
+    # The column header is not painted over an empty day -- there are no columns to head.
+    assert ACTIVITY_HEADER not in texts
+
+
+def test_activity_cursor_line_on_an_empty_scope_stays_in_range() -> None:
+    feed = apply_scope(
+        feed_from_lines(_yesterday_activity_log_lines(), source="/tmp/keel.log"),
+        "today",
+        now_ts=float(NOW_TS),
+    )
+
+    lines, cursor_line = _activity_lines(feed)
+
+    assert 0 <= cursor_line < len(lines)
+
+
+def test_activity_overlay_footer_advertises_the_scope_key() -> None:
+    footer = [line.text for line in build_activity_overlay(_scoped_activity_feed())][-1]
+
+    assert "t scope" in footer
+    assert "expand" in footer
+    assert "close" in footer
+
+
+def test_help_screen_documents_the_scope_and_the_t_key() -> None:
+    texts = [line.text for line in build_help_screen()]
+    joined = " ".join(texts)
+
+    assert any(t.strip().startswith("t ") for t in texts)
+    assert "SCOPED TO TODAY" in joined
+    assert "today -> last 7 days -> all history in the window" in joined
+    assert "has not run yet" in joined
+    assert "reopened" in joined
+
+
+def test_run_live_activity_opens_scoped_to_today(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The requirement, through the live loop: yesterday's cycle is in the log and is not shown."""
+    config = _config(
+        logging=LoggingConfig(
+            file=_write_activity_log(
+                tmp_path, [*_yesterday_activity_log_lines(), *_today_activity_log_lines()]
+            )
+        )
+    )
+    stdscr = _KeySequenceStdscr(height=40, width=240, keys=[ord("v"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted = [call[2] for call in stdscr.calls]
+    assert any("scope: today (" in t for t in painted)
+    assert any("rail veto: per_asset_concentration_cap" in t for t in painted)
+    assert not any("XLM-USD" in t for t in painted)  # yesterday's, hidden
+    assert any("1 older hidden" in t for t in painted)
+
+
+def test_run_live_activity_t_widens_the_scope_to_reveal_the_earlier_day(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """`t` cycles today -> 7d -> all. Two presses reach `all`, and yesterday's cycle appears."""
+    config = _config(
+        logging=LoggingConfig(
+            file=_write_activity_log(
+                tmp_path, [*_yesterday_activity_log_lines(), *_today_activity_log_lines()]
+            )
+        )
+    )
+    stdscr = _KeySequenceStdscr(
+        height=40, width=240, keys=[ord("v"), ord("t"), ord("t"), -1]
+    )
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted = [call[2] for call in stdscr.calls]
+    assert any("scope: last 7 days (from " in t for t in painted)
+    assert any("all history in the window" in t for t in painted)
+    assert any("XLM-USD" in t for t in painted)  # yesterday's cycle, now in scope
+
+
+def test_run_live_activity_reopens_at_today_after_being_widened(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A widened scope answers one question once; it must never become the next open's default."""
+    config = _config(
+        logging=LoggingConfig(
+            file=_write_activity_log(
+                tmp_path, [*_yesterday_activity_log_lines(), *_today_activity_log_lines()]
+            )
+        )
+    )
+    # open, widen to 7d, widen to all, close, reopen -- then repaint.
+    stdscr = _KeySequenceStdscr(
+        height=40, width=240, keys=[ord("v"), ord("t"), ord("t"), 27, ord("v"), -1]
+    )
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted = [call[2] for call in stdscr.calls]
+    all_scope_frame = max(i for i, t in enumerate(painted) if "all history in the window" in t)
+    reopened_frame = max(i for i, t in enumerate(painted) if "scope: today (" in t)
+
+    # The LAST activity frame painted is a `today` one, i.e. the reopen reset it.
+    assert reopened_frame > all_scope_frame
+
+
+def test_run_live_activity_paints_the_empty_state_when_today_holds_no_cycle(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The whole point of the empty state, through the live loop: a log with only older cycles
+    renders words, not a blank panel -- and those words name when keel last ran."""
+    config = _config(
+        logging=LoggingConfig(file=_write_activity_log(tmp_path, _yesterday_activity_log_lines()))
+    )
+    stdscr = _KeySequenceStdscr(height=24, width=200, keys=[ord("v"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted = [call[2] for call in stdscr.calls]
+    assert any("keel has not run yet today." in t for t in painted)
+    assert any("Last cycle:" in t for t in painted)
+    assert any("Press t to widen the scope" in t for t in painted)
