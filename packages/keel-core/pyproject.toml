@@ -1,6 +1,6 @@
 [project]
 name = "keel-core"
-version = "0.6.0"
+version = "0.6.1"
 description = "Shared domain types, configuration, and logging for keel"
 requires-python = ">=3.14.4"
 dependencies = ["pyyaml>=6.0.3", "python-dotenv>=1.2.2"]
