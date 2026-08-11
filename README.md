@@ -53,6 +53,53 @@ rail — not even autonomy.
   time-boxed session: `keel autonomy on --for-hours N`. To stop trading immediately, use
   `keel kill`, not `keel autonomy off`.
 
+### How much money moves
+
+Four settings decide position size and how much can be spent. Three live in `config.yaml`; the
+fourth does not, which is most of why they drift apart.
+
+- **`paper.starting_equity_usd`** — the synthetic paper account's seed. **It is a ONE-TIME seed,
+  applied on the FIRST paper run only** (`keel/agent.py`, the `paper_trader.get_cash() is None`
+  branch). Editing it afterwards does nothing at all: the seeding branch is skipped whenever
+  `paper_cash_usdc` is already set, so an already-seeded account keeps its balance forever.
+  Resizing a running paper account means clearing that persisted `paper_cash_usdc` — a key in the
+  `agent_state` table, with **no command that clears it** (`keel reset-hwm` does not); a fresh
+  database is the clean way. `0` (the default) means "seed from real mark-to-market equity
+  instead"; any value above `0` overrides that and seeds at exactly that amount.
+- **`paper.monthly_contribution_usd`** — a recurring top-up, applied once per UTC calendar month.
+  It compounds, and the base is small: a contribution comparable to the seed doubles the account
+  monthly, and every position size below grows with it.
+- **`caps.max_exposure_usd`** — has **two jobs at once**. It is the ceiling on total notional held
+  at any one moment (rail 4, and rail 6's concentration cap is a percentage of it), *and* it is
+  the **equity proxy that sizes orders** on the live path
+  (`keel/execution/executor.py::_build_intent`). So live `risk_pct` is a fraction of THIS number,
+  not of real account equity — raising the cap raises the real dollars risked per trade. Set above
+  actual equity it stops binding before available cash does, and the refusal comes later and less
+  legibly from the funding check (rail 13). In paper mode the proxy is bypassed: sizing uses the
+  paper account's own equity.
+- **rail 14's monthly allowance** — the fee-free monthly BUY volume. It lives in the **database,
+  not `config.yaml`**: the `broker_subscriptions` row written by `keel subscription attest --venue
+  coinbase --tier <tier>`, or set directly with `keel subscription set --free-volume-usd N`.
+  `config.yaml` only supplies the tier catalogue and the unattested fallback
+  (`subscription.unsubscribed_allowance_usd`). Being in a different place from the caps is exactly
+  why it drifts out of step with them.
+
+**The interaction is the point.** Position sizing scales with equity (or, on the live path, with
+the `max_exposure_usd` proxy); the rail-14 allowance is a fixed dollar figure that scales with
+nothing. Let the two drift apart and *every* setup is vetoed — keel looks broken while every
+component is doing exactly what it was configured to do.
+
+The real case: at **$11,000** paper equity with `risk_pct: 0.01`, a PAXG setup with a 3.35%-wide
+stop sized to **$3,284.67** — exactly 1% of equity ($110) at risk, the correct answer. Rail 14's
+allowance was **$500/month**, so it was vetoed, as was every other setup. Not a bug in either
+setting; the two were simply on different scales. Reseeding the paper account at $500 sizes the
+same setup at **$149.30**, which fits.
+
+Note the counter-intuitive mechanic behind those numbers: **a tighter stop produces a LARGER
+position**, because `size = risk ÷ stop-distance` (`keel/execution/sizing.py::size`). That is how
+a 1% risk becomes a **30% position** — `risk_pct` bounds what you lose if the stop holds, not what
+you spend.
+
 ### Halal by construction, and ships inert
 
 Long-only spot only — no leverage, shorting, or derivatives; sizing uses actual cash, so no
