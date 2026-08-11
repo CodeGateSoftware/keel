@@ -268,6 +268,15 @@ def test_to_port_status_maps_every_known_state(state: str, expected: str) -> Non
     assert STATE_TO_PORT_STATUS[state] == expected
 
 
+def test_to_port_status_maps_partially_filled_to_open_not_pending() -> None:
+    """`partially_filled` is the order-response enum's spelling for a resting order that has
+    started filling -- still working at the venue, not merely accepted-but-untouched. `OPEN` is
+    the honest port status; falling through to `PENDING` (the pre-fix behaviour) would read as
+    not-yet-working, which is wrong for an order the venue has partially executed. See #226."""
+    assert to_port_status("partially_filled") == "OPEN"
+    assert STATE_TO_PORT_STATUS["partially_filled"] == "OPEN"
+
+
 def test_to_port_status_defaults_an_unknown_state_to_pending_not_failed() -> None:
     """An unrecognised state means the adapter does not know the outcome -- not that the order
     failed. `PENDING` keeps the order under observation; `FAILED` would declare a terminal

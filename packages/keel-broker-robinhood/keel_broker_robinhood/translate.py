@@ -49,12 +49,27 @@ TIME_IN_FORCE: str = "gtc"
 #: by capitalizing the venue's spelling. Keeping the mapping explicit, rather than deriving one
 #: from the other programmatically, means a new Robinhood state added by a future API version
 #: fails to translate (via `to_port_status`'s `PENDING` fallback) instead of silently guessing.
+#:
+#: Robinhood's docs publish two `state` enums that do not agree with each other: the order-response
+#: object lists `partially_filled` and omits `pending`; the `GET /orders/` query filter lists
+#: `pending` and omits `partially_filled`. This table covers the union of both, since either shape
+#: could plausibly arrive here, rather than picking one enum and dropping values from the other.
+#: `partially_filled` maps to `OPEN`, not `PENDING`: a partially-filled GTC limit is still resting
+#: and working at the venue, and `PENDING` would read as not-yet-working, which misdescribes an
+#: order the venue has already begun executing. `OPEN` is in the port's accepted status vocabulary
+#: (see the conformance suite's status assertion).
+#:
+#: `partially_filled`'s exact spelling is doc-sourced, not verified against a live order -- no
+#: order object has ever been observed at this venue (see #198) -- and the two docs pages
+#: disagree on which enum even applies here. This entry is the order-response enum's spelling;
+#: treat it as the best available guess, not a confirmed fact, until #198 closes.
 STATE_TO_PORT_STATUS: dict[str, str] = {
     "open": "OPEN",
     "canceled": "CANCELLED",
     "filled": "FILLED",
     "failed": "FAILED",
     "pending": "PENDING",
+    "partially_filled": "OPEN",
 }
 
 
