@@ -29,7 +29,7 @@ evaluation.
 - **`cts_factor_populated` / `rejected_for_missing_input`** (both `dict[str, int]`, keyed by CTS
   context-key name -- see `strategy.indicators_cts.DEFAULT_WEIGHTS`): for *every* ENTER signal
   `evaluate()` emits (whether or not it ends up opened), the engine's own CTS context assembly is
-  reused verbatim (`engine._assemble_cts_context` + `indicators_cts.score`, not reimplemented) to
+  reused verbatim (`engine.assemble_cts_context` + `indicators_cts.score`, not reimplemented) to
   determine, per factor, whether it was present or absent on that bar. Present factors increment
   `cts_factor_populated[name]`; absent ones increment `rejected_for_missing_input[name]`. This is
   symmetric by construction (`populated[k] + missing[k]` == the number of signals a given `k` was
@@ -483,7 +483,7 @@ def _record_cts_telemetry(
         setup = signal.setup
         if setup is None:
             continue
-        cts_result = indicators_cts.score(engine._assemble_cts_context(setup, window_1h))
+        cts_result = indicators_cts.score(engine.assemble_cts_context(setup, window_1h))
         for factor in cts_result.factors:
             bucket = (
                 telemetry.cts_factor_populated
