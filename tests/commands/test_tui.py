@@ -22,6 +22,7 @@ from click.testing import CliRunner
 
 import keel.commands.tui as tui_mod
 from keel.cli import cli
+from keel.commands.activity import ActivityFeed, feed_from_lines
 from keel.commands.admission import DiscoverReport
 from keel.commands.insights import (
     AccountSummary as InsightsAccountSummary,
@@ -48,9 +49,12 @@ from keel.commands.tui import (
     _SHORT_VERSION,
     AvailableBalance,
     ScreenLine,
+    _activity_cursor,
+    _activity_lines,
     _admission_line_style,
     _available_lines,
     _confirm_arm_autonomy,
+    _follow_cursor,
     _footer_lines,
     _freshness_style,
     _guarded,
@@ -63,6 +67,7 @@ from keel.commands.tui import (
     _stdio_is_interactive,
     _style_attrs,
     _visible_slice,
+    build_activity_overlay,
     build_admission_screen_overlay,
     build_discover_overlay,
     build_help_screen,
@@ -81,6 +86,7 @@ from keel.config import (
     Caps,
     Config,
     DcaConfig,
+    LoggingConfig,
     MarketDataConfig,
     MoneyMgmtConfig,
 )
@@ -2292,3 +2298,473 @@ def test_the_refresh_toast_reads_as_ok_not_as_a_failure() -> None:
     """It is a routine, successful action -- it must not paint in the alert/warn colours reserved
     for a failure, a cancelled action, or arming autonomy."""
     assert _message_style(_REFRESH_MESSAGE) == "ok"
+
+
+# -- activity overlay (v): the pure builder ------------------------------------------------------
+
+
+def _activity_line(event: str, ts: float, cycle_id: str | None = "cyc-1", **fields: Any) -> str:
+    """One JSONL record in `keel_core.telemetry.JsonFormatter`'s shape. A local copy of
+    `tests/commands/test_activity.py`'s helper on purpose: the exhaustive parsing/grouping
+    coverage lives over there, and these tests only need enough of a log to prove the OVERLAY
+    renders and scrolls it."""
+    payload: dict[str, Any] = {
+        "ts": ts,
+        "level": fields.pop("level", "INFO"),
+        "logger": "keel.agent",
+        "event": event,
+        "venue": "coinbase",
+    }
+    if cycle_id is not None:
+        payload["cycle_id"] = cycle_id
+    payload.update(fields)
+    return json.dumps(payload)
+
+
+#: A two-cycle log: an ordinary quiet cycle, then the real 2026-08-08 PAXG shape -- a setup, a
+#: guard violation, and an entry that was not placed.
+_ACTIVITY_TS = 1_786_194_006.0
+
+
+def _activity_log_lines() -> list[str]:
+    return [
+        _activity_line("agent.cycle_start", _ACTIVITY_TS, "quiet-1"),
+        _activity_line("agent.mode_resolved", _ACTIVITY_TS + 1, "quiet-1", mode="paper"),
+        _activity_line(
+            "agent.signals_evaluated",
+            _ACTIVITY_TS + 2,
+            "quiet-1",
+            product="BTC-USD",
+            rule_count=1,
+            signal_count=0,
+        ),
+        _activity_line("agent.cycle_start", _ACTIVITY_TS + 86400, "veto-1"),
+        _activity_line("agent.mode_resolved", _ACTIVITY_TS + 86401, "veto-1", mode="paper"),
+        _activity_line(
+            "engine.setup_detected",
+            _ACTIVITY_TS + 86402,
+            "veto-1",
+            rule="turtle_breakout",
+            product="PAXG-USD",
+            cts_score=5,
+            technique="signal_candle",
+            entry="4342.52",
+            stop="4197.09381782563408",
+            target="5215.07709304619552",
+        ),
+        _activity_line(
+            "agent.signals_evaluated",
+            _ACTIVITY_TS + 86402,
+            "veto-1",
+            product="PAXG-USD",
+            rule_count=1,
+            signal_count=1,
+        ),
+        _activity_line(
+            "guards.check_failed",
+            _ACTIVITY_TS + 86402,
+            "veto-1",
+            product="PAXG-USD",
+            side="BUY",
+            violation=(
+                "per_asset_concentration_cap: PAXG exposure 3284.671252850915628790264696 "
+                "exceeds 0.5 of max_exposure_usd (2500.0)"
+            ),
+        ),
+        _activity_line(
+            "agent.enter_evaluated",
+            _ACTIVITY_TS + 86402,
+            "veto-1",
+            product="PAXG-USD",
+            rule="turtle_breakout",
+            technique="signal_candle",
+            cts_score=5,
+            placed=False,
+            reason="paper: vetoed by rails",
+        ),
+    ]
+
+
+def _write_activity_log(tmp_path: Any) -> str:
+    path = tmp_path / "logs" / "keel.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(_activity_log_lines()) + "\n")
+    return str(path)
+
+
+def _activity_feed() -> Any:
+    return feed_from_lines(_activity_log_lines(), source="/tmp/keel.log")
+
+
+def test_build_activity_overlay_is_titled_and_lists_one_row_per_cycle_newest_first() -> None:
+    lines = build_activity_overlay(_activity_feed())
+    texts = [line.text for line in lines]
+
+    assert texts[0] == "keel tui -- activity"
+    veto_idx = next(i for i, t in enumerate(texts) if "rail veto" in t)
+    quiet_idx = next(i for i, t in enumerate(texts) if "quiet -- looked" in t)
+    assert veto_idx < quiet_idx  # newest first
+
+
+def test_build_activity_overlay_collapsed_does_not_list_individual_events() -> None:
+    texts = [line.text for line in build_activity_overlay(_activity_feed())]
+
+    assert not any("engine.setup_detected" in t for t in texts)
+
+
+def test_build_activity_overlay_expanded_lists_the_cycles_events_in_time_order() -> None:
+    feed = _activity_feed()
+    texts = [
+        line.text
+        for line in build_activity_overlay(feed, cursor=0, expanded=frozenset({"veto-1"}))
+    ]
+
+    setup_idx = next(i for i, t in enumerate(texts) if "engine.setup_detected" in t)
+    guard_idx = next(i for i, t in enumerate(texts) if "guards.check_failed" in t)
+    enter_idx = next(i for i, t in enumerate(texts) if "agent.enter_evaluated" in t)
+    assert setup_idx < guard_idx < enter_idx
+    # ...and the fields that carry the meaning, not just the event names.
+    assert any("entry=4342.52" in t for t in texts)
+    assert any("per_asset_concentration_cap" in t for t in texts)
+    assert any("paper: vetoed by rails" in t for t in texts)
+
+
+def test_activity_overlay_styles_a_veto_cycle_differently_from_a_quiet_one() -> None:
+    """The at-a-glance requirement: a rail veto must not read the same as a quiet cycle."""
+    lines = build_activity_overlay(_activity_feed())
+    veto = next(line for line in lines if "rail veto" in line.text)
+    quiet = next(line for line in lines if "quiet -- looked" in line.text)
+
+    assert veto.style != quiet.style
+    assert quiet.style == "muted"
+
+
+def test_activity_overlay_tells_the_operator_how_to_use_it() -> None:
+    texts = [line.text for line in build_activity_overlay(_activity_feed())]
+
+    footer = texts[-1]
+    assert "expand" in footer
+    assert "close" in footer
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_fragment"),
+    [
+        ("missing", "No engine log found"),
+        ("empty", "is empty"),
+        ("unparseable", "could be parsed"),
+        ("oversized", "No complete record"),
+        ("unreadable", "could not be read"),
+    ],
+)
+def test_activity_overlay_explains_a_broken_log_instead_of_rendering_blank(
+    status: str, expected_fragment: str
+) -> None:
+    """A blank overlay would be indistinguishable from the dead-looking dashboard this whole
+    feature exists to disprove -- so every failure mode renders words."""
+    feed = ActivityFeed(status=status, source="/tmp/keel.log", detail="because reasons")
+
+    lines = build_activity_overlay(feed)
+    texts = [line.text for line in lines]
+
+    assert texts[0] == "keel tui -- activity"
+    assert any(expected_fragment in t for t in texts)
+    assert any("Press v or Esc" in t for t in texts)
+
+
+def test_activity_overlay_on_a_readable_log_with_no_cycles_says_so() -> None:
+    feed = ActivityFeed(status="ok", source="/tmp/keel.log", cycles=())
+
+    texts = [line.text for line in build_activity_overlay(feed)]
+
+    assert any("No cycles in the window" in t for t in texts)
+
+
+# -- activity overlay: the cursor ----------------------------------------------------------------
+
+
+def test_activity_cursor_line_points_at_the_selected_row() -> None:
+    feed = _activity_feed()
+
+    for cursor in range(len(feed.cycles)):
+        lines, cursor_line = _activity_lines(feed, cursor=cursor)
+        assert lines[cursor_line].text.startswith(">")
+
+
+def test_activity_cursor_line_survives_a_row_above_it_being_expanded() -> None:
+    """The arithmetic that would drift if the cursor's screen position were computed by a second
+    copy of the layout: expanding the FIRST row pushes the second one down by its event count."""
+    feed = _activity_feed()
+
+    lines, cursor_line = _activity_lines(feed, cursor=1, expanded=frozenset({"veto-1"}))
+
+    assert lines[cursor_line].text.startswith(">")
+    assert "quiet -- looked" in lines[cursor_line].text
+
+
+def test_activity_cursor_line_on_an_empty_feed_is_in_range() -> None:
+    lines, cursor_line = _activity_lines(ActivityFeed(status="ok", source="x", cycles=()))
+
+    assert 0 <= cursor_line < len(lines)
+
+
+@pytest.mark.parametrize(
+    ("key", "start", "expected"),
+    [
+        ("KEY_DOWN", 0, 1),
+        ("KEY_UP", 3, 2),
+        ("KEY_HOME", 4, 0),
+        ("KEY_END", 0, 4),
+        ("KEY_NPAGE", 0, 4),  # a page is larger than this feed -- clamped to the last row
+        ("KEY_PPAGE", 4, 0),
+    ],
+)
+def test_activity_cursor_moves_by_rows_and_clamps(key: str, start: int, expected: int) -> None:
+    fake_curses = _fake_curses()
+
+    assert _activity_cursor(getattr(fake_curses, key), start, 24, 5, fake_curses) == expected
+
+
+def test_activity_cursor_accepts_the_same_vi_keys_the_other_overlays_scroll_with() -> None:
+    fake_curses = _fake_curses()
+
+    assert _activity_cursor(ord("j"), 0, 24, 5, fake_curses) == 1
+    assert _activity_cursor(ord("k"), 2, 24, 5, fake_curses) == 1
+
+
+def test_activity_cursor_never_leaves_the_feed() -> None:
+    fake_curses = _fake_curses()
+
+    assert _activity_cursor(fake_curses.KEY_UP, 0, 24, 5, fake_curses) == 0
+    assert _activity_cursor(fake_curses.KEY_DOWN, 4, 24, 5, fake_curses) == 4
+    # An empty feed has no row to select at all.
+    assert _activity_cursor(fake_curses.KEY_DOWN, 0, 24, 0, fake_curses) == 0
+
+
+def test_activity_cursor_ignores_an_unrelated_key() -> None:
+    fake_curses = _fake_curses()
+
+    assert _activity_cursor(ord("z"), 2, 24, 5, fake_curses) == 2
+    assert _activity_cursor(-1, 2, 24, 5, fake_curses) == 2  # the no-key poll timeout
+
+
+@pytest.mark.parametrize(
+    ("offset", "cursor_line", "height", "expected"),
+    [
+        (0, 5, 24, 0),  # already visible -- do not move the view at all
+        (10, 5, 24, 5),  # above the window -- scroll up to it
+        (0, 30, 24, 7),  # below the window -- scroll down the minimum
+        (0, 5, 0, 0),  # a terminal mid-resize must not divide by anything
+        (3, 3, 1, 3),
+    ],
+)
+def test_follow_cursor_makes_the_smallest_change_that_reveals_the_cursor(
+    offset: int, cursor_line: int, height: int, expected: int
+) -> None:
+    assert _follow_cursor(offset, cursor_line, height) == expected
+
+
+# -- activity overlay: the live loop -------------------------------------------------------------
+
+
+def test_footer_lines_advertise_the_activity_key() -> None:
+    texts = [line.text for line in _footer_lines()]
+
+    assert any("[v] activity" in t for t in texts)
+
+
+def test_help_screen_documents_the_activity_overlay_and_its_keys() -> None:
+    texts = [line.text for line in build_help_screen()]
+    joined = " ".join(texts)
+
+    assert any(t.strip().startswith("v ") for t in texts)
+    assert "Activity overlay (v)" in joined
+    assert "q / Esc / v" in joined
+    assert "Enter / Space" in joined
+    # The two claims the design rests on: it is offline, and the read is bounded.
+    assert "BOUNDED" in joined
+    assert "logging.file" in joined
+
+
+def test_run_live_v_opens_activity_overlay_and_esc_closes_it(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Mirrors the 's'/'p' tests: 'v' opens, Esc closes back to the dashboard."""
+    config = _config(logging=LoggingConfig(file=_write_activity_log(tmp_path)))
+    stdscr = _KeySequenceStdscr(height=24, width=200, keys=[ord("v"), -1, 27])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    activity_idx = next(i for i, t in enumerate(painted_texts) if "keel tui -- activity" in t)
+    dashboard_after_idx = next(
+        i for i, t in enumerate(painted_texts) if i > activity_idx and "paper mode" in t
+    )
+    assert dashboard_after_idx > activity_idx
+
+
+def test_run_live_activity_overlay_paints_the_real_cycles_from_the_configured_log(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The end-to-end claim: the path comes from `logging.file`, the rows come from that file,
+    and a rail-vetoed cycle is legible without expanding anything."""
+    config = _config(logging=LoggingConfig(file=_write_activity_log(tmp_path)))
+    stdscr = _KeySequenceStdscr(height=40, width=240, keys=[ord("v"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("rail veto: per_asset_concentration_cap" in t for t in painted_texts)
+    assert any("quiet -- looked, nothing to do" in t for t in painted_texts)
+
+
+def test_run_live_activity_enter_expands_the_selected_cycle(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    config = _config(logging=LoggingConfig(file=_write_activity_log(tmp_path)))
+    # poll1: normal -> 'v'. poll2: activity, Enter expands row 0 (the newest, vetoed cycle).
+    # poll3: activity, repainted expanded. poll4: 'q' (the stdscr's post-exhaustion default).
+    stdscr = _KeySequenceStdscr(height=40, width=240, keys=[ord("v"), 10, -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("guards.check_failed" in t for t in painted_texts)
+    assert any("paper: vetoed by rails" in t for t in painted_texts)
+
+
+def test_run_live_activity_overlay_reports_a_missing_log_rather_than_crashing(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    config = _config(logging=LoggingConfig(file=str(tmp_path / "nowhere" / "keel.log")))
+    stdscr = _KeySequenceStdscr(height=24, width=200, keys=[ord("v"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("No engine log found" in t for t in painted_texts)
+
+
+def test_run_live_activity_survives_a_transient_read_error_and_keeps_polling(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """`open_state()` itself failing (a locked DB from a concurrent `keel agent` writer) must
+    become a readable overlay, not a crash -- the same contract the insights/screen/propose
+    branches keep."""
+    config = _config(logging=LoggingConfig(file=_write_activity_log(tmp_path)))
+    stdscr = _KeySequenceStdscr(height=24, width=200, keys=[ord("v"), -1, -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    opens: list[int] = []
+
+    def open_state() -> tuple[Repository, Any]:
+        opens.append(1)
+        # Fail on the FIRST call made from inside the activity branch (calls 1 and 2 are the
+        # normal-mode status read and its balance refresh).
+        if len(opens) == 3:
+            raise sqlite3.OperationalError("database is locked")
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("could not be read" in t for t in painted_texts)
+    # ...and it kept polling: a later frame rendered the real feed.
+    assert any("rail veto" in t for t in painted_texts)
+
+
+def test_run_live_activity_overlay_never_builds_a_broker(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The overlay's whole admissibility argument is that reading a local file is neither a
+    broker nor the network. Opening it must add ZERO broker constructions on top of the ones the
+    normal-mode dashboard already makes (one slow-cadence balance refresh, here)."""
+    config = _config(logging=LoggingConfig(file=_write_activity_log(tmp_path)))
+    stdscr = _KeySequenceStdscr(height=24, width=200, keys=[ord("v"), -1, -1, 27])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    built: list[Any] = []
+
+    def _recording_build_broker(cfg: Any, **kwargs: Any) -> Any:
+        built.append(cfg)
+        raise RuntimeError("no venue in tests")
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _recording_build_broker)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("keel tui -- activity" in t for t in painted_texts)
+    # `now_fn` is constant, so the ~30s balance cadence fires exactly once, on the first poll.
+    # Any second construction could only have come from the activity branch.
+    assert len(built) == 1
+
+
+def test_run_live_activity_survives_a_log_record_whose_timestamp_cannot_be_rendered(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The renderer, not just the feed builder, runs on the repaint path. A `ts` no `strftime`
+    can format (a bad clock, a corrupted byte) must not escape `curses.wrapper` and kill the
+    dashboard -- which is why `run_live` wraps the RENDER, not only the build."""
+    path = tmp_path / "keel.log"
+    path.write_text(
+        "\n".join(
+            [
+                *_activity_log_lines(),
+                json.dumps({"ts": 1e20, "event": "agent.cycle_start", "cycle_id": "from-mars"}),
+            ]
+        )
+        + "\n"
+    )
+    config = _config(logging=LoggingConfig(file=str(path)))
+    stdscr = _KeySequenceStdscr(height=40, width=240, keys=[ord("v"), -1])
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)  # must not raise
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    assert any("keel tui -- activity" in t for t in painted_texts)
+    assert any("rail veto" in t for t in painted_texts)
