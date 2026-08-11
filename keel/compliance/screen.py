@@ -50,6 +50,14 @@ BACKING_DAYN = "dayn"
 BACKING_NATIVE = "native"  # a base-layer coin, neither a claim nor a warehouse receipt
 KNOWN_BACKINGS = frozenset({BACKING_AYN, BACKING_DAYN, BACKING_NATIVE})
 
+#: §71.4a: the allowlist is not juristically homogeneous, so admission has to name the CONTRACT,
+#: not just the underlying. `spot` is the only wrapper this policy admits; every other name here
+#: exists so that refusing it is an explicit, recorded classification rather than a shrug.
+WRAPPER_SPOT = "spot"
+KNOWN_WRAPPERS = frozenset(
+    {WRAPPER_SPOT, "cfd", "future", "perpetual", "option", "leveraged_token"}
+)
+
 #: Criteria a documented, human-recorded exception (`keel assets exempt`) may EVER waive. Only
 #: DATA/market criteria belong here -- history depth, liquidity, that kind of thing -- because
 #: those are facts about our own cache, not about the asset's shariah status. The shariah
@@ -87,6 +95,39 @@ class AssetAttestation:
 
 
 @dataclass(frozen=True)
+class InstrumentAttestation:
+    """What CONTRACT a venue listing actually is. A separate claim from `AssetAttestation`.
+
+    The two are complementary, and keeping them apart is the point rather than an accident of
+    layout. Sector, backing and yield are facts about the UNDERLYING -- they are true of BTC
+    wherever BTC is quoted. "What is this listing" is a fact about a VENUE'S PRODUCT, and the
+    honest asset attestation for the underlying of a BTC CFD is character-for-character BTC's
+    existing spot one: `sector=payments, backing=native, pays_yield=False`. That is issue #202 in
+    one sentence -- leverage, swap financing and counterparty exposure are properties of the
+    contract, so no amount of care taken over the asset claim can ever surface them.
+
+    **Keyed on `product_id`, not on `(venue, asset)`.** Coinbase -- the one venue keel already
+    uses -- lists both `BTC-USD` and `BTC-PERP-USD` against the same base leg, so a per-asset
+    wrapper claim would be factually wrong today, not merely imprecise once a second venue lands.
+    The key has to be the thing being traded.
+
+    **Attested, not computed, and that is the whole reason the type exists.** The id's shape
+    cannot answer it: a cTrader CFD spells itself `BTC-USD`, which is exactly the gap --
+    `parse_spot_product_id` reads that as a well-formed spot id and is right to, because the
+    grammar is all it has. Nor is the venue's own metadata a substitute: `product_type` is the
+    venue's self-report about its own product, which makes it excellent INPUT to the human's
+    `source` and unacceptable as the claim itself. Fail closed, like every other attestation here.
+    """
+
+    venue: str
+    product_id: str
+    wrapper: str  # one of KNOWN_WRAPPERS; only WRAPPER_SPOT admits
+    source: str  # where this was established -- venue docs, a contract spec, a regulator filing
+    attested_by: str
+    attested_at: int
+
+
+@dataclass(frozen=True)
 class MarketFacts:
     """Everything the screen can compute for itself."""
 
@@ -104,6 +145,16 @@ class MarketFacts:
     #: so a construction site that forgets it must fail loudly at the call, not quietly at the
     #: verdict.
     product_id: str
+    #: The venue the product is listed on. Half of the key an `InstrumentAttestation` is recorded
+    #: under, and carried here so `screen_asset` can check that the statement on file is about
+    #: THIS listing rather than a same-named one elsewhere -- `BTC-USD` on Coinbase is spot and
+    #: `BTC-USD` on a CFD broker is not, and the id alone cannot tell them apart.
+    #:
+    #: NO default, for `product_id`'s reason exactly. A defaulted venue would have to name some
+    #: venue, and naming the venue keel currently trades on would make every forgotten call site
+    #: silently inherit "Coinbase, therefore spot" -- the fail-OPEN answer to the one question
+    #: this field was added to ask. A construction site that forgets it must fail at the call.
+    venue: str
 
 
 @dataclass(frozen=True)
@@ -137,16 +188,23 @@ def screen_asset(
     attestation: AssetAttestation | None,
     policy: ScreenPolicy | None = None,
     waived: Mapping[str, str] | None = None,
+    instrument: InstrumentAttestation | None = None,
 ) -> ScreenResult:
-    """Deterministic admission decision. `attestation=None` fails closed.
+    """Deterministic admission decision. `attestation=None` and `instrument=None` both fail closed.
+
+    TWO attestations are required, and they answer different questions. `attestation` says what
+    the UNDERLYING is; `instrument` says what the LISTING is. Either one missing is a rejection,
+    and both missing produce both failures in a single run rather than one at a time -- an
+    operator should learn every action they owe from one `keel assets screen`, not discover the
+    second only after satisfying the first.
 
     `waived` is `{criterion: rationale}` from a documented human exception (`keel assets
     exempt` / `repository.get_screen_exceptions`). It is consulted ONLY when a check would
     otherwise FAIL, and ONLY for criteria in `WAIVABLE_CRITERIA` -- a waiver for anything else
-    (a stray `screen_exceptions` row for, say, `attestation`) is silently ignored and that
-    criterion still fails closed. A waiver never affects any criterion other than its own, and a
-    blank/whitespace rationale is treated as no waiver at all (fail closed -- see the `.strip()`
-    check below, mirroring the unsourced-attestation guard further down).
+    (a stray `screen_exceptions` row for, say, `attestation` or `instrument_wrapper`) is silently
+    ignored and that criterion still fails closed. A waiver never affects any criterion other than
+    its own, and a blank/whitespace rationale is treated as no waiver at all (fail closed -- see
+    the `.strip()` check below, mirroring the unsourced-attestation guard further down).
     """
     policy = policy or ScreenPolicy()
     # Filtered ONCE, up front, rather than inline per-branch: this is the actual defense-in-depth
@@ -210,6 +268,57 @@ def screen_asset(
             "shape are refused regardless of what they settle in -- rail 19 would veto every "
             "order for it"
         )
+
+    # The ATTESTED half of the same question, and the reason `spot_instrument` above is not
+    # enough on its own. That check reads the id's GRAMMAR, which is all an id can offer and is
+    # exactly why it cannot close this gap: a cTrader CFD is spelled `BTC-USD`, parses clean, and
+    # is not spot. The two criteria are complementary, deliberately not merged, and both fire for
+    # a derivative-shaped id attested as spot -- a venue whose ids lie about the contract and a
+    # human who mis-states it are different failures, and collapsing them would let either hide
+    # behind the other.
+    #
+    # Not in `DATA_DERIVED_FAILURES`, for `settlement`'s reason: this consults an attestation and
+    # never touches candles, so it stays a real, assessable verdict at zero bars. A candidate we
+    # have never fetched is still one we can say "nobody has told us what contract this is" about.
+    #
+    # Not in `WAIVABLE_CRITERIA` either, and issue #202 says so explicitly. A waiver here would be
+    # a documented exception permitting a derivative, which is the charter, not a threshold.
+    if instrument is None or (instrument.venue, instrument.product_id) != (
+        facts.venue,
+        facts.product_id,
+    ):
+        # A mismatch is treated as ABSENCE, not as a mismatch worth reporting in its own right.
+        # `_screen_product` looks the row up BY this pair, so the two can only diverge via a
+        # direct caller passing a statement about some other listing -- and a claim about a
+        # different product is not weaker evidence about this one, it is no evidence at all.
+        failures.append(
+            f"instrument_wrapper: UNATTESTED for {facts.product_id!r} on {facts.venue!r}. Which "
+            "CONTRACT a venue lists cannot be read off the id -- a CFD can spell itself exactly "
+            "like spot -- so an unattested listing is unknown, and unknown is a rejection (fail "
+            "closed). Record one with `keel assets attest-instrument`."
+        )
+    else:
+        wrapper = instrument.wrapper.strip().lower()
+        if wrapper not in KNOWN_WRAPPERS:
+            failures.append(
+                f"instrument_wrapper: {wrapper!r} is not one of {sorted(KNOWN_WRAPPERS)} -- "
+                "classify it explicitly rather than leaving it open (§71.4a)"
+            )
+        elif wrapper != WRAPPER_SPOT:
+            failures.append(
+                f"instrument_wrapper: {wrapper!r} -- keel is spot-only, and this listing is a "
+                "derivative on the underlying rather than the underlying itself. Leverage, swap "
+                "financing and counterparty exposure are properties of the CONTRACT, so they "
+                "survive any attestation about the asset: the base leg being admissible says "
+                "nothing about this wrapper (§65.6/§65.11, §71.4a)"
+            )
+        if not instrument.source.strip():
+            # Mirrors the unsourced-attestation guard below. Reported ALONGSIDE any wrapper
+            # verdict above rather than instead of it, because "spot, but nobody said where that
+            # came from" is precisely the unsourced claim that must not admit.
+            failures.append(
+                "instrument_wrapper: no source recorded -- an unsourced claim is not evidence"
+            )
 
     # -- attested shariah classification ---------------------------------------
     if attestation is None:

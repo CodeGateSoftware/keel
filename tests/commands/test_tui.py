@@ -1914,6 +1914,7 @@ def _fake_screen_fn(*, admitted: bool = True):
             median_daily_volume=Decimal("2000000"),
             quotable_in_settlement_currency=True,
             product_id=product,
+            venue="coinbase",
         )
         result = screen_mod.ScreenResult(asset=facts.asset, admitted=admitted)
         return facts, result

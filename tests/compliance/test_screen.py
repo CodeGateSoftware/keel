@@ -7,7 +7,10 @@ from decimal import Decimal
 import pytest
 
 from keel.compliance.screen import (
+    KNOWN_WRAPPERS,
+    WAIVABLE_CRITERIA,
     AssetAttestation,
+    InstrumentAttestation,
     MarketFacts,
     ScreenPolicy,
     missing_history_lines,
@@ -15,14 +18,30 @@ from keel.compliance.screen import (
     split_failures,
 )
 
+_VENUE = "coinbase"
 
-def _facts(asset="BTC", bars=2000, volume="50000000", quotable=True, product=None) -> MarketFacts:
+
+def _facts(
+    asset="BTC", bars=2000, volume="50000000", quotable=True, product=None, venue=_VENUE
+) -> MarketFacts:
     return MarketFacts(
         asset=asset,
         daily_bars=bars,
         median_daily_volume=Decimal(volume),
         quotable_in_settlement_currency=quotable,
         product_id=product if product is not None else f"{asset}-USD",
+        venue=venue,
+    )
+
+
+def _instrument(venue=_VENUE, product="BTC-USD", wrapper="spot", source="venue product spec"):
+    return InstrumentAttestation(
+        venue=venue,
+        product_id=product,
+        wrapper=wrapper,
+        source=source,
+        attested_by="tester",
+        attested_at=1_784_505_600,
     )
 
 
@@ -39,7 +58,7 @@ def _attestation(asset="BTC", sector="payments", backing="native", yield_=False,
 
 
 def test_a_clean_asset_is_admitted():
-    result = screen_asset(_facts(), _attestation())
+    result = screen_asset(_facts(), _attestation(), instrument=_instrument())
     assert result.admitted is True
     assert result.failures == []
 
@@ -61,13 +80,183 @@ def test_a_missing_attestation_is_a_REJECTION_not_a_default_pass():
 def test_a_missing_attestation_short_circuits_the_shariah_checks():
     """No sector/backing VERDICT is invented for an asset nobody has classified.
 
-    Asserted as "exactly one failure, and it is the attestation one" rather than by grepping for
-    'backing' -- the missing-attestation message legitimately mentions backing while explaining
-    why it cannot be judged.
+    This test's INTENT is the short-circuit -- that `haram_sector`, `riba_yield` and `backing`
+    produce no verdict at all when there is no attestation to judge. It used to assert that as
+    "exactly one failure", which was a proxy that stopped being true once a second, independent
+    missing-claim criterion existed. The intent is now asserted directly, by tag: no shariah tag
+    appears. (Grepping the message TEXT for 'backing' would false-positive -- the
+    missing-attestation message legitimately mentions backing while explaining why it cannot be
+    judged, which is exactly why the original test counted instead.)
+
+    Both missing-class failures are expected together, and that is deliberate rather than
+    tolerated: an operator who runs `keel assets screen` once should be told BOTH claims they owe
+    -- the underlying's and the listing's -- not discover the second only after recording the
+    first and re-running.
     """
-    result = screen_asset(_facts(), None)
-    assert len(result.failures) == 1
-    assert result.failures[0].startswith("attestation: MISSING")
+    result = screen_asset(_facts(), None, instrument=None)
+    tags = [f.split(":")[0] for f in result.failures]
+    assert "haram_sector" not in tags
+    assert "riba_yield" not in tags
+    assert "backing" not in tags
+    assert sorted(tags) == ["attestation", "instrument_wrapper"]
+
+
+def test_an_admitted_underlying_does_not_admit_an_unstated_wrapper():
+    """Issue #202, the whole point: an honest attestation about BTC does not say what a BTC
+    listing IS.
+
+    `sector=payments, backing=native, pays_yield=False` is a true claim about the underlying, and
+    it is equally true of spot BTC and of a BTC CFD -- swap financing, leverage and counterparty
+    exposure are properties of the CONTRACT, not of the coin. So an asset attestation alone must
+    not be able to admit anything, and with no instrument statement on file the screen fails
+    closed exactly as it does for a missing asset attestation.
+    """
+    result = screen_asset(_facts(), _attestation())
+    assert result.admitted is False
+    assert any(f.startswith("instrument_wrapper:") for f in result.failures)
+
+
+def test_a_cfd_on_an_admitted_underlying_is_refused():
+    """Issue #202's ACCEPTANCE case, and the one that used to pass silently.
+
+    A cTrader-style CFD spells itself `BTC-USD` -- identical to Coinbase's spot id, so the shape
+    check passes it -- and its underlying's honest attestation is BTC's existing admitted one. It
+    is the wrapper claim, and nothing else in this module, that refuses it.
+    """
+    facts = _facts(venue="ctrader")
+    result = screen_asset(
+        facts,
+        _attestation(),
+        instrument=_instrument(venue="ctrader", wrapper="cfd"),
+    )
+    assert result.admitted is False
+    assert any(f.startswith("instrument_wrapper: 'cfd'") for f in result.failures)
+    # The shape check is NOT what caught it -- the id is a well-formed spot id, which is the gap.
+    assert not any(f.startswith("spot_instrument") for f in result.failures)
+
+
+def test_an_attested_spot_listing_is_admitted():
+    result = screen_asset(_facts(), _attestation(), instrument=_instrument(wrapper="spot"))
+    assert result.admitted is True
+    assert result.failures == []
+
+
+@pytest.mark.parametrize("wrapper", sorted(KNOWN_WRAPPERS - {"spot"}))
+def test_no_known_wrapper_other_than_spot_admits(wrapper):
+    """Every name in the vocabulary except `spot` is a refusal. The vocabulary exists so that
+    refusing is an explicit classification, not so that some of its entries are tolerated."""
+    result = screen_asset(_facts(), _attestation(), instrument=_instrument(wrapper=wrapper))
+    assert result.admitted is False
+    assert any(f.startswith(f"instrument_wrapper: {wrapper!r}") for f in result.failures)
+
+
+def test_an_unknown_wrapper_must_be_classified_not_assumed():
+    """Mirrors the unknown-backing branch: an unrecognised name is not a pass."""
+    result = screen_asset(
+        _facts(), _attestation(), instrument=_instrument(wrapper="probably spot")
+    )
+    assert result.admitted is False
+    assert any("instrument_wrapper" in f and "not one of" in f for f in result.failures)
+
+
+@pytest.mark.parametrize("wrapper", ["  SPOT ", "Spot", "spot\n"])
+def test_the_wrapper_is_normalised_before_it_is_judged(wrapper):
+    """Same `.strip().lower()` treatment `sector` and `backing` already get -- a stored 'SPOT'
+    must not read as an unknown wrapper and reject an honestly-attested spot listing."""
+    result = screen_asset(_facts(), _attestation(), instrument=_instrument(wrapper=wrapper))
+    assert result.admitted is True
+
+
+def test_a_statement_about_a_different_venue_is_no_evidence_about_this_one():
+    """The identity check. A `BTC-USD` spot claim made about Coinbase says nothing about
+    `BTC-USD` on a CFD broker -- treating it as evidence is precisely the confusion #202 is
+    about, so a mismatch is handled as ABSENCE and fails closed."""
+    result = screen_asset(
+        _facts(venue="ctrader"),
+        _attestation(),
+        instrument=_instrument(venue="coinbase", wrapper="spot"),
+    )
+    assert result.admitted is False
+    assert any("instrument_wrapper: UNATTESTED" in f for f in result.failures)
+    assert any("'ctrader'" in f for f in result.failures)
+
+
+def test_a_statement_about_a_different_product_is_no_evidence_about_this_one():
+    """The same identity check on the other half of the key: Coinbase lists both `BTC-USD` and
+    `BTC-PERP-USD`, so a spot claim about one must not travel to the other."""
+    result = screen_asset(
+        _facts(product="BTC-PERP-USD"),
+        _attestation(),
+        instrument=_instrument(product="BTC-USD", wrapper="spot"),
+    )
+    assert result.admitted is False
+    assert any("instrument_wrapper: UNATTESTED" in f for f in result.failures)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_an_unsourced_instrument_attestation_is_refused(blank):
+    """Mirrors the unsourced asset-attestation guard: 'spot, but nobody said where that came
+    from' is an unsourced claim, and an unsourced claim is not evidence."""
+    result = screen_asset(
+        _facts(), _attestation(), instrument=_instrument(wrapper="spot", source=blank)
+    )
+    assert result.admitted is False
+    assert any("instrument_wrapper: no source recorded" in f for f in result.failures)
+
+
+def test_a_derivative_shaped_id_attested_as_spot_fails_BOTH_checks():
+    """The two instrument criteria are complementary, and neither is allowed to hide behind the
+    other. A venue whose id says `BTC-PERP-USD` while a human attests `spot` is two separate
+    problems -- the shape and the claim disagree -- and the operator should see both."""
+    result = screen_asset(
+        _facts(product="BTC-PERP-USD"),
+        _attestation(),
+        instrument=_instrument(product="BTC-PERP-USD", wrapper="spot"),
+    )
+    assert result.admitted is False
+    assert any(f.startswith("spot_instrument") for f in result.failures)
+
+
+def test_instrument_wrapper_is_never_waivable():
+    """Issue #202 is explicit that no criterion it adds may be waivable, and `WAIVABLE_CRITERIA`
+    is pinned here rather than merely spot-checked: a documented exception permitting a
+    derivative would waive the charter, not a threshold."""
+    assert WAIVABLE_CRITERIA == frozenset({"history"})
+
+
+def test_a_stray_waiver_for_instrument_wrapper_is_ignored_and_fails_closed():
+    """Defence in depth for the pin above: even if a row reached `screen_exceptions` by hand,
+    the up-front `WAIVABLE_CRITERIA` filter drops it before any branch can read it."""
+    result = screen_asset(
+        _facts(venue="ctrader"),
+        _attestation(),
+        waived={"instrument_wrapper": "someone tried to waive this"},
+        instrument=_instrument(venue="ctrader", wrapper="cfd"),
+    )
+    assert result.admitted is False
+    assert any(f.startswith("instrument_wrapper: 'cfd'") for f in result.failures)
+    assert not any("WAIVED" in w for w in result.warnings)
+
+
+def test_the_wrapper_verdict_is_still_assessable_at_zero_bars():
+    """Like `settlement`, this criterion reads an attestation and never touches candles, so it
+    stays a real verdict about the LISTING even with an empty cache -- it must not be suppressed
+    as "about our data" the way `history`/`liquidity` legitimately are."""
+    from keel.compliance.screen import DATA_DERIVED_FAILURES
+
+    assert "instrument_wrapper" not in DATA_DERIVED_FAILURES
+    facts = _facts(bars=0, volume="0")
+    result = screen_asset(facts, _attestation(), instrument=None)
+    about_the_asset, about_our_cache = split_failures(facts, result)
+    assert any(f.startswith("instrument_wrapper") for f in about_the_asset)
+    assert not any(f.startswith("instrument_wrapper") for f in about_our_cache)
+
+
+def test_the_unattested_message_names_the_command_that_fixes_it():
+    """The fail-closed default REJECTs every product until the operator attests it, so the
+    failure has to carry the exact remedy -- that message is how they are told."""
+    result = screen_asset(_facts(), _attestation(), instrument=None)
+    assert any("keel assets attest-instrument" in f for f in result.failures)
 
 
 def test_an_unsourced_attestation_is_refused():
@@ -115,7 +304,11 @@ def test_an_unknown_backing_must_be_classified_not_assumed():
 
 def test_asset_backed_is_admitted_but_warns_about_the_stricter_sarf_regime():
     """PAXG's case: admitted, but §65.5's no-deferment rule is surfaced, not buried."""
-    result = screen_asset(_facts(asset="PAXG"), _attestation(asset="PAXG", backing="ayn"))
+    result = screen_asset(
+        _facts(asset="PAXG"),
+        _attestation(asset="PAXG", backing="ayn"),
+        instrument=_instrument(product="PAXG-USD"),
+    )
     assert result.admitted is True
     assert any("bay' al-sarf" in w for w in result.warnings)
 
@@ -214,7 +407,10 @@ def test_every_failure_is_reported_not_just_the_first():
 
 def test_policy_thresholds_are_configurable():
     lenient = ScreenPolicy(min_daily_bars=100, min_median_daily_volume=Decimal("1"))
-    assert screen_asset(_facts(bars=200, volume="5"), _attestation(), lenient).admitted is True
+    result = screen_asset(
+        _facts(bars=200, volume="5"), _attestation(), lenient, instrument=_instrument()
+    )
+    assert result.admitted is True
 
 
 # -- documented allowlist-screen exceptions (waivers) --------------------------
@@ -233,7 +429,10 @@ def test_insufficient_history_with_no_waiver_still_rejects():
 
 def test_a_documented_history_waiver_admits_and_warns_loudly():
     result = screen_asset(
-        _facts(bars=400), _attestation(), waived={"history": "PAXG: 441 bars, human-reviewed"}
+        _facts(bars=400),
+        _attestation(),
+        waived={"history": "PAXG: 441 bars, human-reviewed"},
+        instrument=_instrument(),
     )
     assert result.admitted is True
     assert not any("history" in f for f in result.failures)
@@ -254,7 +453,10 @@ def test_a_blank_rationale_waiver_does_not_admit_undocumented_is_not_documented(
 
 def test_a_waiver_is_self_retiring_once_history_clears_the_floor():
     """No leftover warning once the underlying condition it was granted for no longer holds."""
-    result = screen_asset(_facts(bars=2000), _attestation(), waived={"history": "stale reason"})
+    result = screen_asset(
+        _facts(bars=2000), _attestation(), waived={"history": "stale reason"},
+        instrument=_instrument(),
+    )
     assert result.admitted is True
     assert not any("WAIVED" in w for w in result.warnings)
     assert not any("history" in f for f in result.failures)
@@ -291,6 +493,7 @@ def test_a_stray_non_waivable_key_alongside_a_real_waiver_is_dropped_not_honored
         _facts(bars=400),
         _attestation(),
         waived={"history": "documented reason", "settlement": "someone tried to waive this too"},
+        instrument=_instrument(),
     )
     assert result.admitted is True
     assert any("WAIVED" in w and "documented reason" in w for w in result.warnings)

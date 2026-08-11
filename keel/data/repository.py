@@ -742,6 +742,50 @@ class Repository:
         rows = self._conn.execute("SELECT * FROM asset_attestations ORDER BY asset").fetchall()
         return [dict(row) for row in rows]
 
+    # -- instrument attestations --------------------------------------------------
+    # Human-recorded claim about WHAT CONTRACT a venue listing is (spot/cfd/perpetual/future/
+    # option/leveraged_token) -- keyed per (venue, product_id) rather than per asset, because one
+    # venue lists both BTC-USD (spot) and BTC-PERP-USD (perpetual) against the same base leg, so a
+    # per-asset wrapper claim would be factually wrong. Absent = unknown = rejected; see
+    # `keel/compliance/screen.py`.
+
+    def upsert_instrument_attestation(
+        self,
+        venue: str,
+        product_id: str,
+        wrapper: str,
+        source: str,
+        attested_by: str,
+        attested_at: int,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO instrument_attestations
+                (venue, product_id, wrapper, source, attested_by, attested_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(venue, product_id) DO UPDATE SET
+                wrapper = excluded.wrapper,
+                source = excluded.source,
+                attested_by = excluded.attested_by,
+                attested_at = excluded.attested_at
+            """,
+            (venue, product_id, wrapper, source, attested_by, attested_at),
+        )
+        self._conn.commit()
+
+    def get_instrument_attestation(self, venue: str, product_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM instrument_attestations WHERE venue = ? AND product_id = ?",
+            (venue, product_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_instrument_attestations(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM instrument_attestations ORDER BY venue, product_id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     # -- screen exceptions ------------------------------------------------------
     # Documented, per-asset per-criterion waivers of an allowlist-screen admission criterion (KB
     # PAXG/history case). See `keel/compliance/screen.py` -- only criteria in `WAIVABLE_CRITERIA`

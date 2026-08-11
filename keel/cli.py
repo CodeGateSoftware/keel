@@ -516,6 +516,24 @@ def assets_group() -> None:
 _LIQUIDITY_PROBE_DAYS = 180
 
 
+#: The venue every product screened here is listed on.
+#:
+#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The live path constructs
+#: `keel/data/cb_client.py`'s `CoinbaseClient` directly, so there is exactly one venue these
+#: product ids can mean, and an `InstrumentAttestation` is keyed on `(venue, product_id)` --
+#: which means the screen needs a venue id to look one up, and inventing a per-call parameter
+#: for a value with one possible answer would be a knob whose only safe setting is its default.
+#:
+#: The broker-port migration replaces this with the adapter's own `BrokerCapabilities.venue`
+#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`), at which point the wrapper
+#: statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD` somewhere
+#: else -- which is issue #202's entire point and the reason the key is a pair. Until an adapter
+#: handle actually reaches this function, reading a venue id off one would be reading it off
+#: nothing: the same dead-gate pattern `capabilities.py` warns about, where a lookup that cannot
+#: fail reads as a defence.
+_VENUE = "coinbase"
+
+
 def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.MarketFacts:
     """Everything the screen can compute for itself from data we already hold."""
     asset = product.split("-")[0]
@@ -535,6 +553,8 @@ def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.Mark
         # Carried, not reduced: `screen_asset` applies rail 19's grammar to it, so the screen's
         # shape verdict and the rail's cannot disagree, and the verdict can name the id.
         product_id=product,
+        # The other half of the key the instrument statement is recorded under. See `_VENUE`.
+        venue=_VENUE,
     )
 
 
@@ -547,6 +567,11 @@ def _screen_product(
     all route through here, so none of them can drift onto a laxer path -- which is what makes
     "the same vetting process" a property of the code rather than an intention. Returns the facts
     alongside the verdict so a caller can explain WHY without recomputing them.
+
+    The instrument statement is looked up HERE, next to the asset attestation, rather than being
+    threaded in by each caller -- that is what makes the wrapper criterion inherit the same
+    single-decision-point property as everything else on this path. Three callers get the new
+    check with no per-caller wiring, and none of them can be the one that forgot it.
     """
     asset = product.split("-")[0]
     facts = _market_facts(repo, product, quote)
@@ -564,8 +589,23 @@ def _screen_product(
         if raw is not None
         else None
     )
+    raw_instrument = repo.get_instrument_attestation(_VENUE, product)
+    instrument = (
+        screen_mod.InstrumentAttestation(
+            venue=raw_instrument["venue"],
+            product_id=raw_instrument["product_id"],
+            wrapper=raw_instrument["wrapper"],
+            source=raw_instrument["source"],
+            attested_by=raw_instrument["attested_by"],
+            attested_at=raw_instrument["attested_at"],
+        )
+        if raw_instrument is not None
+        else None
+    )
     waived = repo.get_screen_exceptions(asset)
-    return facts, screen_mod.screen_asset(facts, attestation, waived=waived)
+    return facts, screen_mod.screen_asset(
+        facts, attestation, waived=waived, instrument=instrument
+    )
 
 
 # Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
@@ -975,6 +1015,65 @@ def assets_attest(
     click.echo(f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield}")
 
 
+@assets_group.command("attest-instrument")
+@click.option("--venue", default=_VENUE, show_default=True, help="Venue the product is listed on.")
+@click.option("--product", required=True, help="Venue product id, e.g. BTC-USD.")
+@click.option(
+    "--wrapper",
+    required=True,
+    type=click.Choice(sorted(screen_mod.KNOWN_WRAPPERS)),
+    help="What CONTRACT this listing is. Only 'spot' admits; every other value is a refusal.",
+)
+@click.option(
+    "--source",
+    required=True,
+    help="Where this was established: the venue's contract spec, its API docs, a filing.",
+)
+@click.option("--attested-by", required=True, help="Who established it.")
+@click.pass_context
+@with_disclaimer
+def assets_attest_instrument(
+    ctx: click.Context,
+    venue: str,
+    product: str,
+    wrapper: str,
+    source: str,
+    attested_by: str,
+) -> None:
+    """Record what CONTRACT a venue listing is. A claim about the PRODUCT, not the asset.
+
+    `keel assets attest` says what the underlying is -- sector, backing, yield. This says what
+    you actually get when you buy this listing, and the two are genuinely independent: the honest
+    asset attestation for the underlying of a BTC CFD is BTC's existing, already-admitted one, so
+    nothing recorded there can ever surface the leverage, swap financing or counterparty exposure
+    that the CFD adds (issue #202).
+
+    Keyed per `(venue, product)` rather than per asset because one venue lists several contracts
+    on the same base leg -- Coinbase quotes both `BTC-USD` and `BTC-PERP-USD` -- so a per-asset
+    wrapper claim would be wrong on the venue keel already uses, not merely imprecise later.
+
+    This is ATTESTED and cannot be derived. The id's shape does not answer it (a CFD broker
+    spells its contract `BTC-USD`, identical to spot), and the venue's own `product_type` field
+    is its self-report about its own product -- excellent evidence to cite in `--source`, and not
+    a substitute for a human making the claim.
+
+    Not passphrase-gated, for the same reason `keel assets attest` is not: an attestation cannot
+    itself place an order or raise a cap, and the screen it feeds only ever ADMITS to a list that
+    `guards.py` rail 1 still enforces per-trade.
+    """
+    product = product.upper()  # matches the uppercase ids `_screen_product` looks up by
+    repo = _open_repo(ctx)
+    repo.upsert_instrument_attestation(
+        venue=venue,
+        product_id=product,
+        wrapper=wrapper,
+        source=source,
+        attested_by=attested_by,
+        attested_at=int(time.time()),
+    )
+    click.echo(f"attested {product} on {venue}: wrapper={wrapper}")
+
+
 @assets_group.command("exempt")
 @click.option("--asset", required=True, help="Asset code, e.g. PAXG.")
 @click.option(
@@ -1052,11 +1151,16 @@ def assets_unexempt(ctx: click.Context, asset: str, criterion: str) -> None:
 @assets_group.command("list")
 @click.pass_context
 def assets_list(ctx: click.Context) -> None:
-    """List recorded attestations and any documented screen exceptions."""
+    """List recorded attestations and any documented screen exceptions.
+
+    Both KINDS of attestation are shown, because admission now requires both and an operator
+    reading only the asset list would see a fully-attested allowlist that still screens REJECT.
+    """
     repo = _open_repo(ctx)
     rows = repo.get_asset_attestations()
+    instruments = repo.get_instrument_attestations()
     exceptions = repo.list_screen_exceptions()
-    if not rows and not exceptions:
+    if not rows and not instruments and not exceptions:
         click.echo("no attestations recorded")
         return
     for row in rows:
@@ -1064,6 +1168,13 @@ def assets_list(ctx: click.Context) -> None:
             f"{row['asset']:<8} sector={row['sector']:<16} backing={row['backing']:<8} "
             f"pays_yield={bool(row['pays_yield'])!s:<5} by={row['attested_by']}"
         )
+    if instruments:
+        click.echo("\ninstruments:")
+        for row in instruments:
+            click.echo(
+                f"{row['product_id']:<14} venue={row['venue']:<10} "
+                f"wrapper={row['wrapper']:<16} by={row['attested_by']}"
+            )
     if exceptions:
         click.echo("\nexceptions:")
         for row in exceptions:

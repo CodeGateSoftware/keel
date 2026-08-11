@@ -113,6 +113,7 @@ def _fake_screen(admitted, bars=2000):
             median_daily_volume=Decimal("2000000"),
             quotable_in_settlement_currency=True,
             product_id=product,
+            venue="coinbase",
         )
         result = screen_mod.ScreenResult(
             asset=product.split("-")[0],
@@ -155,7 +156,7 @@ def test_shariah_hypothesis_is_never_passed_to_the_gate():
     def screen_fn(repo, product, quote):
         captured.append((repo, product, quote))
         return (
-            screen_mod.MarketFacts("SOL", 0, Decimal(0), True, "SOL-USD"),
+            screen_mod.MarketFacts("SOL", 0, Decimal(0), True, "SOL-USD", "coinbase"),
             screen_mod.ScreenResult("SOL", admitted=False, failures=["attestation: MISSING."]),
         )
 
@@ -179,7 +180,7 @@ def _report(admitted, bars, attested=False, hypothesis=None):
     )
 
     def screen_fn(repo, product, quote):
-        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD")
+        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD", "coinbase")
         failures = (
             []
             if admitted
@@ -273,7 +274,7 @@ def _report_with_real_failure_strings(bars):
     parsed = parse_proposal({"candidates": [_entry(asset="SOL")]})
 
     def screen_fn(repo, product, quote):
-        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD")
+        facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD", "coinbase")
         failures = [
             f"history: {bars} daily bars < 1460 required",
             "liquidity: median daily volume 0 < 1000000 required",
@@ -331,6 +332,7 @@ def test_data_derived_failures_tags_actually_match_screen_asset_output():
         median_daily_volume=Decimal(0),
         quotable_in_settlement_currency=False,
         product_id="SOL-EUR",
+        venue="coinbase",
     )
     tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
     missing = DATA_DERIVED_FAILURES - tags
