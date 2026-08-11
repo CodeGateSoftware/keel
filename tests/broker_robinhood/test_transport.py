@@ -552,10 +552,11 @@ def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: An
     `max_order_size` (a bound a rejected order would violate), and the bid/ask legs a spread check
     would compare.
 
-    There is deliberately **no minimum-order assertion**. The fixture used to carry
-    `min_order_amount` and the venue sends no such field, nor `min_order_size` (#217 F3) -- so a
-    pre-flight minimum check has no source on this endpoint, and asserting an invented bound here
-    would keep pointing #198 at one.
+    `min_order_amount` is asserted here again after #230. #217 F3 read it off `results[0]` --
+    BILL-USD, one of the 26 pairs of 89 that lack the field -- and concluded the venue publishes no
+    minimum at all; #218 then removed it from the fixture. The other 63 pairs carry it, BTC-USD
+    (`0.1`) and ETH-USD among them, so the pre-flight sizing check proposed in #198 has a real
+    lower-bound source for every asset keel trades. `min_order_size` is still absent.
 
     The fixture's raw bytes are replayed rather than a re-serialized decode of them, so the values
     reach the assertions through the same `json.loads(..., parse_float=Decimal)` the live path
@@ -577,7 +578,8 @@ def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: An
     assert isinstance(pair["asset_increment"], str), "this endpoint quotes its numbers -- #217 F6"
     assert Decimal(pair["asset_increment"]) == Decimal("0.00000001")
     assert Decimal(pair["max_order_size"]) > 0
-    assert "min_order_amount" not in pair
+    assert isinstance(pair["min_order_amount"], str), "quoted, like the rest of this endpoint"
+    assert Decimal(pair["min_order_amount"]) == Decimal("0.1")
     assert "min_order_size" not in pair
 
     http(_FakeResponse(text=_fixture_text("rh_best_bid_ask.json")))
