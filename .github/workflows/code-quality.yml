@@ -1,0 +1,200 @@
+name: Code Quality
+
+# SonarQube (static analysis + coverage) and Snyk (dependency vulnerabilities).
+#
+# ┌─ BEFORE THIS CAN RUN ─────────────────────────────────────────────────────────────────────────
+# │ Two repository secrets must exist. As of this workflow landing, NEITHER DOES -- `gh secret
+# │ list` is empty at both repo and org level, so every run will stop at the preflight job below
+# │ until they are added:
+# │
+# │   SONAR_TOKEN  -- from SonarQube ("My Account" -> Security -> Generate Token)
+# │   SNYK_TOKEN   -- from Snyk (Account Settings -> Auth Token, or `snyk config get api`)
+# │
+# │ Set both at https://github.com/CodeGateSoftware/keel/settings/secrets/actions.
+# │ `sonar-project.properties` at the repo root also carries a `sonar.projectKey` that must match
+# │ the project as it exists on the Sonar server, and a commented-out `sonar.organization` that
+# │ SonarQube Cloud requires -- read that file before the first run.
+# └───────────────────────────────────────────────────────────────────────────────────────────────
+#
+# TRIGGERS: a DELIBERATE divergence from the reference workflow this is modelled on
+# (TempTrak-Ingestion-Service's `code-quality.yml`), which runs on `push`, `pull_request` and
+# `workflow_dispatch`. Running per-push here would reintroduce exactly the automatic Actions spend
+# that `ci.yml` was just changed to remove -- the two changes would cancel out. The scheduled run
+# is kept because dependency scanning is the one kind of check that finds something new without
+# the code changing: a CVE published against a version of `cryptography` that keel has been
+# pinning, unmodified, for months is invisible to a per-push trigger and obvious to a weekly one.
+# Static analysis has no such property, but it is cheap to fold into the same weekly pass.
+# Adding `push:` / `pull_request:` below is a one-line change if parity with the other repo is
+# wanted later.
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00 UTC every Monday. A fixed weekday makes a newly-appeared finding easy to date, and
+    # off-the-hour minutes avoid the top-of-hour scheduling queue on GitHub's shared runners.
+    - cron: "0 6 * * 1"
+
+# `github.ref` is `refs/heads/<branch>` for both a manual dispatch and a scheduled run (a schedule
+# always runs on the default branch), so two overlapping runs of the same branch collapse into
+# one. `cancel-in-progress` is false, unlike `ci.yml`: a Snyk `monitor` run that gets cancelled
+# halfway leaves the dashboard holding a stale snapshot, which is worse than waiting.
+concurrency:
+  group: code-quality-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Both scanners fail in unhelpful ways when their token is missing -- Sonar reports "You're not
+  # authorized. Please check the property sonar.token", and Snyk exits with a generic auth error
+  # from inside a container. Neither says "the repository secret does not exist", which is the
+  # actual cause and the only thing the reader needs to know. This job says it once, up front.
+  preflight:
+    name: Check required secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify SONAR_TOKEN and SNYK_TOKEN are set
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "${SONAR_TOKEN:-}" ] || MISSING="$MISSING SONAR_TOKEN"
+          [ -n "${SNYK_TOKEN:-}" ] || MISSING="$MISSING SNYK_TOKEN"
+          if [ -n "$MISSING" ]; then
+            echo "::error title=Missing repository secrets::This workflow cannot run until these secrets exist:$MISSING"
+            echo "Missing:$MISSING"
+            echo
+            echo "Add them at:"
+            echo "  https://github.com/${{ github.repository }}/settings/secrets/actions"
+            echo
+            echo "  SONAR_TOKEN -- SonarQube: My Account > Security > Generate Token"
+            echo "  SNYK_TOKEN  -- Snyk: Account Settings > Auth Token (or 'snyk config get api')"
+            exit 1
+          fi
+          echo "SONAR_TOKEN and SNYK_TOKEN are both present."
+
+  # ONE whole-repo scan, not the reference's per-module matrix. The reference fans out over a
+  # Node monorepo whose modules each have their own package.json, tsconfig and test run, and it
+  # builds that list with a `./.github/actions/load-services` composite action. keel has no such
+  # action, and its five `packages/*` workspace members are not independent in that way: they
+  # share one lockfile, one interpreter, one `pytest` invocation and one coverage report. Splitting
+  # them into five Sonar projects would fragment the quality gate and the coverage number across
+  # units nobody releases separately. `sonar.sources` in sonar-project.properties covers keel/,
+  # packages/ and scripts/ in a single analysis instead.
+  sonarqube:
+    name: SonarQube scan
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for better relevancy of analysis
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install   # version comes from .python-version; never pin it here twice
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+
+      # Sonar treats coverage as a first-class measure and shows 0% without a report to import.
+      # This is the ONLY place coverage is collected: `ci.yml` and `release.yml` deliberately keep
+      # their plain `pytest -q`, so instrumenting the suite here cannot slow those two down.
+      # `--cov` with no value reads `[tool.coverage.run]` in pyproject.toml for the source roots.
+      - name: Test with coverage
+        run: uv run pytest -q --cov --cov-report=xml
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # Self-hosted SonarQube Server also needs SONAR_HOST_URL; SonarQube Cloud does not.
+          # Uncomment and add the secret if the server is self-hosted:
+          # SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  snyk:
+    name: Snyk dependency scan
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      # WHY A REQUIREMENTS FILE AND NOT `uv.lock` DIRECTLY:
+      # Snyk does have `uv.lock` support, but as of this writing it is Early Access and gated to
+      # Enterprise plans (docs.snyk.io "Support for uv"); `uv.lock` is absent from the GA
+      # "supported languages and package managers" list, where Python means requirements.txt,
+      # Pipfile(.lock), pyproject.toml+poetry.lock, or setup.py. Relying on an Early Access,
+      # plan-gated path would make this workflow silently depend on which Snyk plan the account
+      # is on. Exporting the lockfile to a fully-pinned requirements.txt uses the GA path instead,
+      # and loses nothing: the versions come from `uv.lock` either way.
+      #
+      #   --frozen              use uv.lock exactly as committed; never re-resolve in CI
+      #   --no-hashes           Snyk's requirements.txt parser does not consume hashes
+      #   --no-dev              scan what ships. mypy/pytest/ruff never reach a user's machine, so
+      #                         a CVE in one is not a vulnerability in keel. Drop this flag to
+      #                         widen the scan to the dev toolchain.
+      #   --no-emit-workspace   omit the five `-e ./packages/...` editable entries. Those are keel's
+      #                         own code, not third-party dependencies, and a local path is not
+      #                         something Snyk can look up.
+      - name: Export the locked dependencies as requirements.txt
+        run: |
+          set -euo pipefail
+          uv export --frozen --format requirements-txt --no-hashes --no-dev \
+            --no-emit-workspace -o requirements.txt
+          echo "--- requirements.txt ---"
+          cat requirements.txt
+
+      # `snyk/actions/setup` installs the Snyk CLI onto the runner, rather than the per-language
+      # `snyk/actions/python`, which executes inside `docker://snyk/snyk:python` -- a container
+      # whose interpreter keel does not control and cannot pin to 3.14. Snyk publishes no
+      # `python-3.14` or `uv-*` action wrapper (the PR adding them, snyk/actions#206, was closed
+      # unmerged), so the containerised route would scan a 3.14 project from an older interpreter.
+      # Running the CLI directly on the runner sidesteps that entirely, and the exported
+      # requirements.txt is fully pinned, so nothing needs resolving at scan time anyway.
+      - name: Install the Snyk CLI
+        uses: snyk/actions/setup@v1
+
+      # Fails the job on findings. Add `--severity-threshold=high` to only fail on high/critical.
+      - name: Snyk test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk test --file=requirements.txt --package-manager=pip
+
+      # Reports the current dependency tree to the Snyk dashboard so newly-published CVEs against
+      # these exact pins raise an alert between weekly runs. `always()` so a failing `snyk test`
+      # above still leaves the dashboard up to date -- the finding is the reason to record it.
+      - name: Snyk monitor
+        if: always()
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        # PLACEHOLDER -- SET BEFORE FIRST USE, OR DELETE:
+        # Add `--org=<keel-snyk-org-id>` below to file this project under a specific Snyk
+        # organization. It is deliberately omitted rather than copied from the workflow this was
+        # modelled on, whose `--org` value belongs to an unrelated project; with no `--org`, Snyk
+        # uses the token's default organization, which is correct for a single-org account.
+        run: snyk monitor --file=requirements.txt --package-manager=pip --project-name=keel
+
+  # NO DOCKER SCAN JOB, on purpose. The reference workflow builds an image and runs
+  # `snyk/actions/docker` against it. keel has no Dockerfile and ships no container -- it is
+  # distributed as wheels built by `release.yml` and installed with pip. There is no image to
+  # scan, so the job is absent rather than stubbed. Add one here if keel ever grows a Dockerfile.
