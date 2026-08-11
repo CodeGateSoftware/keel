@@ -1,6 +1,6 @@
 [project]
 name = "keel-broker-robinhood"
-version = "0.5.7"
+version = "0.6.0"
 description = "Robinhood Crypto Trading API v2 adapter for keel"
 requires-python = ">=3.14.4"
 # `pynacl` is here and nowhere else in the workspace: Robinhood signs every request with an
