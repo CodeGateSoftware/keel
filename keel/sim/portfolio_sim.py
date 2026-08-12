@@ -68,7 +68,7 @@ from keel.execution import sizing
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.strategy import engine, indicators_cts
-from keel.strategy.backtest import _resolve_order, _touches
+from keel.strategy.backtest import TAKER_FEE_PCT, _resolve_order, _touches
 from keel.strategy.rules.base import Rule, Setup, Signal
 from keel.types import Candle, Granularity
 
@@ -222,7 +222,7 @@ def run(
     start_ts: int,
     end_ts: int,
     monthly_contribution: Decimal,
-    fee_pct: Decimal = Decimal("0.006"),
+    fee_pct: Decimal = TAKER_FEE_PCT,
     slippage_pct: Decimal = Decimal("0.0005"),
     monthly_volume_cap: Decimal | None = None,
 ) -> SimResult:

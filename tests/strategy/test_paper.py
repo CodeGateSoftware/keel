@@ -16,11 +16,16 @@ import pytest
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.backtest import BacktestResult
-from keel.strategy.paper import PaperTrader, track_record
+from keel.strategy.paper import _DEFAULT_FEE_PCT, PaperTrader, track_record
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Candle, Side
 
-FEE_PCT = Decimal("0.006")
+# Mirrors `PaperTrader`'s own default rather than restating a literal: these tests recompute
+# expected cash and P&L by hand, so a hardcoded rate here would silently stop testing the
+# default the moment it moved -- which is how the maker/taker mix-up (#247) went unnoticed.
+# Was `Decimal("0.006")` (maker) before #247; the paper account now prices its market-style
+# fills at the taker rate.
+FEE_PCT = _DEFAULT_FEE_PCT
 SLIPPAGE_PCT = Decimal("0.0005")
 
 

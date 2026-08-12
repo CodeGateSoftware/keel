@@ -11,19 +11,26 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from keel_core.config import ResearchConfig
 
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.research.cscv import PBOResult
 from keel.strategy.backtest import BacktestResult
 from keel.strategy.promotion import (
     DEFAULT_CLASS,
+    FAILED,
+    NOT_RUN,
+    PASSED,
     TREND_FOLLOW,
     PBOGate,
     PromotionConfig,
     can_promote,
+    check_floors,
     floor_for_class,
     g4_pbo_gate,
     next_status,
+    pbo_gate_from_config,
     promotion_class_of,
     should_demote,
     transition,
@@ -80,47 +87,173 @@ def _rule_status(repo: Repository, rule_id: int) -> str:
     return row["status"]
 
 
-# -- can_promote --------------------------------------------------------------
+def _pbo(pbo: str = "0.01", slope: str = "-0.2") -> PBOResult:
+    """A minimal `PBOResult` carrying only the two fields G4 reads.
+
+    Built directly rather than by running `cscv.pbo` over synthetic columns: this module tests
+    the GATE, and a real CSCV run would make these tests depend on the estimator's behaviour
+    instead of on the threshold logic. `tests/research/test_cscv.py` owns the estimator.
+    """
+    return PBOResult(
+        pbo=Decimal(pbo),
+        n_combinations=20,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=800,
+        rows_dropped=0,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal(slope),
+    )
+
+
+# -- the overfitting axis: an ABSENT check must never read as a pass -----------
+
+
+def test_can_promote_refuses_when_no_overfitting_evidence_was_supplied() -> None:
+    """Clean on all four floors, but nobody ran CSCV -- so this is NOT a promotion.
+
+    The whole point of #247. `research: pbo_max/slope_floor` shipped in every config and
+    `g4_pbo_gate` shipped in this module, and nothing called either: promotion was decided on
+    four performance floors while the overfitting gate sat dormant. A rule that clears
+    expectancy/RR/win-rate on one in-sample parameter set is exactly the thing PBO exists to be
+    suspicious of, so "we never checked" has to block, not wave through.
+    """
+    decision = can_promote(_stats(), PromotionConfig())
+
+    assert decision.promotable is False
+    assert decision.floors_pass is True  # the floors themselves were fine
+    assert decision.overfitting == NOT_RUN
+    assert any("not run" in r.lower() for r in decision.reasons)
+
+
+def test_can_promote_passes_when_floors_and_the_overfitting_gate_both_clear() -> None:
+    decision = can_promote(_stats(), PromotionConfig(), pbo=_pbo())
+
+    assert decision.promotable is True
+    assert decision.overfitting == PASSED
+    assert decision.reasons == []
+
+
+def test_can_promote_refuses_on_the_g4_signature_even_with_perfect_floors() -> None:
+    """High PBO AND a steeply negative degradation slope -- §78.8's fitted-selection signature."""
+    decision = can_promote(_stats(), PromotionConfig(), pbo=_pbo(pbo="0.80", slope="-0.90"))
+
+    assert decision.promotable is False
+    assert decision.floors_pass is True
+    assert decision.overfitting == FAILED
+    assert any("PBO" in r for r in decision.reasons)
+
+
+def test_a_failing_floor_and_an_absent_pbo_are_reported_together() -> None:
+    """Both axes surface at once, same as the floors already do among themselves -- an operator
+    fixing one problem should already be able to see the other."""
+    decision = can_promote(_stats(win_rate=0.10), PromotionConfig())
+
+    assert decision.promotable is False
+    assert decision.floors_pass is False
+    assert any("win_rate" in r for r in decision.reasons)
+    assert any("not run" in r.lower() for r in decision.reasons)
+
+
+def test_pbo_gate_thresholds_come_from_config_not_from_reinvented_constants() -> None:
+    """`research.pbo_max`/`slope_floor` are the shipped thresholds; the gate must read THEM.
+
+    KB §78.7's Strathern warning cuts both ways: thresholds must not be tuned to obtain a
+    verdict, which also means the gate must not quietly use numbers other than the ones the
+    deployment declared and can be audited against.
+    """
+    research = ResearchConfig(pbo_max=Decimal("0.9"), slope_floor=Decimal("-0.1"))
+    gate = pbo_gate_from_config(research)
+
+    assert gate.pbo_max == Decimal("0.9")
+    assert gate.slope_floor == Decimal("-0.1")
+
+    # A result that the DEFAULT gate would fail (0.80 > 0.05 and -0.90 < -0.5) still fails
+    # under this stricter-sloped one, but the reason must quote the configured numbers.
+    decision = can_promote(
+        _stats(), PromotionConfig(), pbo=_pbo(pbo="0.95", slope="-0.5"), gate=gate
+    )
+    assert decision.promotable is False
+    assert any("0.9" in r for r in decision.reasons)
+
+
+def test_transition_does_not_promote_without_overfitting_evidence(repo: Repository) -> None:
+    """The gap closes where it actually matters: the DB-writing path.
+
+    `transition` is what moves a rule candidate->paper->live. Before #247 it advanced on the
+    four floors alone; now an un-checked rule stays put. `rules promote --force` remains the
+    deliberate, loud, audited bypass for the low-frequency case that can never reach the floor
+    -- an operator who wants to override this has a documented door, and it leaves a record.
+    """
+    rule_id = _insert_rule(repo, "turtle_breakout", status="candidate")
+
+    assert transition(repo, "turtle_breakout", _stats(), PromotionConfig()) == "candidate"
+    assert _rule_status(repo, rule_id) == "candidate"
+
+    # Same stats, now with a clean CSCV result behind them: promotes.
+    assert (
+        transition(repo, "turtle_breakout", _stats(), PromotionConfig(), pbo=_pbo()) == "paper"
+    )
+    assert _rule_status(repo, rule_id) == "paper"
+
+
+def test_demotion_never_requires_overfitting_evidence(repo: Repository) -> None:
+    """Demotion must stay reachable without a CSCV run.
+
+    Asymmetric on purpose, and the asymmetry is the safety property: missing evidence blocks
+    letting a rule ADVANCE toward real money, and must never block pulling one back from it.
+    """
+    rule_id = _insert_rule(repo, "decayed", status="live")
+
+    assert transition(repo, "decayed", _stats(expectancy=Decimal("-5")), PromotionConfig()) == (
+        "disabled"
+    )
+    assert _rule_status(repo, rule_id) == "disabled"
+
+
+# -- check_floors (the four performance floors, spec G2) ----------------------
 
 
 def test_can_promote_true_when_all_floors_met() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(_stats(), cfg)
+    ok, reasons = check_floors(_stats(), cfg)
     assert ok is True
     assert reasons == []
 
 
 def test_can_promote_false_on_failing_win_rate_with_reason() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(_stats(win_rate=0.40), cfg)
+    ok, reasons = check_floors(_stats(win_rate=0.40), cfg)
     assert ok is False
     assert any("win_rate" in r for r in reasons)
 
 
 def test_can_promote_false_on_failing_expectancy_with_reason() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(_stats(expectancy=Decimal("-1")), cfg)
+    ok, reasons = check_floors(_stats(expectancy=Decimal("-1")), cfg)
     assert ok is False
     assert any("expectancy" in r for r in reasons)
 
 
 def test_can_promote_false_on_failing_rr_with_reason() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(_stats(avg_win=Decimal("5"), avg_loss=Decimal("-10")), cfg)
+    ok, reasons = check_floors(_stats(avg_win=Decimal("5"), avg_loss=Decimal("-10")), cfg)
     assert ok is False
     assert any("rr" in r for r in reasons)
 
 
 def test_can_promote_false_on_insufficient_sample_with_reason() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(_stats(n_trades=10), cfg)
+    ok, reasons = check_floors(_stats(n_trades=10), cfg)
     assert ok is False
     assert any("n_trades" in r for r in reasons)
 
 
 def test_can_promote_accumulates_all_failing_reasons() -> None:
     cfg = PromotionConfig()
-    ok, reasons = can_promote(
+    ok, reasons = check_floors(
         _stats(n_trades=5, win_rate=0.1, avg_win=Decimal("1"), avg_loss=Decimal("-10")), cfg
     )
     assert ok is False
@@ -130,7 +263,7 @@ def test_can_promote_accumulates_all_failing_reasons() -> None:
 def test_can_promote_respects_custom_config_floors() -> None:
     cfg = PromotionConfig(min_trades=5, min_rr=Decimal("1.0"), min_win_rate=0.5)
     stats = _stats(n_trades=6, win_rate=0.5, avg_win=Decimal("10"), avg_loss=Decimal("-9"))
-    ok, reasons = can_promote(stats, cfg)
+    ok, reasons = check_floors(stats, cfg)
     assert ok is True
     assert reasons == []
 
@@ -199,8 +332,8 @@ def test_low_win_rate_edge_passes_trend_floor_but_fails_canonical() -> None:
         avg_loss=Decimal("-1938"),
         expectancy=Decimal("417"),
     )
-    assert can_promote(trend_edge, PromotionConfig())[0] is False
-    assert can_promote(trend_edge, floor_for_class(TREND_FOLLOW))[0] is True
+    assert check_floors(trend_edge, PromotionConfig())[0] is False
+    assert check_floors(trend_edge, floor_for_class(TREND_FOLLOW))[0] is True
 
 
 def test_the_live_turtle_sample_now_FAILS_the_trend_floor_on_sample_size() -> None:
@@ -222,7 +355,7 @@ def test_the_live_turtle_sample_now_FAILS_the_trend_floor_on_sample_size() -> No
         avg_loss=Decimal("-1938"),
         expectancy=Decimal("417"),
     )
-    ok, reasons = can_promote(turtle, floor_for_class(TREND_FOLLOW))
+    ok, reasons = check_floors(turtle, floor_for_class(TREND_FOLLOW))
     assert ok is False
     assert any("n_trades" in r for r in reasons), reasons
     # ...and it fails ONLY on sample size -- the win-rate relaxation still works.
@@ -268,7 +401,10 @@ def test_transition_promotes_candidate_to_paper_on_passing_stats(repo: Repositor
     rule_id = _insert_rule(repo, "pullback_continuation", status="candidate")
     cfg = PromotionConfig()
 
-    new_status = transition(repo, "pullback_continuation", _stats(), cfg)
+    # `pbo=` supplied because promotion now requires an overfitting check to have RUN (#247);
+    # without it this same call correctly returns "candidate" -- see
+    # test_transition_does_not_promote_without_overfitting_evidence.
+    new_status = transition(repo, "pullback_continuation", _stats(), cfg, pbo=_pbo())
 
     assert new_status == "paper"
     assert _rule_status(repo, rule_id) == "paper"
@@ -288,7 +424,7 @@ def test_transition_promotes_paper_to_live_on_passing_stats(repo: Repository) ->
     rule_id = _insert_rule(repo, "rsi_meanrev", status="paper")
     cfg = PromotionConfig()
 
-    new_status = transition(repo, "rsi_meanrev", _stats(), cfg)
+    new_status = transition(repo, "rsi_meanrev", _stats(), cfg, pbo=_pbo())  # see #247
 
     assert new_status == "live"
     assert _rule_status(repo, rule_id) == "live"

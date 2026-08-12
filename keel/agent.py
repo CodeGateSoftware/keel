@@ -849,7 +849,15 @@ def run_once(
         # `mode: paper` is not an executor mode (see `_effective_mode`); it routes to the
         # PAPER path instead, which never touches the broker. Constructed once per cycle and
         # rehydrated from the orders table, so a per-cycle agent resumes its open positions.
-        paper_trader = PaperTrader(repo) if config.auto_trade.mode == "paper" else None
+        # Fees come from the deployment's own `fees.taker_pct` (paper fills are market-style,
+        # same as the backtester's), not from `paper.py`'s library default -- a paper-forward
+        # exists to estimate what live trading would have cost, so it has to price fills at the
+        # rate THIS account would actually pay.
+        paper_trader = (
+            PaperTrader(repo, fee_pct=config.fees.taker_pct)
+            if config.auto_trade.mode == "paper"
+            else None
+        )
         # What this cycle actually DID, for the log line and `LoopResult`. `_effective_mode`
         # returns the executor string `"confirm"` for any non-live config -- paper included --
         # so reporting it verbatim told the user a confirm-mode (live) run happened when the

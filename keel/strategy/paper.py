@@ -33,6 +33,7 @@ from decimal import Decimal
 from keel_core.telemetry import log_event
 
 from keel.data.repository import Repository
+from keel.strategy.backtest import TAKER_FEE_PCT
 from keel.strategy.rules.base import Action, Setup, Signal, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Side
@@ -43,7 +44,19 @@ logger = logging.getLogger(__name__)
 # every paper trade uses a fixed 1-unit notional, sufficient for win-rate/
 # expectancy/drawdown/R-multiple stats.
 _QTY = Decimal(1)
-_DEFAULT_FEE_PCT = Decimal("0.006")
+# The paper account's execution friction. TAKER, because `PaperTrader` fills a `Signal` against
+# the next bar the way `backtest` does -- marketable, crossing the spread.
+#
+# ⚠️ THIS ONE IS NOT RETROACTIVE, and that asymmetry matters when reading the paper record.
+# Fees here are charged at fill time and journalled into `orders(mode='paper')` as realized
+# cash; changing the rate changes what the paper account records **from the next fill onward**
+# and rewrites nothing already stored. So the paper-forward's history is now spliced: fills
+# journalled before #247 were priced at the maker rate (0.006) and are optimistic by ~1.2% of
+# notional per round trip; fills after it are priced correctly. `track_record()` pools both,
+# which means its stats stay mildly flattered until the pre-#247 fills age out of the window.
+# That splice is deliberate -- restating a journalled account's realized cash would be
+# falsifying its own audit trail, which is a worse defect than the one being fixed.
+_DEFAULT_FEE_PCT = TAKER_FEE_PCT
 _DEFAULT_SLIPPAGE_PCT = Decimal("0.0005")
 
 

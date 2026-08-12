@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any, Literal, get_args, get_origin, get_type_hints
 
 import click
+from keel_core.config import ConfigError
 from keel_core.telemetry import log_event
 
 from keel import agent
@@ -34,6 +35,9 @@ from keel.data.repository import Repository
 # preview of what rail 1 will say about the product, and a note that disagreed with the rail it
 # is quoting would be worse than no note at all.
 from keel.execution.guards import _asset as _asset_of
+from keel.research import cscv as cscv_mod
+from keel.research import ledger as trials_ledger
+from keel.research import matrix as matrix_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Granularity
@@ -85,8 +89,51 @@ def _resolve_granularity(rule: Any, granularity_opt: str | None) -> Granularity 
     return None
 
 
+def _optional_cfg(ctx: click.Context) -> Any | None:
+    """The loaded config, or `None` if there isn't a usable one.
+
+    `rules backtest` is read-only and useful without a deployment config (a bare checkout, a
+    scratch database). It should not start REQUIRING one just to learn a fee rate -- so a
+    missing/invalid config degrades to the library default here rather than aborting. What it
+    must never do is degrade *silently*: the caller pairs this with `_describe_fee`, which
+    prints which of the two sources supplied the rate.
+    """
+    try:
+        return _load_cfg(ctx)
+    except ConfigError:
+        return None
+
+
+def _backtest_fee(config: Any | None) -> tuple[Decimal, str]:
+    """The fee rate to price fills at, and a human-readable statement of where it came from.
+
+    Returns `config.fees.taker_pct` when a config is loaded, else `backtest.TAKER_FEE_PCT`. The
+    two agree by construction (pinned by a test), so the fallback cannot flatter a result; the
+    *source* is returned anyway because "1.2000% (taker, from config `fees.taker_pct`)" and
+    "1.2000% (taker, library default)" answer different questions when a deployment's config
+    turns out not to be the one the operator thought they were running.
+
+    Taker is correct here because `backtest` fills market-style at next-bar open (see
+    `backtest.TAKER_FEE_PCT`). A caller wanting to model resting limit orders instead should
+    pass `fees.maker_pct` explicitly and say so in its output.
+    """
+    if config is None:
+        return backtest_mod.TAKER_FEE_PCT, "taker, library default"
+    return config.fees.taker_pct, "taker, from config `fees.taker_pct`"
+
+
+def _describe_fee(fee_pct: Decimal, source: str) -> str:
+    """`fee_pct=1.2000% (taker, from config ...)` -- the provenance line that travels with every
+    printed backtest number. See `backtest.TAKER_FEE_PCT` for why this is not optional."""
+    return f"fee_pct={fee_pct * 100:.4f}% ({source})"
+
+
 def _run_backtest(
-    ctx: click.Context, repo: Repository, rule: Any, granularity_opt: str | None
+    ctx: click.Context,
+    repo: Repository,
+    rule: Any,
+    granularity_opt: str | None,
+    fee_pct: Decimal,
 ) -> backtest_mod.BacktestResult:
     product_id = getattr(rule, "product_id", None)
     if product_id is None:
@@ -97,7 +144,38 @@ def _run_backtest(
         click.echo("Error: could not determine a granularity; pass --granularity", err=True)
         ctx.exit(1)
     candles = repo.get_candles(product_id, granularity)
-    return backtest_mod.backtest(rule, candles)
+    return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
+
+
+def _load_pbo(
+    ctx: click.Context, session: str | None, blocks: int
+) -> cscv_mod.PBOResult | None:
+    """The CSCV result for `session`, or `None` when no session was named.
+
+    Reuses the exact pipeline behind `keel trials pbo` -- ledger -> `build_matrix` ->
+    `cscv.pbo` -- rather than a second implementation, so the number the gate applies is the
+    same number an operator can reproduce by hand and audit.
+
+    Returning `None` for "no session given" is safe here ONLY because `can_promote` treats
+    `None` as NOT RUN and refuses to promote on it. A genuinely empty/unusable matrix is a hard
+    error instead: the operator asked for the check, so silently downgrading to "not run" would
+    hide a broken ledger behind the same message as not having asked.
+    """
+    if session is None:
+        return None
+    trials = trials_ledger.read_trials(trials_ledger.DEFAULT_LEDGER_PATH)
+    build = matrix_mod.build_matrix(trials, session=session)
+    if not build.columns:
+        click.echo(
+            f"Error: no usable trial columns for session {session!r} -- every trial is "
+            "`series_missing` or the session has no trials. CSCV cannot run, so the rule "
+            "cannot be promoted through the gate.",
+            err=True,
+        )
+        ctx.exit(1)
+    for warning in build.warnings:
+        click.echo(f"warning: {warning}", err=True)
+    return cscv_mod.pbo(build.columns, s=blocks)
 
 
 @rules_group.command("backtest")
@@ -108,15 +186,23 @@ def _run_backtest(
 @click.pass_context
 @with_disclaimer
 def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
-    """Backtest a stored rule against its historical candles (read-only)."""
+    """Backtest a stored rule against its historical candles (read-only).
+
+    The output states the fee rate the fills were priced at. That is not decoration: a profit
+    factor is a statement about net edge, and at this strategy's cost-to-edge ratio the fee is
+    the dominant term, not a rounding detail -- prior numbers printed without it turned out to
+    be maker-priced against a taker fill model (#247).
+    """
     repo = _open_repo(ctx)
     row = _require_rule_row(ctx, repo, rule_id)
     rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
+    fee_pct, fee_source = _backtest_fee(_optional_cfg(ctx))
+    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
     click.echo(
         f"rule {rule_id} ({row['kind']}): n_trades={stats.n_trades} "
         f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
-        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown}"
+        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown} "
+        f"{_describe_fee(fee_pct, fee_source)}"
     )
 
 
@@ -134,10 +220,34 @@ def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) ->
     "a rule's backtest can never reach the min_trades floor -- analogous to `rules seed "
     "--status live`'s gate bypass.",
 )
+@click.option(
+    "--pbo-session",
+    default=None,
+    help="Trials-ledger session label to run the G4 overfitting check (PBO/CSCV) against. "
+    "REQUIRED for promotion: without it the check cannot run, and an un-run check is not a "
+    "pass. Use `keel trials list` to find the session your parameter sweep recorded under.",
+)
+@click.option(
+    "--pbo-blocks", default=16, show_default=True, help="S: number of CSCV row blocks."
+)
 @click.pass_context
 @with_disclaimer
-def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, force: bool) -> None:
-    """Re-run a rule's backtest and advance its lifecycle status if it clears the floor.
+def rules_promote(
+    ctx: click.Context,
+    rule_id: int,
+    granularity: str | None,
+    force: bool,
+    pbo_session: str | None,
+    pbo_blocks: int,
+) -> None:
+    """Re-run a rule's backtest and advance its lifecycle status if it clears the gate.
+
+    The gate is TWO things, and both must pass: the performance floors (G2 -- trades,
+    expectancy, R:R, win rate) and the overfitting check (G4 -- PBO/CSCV against the trial
+    matrix the rule's parameters were selected from, §78). Pass `--pbo-session` to supply the
+    second. **Omitting it does not promote**: a rule that clears four floors on one in-sample
+    parameter set is exactly what PBO exists to be suspicious of, so "nobody checked" is
+    reported as a failing reason rather than quietly treated as fine (#247).
 
     With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
     directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can
@@ -177,7 +287,11 @@ def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, for
 
     config = _load_cfg(ctx)
     rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
+    fee_pct, fee_source = _backtest_fee(config)
+    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
+    click.echo(
+        f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}"
+    )
 
     promo_cfg = promotion_mod.PromotionConfig(
         min_trades=config.promotion.min_trades,
@@ -185,7 +299,15 @@ def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, for
         min_rr=config.promotion.min_rr,
         min_win_rate=float(config.promotion.min_win_rate),
     )
-    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg)
+    pbo_result = _load_pbo(ctx, pbo_session, pbo_blocks)
+    gate = promotion_mod.pbo_gate_from_config(config.research)
+
+    decision = promotion_mod.can_promote(stats, promo_cfg, pbo_result, gate)
+    click.echo(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
+    for reason in decision.reasons:
+        click.echo(f"  - {reason}")
+
+    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg, pbo_result, gate)
     click.echo(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
 
 
