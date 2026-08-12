@@ -13,9 +13,16 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   ambiguous at that resolution: entry-vs-stop ambiguity **invalidates** the trade
   entirely (no fill ever happened); stop-vs-target ambiguity in an open position
   resolves to the stop (a loss).
-- **No overlap:** `detect()` is only called while flat (no pending or open
-  position) — one instrument, one position at a time. A rule whose condition would
-  fire on every bar still yields only sequential, non-overlapping trades.
+- **No overlap:** `detect()` is only called while **flat** — one instrument, one position at a
+  time. A rule whose condition would fire on every bar still yields only sequential,
+  non-overlapping trades. What enforces that is the *open position* check, not the pending one:
+  while flat with an unfilled `Setup`, the rule is re-asked every bar and the stale setup is
+  replaced (#254). Carrying it instead meant a setup whose entry was never revisited pinned
+  `pending` for the rest of the series and `detect()` was never called again — the engine
+  switched its own detector off, indistinguishably from a rule that found no more setups.
+  Re-detecting is not a tunable ("expire after N bars"): it is what production does, since
+  `strategy/engine.py::evaluate` calls `detect()` once per cycle unconditionally and keeps no
+  pending-setup state between cycles.
 - **Costs:** `slippage_pct` worsens the fill price on both entry (paid) and exit
   (received); `fee_pct` is charged on both legs' notional. This models spread +
   slippage + fees (§4.2).
@@ -228,9 +235,27 @@ def backtest(
             entry_touched = _touches(candle, pending.entry)
             stop_touched = _touches(candle, pending.stop)
             if not entry_touched:
-                # Not filled yet this bar (whether or not the stop alone was
-                # touched — the pending order never triggered, so the stop is
-                # irrelevant until entry is actually reached).
+                # Not filled this bar (whether or not the stop alone was touched — the pending
+                # order never triggered, so the stop is irrelevant until entry is reached).
+                #
+                # RE-DETECT rather than carry the stale setup forward (#254). Keeping it meant a
+                # setup whose entry was never revisited pinned `pending` for the rest of the
+                # series, so the `pending is None` branch above never ran again and `detect()`
+                # was never called again — the simulator switched its own detector off, silently,
+                # and the output was indistinguishable from a rule that simply found no more
+                # setups. Measured: `rsi_meanrev` on UNI-USD at oversold=35 stopped detecting in
+                # November 2021 and sat dead for ~40,000 bars, reporting 9 trades against 309 at
+                # the STRICTER oversold=30.
+                #
+                # Re-detecting is not a heuristic choice like "expire after N bars" — it is what
+                # production does. `strategy/engine.py::evaluate` calls `rule.detect()` once per
+                # cycle unconditionally and carries no pending-setup state between cycles, so an
+                # unexecuted setup is simply re-derived from fresh data. N never existed live.
+                #
+                # `candles[: i + 1]` is the same window the `pending is None` branch would use on
+                # this bar, and the fill attempt above already happened, so this introduces no
+                # lookahead: a setup derived on bar i can still only fill on bar i+1 or later.
+                pending = rule.detect(candles_by_tf)
                 continue
             ambiguous_fill = stop_touched
             if ambiguous_fill:
