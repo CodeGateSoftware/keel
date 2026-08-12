@@ -114,7 +114,7 @@ def _pbo(pbo: str = "0.01", slope: str = "-0.2") -> PBOResult:
 def test_can_promote_refuses_when_no_overfitting_evidence_was_supplied() -> None:
     """Clean on all four floors, but nobody ran CSCV -- so this is NOT a promotion.
 
-    The whole point of #248. `research: pbo_max/slope_floor` shipped in every config and
+    The whole point of #247. `research: pbo_max/slope_floor` shipped in every config and
     `g4_pbo_gate` shipped in this module, and nothing called either: promotion was decided on
     four performance floors while the overfitting gate sat dormant. A rule that clears
     expectancy/RR/win-rate on one in-sample parameter set is exactly the thing PBO exists to be
@@ -182,7 +182,7 @@ def test_pbo_gate_thresholds_come_from_config_not_from_reinvented_constants() ->
 def test_transition_does_not_promote_without_overfitting_evidence(repo: Repository) -> None:
     """The gap closes where it actually matters: the DB-writing path.
 
-    `transition` is what moves a rule candidate->paper->live. Before #248 it advanced on the
+    `transition` is what moves a rule candidate->paper->live. Before #247 it advanced on the
     four floors alone; now an un-checked rule stays put. `rules promote --force` remains the
     deliberate, loud, audited bypass for the low-frequency case that can never reach the floor
     -- an operator who wants to override this has a documented door, and it leaves a record.
@@ -401,7 +401,7 @@ def test_transition_promotes_candidate_to_paper_on_passing_stats(repo: Repositor
     rule_id = _insert_rule(repo, "pullback_continuation", status="candidate")
     cfg = PromotionConfig()
 
-    # `pbo=` supplied because promotion now requires an overfitting check to have RUN (#248);
+    # `pbo=` supplied because promotion now requires an overfitting check to have RUN (#247);
     # without it this same call correctly returns "candidate" -- see
     # test_transition_does_not_promote_without_overfitting_evidence.
     new_status = transition(repo, "pullback_continuation", _stats(), cfg, pbo=_pbo())
@@ -424,7 +424,7 @@ def test_transition_promotes_paper_to_live_on_passing_stats(repo: Repository) ->
     rule_id = _insert_rule(repo, "rsi_meanrev", status="paper")
     cfg = PromotionConfig()
 
-    new_status = transition(repo, "rsi_meanrev", _stats(), cfg, pbo=_pbo())  # see #248
+    new_status = transition(repo, "rsi_meanrev", _stats(), cfg, pbo=_pbo())  # see #247
 
     assert new_status == "live"
     assert _rule_status(repo, rule_id) == "live"

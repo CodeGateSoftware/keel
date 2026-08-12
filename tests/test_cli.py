@@ -599,7 +599,7 @@ def test_rules_promote_reports_that_the_overfitting_check_did_not_run(
 ):
     """Without `--pbo-session` the G4 check cannot run, and the output SAYS SO.
 
-    The visible half of #248. Before it, `rules promote` printed only `status -> X` and an
+    The visible half of #247. Before it, `rules promote` printed only `status -> X` and an
     operator had no way to tell that the overfitting gate had never been consulted -- the gate
     was dormant and the output was indistinguishable from one where it had passed.
     """

@@ -247,7 +247,7 @@ def rules_promote(
     matrix the rule's parameters were selected from, §78). Pass `--pbo-session` to supply the
     second. **Omitting it does not promote**: a rule that clears four floors on one in-sample
     parameter set is exactly what PBO exists to be suspicious of, so "nobody checked" is
-    reported as a failing reason rather than quietly treated as fine (#248).
+    reported as a failing reason rather than quietly treated as fine (#247).
 
     With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
     directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can

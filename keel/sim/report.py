@@ -779,7 +779,7 @@ def _render_pbo_section(
 
     `gate_ok=None` means the thresholds were never applied to these numbers, and renders as
     NOT EVALUATED rather than PASS. It used to default to `True` -- a section that printed
-    "G4: PASS" for a gate nobody had run, which is the same defect #248 fixed in the promotion
+    "G4: PASS" for a gate nobody had run, which is the same defect #247 fixed in the promotion
     gate itself, in the module that reports on it.
     """
     status = "NOT EVALUATED" if gate_ok is None else ("PASS" if gate_ok else "FAIL")

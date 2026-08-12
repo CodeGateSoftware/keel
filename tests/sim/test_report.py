@@ -628,7 +628,7 @@ def test_render_markdown_has_all_sections():
 
 
 def test_pbo_section_renders_not_evaluated_when_no_gate_was_applied():
-    """An unevaluated G4 must not print as a passed G4 (#248).
+    """An unevaluated G4 must not print as a passed G4 (#247).
 
     This section used to default `gate_ok` to `True`, so a report carrying PBO diagnostics with
     no thresholds applied announced "G4: PASS" -- the reporting-layer twin of the dormant

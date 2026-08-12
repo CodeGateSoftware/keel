@@ -10,7 +10,7 @@ Per spec §11 (proving gate) and §6.3/§20.7 (edge decay / demotion): a rule st
 
 "Passes" means BOTH gates, not just the performance floors: `can_promote` requires the four
 floors (G2, `check_floors`) **and** the PBO/CSCV overfitting gate (G4, `g4_pbo_gate`). Until
-#248 only the floors were consulted -- `g4_pbo_gate` and `config.research.pbo_max`/`slope_floor`
+#247 only the floors were consulted -- `g4_pbo_gate` and `config.research.pbo_max`/`slope_floor`
 both shipped, and nothing called either -- so a rule advanced toward real money on in-sample
 performance alone, with a dormant gate that looked live. An overfitting check that was never
 run is now reported as `NOT_RUN` and blocks promotion; it is not silently treated as a pass.
@@ -143,7 +143,7 @@ def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, lis
     Returns `(True, [])` on pass, else `(False, reasons)` — one human-readable reason per
     failing floor, so all failures are visible at once rather than only the first.
 
-    **This is not the promotion decision.** It was called `can_promote` until #248, which was
+    **This is not the promotion decision.** It was called `can_promote` until #247, which was
     the whole problem: a rule clearing four performance floors on one in-sample parameter set is
     precisely what §78's overfitting gate exists to be suspicious of, and a function with that
     name reads as authoritative to every caller and reader. The promotion decision is
