@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any, Literal, get_args, get_origin, get_type_hints
 
 import click
+from keel_core.config import ConfigError
 from keel_core.telemetry import log_event
 
 from keel import agent
@@ -85,8 +86,51 @@ def _resolve_granularity(rule: Any, granularity_opt: str | None) -> Granularity 
     return None
 
 
+def _optional_cfg(ctx: click.Context) -> Any | None:
+    """The loaded config, or `None` if there isn't a usable one.
+
+    `rules backtest` is read-only and useful without a deployment config (a bare checkout, a
+    scratch database). It should not start REQUIRING one just to learn a fee rate -- so a
+    missing/invalid config degrades to the library default here rather than aborting. What it
+    must never do is degrade *silently*: the caller pairs this with `_describe_fee`, which
+    prints which of the two sources supplied the rate.
+    """
+    try:
+        return _load_cfg(ctx)
+    except ConfigError:
+        return None
+
+
+def _backtest_fee(config: Any | None) -> tuple[Decimal, str]:
+    """The fee rate to price fills at, and a human-readable statement of where it came from.
+
+    Returns `config.fees.taker_pct` when a config is loaded, else `backtest.TAKER_FEE_PCT`. The
+    two agree by construction (pinned by a test), so the fallback cannot flatter a result; the
+    *source* is returned anyway because "1.2000% (taker, from config `fees.taker_pct`)" and
+    "1.2000% (taker, library default)" answer different questions when a deployment's config
+    turns out not to be the one the operator thought they were running.
+
+    Taker is correct here because `backtest` fills market-style at next-bar open (see
+    `backtest.TAKER_FEE_PCT`). A caller wanting to model resting limit orders instead should
+    pass `fees.maker_pct` explicitly and say so in its output.
+    """
+    if config is None:
+        return backtest_mod.TAKER_FEE_PCT, "taker, library default"
+    return config.fees.taker_pct, "taker, from config `fees.taker_pct`"
+
+
+def _describe_fee(fee_pct: Decimal, source: str) -> str:
+    """`fee_pct=1.2000% (taker, from config ...)` -- the provenance line that travels with every
+    printed backtest number. See `backtest.TAKER_FEE_PCT` for why this is not optional."""
+    return f"fee_pct={fee_pct * 100:.4f}% ({source})"
+
+
 def _run_backtest(
-    ctx: click.Context, repo: Repository, rule: Any, granularity_opt: str | None
+    ctx: click.Context,
+    repo: Repository,
+    rule: Any,
+    granularity_opt: str | None,
+    fee_pct: Decimal,
 ) -> backtest_mod.BacktestResult:
     product_id = getattr(rule, "product_id", None)
     if product_id is None:
@@ -97,7 +141,7 @@ def _run_backtest(
         click.echo("Error: could not determine a granularity; pass --granularity", err=True)
         ctx.exit(1)
     candles = repo.get_candles(product_id, granularity)
-    return backtest_mod.backtest(rule, candles)
+    return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
 
 
 @rules_group.command("backtest")
@@ -108,15 +152,23 @@ def _run_backtest(
 @click.pass_context
 @with_disclaimer
 def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
-    """Backtest a stored rule against its historical candles (read-only)."""
+    """Backtest a stored rule against its historical candles (read-only).
+
+    The output states the fee rate the fills were priced at. That is not decoration: a profit
+    factor is a statement about net edge, and at this strategy's cost-to-edge ratio the fee is
+    the dominant term, not a rounding detail -- prior numbers printed without it turned out to
+    be maker-priced against a taker fill model (#247).
+    """
     repo = _open_repo(ctx)
     row = _require_rule_row(ctx, repo, rule_id)
     rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
+    fee_pct, fee_source = _backtest_fee(_optional_cfg(ctx))
+    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
     click.echo(
         f"rule {rule_id} ({row['kind']}): n_trades={stats.n_trades} "
         f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
-        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown}"
+        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown} "
+        f"{_describe_fee(fee_pct, fee_source)}"
     )
 
 
@@ -177,7 +229,11 @@ def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, for
 
     config = _load_cfg(ctx)
     rule = agent._build_rule(row)
-    stats = _run_backtest(ctx, repo, rule, granularity)
+    fee_pct, fee_source = _backtest_fee(config)
+    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
+    click.echo(
+        f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}"
+    )
 
     promo_cfg = promotion_mod.PromotionConfig(
         min_trades=config.promotion.min_trades,

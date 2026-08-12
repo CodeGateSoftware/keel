@@ -598,12 +598,32 @@ def _render_coverage_section(sim: SimResult) -> list[str]:
     return lines
 
 
-def _render_edge_section(edge: dict[str, BacktestResult]) -> list[str]:
+def _render_edge_section(
+    edge: dict[str, BacktestResult], fee_pct: Decimal | None = None
+) -> list[str]:
+    """The edge table, with the fee its numbers were priced at stated above it.
+
+    The fee line is not optional furniture. A profit factor is a claim about NET edge, and for a
+    strategy whose per-trade move is the same order as its costs, the fee is the dominant term --
+    #247 found every printed figure here priced at the maker rate (0.006) under a taker fill
+    model, which moved profit factors by up to 0.31 and was invisible because the number was
+    never printed beside them. `fee_pct=None` renders "not recorded" rather than omitting the
+    line, so a caller that forgets to pass it produces a visible gap instead of a clean-looking
+    table.
+    """
+    fee_note = (
+        f"Fills priced at **{fee_pct * 100:.4f}%** per leg (taker) plus slippage."
+        if fee_pct is not None
+        else "**Fee rate not recorded for this run** -- these figures cannot be compared "
+        "against runs priced differently."
+    )
     lines = [
         "## Edge table",
         "",
         "Per-rule and pooled backtest stats (unit-less R-multiples). "
         f"`{POOLED_KEY}` is the pooled sample G2 is checked against.",
+        "",
+        fee_note,
         "",
         "| Rule | N | Win% | Expectancy | Avg win | Avg loss | Profit factor | Max DD | "
         "Losing streak | Avg MFE | Avg MAE |",
@@ -809,6 +829,7 @@ def render_markdown(
     tier_results: list[TierFeeResult] | None = None,
     pbo_result: PBOResult | None = None,
     pbo_gate: tuple[bool, list[str]] | None = None,
+    fee_pct: Decimal | None = None,
 ) -> str:
     """Render the full report (spec §6 structure, plus Issue #86's tier/fee matrix) as one
     Markdown string.
@@ -825,7 +846,7 @@ def render_markdown(
     sections = [
         _render_verdict_section(verdict, in_sample),
         _render_coverage_section(sim),
-        _render_edge_section(edge),
+        _render_edge_section(edge, fee_pct),
         _render_account_section(account_metrics),
         _render_benchmark_section(account_metrics, benchmark),
         _render_tier_section(tier_results or []),

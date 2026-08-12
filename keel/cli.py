@@ -123,6 +123,7 @@ from keel.sim import metrics as metrics_mod
 from keel.sim import portfolio_sim
 from keel.sim import report as report_mod
 from keel.sim import tiers as tiers_mod
+from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Candle, Granularity
 from keel.version import build_info, check_install
@@ -1686,10 +1687,29 @@ def pnl(ctx: click.Context, asset: str | None, raw_marks: tuple[str, ...]) -> No
 
 # -- simulate (Sim Task 8) -------------------------------------------------------------------
 
-# Match `strategy/backtest.backtest`'s / `sim/portfolio_sim.run`'s own defaults so the edge
-# table, the account pass, and the benchmarks all price fills identically.
-_SIM_FEE_PCT = Decimal("0.006")
+# Fallback execution friction for the simulate pass, used only when a rate cannot be read from
+# config. `simulate` sources the fee from `config.fees.taker_pct` instead (see `_sim_fee_pct`),
+# so the edge table, the account pass, the tier matrix and the benchmarks still price fills
+# identically -- the property this constant used to provide, now at a rate the deployment
+# controls.
+#
+# It was `Decimal("0.006")` until #247, deliberately matching `strategy/backtest.backtest`'s and
+# `sim/portfolio_sim.run`'s own defaults. Those defaults were the MAKER rate under a taker fill
+# model, so the consistency was real and the number was wrong -- every simulate report, edge
+# table and benchmark comparison was priced at half the cost of trading
+# (`docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md` §5).
+_SIM_FEE_PCT = backtest_mod.TAKER_FEE_PCT
 _SIM_SLIPPAGE_PCT = Decimal("0.0005")
+
+
+def _sim_fee_pct(config: Config) -> Decimal:
+    """The rate `simulate` prices every fill at: the deployment's own `fees.taker_pct`.
+
+    Taker because every simulated fill in this project is market-style (`backtest` fills at a
+    touched level, `SimAccount` at next-bar open); a deployment on a different volume tier or
+    venue moves the rate by editing config, not code.
+    """
+    return config.fees.taker_pct
 _SIM_GRANULARITIES = [Granularity.ONE_HOUR, Granularity.ONE_DAY]
 _DAYS_PER_YEAR = 365
 
@@ -1882,7 +1902,7 @@ def _build_tier_results(
             start_ts=start_ts,
             end_ts=now_ts,
             monthly_contribution=monthly_contribution,
-            fee_pct=_SIM_FEE_PCT,
+            fee_pct=_sim_fee_pct(config),
             slippage_pct=_SIM_SLIPPAGE_PCT,
             monthly_volume_cap=tier.free_volume_usd,
         )
@@ -2025,7 +2045,12 @@ def simulate(
     candles_by_asset, prices_by_asset = _load_sim_candles(repo, product_list, start_ts, now_ts)
     rules = [agent._build_rule(row) for row in repo.get_rules()]
 
-    edge = report_mod.edge_table(rules, candles_by_asset, _SIM_FEE_PCT, _SIM_SLIPPAGE_PCT)
+    # One rate for the whole pass -- edge table, account sim, and both benchmarks -- so the
+    # report's comparisons stay like-for-like. Sourced from config, and reported in the header
+    # below rather than left for the reader to assume.
+    sim_fee_pct = _sim_fee_pct(config)
+
+    edge = report_mod.edge_table(rules, candles_by_asset, sim_fee_pct, _SIM_SLIPPAGE_PCT)
 
     sim = portfolio_sim.run(
         rules,
@@ -2034,7 +2059,7 @@ def simulate(
         start_ts=start_ts,
         end_ts=now_ts,
         monthly_contribution=monthly_contribution,
-        fee_pct=_SIM_FEE_PCT,
+        fee_pct=sim_fee_pct,
         slippage_pct=_SIM_SLIPPAGE_PCT,
     )
     sim.coverage = coverage
@@ -2046,13 +2071,13 @@ def simulate(
         config.target_weights,
         monthly_contribution,
         months,
-        _SIM_FEE_PCT,
+        sim_fee_pct,
         _SIM_SLIPPAGE_PCT,
     )
     # Secondary benchmark (spec: DCA-into-BTC); not fed into the verdict gate, but computed so
     # a future report revision can surface it without another sim pass.
     benchmark_mod.dca_into_btc(
-        prices_by_asset, monthly_contribution, months, _SIM_FEE_PCT, _SIM_SLIPPAGE_PCT
+        prices_by_asset, monthly_contribution, months, sim_fee_pct, _SIM_SLIPPAGE_PCT
     )
 
     promo_cfg = promotion_mod.PromotionConfig(
@@ -2126,6 +2151,7 @@ def simulate(
         gaps,
         in_sample=True,
         tier_results=tier_results,
+        fee_pct=sim_fee_pct,
     )
 
     out = Path(out_path) if out_path is not None else _default_report_path(now_ts)

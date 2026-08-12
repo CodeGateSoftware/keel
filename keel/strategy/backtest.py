@@ -37,7 +37,36 @@ from keel.strategy.rules.base import Rule, Setup, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
 
-__all__ = ["BacktestResult", "backtest"]
+__all__ = ["TAKER_FEE_PCT", "BacktestResult", "backtest"]
+
+# The default rate `backtest` charges per leg, and the reason it is the TAKER rate.
+#
+# This module fills market-style: a pending `Setup` fills the moment a later bar's range
+# touches its entry, at that level plus slippage. That is a marketable order crossing the
+# spread -- taker behaviour -- so the taker rate is the one that prices it. Until #247 this
+# default was the MAKER rate (0.006) while the fill model was unchanged, and the two halves of
+# the project disagreed **in writing**: `config.yaml`'s own `fees:` comment says "taker_pct is
+# the sim's default -- it fills market-style at next-bar open", and `keel_core.config
+# .FeesConfig` has carried `taker_pct = 0.012` as its default the whole time. The config was
+# the half that was right about the execution model.
+#
+# The consequence was not cosmetic. Fees are charged on BOTH legs, so round-trip friction
+# (2 x fee + 2 x slippage) ran at 1.30% of notional instead of 2.50% -- a 1.92x understatement
+# of the dominant cost term for a strategy whose per-trade edge is the same order of magnitude
+# as its costs. `promotion.can_promote` reads expectancy, win rate and realized R:R straight off
+# these stats, so the promotion gate itself was evaluating rules at half the price of trading
+# them (`docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md` §5).
+#
+# Where a caller HAS a loaded `Config`, it should thread `config.fees.taker_pct` in explicitly
+# rather than lean on this constant -- a deployment on a different volume tier or venue must be
+# able to move the rate without editing code. This default exists for callers that genuinely
+# have no config (library use, tests, ad-hoc analysis). It is deliberately the conservative
+# choice of the two published rates: a default that overstates cost cannot manufacture an edge
+# that isn't there, and a default that understates it already did exactly that.
+#
+# `tests/strategy/test_backtest.py::test_taker_fee_constant_tracks_the_config_schema_default`
+# fails if this drifts from `FeesConfig.taker_pct`.
+TAKER_FEE_PCT = Decimal("0.012")
 
 # Default key used to present the single candle series to `Rule.detect()`/
 # `Rule.exit_signal()` in the `dict[Granularity, list[Candle]]` shape the interface
@@ -168,7 +197,7 @@ def backtest(
     rule: Rule,
     candles: list[Candle],
     finer_candles: list[Candle] | None = None,
-    fee_pct: Decimal = Decimal("0.006"),
+    fee_pct: Decimal = TAKER_FEE_PCT,
     slippage_pct: Decimal = Decimal("0.0005"),
 ) -> BacktestResult:
     """Simulate `rule` over `candles` (ascending by `ts`), one position at a time.
@@ -176,6 +205,12 @@ def backtest(
     `finer_candles` (optional) is a finer-granularity series covering the same
     period, consulted only to resolve intrabar ambiguity (a bar whose range spans
     two of entry/stop/target at once).
+
+    `fee_pct` defaults to `TAKER_FEE_PCT`, the rate that matches this module's own
+    market-style fill model; see that constant for why, and prefer threading
+    `config.fees.taker_pct` in from a loaded `Config` when the caller has one. Whatever a
+    caller passes, it should **report the rate alongside the result** -- a profit factor
+    printed without its fee cannot be checked by the person reading it.
     """
     trades: list[Trade] = []
     position: _OpenPosition | None = None

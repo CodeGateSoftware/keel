@@ -19,6 +19,7 @@ from keel.sim.report import (
     POOLED_KEY,
     GapItem,
     Verdict,
+    _render_edge_section,
     analyze_gaps,
     build_verdict,
     edge_table,
@@ -622,6 +623,24 @@ def test_render_markdown_has_all_sections():
         assert heading.lower() in md.lower()
     assert "IN-SAMPLE" in md
     assert "GO-LIVE candidate" in md
+
+
+def test_edge_table_states_the_fee_its_numbers_were_priced_at():
+    """A profit factor without its fee is an unfalsifiable number (#247)."""
+    md = _render_edge_section({POOLED_KEY: _pooled_result()}, Decimal("0.012"))
+
+    assert "1.2000%" in "\n".join(md)
+
+
+def test_edge_table_says_so_loudly_when_the_fee_was_not_recorded():
+    """The absent case must read as a GAP, not as a clean table.
+
+    Same principle as the promotion gate's absent PBO: a caller that omits the rate should
+    produce output that visibly lacks it, never output that looks complete.
+    """
+    md = "\n".join(_render_edge_section({POOLED_KEY: _pooled_result()}, None))
+
+    assert "not recorded" in md.lower()
 
 
 def test_render_markdown_out_of_sample_label():

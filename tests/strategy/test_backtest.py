@@ -9,9 +9,23 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from keel.strategy.backtest import BacktestResult, backtest
+from keel_core.config import FeesConfig
+
+from keel.strategy.backtest import TAKER_FEE_PCT, BacktestResult, backtest
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity, Side
+
+
+def test_taker_fee_constant_tracks_the_config_schema_default() -> None:
+    """`backtest.TAKER_FEE_PCT` and `FeesConfig.taker_pct` must not drift apart.
+
+    They are deliberately two constants rather than one import: `backtest.py` keeps itself free
+    of config-package coupling (the same reason it imports no concrete `Rule`). That freedom is
+    only safe if drift is a CI failure rather than a discovery, which is what this test is --
+    the library default and the value a config-bearing caller threads in must name the same
+    rate, or the "which fee did this number use?" question has two answers again.
+    """
+    assert TAKER_FEE_PCT == FeesConfig().taker_pct
 
 
 def _candle(ts: int, o: str, h: str, l: str, c: str) -> Candle:  # noqa: E741 - matches OHLC convention
@@ -148,6 +162,27 @@ class TestKnownWinningTrade:
         assert trade.mae == expected_mae
         assert result.avg_mfe == expected_mfe
         assert result.avg_mae == expected_mae
+
+    def test_default_fee_is_the_taker_rate_not_the_maker_rate(self) -> None:
+        """The simulator fills market-style at next-bar open, which is TAKER behaviour, so the
+        default it charges must be the taker rate.
+
+        Pinned as a *behavioural* assertion (the P&L the default actually produces), not just
+        the constant's value: until #247 the default was the MAKER rate (0.006) while the fill
+        model was taker, so every profit factor this project printed -- including the input to
+        `promotion.can_promote` -- was priced at half the real cost of trading. The equality
+        against an explicit `fee_pct=TAKER_FEE_PCT` is what fails if the default ever drifts
+        back down; the inequality against the maker rate is what fails if the two are confused
+        again.
+        """
+        default_run = backtest(self._rule(), self._candles())
+        taker_run = backtest(self._rule(), self._candles(), fee_pct=TAKER_FEE_PCT)
+        maker_run = backtest(self._rule(), self._candles(), fee_pct=Decimal("0.006"))
+
+        assert default_run.trades[0].pnl == taker_run.trades[0].pnl
+        assert default_run.trades[0].pnl != maker_run.trades[0].pnl
+        # The maker rate flatters: half the cost, so strictly more profit.
+        assert maker_run.trades[0].pnl > default_run.trades[0].pnl
 
     def test_fees_and_slippage_applied_on_entry_and_exit(self) -> None:
         result = backtest(

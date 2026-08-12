@@ -27,6 +27,7 @@ from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
+from tests.conftest import VALID_CONFIG_YAML
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
 
@@ -406,6 +407,54 @@ def test_rules_backtest_with_no_candles_reports_zero_trades(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "n_trades=0" in result.output
+
+
+def test_rules_backtest_states_the_fee_rate_it_priced_fills_at(tmp_path, valid_config_path):
+    """The output line must name the fee it used.
+
+    This is the half of #247 that matters most and the half that keeps mattering: a printed
+    `profit_factor` with no fee beside it is unfalsifiable by its reader. Every number in
+    `docs/experiments/` predating this line was maker-priced and said nothing about it, which
+    is precisely how a 2x cost error survived in a shipped gate. The rate travels WITH the
+    result from here on.
+    """
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path), "rules", "backtest",
+         str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "fee_pct=1.2000%" in result.output
+    assert "taker" in result.output
+
+
+def test_rules_backtest_prices_fills_at_the_configs_taker_rate(tmp_path, write_config):
+    """The rate comes from `fees.taker_pct`, not from a constant that merely happens to agree.
+
+    A deployment that edits `fees.taker_pct` (a different Coinbase volume tier, a different
+    venue) must see the backtest follow it. Asserted with a rate no default anywhere in the
+    tree uses, so passing this cannot be an accident of matching numbers.
+    """
+    config_path = write_config(
+        VALID_CONFIG_YAML + "\nfees:\n  taker_pct: 0.03\n  maker_pct: 0.01\n"
+    )
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "rules", "backtest", str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "fee_pct=3.0000%" in result.output
 
 
 def test_rules_backtest_unknown_rule_id_errors(tmp_path):
