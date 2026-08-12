@@ -4,25 +4,36 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
 `BacktestResult`. Per spec §12 (and the supporting knowledge-base sources §2.3/§4.2/
 §20.2/§20.5):
 
-- **Intrabar resolution:** a rule's `Setup` (entry/stop/target) is a *pending* order;
-  when a single bar's range spans two of these levels at once (e.g. both entry and
-  stop, or both stop and target), the order they were touched in is ambiguous from
-  that bar alone. We resolve it using `finer_candles` covering that bar's time span,
-  falling back to the conservative outcome ("backtesting exists to lower
-  expectations, not raise them") when finer data isn't available or is still
-  ambiguous at that resolution: entry-vs-stop ambiguity **invalidates** the trade
-  entirely (no fill ever happened); stop-vs-target ambiguity in an open position
-  resolves to the stop (a loss).
+- **Entries fill at the next bar's open (#257).** Production places MARKET orders —
+  `execution/executor.py::_order_row` writes `order_type="market"`, `limit_price=None`, and keeps
+  the setup's own price only as `expected_fill`. So a `Setup` detected on bar `i` is filled at
+  `candles[i+1].open` plus slippage, the first price obtainable once the signal exists.
+  **`Setup.entry` is informational here**, exactly as `expected_fill` is live; risk is measured
+  from the achieved fill against the setup's stop, never from the quoted entry.
+
+  The previous model waited for a later bar's range to *touch* `entry` and filled at that level.
+  That gave the simulator free optionality on the entry price (unfavourable entries were silently
+  declined, since a setup only became a trade if the market offered the chosen level) and
+  unbounded patience — neither of which production has, and both of which flattered results.
+
+  A consequence worth naming: a rule that encodes a *confirmation* condition in its entry price no
+  longer gets one. `pullback_continuation` sets `entry = signal_candle.high + buffer` precisely to
+  demand follow-through, and a market fill takes trades it meant to decline. That is not
+  introduced here — it is what the live box already does, and modelling it faithfully is the
+  point. Making the executor honour a stop/limit entry is the alternative, and belongs in the
+  executor rather than in this module (#257, "Option B").
+- **Intrabar resolution:** when a single bar's range spans both the stop and the target, the order
+  they were touched in is ambiguous from that bar alone. We resolve it using `finer_candles`
+  covering that bar's time span, falling back to the conservative outcome ("backtesting exists to
+  lower expectations, not raise them") when finer data isn't available or is still ambiguous at
+  that resolution: stop-vs-target ambiguity resolves to the **stop** (a loss). This applies on the
+  fill bar too — filling at the open means the rest of that bar can reach either level.
 - **No overlap:** `detect()` is only called while **flat** — one instrument, one position at a
   time. A rule whose condition would fire on every bar still yields only sequential,
-  non-overlapping trades. What enforces that is the *open position* check, not the pending one:
-  while flat with an unfilled `Setup`, the rule is re-asked every bar and the stale setup is
-  replaced (#254). Carrying it instead meant a setup whose entry was never revisited pinned
-  `pending` for the rest of the series and `detect()` was never called again — the engine
-  switched its own detector off, indistinguishably from a rule that found no more setups.
-  Re-detecting is not a tunable ("expire after N bars"): it is what production does, since
-  `strategy/engine.py::evaluate` calls `detect()` once per cycle unconditionally and keeps no
-  pending-setup state between cycles.
+  non-overlapping trades. It is the *open position* that enforces this. (Under the touch-fill
+  model an unfilled setup could pin `pending` forever and silently switch the detector off; #254
+  fixed that by re-detecting each bar, and #257 makes the situation unreachable — every pending
+  now fills on the very next bar.)
 - **Costs:** `slippage_pct` worsens the fill price on both entry (paid) and exit
   (received); `fee_pct` is charged on both legs' notional. This models spread +
   slippage + fees (§4.2).
@@ -48,9 +59,17 @@ __all__ = ["TAKER_FEE_PCT", "BacktestResult", "backtest"]
 
 # The default rate `backtest` charges per leg, and the reason it is the TAKER rate.
 #
-# This module fills market-style: a pending `Setup` fills the moment a later bar's range
-# touches its entry, at that level plus slippage. That is a marketable order crossing the
-# spread -- taker behaviour -- so the taker rate is the one that prices it. Until #247 this
+# This module fills market-style: a `Setup` detected on bar i fills at bar i+1's OPEN plus
+# slippage (#257), mirroring the market order `execution/executor.py` actually places. That is a
+# marketable order crossing the spread -- taker behaviour -- so the taker rate prices it.
+#
+# #257 also removed the one wrinkle in this justification. Under the previous touch-fill model the
+# claim held only for a rule whose entry sat ABOVE the market (a breakout, i.e. a stop order,
+# genuinely marketable) and was wrong for one whose entry sat BELOW it (`rsi_meanrev` buying near
+# support, which touching would make a resting MAKER fill). Now that every entry is a market
+# order at the open, the taker rate is the right one for all of them, unconditionally.
+#
+# Until #247 this
 # default was the MAKER rate (0.006) while the fill model was unchanged, and the two halves of
 # the project disagreed **in writing**: `config.yaml`'s own `fees:` comment says "taker_pct is
 # the sim's default -- it fills market-style at next-bar open", and `keel_core.config
@@ -232,61 +251,46 @@ def backtest(
             continue
 
         if position is None and pending is not None:
-            entry_touched = _touches(candle, pending.entry)
-            stop_touched = _touches(candle, pending.stop)
-            if not entry_touched:
-                # Not filled this bar (whether or not the stop alone was touched — the pending
-                # order never triggered, so the stop is irrelevant until entry is reached).
-                #
-                # RE-DETECT rather than carry the stale setup forward (#254). Keeping it meant a
-                # setup whose entry was never revisited pinned `pending` for the rest of the
-                # series, so the `pending is None` branch above never ran again and `detect()`
-                # was never called again — the simulator switched its own detector off, silently,
-                # and the output was indistinguishable from a rule that simply found no more
-                # setups. Measured: `rsi_meanrev` on UNI-USD at oversold=35 stopped detecting in
-                # November 2021 and sat dead for ~40,000 bars, reporting 9 trades against 309 at
-                # the STRICTER oversold=30.
-                #
-                # Re-detecting is not a heuristic choice like "expire after N bars" — it is what
-                # production does. `strategy/engine.py::evaluate` calls `rule.detect()` once per
-                # cycle unconditionally and carries no pending-setup state between cycles, so an
-                # unexecuted setup is simply re-derived from fresh data. N never existed live.
-                #
-                # `candles[: i + 1]` is the same window the `pending is None` branch would use on
-                # this bar, and the fill attempt above already happened, so this introduces no
-                # lookahead: a setup derived on bar i can still only fill on bar i+1 or later.
-                pending = rule.detect(candles_by_tf)
-                continue
-            ambiguous_fill = stop_touched
-            if ambiguous_fill:
-                order = _resolve_order(
-                    i, candles, finer_candles, {"entry": pending.entry, "stop": pending.stop}
-                )
-                if order != "entry":
-                    # Stop breached before (or indistinguishably from) entry:
-                    # invalidate — no fill ever happened.
-                    pending = None
-                    continue
+            # PRODUCTION PLACES MARKET ORDERS (#257). `execution/executor.py::_order_row` writes
+            # `order_type="market"`, `limit_price=None`, and records the setup's own price only as
+            # `expected_fill`. So live never rests an order at `Setup.entry` and never waits for
+            # price to come to it: when `engine.evaluate` emits a signal and the rails pass, the
+            # executor buys at market on that cycle.
+            #
+            # This branch runs on the bar AFTER detection, so `candle.open` is the first price
+            # obtainable once the signal exists — the faithful analogue of that market order, and
+            # the earliest fill that involves no lookahead.
+            #
+            # What this replaces, and why it had to go: the previous model held the setup until a
+            # later bar's range TOUCHED `entry`, then filled AT that level. That granted the
+            # simulator two things production does not have — free optionality on the entry price
+            # (a setup only became a trade if the market offered the chosen level, so unfavourable
+            # entries were silently declined) and unbounded patience. Both flatter results, and
+            # the bias runs opposite to #254's, which suppressed trades.
+            #
+            # `Setup.entry` is therefore now INFORMATIONAL in the backtest, exactly as
+            # `expected_fill` is live. Risk is measured from the achieved fill against the setup's
+            # stop (`_close_trade`), never from the quoted entry, so nothing downstream reads it.
+            #
+            # Consequence worth stating: a rule whose entry encodes a CONFIRMATION condition no
+            # longer gets it. `pullback_continuation` sets `entry = signal_candle.high + buffer`
+            # precisely to require follow-through, and under a market fill it takes trades it
+            # meant to decline. That is not introduced here — it is what the live box already
+            # does, and modelling it is the point. Fixing it belongs in the executor, not here
+            # (the Option B discussion on #257).
             position = _OpenPosition(
                 setup=pending,
-                entry_fill=pending.entry * (Decimal(1) + slippage_pct),
+                entry_fill=candle.open * (Decimal(1) + slippage_pct),
                 entry_ts=candle.ts,
                 mfe=Decimal(0),
                 mae=Decimal(0),
             )
             pending = None
-            if ambiguous_fill:
-                # Finer data was already spent to prove entry hit before stop.
-                # Re-checking this same bar's raw (coarse) range for stop/target
-                # would spuriously re-trigger the very stop level finer data just
-                # showed was touched *before* entry. Defer stop/target resolution
-                # for the remainder of this bar to the next bar's coarse data.
-                position.mfe = max(position.mfe, candle.high - position.entry_fill)
-                position.mae = max(position.mae, position.entry_fill - candle.low)
-                continue
-            # Stop is known clear this bar (simple, unambiguous fill); fall
-            # through to the shared stop/target/exit-signal check below, which
-            # for this bar only needs to consider the target.
+            # Fall through to the shared stop/target block for the REMAINDER of this bar. Unlike
+            # the old unambiguous-fill path, the stop is NOT known clear here — we filled at the
+            # open, so this bar's range can reach either level, and the shared block's
+            # stop-vs-target `_resolve_order` is exactly the right adjudicator.
+
 
         assert position is not None  # noqa: S101 - narrows type for the checks below
         position.mfe = max(position.mfe, candle.high - position.entry_fill)

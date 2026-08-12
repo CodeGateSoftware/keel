@@ -134,7 +134,7 @@ class TestKnownWinningTrade:
         return [
             _candle(0, "100", "101", "99", "100"),  # baseline; rule doesn't fire yet
             _candle(60, "104", "106", "103", "105"),  # trigger bar: rule fires here
-            _candle(120, "105", "112", "104", "108"),  # fill bar: touches entry(110) only
+            _candle(120, "105", "112", "104", "108"),  # fill bar: fills at its open (105)
             _candle(180, "111", "135", "109", "132"),  # exit bar: touches target(130) only
         ]
 
@@ -156,7 +156,8 @@ class TestKnownWinningTrade:
         result = backtest(self._rule(), self._candles())
 
         trade = result.trades[0]
-        entry_fill = Decimal(110) * Decimal("1.0005")
+        # #257: filled at the FILL BAR's open (105), not at the setup's quoted entry (110).
+        entry_fill = Decimal(105) * Decimal("1.0005")
         expected_mfe = Decimal("135") - entry_fill  # highest high (exit bar) minus entry fill
         expected_mae = entry_fill - Decimal("104")  # lowest low (fill bar) minus entry fill
         assert trade.mfe == expected_mfe
@@ -191,7 +192,8 @@ class TestKnownWinningTrade:
         )
 
         trade = result.trades[0]
-        entry_fill = Decimal(110) * Decimal("1.0005")
+        # #257: entry is the fill bar's open plus slippage; the setup's 110 is informational.
+        entry_fill = Decimal(105) * Decimal("1.0005")
         exit_fill = Decimal(130) * (Decimal(1) - Decimal("0.0005"))
         entry_fee = entry_fill * Decimal("0.006")
         exit_fee = exit_fill * Decimal("0.006")
@@ -204,54 +206,11 @@ class TestKnownWinningTrade:
         assert result.expectancy == expected_pnl
 
 
-class TestIntrabarResolutionEntryVsStop:
-    """A fill-seeking bar's range spans both the entry and the stop level: ambiguous
-    without finer data. `finer_candles` must resolve the true order of events.
-    """
-
-    def _candles(self) -> list[Candle]:
-        return [
-            _candle(0, "100", "101", "99", "100"),
-            _candle(60, "104", "106", "103", "105"),  # trigger bar
-            # fill-seeking bar: spans BOTH entry(110) and stop(100) -> ambiguous
-            _candle(120, "105", "115", "95", "112"),
-            _candle(180, "112", "135", "111", "132"),
-        ]
-
-    def _rule(self) -> _ScriptedRule:
-        return _ScriptedRule(
-            trigger_ts=60, entry=Decimal(110), stop=Decimal(100), target=Decimal(130)
-        )
-
-    def test_finer_candles_showing_stop_first_invalidates_the_trade(self) -> None:
-        finer = [
-            # within [120, 180): price dips to touch stop(100) before ever reaching entry(110)
-            _candle(125, "105", "106", "99", "100"),
-            _candle(140, "100", "112", "99", "111"),
-        ]
-        result = backtest(self._rule(), self._candles(), finer_candles=finer)
-
-        # invalidated: the setup never resulted in a real fill, so no trade is recorded
-        assert result.n_trades == 0
-        assert result.trades == []
-        assert result.expectancy == Decimal(0)
-
-    def test_finer_candles_showing_entry_first_fills_and_continues(self) -> None:
-        finer = [
-            # within [120, 180): price rises to touch entry(110) before ever touching stop(100)
-            _candle(125, "105", "111", "104", "110"),
-            _candle(140, "110", "116", "109", "112"),
-        ]
-        result = backtest(self._rule(), self._candles(), finer_candles=finer)
-
-        assert result.n_trades == 1
-        assert result.trades[0].outcome == "win"
-
-    def test_ambiguous_bar_without_finer_candles_is_conservatively_invalidated(self) -> None:
-        result = backtest(self._rule(), self._candles(), finer_candles=None)
-
-        assert result.n_trades == 0
-        assert result.trades == []
+# NOTE: `TestIntrabarResolutionEntryVsStop` was deleted by #257. It exercised the resolution of
+# a bar whose range spanned both the entry and the stop -- a question that only arises when an
+# entry is a resting order seeking a level. Entries now fill at the next bar's open, so that
+# ambiguity is unreachable and the code path it covered is gone. `_resolve_order` is still
+# exercised for the stop-vs-target case, which remains real (see the shared exit block).
 
 
 class TestNoOverlap:
@@ -331,37 +290,42 @@ class _StaleThenReachableRule(Rule):
         return {"name": self.name, "params": self.params}
 
 
-class TestPendingSetupDoesNotFreezeDetection:
-    """#254: an unfilled setup must not switch the detector off for the rest of the series."""
+class TestEntryFillsAtNextBarOpen:
+    """#257: production places market orders, so an entry fills at the next bar's open.
+
+    This also subsumes #254. That defect was a setup whose entry level was never revisited
+    pinning `pending` forever, which switched the detector off for the rest of the series
+    (`rsi_meanrev` on UNI-USD at oversold=35: dead from November 2021, 9 trades against 309 at
+    the STRICTER oversold=30). Under a market fill every pending resolves on the very next bar,
+    so the state that caused it is now unreachable rather than merely handled.
+    """
 
     def _candles(self) -> list[Candle]:
         return [
-            _candle(0, "100", "101", "99", "100"),  # unreachable setup emitted here
-            _candle(60, "100", "102", "99", "101"),  # entry(1000) untouched, stop(900) untouched
-            _candle(120, "101", "103", "100", "102"),  # switch_ts: a fillable setup is now offered
-            _candle(180, "103", "112", "102", "111"),  # touches entry(110)
-            _candle(240, "111", "132", "110", "131"),  # touches target(130)
+            _candle(0, "100", "101", "99", "100"),  # rule fires here
+            _candle(60, "102", "103", "101", "102"),  # FILL bar: opens 102, never nears 1000
+            _candle(120, "102", "103", "101", "102"),
         ]
 
-    def test_unfilled_setup_is_replaced_so_a_later_setup_can_still_fill(self) -> None:
-        rule = _StaleThenReachableRule(switch_ts=120)
-        result = backtest(rule, self._candles())
+    def test_setup_fills_at_the_next_bars_open_not_its_quoted_entry(self) -> None:
+        """The entry level is never touched, and the trade happens anyway."""
+        rule = _StaleThenReachableRule(switch_ts=10**9)  # always the unreachable setup
+        result = backtest(rule, self._candles(), slippage_pct=Decimal("0.0005"))
 
-        # Before the fix this was 0: the ts=0 setup pinned `pending`, so the fillable setup
-        # offered from ts=120 was never requested, let alone filled.
-        assert result.n_trades == 1
-        assert result.trades[0].outcome == "win"
+        # Before #257 this was zero trades: entry(1000) was never touched, so nothing filled.
+        assert len(result.trades) == 1
+        assert result.trades[0].entry == Decimal(102) * Decimal("1.0005")
 
-    def test_detect_is_called_on_every_flat_bar(self) -> None:
-        """The contract that replaced 'detect only while pending is None'.
+    def test_detector_cannot_be_frozen_by_an_unfilled_setup(self) -> None:
+        """The #254 regression, restated for the model that makes it impossible.
 
-        A position still blocks detection (see `TestNoOverlap`); an unfilled *pending* no longer
-        does, which is what `strategy/engine.py::evaluate` does live -- it calls `detect()` once
-        per cycle unconditionally and carries no pending state between cycles.
+        Bar 0 detects; bar 60 fills. Detection stops only because a position is open -- never
+        because a stale setup is pinned.
         """
-        rule = _StaleThenReachableRule(switch_ts=120)
+        rule = _StaleThenReachableRule(switch_ts=10**9)
         backtest(rule, self._candles())
 
-        # Bars 0,60,120 are flat and each must ask the rule. Bar 180 fills and bar 240 exits,
-        # so detection legitimately stops there.
-        assert rule.detect_calls == 3
+        # Exactly one: bar 0 detects, bar 60 fills, bar 120 holds. Under #256's re-detect
+        # model this was 3 (every flat bar re-asked, because nothing ever filled) -- so this
+        # number is also what distinguishes the two fill models.
+        assert rule.detect_calls == 1
