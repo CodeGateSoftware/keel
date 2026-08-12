@@ -76,9 +76,10 @@ class _ScriptedRule(Rule):
 class _AlwaysOnRule(Rule):
     """Would fire a signal on EVERY bar it's asked, if the backtester let it.
 
-    Used to prove overlapping signals are not double-counted: the backtester must
-    only call `detect()` while flat (no pending or open position), so a persistent
-    "always true" condition must still yield only sequential, non-overlapping trades.
+    Used to prove overlapping signals are not double-counted: the backtester must only call
+    `detect()` while flat, so a persistent "always true" condition must still yield only
+    sequential, non-overlapping trades. Note it is the OPEN POSITION that blocks re-detection --
+    an unfilled pending setup does not, and is replaced each bar (#254).
     """
 
     name = "always_on"
@@ -285,3 +286,82 @@ class TestNoOverlap:
         assert len(result.trades) == 1
         assert result.trades[0].outcome == "open"
         assert result.trades[0].exit is None
+
+
+class _StaleThenReachableRule(Rule):
+    """Emits an UNREACHABLE setup first, then a fillable one from `switch_ts` onward.
+
+    The regression fixture for #254. The first setup's entry is never touched and neither is its
+    stop, which is precisely the state that used to pin `pending` forever: the backtester's
+    `pending is None` branch never ran again, `detect()` was never called again, and the second,
+    fillable setup was never seen. Measured in the wild as `rsi_meanrev` on UNI-USD at
+    oversold=35 -- 9 trades and a detector dead from November 2021, against 309 trades at the
+    STRICTER oversold=30.
+    """
+
+    name = "stale_then_reachable"
+    params: dict = {}
+
+    def __init__(self, switch_ts: int) -> None:
+        self.switch_ts = switch_ts
+        self.detect_calls = 0
+
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        self.detect_calls += 1
+        window = next(iter(candles_by_tf.values()))
+        latest = window[-1]
+        # Far above every price in the series, so neither entry nor stop is ever touched.
+        entry, stop, target = (Decimal(1000), Decimal(900), Decimal(1100))
+        if latest.ts >= self.switch_ts:
+            entry, stop, target = (Decimal(110), Decimal(95), Decimal(130))
+        return Setup(
+            product_id="BTC-USD",
+            direction="long",
+            entry=entry,
+            stop=stop,
+            target=target,
+            context={},
+            ts=latest.ts,
+        )
+
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
+        return False
+
+    def describe(self) -> dict:
+        return {"name": self.name, "params": self.params}
+
+
+class TestPendingSetupDoesNotFreezeDetection:
+    """#254: an unfilled setup must not switch the detector off for the rest of the series."""
+
+    def _candles(self) -> list[Candle]:
+        return [
+            _candle(0, "100", "101", "99", "100"),  # unreachable setup emitted here
+            _candle(60, "100", "102", "99", "101"),  # entry(1000) untouched, stop(900) untouched
+            _candle(120, "101", "103", "100", "102"),  # switch_ts: a fillable setup is now offered
+            _candle(180, "103", "112", "102", "111"),  # touches entry(110)
+            _candle(240, "111", "132", "110", "131"),  # touches target(130)
+        ]
+
+    def test_unfilled_setup_is_replaced_so_a_later_setup_can_still_fill(self) -> None:
+        rule = _StaleThenReachableRule(switch_ts=120)
+        result = backtest(rule, self._candles())
+
+        # Before the fix this was 0: the ts=0 setup pinned `pending`, so the fillable setup
+        # offered from ts=120 was never requested, let alone filled.
+        assert result.n_trades == 1
+        assert result.trades[0].outcome == "win"
+
+    def test_detect_is_called_on_every_flat_bar(self) -> None:
+        """The contract that replaced 'detect only while pending is None'.
+
+        A position still blocks detection (see `TestNoOverlap`); an unfilled *pending* no longer
+        does, which is what `strategy/engine.py::evaluate` does live -- it calls `detect()` once
+        per cycle unconditionally and carries no pending state between cycles.
+        """
+        rule = _StaleThenReachableRule(switch_ts=120)
+        backtest(rule, self._candles())
+
+        # Bars 0,60,120 are flat and each must ask the rule. Bar 180 fills and bar 240 exits,
+        # so detection legitimately stops there.
+        assert rule.detect_calls == 3
