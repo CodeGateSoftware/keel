@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from keel.config import TierConfig
 from keel.data.history import CoverageInfo
+from keel.research.cscv import PBOResult
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimResult, SimTelemetry
 from keel.sim.report import (
@@ -20,6 +21,7 @@ from keel.sim.report import (
     GapItem,
     Verdict,
     _render_edge_section,
+    _render_pbo_section,
     analyze_gaps,
     build_verdict,
     edge_table,
@@ -623,6 +625,32 @@ def test_render_markdown_has_all_sections():
         assert heading.lower() in md.lower()
     assert "IN-SAMPLE" in md
     assert "GO-LIVE candidate" in md
+
+
+def test_pbo_section_renders_not_evaluated_when_no_gate_was_applied():
+    """An unevaluated G4 must not print as a passed G4 (#248).
+
+    This section used to default `gate_ok` to `True`, so a report carrying PBO diagnostics with
+    no thresholds applied announced "G4: PASS" -- the reporting-layer twin of the dormant
+    promotion gate.
+    """
+    result = PBOResult(
+        pbo=Decimal("0.9"),
+        n_combinations=20,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=800,
+        rows_dropped=0,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal("-0.9"),
+    )
+
+    md = "\n".join(_render_pbo_section(result, None, ["not applied"]))
+
+    assert "NOT EVALUATED" in md
+    assert "G4: PASS" not in md
 
 
 def test_edge_table_states_the_fee_its_numbers_were_priced_at():

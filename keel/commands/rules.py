@@ -35,6 +35,9 @@ from keel.data.repository import Repository
 # preview of what rail 1 will say about the product, and a note that disagreed with the rail it
 # is quoting would be worse than no note at all.
 from keel.execution.guards import _asset as _asset_of
+from keel.research import cscv as cscv_mod
+from keel.research import ledger as trials_ledger
+from keel.research import matrix as matrix_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.types import Granularity
@@ -144,6 +147,37 @@ def _run_backtest(
     return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
 
 
+def _load_pbo(
+    ctx: click.Context, session: str | None, blocks: int
+) -> cscv_mod.PBOResult | None:
+    """The CSCV result for `session`, or `None` when no session was named.
+
+    Reuses the exact pipeline behind `keel trials pbo` -- ledger -> `build_matrix` ->
+    `cscv.pbo` -- rather than a second implementation, so the number the gate applies is the
+    same number an operator can reproduce by hand and audit.
+
+    Returning `None` for "no session given" is safe here ONLY because `can_promote` treats
+    `None` as NOT RUN and refuses to promote on it. A genuinely empty/unusable matrix is a hard
+    error instead: the operator asked for the check, so silently downgrading to "not run" would
+    hide a broken ledger behind the same message as not having asked.
+    """
+    if session is None:
+        return None
+    trials = trials_ledger.read_trials(trials_ledger.DEFAULT_LEDGER_PATH)
+    build = matrix_mod.build_matrix(trials, session=session)
+    if not build.columns:
+        click.echo(
+            f"Error: no usable trial columns for session {session!r} -- every trial is "
+            "`series_missing` or the session has no trials. CSCV cannot run, so the rule "
+            "cannot be promoted through the gate.",
+            err=True,
+        )
+        ctx.exit(1)
+    for warning in build.warnings:
+        click.echo(f"warning: {warning}", err=True)
+    return cscv_mod.pbo(build.columns, s=blocks)
+
+
 @rules_group.command("backtest")
 @click.argument("rule_id", type=int)
 @click.option(
@@ -186,10 +220,34 @@ def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) ->
     "a rule's backtest can never reach the min_trades floor -- analogous to `rules seed "
     "--status live`'s gate bypass.",
 )
+@click.option(
+    "--pbo-session",
+    default=None,
+    help="Trials-ledger session label to run the G4 overfitting check (PBO/CSCV) against. "
+    "REQUIRED for promotion: without it the check cannot run, and an un-run check is not a "
+    "pass. Use `keel trials list` to find the session your parameter sweep recorded under.",
+)
+@click.option(
+    "--pbo-blocks", default=16, show_default=True, help="S: number of CSCV row blocks."
+)
 @click.pass_context
 @with_disclaimer
-def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, force: bool) -> None:
-    """Re-run a rule's backtest and advance its lifecycle status if it clears the floor.
+def rules_promote(
+    ctx: click.Context,
+    rule_id: int,
+    granularity: str | None,
+    force: bool,
+    pbo_session: str | None,
+    pbo_blocks: int,
+) -> None:
+    """Re-run a rule's backtest and advance its lifecycle status if it clears the gate.
+
+    The gate is TWO things, and both must pass: the performance floors (G2 -- trades,
+    expectancy, R:R, win rate) and the overfitting check (G4 -- PBO/CSCV against the trial
+    matrix the rule's parameters were selected from, §78). Pass `--pbo-session` to supply the
+    second. **Omitting it does not promote**: a rule that clears four floors on one in-sample
+    parameter set is exactly what PBO exists to be suspicious of, so "nobody checked" is
+    reported as a failing reason rather than quietly treated as fine (#248).
 
     With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
     directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can
@@ -241,7 +299,15 @@ def rules_promote(ctx: click.Context, rule_id: int, granularity: str | None, for
         min_rr=config.promotion.min_rr,
         min_win_rate=float(config.promotion.min_win_rate),
     )
-    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg)
+    pbo_result = _load_pbo(ctx, pbo_session, pbo_blocks)
+    gate = promotion_mod.pbo_gate_from_config(config.research)
+
+    decision = promotion_mod.can_promote(stats, promo_cfg, pbo_result, gate)
+    click.echo(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
+    for reason in decision.reasons:
+        click.echo(f"  - {reason}")
+
+    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg, pbo_result, gate)
     click.echo(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
 
 

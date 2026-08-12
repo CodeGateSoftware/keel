@@ -56,7 +56,7 @@ from keel.data.repository import Repository
 from keel.strategy.paper import track_record
 from keel.strategy.promotion import (
     PromotionConfig,
-    can_promote,
+    check_floors,
     floor_for_class,
     promotion_class_of,
 )
@@ -190,7 +190,7 @@ def build_gate_distance(
     for classes with no code-defined override)."""
     promotion_class = promotion_class_of(rule)
     floor = floor_for_class(promotion_class, default=default_floor)
-    passing, reasons = can_promote(stats, floor)
+    passing, reasons = check_floors(stats, floor)
     return GateDistance(
         rule_name=rule.name,
         promotion_class=promotion_class,

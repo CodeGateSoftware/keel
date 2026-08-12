@@ -594,6 +594,55 @@ def test_rules_promote_without_force_still_gates_on_the_backtest(tmp_path, valid
     assert row["status"] == "candidate"
 
 
+def test_rules_promote_reports_that_the_overfitting_check_did_not_run(
+    tmp_path, valid_config_path
+):
+    """Without `--pbo-session` the G4 check cannot run, and the output SAYS SO.
+
+    The visible half of #248. Before it, `rules promote` printed only `status -> X` and an
+    operator had no way to tell that the overfitting gate had never been consulted -- the gate
+    was dormant and the output was indistinguishable from one where it had passed.
+    """
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "rules", "promote", str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "overfitting check = not_run" in result.output
+    assert "NOT RUN" in result.output
+    assert "status -> candidate" in result.output
+
+
+def test_rules_promote_errors_rather_than_downgrading_an_unusable_pbo_session(
+    tmp_path, valid_config_path
+):
+    """Asking for the check and not getting one is an ERROR, not a quiet "not run".
+
+    The two states must stay distinguishable: not asking is an operator choice, whereas asking
+    against an empty or `series_missing` ledger means the evidence the operator believes exists
+    does not. Collapsing the second into the first would hide a broken ledger behind a routine
+    message -- the same failure mode as the dormant gate itself.
+    """
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "rules", "promote", str(rule_id), "--pbo-session", "no-such-session"],
+    )
+
+    assert result.exit_code != 0
+    assert "no usable trial columns" in result.output
+
+
 def test_rules_demote_steps_back_one_stage(tmp_path):
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)

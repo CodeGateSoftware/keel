@@ -10,7 +10,7 @@ is passed in by the caller.
   keyed by `"{rule.name}:{asset}"`, plus a pooled `"__pooled__"` entry summarizing every rule's
   trades together.
 - `build_verdict` -- the three gates from spec §6.2 (G1 data sufficiency, G2 promotion floors via
-  `strategy.promotion.can_promote`, G3 risk-adjusted edge vs a `BenchmarkResult`).
+  `strategy.promotion.check_floors`, G3 risk-adjusted edge vs a `BenchmarkResult`).
 - `analyze_gaps` -- the six deterministic "lacked information" detectors from spec §6.1, read
   straight off `portfolio_sim.SimTelemetry` (no LLM, no heuristic guessing -- these are counts and
   thresholds over data the sim already collected).
@@ -65,7 +65,7 @@ from keel.sim.portfolio_sim import SimResult, SimTelemetry
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
 from keel.strategy.backtest import _rule_trading_tf, backtest
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
-from keel.strategy.promotion import PromotionConfig, can_promote, promotion_class_of
+from keel.strategy.promotion import PromotionConfig, check_floors, promotion_class_of
 from keel.strategy.rules.base import Rule
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity
@@ -252,7 +252,7 @@ def _g2_per_class(
     reasons: list[str] = []
     for cls in sorted(pooled_by_class):
         floor = floors.get(cls, default_cfg)
-        _ok, cls_reasons = can_promote(pooled_by_class[cls], floor)
+        _ok, cls_reasons = check_floors(pooled_by_class[cls], floor)
         reasons.extend(f"[{cls}] {reason}" for reason in cls_reasons)
     return (len(reasons) == 0, reasons)
 
@@ -292,7 +292,7 @@ def build_verdict(
     if pooled_by_class is not None:
         g2_pass, g2_reasons = _g2_per_class(pooled_by_class, floors or {}, promotion_cfg)
     else:
-        g2_pass, g2_reasons = can_promote(pooled, promotion_cfg)
+        g2_pass, g2_reasons = check_floors(pooled, promotion_cfg)
     if not g2_pass:
         reasons.extend(g2_reasons)
 
@@ -769,15 +769,20 @@ def _render_caveats_section() -> list[str]:
 
 
 def _render_pbo_section(
-    result: PBOResult, gate_ok: bool, gate_reasons: list[str]
+    result: PBOResult, gate_ok: bool | None, gate_reasons: list[str]
 ) -> list[str]:
     """Render the PBO block. The reading rule travels WITH the number, deliberately.
 
     §78.7's limitation 4 means a bare PBO is misleading on its own for exactly the plateau
     shape this project is told to prefer, so the section never prints phi without the
     degradation slope beside it and the interpretation underneath.
+
+    `gate_ok=None` means the thresholds were never applied to these numbers, and renders as
+    NOT EVALUATED rather than PASS. It used to default to `True` -- a section that printed
+    "G4: PASS" for a gate nobody had run, which is the same defect #248 fixed in the promotion
+    gate itself, in the module that reports on it.
     """
-    status = "PASS" if gate_ok else "FAIL"
+    status = "NOT EVALUATED" if gate_ok is None else ("PASS" if gate_ok else "FAIL")
     lines = [
         "## Overfitting diagnostics (PBO / CSCV)",
         "",
@@ -854,7 +859,17 @@ def render_markdown(
         _render_caveats_section(),
     ]
     if pbo_result is not None:
-        gate_ok, gate_reasons = pbo_gate if pbo_gate is not None else (True, [])
+        gate_ok, gate_reasons = (
+            pbo_gate
+            if pbo_gate is not None
+            else (
+                None,
+                [
+                    "G4 thresholds were not applied to this PBO result -- these diagnostics "
+                    "are reported, not gated on. An unevaluated gate is not a passed one."
+                ],
+            )
+        )
         sections.insert(-2, _render_pbo_section(pbo_result, gate_ok, gate_reasons))
     lines = ["# Engine Validation & Trade-Simulation Report", ""]
     for section in sections:
