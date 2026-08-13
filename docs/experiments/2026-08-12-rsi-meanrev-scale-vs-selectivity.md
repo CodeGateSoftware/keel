@@ -1,5 +1,18 @@
 # `rsi_meanrev`'s edge is selectivity, not alpha — and the search for it found a simulator defect
 
+> **⚠️ AMENDED 2026-08-13 — read alongside
+> [`2026-08-13-restated-under-a-production-faithful-engine.md`](2026-08-13-restated-under-a-production-faithful-engine.md).**
+>
+> Every number below was produced by an engine carrying two defects, since fixed (#256, #258).
+> **All conclusions here survive**, and the central one strengthens: the level shift across the
+> trade floor widens from 1.1631 → 0.8938 to **1.1251 → 0.8396**, and gross-positive cells at the
+> floor nearly halve (11/76 → 6/82). Still 0 net-positive at maker.
+>
+> §5's monotonicity anomaly — the 34× UNI-USD collapse that led to both fixes — is **structurally
+> gone**: 3 non-monotonic assets → 0.
+>
+> These numbers are **annotated, not restated**, per the convention #247 set.
+
 **Date:** 2026-08-12
 **Issue:** #253 — closes the single open question left by #252
 **Change:** documentation only. No code, no config, no rule status, no version bump. The simulator
