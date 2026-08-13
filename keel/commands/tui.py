@@ -251,8 +251,13 @@ def _autonomy_lines(report: StatusReport) -> list[ScreenLine]:
     else:
         lines.append(ScreenLine("autonomy: off", "muted"))
     if a.autonomous and not a.live:
-        lapsed_text = f"  (was ON but LAPSED at {_human_dt(a.autonomous_until)})"
-        lines.append(ScreenLine(lapsed_text, "muted"))
+        # An expiry is what makes this branch reachable (autonomy recorded ON, its deadline
+        # passed), so `autonomous_until` is set here in practice. Guarded anyway because the
+        # failure is silent rather than loud: `_human_dt(None)` does not raise --
+        # `time.localtime(None)` means "now" -- so a missing deadline would render as having
+        # lapsed at this very instant, which reads as fact.
+        lapsed_at = _human_dt(a.autonomous_until) if a.autonomous_until is not None else "unknown"
+        lines.append(ScreenLine(f"  (was ON but LAPSED at {lapsed_at})", "muted"))
     elif a.live and a.autonomous_until is not None:
         lines.append(ScreenLine(f"  lapses at {_human_dt(a.autonomous_until)}", "muted"))
     return lines
@@ -313,9 +318,12 @@ def _available_lines(available: AvailableBalance | None) -> list[ScreenLine]:
     if available is None:
         return []
     if available.amount is not None:
+        # `updated_ts` is a separate field from `amount` and can be absent while the amount is
+        # present; same silent-"now" hazard as the autonomy line above, and on a freshness
+        # stamp specifically, where a wrong value is worse than an admitted missing one.
+        as_of = _human_dt(available.updated_ts) if available.updated_ts is not None else "unknown"
         text = (
-            f"live account: {available.amount:,.2f} {available.quote} available  "
-            f"({_human_dt(available.updated_ts)})"
+            f"live account: {available.amount:,.2f} {available.quote} available  ({as_of})"
         )
         return [ScreenLine(text, "ok")]
     return [ScreenLine(f"live account: unavailable -- {available.error}", "warn")]

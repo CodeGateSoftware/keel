@@ -75,17 +75,29 @@ def test_the_dev_only_fake_venue_is_not_a_runtime_dependency_of_anything():
         assert "keel-broker-fake" not in deps, f"{name} must not depend on keel-broker-fake"
 
 
+#: The flag that identifies a strict override. `strict = true` cannot be used in a per-module
+#: section -- mypy applies it GLOBALLY whatever `module` the section names -- so the strict
+#: packages spell the bundle out flag by flag instead, and this is the one that best marks the
+#: intent. Detecting the old `strict = true` spelling as well keeps this honest if a section is
+#: ever added that way: the marker rule below should still cover it (the scoping bug is a
+#: separate problem from the PEP 561 one).
+_STRICT_MARKER = "disallow_untyped_defs"
+
+
+def _mypy_overrides() -> list[dict]:
+    return tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"]["mypy"]["overrides"]
+
+
 def _strict_modules() -> list[str]:
     """Import packages the root `[tool.mypy]` config checks in strict mode.
 
-    Read from the config rather than listed here, so that tightening a package (moving it into a
-    `strict = true` override) automatically brings it under the marker rule below instead of
-    requiring someone to remember this file.
+    Read from the config rather than listed here, so that tightening a package (giving it the
+    strict flag block) automatically brings it under the marker rule below instead of requiring
+    someone to remember this file.
     """
-    overrides = tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"]["mypy"]["overrides"]
     modules: list[str] = []
-    for override in overrides:
-        if not override.get("strict"):
+    for override in _mypy_overrides():
+        if not (override.get("strict") or override.get(_STRICT_MARKER)):
             continue
         entry = override["module"]
         for pattern in [entry] if isinstance(entry, str) else entry:
@@ -111,6 +123,69 @@ def test_strictly_typed_packages_ship_a_py_typed_marker(module):
     """
     candidates = [*(_ROOT / "packages").glob(f"*/{module}/py.typed"), _ROOT / module / "py.typed"]
     assert any(p.is_file() for p in candidates), (
-        f"{module} is type-checked with `strict = true` but ships no py.typed marker; "
+        f"{module} is type-checked strictly but ships no py.typed marker; "
         f"create an empty one beside its `__init__.py` so installers can see the annotations"
+    )
+
+
+def test_the_strict_module_list_is_not_empty():
+    """`_strict_modules()` must actually find the strict packages.
+
+    It discovers them by reading the mypy config, which means a change to how strictness is
+    SPELLED there silently empties the parametrization above -- `pytest` then reports one
+    skipped `[NOTSET]` case instead of four passing ones, and the py.typed rule stops being
+    enforced without anything going red. That is exactly what happened when the broker section
+    moved off `strict = true` onto the expanded flag list. A guard whose coverage can vanish
+    quietly needs a guard of its own.
+    """
+    assert _strict_modules(), (
+        "no strictly-typed modules found in [tool.mypy] overrides -- if the way strictness is "
+        f"configured changed, update `_STRICT_MARKER` ({_STRICT_MARKER!r}) to match"
+    )
+
+
+def test_broker_strict_flags_match_mypy_strict():
+    """The expanded flag list must stay equal to what `--strict` actually turns on.
+
+    The broker packages spell `--strict` out flag by flag because `strict = true` is not a
+    per-module setting (mypy applies it globally regardless of the `module` pattern, which is
+    how `keel.*` came to be checked under full strict mode while appearing exempt). The cost of
+    expanding it is that the list is now a COPY of mypy's, and a copy drifts: a future mypy that
+    adds a flag to the bundle would tighten every other project and quietly leave these four
+    behind.
+
+    So the bundle is derived from the installed mypy rather than hard-coded here -- diffing a
+    default `Options` against a `--strict` one -- and compared with the config. `implicit_reexport`
+    is the one flag whose sense is inverted (`--strict` clears it; the config sets its `no_`
+    form), and `warn_redundant_casts` is excluded because it is global-only and already mypy's
+    default, so it never appears in the diff.
+    """
+    import contextlib
+    import io
+
+    from mypy.main import process_options
+
+    def options(extra: list[str]):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            _, opts = process_options([*extra, "x.py"], server_options=False)
+        return opts
+
+    default, strict = options([]), options(["--strict"])
+    expected = set()
+    for name in (n for n in dir(default) if not n.startswith("_")):
+        value = getattr(strict, name, None)
+        if isinstance(value, bool) and getattr(default, name, None) != value:
+            # `--strict` CLEARS implicit_reexport; the config states that as `no_implicit_reexport`.
+            expected.add(name if value else f"no_{name}")
+
+    broker_override = next(
+        o for o in _mypy_overrides() if o.get(_STRICT_MARKER) and "keel_broker_api.*" in o["module"]
+    )
+    configured = {k for k, v in broker_override.items() if k != "module" and v is True}
+
+    assert configured == expected, (
+        "the broker strict-flag list has drifted from mypy's own `--strict` bundle.\n"
+        f"  missing from pyproject.toml: {sorted(expected - configured)}\n"
+        f"  no longer implied by --strict: {sorted(configured - expected)}\n"
+        "Update the [[tool.mypy.overrides]] block for the broker packages to match."
     )

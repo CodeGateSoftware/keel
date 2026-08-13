@@ -401,7 +401,7 @@ def _would_have_traded_gaps(telemetry: SimTelemetry) -> list[GapItem]:
 
 
 def _data_coverage_gaps(coverage: dict) -> list[GapItem]:
-    gaps = []
+    gaps: list[GapItem] = []
     if not coverage:
         return gaps
 

@@ -310,12 +310,17 @@ def _match_trade(entries_for_rule: list[Any], opened_at: int, closed_at: int) ->
 def _journal_entry_from_outcome(
     row: dict[str, Any], trades_by_rule: dict[str, list[Any]], repo: Repository
 ) -> JournalEntry:
+    # `outcome` is resolved through a separate `matched_outcome` local, and declared `str` here,
+    # so that `JournalEntry.outcome` (a `str`) receives a value the checker agrees is one. Read
+    # straight off `matched` -- which `_match_trade` types `Any` -- it stayed `str | None` all
+    # the way to the constructor even though the fallback below leaves no `None` path.
+    outcome: str
     if row["is_dca"]:
         r_multiple = None
         outcome = "dca"
     else:
         r_multiple = None
-        outcome = None
+        matched_outcome: str | None = None
         rule_name = row["rule_name"]
         if rule_name:
             if rule_name not in trades_by_rule:
@@ -323,10 +328,11 @@ def _journal_entry_from_outcome(
             matched = _match_trade(trades_by_rule[rule_name], row["opened_at"], row["closed_at"])
             if matched is not None:
                 r_multiple = matched.r_multiple
-                outcome = matched.outcome
-        if outcome is None:
+                matched_outcome = matched.outcome
+        if matched_outcome is None:
             pnl = row["pnl_net"]
-            outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "scratch"
+            matched_outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "scratch"
+        outcome = matched_outcome
 
     return JournalEntry(
         closed_at=row["closed_at"],

@@ -461,13 +461,19 @@ def rules_seed(
     seeded: list[str] = []
     skipped: list[str] = []
     for kind in kind_list:
-        rule_cls = agent.RULE_REGISTRY[kind]
         for product in product_list:
             label = f"{kind}:{product}"
             if not force and (kind, product) in existing_keys:
                 skipped.append(label)
                 continue
-            rule = rule_cls(product_id=product)
+            # Via `build_rule_from_params` rather than `RULE_REGISTRY[kind](product_id=...)`:
+            # that function is documented as THE `(kind, params)` -> `Rule` boundary, and this
+            # was the one caller reaching around it. With `product_id` as the only param none
+            # of its coercion tables apply, so it calls the very same constructor -- but a rule
+            # kind that later needs coercion for a seeded default gets it here for free. Its
+            # unknown-kind `ValueError` cannot fire: `kind_list` is checked against the registry
+            # above and exits non-zero before this loop.
+            rule = agent.build_rule_from_params(kind, {"product_id": product})
             params = _json_plain(rule.describe()["params"])
             params["product_id"] = product
             repo.insert_rule(kind, params, status=status, now_ts=now_ts)
@@ -515,7 +521,11 @@ def _declared_choices(rule_cls: type) -> dict[str, tuple[Any, ...]]:
     exception: an un-checkable param is the status quo, a crashing `rules add` is not.
     """
     try:
-        hints = get_type_hints(rule_cls.__init__)
+        # `type: ignore[misc]`: mypy rejects reading `__init__` off a value because a subclass
+        # could carry an incompatible one -- which is precisely what is being introspected here.
+        # Reaching for the constructor of whatever concrete rule class was passed IS the job of
+        # this function (see the docstring), so the unsoundness it warns about is the intent.
+        hints = get_type_hints(rule_cls.__init__)  # type: ignore[misc]
     except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
         return {}
 
