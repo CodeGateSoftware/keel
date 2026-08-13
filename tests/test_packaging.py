@@ -73,3 +73,44 @@ def test_the_dev_only_fake_venue_is_not_a_runtime_dependency_of_anything():
     for name, data in _pyprojects().items():
         deps = [_requirement_name(s) for s in data["project"].get("dependencies", [])]
         assert "keel-broker-fake" not in deps, f"{name} must not depend on keel-broker-fake"
+
+
+def _strict_modules() -> list[str]:
+    """Import packages the root `[tool.mypy]` config checks in strict mode.
+
+    Read from the config rather than listed here, so that tightening a package (moving it into a
+    `strict = true` override) automatically brings it under the marker rule below instead of
+    requiring someone to remember this file.
+    """
+    overrides = tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"]["mypy"]["overrides"]
+    modules: list[str] = []
+    for override in overrides:
+        if not override.get("strict"):
+            continue
+        entry = override["module"]
+        for pattern in [entry] if isinstance(entry, str) else entry:
+            modules.append(pattern.removesuffix(".*"))
+    return sorted(modules)
+
+
+@pytest.mark.parametrize("module", _strict_modules())
+def test_strictly_typed_packages_ship_a_py_typed_marker(module):
+    """A package mypy checks strictly must declare that fact to whoever installs it (PEP 561).
+
+    Without the marker the annotations are invisible off the source tree: mypy in a CONSUMER's
+    project reports `module is installed, but missing library stubs or py.typed marker` and falls
+    back to `Any` for every symbol crossing the boundary. The wheel still builds and imports, so
+    the loss is silent -- which is the same failure shape as the unpinned siblings above, and the
+    reason this is a test rather than a note. All four broker distributions shipped that way
+    through 0.7.0; `keel_broker_api` is the one that matters most, since the port's types are the
+    contract every adapter and every consumer codes against.
+
+    Scoped to strict modules on purpose: `keel.*` and `keel_core.*` are still `ignore_errors`, and
+    a marker on unchecked code promises a guarantee nothing verifies. `keel_core` carries one
+    anyway for historical reasons -- that is allowed, this rule is a floor, not an equality.
+    """
+    candidates = [*(_ROOT / "packages").glob(f"*/{module}/py.typed"), _ROOT / module / "py.typed"]
+    assert any(p.is_file() for p in candidates), (
+        f"{module} is type-checked with `strict = true` but ships no py.typed marker; "
+        f"create an empty one beside its `__init__.py` so installers can see the annotations"
+    )
