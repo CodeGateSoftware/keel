@@ -102,12 +102,16 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from decimal import Decimal
+from pathlib import Path
 
-DB = "/Users/elmehdiaitbrahim/keel/keel.db"
-SCRATCH = (
-    "/private/tmp/claude-501/-Users-elmehdiaitbrahim-Development-work-CodeGate-keel/"
-    "28ff9a61-09d1-498b-b325-1631c0662734/scratchpad"
-)
+# Resolved rather than hardcoded: these were absolute literals into one laptop's home and into a
+# per-session temp directory that is collected when the session ends -- so this recorded run could
+# not be re-run, which is the one thing a recorded run is for. `_out/` sits beside this script
+# (gitignored), which is also where the intersection run writes the ANCHOR this reads.
+# Override either with KEEL_EXPERIMENT_DB / KEEL_EXPERIMENT_OUT.
+DB = os.environ.get("KEEL_EXPERIMENT_DB") or str(Path.home() / "keel" / "keel.db")
+SCRATCH = os.environ.get("KEEL_EXPERIMENT_OUT") or str(Path(__file__).resolve().parent / "_out")
+Path(SCRATCH).mkdir(parents=True, exist_ok=True)
 ANCHOR = f"{SCRATCH}/intersection_257.jsonl"  # supplies the oversold=20 rows
 OUT_PRIMARY = f"{SCRATCH}/rsi_scale_257.jsonl"
 OUT_CONDITIONAL = f"{SCRATCH}/rsi_scale_257_proximity.jsonl"  # separate file, never merged
@@ -132,11 +136,12 @@ TRIGGER_AT_OVERSOLD = 40.0
 
 def _run(job: tuple[str, float, str]) -> list[dict]:
     product, oversold, proximity = job
+    from keel_core.types import Granularity
+
     from keel.data.db import connect
     from keel.data.repository import Repository
     from keel.strategy import backtest as bt
     from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
-    from keel_core.types import Granularity
 
     out: list[dict] = []
     try:
