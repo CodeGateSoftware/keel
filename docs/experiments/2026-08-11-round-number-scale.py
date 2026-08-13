@@ -208,7 +208,8 @@ def print_presence(
     rates = [_rate(s.vectors[FACTOR]) for s in after.values()]
     old_rates = [_rate(s.vectors[FACTOR]) for s in before.values()]
     print(
-        f"\n  cross-asset spread (max/min):  before {_fmt(max(old_rates) / min(old_rates), '0.01')}x"
+        f"\n  cross-asset spread (max/min):  before "
+        f"{_fmt(max(old_rates) / min(old_rates), '0.01')}x"
         f"   after {_fmt(max(rates) / min(rates), '0.01')}x"
     )
     print(
@@ -291,14 +292,18 @@ def print_thresholds(
         now = [entry_technique(t, CTS_LOW, CTS_HIGH) for t in after[product_id].totals]
         moved = sum(1 for a, b in zip(was, now) if a != b)
         n = len(now)
-        print(f"{product_id:10} {'before':>7} " + " ".join(f"{was.count(t):14d}" for t in techniques))
+        print(
+            f"{product_id:10} {'before':>7} "
+            + " ".join(f"{was.count(t):14d}" for t in techniques)
+        )
         print(
             f"{'':10} {'after':>7} " + " ".join(f"{now.count(t):14d}" for t in techniques)
             + f" {moved:7d}"
         )
         print(
             f"{'':10} {'':>7} " + " ".join(
-                f"{(Decimal(now.count(t) - was.count(t)) / Decimal(n)):>+13.4f} " for t in techniques
+                f"{(Decimal(now.count(t) - was.count(t)) / Decimal(n)):>+13.4f} "
+                for t in techniques
             )
             + f" {Decimal(moved) / Decimal(n):>6.4f}"
         )

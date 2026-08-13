@@ -53,12 +53,20 @@ library defaults #247 changed.
 """
 
 import json
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from decimal import Decimal
+from pathlib import Path
 
-DB = "/Users/elmehdiaitbrahim/keel/keel.db"
-OUT_DIR = "/private/tmp/claude-501/-Users-elmehdiaitbrahim-Development-work-CodeGate-keel/28ff9a61-09d1-498b-b325-1631c0662734/scratchpad"
+# Resolved rather than hardcoded: these were absolute literals into one laptop's home and into a
+# per-session temp directory that is collected when the session ends -- so this recorded run could
+# not be re-run, which is the one thing a recorded run is for. `_out/` sits beside this script
+# (gitignored) so the resumable JSONL survives and the rsi-scale scripts find it as their ANCHOR.
+# Override either with KEEL_EXPERIMENT_DB / KEEL_EXPERIMENT_OUT.
+DB = os.environ.get("KEEL_EXPERIMENT_DB") or str(Path.home() / "keel" / "keel.db")
+OUT_DIR = os.environ.get("KEEL_EXPERIMENT_OUT") or str(Path(__file__).resolve().parent / "_out")
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 JSONL_PATH = f"{OUT_DIR}/intersection.jsonl"
 JSON_PATH = f"{OUT_DIR}/intersection.json"
 
@@ -89,9 +97,9 @@ def build_jobs():
 
 
 def make_rule(arm, rule, asset):
-    from keel.strategy.rules.turtle_breakout import TurtleBreakout
-    from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
     from keel.strategy.rules.pullback_continuation import PullbackContinuation
+    from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+    from keel.strategy.rules.turtle_breakout import TurtleBreakout
 
     if arm == "A":
         if rule == "turtle":
@@ -119,10 +127,11 @@ def make_rule(arm, rule, asset):
 
 def run_job(job):
     arm, rule, asset = job
+    from keel_core.types import Granularity
+
     from keel.data.db import connect
     from keel.data.repository import Repository
     from keel.strategy import backtest as bt
-    from keel_core.types import Granularity
 
     rows = []
     try:
@@ -197,7 +206,10 @@ def main():
     prio = {("B", "turtle"): 0, ("A", "pullback"): 1, ("A", "rsi"): 2}
     jobs.sort(key=lambda j: prio.get((j[0], j[1]), 3))
     total = len(jobs)
-    print(f"Declared jobs: {total_declared}; already done: {len(done)}; running: {total}", flush=True)
+    print(
+        f"Declared jobs: {total_declared}; already done: {len(done)}; running: {total}",
+        flush=True,
+    )
 
     start = time.time()
     completed = 0
