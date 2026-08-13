@@ -178,8 +178,28 @@ def test_broker_strict_flags_match_mypy_strict():
             # `--strict` CLEARS implicit_reexport; the config states that as `no_implicit_reexport`.
             expected.add(name if value else f"no_{name}")
 
+    # Dropped explicitly, not by accident: `warn_redundant_casts` is part of the bundle but is
+    # global-only, so it lives in `[tool.mypy]`. It happens not to appear in the diff above
+    # because it is already mypy's default -- if that default ever flips it WOULD appear, and
+    # this test would then demand it in a per-module section where mypy refuses to accept it,
+    # leaving the config unsatisfiable. Excluding it by name keeps that impossible.
+    expected.discard("warn_redundant_casts")
+
     broker_override = next(
-        o for o in _mypy_overrides() if o.get(_STRICT_MARKER) and "keel_broker_api.*" in o["module"]
+        (
+            o
+            for o in _mypy_overrides()
+            if o.get(_STRICT_MARKER) and "keel_broker_api.*" in o["module"]
+        ),
+        None,
+    )
+    # Asserted rather than left to `next()`: re-collapsing the block to `strict = true` is THE
+    # regression this test exists to catch, and a bare `StopIteration` from an exhausted
+    # generator is the least legible way pytest can report it.
+    assert broker_override is not None, (
+        f"no broker override sets {_STRICT_MARKER!r} -- if the block was collapsed back to "
+        "`strict = true`, that re-enables strict mode globally for every module (see the "
+        "comment above the block in pyproject.toml); expand it into its flags again"
     )
     configured = {k for k, v in broker_override.items() if k != "module" and v is True}
 

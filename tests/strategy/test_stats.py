@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from keel.strategy.rules.base import Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Side
@@ -134,3 +136,17 @@ def test_summarize_open_trade_included_in_trades_but_excluded_from_aggregates() 
 
     assert result.trades == [closed, still_open]
     assert result.n_trades == 1
+
+
+def test_summarize_rejects_a_closed_trade_carrying_no_pnl() -> None:
+    """A closed trade with no realised P&L is a broken input, and must SAY so.
+
+    Only an open trade may omit `pnl`; every close path sets it. The value of raising here is
+    the diagnostic: unguarded, this surfaced as `TypeError: unsupported operand type(s) for +:
+    'Decimal' and 'NoneType'` raised from inside a generator, with no way to tell which trade
+    caused it. The outcome is asserted in the message for exactly that reason.
+    """
+    with pytest.raises(ValueError, match="pnl=None") as excinfo:
+        summarize([_trade("win", pnl=None)])
+
+    assert "outcome='win'" in str(excinfo.value)

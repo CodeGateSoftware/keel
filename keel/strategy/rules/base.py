@@ -75,7 +75,15 @@ class Signal:
 #: (`backtest._closed_trade`, which picks the branch) and the consumer (`Trade.outcome`) cannot
 #: drift: an inline `Literal[...]` repeated in both places lets one side gain a value the other
 #: silently rejects, and the mismatch only shows up as an `arg-type` error at the constructor.
-type TradeOutcome = Literal["win", "loss", "open", "scratch"]
+#
+#: Spelled as a plain assignment, NOT the PEP 695 `type TradeOutcome = ...` statement, and that
+#: is load-bearing rather than stylistic: `get_type_hints()` leaves a `type` alias as a
+#: `TypeAliasType`, whose `get_origin()` is `None`, while the assignment form resolves through to
+#: `Literal`. `commands.rules._declared_choices` validates an operator's `rules add --params`
+#: by testing exactly `get_origin(hint) is Literal`, so the modern spelling would silently turn
+#: that validation off for any param annotated with it. `StopMethod`/`TargetMethod` in the rule
+#: modules use this same form for the same reason -- keep them consistent.
+TradeOutcome = Literal["win", "loss", "open", "scratch"]
 
 
 @dataclass
