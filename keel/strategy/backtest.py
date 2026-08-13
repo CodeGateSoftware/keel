@@ -69,8 +69,8 @@ __all__ = ["TAKER_FEE_PCT", "BacktestResult", "backtest"]
 # support, which touching would make a resting MAKER fill). Now that every entry is a market
 # order at the open, the taker rate is the right one for all of them, unconditionally.
 #
-# Until #247 this
-# default was the MAKER rate (0.006) while the fill model was unchanged, and the two halves of
+# Until #247 this default was the MAKER rate (0.006) while the fill model was unchanged, and the
+# two halves of
 # the project disagreed **in writing**: `config.yaml`'s own `fees:` comment says "taker_pct is
 # the sim's default -- it fills market-style at next-bar open", and `keel_core.config
 # .FeesConfig` has carried `taker_pct = 0.012` as its default the whole time. The config was
@@ -242,9 +242,47 @@ def backtest(
     position: _OpenPosition | None = None
     pending: Setup | None = None
     trading_tf = _rule_trading_tf(rule)
+    #: Bars the current `pending` has survived. Since #257 a setup detected on bar i is filled
+    #: unconditionally at bar i+1's open, so this can only ever reach 1 -- see the invariant
+    #: check at the top of the loop.
+    pending_age = 0
 
     for i, candle in enumerate(candles):
         candles_by_tf = {trading_tf: candles[: i + 1]}
+
+        # ENGINE INVARIANT: a pending setup is never carried across more than one bar.
+        #
+        # This is an assertion, not a heuristic, and it has no false-positive mode: since #257
+        # every pending fills at the next bar's open, so the correct value is exactly 1 for every
+        # rule on every series. It is checked rather than thresholded, needs no per-asset tuning,
+        # and cannot fire on legitimate behaviour.
+        #
+        # It exists because #254 was invisible for the life of the project. A setup whose entry
+        # and stop were both never revisited pinned `pending` forever, `detect()` was never called
+        # again, and the engine silently switched its own detector off. On UNI-USD this counter
+        # would have read ~40,000. Nothing else caught it: 2,712 tests passed, and a frozen
+        # backtest is indistinguishable from a selective one in any summary output.
+        #
+        # The obvious alternative -- warn when trades stop long before the series ends -- was
+        # considered and REJECTED. #257 made the freeze structurally impossible, so a dead tail
+        # now only ever means the rule genuinely stopped firing (a regime change, a threshold too
+        # strict for recent volatility). Such a warning would fire exclusively on legitimate runs
+        # and spend the attention budget a real alert needs.
+        #
+        # If resting entry orders are ever reintroduced (#260's "Option B"), this bound stops
+        # being 1 -- and the value it becomes IS the cancel/replace policy, stated in one place.
+        if pending is not None:
+            pending_age += 1
+            if pending_age > 1:
+                raise AssertionError(
+                    f"engine invariant violated: rule {rule.name!r} on "
+                    f"{getattr(pending, 'product_id', '?')} carried a pending setup across "
+                    f"{pending_age} bars (bar index {i}). Since #257 every pending fills at the "
+                    f"next bar's open, so this cannot exceed 1 -- the fill path has regressed "
+                    f"(cf. #254, where the detector silently stopped being called)."
+                )
+        else:
+            pending_age = 0
 
         if position is None and pending is None:
             pending = rule.detect(candles_by_tf)

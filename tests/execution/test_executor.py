@@ -39,6 +39,7 @@ from keel.execution.executor import (
     scale_out,
     trail_stop_atr,
 )
+from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
 from tests.conftest import attest_subscription
@@ -1613,3 +1614,84 @@ def test_a_placed_bracket_clears_an_earlier_unprotected_record(repo):
     )
 
     assert repo.get_state("unbracketed:BTC-USD") is None
+
+
+def _divergence_fields(caplog) -> dict:
+    """The structured payload of the last `executor.intent_divergence` record.
+
+    `log_event` attaches fields via `extra`, not the message, so `caplog.text` shows only the
+    event name -- asserting on it would pass for any values at all.
+    """
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    records = [r for r in caplog.records if r.getMessage() == "executor.intent_divergence"]
+    assert records, "no executor.intent_divergence record was emitted"
+    return getattr(records[-1], _FIELDS_ATTR)
+
+
+class TestIntentDivergenceLog:
+    """#260 mitigation: the executor records the rule's intended entry and the achieved fill
+    side by side and never compared them. That missing subtraction is how #257 stayed invisible.
+    """
+
+    @staticmethod
+    def _intent(entry: str = "50000") -> OrderIntent:
+        return OrderIntent(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            qty=Decimal("0.001"),
+            entry=Decimal(entry),
+            stop=Decimal("49000"),
+            notional=Decimal("50"),
+            is_dca=False,
+            rule_kind="pullback_continuation",
+        )
+
+    def test_divergence_is_logged_with_signed_basis_points(self, caplog) -> None:
+        from keel.execution.executor import _log_intent_divergence
+
+        with caplog.at_level(logging.INFO):
+            # Filled 50 above a 50,000 intent -> +10.00 bps.
+            _log_intent_divergence(order_id=7, intent=self._intent(), realized=Decimal("50050"))
+
+        assert _divergence_fields(caplog)["divergence_bps"] == "10.00"
+
+    def test_divergence_is_signed_so_direction_is_legible(self, caplog) -> None:
+        """Negative means the fill came in BELOW the rule's intended entry.
+
+        Signedness is the point: an unsigned magnitude cannot distinguish "we paid up" from "we
+        got filled cheaper", and for a rule whose entry encodes a confirmation condition those
+        are opposite failures.
+        """
+        from keel.execution.executor import _log_intent_divergence
+
+        with caplog.at_level(logging.INFO):
+            _log_intent_divergence(order_id=8, intent=self._intent(), realized=Decimal("49950"))
+
+        assert _divergence_fields(caplog)["divergence_bps"] == "-10.00"
+
+    def test_logged_unconditionally_even_when_divergence_is_zero(self, caplog) -> None:
+        """No threshold, deliberately.
+
+        A basis-point cutoff right for BTC is wrong for a thin book, and the per-asset liquidity
+        model that would set one does not exist yet (#259). Gating this on that work would block
+        the cheap half behind the expensive half -- so every fill reports, exactly as #247 made
+        the fee rate report on every backtest.
+        """
+        from keel.execution.executor import _log_intent_divergence
+
+        with caplog.at_level(logging.INFO):
+            _log_intent_divergence(order_id=9, intent=self._intent(), realized=Decimal("50000"))
+
+        fields = _divergence_fields(caplog)
+        assert fields["divergence_bps"] == "0.00"
+        assert fields["product"] == "BTC-USD"
+
+    def test_never_raises_on_unusable_input(self, caplog) -> None:
+        """Telemetry on an already-settled order must not be able to fail a cycle."""
+        from keel.execution.executor import _log_intent_divergence
+
+        with caplog.at_level(logging.INFO):
+            _log_intent_divergence(order_id=10, intent=None, realized=Decimal("50000"))
+            _log_intent_divergence(order_id=11, intent=self._intent("0"), realized=Decimal("1"))
+            _log_intent_divergence(order_id=12, intent=self._intent(), realized="not-a-number")

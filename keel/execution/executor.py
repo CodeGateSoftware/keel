@@ -60,7 +60,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from keel_broker_api.results import Preview
@@ -526,7 +526,7 @@ def _run_order(
     )
 
     if success and status == "filled":
-        _upgrade_to_observed_economics(broker, repo, order_id, place_result, now_ts)
+        _upgrade_to_observed_economics(broker, repo, order_id, place_result, now_ts, intent)
 
     if not success:
         log_event(
@@ -568,7 +568,12 @@ def _run_order(
 
 
 def _upgrade_to_observed_economics(
-    broker: Any, repo: Repository, order_id: int, place_result: dict[str, Any], now_ts: int
+    broker: Any,
+    repo: Repository,
+    order_id: int,
+    place_result: dict[str, Any],
+    now_ts: int,
+    intent: OrderIntent | None = None,
 ) -> None:
     """Replace an immediately-filled order's ESTIMATED economics with the exchange's observed ones.
 
@@ -600,6 +605,52 @@ def _upgrade_to_observed_economics(
     if not fill or fill <= 0:
         return
     repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
+    _log_intent_divergence(order_id, intent, fill)
+
+
+def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: Any) -> None:
+    """Report how far the achieved fill sat from the price the RULE asked for.
+
+    Both numbers were already persisted on the order row -- `expected_fill` at placement and
+    `actual_fill` from the venue -- and nothing compared them. That gap is exactly how #257 went
+    unnoticed: the executor places MARKET orders (`order_type="market"`, `limit_price=None`), so a
+    rule's `Setup.entry` is recorded and then not used to execute. For a rule entering at the
+    signal-bar close (`turtle_breakout`, `rsi_meanrev`) that is nearly free; for one whose entry
+    encodes a CONDITION (`pullback_continuation` uses `signal_candle.high + buffer_ticks` to demand
+    follow-through) production silently takes trades the rule meant to decline (#260).
+
+    Logged UNCONDITIONALLY rather than past a threshold. A basis-point threshold that is right for
+    BTC is wrong for a thin book, and the per-asset liquidity model that would set it does not
+    exist yet (#259) -- gating this on that work would block the cheap half behind the expensive
+    half. This follows what #247 did with the fee rate: make the number visible first, act on it
+    second. `divergence_bps` is signed, so direction is legible without recomputing it: positive
+    means the fill came in ABOVE the rule's intended entry.
+
+    Never raises. This is telemetry attached to an order that has already been placed and settled;
+    a formatting problem here must not fail a cycle.
+    """
+    if intent is None:
+        return
+    try:
+        expected = Decimal(str(intent.entry))
+        actual = Decimal(str(realized))
+        if expected <= 0:
+            return
+        divergence_bps = (actual - expected) / expected * Decimal(10_000)
+    except (InvalidOperation, TypeError, ValueError):
+        log_exception(logger, "executor.intent_divergence_uncomputable", order_id=order_id)
+        return
+
+    log_event(
+        logger,
+        logging.INFO,
+        "executor.intent_divergence",
+        order_id=order_id,
+        product=intent.product_id,
+        intent_entry=str(expected),
+        realized_fill=str(actual),
+        divergence_bps=f"{divergence_bps:.2f}",
+    )
 
 
 def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
