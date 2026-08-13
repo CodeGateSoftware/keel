@@ -1,13 +1,13 @@
 [project]
 name = "keel-broker-robinhood"
-version = "0.7.0"
+version = "0.7.1"
 description = "Robinhood Crypto Trading API v2 adapter for keel"
 requires-python = ">=3.14.4"
 # `pynacl` is here and nowhere else in the workspace: Robinhood signs every request with an
 # Ed25519 key, which no other venue keel talks to requires. Keeping it a dependency of this
 # package alone means an engine that never installs this adapter never installs the crypto stack
 # either -- the whole point of adapters being separate distributions.
-dependencies = ["keel-core==0.7.0", "keel-broker-api==0.7.0", "pynacl>=1.5.0", "requests>=2.32.0"]
+dependencies = ["keel-core==0.7.1", "keel-broker-api==0.7.1", "pynacl>=1.5.0", "requests>=2.32.0"]
 
 [project.entry-points."keel.brokers"]
 robinhood = "keel_broker_robinhood:RobinhoodAdapter"

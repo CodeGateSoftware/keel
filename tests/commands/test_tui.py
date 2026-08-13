@@ -317,6 +317,23 @@ def test_available_lines_with_amount_is_ok_style_and_informative() -> None:
     assert "USDC" in line.text
 
 
+def test_available_lines_without_updated_ts_says_unknown_rather_than_now() -> None:
+    """Same silent-"now" hazard as the autonomy line, on a FRESHNESS stamp.
+
+    `updated_ts` is a separate field from `amount` and can be absent while the amount is
+    present. A staleness marker that quietly reports the current instant is worse than one that
+    admits it does not know, because an operator reads it as "just refreshed".
+    """
+    available = AvailableBalance(Decimal("10234.5"), "USDC", None, None)
+    lines = _available_lines(available)
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.style == "ok"
+    assert "10,234.50" in line.text
+    assert "unknown" in line.text
+    assert _human_dt(NOW_TS) not in line.text
+
+
 def test_available_lines_with_error_is_warn_style() -> None:
     available = AvailableBalance(None, "USDC", NOW_TS, "no USDC balance")
     lines = _available_lines(available)
@@ -489,6 +506,27 @@ def test_autonomy_lapsed_line_uses_human_readable_timestamp() -> None:
     lapsed_line = next(line for line in lines if "LAPSED" in line.text)
     assert f"LAPSED at {until}" not in lapsed_line.text
     assert _human_dt(until) in lapsed_line.text
+
+
+def test_autonomy_lapsed_line_without_a_deadline_says_unknown_rather_than_now() -> None:
+    """A missing `autonomous_until` must not render as "lapsed this instant".
+
+    `_human_dt` does not fail on `None` -- `time.localtime(None)` means "now" -- so without the
+    guard this branch printed the CURRENT time as though it were the recorded lapse. The second
+    assertion is the load-bearing one: absence has to read as absence, not as a fresh fact.
+    """
+    autonomy = AutonomyStatus(
+        live=False,
+        autonomous=True,
+        autonomous_until=None,
+        updated_ts=NOW_TS,
+        profile_readable=True,
+    )
+    report = _base_report(autonomy=autonomy)
+    lines = build_screen(report, NOW_TS)
+    lapsed_line = next(line for line in lines if "LAPSED" in line.text)
+    assert "unknown" in lapsed_line.text
+    assert _human_dt(NOW_TS) not in lapsed_line.text
 
 
 def test_autonomy_lapses_at_line_uses_human_readable_timestamp() -> None:
