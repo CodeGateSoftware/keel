@@ -88,8 +88,25 @@ dev = [
 [tool.mypy]
 python_version = "3.14"
 files = ["packages", "keel", "tests"]
+# Implied by `--strict`, but mypy rejects it in a per-module section ("Per-module sections
+# should only specify per-module flags"), so it is stated here rather than in the broker block
+# below. It is already mypy's own default, so this line changes no behaviour today -- it is
+# here so the setting stays explicit if that default ever flips.
+warn_redundant_casts = true
 
 # New packages are strict from birth.
+#
+# ⚠️ These are the flags `--strict` bundles, listed one by one INSTEAD of `strict = true`,
+# because `strict` is not actually a per-module setting: mypy applies it GLOBALLY no matter
+# which `module` pattern the section carries (a section naming a module that does not exist
+# turns it on for the whole run just the same). Written as `strict = true` here, this section
+# silently type-checked `keel.*`, `keel_core.*` and `tests.*` under full strict mode too --
+# invisible only because all three carry `ignore_errors` below and so never printed what it
+# found. The bug surfaces the moment a module is ungated: dropping `keel.*` from the exempt
+# list turned up 131 errors where default mode finds 45. Keep this list expanded; re-collapsing
+# it to `strict = true` re-breaks the scoping. If a future mypy adds a strict-implied flag,
+# add it here as well -- `tests/test_packaging.py::test_broker_strict_flags_match_mypy_strict`
+# fails the build when this list and mypy's own `--strict` bundle drift apart.
 [[tool.mypy.overrides]]
 module = [
     "keel_broker_api.*",
@@ -97,13 +114,37 @@ module = [
     "keel_broker_fake.*",
     "keel_broker_robinhood.*",
 ]
-strict = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+# `warn_redundant_casts` belongs to the bundle too but is global-only; see `[tool.mypy]` above.
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
 
-# Legacy code and the existing suite are exempt until their modules move out
-# (monorepo spec steps 4-7). Tighten one package at a time, never all at once.
+# The suite is exempt until its modules move out (monorepo spec steps 4-7). `keel.*` came off
+# this list once its default-mode errors were fixed: it is CHECKED but not yet `strict`, which
+# is the next tightening step for it (and the reason it is not simply added to the strict block
+# above). Tighten one package at a time, never all at once.
 [[tool.mypy.overrides]]
-module = ["keel.*", "tests.*"]
+module = ["tests.*"]
 ignore_errors = true
+
+# The Coinbase SDK ships no `py.typed`, so every module importing it is an `import-untyped`
+# error the moment its importer is checked. `keel/commands/_common.py` and `keel/data/cb_client.py`
+# import it directly (the broker-port migration has not removed those yet -- see the note on the
+# `keel-broker-coinbase` dependency above). Scoped to the SDK, NOT to our modules: our own code
+# stays checked, only the untyped third-party import is waved through, exactly as the broker
+# adapter already has to do.
+[[tool.mypy.overrides]]
+module = "coinbase.*"
+ignore_missing_imports = true
 
 # keel-core moved in the previous plan but predates strict mode; it is tightened
 # when its remaining consumers migrate.

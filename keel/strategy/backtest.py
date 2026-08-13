@@ -51,7 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from keel.strategy.rules.base import Rule, Setup, Trade
+from keel.strategy.rules.base import Rule, Setup, Trade, TradeOutcome
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
 
@@ -181,6 +181,10 @@ def _close_trade(
     risk = (entry_fill - position.setup.stop) * qty
     r_multiple = pnl / risk if risk != 0 else None
 
+    # Annotated rather than inferred: without it the three branches widen `outcome` to plain
+    # `str`, which `Trade.outcome` then rejects. Naming the alias also catches a typo in one of
+    # these literals here, at the assignment, instead of at the constructor call below.
+    outcome: TradeOutcome
     if pnl > 0:
         outcome = "win"
     elif pnl < 0:

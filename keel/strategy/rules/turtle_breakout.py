@@ -161,11 +161,17 @@ class TurtleBreakout(Rule):
     # Rule interface
     # ------------------------------------------------------------------
 
-    def _decline(self, gate: str, **numbers: object) -> None:
+    def _decline(self, gate: str, **numbers: object) -> Setup | None:
         """Record WHY this bar declined on `last_rejection`, and return `None` for `detect()`.
 
         Returning `None` (rather than setting and letting the caller `return None`) keeps each
         decline a single line, so the reason can never drift from the branch that produced it.
+
+        The return type is `Setup | None` rather than the `None` this always returns, because
+        all 8 call sites are `return self._decline(...)` and mypy rejects using the value of a
+        `-> None` call at all (`func-returns-value`) -- the annotation names what the CALLER
+        returns, which is what makes the one-line idiom above type-check. It never returns a
+        `Setup`; declining is the only thing it does.
 
         This only ever writes an attribute -- it does NOT log. `detect()` runs once per bar in
         `strategy.backtest` and `sim.portfolio_sim`, so logging here would emit millions of
@@ -346,11 +352,16 @@ class TurtleBreakout(Rule):
         warmup = max(entry_lookback, adx_period, atr_period) + 1
 
         won = False
-        pos_entry: Decimal | None = None
-        pos_stop: Decimal | None = None
+        # (entry, stop) as ONE optional pair rather than two independently-optional locals:
+        # they are set together on entry and cleared together on exit, and every read of the
+        # stop happens on a bar where the entry is also live. As two variables that coupling
+        # was invisible -- narrowing `pos_entry is None` told the checker nothing about
+        # `pos_stop`, so the protective-stop comparison below read a `Decimal | None`. Pairing
+        # them makes "stopped without an entry" unrepresentable instead of merely unreachable.
+        position: tuple[Decimal, Decimal] | None = None
         for i in range(warmup, len(tail)):
             c = tail[i]
-            if pos_entry is None:
+            if position is None:
                 # entry mirrors detect(): close > prior-entry_lookback Donchian high, ADX>thr,
                 # optional MACD>0, valid 2N stop.
                 if not float(c.close) > donchian_high(tail[:i], entry_lookback):
@@ -370,15 +381,16 @@ class TurtleBreakout(Rule):
                 stop_px = entry_px - stop_mult * atr_i
                 if stop_px >= entry_px:
                     continue
-                pos_entry, pos_stop = entry_px, stop_px
+                position = (entry_px, stop_px)
             else:
                 # manage: 2N stop first (protective), then the asymmetric channel-low exit.
+                pos_entry, pos_stop = position
                 if c.low <= pos_stop:
                     won = False  # stopped out below entry
-                    pos_entry = pos_stop = None
+                    position = None
                 elif float(c.close) <= donchian_low(tail[:i], exit_lookback):
                     won = c.close > pos_entry
-                    pos_entry = pos_stop = None
+                    position = None
 
         self._filter_cache = (last_ts, won)
         return won

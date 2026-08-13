@@ -71,6 +71,13 @@ class Signal:
     rule_id: int | None = None
 
 
+#: How a trade ended. Named rather than spelled out at each use so the producer
+#: (`backtest._closed_trade`, which picks the branch) and the consumer (`Trade.outcome`) cannot
+#: drift: an inline `Literal[...]` repeated in both places lets one side gain a value the other
+#: silently rejects, and the mismatch only shows up as an `arg-type` error at the constructor.
+type TradeOutcome = Literal["win", "loss", "open", "scratch"]
+
+
 @dataclass
 class Trade:
     """A backtest/paper fill pair (entry + optional exit)."""
@@ -85,7 +92,7 @@ class Trade:
     r_multiple: Decimal | None
     mfe: Decimal
     mae: Decimal
-    outcome: Literal["win", "loss", "open", "scratch"]
+    outcome: TradeOutcome
 
 
 class Rule(ABC):
@@ -106,6 +113,13 @@ class Rule(ABC):
 
     name: str
     params: dict
+    #: The product this rule instance trades. Declared here because it was already a de-facto
+    #: part of the interface: every concrete rule takes it as its first constructor argument and
+    #: stores it (`PullbackContinuation`, `Dca` and `TurtleBreakout` assign it; `RsiMeanReversion`
+    #: carries it as a dataclass field), and `sim.portfolio_sim`/`sim.report` read
+    #: `rule.product_id` off rules they hold only as this base type. Annotation only -- no
+    #: default, exactly like `name`/`params`, so nothing about construction changes.
+    product_id: str
     promotion_class: str = "default"
     rule_id: int | None = None
     #: Why the last `detect()` call declined, or `None` if it fired (or never recorded one).

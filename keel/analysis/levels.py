@@ -91,7 +91,11 @@ def _cluster_pivots(
     clusters: list[list[tuple[int, Decimal]]] = [[ordered[0]]]
     for pivot in ordered[1:]:
         current = clusters[-1]
-        avg = sum(price for _, price in current) / len(current)
+        # `Decimal(0)` start: a bare `sum()` starts from an `int` 0, which types the running
+        # average as `Decimal | float` and carries that widening into `Level.price` below. Every
+        # cluster holds at least the pivot that opened it, so the start value is never actually
+        # summed -- this pins the type without changing a single computed number.
+        avg = sum((price for _, price in current), Decimal(0)) / len(current)
         if abs(pivot[1] - avg) <= avg * tolerance:
             current.append(pivot)
         else:
@@ -99,7 +103,7 @@ def _cluster_pivots(
 
     levels = []
     for cluster in clusters:
-        avg_price = sum(price for _, price in cluster) / len(cluster)
+        avg_price = sum((price for _, price in cluster), Decimal(0)) / len(cluster)
         touches = _distinct_touches([ts for ts, _ in cluster], min_separation_sec)
         levels.append(Level(price=avg_price, kind=kind, touches=touches, angular=False))
     return levels

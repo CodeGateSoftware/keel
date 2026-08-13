@@ -561,7 +561,11 @@ def _process_rule_signals(
     account: SimAccount,
     config: Config,
     latest_price: dict[str, Decimal],
-    held: dict[str, _Held],
+    # Keyed by (asset, rule_name) -- one slot per RULE per asset, matching `run()`'s own `held`
+    # and `_process_dca_signals`. This said `dict[str, _Held]`, which no caller ever passed and
+    # which contradicted both the `(asset, signal.rule_name)` membership test and the assignment
+    # under the same key in this function's body.
+    held: dict[tuple[str, str], _Held],
     now_ts: int,
     monthly_volume_cap: Decimal | None = None,
 ) -> bool:

@@ -43,6 +43,28 @@ class BacktestResult:
     avg_mae: Decimal
 
 
+def _closed_pnl(trade: Trade) -> Decimal:
+    """`trade`'s realised P&L, with the closed-trade invariant stated instead of assumed.
+
+    `Trade.pnl` is `Decimal | None` because an OPEN trade has no realised P&L yet. Every other
+    outcome is produced by a close path that sets it (`backtest._closed_trade`; `paper` does the
+    same), and `summarize` filters to `outcome != "open"` before computing any aggregate -- so
+    within those aggregates `pnl` is never `None`. Nothing in the type system said so, which left
+    every `sum()` below summing `Decimal | None`.
+
+    Asserting it here rather than at each call site buys two things: the aggregates come out
+    typed `Decimal` instead of `Decimal | None`, and a violation surfaces as a named error
+    naming the offending outcome, rather than as a `TypeError: unsupported operand type(s) for
+    +: 'decimal.Decimal' and 'NoneType'` raised from inside a generator with no trade in hand.
+    """
+    if trade.pnl is None:
+        raise ValueError(
+            f"trade with outcome={trade.outcome!r} has pnl=None; only an open trade may "
+            "omit realised P&L, and open trades are excluded from these aggregates"
+        )
+    return trade.pnl
+
+
 def summarize(trades: list[Trade]) -> BacktestResult:
     """Aggregate `trades` into a `BacktestResult`.
 
@@ -71,12 +93,14 @@ def summarize(trades: list[Trade]) -> BacktestResult:
     losses = [t for t in closed if t.outcome == "loss"]
 
     win_rate = len(wins) / n_trades
-    avg_win = (sum((t.pnl for t in wins), Decimal(0)) / len(wins)) if wins else Decimal(0)
-    avg_loss = (sum((t.pnl for t in losses), Decimal(0)) / len(losses)) if losses else Decimal(0)
-    expectancy = sum((t.pnl for t in closed), Decimal(0)) / n_trades
+    avg_win = (sum((_closed_pnl(t) for t in wins), Decimal(0)) / len(wins)) if wins else Decimal(0)
+    avg_loss = (
+        (sum((_closed_pnl(t) for t in losses), Decimal(0)) / len(losses)) if losses else Decimal(0)
+    )
+    expectancy = sum((_closed_pnl(t) for t in closed), Decimal(0)) / n_trades
 
-    gross_profit = sum((t.pnl for t in wins), Decimal(0))
-    gross_loss = abs(sum((t.pnl for t in losses), Decimal(0)))
+    gross_profit = sum((_closed_pnl(t) for t in wins), Decimal(0))
+    gross_loss = abs(sum((_closed_pnl(t) for t in losses), Decimal(0)))
     if gross_loss > 0:
         profit_factor = gross_profit / gross_loss
     elif gross_profit > 0:
@@ -90,7 +114,7 @@ def summarize(trades: list[Trade]) -> BacktestResult:
     streak = 0
     max_losing_streak = 0
     for t in closed:
-        running += t.pnl
+        running += _closed_pnl(t)
         peak = max(peak, running)
         max_drawdown = max(max_drawdown, peak - running)
         if t.outcome == "loss":

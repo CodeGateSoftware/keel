@@ -60,7 +60,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
@@ -309,9 +309,16 @@ def _open_tranche(
     rails vetoed. Neither is an error here -- the tranche is real either way, and reconciliation
     simply has no bracket to resolve back to it until one is placed.
     """
-    entry_fill = None if order is None else order["actual_fill"]
-    qty = None if order is None else order["qty"]
-    if entry_fill is None or qty is None:
+    # `order is None` is folded into the one guard below rather than tested separately, so the
+    # checker can narrow `order` for the `order["fee"]` read after it. Testing only the two
+    # extracted values left `order` typed `dict | None` all the way down, even though a `None`
+    # order forces `entry_fill`/`qty` to `None` and returns here.
+    if order is None:
+        entry_fill = qty = None
+    else:
+        entry_fill = order["actual_fill"]
+        qty = order["qty"]
+    if order is None or entry_fill is None or qty is None:
         log_event(
             logger,
             logging.WARNING,
@@ -478,6 +485,11 @@ def _seed_paper_account_if_needed(
         repo.set_state("equity_state_mode", "paper")
     if paper_trader.get_cash() is None:
         funding = config.paper.starting_equity_usd
+        # Declared up front: inferring from the first branch pins `seed` to `Decimal`, and the
+        # mark-to-market fallback below can legitimately yield `None` (unreadable broker). The
+        # `is None` check in that branch still returns before `seed_cash`, so this only widens
+        # the declaration to match what the two branches actually produce.
+        seed: Decimal | None
         if funding > 0:
             seed = funding
         else:
@@ -593,7 +605,10 @@ def _handle_exits(
     repo: Repository,
     broker: Any,
     config: Config,
-    mode: str,
+    # Same `Literal` pair as `_effective_mode`'s return and `executor.execute`'s parameter: this
+    # only ever receives the former and only ever forwards to the latter, so a bare `str` here
+    # was the one gap that let an unchecked value through the middle of that path.
+    mode: Literal["confirm", "autonomous"],
     now_ts: int,
     confirm_fn: executor.ConfirmFn | None = None,
 ) -> list[ExecutionResult]:
@@ -769,8 +784,16 @@ class LoopResult:
     drawdown_weekly_pct: Decimal | None = None
 
 
-def _effective_mode(config: Config, repo: Repository, now_ts: int) -> str:
+def _effective_mode(
+    config: Config, repo: Repository, now_ts: int
+) -> Literal["confirm", "autonomous"]:
     """The executor mode for this cycle: `"autonomous"` or `"confirm"`.
+
+    The return type is the same `Literal` pair `executor.execute` accepts, not a bare `str`:
+    those two values are all this can return (see the fail-toward-`"confirm"` note below), and
+    the wider annotation meant the two `execute(...)` call sites in this module were passing an
+    unchecked `str` into a `Literal` parameter. `config.auto_trade.mode` stays a `str` -- it has
+    a third value, `"paper"`, which never reaches an executor mode at all.
 
     Two independent switches, deliberately not conflated into one enum:
 

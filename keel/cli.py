@@ -1816,14 +1816,18 @@ def _build_account_metrics(
         per_asset_pnl[trade.asset] = per_asset_pnl.get(trade.asset, Decimal("0")) + (
             trade.pnl or Decimal("0")
         )
+    # `exit_ts` is optional on the trade type because an OPEN trade has none; `closed_trades`
+    # has already excluded those, so every entry here carries one. Written as a filter rather
+    # than left implicit so the average is taken over exactly the trades that can contribute a
+    # duration -- matching the defensive `trade.pnl or Decimal("0")` two lines up, and keeping
+    # a stray `None` from reaching `Decimal(None - entry_ts)`.
+    hold_spans = [
+        Decimal(t.exit_ts - t.entry_ts) / Decimal(3600)
+        for t in closed_trades
+        if t.exit_ts is not None
+    ]
     avg_hold_hours = (
-        sum(
-            (Decimal(t.exit_ts - t.entry_ts) / Decimal(3600) for t in closed_trades),
-            Decimal("0"),
-        )
-        / len(closed_trades)
-        if closed_trades
-        else Decimal("0")
+        sum(hold_spans, Decimal("0")) / len(hold_spans) if hold_spans else Decimal("0")
     )
 
     return {
