@@ -329,3 +329,42 @@ class TestEntryFillsAtNextBarOpen:
         # model this was 3 (every flat bar re-asked, because nothing ever filled) -- so this
         # number is also what distinguishes the two fill models.
         assert rule.detect_calls == 1
+
+
+class TestPendingLifespanInvariant:
+    """A pending setup must never survive more than one bar (#254 / #257).
+
+    HONEST NOTE ON COVERAGE: this invariant cannot be violated through the public API, because
+    since #257 the fill is unconditional -- there is no input that makes the engine carry a setup.
+    So there is no red-then-green test for it, and pretending otherwise would be theatre.
+
+    What actually protects it is that the assertion sits in the hot loop of `backtest()`, so
+    EVERY existing test in this file, the baseline golden, and the whole sim suite now execute it.
+    If someone reintroduces a carried pending -- resting orders for #260's Option B, say -- the
+    suite fails loudly with a message naming the rule and the bar, instead of the silence that let
+    #254 survive the entire project.
+
+    The tests below pin the contract itself so its value is stated somewhere a reader will find.
+    """
+
+    def test_a_long_series_that_rarely_fires_never_trips_the_invariant(self) -> None:
+        """The #254 shape: a rule that mostly declines, over many bars, must run clean."""
+        rule = _ScriptedRule(
+            trigger_ts=600, entry=Decimal(110), stop=Decimal(95), target=Decimal(130)
+        )
+        candles = [_candle(ts, "100", "101", "99", "100") for ts in range(0, 6000, 60)]
+        result = backtest(rule, candles)  # must not raise
+        assert isinstance(result, BacktestResult)
+
+    def test_an_unfillable_setup_still_resolves_within_one_bar(self) -> None:
+        """The exact #254 trigger: entry and stop both unreachable, forever.
+
+        Before #257 this pinned `pending` for the rest of the series. It must now fill on the very
+        next bar instead, which is what keeps the lifespan at 1.
+        """
+        rule = _StaleThenReachableRule(switch_ts=10**9)
+        candles = [_candle(ts, "100", "101", "99", "100") for ts in range(0, 3000, 60)]
+        result = backtest(rule, candles)  # must not raise
+
+        assert len(result.trades) == 1  # filled immediately, then held to the end of the series
+        assert result.trades[0].outcome == "open"
