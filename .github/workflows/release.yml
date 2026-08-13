@@ -59,6 +59,11 @@ jobs:
       - name: Lint
         run: uv run ruff check keel tests packages
 
+      # Re-run here rather than trusting CI's: this workflow is dispatched against whatever
+      # `main` is at the time, which need not be the commit any CI run went green on.
+      - name: Type-check
+        run: uv run mypy
+
       - name: Test
         run: uv run pytest -q
 

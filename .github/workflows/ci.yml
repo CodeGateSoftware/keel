@@ -22,7 +22,7 @@ name: CI
 # way. If you rename it, update the ruleset in the same change.
 #
 # So the two triggers do different jobs: `pull_request` GATES the merge, `push` VERIFIES the result
-# of it. `release.yml` remains the gate that matters for money -- it re-runs `ruff` + `pytest`
+# of it. `release.yml` remains the gate that matters for money -- it re-runs `ruff` + `mypy` + `pytest`
 # itself before it will build an artifact, so a red `main` cannot become a wheel, a tag, or a
 # release asset even if both of these were removed.
 on:
@@ -59,6 +59,18 @@ jobs:
 
       - name: Lint
         run: uv run ruff check keel tests packages
+
+      # A STEP in this job, deliberately not a job of its own. The `main` ruleset requires the
+      # status context `test`, which this job produces; a separate `typecheck:` job would report
+      # a context nothing requires, so a red mypy would not block a merge -- the same failure
+      # shape the header above describes for a renamed job. As a step it inherits that gate.
+      #
+      # Paths come from `[tool.mypy]`'s `files` in pyproject.toml and are deliberately NOT
+      # repeated here: `keel.*` came off the `ignore_errors` list in #266, and the point of this
+      # step is that it cannot drift back silently. A package moving in or out of the checked
+      # set is then one edit there, not one edit mirrored across two workflows.
+      - name: Type-check
+        run: uv run mypy
 
       - name: Test
         run: uv run pytest -q
