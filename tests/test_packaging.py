@@ -144,6 +144,32 @@ def test_the_strict_module_list_is_not_empty():
     )
 
 
+def test_keel_is_not_exempt_from_type_checking():
+    """`keel.*` must not reappear on an `ignore_errors` override.
+
+    CI runs `mypy` (`ci.yml`, `release.yml`), which catches a type ERROR in `keel/`. It cannot
+    catch the other direction: re-adding `keel.*` here silences the whole package, mypy goes
+    green, and the ungating done in #266 is undone with nothing to show for it. That is the
+    failure mode this file already guards for strictness, in the opposite direction -- an
+    exemption that reads as a passing build.
+
+    `tests.*` and `keel_core.*` are still legitimately exempt (see the comments beside each in
+    pyproject.toml); this pins only the one that was deliberately brought under the checker.
+    """
+    exempt = []
+    for override in _mypy_overrides():
+        if not override.get("ignore_errors"):
+            continue
+        entry = override["module"]
+        exempt.extend([entry] if isinstance(entry, str) else entry)
+
+    assert "keel.*" not in exempt, (
+        "`keel.*` is back on an `ignore_errors` override, which silently un-checks the entire "
+        "package -- mypy will pass while checking nothing there. It was ungated deliberately "
+        f"(#266); currently exempt: {sorted(exempt)!r}"
+    )
+
+
 def test_broker_strict_flags_match_mypy_strict():
     """The expanded flag list must stay equal to what `--strict` actually turns on.
 
