@@ -1,5 +1,21 @@
 # Three rules, 24 assets, zero free parameters — the viable intersection is empty, and one of the three fails for the opposite reason we recorded
 
+> **⚠️ AMENDED 2026-08-13 — read alongside
+> [`2026-08-13-restated-under-a-production-faithful-engine.md`](2026-08-13-restated-under-a-production-faithful-engine.md).**
+>
+> Every number below was produced by an engine carrying two defects, since fixed: a pending setup
+> that never expired and silently switched the detector off (#256), and entries that filled at a
+> price production never waits for (#258). They pushed in opposite directions — one suppressed
+> opportunity, the other flattered execution.
+>
+> Re-measured on the corrected engine, **every conclusion here survives except one**: ZEC-`turtle`
+> no longer clears the maker line (1.034 → 0.968), so §6's three-probe narrative describes a
+> survivor the faithful engine does not produce. The finding becomes simpler — the viable quadrant
+> is empty at every reachable fee, 0 of 90, with nothing needing three probes to eliminate.
+>
+> These numbers are **annotated, not restated**, per the convention #247 set: they were real
+> outputs of the code as it stood.
+
 **Date:** 2026-08-12
 **Issue:** #251
 **Change:** documentation only. No code, no config, no rule status, no parameter, no version bump.
