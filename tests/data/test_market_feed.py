@@ -30,7 +30,6 @@ EXPECTED_TS = list(range(WINDOW_START, LATEST_CLOSED + 1, GRAN_SEC))  # 48 hourl
 STALE_HOURS = 552  # the real ZEC-USD gap
 STALE_LAST_TS = LATEST_CLOSED - STALE_HOURS * GRAN_SEC  # the stale last-stored candle
 STALE_FULL_TS = list(range(STALE_LAST_TS, LATEST_CLOSED + 1, GRAN_SEC))  # seed + all catch-up
-STALE_EXPECTED_TS = STALE_FULL_TS[1:]  # the STALE_HOURS newly-closed candles to be written
 
 
 def _candle(ts: int, price: str = "100") -> Candle:
@@ -248,6 +247,50 @@ def test_poll_once_chunk_windows_are_contiguous_and_non_overlapping(repo):
     assert client.calls[-1][3] == LATEST_CLOSED
     for previous, current in zip(client.calls, client.calls[1:]):
         assert current[2] == previous[3] + GRAN_SEC
+
+
+def test_poll_once_keeps_going_past_an_empty_window_so_a_mid_history_hole_cannot_wedge_catch_up(
+    repo,
+):
+    """A window that returns zero candles must not stop catch-up.
+
+    `_poll_catch_up`'s docstring calls this out explicitly: an empty window means a
+    mid-history hole (a stretch the venue genuinely has no candles for), not proof that
+    there's nothing further to fetch. If the loop broke on an empty window -- the way
+    `history._fill_backward` does -- catch-up would wedge at the hole forever and never
+    reach fresh data beyond it. That asymmetry with `_fill_backward` is intentional, not an
+    oversight: `_fill_backward` walks backward through history it may legitimately exhaust,
+    so stopping at "no more data" is correct there. `_poll_catch_up` walks forward toward
+    *now*, where there is always more recent data past any hole, so it must keep paging.
+
+    The fixture spans a gap wider than the Coinbase cap (`STALE_HOURS`, as in the chunking
+    tests above), so catch-up must issue more than one windowed request. The fake client is
+    configured to have real candles for *none* of the first window's range -- an empty
+    window, simulating the hole -- and only serves candles for a later window. A future
+    refactor that adds `if not fetched: break` to `_poll_catch_up` makes this test fail: the
+    loop would stop after the first (empty) window and never reach the later, real candles.
+    """
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, [_candle(STALE_LAST_TS)])
+    fetch_start = STALE_LAST_TS + GRAN_SEC
+    first_window_end = min(
+        LATEST_CLOSED, fetch_start + (MAX_CANDLES_PER_REQUEST - 1) * GRAN_SEC
+    )
+    assert first_window_end < LATEST_CLOSED, "fixture must span >1 window for this test to hold"
+    later_ts = list(range(first_window_end + GRAN_SEC, LATEST_CLOSED + 1, GRAN_SEC))
+    client = FakeClient(
+        {("BTC-USD", Granularity.ONE_HOUR): [_candle(ts) for ts in later_ts + [NOW]]}
+    )
+
+    written = poll_once(client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], now_ts=NOW)
+
+    # the empty first window must not have stopped the loop before a second request
+    assert len(client.calls) > 1
+    assert written == len(later_ts)
+    stored_ts = {c.ts for c in repo.get_candles("BTC-USD", Granularity.ONE_HOUR)}
+    # the pre-existing seed candle plus exactly the later window's candles -- nothing from
+    # the empty (hole) window, since it had nothing to write
+    assert stored_ts == {STALE_LAST_TS, *later_ts}
+    assert LATEST_CLOSED in stored_ts  # catch-up reached fresh data past the hole
 
 
 # -- is_fresh -------------------------------------------------------------------
