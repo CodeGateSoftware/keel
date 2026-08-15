@@ -10,6 +10,7 @@ import pytest
 from keel.data import gaps as gaps_mod
 from keel.data import repair as repair_mod
 from keel.data.db import connect, migrate
+from keel.data.history import MAX_CANDLES_PER_REQUEST
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
 
@@ -127,6 +128,26 @@ def _seed(repo, missing: set[int], n: int = 10, product="BTC-USD"):
         Granularity.ONE_DAY,
         [_candle(_BASE + i * _DAY) for i in range(n) if i not in missing],
     )
+
+
+class _CappedVenue(_Venue):
+    """Like `_Venue`, but actually enforces Coinbase's real per-request ceiling.
+
+    `_Venue` alone never rejects an oversized ask, so it can't tell an unchunked repair apart
+    from a chunked one. This is what turns "the request would 400 in production" into something
+    a test can observe: any single call spanning >349 candles blows up, same as the real venue.
+    """
+
+    _CAP = 349  # Coinbase's real ceiling; MAX_CANDLES_PER_REQUEST (300) must stay under it
+
+    def get_candles(self, product, granularity, start, end):
+        self.calls.append((start, end))
+        n_requested = (end - start) // _DAY + 1
+        if n_requested > self._CAP:
+            raise RuntimeError(
+                "400 INVALID_ARGUMENT: number of candles requested should be less than 350"
+            )
+        return [_candle(ts) for ts in sorted(self.available) if start <= ts <= end]
 
 
 def test_repair_recovers_a_hole_the_venue_has(repo):
@@ -254,3 +275,138 @@ def test_a_shifted_window_is_treated_as_new_and_re_probed(repo):
     third = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=3)
     assert third.windows_skipped_known_absent == 0
     assert third.windows_probed == 1
+
+
+# -- chunking a gap window that exceeds the per-request cap -------------------
+#
+# PREVENTATIVE, not a reproduction: no cached series has an interior gap anywhere near the cap
+# today (the largest across the deployment is 15 bars, against a ~349 limit). But an interior
+# gap that big is entirely reachable -- a multi-day venue outage, a delisting-and-relisting, a
+# product added back after a long absence -- and the failure mode if it ever happens is the bad
+# kind: one request for the whole window 400s ("number of candles requested should be less than
+# 350"), `repair_series` swallows it into `result.errors` and continues, and every scheduled run
+# thereafter retries the same doomed request. Silent and permanent. These tests pin the fix:
+# page the widened outer range in contiguous, non-overlapping chunks of at most
+# `MAX_CANDLES_PER_REQUEST` candles. 553 is used as the oversized-gap figure throughout.
+
+
+def test_a_large_hole_is_fetched_in_capped_chunks(repo):
+    """The widened outer range spans 555 candles (553 missing + one step on each side), so it
+    must page as 300 then 255 -- never one request the venue would reject."""
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=n_missing + 2)
+    venue = _CappedVenue({_BASE + i * _DAY for i in range(n_missing + 2)})
+
+    repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert len(venue.calls) == 2
+    counts = [(end - start) // _DAY + 1 for start, end in venue.calls]
+    assert counts == [300, 255]
+    assert all(count <= MAX_CANDLES_PER_REQUEST for count in counts)
+
+
+def test_a_large_hole_is_fully_recovered_with_no_duplicates_or_drops(repo):
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=n_missing + 2)
+    venue = _CappedVenue({_BASE + i * _DAY for i in range(n_missing + 2)})
+
+    result = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert result.bars_recovered == n_missing
+    assert result.remaining == []
+    stored = repo.get_candles("BTC-USD", Granularity.ONE_DAY)
+    ts_values = [c.ts for c in stored]
+    assert ts_values == sorted(set(ts_values))  # ascending, no duplicates
+    assert len(stored) == n_missing + 2  # nothing dropped either
+
+
+def test_chunk_windows_tile_the_outer_range_without_widening_interior_boundaries(repo):
+    """The ±step widening is load-bearing only at the OUTER edges (venues disagree about
+    endpoint inclusivity); internal chunk boundaries must stay contiguous, not overlap, and
+    must not themselves be widened."""
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=n_missing + 2)
+    venue = _CappedVenue({_BASE + i * _DAY for i in range(n_missing + 2)})
+
+    repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    counts = [(end - start) // _DAY + 1 for start, end in venue.calls]
+    assert all(count <= MAX_CANDLES_PER_REQUEST for count in counts)
+    assert venue.calls[0][0] == _BASE + 0 * _DAY  # window.start_ts - step
+    assert venue.calls[-1][1] == _BASE + (n_missing + 1) * _DAY  # window.end_ts + step
+    for (_, prev_end), (next_start, _) in zip(venue.calls, venue.calls[1:]):
+        assert next_start == prev_end + _DAY
+
+
+def test_one_bad_chunk_is_not_recorded_absent_and_a_later_window_still_repairs(repo):
+    """A partially-fetched window proves nothing about whether the venue holds the rest of it --
+    it must not be recorded absent, and a later, separate gap in the same pass must still get
+    probed and filled rather than the whole pass aborting."""
+
+    class _FlakySecondChunk(_CappedVenue):
+        def get_candles(self, product, granularity, start, end):
+            if start == _BASE + 300 * _DAY:  # the big window's second chunk
+                raise RuntimeError("boom")
+            return super().get_candles(product, granularity, start, end)
+
+    n_missing = 553
+    missing = set(range(1, n_missing + 1)) | {700, 701}
+    _seed(repo, missing=missing, n=706)
+    venue = _FlakySecondChunk({_BASE + i * _DAY for i in range(706)})
+
+    result = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert len(result.errors) == 1
+    assert result.windows_absent_at_source == 0
+    assert repo.get_gap_probes("BTC-USD") == []
+
+    # The later, separate gap still got probed and filled in the same pass.
+    stored_ts = {c.ts for c in repo.get_candles("BTC-USD", Granularity.ONE_DAY)}
+    assert _BASE + 700 * _DAY in stored_ts
+    assert _BASE + 701 * _DAY in stored_ts
+
+    # Exactly the failed chunk's span -- not the whole original window -- remains missing.
+    (remaining,) = result.remaining
+    assert remaining.start_ts == _BASE + 300 * _DAY
+    assert remaining.end_ts == _BASE + 553 * _DAY
+    assert remaining.n_missing == 254
+
+
+def test_a_small_hole_still_takes_exactly_one_request(repo):
+    """Regression guard: chunking must not fragment requests that already fit under the cap."""
+    _seed(repo, missing={4, 5})
+    venue = _CappedVenue({_BASE + i * _DAY for i in range(10)})
+
+    result = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert len(venue.calls) == 1
+    assert result.bars_recovered == 2
+
+
+def test_sleep_fn_is_called_once_per_chunk_not_once_per_window(repo):
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=n_missing + 2)
+    venue = _CappedVenue({_BASE + i * _DAY for i in range(n_missing + 2)})
+    sleeps: list[float] = []
+
+    repair_mod.repair_series(
+        venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999, sleep_fn=sleeps.append
+    )
+
+    assert len(sleeps) == 2
+
+
+def test_a_multi_chunk_window_with_nothing_at_venue_is_still_recorded_absent(repo):
+    """`probed_ok` requires every chunk to COMPLETE, not to return data. A large hole the venue
+    genuinely has none of must still end up recorded absent at source, exactly like a
+    single-chunk one would -- chunking is a fetch-mechanics detail, not a change in what counts
+    as a real probe."""
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=n_missing + 2)
+    venue = _CappedVenue(set())  # the venue has none of the missing timestamps
+
+    result = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert result.windows_absent_at_source == 1
+    assert len(repo.get_gap_probes("BTC-USD")) == 1
+    assert len(venue.calls) > 1

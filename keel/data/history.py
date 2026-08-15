@@ -111,7 +111,9 @@ def _fill_forward(
     """Fetch any bars strictly newer than `latest_cached`, up to `now_ts` (recent-bar gaps)."""
     window_start = latest_cached + step
     while window_start <= now_ts:
-        window_end = min(now_ts, window_start + MAX_CANDLES_PER_REQUEST * step)
+        # Inclusive range: [a, a + N*step] spans N+1 candles, so the cap needs the -1 or a
+        # request for MAX_CANDLES_PER_REQUEST candles actually asks for one more than that.
+        window_end = min(now_ts, window_start + (MAX_CANDLES_PER_REQUEST - 1) * step)
         batch = client.get_candles(product, granularity, window_start, window_end)
         if batch:
             repo.upsert_candles(product, granularity, batch)
@@ -133,7 +135,8 @@ def _fill_backward(
     """Page backward from `window_end` down to `start_floor`, stopping at the first empty
     window -- that window is either the asset's inception or already-covered territory."""
     while window_end >= start_floor:
-        window_start = max(start_floor, window_end - MAX_CANDLES_PER_REQUEST * step)
+        # Same inclusive-range arithmetic as `_fill_forward`: N*step would span N+1 candles.
+        window_start = max(start_floor, window_end - (MAX_CANDLES_PER_REQUEST - 1) * step)
         batch = client.get_candles(product, granularity, window_start, window_end)
         if not batch:
             break  # inception (or a confirmed-empty probe) -- nothing older to fetch

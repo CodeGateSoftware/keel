@@ -12,10 +12,13 @@ from decimal import Decimal
 
 import pytest
 
+from keel.data import history as history_mod
 from keel.data.db import connect, migrate
 from keel.data.history import (
     GRANULARITY_SECONDS,
     MAX_CANDLES_PER_REQUEST,
+    _fill_backward,
+    _fill_forward,
     coverage,
     ensure_history,
 )
@@ -110,3 +113,69 @@ def test_coverage_empty_when_nothing_cached(repo):
 
 def test_max_candles_per_request_is_conservative_under_coinbase_cap():
     assert MAX_CANDLES_PER_REQUEST == 300
+
+
+# -- inclusive-range off-by-one: [a, a + N*step] holds N+1 candles, not N ------
+#
+# Harmless at MAX_CANDLES_PER_REQUEST=300 (301 candles still clears Coinbase's ~350 ceiling),
+# but it silently activates the same incident as the repair-side hole in `repair.py` the moment
+# the constant is raised toward 350. Each window must hold at most MAX_CANDLES_PER_REQUEST
+# candles: `(end - start) // step + 1 <= MAX_CANDLES_PER_REQUEST`.
+
+
+def test_fill_forward_never_requests_more_than_the_cap_per_call(repo):
+    step = GRANULARITY_SECONDS[Granularity.ONE_HOUR]
+    latest_cached = 0
+    now = 1000 * step
+    full = [_mk(i * step) for i in range(1, 1001)]  # 1000 candles strictly newer than cached
+    client = FakeClient({"BTC-USD": full})
+
+    _fill_forward(
+        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, latest_cached, now,
+        sleep_fn=lambda s: None, sleep_sec=0,
+    )
+
+    sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]
+    assert sizes == [300, 300, 300, 100]
+    assert max(sizes) <= MAX_CANDLES_PER_REQUEST
+
+
+def test_fill_backward_never_requests_more_than_the_cap_per_call(repo):
+    step = GRANULARITY_SECONDS[Granularity.ONE_HOUR]
+    now = 2000 * step
+    window_end = now
+    start_floor = now - 999 * step
+    full = [_mk(now - i * step) for i in range(1000)]  # exactly [start_floor, window_end]
+    client = FakeClient({"BTC-USD": full})
+
+    _fill_backward(
+        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, window_end, start_floor,
+        sleep_fn=lambda s: None, sleep_sec=0,
+    )
+
+    sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]
+    assert sizes == [300, 300, 300, 100]
+    assert max(sizes) <= MAX_CANDLES_PER_REQUEST
+
+
+def test_window_sizing_tracks_the_cap_constant_so_raising_it_toward_350_stays_safe(
+    monkeypatch, repo
+):
+    """The whole point of the -1 fix: window sizing must be `(MAX_CANDLES_PER_REQUEST - 1) *
+    step`, derived from the constant, not a number that happens to match it today. Raise the cap
+    toward Coinbase's real ~350 ceiling and the per-call size must track it exactly, not drift
+    a candle over."""
+    monkeypatch.setattr(history_mod, "MAX_CANDLES_PER_REQUEST", 350)
+    step = GRANULARITY_SECONDS[Granularity.ONE_HOUR]
+    latest_cached = 0
+    now = 1000 * step
+    full = [_mk(i * step) for i in range(1, 1001)]
+    client = FakeClient({"BTC-USD": full})
+
+    history_mod._fill_forward(
+        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, latest_cached, now,
+        sleep_fn=lambda s: None, sleep_sec=0,
+    )
+
+    sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]
+    assert max(sizes) <= 350
