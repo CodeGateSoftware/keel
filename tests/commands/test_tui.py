@@ -2094,7 +2094,7 @@ def test_build_discover_overlay_with_report_is_nonempty_titled_and_headed() -> N
     report = DiscoverReport(
         quote="USD",
         venue_product_count=900,
-        candidates=[candidate],
+        candidates=(candidate,),
         min_quote_24h_volume=Decimal("5000000"),
         excluded=screen_mod.DiscoveryExclusions(below_volume_floor=899),
     )

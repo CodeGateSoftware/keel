@@ -791,6 +791,32 @@ def test_render_discover_report_includes_the_exclusion_summary(repo: Repository)
     assert "below 24h volume floor 1" in text
 
 
+def test_render_discover_report_never_renders_a_negative_survivor_count():
+    """`survivor_count = venue_product_count - excluded.total` relies on the invariant
+    `len(candidates) + excluded.total == venue_product_count`, which `build_discover_report`
+    upholds but which nothing STOPS a caller from violating: `DiscoverReport` is a public frozen
+    dataclass, constructed directly in tests (and by anything else that imports it), so a report
+    whose fields simply do not agree is one bad construction away. Confirmed: an unclamped
+    `report.venue_product_count - report.excluded.total` on the report below renders
+    `10 venue products -> -89 candidates`, which is not a real state and must never reach an
+    operator. The subtraction in `render_discover_report` is clamped to 0 for exactly this."""
+    candidate = screen_mod.Candidate(
+        product_id="SOL-USD", asset="SOL", base_name="Solana", quote_24h_volume=Decimal("9000000")
+    )
+    report = DiscoverReport(
+        quote="USD",
+        venue_product_count=10,
+        candidates=(candidate,),
+        min_quote_24h_volume=Decimal("100000"),
+        excluded=screen_mod.DiscoveryExclusions(below_volume_floor=99),
+    )
+
+    text = "\n".join(render_discover_report(report))
+
+    assert "-89" not in text
+    assert "0 candidates" in text
+
+
 def test_render_discover_report_never_includes_probe_history_marker():
     """Out of scope by design: `--probe-history` is one extra network request per candidate,
     which this offline module must never make."""

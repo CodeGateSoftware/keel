@@ -549,8 +549,8 @@ def test_discovery_keeps_liquid_online_products_in_the_settlement_currency():
 def test_discovery_drops_the_wrong_quote_currency():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(quote="USDC")]).candidates == []
-    assert discover_candidates([_product(quote="BTC")]).candidates == []
+    assert discover_candidates([_product(quote="USDC")]).candidates == ()
+    assert discover_candidates([_product(quote="BTC")]).candidates == ()
 
 
 def test_discovery_drops_untradable_products():
@@ -562,20 +562,50 @@ def test_discovery_drops_untradable_products():
         {"is_disabled": True},
         {"view_only": True},
     ):
-        assert discover_candidates([_product(**kwargs)]).candidates == [], kwargs
+        assert discover_candidates([_product(**kwargs)]).candidates == (), kwargs
 
 
 def test_discovery_drops_thin_products():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(volume="100")]).candidates == []
+    assert discover_candidates([_product(volume="100")]).candidates == ()
 
 
 def test_discovery_survives_a_malformed_volume_rather_than_crashing():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(volume=None)]).candidates == []
-    assert discover_candidates([_product(volume="n/a")]).candidates == []
+    assert discover_candidates([_product(volume=None)]).candidates == ()
+    assert discover_candidates([_product(volume="n/a")]).candidates == ()
+
+
+def test_discovery_treats_nan_volume_as_unreadable_rather_than_crashing():
+    """`Decimal("NaN")` parses cleanly -- the `try/except` around the parse does not catch it --
+    and then `volume < policy.min_quote_24h_volume` raises `decimal.InvalidOperation`, which used
+    to crash the whole sweep on a single bad venue row. A NaN is exactly as uninformative about
+    liquidity as an unparseable string, so it must land in the same `unreadable_volume` bucket,
+    not blow up the command. Covers a string `"NaN"`, a `float("nan")` (the `str()` call ahead of
+    `Decimal(...)` still produces the string `"nan"`), and the signaling `"sNaN"` form."""
+    from keel.compliance.screen import discover_candidates
+
+    for nan_volume in ("NaN", "nan", float("nan"), "sNaN"):
+        result = discover_candidates([_product(volume=nan_volume)])
+        assert result.candidates == (), nan_volume
+        assert result.excluded.unreadable_volume == 1, nan_volume
+        assert result.excluded.below_volume_floor == 0, nan_volume
+
+
+def test_discovery_treats_infinite_volume_as_unreadable_not_a_credible_candidate():
+    """`Decimal("Infinity")` also parses cleanly and compares fine against the floor, so left
+    unguarded it would silently become a candidate. A venue reporting infinite 24h volume is not
+    credible data -- it is a malformed feed -- so it is counted `unreadable_volume`, the same
+    fail-closed bucket as any other value this module cannot trust, rather than treated as
+    "definitely liquid"."""
+    from keel.compliance.screen import discover_candidates
+
+    result = discover_candidates([_product(volume="Infinity")])
+    assert result.candidates == ()
+    assert result.excluded.unreadable_volume == 1
+    assert result.excluded.below_volume_floor == 0
 
 
 def test_discovery_excludes_assets_we_already_hold():
@@ -633,20 +663,27 @@ def test_a_quiet_days_snapshot_no_longer_hides_an_asset_the_gate_would_admit():
     Measured on 2026-08-15, five assets were silently dropped by discovery at the old
     1,000,000 floor despite the gate's own statistic sitting far above the admission floor:
     ATOM 3,077,474 (3.08x), AAVE 6,315,463 (6.32x), BCH 5,464,940 (5.46x), CRV 3,329,753
-    (3.33x) and ALGO 3,780,207 (3.78x). Four of the five -- all but AAVE -- had 24h snapshots
-    clustered between 852,133 and 979,000 on that single quiet day, i.e. comfortably below the
-    old floor while their median-over-history liquidity was multiples of the admission
-    requirement.
+    (3.33x) and ALGO 3,780,207 (3.78x). Four of the five -- ATOM, AAVE, BCH, CRV -- had 24h
+    snapshots clustered between 852,133 and 979,000 on that single quiet day, comfortably below
+    the old floor while their median-over-history liquidity was multiples of the admission
+    requirement. ALGO was NOT part of that cluster: it was a separate, lower outlier at
+    `437,712` (`430,520` measured again an hour later) -- the lowest 24h snapshot of the five,
+    and the one that most tightly constrains how low this floor may safely sit.
 
-    This test uses ATOM's actual measured 24h figure, `852133`: well under the OLD floor of
-    1,000,000 but above the new default of 100,000. Under the default `DiscoveryPolicy()` it
-    must survive the pre-filter, so the sweep can no longer hide an asset the gate would admit.
+    This test pins ALGO's actual measured 24h figure, `437712`, not the cluster's -- the LOWEST
+    measured value in the incident, not the highest. That is deliberate: a regression test that
+    instead pinned the top of the cluster (`852133`) would keep passing under a floor as high as
+    500,000, which would silently re-hide ALGO while looking green. `437712` is well under the
+    OLD floor of 1,000,000 but above the new default of 100,000. Under the default
+    `DiscoveryPolicy()` it must survive the pre-filter, so the sweep can no longer hide an asset
+    the gate would admit. (Verified separately: a floor of 500,000 fails this test once it is
+    pinned to `437712`, and would NOT have failed it pinned to `852133`.)
     """
     from keel.compliance.screen import discover_candidates
 
-    found = discover_candidates([_product(pid="ATOM-USD", volume="852133")])
+    found = discover_candidates([_product(pid="ALGO-USD", volume="437712")])
 
-    assert [c.asset for c in found.candidates] == ["ATOM"]
+    assert [c.asset for c in found.candidates] == ["ALGO"]
 
 
 def test_discovery_counts_every_exclusion_by_reason():
@@ -692,6 +729,37 @@ def test_discovery_counts_every_exclusion_by_reason():
     assert [c.asset for c in result.candidates] == ["SOL"]
 
 
+def test_discovery_survivors_plus_excluded_always_account_for_every_product():
+    """The invariant `len(candidates) + excluded.total == len(products)` that
+    `render_discover_report` (`keel/commands/admission.py`) leans on to derive its displayed
+    survivor count via subtraction (`venue_product_count - excluded.total`) instead of carrying
+    a redundant field. Nothing previously asserted this identity directly -- only that individual
+    counts landed in the right buckets -- so a future change that drops a product on the floor
+    (double-counts it, or skips it) without incrementing any `excluded` field or appending to
+    `candidates` would go unnoticed here and would render nonsense downstream.
+
+    Uses the same one-product-per-reason mix as
+    `test_discovery_counts_every_exclusion_by_reason`, plus a SECOND survivor, so the identity is
+    checked with more than one candidate on each side of the equation."""
+    from keel.compliance.screen import discover_candidates
+
+    products = [
+        _product("WRONGQ-USD", quote="EUR"),
+        _product("OFFLINE-USD", status="offline"),
+        _product("HALTED-USD", trading_disabled=True),
+        _product("VIEWONLY-USD", view_only=True),
+        _product("BTC-USD"),  # already on the allowlist
+        _product("BADVOL-USD", volume="not-a-number"),
+        _product("THIN-USD", volume="1"),
+        _product("SOL-USD"),  # survivor 1
+        _product("ETH-USD"),  # survivor 2
+    ]
+
+    result = discover_candidates(products, exclude_assets=frozenset({"BTC"}))
+
+    assert len(result.candidates) + result.excluded.total == len(products)
+
+
 def test_discovery_counts_both_trading_disabled_flag_variants_together():
     """`trading_disabled` covers BOTH the `trading_disabled` and `is_disabled` product flags --
     feeding one of each must total 2 under the single `trading_disabled` reason, not split
@@ -707,7 +775,7 @@ def test_discovery_counts_both_trading_disabled_flag_variants_together():
 
     assert result.excluded.trading_disabled == 2
     assert result.excluded.total == 2
-    assert result.candidates == []
+    assert result.candidates == ()
 
 
 def test_discovery_exclusions_summary_line_names_every_reason_and_the_total():
