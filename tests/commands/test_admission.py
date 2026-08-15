@@ -851,3 +851,23 @@ def test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor():
     from keel.compliance.screen import ScreenPolicy
 
     assert DEFAULT_MIN_QUOTE_24H_VOLUME < ScreenPolicy().min_median_daily_volume
+
+
+def test_the_admission_liquidity_floor_is_pinned_to_its_actual_value():
+    """`min_median_daily_volume` is the real admission criterion -- the number that decides
+    which assets a money-moving tool may buy -- and this is the ONLY test in the suite that pins
+    its VALUE rather than its relationship to something else.
+
+    `test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor` above only asserts
+    `DEFAULT_MIN_QUOTE_24H_VOLUME < ScreenPolicy().min_median_daily_volume`. That `<` guards the
+    relationship between discovery's pre-filter and the gate correctly, and must stay -- but a
+    `<` assertion alone permits ANY value above the discovery floor: raise or, worse, silently
+    lower `min_median_daily_volume` by 5x (verified: dropping it from 1,000,000 to 200,000 still
+    left the whole suite green, 2741 passed / 1 skipped, with the relationship test still
+    passing) and nothing else in the suite would notice. Keep BOTH assertions: the `<` one
+    guards that discovery must never be stricter than the gate, this one guards the criterion
+    itself.
+    """
+    from keel.compliance.screen import ScreenPolicy
+
+    assert ScreenPolicy().min_median_daily_volume == Decimal("1000000")
