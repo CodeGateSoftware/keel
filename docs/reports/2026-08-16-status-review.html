@@ -1,0 +1,445 @@
+<title>Keel Status Review</title>
+<style>
+  :root {
+    --ground: #E7ECEF;
+    --panel: #F3F6F7;
+    --panel-2: #DDE4E8;
+    --ink: #0C1A24;
+    --ink-2: #33454F;
+    --ink-3: #64777F;
+    --rule: #C3CED4;
+    --rule-soft: #D6DEE2;
+    --accent: #A87833;
+    --accent-soft: #F0E4CE;
+    --teal: #2C6A6E;
+    --neg: #8F2C2C;
+    --neg-soft: #F2DEDE;
+    --pos: #2C6249;
+    --pos-soft: #DCEAE1;
+    --warn: #8A6410;
+    --warn-soft: #F5E9CC;
+
+    --display: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+    --measure: 68ch;
+    --pad: clamp(1.25rem, 4vw, 3.5rem);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0A141B;
+      --panel: #101E27;
+      --panel-2: #16272F;
+      --ink: #E4EBEE;
+      --ink-2: #B0C0C7;
+      --ink-3: #7C8F98;
+      --rule: #22343E;
+      --rule-soft: #1A2A33;
+      --accent: #D8A85C;
+      --accent-soft: #2C2317;
+      --teal: #5FA9AC;
+      --neg: #D98080;
+      --neg-soft: #2E1A1A;
+      --pos: #77B394;
+      --pos-soft: #14251D;
+      --warn: #D3A94F;
+      --warn-soft: #2A2213;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0A141B;
+    --panel: #101E27;
+    --panel-2: #16272F;
+    --ink: #E4EBEE;
+    --ink-2: #B0C0C7;
+    --ink-3: #7C8F98;
+    --rule: #22343E;
+    --rule-soft: #1A2A33;
+    --accent: #D8A85C;
+    --accent-soft: #2C2317;
+    --teal: #5FA9AC;
+    --neg: #D98080;
+    --neg-soft: #2E1A1A;
+    --pos: #77B394;
+    --pos-soft: #14251D;
+    --warn: #D3A94F;
+    --warn-soft: #2A2213;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16.5px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 var(--pad); }
+
+  /* ---------- masthead ---------- */
+  .masthead { padding: clamp(3rem, 8vw, 5.5rem) 0 2.25rem; border-bottom: 2px solid var(--ink); }
+  .kicker {
+    font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 1.5rem;
+    display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem;
+  }
+  h1 {
+    font-family: var(--display); font-weight: 600;
+    font-size: clamp(2.4rem, 6.5vw, 4rem); line-height: 1.04;
+    letter-spacing: -0.02em; margin: 0 0 1rem; text-wrap: balance;
+  }
+  .standfirst {
+    font-size: clamp(1.05rem, 2.2vw, 1.28rem); line-height: 1.5;
+    color: var(--ink-2); max-width: var(--measure); margin: 0;
+  }
+  .standfirst strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- vitals strip ---------- */
+  .vitals {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1px; background: var(--rule); border-bottom: 1px solid var(--rule);
+  }
+  .vital { background: var(--ground); padding: 1.15rem 0.25rem 1.25rem; }
+  .vital .v {
+    font-family: var(--mono); font-size: clamp(1.3rem, 3vw, 1.7rem);
+    font-variant-numeric: tabular-nums; letter-spacing: -0.02em; display: block; line-height: 1.1;
+  }
+  .vital .l {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.11em;
+    text-transform: uppercase; color: var(--ink-3); display: block; margin-top: 0.45rem;
+  }
+
+  /* ---------- sections ---------- */
+  section { padding: clamp(2.5rem, 6vw, 3.75rem) 0; border-bottom: 1px solid var(--rule); }
+  section:last-of-type { border-bottom: 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 0.85rem;
+  }
+  h2 {
+    font-family: var(--display); font-weight: 600;
+    font-size: clamp(1.5rem, 3.4vw, 2.1rem); line-height: 1.15;
+    letter-spacing: -0.015em; margin: 0 0 1.1rem; max-width: 22ch; text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--body); font-weight: 650; font-size: 0.95rem;
+    letter-spacing: 0.01em; margin: 2rem 0 0.7rem; color: var(--ink);
+  }
+  p { max-width: var(--measure); margin: 0 0 1rem; }
+  p:last-child { margin-bottom: 0; }
+  .lead { font-size: 1.06rem; color: var(--ink-2); }
+  strong { font-weight: 650; }
+  em { font-style: italic; }
+  code, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 0.92em; }
+
+  /* ---------- verdict chips ---------- */
+  .chip {
+    display: inline-block; font-family: var(--mono); font-size: 0.63rem;
+    letter-spacing: 0.11em; text-transform: uppercase; padding: 0.22em 0.6em;
+    border-radius: 2px; white-space: nowrap; vertical-align: 0.12em; font-weight: 600;
+  }
+  .chip-live { background: var(--pos-soft); color: var(--pos); }
+  .chip-ref  { background: var(--neg-soft); color: var(--neg); }
+  .chip-open { background: var(--warn-soft); color: var(--warn); }
+  .chip-meas { background: var(--accent-soft); color: var(--accent); }
+
+  /* ---------- the finding panel ---------- */
+  .finding {
+    background: var(--panel); border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent); padding: clamp(1.25rem, 3vw, 1.9rem); margin: 1.5rem 0;
+  }
+  .finding h3 { margin-top: 0; }
+  .finding p { max-width: 62ch; }
+
+  /* ---------- tables ---------- */
+  .scroll { overflow-x: auto; margin: 1.35rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; min-width: 480px; }
+  caption {
+    text-align: left; font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink-3); padding-bottom: 0.6rem;
+  }
+  th, td { text-align: left; padding: 0.6rem 0.9rem 0.6rem 0; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  th {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--ink-3); font-weight: 500;
+    border-bottom: 1px solid var(--rule);
+  }
+  td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; padding-right: 0; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .dim { color: var(--ink-3); }
+  .bad { color: var(--neg); font-weight: 600; }
+  .good { color: var(--pos); font-weight: 600; }
+
+  /* ---------- two-col ---------- */
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem 2.5rem; margin-top: 1.25rem; }
+  .cols p, .cols ul { max-width: 46ch; }
+
+  ul { margin: 0 0 1rem; padding-left: 1.1rem; max-width: var(--measure); }
+  li { margin-bottom: 0.5rem; }
+  li::marker { color: var(--ink-3); }
+
+  /* ---------- roadmap ---------- */
+  .road { display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin-top: 1.35rem; }
+  .road-item { background: var(--panel); padding: 1rem 1.15rem; display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1rem; align-items: baseline; }
+  .road-id { font-family: var(--mono); font-size: 0.8rem; color: var(--accent); font-weight: 600; }
+  .road-t { font-weight: 600; font-size: 0.95rem; }
+  .road-d { grid-column: 2; color: var(--ink-2); font-size: 0.9rem; max-width: 60ch; }
+
+  footer { padding: 2.5rem 0 4rem; color: var(--ink-3); font-size: 0.85rem; }
+  footer p { max-width: var(--measure); }
+
+  a { color: var(--teal); text-underline-offset: 2px; }
+  a:focus-visible, :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <p class="kicker"><span>Status Review</span><span>16 August 2026</span><span>v0.7.1</span><span>Coinbase spot</span></p>
+    <h1>Keel: the instrument works, the strategies don't</h1>
+    <p class="standfirst">Keel is a Shariah-screened spot crypto trading agent. It is built, tested, deployed and trading live. After exhaustive measurement, <strong>none of the strategies it runs has a positive edge net of cost</strong> — and establishing that, rather than hiding it, is the project's main result to date.</p>
+  </header>
+</div>
+
+<div class="wrap">
+  <div class="vitals">
+    <div class="vital"><span class="v">0.7.1</span><span class="l">Version · 18 releases</span></div>
+    <div class="vital"><span class="v">2,762</span><span class="l">Tests passing</span></div>
+    <div class="vital"><span class="v">19</span><span class="l">Guard rails</span></div>
+    <div class="vital"><span class="v">1</span><span class="l">Live order, ever</span></div>
+    <div class="vital"><span class="v">0 / 20</span><span class="l">Rules with net edge</span></div>
+  </div>
+</div>
+
+<div class="wrap">
+
+<section>
+  <p class="eyebrow">Where it stands</p>
+  <h2>Deployed, autonomous, and deliberately tiny</h2>
+  <p class="lead">Keel runs unattended on a daily cycle, places real orders against real funds, and is capped so that being wrong costs a few dollars rather than a portfolio.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Live deployment · sandbox scale</caption>
+      <thead><tr><th>Item</th><th>State</th><th class="n">Figure</th></tr></thead>
+      <tbody>
+        <tr><td>Mode</td><td>Autonomous, one cycle per UTC day <span class="chip chip-live">Live</span></td><td class="n">01:20 UTC</td></tr>
+        <tr><td>Allowlist</td><td>BTC, ETH, PAXG, ADA, XLM, DOGE</td><td class="n">6</td></tr>
+        <tr><td>Active rules</td><td>5 × turtle breakout, 1 × DCA, 1 × DOGE turtle</td><td class="n">7</td></tr>
+        <tr><td>Open position</td><td>BTC-USD, opened by the DCA rule</td><td class="n">1</td></tr>
+        <tr><td>Account scale</td><td class="dim">Sandbox — sized so that being wrong costs a few dollars</td><td class="n">withheld</td></tr>
+        <tr><td>Position caps</td><td class="dim">Total exposure and per-order, both rail-enforced</td><td class="n">withheld</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>A parallel paper deployment carries a wider universe — <span class="num">19</span> allowlisted assets, <span class="num">20</span> attested, <span class="num">22</span> rules — and exists purely to accumulate evidence without risking funds.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Orders</p>
+  <h2>One order in the system's lifetime, and we can say exactly why</h2>
+  <p>Keel has placed <strong>one live order</strong>. That number is a feature of the design, not a defect in it — every buy must clear nineteen independent rails, and most candidate trades never do.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>The only live order</caption>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Placed</td><td class="num">August 2026</td></tr>
+        <tr><td>Instrument</td><td class="num">BTC-USD</td></tr>
+        <tr><td>Side / type</td><td>BUY, market order</td></tr>
+        <tr><td>Rule</td><td><code>dca</code> — scheduled accumulation, not a signal trade</td></tr>
+        <tr><td>Status</td><td>Filled; position still open, marked modestly negative</td></tr>
+        <tr><td>Sizes and fills</td><td class="dim">Withheld — see note below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="dim" style="font-size:0.88rem"><em>Account balances, position sizes, fill prices and exact order times are withheld from this committed copy. This repository is public; those figures are personal account state, and nothing in the analysis depends on them.</em></p>
+
+  <h3>Why only one</h3>
+  <p>The DCA rule is the only one currently able to fire: it is exempt from the risk breakers that gate signal rules, and it never exits, so it accumulates rather than round-trips. Every turtle-breakout signal since has been either <em>no setup</em> or vetoed at the rails. Most recently a valid DCA signal on <span class="num">2026-08-14</span> was vetoed by rail 17 because the withdrawal-capability attestation had expired — the system refused to buy an asset it could not prove it was able to withdraw.</p>
+</section>
+
+<section>
+  <p class="eyebrow">The central result</p>
+  <h2>Cost, not signal, is the binding constraint</h2>
+
+  <div class="finding">
+    <h3>Across the entire universe, no configuration is simultaneously measurable and profitable</h3>
+    <p>Round-trip friction is <strong>~2.5% of notional</strong> (1.2% taker per leg plus slippage). That is the same order of magnitude as the per-trade edge of everything measured — so the edge is real but the toll eats it.</p>
+    <ul>
+      <li><strong>Hourly bars</strong> — <span class="num">19 of 20</span> rules reach a measurable sample (median <span class="num">n=268</span>). <span class="bad">Zero are net-positive.</span></li>
+      <li><strong>Daily bars</strong> — 6 of 20 look net-positive, but <span class="bad">zero reach n≥100</span> (max <span class="num">n=18</span>). Not one is promotable.</li>
+      <li><strong>The daily table is noise.</strong> Rank correlation between daily and hourly results is <span class="num">ρ = −0.009</span> — none. At n≈12 the ranking carries no information about n≈268.</li>
+    </ul>
+  </div>
+
+  <h3>What was measured</h3>
+  <div class="cols">
+    <div>
+      <p><strong>Grids swept.</strong> An 864-trial turtle-breakout parameter sweep across six assets; a 90-cell shipped-defaults intersection across all 24 assets with hourly history; an 82-cell RSI mean-reversion frequency grid. All re-run on a corrected engine.</p>
+    </div>
+    <div>
+      <p><strong>Asset expansion is refuted as a performance fix.</strong> Turtle breakout is negative on all 24 assets measured, so a 25th cannot rescue it. New assets are justified on statistical power and the compliance pipeline — never on hoped-for returns.</p>
+    </div>
+  </div>
+
+  <h3>Two engine defects that produced believable numbers</h3>
+  <p>Two pairs of bugs — a pending setup that never expired, and entries filling at a touched limit price rather than the next open — produced <em>plausible, internally consistent</em> results for the life of the project while 2,712 tests passed. On restatement, trade counts rose in 87 of 90 cells and profit factors fell in 69 of 90. <strong>Every performance figure predating the fix was void.</strong> Plausible output is not evidence of a working engine.</p>
+
+  <p>An independent, executed measurement (Frankfurt School, 432 real round-trips, Jan–Feb 2026) puts retail crypto round-trip costs at <span class="num">0.53%–6.45%</span> depending on venue. Our ~2.5% model sits mid-range — not pessimistic.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Rules &amp; strategies</p>
+  <h2>Four registered rule kinds, closed by design</h2>
+  <p>The rule registry is deliberately closed: a new strategy is a reviewed change to the trading core, not something a research process can introduce on its own.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>The shipped library and how each fails</caption>
+      <thead><tr><th>Rule</th><th>Shape</th><th>Measured verdict</th></tr></thead>
+      <tbody>
+        <tr><td><code>turtle_breakout</code></td><td>Donchian breakout, ADX-gated, ATR stop</td><td>Real, broad gross edge — <span class="bad">destroyed by cost</span></td></tr>
+        <tr><td><code>rsi_meanrev</code></td><td>Oversold bounce at support</td><td>Best gross distribution — <span class="bad">never fires enough to be measured</span></td></tr>
+        <tr><td><code>pullback_continuation</code></td><td>Trend pullback to EMA band</td><td><span class="bad">Essentially no edge</span> (median gross 0.77)</td></tr>
+        <tr><td><code>dca</code></td><td>Scheduled accumulation, never exits</td><td>No edge claim — <span class="chip chip-live">Live</span> the only rule trading</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Three unrelated failure modes</strong> is itself the finding — this is not one broken idea, it is three separate ones failing for three separate reasons, which is what makes the cost explanation credible rather than convenient.</p>
+
+  <h3>A structural asymmetry worth knowing</h3>
+  <p>Fees are purely proportional — there is no fixed per-order component. So splitting a given sum across more trades costs exactly the same. "Trade less" helps a round-trip rule, where each completed trade must clear a ~2.5% toll; it does nothing for an accumulation rule that never exits. DCA pays roughly half the friction of a signal rule because it defers the exit leg indefinitely, not because it trades rarely.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Compliance</p>
+  <h2>Nineteen rails, and unknown always means no</h2>
+  <p>Keel is a Shariah-screened system. Sector, backing and yield cannot be derived from price data, so an unclassified asset is <em>unknown</em> — and unknown is a rejection, never a default pass. Twenty assets carry human attestations; each also needs a separate attestation of what contract the venue listing actually is, because a CFD can spell itself exactly like spot.</p>
+
+  <div class="cols">
+    <div>
+      <h3>Representative rails</h3>
+      <ul>
+        <li><strong>Rail 1</strong> — allowlist, enforced per trade</li>
+        <li><strong>Rails 11 / 16</strong> — drawdown and consecutive-loss breakers, entries only</li>
+        <li><strong>Rail 17</strong> — withdrawal capability (§65.4 <em>qabd</em>): an asset that cannot be withdrawn may not be validly possessed, so acquiring more of it stops</li>
+        <li><strong>Rails 18 / 19</strong> — USD-settled spot only; every other contract class is refused mechanically</li>
+      </ul>
+    </div>
+    <div>
+      <h3>The governing asymmetry</h3>
+      <p>An automated process may <em>reduce</em> risk directly, but may only <em>increase</em> activity — a new asset, a new rule, a buy — by passing a deterministic gate a human built and reviews. Attestation and admission remain human decisions by construction, and the CLI enforces it: releasing a rail-17 halt demands a typed confirmation at a terminal, specifically so a scheduled job cannot do it.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">Asset sweep</p>
+  <h2>The scout found more bugs in itself than assets to trade</h2>
+  <p>An automated scout sweeps ~920 Coinbase USD listings, screens them, and proposes candidates for human attestation. Fourteen runs to date. Its most valuable output has been <strong>three defects in the discovery pipeline itself</strong>, each of which silently hid assets the admission gate would have accepted.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Discovery estimators vs the criteria they stood in for</caption>
+      <thead><tr><th>Estimator</th><th>Failure</th><th>Visibility</th></tr></thead>
+      <tbody>
+        <tr><td>24h volume pre-filter</td><td>Dropped assets before emission</td><td class="bad">Silent — no output at all</td></tr>
+        <tr><td><code>--probe-liquidity</code></td><td>Understated the real figure by 4.45×</td><td>Visible but misleading</td></tr>
+        <tr><td><code>--probe-history</code></td><td>±30-day approximation of a hard bar count</td><td>Benign false positive</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>On a single quiet trading day, <strong>five admissible assets vanished from the sweep</strong> — their true liquidity sitting at 3.08× to 6.32× the admission floor. One was the scout's own shortlisted candidate. All three defects are now fixed: the pre-filter no longer shares a threshold with a statistic it isn't comparable to, exclusions are reported with per-reason counts, and truncation is stated rather than silent.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Venues</p>
+  <h2>Coinbase spot only — and the refusals are structural</h2>
+  <p>Three venue expansions were studied and three answered no. Two are permanent; one is "not yet".</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Venue feasibility studies · August 2026</caption>
+      <thead><tr><th>Venue</th><th>Verdict</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>cTrader Open API</td><td><span class="chip chip-ref">Refused</span></td><td>Every account it can express is a leveraged, short-permitting CFD. There is no message in the protocol for an unleveraged spot holding.</td></tr>
+        <tr><td>Trade Nation</td><td><span class="chip chip-ref">Refused</span></td><td>Nothing in the product range is spot ownership — CFDs and spread bets throughout.</td></tr>
+        <tr><td>US equities</td><td><span class="chip chip-open">Not yet</span></td><td>Coinbase <em>does</em> have an equities order path — the brief was wrong. But market data is absent: <span class="num">n=0</span> candles across 21 trading days, preview refused 403, three conflicts with our execution model.</td></tr>
+        <tr><td>Coinbase futures / perps</td><td><span class="chip chip-ref">Refused</span></td><td>Rails 18/19 reject any non-USD-settled-spot contract mechanically, regardless of narrative.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The distinction matters for planning: a CFD venue is <strong>never</strong>, because the instrument conflicts with the charter. Equities are <strong>not yet</strong>, because the blocker is data and execution capability, both of which can change.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Engineering</p>
+  <h2>Refactoring, typing, and versions that can prove what they are</h2>
+
+  <div class="cols">
+    <div>
+      <h3>Workspace split</h3>
+      <p>The monolith became six distributions — <code>keel-core</code>, a broker <em>port</em> (<code>keel-broker-api</code>), and three adapters (<code>coinbase</code>, <code>fake</code>, <code>robinhood</code>) behind it. Adding a venue is now an adapter, not surgery on the core.</p>
+
+      <h3>Type safety, made real</h3>
+      <p>mypy <code>strict</code> is scoped to the brokers, with <code>keel.*</code> genuinely checked rather than nominally — it had been silently on an ignore list. <code>py.typed</code> now ships with all four broker distributions, and CI gates on mypy so the ungating cannot quietly come undone.</p>
+    </div>
+    <div>
+      <h3>Versioning</h3>
+      <p>Eighteen releases, <span class="num">v0.5.0 → v0.7.1</span>. Releases are manual-only and re-run lint, types and the full suite before building — a red main cannot become a wheel.</p>
+      <p>Each build stamps its own version and commit, so an installed artifact identifies itself with no git present: <code>keel 0.7.1+02bc86d90b67 [release]</code>. A separate <code>keel versions</code> command cross-checks that <em>every</em> keel distribution in the environment agrees — added after a deployment silently ran <code>keel-trader 0.5.7</code> against <code>keel-core 0.5.5</code>.</p>
+    </div>
+  </div>
+
+  <h3>This week</h3>
+  <p>Six pull requests merged. Two fixed live production defects: a catch-up request that exceeded the venue's 350-candle cap and <em>self-wedged</em> — the gap grew daily, so it could never recover — and a discovery filter that hid admissible assets. Both were verified against real production data, not only tests. Four more closed review findings, including one where a change had removed the only test pinning the admission liquidity floor: the floor could have been cut 5× with a fully green suite.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Roadmap</p>
+  <h2>What's next, in the order it matters</h2>
+
+  <div class="road">
+    <div class="road-item">
+      <span class="road-id">#260</span><span class="road-t">Honour a rule's conditional entry price <span class="chip chip-meas">Highest value</span></span>
+      <span class="road-d">The executor discards the entry level a rule computed and routes a market order. This is not cosmetic: it doubled <code>pullback_continuation</code>'s trade count and dropped its gross profit factor from 0.92 to 0.77 — the strategy takes trades it was designed to decline.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#259</span><span class="road-t">Per-asset slippage</span>
+      <span class="road-d">One global 5bp constant is applied from BTC to the thinnest listing, so illiquid assets are credited with execution they cannot achieve — always in the favourable direction, by an unmeasured amount.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#233</span><span class="road-t">Capability-based venue visibility</span>
+      <span class="road-d">A read-only API key currently looks identical to a working one until an order fails.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#198</span><span class="road-t">Robinhood prerequisites</span>
+      <span class="road-d">The adapter exists behind the broker port; the live execution path is deliberately not wired until its preconditions are met.</span>
+    </div>
+  </div>
+
+  <h3>The open strategic question</h3>
+  <p>Every reachable configuration has now been measured and none is viable at this venue's cost. That leaves three honest directions, and they are not equivalent:</p>
+  <ul>
+    <li><strong>Reduce cost.</strong> The measured 12× spread between the cheapest and dearest retail venue is larger than any edge this project has found. Venue economics dominate every parameter we could tune.</li>
+    <li><strong>Raise per-trade edge.</strong> A genuinely new technique — the registry is closed, so this is a reviewed core change, not a parameter.</li>
+    <li><strong>Accept the result.</strong> Keel is a working, compliant, well-tested instrument. Continuing to run DCA and accumulate live evidence is a legitimate outcome.</li>
+  </ul>
+  <p>The turnover-reduction literature — the most promising family — was chased to its primary source this week and closed: its best-evidenced technique has already been swept in our own grids and produced nothing.</p>
+</section>
+
+<footer>
+  <p><strong>Standing caveat.</strong> Every performance figure here is net of the 1.2% taker rate actually paid, on a corrected engine. Small-sample profit factors are reported as such: a headline number on n=5 is a lottery ticket, not an edge. Keel is a personal tool — not financial advice, and not religious advice.</p>
+</footer>
+
+</div>
