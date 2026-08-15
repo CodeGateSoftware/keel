@@ -646,18 +646,20 @@ def test_build_discover_report_excludes_allowlist_assets(repo: Repository):
 
 
 def test_build_discover_report_applies_default_volume_floor_matching_assets_discover(repo):
-    """`keel assets discover --min-volume-24h` defaults to `5000000` -- read straight from the
-    CLI option's own default (by name, not position, so a decorator reorder cannot silently
-    break this pin) so the two can never drift apart silently."""
+    """`keel assets discover --min-volume-24h`'s default and `build_discover_report`'s own
+    default must be the SAME number -- read straight from the CLI option's own default (by
+    name, not position, so a decorator reorder cannot silently break this pin) and compare it
+    against `DEFAULT_MIN_QUOTE_24H_VOLUME` rather than a hardcoded literal, so a future change
+    to either constant fails this test instead of silently drifting the two apart."""
     cli_option = next(
         p for p in cli_module.assets_discover.params if p.name == "min_volume_24h"
     )
     default_floor = Decimal(cli_option.default)
-    assert default_floor == Decimal("1000000")
+    assert default_floor == DEFAULT_MIN_QUOTE_24H_VOLUME
 
     config = _config(allowlist=[])
-    below = _venue_product("DOGE", volume="999999")
-    above = _venue_product("SHIB", volume="1000001")
+    below = _venue_product("DOGE", volume="99999")
+    above = _venue_product("SHIB", volume="100001")
 
     report = build_discover_report([below, above], config)
 
@@ -703,6 +705,42 @@ def test_render_discover_report_shows_table_and_ends_with_proposals_not_admissio
     assert "keel assets attest" in text
 
 
+def test_build_discover_report_excluded_carries_per_reason_counts(repo: Repository):
+    """`DiscoverReport.excluded` is the thing that makes a `900 -> 40` sweep summary honest --
+    without it, nothing distinguishes 860 products dropped for being junk (wrong quote
+    currency, offline, already on the allowlist) from 860 products dropped just under the
+    liquidity floor. One allowlisted product and one below-floor product are enough to pin that
+    each reason lands in its own bucket rather than a single opaque total."""
+    config = _config(allowlist=["BTC"])
+    below_floor = _venue_product("DOGE", volume="1")
+    already_allowlisted = _venue_product("BTC")
+    survivor = _venue_product("SOL")
+
+    report = build_discover_report([below_floor, already_allowlisted, survivor], config)
+
+    assert report.excluded.already_on_allowlist == 1
+    assert report.excluded.below_volume_floor == 1
+    assert [c.asset for c in report.candidates] == ["SOL"]
+
+
+def test_render_discover_report_includes_the_exclusion_summary(repo: Repository):
+    """The rendered report must surface WHY products were dropped, not just how many candidates
+    survived -- otherwise an operator reading `900 -> 40` has no way to tell junk from
+    near-misses on the floor."""
+    config = _config(allowlist=["BTC"])
+    below_floor = _venue_product("DOGE", volume="1")
+    already_allowlisted = _venue_product("BTC")
+    survivor = _venue_product("SOL")
+
+    report = build_discover_report([below_floor, already_allowlisted, survivor], config)
+    lines = render_discover_report(report)
+    text = "\n".join(lines)
+
+    assert report.excluded.summary_line() in text
+    assert "already on allowlist 1" in text
+    assert "below 24h volume floor 1" in text
+
+
 def test_render_discover_report_never_includes_probe_history_marker():
     """Out of scope by design: `--probe-history` is one extra network request per candidate,
     which this offline module must never make."""
@@ -717,12 +755,15 @@ def test_render_discover_report_never_includes_probe_history_marker():
 
 
 def test_every_discovery_floor_default_agrees():
-    """Three modules carry this default; a drift between them is silent and changes the sweep.
+    """Three DISCOVERY places carry this default; a drift between them is silent and changes
+    the sweep. `cli.assets_discover`'s `--min-volume-24h` option, `admission.
+    DEFAULT_MIN_QUOTE_24H_VOLUME` and `screen.DiscoveryPolicy.min_quote_24h_volume` each name
+    the same pre-filter floor and must move together.
 
-    `cli.assets_discover`'s option, `admission.DEFAULT_MIN_QUOTE_24H_VOLUME` and
-    `screen.DiscoveryPolicy` each name a floor. The first two were already pinned to each other;
-    `DiscoveryPolicy` was not, so a caller constructing one directly (as `cli.assets_discover`
-    does) could silently use a different floor from `build_discover_report`.
+    These three are deliberately NOT pinned to the admission floor
+    (`ScreenPolicy.min_median_daily_volume`) -- see
+    `test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor` for why equal
+    numbers there would be wrong, not merely a coincidence worth asserting.
     """
     from keel.compliance.screen import DiscoveryPolicy
 
@@ -732,14 +773,31 @@ def test_every_discovery_floor_default_agrees():
     assert DiscoveryPolicy().min_quote_24h_volume == DEFAULT_MIN_QUOTE_24H_VOLUME
 
 
-def test_the_discovery_floor_matches_the_admission_liquidity_floor():
-    """Discovery should not hide assets the gate would admit.
+def test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor():
+    """Discovery's pre-filter must not be able to hide an asset the gate would admit.
 
-    The sweep's floor is a 24h snapshot and the gate's is a median over history -- different
-    statistics (which is why `--probe-liquidity` exists). Pinning the two NUMBERS equal keeps the
-    pre-filter from being stricter than the criterion it screens for: at the old 5x-higher floor,
-    FET sat at $2.94M/24h and never appeared, while measuring 4.8x the admission floor.
+    The sweep's floor (`DEFAULT_MIN_QUOTE_24H_VOLUME`) and the gate's
+    (`ScreenPolicy.min_median_daily_volume`) are DIFFERENT statistics: a 24h venue snapshot
+    versus the median of volume x close over all cached history. Pinning them to the SAME
+    number, as this codebase used to, does not make the pre-filter non-stricter -- a quiet
+    trading day can push the snapshot below a floor the asset's own median clears many times
+    over.
+
+    This was tried twice and failed twice. First at 5,000,000, retired 2026-08-08: FET sat at
+    $2.94M/24h and never appeared in a sweep, despite measuring 4.8x the admission floor on the
+    gate's own statistic. Lowering the two NUMBERS to agree (1,000,000, matching the admission
+    floor exactly) looked like a fix but was not one -- it only shrank the gap, because equal
+    numbers on different statistics still let a quiet day hide an asset. Measured again on
+    2026-08-15: ATOM (3.08x the admission floor on its real median), AAVE (6.32x), BCH (5.46x),
+    CRV (3.33x) and ALGO (3.78x) were all silently dropped, four of them with 24h snapshots
+    clustered between 852,133 and 979,000 on a single quiet day -- comfortably under the
+    1,000,000 floor despite being multiples above the admission requirement on the statistic
+    that actually gates them.
+
+    The corrected mechanism: discovery's floor must be STRICTLY LESS than the gate's, not
+    merely equal to it, precisely because the two sides measure different things and only a
+    genuine margin protects a quiet-day snapshot from undercutting a healthy median.
     """
     from keel.compliance.screen import ScreenPolicy
 
-    assert DEFAULT_MIN_QUOTE_24H_VOLUME == ScreenPolicy().min_median_daily_volume
+    assert DEFAULT_MIN_QUOTE_24H_VOLUME < ScreenPolicy().min_median_daily_volume

@@ -35,6 +35,7 @@ from pathlib import Path
 from keel.commands._products import _default_sim_products
 from keel.compliance.screen import (
     Candidate,
+    DiscoveryExclusions,
     DiscoveryPolicy,
     MarketFacts,
     ScreenResult,
@@ -66,18 +67,35 @@ DEFAULT_PROPOSALS_DIR = "~/keel/proposals"
 #: create the cycle `cli -> tui -> admission -> cli`. `test_build_discover_report_applies_
 #: default_volume_floor_matching_assets_discover` reads the CLI option's own default and asserts
 #: it equals this constant, so the two cannot silently drift apart.
-#: Discovery's 24h-volume pre-filter, pinned EQUAL to `ScreenPolicy.min_median_daily_volume` so a
-#: sweep can never be stricter than the gate it feeds. It bounds how many products get probed; it
-#: is not a liquidity verdict (that is `--probe-liquidity`, which computes the gate's own median).
+#:
+#: Discovery's 24h-volume pre-filter. It bounds how many products get probed for history; it is
+#: not a liquidity verdict (that is `--probe-liquidity`, which computes the gate's own median).
 #:
 #: Was 5,000,000 until 2026-08-08. At that floor the sweep returned 9 candidates and exactly one
 #: unsettled survivor; at a lower floor, seven more cleared BOTH mechanical gates -- FET among them
 #: at $2.94M/24h, i.e. invisible to the sweep while measuring 4.8x the admission floor. The floor,
 #: not the market, was the binding constraint on the candidate pipeline.
 #:
-#: `tests/commands/test_admission.py` pins this to the CLI option, to `DiscoveryPolicy`'s default
-#: and to the admission floor; all four move together or the suite fails.
-DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("1000000")
+#: The fix that followed pinned this EQUAL to `ScreenPolicy.min_median_daily_volume`
+#: (1,000,000), reasoning that a sweep pinned to the gate's own floor could never be stricter
+#: than the gate it feeds. That reasoning got the INTENT right and the MECHANISM wrong: the two
+#: floors measure DIFFERENT statistics -- this one is a single 24-hour venue snapshot, the
+#: admission floor is the median of volume x close over ALL cached history -- so an equal number
+#: does nothing to stop a quiet trading day from pushing the snapshot below a floor the asset's
+#: own median clears many times over. Measured 2026-08-15: five assets (ATOM, AAVE, BCH, CRV,
+#: ALGO) were silently dropped by the equal-floor sweep despite each measuring 3.1x-6.3x the
+#: admission floor on the gate's own statistic; four of the five sat in an 852,133-979,000 24h
+#: snapshot cluster on that single quiet day.
+#:
+#: The floor is now strictly BELOW the admission floor, by an order of magnitude, so a quiet-day
+#: snapshot has real room before it can hide an asset the gate would admit. See
+#: `keel.compliance.screen.DiscoveryPolicy.min_quote_24h_volume`, which carries the identical
+#: reasoning next to the number it actually applies.
+#:
+#: `tests/commands/test_admission.py` pins this to the CLI option, to `DiscoveryPolicy`'s default,
+#: and to being strictly less than the admission floor; all of those move together or the suite
+#: fails.
+DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("100000")
 
 
 # -- 2a. shortlist location (offline) ------------------------------------------------------------
@@ -380,6 +398,11 @@ class DiscoverReport:
     venue_product_count: int
     candidates: list[Candidate]
     min_quote_24h_volume: Decimal
+    #: Per-reason exclusion counts over the WHOLE sweep -- every product in `venue_product_count`
+    #: that did not become a candidate, not just the ones cut by `limit` below. See
+    #: `build_discover_report`'s docstring for why that distinction matters when reading this
+    #: field alongside `candidates`.
+    excluded: DiscoveryExclusions
 
 
 def build_discover_report(
@@ -396,7 +419,14 @@ def build_discover_report(
     Uses `screen.discover_candidates` with a `DiscoveryPolicy` built from `config.quote_currency`
     and the volume floor, excluding `config.allowlist` -- mirroring `assets_discover` in
     `keel/cli.py`. `min_quote_24h_volume` defaults to `DEFAULT_MIN_QUOTE_24H_VOLUME`, matching
-    `assets discover`'s own CLI default (`5000000`).
+    `assets discover`'s own CLI default (`100000`).
+
+    `DiscoverReport.candidates` is truncated to `limit`, but `DiscoverReport.excluded` is NOT --
+    it is the per-reason count over the WHOLE sweep, every product in `venue_product_count` that
+    did not become a candidate at all. Read the two together with that in mind: `excluded.total`
+    plus `len(candidates)` before truncation equals `venue_product_count`, not
+    `len(report.candidates)` plus `excluded.total` -- the shown rows are a further cut of the
+    survivors, not of the population `excluded` is counted against.
     """
     floor = (
         min_quote_24h_volume
@@ -404,14 +434,15 @@ def build_discover_report(
         else DEFAULT_MIN_QUOTE_24H_VOLUME
     )
     policy = DiscoveryPolicy(quote_currency=config.quote_currency, min_quote_24h_volume=floor)
-    candidates = discover_candidates(
+    result = discover_candidates(
         products, policy, exclude_assets=frozenset(a.upper() for a in config.allowlist)
     )
     return DiscoverReport(
         quote=policy.quote_currency,
         venue_product_count=len(products),
-        candidates=candidates[:limit],
+        candidates=result.candidates[:limit],
         min_quote_24h_volume=floor,
+        excluded=result.excluded,
     )
 
 
@@ -425,6 +456,7 @@ def render_discover_report(report: DiscoverReport) -> list[str]:
         f"{report.venue_product_count} venue products -> {len(report.candidates)} candidates "
         f"(quote={report.quote}, 24h volume >= {report.min_quote_24h_volume:,.0f}, excluding "
         "the current allowlist)",
+        report.excluded.summary_line(),
         "",
         f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}  name",
     ]
