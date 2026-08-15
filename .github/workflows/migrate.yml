@@ -1,16 +1,23 @@
 name: Migrate database
 
-# MANUAL ONLY. Schema migration for an EXISTING database -- never runs on push or merge.
+# Migrating a REAL database is manual only. Merging to `main` runs the migration-chain SMOKE TEST,
+# and structurally cannot do more than that -- see the safety property below.
 #
 # Migration is deliberately separate from seeding: `keel init` seeds the strategy (rules) library
 # on a FRESH deployment, while `keel migrate` only evolves an existing database's schema. Seeding
 # on migrate would resurrect rules that were deliberately deleted or refuted.
 #
+# ⚠️ THE SAFETY PROPERTY THAT MAKES THE `push` TRIGGER SOUND, and it is a property of the event, not
+# of anyone's discipline: `db_path` is a `workflow_dispatch` INPUT. A `push` event carries no
+# inputs, so on a merge `${{ inputs.db_path }}` renders EMPTY and the job below takes its
+# `migration_smoke.py` branch -- always. There is no value a merge can supply that would make it
+# migrate a real database. Only a human dispatching it by hand can pass a `db_path`.
+# Do not "helpfully" add a default target or read a path from a repo variable: either would remove
+# this property and let a merge write to a live database.
+#
 # DEFERRED SEAM: today `keel.db` is local, git-ignored and single-user, so CI has no database to
 # reach. Once the app is server-hosted, that deployment's database becomes the `db_path` target
-# (via a self-hosted runner or a mounted volume) and the release workflow can call this job. Until
-# then, dispatching this with no target runs a migration-integrity check instead of pretending to
-# migrate something that is not there.
+# (via a self-hosted runner or a mounted volume) and the release workflow can call this job.
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +26,8 @@ on:
         required: false
         type: string
         default: ""
+  push:
+    branches: [main]
 
 permissions:
   contents: read
