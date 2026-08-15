@@ -3,9 +3,8 @@ name: Code Quality
 # SonarQube (static analysis + coverage) and Snyk (dependency vulnerabilities).
 #
 # ┌─ BEFORE THIS CAN RUN ─────────────────────────────────────────────────────────────────────────
-# │ Two repository secrets must exist. As of this workflow landing, NEITHER DOES -- `gh secret
-# │ list` is empty at both repo and org level, so every run will stop at the preflight job below
-# │ until they are added:
+# │ Two repository secrets must exist. As of 2026-08-16, NEITHER DOES -- `gh secret list` is empty
+# │ at both repo and org level:
 # │
 # │   SONAR_TOKEN  -- from SonarQube ("My Account" -> Security -> Generate Token)
 # │   SNYK_TOKEN   -- from Snyk (Account Settings -> Auth Token, or `snyk config get api`)
@@ -14,6 +13,10 @@ name: Code Quality
 # │ `sonar-project.properties` at the repo root also carries a `sonar.projectKey` that must match
 # │ the project as it exists on the Sonar server, and a commented-out `sonar.organization` that
 # │ SonarQube Cloud requires -- read that file before the first run.
+# │
+# │ UNTIL THEY EXIST, this workflow does NOT fail the build. It skips both scans and explains
+# │ itself in the run summary -- unless a human DISPATCHED it, in which case it fails loudly,
+# │ because silently ignoring a direct request is worse. See `preflight` for the full argument.
 # └───────────────────────────────────────────────────────────────────────────────────────────────
 #
 # TRIGGERS. This was `workflow_dispatch` + `schedule` only, to avoid the automatic Actions spend a
@@ -55,12 +58,31 @@ jobs:
   # authorized. Please check the property sonar.token", and Snyk exits with a generic auth error
   # from inside a container. Neither says "the repository secret does not exist", which is the
   # actual cause and the only thing the reader needs to know. This job says it once, up front.
+  #
+  # ⚠️ IT SAYS IT DIFFERENTLY DEPENDING ON WHO ASKED, and that asymmetry is the whole point:
+  #
+  #   workflow_dispatch  -> a human asked for a scan. If it cannot run, FAIL, loudly. Silently
+  #                         doing nothing in response to a direct request is the worse outcome.
+  #   push / schedule    -> nobody asked; the trigger fired on its own. If the tokens are not
+  #                         configured, SKIP cleanly and say so in the run summary.
+  #
+  # The second half exists because `push: [main]` was added in #272 when the repo went public and
+  # Actions minutes stopped being billed. Before that this workflow ran weekly, so an unconfigured
+  # repo produced one red X every Monday. On every merge, the same behaviour is a permanently red
+  # `main` that teaches the reader to ignore CI -- which costs more than the missing scan does.
+  # A skipped scan that announces itself is honest; a red X nobody reads is not.
+  #
+  # `secrets` cannot be referenced from a job-level `if:`, which is why this is an OUTPUT consumed
+  # by the two scan jobs rather than a condition written directly on them.
   preflight:
     name: Check required secrets
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
     steps:
       - name: Verify SONAR_TOKEN and SNYK_TOKEN are set
+        id: check
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
@@ -69,18 +91,37 @@ jobs:
           MISSING=""
           [ -n "${SONAR_TOKEN:-}" ] || MISSING="$MISSING SONAR_TOKEN"
           [ -n "${SNYK_TOKEN:-}" ] || MISSING="$MISSING SNYK_TOKEN"
-          if [ -n "$MISSING" ]; then
-            echo "::error title=Missing repository secrets::This workflow cannot run until these secrets exist:$MISSING"
-            echo "Missing:$MISSING"
+
+          if [ -z "$MISSING" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "SONAR_TOKEN and SNYK_TOKEN are both present."
+            exit 0
+          fi
+
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Code quality scans skipped"
             echo
-            echo "Add them at:"
-            echo "  https://github.com/${{ github.repository }}/settings/secrets/actions"
+            echo "These repository secrets do not exist, so SonarQube and Snyk cannot run:"
             echo
-            echo "  SONAR_TOKEN -- SonarQube: My Account > Security > Generate Token"
-            echo "  SNYK_TOKEN  -- Snyk: Account Settings > Auth Token (or 'snyk config get api')"
+            for s in $MISSING; do echo "- \`$s\`"; done
+            echo
+            echo "Add them at [Settings > Secrets > Actions](https://github.com/${{ github.repository }}/settings/secrets/actions):"
+            echo
+            echo "| secret | where to get it |"
+            echo "| --- | --- |"
+            echo "| \`SONAR_TOKEN\` | SonarQube: My Account > Security > Generate Token |"
+            echo "| \`SNYK_TOKEN\` | Snyk: Account Settings > Auth Token (or \`snyk config get api\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # A human asked for this scan. Refusing quietly would be worse than failing.
+            echo "::error title=Missing repository secrets::You dispatched this workflow, but it cannot run until these secrets exist:$MISSING"
             exit 1
           fi
-          echo "SONAR_TOKEN and SNYK_TOKEN are both present."
+
+          echo "::notice title=Code quality scans skipped::Not configured yet -- missing:$MISSING. This is not a build failure; see the run summary."
 
   # ONE whole-repo scan, not the reference's per-module matrix. The reference fans out over a
   # Node monorepo whose modules each have their own package.json, tsconfig and test run, and it
@@ -93,6 +134,7 @@ jobs:
   sonarqube:
     name: SonarQube scan
     needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -131,6 +173,7 @@ jobs:
   snyk:
     name: Snyk dependency scan
     needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
