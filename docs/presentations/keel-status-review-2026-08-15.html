@@ -236,7 +236,61 @@
     </table>
   </div>
 
-  <p>A parallel paper deployment carries a wider universe — <span class="num">19</span> allowlisted assets, <span class="num">20</span> attested, <span class="num">22</span> rules — and exists purely to accumulate evidence without risking funds.</p>
+  <p>Alongside it runs a <strong>paper deployment</strong> — separate database, separate config, synthetic cash. It is not a toy: it is the evidence pipeline that is supposed to feed live. The next section is about why it currently does not.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Paper → live</p>
+  <h2>The promotion path exists, is enforced, and is unreachable</h2>
+  <p class="lead">A rule is not supposed to touch real money until it has earned it. keel encodes that as a status ladder with a deterministic gate between the last two rungs — and the gate is doing its job, which is how we know the strategy cannot clear it.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Paper deployment · synthetic cash, wider universe</caption>
+      <thead><tr><th>Item</th><th>Detail</th><th class="n">Figure</th></tr></thead>
+      <tbody>
+        <tr><td>Mode</td><td>Paper — synthetic equity, no venue orders</td><td class="n">$500 → $550</td></tr>
+        <tr><td>Allowlist</td><td>The live six plus SOL, LTC, LINK, ZEC, NEAR, AVAX, UNI, FET, ICP, DOT, CRV, ALGO, BCH</td><td class="n">19</td></tr>
+        <tr><td>Attested assets</td><td>Human-classified, each with a source</td><td class="n">20</td></tr>
+        <tr><td>Rules on the books</td><td>19 × <code>turtle_breakout</code> at <code>paper</code>, 1 at <code>candidate</code>, 2 × <code>dca</code> <code>disabled</code></td><td class="n">22</td></tr>
+        <tr><td>Rules that actually load</td><td class="dim">Only <code>status=paper</code> loads in paper mode — the other three are inert</td><td class="n">19</td></tr>
+        <tr><td>Signals produced</td><td class="dim">To date</td><td class="n bad">0</td></tr>
+        <tr><td>Orders, positions, outcomes</td><td class="dim">To date</td><td class="n bad">0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>The ladder, and the gate between paper and live</h3>
+  <p>A rule moves <code>candidate</code> → <code>paper</code> → <code>live</code>. Status is not a label: it decides whether the agent loads the rule at all. Promotion to live requires clearing every floor below, and the floors were deliberately <em>not</em> relaxed together — when the win-rate axis was loosened for trend-following, <code>min_trades</code> was held at its canonical value on the grounds that the two axes are independent and only one had a justification.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Promotion floors · <code>strategy/promotion.py</code></caption>
+      <thead><tr><th>Floor</th><th class="n">Required</th><th>Status against measurement</th></tr></thead>
+      <tbody>
+        <tr><td><code>min_trades</code></td><td class="n">100</td><td class="bad">Unreachable — see below</td></tr>
+        <tr><td><code>min_expectancy</code></td><td class="n">&gt; 0</td><td class="dim">Untested at scale</td></tr>
+        <tr><td><code>min_rr</code></td><td class="n">1.5</td><td class="dim">Untested at scale</td></tr>
+        <tr><td><code>min_win_rate</code> (trend class)</td><td class="n">0.30</td><td class="dim">Relaxed from 0.55, deliberately and alone</td></tr>
+        <tr><td>PBO / overfitting gate</td><td class="n">required</td><td class="bad">Blocks while unset</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="finding">
+    <h3>The floor and the timeframe are arithmetically incompatible</h3>
+    <p><code>min_trades = 100</code> is checked <strong>per rule, per product</strong> — it does not pool across assets. Measured trade rates for the daily turtle:</p>
+    <ul>
+      <li>BTC <span class="num">2.59</span>/yr · ETH <span class="num">2.59</span>/yr · PAXG <span class="num">3.20</span>/yr · XLM <span class="num">1.59</span>/yr · ADA <span class="num">1.19</span>/yr</li>
+      <li>Years to reach <span class="num">n=100</span> from scratch: <strong>31 to 84</strong>.</li>
+    </ul>
+    <p><strong>Waiting for the gate is not a slower path to the same place; it is no path.</strong> And adding assets does not help — the floor is per rule, so a new asset yields a new rule with its own ~14 trades, not a pooled 114.</p>
+  </div>
+
+  <h3>What follows, stated plainly</h3>
+  <p><strong>Five of the seven live rules carry <code>promoted_at = NULL</code>.</strong> They were seeded straight to <code>live</code> and have been left there. That is a recorded decision, not an oversight — the reasoning sits in the live config, reviewed and dated. Only the BTC <code>dca</code> rule and the DOGE turtle were promoted through the normal path.</p>
+  <p>What bounds the risk is therefore <em>not</em> the promotion gate, which never ran. It is the position caps, the nineteen rails, and the allowlist — and those are separate mechanisms that all did run. The bypass is of the <strong>evidence</strong> gate, not the <strong>safety</strong> rails.</p>
+  <p>This is also why paper matters more than its zero signals suggest. It is the only apparatus that could ever produce the evidence the gate demands, and the honest reading of <span class="num">0</span> signals is not that paper is broken — it is that a rule firing twice a year cannot generate a hundred trades inside a human attention span.</p>
 </section>
 
 <section>
