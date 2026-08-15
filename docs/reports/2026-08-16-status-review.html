@@ -406,36 +406,69 @@
 </section>
 
 <section>
-  <p class="eyebrow">Roadmap</p>
-  <h2>What's next, in the order it matters</h2>
+  <p class="eyebrow">Direction</p>
+  <h2>The decision: open-source the compliance engine</h2>
+  <p class="lead">Every reachable strategy configuration has been measured and none is viable at this venue's cost. That result reframes what keel is <em>for</em> — and the answer is the part that works.</p>
 
-  <div class="road">
-    <div class="road-item">
-      <span class="road-id">#260</span><span class="road-t">Honour a rule's conditional entry price <span class="chip chip-meas">Highest value</span></span>
-      <span class="road-d">The executor discards the entry level a rule computed and routes a market order. This is not cosmetic: it doubled <code>pullback_continuation</code>'s trade count and dropped its gross profit factor from 0.92 to 0.77 — the strategy takes trades it was designed to decline.</span>
-    </div>
-    <div class="road-item">
-      <span class="road-id">#259</span><span class="road-t">Per-asset slippage</span>
-      <span class="road-d">One global 5bp constant is applied from BTC to the thinnest listing, so illiquid assets are credited with execution they cannot achieve — always in the favourable direction, by an unmeasured amount.</span>
-    </div>
-    <div class="road-item">
-      <span class="road-id">#233</span><span class="road-t">Capability-based venue visibility</span>
-      <span class="road-d">A read-only API key currently looks identical to a working one until an order fails.</span>
-    </div>
-    <div class="road-item">
-      <span class="road-id">#198</span><span class="road-t">Robinhood prerequisites</span>
-      <span class="road-d">The adapter exists behind the broker port; the live execution path is deliberately not wired until its preconditions are met.</span>
-    </div>
+  <div class="finding">
+    <h3>The strategies are not the asset. The rails are.</h3>
+    <p>Nineteen deterministic rails, attestation-based screening that fails closed, and §65.4 <em>qabd</em> encoded as an executable check that halts entries. There is no other open, auditable Shariah screening engine for spot trading — most halal-investing tooling is a closed app asking you to trust its list.</p>
+    <p>So keel is being positioned as <strong>an auditable Shariah compliance engine, with a reference agent attached</strong>. The agent demonstrates the engine; it was never the product.</p>
   </div>
 
-  <h3>The open strategic question</h3>
-  <p>Every reachable configuration has now been measured and none is viable at this venue's cost. That leaves three honest directions, and they are not equivalent:</p>
+  <h3>The governance question, and why it is already answered</h3>
+  <p>Contributors from different madhāhib will disagree about rulings — what counts as riba exposure, how a staking wrapper or a governance token should be classified. Ungoverned, that fragments a project faster than any technical dispute.</p>
+  <p>The architecture answers it: <strong>keel does not issue rulings.</strong> Attestation is a human input that fails closed — the operator supplies sector, backing and yield with a source and an attributed name, and keel enforces that deterministically. Nothing is derived from price data. A Hanafi operator and a Shafi'i operator can both use it, because the ruling lives in the attestation, not the code.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Roadmap</p>
+  <h2>Two tracks, nine milestones, sequenced</h2>
+
+  <h3>Track 1 — Engineering, four open issues</h3>
+  <div class="road">
+    <div class="road-item">
+      <span class="road-id">#260</span><span class="road-t">Honour a rule's conditional entry price <span class="chip chip-meas">Phase 9</span></span>
+      <span class="road-d">The executor discards the entry level a rule computed and routes a market order. Not cosmetic: it doubled <code>pullback_continuation</code>'s trade count and dropped its gross profit factor from 0.92 to 0.77 — the strategy takes trades it was designed to decline.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#259</span><span class="road-t">Per-asset slippage <span class="chip chip-meas">Phase 9</span></span>
+      <span class="road-d">One global 5bp constant from BTC to the thinnest listing, so illiquid assets are credited with execution they cannot achieve — always favourably, by an unmeasured amount.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#233</span><span class="road-t">Capability-based venue visibility <span class="chip chip-open">Phase 5</span></span>
+      <span class="road-d">A read-only API key looks identical to a working one until an order fails.</span>
+    </div>
+    <div class="road-item">
+      <span class="road-id">#198</span><span class="road-t">Robinhood prerequisites <span class="chip chip-open">Phase 5</span></span>
+      <span class="road-d">The adapter exists behind the broker port; the live path is deliberately unwired until its preconditions are met.</span>
+    </div>
+  </div>
+  <p><strong>Phase 9 — Execution &amp; backtest fidelity</strong> is new, and it groups these with the two closed defects of the same class that once voided every performance figure in the project. That is the honest home for them: all four are divergences between what a rule computes, what the backtest models, and what the venue actually does.</p>
+
+  <h3>Track 2 — Open source, fifteen issues across three gated phases</h3>
+  <div class="scroll">
+    <table>
+      <caption>Sequenced, because each phase gates the next</caption>
+      <thead><tr><th>Phase</th><th>Outcome</th><th class="n">Issues</th></tr></thead>
+      <tbody>
+        <tr><td><strong>6 — Licence &amp; discoverability</strong> <span class="chip chip-ref">Blocking</span></td><td>The repo is public but legally all-rights-reserved: no licence, no description, no topics. Nobody may contribute, and nobody can find it.</td><td class="n">4</td></tr>
+        <tr><td><strong>7 — Contributor readiness</strong></td><td>README written for a stranger, the documentation standard stated explicitly, the toolchain floor resolved, and a real on-ramp of shallow issues.</td><td class="n">7</td></tr>
+        <tr><td><strong>8 — Scholarly grounding &amp; launch</strong></td><td>The fiqh basis written down, a review path decided honestly, an Arabic entry point — then announce, never before.</td><td class="n">4</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Two of these are not code and matter most: <strong>stating that keel enforces rulings rather than issuing them</strong>, and <strong>deciding the scholarly review path honestly</strong> — including the option of saying plainly that no scholarly review has occurred. In this domain an overstated claim is not a marketing problem; it destroys the only thing worth having.</p>
+
+  <p>The launch itself is a gate, not a task: nothing is announced until every prior box is ticked. A project that attracts attention before it can absorb it dies of that attention, and there is one first impression with this audience.</p>
+
+  <h3>What remains genuinely open</h3>
   <ul>
     <li><strong>Reduce cost.</strong> The measured 12× spread between the cheapest and dearest retail venue is larger than any edge this project has found. Venue economics dominate every parameter we could tune.</li>
-    <li><strong>Raise per-trade edge.</strong> A genuinely new technique — the registry is closed, so this is a reviewed core change, not a parameter.</li>
-    <li><strong>Accept the result.</strong> Keel is a working, compliant, well-tested instrument. Continuing to run DCA and accumulate live evidence is a legitimate outcome.</li>
+    <li><strong>Raise per-trade edge.</strong> A genuinely new technique — the registry is closed, so this is a reviewed core change, not a parameter. The most promising family, turnover reduction, was chased to its primary source and closed: its best-evidenced technique is already swept in our grids and produced nothing.</li>
+    <li><strong>Let the engine be the contribution.</strong> Now the stated direction. The compliance work is valuable whether or not any strategy ever clears its cost.</li>
   </ul>
-  <p>The turnover-reduction literature — the most promising family — was chased to its primary source this week and closed: its best-evidenced technique has already been swept in our own grids and produced nothing.</p>
 </section>
 
 <footer>
