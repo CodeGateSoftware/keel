@@ -419,6 +419,35 @@ def test_discover_proposes_and_says_so_loudly(tmp_path, valid_config_path, monke
     assert "attest" in result.output
 
 
+def test_discover_reports_the_exclusion_summary(tmp_path, valid_config_path, monkeypatch):
+    """`discover_candidates` used to drop excluded products with a bare `continue`, so `keel
+    assets discover`'s output never said WHY a product vanished between the venue's product
+    count and the candidate table -- only the bare `900 -> 40` header line. This pins that the
+    CLI now echoes a per-reason summary alongside that header: one product survives, one is
+    excluded for the wrong quote currency, and one is excluded for sitting below the 24h
+    volume floor."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    venue = _FakeVenue(
+        [
+            _venue_product("SOL-USD", "50000000"),
+            _venue_product("EURPAIR-EUR", "50000000", quote_currency_id="EUR"),
+            _venue_product("THIN-USD", "1"),
+        ]
+    )
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "discover"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SOL" in result.output
+    assert "wrong quote currency 1" in result.output
+    assert "below 24h volume floor 1" in result.output
+    assert "excluded 2" in result.output
+
+
 def test_discover_excludes_the_current_allowlist(tmp_path, valid_config_path, monkeypatch):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
@@ -432,6 +461,60 @@ def test_discover_excludes_the_current_allowlist(tmp_path, valid_config_path, mo
     )
     assert "SOL" in result.output
     assert "BTC-USD" not in result.output
+
+
+def test_discover_default_limit_is_100():
+    """Pins the new default. Raised from 25 now that a lower --min-volume-24h surfaces ~130
+    candidates instead of ~35 -- 25 would cut off most of a typical sweep before the operator
+    ever sees it."""
+    cli_option = next(p for p in cli_module.assets_discover.params if p.name == "limit")
+    assert cli_option.default == 100
+
+
+def test_discover_states_total_and_shown_when_limit_truncates(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The load-bearing case, verified at the CLI: with more candidates than --limit shows, the
+    output must say the true candidate count, how many are shown, and that --limit controls it --
+    never let a truncated table read as the whole candidate set."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    products = [_venue_product(f"COIN{i}-USD", str(10_000_000 + i)) for i in range(5)]
+    venue = _FakeVenue(products)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "discover", "--limit", "3"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "5 venue products -> 5 candidates" in result.output
+    assert "showing 3 of 5 candidates" in result.output
+    assert "--limit" in result.output
+    shown_rows = [ln for ln in result.output.splitlines() if "COIN" in ln and "-USD" in ln]
+    assert len(shown_rows) == 3
+
+
+def test_discover_no_truncation_notice_when_everything_fits(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """No false alarm: when every candidate fits under --limit, nothing should claim a cut
+    happened."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    products = [_venue_product(f"COIN{i}-USD", str(10_000_000 + i)) for i in range(3)]
+    venue = _FakeVenue(products)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "discover"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "3 venue products -> 3 candidates" in result.output
+    assert "showing" not in result.output
 
 
 def test_probe_history_marks_candidates_without_a_four_year_series(

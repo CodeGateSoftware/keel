@@ -471,7 +471,22 @@ class DiscoveryPolicy:
     """
 
     quote_currency: str = "USD"
-    min_quote_24h_volume: Decimal = Decimal("1000000")
+    #: DISCOVERY's floor, deliberately an order of magnitude BELOW the admission floor
+    #: `ScreenPolicy.min_median_daily_volume` (1,000,000), and deliberately NOT equal to it. The
+    #: two numbers measure different statistics -- this one is a single 24-hour venue snapshot,
+    #: while the admission floor is the median of volume x close over ALL cached history -- so
+    #: pinning them equal does not make the pre-filter non-stricter than the gate it feeds: a
+    #: quiet trading day can push the snapshot below a floor the asset's own median clears many
+    #: times over.
+    #:
+    #: Measured 2026-08-15: four of five wrongly-dropped assets (ATOM, BCH, CRV, ALGO) sat in an
+    #: 852,133-979,000 24h-snapshot cluster on a single quiet day, while their median-over-history
+    #: liquidity was 3.1x-6.3x the admission floor. 100,000 sits comfortably below that cluster,
+    #: with room to spare for a quieter day still.
+    #:
+    #: This bounds how many products get probed for history; it is not a liquidity verdict.
+    #: `--probe-liquidity` computes the gate's own statistic and is the honest estimator of that.
+    min_quote_24h_volume: Decimal = Decimal("100000")
 
 
 def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
@@ -496,43 +511,153 @@ def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
     return volumes[len(volumes) // 2]
 
 
+@dataclass(frozen=True)
+class DiscoveryExclusions:
+    """Per-reason counts of every venue product `discover_candidates` dropped, in the SAME
+    declaration order the checks run in.
+
+    `discover_candidates` used to drop an excluded product with a bare `continue`, so nothing
+    recorded WHY a product vanished or how many were lost to each reason -- an operator watching
+    `900 -> 40` had no way to tell whether the missing 860 were junk (wrong quote currency,
+    offline, disabled) or real candidates sitting just under the liquidity floor. This type is
+    the fix: every reason is a named field, counted exactly once per product (the FIRST check it
+    fails, never a later one it would also have failed), so the sweep's own output can explain
+    itself.
+
+    Every field defaults to 0 rather than the type being optional or partial, because a reason
+    reading 0 is itself informative -- it tells the operator that reason was checked and simply
+    did not fire, which is different from a reason that was never evaluated at all. `counts()`
+    and `summary_line()` both list every reason unconditionally for the same cause: a summary
+    line whose shape changes depending on which reasons happened to be nonzero would make the
+    line itself something an operator has to learn to parse, rather than a fixed shape they can
+    scan every time.
+    """
+
+    wrong_quote_currency: int = 0
+    not_online: int = 0
+    trading_disabled: int = 0
+    view_only: int = 0
+    already_on_allowlist: int = 0
+    unreadable_volume: int = 0
+    below_volume_floor: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.wrong_quote_currency
+            + self.not_online
+            + self.trading_disabled
+            + self.view_only
+            + self.already_on_allowlist
+            + self.unreadable_volume
+            + self.below_volume_floor
+        )
+
+    def counts(self) -> tuple[tuple[str, int], ...]:
+        """`(human label, count)` pairs in declaration order. The single source of truth for the
+        label text, so `summary_line()` and any future renderer (the TUI overlay, say) cannot
+        drift into naming the same reason two different ways."""
+        return (
+            ("wrong quote currency", self.wrong_quote_currency),
+            ("not online", self.not_online),
+            ("trading disabled", self.trading_disabled),
+            ("view only", self.view_only),
+            ("already on allowlist", self.already_on_allowlist),
+            ("unreadable 24h volume", self.unreadable_volume),
+            ("below 24h volume floor", self.below_volume_floor),
+        )
+
+    def summary_line(self) -> str:
+        """`"excluded N: reason1 n1, reason2 n2, ..."` -- every reason named, including the zero
+        ones, for `counts()`'s reason above."""
+        return f"excluded {self.total}: " + ", ".join(f"{label} {n}" for label, n in self.counts())
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """`discover_candidates`'s return value: the survivors, plus a full accounting of everyone
+    who did not survive and why. See `DiscoveryExclusions` for the accounting half."""
+
+    candidates: list[Candidate]
+    excluded: DiscoveryExclusions
+
+
 def discover_candidates(
     products: list[dict],
     policy: DiscoveryPolicy | None = None,
     exclude_assets: frozenset[str] | None = None,
-) -> list[Candidate]:
+) -> DiscoveryResult:
     """Propose candidates from venue metadata. **Proposes only — admits nothing.**
 
     §5's asymmetry: a proposal may come from anywhere, but activity may only INCREASE through
     the deterministic gate. Nothing here checks sector or backing, and nothing here may be read
     as approval — every survivor still has to clear `screen_asset`, which fails closed without a
     human attestation.
+
+    Returns a `DiscoveryResult` rather than a bare `list[Candidate]` (its shape before this
+    accounting existed) precisely so that adding `excluded` could not become a silent trap for an
+    un-updated caller. A tuple `(candidates, excluded)` would have let an old call site that still
+    expected a list either mis-index (`result[0]` now the whole result, not the first candidate)
+    or iterate the wrong thing -- both wrong answers that run without complaint. A named
+    dataclass makes the same old call site fail LOUDLY at the attribute access
+    (`AttributeError: 'DiscoveryResult' object has no attribute 'asset'`) instead of silently
+    reading nonsense, which is the same fail-closed instinct the rest of this module applies to
+    admission itself.
+
+    Each dropped product counts against the FIRST criterion order below that it fails, never a
+    later one it would also have failed -- so a product excluded for the wrong quote currency is
+    not ALSO counted as thin, even though it may be. `trading_disabled` and `is_disabled` are two
+    venue flags that mean the same thing to an operator and both land in the single
+    `trading_disabled` reason; a volume that fails to parse as a `Decimal` lands in
+    `unreadable_volume`, distinct from `below_volume_floor`, which is a volume that parsed fine
+    but did not clear `policy.min_quote_24h_volume`.
+
+    Deliberately PURE and OFFLINE: no network call, no DB read or write, no logging. `products`
+    is the caller's already-fetched venue metadata, and this function's only job is to filter and
+    count it -- see the module-level split between computed facts and attested judgement for why
+    keeping side effects out of a function like this matters generally, and `keel/commands/
+    admission.py`'s module docstring for why THIS function in particular has to be safely
+    callable with nothing but a fake product list in a test.
     """
     policy = policy or DiscoveryPolicy()
     exclude = exclude_assets or frozenset()
     out: list[Candidate] = []
+    wrong_quote_currency = 0
+    not_online = 0
+    trading_disabled = 0
+    view_only = 0
+    already_on_allowlist = 0
+    unreadable_volume = 0
+    below_volume_floor = 0
 
     for product in products:
         product_id = product.get("product_id") or ""
         if (product.get("quote_currency_id") or "").upper() != policy.quote_currency.upper():
+            wrong_quote_currency += 1
             continue
         if product.get("status") != "online":
+            not_online += 1
             continue
         if product.get("trading_disabled") or product.get("is_disabled"):
+            trading_disabled += 1
             continue
         if product.get("view_only"):
+            view_only += 1
             continue
 
         asset = product_id.split("-")[0]
         if asset in exclude:
+            already_on_allowlist += 1
             continue
 
         raw_volume = product.get("quote_24h_volume")
         try:
             volume = Decimal(str(raw_volume))
         except (TypeError, ArithmeticError, ValueError):
+            unreadable_volume += 1
             continue
         if volume < policy.min_quote_24h_volume:
+            below_volume_floor += 1
             continue
 
         out.append(
@@ -544,4 +669,15 @@ def discover_candidates(
             )
         )
 
-    return sorted(out, key=lambda c: c.quote_24h_volume, reverse=True)
+    return DiscoveryResult(
+        candidates=sorted(out, key=lambda c: c.quote_24h_volume, reverse=True),
+        excluded=DiscoveryExclusions(
+            wrong_quote_currency=wrong_quote_currency,
+            not_online=not_online,
+            trading_disabled=trading_disabled,
+            view_only=view_only,
+            already_on_allowlist=already_on_allowlist,
+            unreadable_volume=unreadable_volume,
+            below_volume_floor=below_volume_floor,
+        ),
+    )

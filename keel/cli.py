@@ -763,13 +763,29 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
 @assets_group.command("discover")
 @click.option("--quote", default=None, help="Settlement currency (default: config.quote_currency).")
 @click.option(
-    "--min-volume-24h", default="1000000", show_default=True,
+    "--min-volume-24h", default="100000", show_default=True,
     help="Cheap pre-filter on the venue's reported 24h quote volume. Bounds the request count; it "
     "is NOT a liquidity criterion -- a 24h snapshot is a different statistic from the median the "
-    "gate applies, so use --probe-liquidity for that. Set equal to the admission floor so "
-    "discovery cannot be stricter than the criterion it screens for.",
+    "gate applies, so use --probe-liquidity for that. Deliberately set well BELOW the admission "
+    "floor, not equal to it: a 24h snapshot and the gate's all-cached-history median are "
+    "different statistics, so an equal number does not make discovery non-stricter than the gate "
+    "it feeds -- a quiet trading day can push the snapshot under a floor the asset's own median "
+    "clears many times over.",
 )
-@click.option("--limit", default=25, show_default=True, help="Show at most this many candidates.")
+@click.option(
+    # Raised from 25 to 100 on 2026-08-15: lowering --min-volume-24h's floor (see that option's
+    # own help text) grew a typical sweep from ~35 candidates to ~130, sorted by descending 24h
+    # volume, so the assets that floor change exists to surface can land well past rank 25 and
+    # get cut off by this option before an operator ever sees them. 100 shows nearly all of a
+    # typical sweep at no extra cost: with NEITHER probe flag, `discover` makes exactly ONE venue
+    # request regardless of --limit -- filtering and sorting are local. --probe-history and
+    # --probe-liquidity are the ones with a per-row cost, called out below.
+    "--limit", default=100, show_default=True,
+    help="Show at most this many candidates. With neither --probe-history nor --probe-liquidity, "
+    "raising this costs nothing extra -- discovery still makes exactly one venue request. Each "
+    "probe flag adds one venue request PER CANDIDATE SHOWN (two requests per row if both are "
+    "given), so a large --limit combined with a probe flag multiplies the request count.",
+)
 @click.option(
     "--probe-history",
     is_flag=True,
@@ -812,15 +828,27 @@ def assets_discover(
         quote_currency=quote or config.quote_currency,
         min_quote_24h_volume=Decimal(min_volume_24h),
     )
-    candidates = screen_mod.discover_candidates(
+    result = screen_mod.discover_candidates(
         products, policy, exclude_assets=frozenset(config.allowlist)
     )
 
     click.echo(
-        f"{len(products)} venue products -> {len(candidates)} candidates "
+        f"{len(products)} venue products -> {len(result.candidates)} candidates "
         f"(quote={policy.quote_currency}, 24h volume >= {policy.min_quote_24h_volume:,.0f}, "
-        f"excluding the current allowlist)\n"
+        f"excluding the current allowlist)"
     )
+    click.echo(result.excluded.summary_line())
+    # Never truncate silently: `result.candidates` above is the FULL survivor list (only the
+    # table loop below is cut to `limit`), so if there are more survivors than `limit` allows,
+    # say so explicitly -- how many exist, how many are about to be shown, and that --limit is
+    # the knob. A silent cap here would be exactly the defect class this command's own fix
+    # (the --min-volume-24h floor) exists to eliminate, just moved one step later in the pipeline.
+    if len(result.candidates) > limit:
+        click.echo(
+            f"showing {limit} of {len(result.candidates)} candidates -- raise --limit to see "
+            "the rest."
+        )
+    click.echo("")
     screen_policy = screen_mod.ScreenPolicy()
     header = f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}"
     if probe_history:
@@ -832,7 +860,7 @@ def assets_discover(
     now_ts = int(time.time())
     four_years_ago = now_ts - 4 * _DAYS_PER_YEAR * 86400
     liquidity_window_start = now_ts - _LIQUIDITY_PROBE_DAYS * 86400
-    for index, candidate in enumerate(candidates[:limit], start=1):
+    for index, candidate in enumerate(result.candidates[:limit], start=1):
         line = (
             f"{index:>3}  {candidate.product_id:<14} {candidate.asset:<8} "
             f"{candidate.quote_24h_volume:>18,.0f}"

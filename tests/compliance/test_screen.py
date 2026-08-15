@@ -543,14 +543,14 @@ def test_discovery_keeps_liquid_online_products_in_the_settlement_currency():
     from keel.compliance.screen import discover_candidates
 
     found = discover_candidates([_product()])
-    assert [c.asset for c in found] == ["SOL"]
+    assert [c.asset for c in found.candidates] == ["SOL"]
 
 
 def test_discovery_drops_the_wrong_quote_currency():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(quote="USDC")]) == []
-    assert discover_candidates([_product(quote="BTC")]) == []
+    assert discover_candidates([_product(quote="USDC")]).candidates == []
+    assert discover_candidates([_product(quote="BTC")]).candidates == []
 
 
 def test_discovery_drops_untradable_products():
@@ -562,20 +562,20 @@ def test_discovery_drops_untradable_products():
         {"is_disabled": True},
         {"view_only": True},
     ):
-        assert discover_candidates([_product(**kwargs)]) == [], kwargs
+        assert discover_candidates([_product(**kwargs)]).candidates == [], kwargs
 
 
 def test_discovery_drops_thin_products():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(volume="100")]) == []
+    assert discover_candidates([_product(volume="100")]).candidates == []
 
 
 def test_discovery_survives_a_malformed_volume_rather_than_crashing():
     from keel.compliance.screen import discover_candidates
 
-    assert discover_candidates([_product(volume=None)]) == []
-    assert discover_candidates([_product(volume="n/a")]) == []
+    assert discover_candidates([_product(volume=None)]).candidates == []
+    assert discover_candidates([_product(volume="n/a")]).candidates == []
 
 
 def test_discovery_excludes_assets_we_already_hold():
@@ -584,7 +584,7 @@ def test_discovery_excludes_assets_we_already_hold():
     found = discover_candidates(
         [_product("BTC-USD"), _product("SOL-USD")], exclude_assets=frozenset({"BTC"})
     )
-    assert [c.asset for c in found] == ["SOL"]
+    assert [c.asset for c in found.candidates] == ["SOL"]
 
 
 def test_discovery_ranks_by_liquidity():
@@ -593,14 +593,14 @@ def test_discovery_ranks_by_liquidity():
     found = discover_candidates(
         [_product("A-USD", volume="10000000"), _product("B-USD", volume="90000000")]
     )
-    assert [c.asset for c in found] == ["B", "A"]
+    assert [c.asset for c in found.candidates] == ["B", "A"]
 
 
 def test_discovery_proposes_but_never_admits():
     """A discovered candidate is still REJECTED by the screen until a human attests it."""
     from keel.compliance.screen import discover_candidates
 
-    (candidate,) = discover_candidates([_product()])
+    (candidate,) = discover_candidates([_product()]).candidates
     result = screen_asset(_facts(asset=candidate.asset), None)
     assert result.admitted is False
 
@@ -611,10 +611,124 @@ def test_discovery_matches_the_quote_currency_case_insensitively():
     from keel.compliance.screen import DiscoveryPolicy, discover_candidates
 
     lowercase_venue = _product(pid="SOL-USD", quote="usd")
-    assert discover_candidates([lowercase_venue]), "lowercase venue quote id dropped everything"
+    assert discover_candidates(
+        [lowercase_venue]
+    ).candidates, "lowercase venue quote id dropped everything"
     assert discover_candidates(
         [_product(pid="SOL-USD", quote="USD")], DiscoveryPolicy(quote_currency="usd")
-    ), "lowercase configured quote currency dropped everything"
+    ).candidates, "lowercase configured quote currency dropped everything"
+
+
+def test_a_quiet_days_snapshot_no_longer_hides_an_asset_the_gate_would_admit():
+    """The 2026-08-15 regression this default change fixes.
+
+    `--min-volume-24h` used to default to `Decimal("1000000")`, pinned EQUAL to the admission
+    floor `ScreenPolicy.min_median_daily_volume`. That equality does not make the pre-filter
+    non-stricter than the gate it feeds, because the two sides measure DIFFERENT statistics:
+    discovery's `quote_24h_volume` is a single 24-hour venue snapshot, while the gate's
+    `median_daily_volume` is the median of volume x close over ALL cached history. A quiet
+    trading day can push the snapshot below a floor the asset clears comfortably on a typical
+    day, and an equal number does nothing to prevent that.
+
+    Measured on 2026-08-15, five assets were silently dropped by discovery at the old
+    1,000,000 floor despite the gate's own statistic sitting far above the admission floor:
+    ATOM 3,077,474 (3.08x), AAVE 6,315,463 (6.32x), BCH 5,464,940 (5.46x), CRV 3,329,753
+    (3.33x) and ALGO 3,780,207 (3.78x). Four of the five -- all but AAVE -- had 24h snapshots
+    clustered between 852,133 and 979,000 on that single quiet day, i.e. comfortably below the
+    old floor while their median-over-history liquidity was multiples of the admission
+    requirement.
+
+    This test uses ATOM's actual measured 24h figure, `852133`: well under the OLD floor of
+    1,000,000 but above the new default of 100,000. Under the default `DiscoveryPolicy()` it
+    must survive the pre-filter, so the sweep can no longer hide an asset the gate would admit.
+    """
+    from keel.compliance.screen import discover_candidates
+
+    found = discover_candidates([_product(pid="ATOM-USD", volume="852133")])
+
+    assert [c.asset for c in found.candidates] == ["ATOM"]
+
+
+def test_discovery_counts_every_exclusion_by_reason():
+    """`discover_candidates` used to drop excluded products with a bare `continue`, so nothing
+    recorded WHY a product was excluded or how many were. That made a quiet-day floor problem
+    (see `test_a_quiet_days_snapshot_no_longer_hides_an_asset_the_gate_would_admit`) invisible
+    in the sweep's own output -- an operator watching `900 -> 40` had no way to tell whether the
+    missing 860 were junk (wrong quote currency, offline, disabled) or real candidates sitting
+    just under the floor.
+
+    Exactly ONE product is fed per reason, first-match-wins in the declaration order of
+    `DiscoveryExclusions`, plus one clean survivor -- so every count below is 1, the total is the
+    number of reasons, and a product excluded for one reason is pinned NOT to be double-counted
+    against a later check it would also fail. The `trading_disabled` reason covers two venue
+    flags (`trading_disabled` and `is_disabled`) and is therefore fed only its first variant
+    here; that the second lands in the same bucket rather than a reason of its own is pinned
+    separately by `test_discovery_counts_both_trading_disabled_flag_variants_together`, which
+    keeps this test's one-product-per-reason arithmetic honest.
+    """
+    from keel.compliance.screen import discover_candidates
+
+    products = [
+        _product("WRONGQ-USD", quote="EUR"),
+        _product("OFFLINE-USD", status="offline"),
+        _product("HALTED-USD", trading_disabled=True),
+        _product("VIEWONLY-USD", view_only=True),
+        _product("BTC-USD"),  # excluded via `exclude_assets` below: already on the allowlist
+        _product("BADVOL-USD", volume="not-a-number"),
+        _product("THIN-USD", volume="1"),
+        _product("SOL-USD"),  # the one survivor
+    ]
+
+    result = discover_candidates(products, exclude_assets=frozenset({"BTC"}))
+
+    assert result.excluded.wrong_quote_currency == 1
+    assert result.excluded.not_online == 1
+    assert result.excluded.trading_disabled == 1
+    assert result.excluded.view_only == 1
+    assert result.excluded.already_on_allowlist == 1
+    assert result.excluded.unreadable_volume == 1
+    assert result.excluded.below_volume_floor == 1
+    assert result.excluded.total == 7
+    assert [c.asset for c in result.candidates] == ["SOL"]
+
+
+def test_discovery_counts_both_trading_disabled_flag_variants_together():
+    """`trading_disabled` covers BOTH the `trading_disabled` and `is_disabled` product flags --
+    feeding one of each must total 2 under the single `trading_disabled` reason, not split
+    across a reason that does not exist."""
+    from keel.compliance.screen import discover_candidates
+
+    products = [
+        _product("HALTED-USD", trading_disabled=True),
+        _product("DISABLED-USD", is_disabled=True),
+    ]
+
+    result = discover_candidates(products)
+
+    assert result.excluded.trading_disabled == 2
+    assert result.excluded.total == 2
+    assert result.candidates == []
+
+
+def test_discovery_exclusions_summary_line_names_every_reason_and_the_total():
+    from keel.compliance.screen import DiscoveryExclusions
+
+    exclusions = DiscoveryExclusions(
+        wrong_quote_currency=1,
+        not_online=1,
+        trading_disabled=1,
+        view_only=1,
+        already_on_allowlist=1,
+        unreadable_volume=1,
+        below_volume_floor=1,
+    )
+
+    line = exclusions.summary_line()
+
+    assert line == (
+        "excluded 7: wrong quote currency 1, not online 1, trading disabled 1, view only 1, "
+        "already on allowlist 1, unreadable 24h volume 1, below 24h volume floor 1"
+    )
 
 
 # -- split_failures / missing_history_lines -------------------------------------------------
