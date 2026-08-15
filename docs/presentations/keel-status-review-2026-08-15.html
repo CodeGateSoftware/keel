@@ -236,7 +236,61 @@
     </table>
   </div>
 
-  <p>A parallel paper deployment carries a wider universe — <span class="num">19</span> allowlisted assets, <span class="num">20</span> attested, <span class="num">22</span> rules — and exists purely to accumulate evidence without risking funds.</p>
+  <p>Alongside it runs a <strong>paper deployment</strong> — separate database, separate config, synthetic cash. It is not a toy: it is the evidence pipeline that is supposed to feed live. The next section is about why it currently does not.</p>
+</section>
+
+<section>
+  <p class="eyebrow">Paper → live</p>
+  <h2>The promotion path exists, is enforced, and is unreachable</h2>
+  <p class="lead">A rule is not supposed to touch real money until it has earned it. keel encodes that as a status ladder with a deterministic gate between the last two rungs — and the gate is doing its job, which is how we know the strategy cannot clear it.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Paper deployment · synthetic cash, wider universe</caption>
+      <thead><tr><th>Item</th><th>Detail</th><th class="n">Figure</th></tr></thead>
+      <tbody>
+        <tr><td>Mode</td><td>Paper — synthetic equity, no venue orders</td><td class="n">$500 → $550</td></tr>
+        <tr><td>Allowlist</td><td>The live six plus SOL, LTC, LINK, ZEC, NEAR, AVAX, UNI, FET, ICP, DOT, CRV, ALGO, BCH</td><td class="n">19</td></tr>
+        <tr><td>Attested assets</td><td>Human-classified, each with a source</td><td class="n">20</td></tr>
+        <tr><td>Rules on the books</td><td>19 × <code>turtle_breakout</code> at <code>paper</code>, 1 at <code>candidate</code>, 2 × <code>dca</code> <code>disabled</code></td><td class="n">22</td></tr>
+        <tr><td>Rules that actually load</td><td class="dim">Only <code>status=paper</code> loads in paper mode — the other three are inert</td><td class="n">19</td></tr>
+        <tr><td>Signals produced</td><td class="dim">To date</td><td class="n bad">0</td></tr>
+        <tr><td>Orders, positions, outcomes</td><td class="dim">To date</td><td class="n bad">0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>The ladder, and the gate between paper and live</h3>
+  <p>A rule moves <code>candidate</code> → <code>paper</code> → <code>live</code>. Status is not a label: it decides whether the agent loads the rule at all. Promotion to live requires clearing every floor below, and the floors were deliberately <em>not</em> relaxed together — when the win-rate axis was loosened for trend-following, <code>min_trades</code> was held at its canonical value on the grounds that the two axes are independent and only one had a justification.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Promotion floors · <code>strategy/promotion.py</code></caption>
+      <thead><tr><th>Floor</th><th class="n">Required</th><th>Status against measurement</th></tr></thead>
+      <tbody>
+        <tr><td><code>min_trades</code></td><td class="n">100</td><td class="bad">Unreachable — see below</td></tr>
+        <tr><td><code>min_expectancy</code></td><td class="n">&gt; 0</td><td class="dim">Untested at scale</td></tr>
+        <tr><td><code>min_rr</code></td><td class="n">1.5</td><td class="dim">Untested at scale</td></tr>
+        <tr><td><code>min_win_rate</code> (trend class)</td><td class="n">0.30</td><td class="dim">Relaxed from 0.55, deliberately and alone</td></tr>
+        <tr><td>PBO / overfitting gate</td><td class="n">required</td><td class="bad">Blocks while unset</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="finding">
+    <h3>The floor and the timeframe are arithmetically incompatible</h3>
+    <p><code>min_trades = 100</code> is checked <strong>per rule, per product</strong> — it does not pool across assets. Measured trade rates for the daily turtle:</p>
+    <ul>
+      <li>BTC <span class="num">2.59</span>/yr · ETH <span class="num">2.59</span>/yr · PAXG <span class="num">3.20</span>/yr · XLM <span class="num">1.59</span>/yr · ADA <span class="num">1.19</span>/yr</li>
+      <li>Years to reach <span class="num">n=100</span> from scratch: <strong>31 to 84</strong>.</li>
+    </ul>
+    <p><strong>Waiting for the gate is not a slower path to the same place; it is no path.</strong> And adding assets does not help — the floor is per rule, so a new asset yields a new rule with its own ~14 trades, not a pooled 114.</p>
+  </div>
+
+  <h3>What follows, stated plainly</h3>
+  <p><strong>Five of the seven live rules carry <code>promoted_at = NULL</code>.</strong> They were seeded straight to <code>live</code> and have been left there. That is a recorded decision, not an oversight — the reasoning sits in the live config, reviewed and dated. Only the BTC <code>dca</code> rule and the DOGE turtle were promoted through the normal path.</p>
+  <p>What bounds the risk is therefore <em>not</em> the promotion gate, which never ran. It is the position caps, the nineteen rails, and the allowlist — and those are separate mechanisms that all did run. The bypass is of the <strong>evidence</strong> gate, not the <strong>safety</strong> rails.</p>
+  <p>This is also why paper matters more than its zero signals suggest. It is the only apparatus that could ever produce the evidence the gate demands, and the honest reading of <span class="num">0</span> signals is not that paper is broken — it is that a rule firing twice a year cannot generate a hundred trades inside a human attention span.</p>
 </section>
 
 <section>
@@ -342,6 +396,55 @@
 </section>
 
 <section>
+  <p class="eyebrow">Shariah basis</p>
+  <h2>Which rulings are encoded, and what they rest on</h2>
+  <p class="lead">The compliance screen is not a curated list of "approved coins". It is a set of named juristic tests, each traceable to a source, each enforced in code that fails closed.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>The encoded rules · <code>compliance/screen.py</code> and <code>execution/guards.py</code></caption>
+      <thead><tr><th>Criterion</th><th>What it tests</th><th>Source</th><th>Waivable?</th></tr></thead>
+      <tbody>
+        <tr><td><code>attestation</code></td><td>Sector, backing and yield are human-attested with a source. Nothing is derived from price data, so an unclassified asset is <em>unknown</em> — and unknown is a rejection</td><td class="num">§28.4</td><td class="bad">Never</td></tr>
+        <tr><td><code>haram_sector</code></td><td>The token's core business line is not an excluded one</td><td class="num">§28.4</td><td class="bad">Never</td></tr>
+        <tr><td><code>riba_yield</code></td><td>Holding it carries no guaranteed or expected return — that is riba-like, and not a bare spot position</td><td class="num">§28.4</td><td class="bad">Never</td></tr>
+        <tr><td><code>backing</code></td><td><em>'ayn</em> (a tangible, owned thing) versus <em>dayn</em> (a debt claim on an issuer). A pure claim is refused</td><td class="num">§65.5 · §67.2</td><td class="bad">Never</td></tr>
+        <tr><td class="dim">└ gold &amp; silver</td><td class="dim">If the backing is gold or silver, the stricter <em>bay' al-sarf</em> treatment applies — relevant to PAXG</td><td class="num">§65.5</td><td class="bad">Never</td></tr>
+        <tr><td><code>instrument_wrapper</code></td><td>Admission must name the <strong>contract</strong>, not just the asset: the allowlist is not juristically homogeneous, and a CFD can spell itself exactly like spot</td><td class="num">§71.4a</td><td class="bad">Never</td></tr>
+        <tr><td><code>withdrawal_capability</code></td><td><em>Qabd</em> — possession holds only while nothing prevents withdrawal on demand. Rail 17 halts new entries when it cannot be shown</td><td class="num">§65.4</td><td class="bad">Never</td></tr>
+        <tr><td><code>settlement</code></td><td>USD-settled spot only; every other contract class is refused mechanically</td><td class="num">rails 18/19</td><td class="bad">Never</td></tr>
+        <tr><td><code>history</code></td><td>Four years of daily bars before a rule can be validated</td><td class="dim">evidence, not fiqh</td><td class="good">Yes, documented</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Only one criterion in the whole screen can be waived, and it is the one that is not a religious question.</strong> The code does not consult the waiver map for any of the others, and the CLI will not accept them — expanding that set is a deliberate decision, not something a passing test can quietly do.</p>
+
+  <h3>The sources</h3>
+  <div class="scroll">
+    <table>
+      <caption>Compliance references, in the order they entered the record</caption>
+      <thead><tr><th>Ref</th><th>Source</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td class="num">§28</td><td>Andreas Jobst, <em>The Economics of Islamic Finance and Securitization</em> — IMF Working Paper 07/117 (2007)</td><td>The original compliance foundation; its §II definition grounded the first screen</td></tr>
+        <tr><td class="num">§65</td><td>Muhammad Ayub, <em>Understanding Islamic Finance</em> — Wiley Finance (2007, 544pp)</td><td><strong>The foundation source</strong>, displacing §28. Derives the prohibitions from primary texts, names the juristic tests, and cites OIC Fiqh Academy and AAOIFI resolutions</td></tr>
+        <tr><td class="num">§66</td><td>Four trading-specific papers on <em>bay' al-sarf</em>, <em>qabd</em> and forex fiqh — including Syed Faiq Najeeb (INCEIF)</td><td>Exchange-specific rather than banking-specific; the sharpest-focused material in the base</td></tr>
+        <tr><td class="num">§67</td><td>Al-Jarhi, Abuzaid &amp; Oweida, <em>Handbook of Islamic Finance</em> — Ankara Social Sciences University (2022, 322pp)</td><td>The <em>'ayn</em>/<em>dayn</em> distinction the backing axis rests on</td></tr>
+        <tr><td class="num">§71</td><td>IIFA Resolution 237, the SRB material, and the IIUM literature review</td><td>Sought specifically to close the crypto gap below</td></tr>
+        <tr><td class="num">§72</td><td>Four academic papers on cryptocurrency and Shariah — the <em>māl</em>/<em>thaman</em> question</td><td>The first direct engagement with whether crypto is Shariah-recognised property</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="finding">
+    <h3>⚠️ The honest gap, and why it is stated rather than papered over</h3>
+    <p><strong>The field's highest authority has expressly declined to rule on the central question.</strong> IIFA Resolution 237 carries a heading reading <em>"Second: Shariah Ruling"</em> — and there is no ruling under it. The Academy identified the foundational questions as unresolved. It <em>has</em> ruled on electronic possession, which is precisely why the <em>qabd</em> test behind rail 17 is well-grounded; it has not ruled on whether crypto is Shariah-recognised property. The IIUM piece is a literature review and issues no ruling of its own.</p>
+    <p>An earlier note in the record puts it more bluntly: at the time, <strong>not one compliance source addressed crypto directly — and silence is not permission.</strong> §71 and §72 were sought specifically to close that, and they narrowed it rather than closing it.</p>
+    <p><strong>So keel does not claim the question is settled.</strong> It enforces what <em>is</em> settled — possession, riba, sector, backing, contract class — and records the operator's own attestation, attributed and sourced, for what is not. That is the whole design: keel is an enforcement engine for a ruling you supply, not a source of rulings.</p>
+  </div>
+</section>
+
+<section>
   <p class="eyebrow">Asset sweep</p>
   <h2>The scout found more bugs in itself than assets to trade</h2>
   <p>An automated scout sweeps ~920 Coinbase USD listings, screens them, and proposes candidates for human attestation. Fourteen runs to date. Its most valuable output has been <strong>three defects in the discovery pipeline itself</strong>, each of which silently hid assets the admission gate would have accepted.</p>
@@ -364,7 +467,7 @@
 <section>
   <p class="eyebrow">Venues</p>
   <h2>Coinbase spot only — and the refusals are structural</h2>
-  <p>Three venue expansions were studied and three answered no. Two are permanent; one is "not yet".</p>
+  <p>Four venues have been assessed beyond Coinbase spot. None is live, and the reasons are not interchangeable — two are permanent refusals on the instrument, one waits on data, and one is <em>built and deliberately unwired</em>.</p>
 
   <div class="scroll">
     <table>
@@ -375,11 +478,16 @@
         <tr><td>Trade Nation</td><td><span class="chip chip-ref">Refused</span></td><td>Nothing in the product range is spot ownership — CFDs and spread bets throughout.</td></tr>
         <tr><td>US equities</td><td><span class="chip chip-open">Not yet</span></td><td>Coinbase <em>does</em> have an equities order path — the brief was wrong. But market data is absent: <span class="num">n=0</span> candles across 21 trading days, preview refused 403, three conflicts with our execution model.</td></tr>
         <tr><td>Coinbase futures / perps</td><td><span class="chip chip-ref">Refused</span></td><td>Rails 18/19 reject any non-USD-settled-spot contract mechanically, regardless of narrative.</td></tr>
+        <tr><td><strong>Robinhood</strong></td><td><span class="chip chip-open">Built, unwired</span></td><td>The <em>only</em> venue with a working adapter — <code>keel-broker-robinhood</code> ships translate, transport and adapter layers behind the broker port, with its own test suite. It is deliberately unreachable from live: the executor still calls Coinbase's signature directly, <code>_common.py</code> constructs a <code>CoinbaseClient</code>, and nothing calls <code>load_broker()</code>.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>The distinction matters for planning: a CFD venue is <strong>never</strong>, because the instrument conflicts with the charter. Equities are <strong>not yet</strong>, because the blocker is data and execution capability, both of which can change.</p>
+  <h3>Robinhood is blocked by the venue, not by us</h3>
+  <p>The gap is a property of the venue rather than a bug to fix: <strong>Robinhood's market orders accept only <code>asset_quantity</code> — there is no quote-amount market order.</strong> keel opens every position with <code>MarketIOCByQuote</code>, sizing in dollars rather than coins, so under the current entry model <strong>Robinhood cannot open a position at all</strong>. The adapter is honest about it: it declares <code>market_ioc_quote</code> unsupported and raises rather than approximating.</p>
+  <p>That is why the port work is finished and the wiring is not. Issue <span class="num">#198</span> exists so the migration trips over this deliberately, on the bench, rather than discovering it with real money.</p>
+
+  <p>The distinction matters for planning. A CFD venue is <strong>never</strong> — the instrument conflicts with the charter. Equities are <strong>not yet</strong> — the blocker is data and execution capability, both of which can change. Robinhood is <strong>not like this</strong> — it needs either a different entry model or a venue-side capability that does not exist today.</p>
 </section>
 
 <section>
