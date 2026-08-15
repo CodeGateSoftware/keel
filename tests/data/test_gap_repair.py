@@ -372,6 +372,45 @@ def test_one_bad_chunk_is_not_recorded_absent_and_a_later_window_still_repairs(r
     assert remaining.n_missing == 254
 
 
+def test_a_window_whose_FIRST_chunk_fails_is_not_recorded_absent(repo):
+    """The discriminating case for "every chunk must complete before recording absent".
+
+    Its sibling above fails the SECOND chunk, which means the first chunk lands 299 bars and the
+    surviving gap window's key shifts from (BASE+1d, BASE+553d) to (BASE+300d, BASE+553d). The
+    `probed_keys` match in `repair.py` is by EXACT key, so that test's `windows_absent_at_source`
+    and `get_gap_probes` assertions hold no matter what `probed_ok` contains -- they cannot see a
+    regression. Failing the FIRST chunk instead means nothing is upserted, the remaining window
+    keeps its original key, and the gate is genuinely exercised.
+
+    Without this, a plausible refactor -- "partial progress means the window was probed" -- passes
+    the whole suite while permanently writing off a hole the venue was never fully asked about.
+    """
+
+    class _FlakyFirstChunk(_CappedVenue):
+        def get_candles(self, product, granularity, start, end):
+            if start == _BASE + 0 * _DAY:  # the widened window's FIRST chunk
+                raise RuntimeError("boom")
+            return super().get_candles(product, granularity, start, end)
+
+    n_missing = 553
+    _seed(repo, missing=set(range(1, n_missing + 1)), n=706)
+    venue = _FlakyFirstChunk({_BASE + i * _DAY for i in range(706)})
+
+    result = repair_mod.repair_series(venue, repo, "BTC-USD", Granularity.ONE_DAY, now_ts=999)
+
+    assert len(result.errors) == 1
+    assert result.bars_recovered == 0, "the first chunk failed, so nothing should have landed"
+
+    # The key is UNCHANGED, which is what makes the next two assertions meaningful rather than
+    # vacuous: `probed_keys` is consulted for exactly this window.
+    (remaining,) = result.remaining
+    assert remaining.start_ts == _BASE + 1 * _DAY
+    assert remaining.end_ts == _BASE + n_missing * _DAY
+
+    assert result.windows_absent_at_source == 0
+    assert repo.get_gap_probes("BTC-USD") == []
+
+
 def test_a_small_hole_still_takes_exactly_one_request(repo):
     """Regression guard: chunking must not fragment requests that already fit under the cap."""
     _seed(repo, missing={4, 5})
