@@ -26,6 +26,7 @@ import pytest
 
 import keel.cli as cli_module
 from keel.commands.admission import (
+    DEFAULT_DISCOVER_LIMIT,
     DEFAULT_MIN_QUOTE_24H_VOLUME,
     DEFAULT_PROPOSALS_DIR,
     DiscoverReport,
@@ -690,6 +691,55 @@ def test_build_discover_report_limit_respected(repo: Repository):
     # sorted descending by volume, so the top 3 by volume survive the limit
     assert report.candidates[0].quote_24h_volume >= report.candidates[1].quote_24h_volume
     assert report.candidates[1].quote_24h_volume >= report.candidates[2].quote_24h_volume
+
+
+def test_build_discover_report_applies_default_limit_matching_assets_discover():
+    """`keel assets discover --limit`'s default and `build_discover_report`'s own default must
+    be the SAME number, for the identical reason
+    `test_build_discover_report_applies_default_volume_floor_matching_assets_discover` pins the
+    volume floor: read straight from the CLI option's own default, compared against
+    `DEFAULT_DISCOVER_LIMIT` rather than a hardcoded literal, so a future change to either one
+    fails this test instead of silently drifting the two apart."""
+    cli_option = next(p for p in cli_module.assets_discover.params if p.name == "limit")
+    assert cli_option.default == DEFAULT_DISCOVER_LIMIT
+
+
+def test_default_discover_limit_is_100():
+    """Pins the new default value itself. Raised from 25 now that a lower --min-volume-24h
+    surfaces ~130 candidates instead of ~35 -- 25 would hide most of a typical sweep."""
+    assert DEFAULT_DISCOVER_LIMIT == 100
+
+
+def test_render_discover_report_states_total_and_shown_when_limit_truncates(repo: Repository):
+    """The load-bearing case: more candidates exist than `limit` shows. The rendered output must
+    say the true survivor count, the shown count, and that --limit controls the cut -- never let
+    a truncated table read as the whole candidate set."""
+    config = _config(allowlist=[])
+    products = [_venue_product(f"COIN{i}", volume=str(10_000_000 + i)) for i in range(10)]
+
+    report = build_discover_report(products, config, limit=3)
+    lines = render_discover_report(report)
+    text = "\n".join(lines)
+
+    assert "10 venue products -> 10 candidates" in text
+    assert "showing 3 of 10 candidates" in text
+    assert "--limit" in text
+    assert len(report.candidates) == 3
+
+
+def test_render_discover_report_no_truncation_notice_when_everything_fits(repo: Repository):
+    """No false alarm: when every survivor fits under `limit`, nothing should claim a cut
+    happened."""
+    config = _config(allowlist=[])
+    products = [_venue_product(f"COIN{i}", volume=str(10_000_000 + i)) for i in range(3)]
+
+    report = build_discover_report(products, config, limit=25)
+    lines = render_discover_report(report)
+    text = "\n".join(lines)
+
+    assert "3 venue products -> 3 candidates" in text
+    assert "showing" not in text
+    assert len(report.candidates) == 3
 
 
 def test_render_discover_report_shows_table_and_ends_with_proposals_not_admissions_warning():

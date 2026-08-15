@@ -463,6 +463,60 @@ def test_discover_excludes_the_current_allowlist(tmp_path, valid_config_path, mo
     assert "BTC-USD" not in result.output
 
 
+def test_discover_default_limit_is_100():
+    """Pins the new default. Raised from 25 now that a lower --min-volume-24h surfaces ~130
+    candidates instead of ~35 -- 25 would cut off most of a typical sweep before the operator
+    ever sees it."""
+    cli_option = next(p for p in cli_module.assets_discover.params if p.name == "limit")
+    assert cli_option.default == 100
+
+
+def test_discover_states_total_and_shown_when_limit_truncates(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The load-bearing case, verified at the CLI: with more candidates than --limit shows, the
+    output must say the true candidate count, how many are shown, and that --limit controls it --
+    never let a truncated table read as the whole candidate set."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    products = [_venue_product(f"COIN{i}-USD", str(10_000_000 + i)) for i in range(5)]
+    venue = _FakeVenue(products)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "assets", "discover", "--limit", "3"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "5 venue products -> 5 candidates" in result.output
+    assert "showing 3 of 5 candidates" in result.output
+    assert "--limit" in result.output
+    shown_rows = [ln for ln in result.output.splitlines() if "COIN" in ln and "-USD" in ln]
+    assert len(shown_rows) == 3
+
+
+def test_discover_no_truncation_notice_when_everything_fits(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """No false alarm: when every candidate fits under --limit, nothing should claim a cut
+    happened."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    products = [_venue_product(f"COIN{i}-USD", str(10_000_000 + i)) for i in range(3)]
+    venue = _FakeVenue(products)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: venue)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "discover"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "3 venue products -> 3 candidates" in result.output
+    assert "showing" not in result.output
+
+
 def test_probe_history_marks_candidates_without_a_four_year_series(
     tmp_path, valid_config_path, monkeypatch
 ):

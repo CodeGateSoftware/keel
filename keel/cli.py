@@ -772,7 +772,20 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     "it feeds -- a quiet trading day can push the snapshot under a floor the asset's own median "
     "clears many times over.",
 )
-@click.option("--limit", default=25, show_default=True, help="Show at most this many candidates.")
+@click.option(
+    # Raised from 25 to 100 on 2026-08-15: lowering --min-volume-24h's floor (see that option's
+    # own help text) grew a typical sweep from ~35 candidates to ~130, sorted by descending 24h
+    # volume, so the assets that floor change exists to surface can land well past rank 25 and
+    # get cut off by this option before an operator ever sees them. 100 shows nearly all of a
+    # typical sweep at no extra cost: with NEITHER probe flag, `discover` makes exactly ONE venue
+    # request regardless of --limit -- filtering and sorting are local. --probe-history and
+    # --probe-liquidity are the ones with a per-row cost, called out below.
+    "--limit", default=100, show_default=True,
+    help="Show at most this many candidates. With neither --probe-history nor --probe-liquidity, "
+    "raising this costs nothing extra -- discovery still makes exactly one venue request. Each "
+    "probe flag adds one venue request PER CANDIDATE SHOWN (two requests per row if both are "
+    "given), so a large --limit combined with a probe flag multiplies the request count.",
+)
 @click.option(
     "--probe-history",
     is_flag=True,
@@ -824,7 +837,18 @@ def assets_discover(
         f"(quote={policy.quote_currency}, 24h volume >= {policy.min_quote_24h_volume:,.0f}, "
         f"excluding the current allowlist)"
     )
-    click.echo(result.excluded.summary_line() + "\n")
+    click.echo(result.excluded.summary_line())
+    # Never truncate silently: `result.candidates` above is the FULL survivor list (only the
+    # table loop below is cut to `limit`), so if there are more survivors than `limit` allows,
+    # say so explicitly -- how many exist, how many are about to be shown, and that --limit is
+    # the knob. A silent cap here would be exactly the defect class this command's own fix
+    # (the --min-volume-24h floor) exists to eliminate, just moved one step later in the pipeline.
+    if len(result.candidates) > limit:
+        click.echo(
+            f"showing {limit} of {len(result.candidates)} candidates -- raise --limit to see "
+            "the rest."
+        )
+    click.echo("")
     screen_policy = screen_mod.ScreenPolicy()
     header = f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}"
     if probe_history:

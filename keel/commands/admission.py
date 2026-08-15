@@ -97,6 +97,27 @@ DEFAULT_PROPOSALS_DIR = "~/keel/proposals"
 #: fails.
 DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("100000")
 
+#: Mirrors `keel assets discover --limit`'s own default (`keel/cli.py::assets_discover`), for the
+#: same "literal here, not an import from `keel.cli`" reason `DEFAULT_MIN_QUOTE_24H_VOLUME` gives
+#: above. `test_build_discover_report_applies_default_limit_matching_assets_discover` pins the two
+#: together.
+#:
+#: Was 25, set back when `--min-volume-24h`'s floor was 1,000,000 and a sweep returned ~35
+#: candidates -- 25 showed nearly all of them. Lowering that floor to 100,000 (see
+#: `DEFAULT_MIN_QUOTE_24H_VOLUME` above) grew a typical sweep to ~130 candidates, all sorted by
+#: descending 24h volume, so the five assets that floor change exists to surface (ATOM, AAVE,
+#: BCH, CRV, ALGO -- see that constant's docstring) landed at ranks 33-59: below the ~35 still
+#: above the OLD floor, and past a limit of 25. The floor fix was real but invisible at the
+#: operator's own default view.
+#:
+#: 100 costs nothing extra on its own: with neither `--probe-history` nor `--probe-liquidity`,
+#: `assets discover` makes exactly ONE venue request (`list_products`) regardless of `--limit` --
+#: the candidate list is filtered and sorted locally. The two probe flags are the ones with a
+#: per-row cost (one venue request EACH per candidate SHOWN, so two together), which is why that
+#: trade-off is called out in `--limit`'s own `help=` text rather than left for an operator to
+#: discover by combining the flags and watching the request count climb.
+DEFAULT_DISCOVER_LIMIT = 100
+
 
 # -- 2a. shortlist location (offline) ------------------------------------------------------------
 
@@ -409,7 +430,7 @@ def build_discover_report(
     products: list[dict],
     config: Config,
     *,
-    limit: int = 25,
+    limit: int = DEFAULT_DISCOVER_LIMIT,
     min_quote_24h_volume: Decimal | None = None,
 ) -> DiscoverReport:
     """PURE over `products` -- the caller's already-fetched venue metadata. Builds no broker and
@@ -419,14 +440,18 @@ def build_discover_report(
     Uses `screen.discover_candidates` with a `DiscoveryPolicy` built from `config.quote_currency`
     and the volume floor, excluding `config.allowlist` -- mirroring `assets_discover` in
     `keel/cli.py`. `min_quote_24h_volume` defaults to `DEFAULT_MIN_QUOTE_24H_VOLUME`, matching
-    `assets discover`'s own CLI default (`100000`).
+    `assets discover`'s own CLI default (`100000`); `limit` defaults to `DEFAULT_DISCOVER_LIMIT`,
+    matching its `--limit` default (`100`).
 
     `DiscoverReport.candidates` is truncated to `limit`, but `DiscoverReport.excluded` is NOT --
     it is the per-reason count over the WHOLE sweep, every product in `venue_product_count` that
     did not become a candidate at all. Read the two together with that in mind: `excluded.total`
     plus `len(candidates)` before truncation equals `venue_product_count`, not
     `len(report.candidates)` plus `excluded.total` -- the shown rows are a further cut of the
-    survivors, not of the population `excluded` is counted against.
+    survivors, not of the population `excluded` is counted against. `render_discover_report`
+    relies on exactly that identity (`venue_product_count - excluded.total` recovers the
+    pre-truncation survivor count) to report when `limit` has cut the table, without this
+    dataclass needing a redundant field to carry the same number twice.
     """
     floor = (
         min_quote_24h_volume
@@ -451,15 +476,28 @@ def render_discover_report(report: DiscoverReport) -> list[str]:
     with the SAME loud warning `keel assets discover` prints -- these are PROPOSALS, not
     admissions. Deliberately omits `--probe-history`'s per-candidate marker column: that is an
     extra network request per candidate, out of scope for this offline module (the caller already
-    made the one network call this workflow needs, to fetch `products`)."""
+    made the one network call this workflow needs, to fetch `products`).
+
+    Also never truncates SILENTLY: `report.candidates` is already cut to whatever `limit`
+    `build_discover_report` was called with, and `venue_product_count - excluded.total` recovers
+    how many survivors there were before that cut (see `build_discover_report`'s docstring for
+    the identity this leans on). When that is more than `len(report.candidates)`, a line says so
+    -- how many candidates exist, how many are shown, and that `--limit`/`limit=` controls it --
+    so a truncated table can never read as the whole candidate set."""
+    survivor_count = report.venue_product_count - report.excluded.total
     lines = [
-        f"{report.venue_product_count} venue products -> {len(report.candidates)} candidates "
+        f"{report.venue_product_count} venue products -> {survivor_count} candidates "
         f"(quote={report.quote}, 24h volume >= {report.min_quote_24h_volume:,.0f}, excluding "
         "the current allowlist)",
         report.excluded.summary_line(),
-        "",
-        f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}  name",
     ]
+    if survivor_count > len(report.candidates):
+        lines.append(
+            f"showing {len(report.candidates)} of {survivor_count} candidates -- raise "
+            "--limit to see the rest."
+        )
+    lines.append("")
+    lines.append(f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}  name")
     for index, candidate in enumerate(report.candidates, start=1):
         lines.append(
             f"{index:>3}  {candidate.product_id:<14} {candidate.asset:<8} "
