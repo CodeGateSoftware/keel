@@ -16,18 +16,24 @@ name: Code Quality
 # │ SonarQube Cloud requires -- read that file before the first run.
 # └───────────────────────────────────────────────────────────────────────────────────────────────
 #
-# TRIGGERS: a DELIBERATE divergence from the reference workflow this is modelled on
-# (TempTrak-Ingestion-Service's `code-quality.yml`), which runs on `push`, `pull_request` and
-# `workflow_dispatch`. Running per-push here would reintroduce exactly the automatic Actions spend
-# that `ci.yml` was just changed to remove -- the two changes would cancel out. The scheduled run
-# is kept because dependency scanning is the one kind of check that finds something new without
-# the code changing: a CVE published against a version of `cryptography` that keel has been
-# pinning, unmodified, for months is invisible to a per-push trigger and obvious to a weekly one.
-# Static analysis has no such property, but it is cheap to fold into the same weekly pass.
-# Adding `push:` / `pull_request:` below is a one-line change if parity with the other repo is
-# wanted later.
+# TRIGGERS. This was `workflow_dispatch` + `schedule` only, to avoid the automatic Actions spend a
+# per-merge trigger implies. **That constraint is gone: the repository became PUBLIC on 2026-08-15,
+# and GitHub bills no Actions minutes for standard runners on public repositories.** The cost
+# argument that kept this off `push` no longer holds, so it now also runs on every merge to `main`.
+#
+# The scheduled run is KEPT rather than replaced, deliberately: dependency scanning is the one kind
+# of check that finds something new WITHOUT the code changing. A CVE published against a version of
+# `cryptography` that keel has been pinning, unmodified, for months is invisible to a per-merge
+# trigger and obvious to a weekly one. Static analysis has no such property, but it is cheap to
+# fold into the same pass.
+#
+# `pull_request` is still deliberately absent, and on a public repo that is now a SECURITY choice
+# rather than a cost one: `pull_request` fires for forks, fork runs receive no repository secrets,
+# so every fork PR would fail at the preflight below for a reason the contributor cannot fix.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   schedule:
     # 06:00 UTC every Monday. A fixed weekday makes a newly-appeared finding easy to date, and
     # off-the-hour minutes avoid the top-of-hour scheduling queue on GitHub's shared runners.
