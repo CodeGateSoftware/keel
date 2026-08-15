@@ -7,6 +7,13 @@ fake client and an in-memory `Repository` with zero network calls.
 Only *closed* candles are ever fetched or persisted: the candle currently forming as of
 `now_ts` has OHLC values that are still changing, so both `backfill` and `poll_once` stop at
 the most recently closed candle boundary for each granularity.
+
+`poll_once`'s catch-up range is requested in windows of at most `MAX_CANDLES_PER_REQUEST`
+candles, not as one single request: Coinbase rejects any range over ~350 candles with
+`400 INVALID_ARGUMENT`. Without chunking, a product that ever falls behind that cap (e.g. after
+downtime) would fail every poll forever -- the request only gets bigger over time, never
+smaller -- so it can never self-heal. Chunking makes catch-up always succeed eventually,
+however far behind a product has fallen.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from keel.data.history import MAX_CANDLES_PER_REQUEST
 from keel.types import Candle, Granularity
 
 if TYPE_CHECKING:
@@ -116,6 +124,46 @@ def backfill(
     return total_written
 
 
+def _poll_catch_up(
+    client: CoinbaseClient,
+    repo: Repository,
+    product_id: str,
+    granularity: Granularity,
+    gran_sec: int,
+    fetch_start: int,
+    latest_closed: int,
+    last_ts: int | None,
+) -> int:
+    """Fetch and upsert `[fetch_start, latest_closed]`, chunked under the venue's candle cap.
+
+    Mirrors `history._fill_forward`'s windowing idiom: page forward in windows of at most
+    `MAX_CANDLES_PER_REQUEST` candles each, upserting per window for incremental durability
+    (if a later window raises, earlier windows are already persisted). An empty window does
+    *not* stop the loop -- a mid-history hole must not block catch-up of newer candles.
+    """
+    total_written = 0
+    seen: set[int] = set()
+    window_start = fetch_start
+    while window_start <= latest_closed:
+        # `- 1` keeps each inclusive [window_start, window_end] range at exactly
+        # MAX_CANDLES_PER_REQUEST candles (an inclusive range of `+ step` would be one over).
+        window_end = min(
+            latest_closed, window_start + (MAX_CANDLES_PER_REQUEST - 1) * gran_sec
+        )
+        fetched = client.get_candles(product_id, granularity, window_start, window_end)
+        new_candles: list[Candle] = [
+            c
+            for c in fetched
+            if c.ts <= latest_closed and (last_ts is None or c.ts > last_ts) and c.ts not in seen
+        ]
+        if new_candles:
+            seen.update(c.ts for c in new_candles)
+            total_written += repo.upsert_candles(product_id, granularity, new_candles)
+        window_start = window_end + gran_sec
+
+    return total_written
+
+
 def poll_once(
     client: CoinbaseClient,
     repo: Repository,
@@ -127,7 +175,11 @@ def poll_once(
     """Fetch and upsert any newly closed candles since the last poll.
 
     For each `(product, granularity)` pair, only candles strictly newer than the latest one
-    already stored (and no later than the most recently closed candle) are written.
+    already stored (and no later than the most recently closed candle) are written. The
+    catch-up range is requested in windows of at most `MAX_CANDLES_PER_REQUEST` candles (see
+    module docstring) so a product that has fallen far behind -- even hundreds of candles, as
+    happened in production -- still fully catches up in one call to `poll_once`, instead of
+    failing outright and staying stuck.
 
     Returns the total number of new candle rows written.
     """
@@ -145,14 +197,9 @@ def poll_once(
                 continue
 
             fetch_start = last_ts + gran_sec if last_ts is not None else latest_closed
-            fetched = client.get_candles(product_id, granularity, fetch_start, latest_closed)
-            new_candles: list[Candle] = [
-                c
-                for c in fetched
-                if c.ts <= latest_closed and (last_ts is None or c.ts > last_ts)
-            ]
-            if new_candles:
-                total_written += repo.upsert_candles(product_id, granularity, new_candles)
+            total_written += _poll_catch_up(
+                client, repo, product_id, granularity, gran_sec, fetch_start, latest_closed, last_ts
+            )
 
     return total_written
 
