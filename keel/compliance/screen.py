@@ -479,10 +479,12 @@ class DiscoveryPolicy:
     #: quiet trading day can push the snapshot below a floor the asset's own median clears many
     #: times over.
     #:
-    #: Measured 2026-08-15: four of five wrongly-dropped assets (ATOM, BCH, CRV, ALGO) sat in an
+    #: Measured 2026-08-15: four of five wrongly-dropped assets (ATOM, AAVE, BCH, CRV) sat in an
     #: 852,133-979,000 24h-snapshot cluster on a single quiet day, while their median-over-history
-    #: liquidity was 3.1x-6.3x the admission floor. 100,000 sits comfortably below that cluster,
-    #: with room to spare for a quieter day still.
+    #: liquidity was 3.1x-6.3x the admission floor. The fifth, ALGO, was a separate low outlier at
+    #: 437,712 (430,520 an hour later) -- the lowest of the five, not part of the cluster, and the
+    #: one that most tightly constrains how low this floor may safely sit. 100,000 sits
+    #: comfortably below both, with room to spare for a quieter day still.
     #:
     #: This bounds how many products get probed for history; it is not a liquidity verdict.
     #: `--probe-liquidity` computes the gate's own statistic and is the honest estimator of that.
@@ -576,9 +578,15 @@ class DiscoveryExclusions:
 @dataclass(frozen=True)
 class DiscoveryResult:
     """`discover_candidates`'s return value: the survivors, plus a full accounting of everyone
-    who did not survive and why. See `DiscoveryExclusions` for the accounting half."""
+    who did not survive and why. See `DiscoveryExclusions` for the accounting half.
 
-    candidates: list[Candidate]
+    `candidates` is a `tuple`, not a `list`, so that `frozen=True` means what it claims: a `list`
+    field is mutable in place (`result.candidates.append(...)` would succeed on a "frozen"
+    dataclass) and a dataclass holding one is unhashable regardless of the decorator. A tuple
+    closes both gaps.
+    """
+
+    candidates: tuple[Candidate, ...]
     excluded: DiscoveryExclusions
 
 
@@ -656,6 +664,20 @@ def discover_candidates(
         except (TypeError, ArithmeticError, ValueError):
             unreadable_volume += 1
             continue
+        # `Decimal("NaN")`/`Decimal("sNaN")` PARSE cleanly -- the `try` above does not catch
+        # them -- and then `<` raises `decimal.InvalidOperation`, which used to crash the whole
+        # sweep on one bad venue row. Treated as unreadable, same bucket as a value that failed
+        # to parse at all: a NaN is exactly as uninformative about liquidity as `"n/a"` is, and
+        # counting it separately would only teach an operator to distrust a count that means the
+        # same thing either way.
+        #
+        # `Decimal("Infinity")` also parses cleanly and compares fine (nothing is `>= Infinity`),
+        # so left unguarded it would silently become a candidate -- but a venue reporting
+        # infinite 24h volume is not credible data, it is a malformed feed, so it is counted
+        # unreadable rather than trusted as "definitely liquid".
+        if volume.is_nan() or volume.is_infinite():
+            unreadable_volume += 1
+            continue
         if volume < policy.min_quote_24h_volume:
             below_volume_floor += 1
             continue
@@ -670,7 +692,7 @@ def discover_candidates(
         )
 
     return DiscoveryResult(
-        candidates=sorted(out, key=lambda c: c.quote_24h_volume, reverse=True),
+        candidates=tuple(sorted(out, key=lambda c: c.quote_24h_volume, reverse=True)),
         excluded=DiscoveryExclusions(
             wrong_quote_currency=wrong_quote_currency,
             not_online=not_online,

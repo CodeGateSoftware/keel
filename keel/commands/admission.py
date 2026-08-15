@@ -415,9 +415,13 @@ def render_propose_view(view: ProposeView) -> list[str]:
 
 @dataclass(frozen=True)
 class DiscoverReport:
+    """See `keel.compliance.screen.DiscoveryResult` for why `candidates` is a `tuple`, not a
+    `list`: on a `frozen=True` dataclass a `list` field is still mutable in place and still makes
+    the dataclass unhashable, so a tuple is what makes `frozen` mean what it claims here too."""
+
     quote: str
     venue_product_count: int
-    candidates: list[Candidate]
+    candidates: tuple[Candidate, ...]
     min_quote_24h_volume: Decimal
     #: Per-reason exclusion counts over the WHOLE sweep -- every product in `venue_product_count`
     #: that did not become a candidate, not just the ones cut by `limit` below. See
@@ -483,8 +487,17 @@ def render_discover_report(report: DiscoverReport) -> list[str]:
     how many survivors there were before that cut (see `build_discover_report`'s docstring for
     the identity this leans on). When that is more than `len(report.candidates)`, a line says so
     -- how many candidates exist, how many are shown, and that `--limit`/`limit=` controls it --
-    so a truncated table can never read as the whole candidate set."""
-    survivor_count = report.venue_product_count - report.excluded.total
+    so a truncated table can never read as the whole candidate set.
+
+    `survivor_count` is clamped to 0: it relies on the invariant `len(candidates) + excluded.total
+    == venue_product_count` (pinned directly by
+    `test_discovery_survivors_plus_excluded_always_account_for_every_product` in
+    `tests/compliance/test_screen.py`, over `discover_candidates`'s output), but `DiscoverReport`
+    is a public frozen dataclass any caller -- test or otherwise -- can construct directly with
+    fields that do not actually satisfy it. Without the clamp, an inconsistent report renders a
+    negative count (`10 venue products -> -89 candidates`), which is not a real state and must
+    never reach an operator's screen."""
+    survivor_count = max(0, report.venue_product_count - report.excluded.total)
     lines = [
         f"{report.venue_product_count} venue products -> {survivor_count} candidates "
         f"(quote={report.quote}, 24h volume >= {report.min_quote_24h_volume:,.0f}, excluding "

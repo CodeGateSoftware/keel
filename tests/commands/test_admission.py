@@ -791,6 +791,32 @@ def test_render_discover_report_includes_the_exclusion_summary(repo: Repository)
     assert "below 24h volume floor 1" in text
 
 
+def test_render_discover_report_never_renders_a_negative_survivor_count():
+    """`survivor_count = venue_product_count - excluded.total` relies on the invariant
+    `len(candidates) + excluded.total == venue_product_count`, which `build_discover_report`
+    upholds but which nothing STOPS a caller from violating: `DiscoverReport` is a public frozen
+    dataclass, constructed directly in tests (and by anything else that imports it), so a report
+    whose fields simply do not agree is one bad construction away. Confirmed: an unclamped
+    `report.venue_product_count - report.excluded.total` on the report below renders
+    `10 venue products -> -89 candidates`, which is not a real state and must never reach an
+    operator. The subtraction in `render_discover_report` is clamped to 0 for exactly this."""
+    candidate = screen_mod.Candidate(
+        product_id="SOL-USD", asset="SOL", base_name="Solana", quote_24h_volume=Decimal("9000000")
+    )
+    report = DiscoverReport(
+        quote="USD",
+        venue_product_count=10,
+        candidates=(candidate,),
+        min_quote_24h_volume=Decimal("100000"),
+        excluded=screen_mod.DiscoveryExclusions(below_volume_floor=99),
+    )
+
+    text = "\n".join(render_discover_report(report))
+
+    assert "-89" not in text
+    assert "0 candidates" in text
+
+
 def test_render_discover_report_never_includes_probe_history_marker():
     """Out of scope by design: `--probe-history` is one extra network request per candidate,
     which this offline module must never make."""
@@ -851,3 +877,23 @@ def test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor():
     from keel.compliance.screen import ScreenPolicy
 
     assert DEFAULT_MIN_QUOTE_24H_VOLUME < ScreenPolicy().min_median_daily_volume
+
+
+def test_the_admission_liquidity_floor_is_pinned_to_its_actual_value():
+    """`min_median_daily_volume` is the real admission criterion -- the number that decides
+    which assets a money-moving tool may buy -- and this is the ONLY test in the suite that pins
+    its VALUE rather than its relationship to something else.
+
+    `test_the_discovery_floor_is_strictly_below_the_admission_liquidity_floor` above only asserts
+    `DEFAULT_MIN_QUOTE_24H_VOLUME < ScreenPolicy().min_median_daily_volume`. That `<` guards the
+    relationship between discovery's pre-filter and the gate correctly, and must stay -- but a
+    `<` assertion alone permits ANY value above the discovery floor: raise or, worse, silently
+    lower `min_median_daily_volume` by 5x (verified: dropping it from 1,000,000 to 200,000 still
+    left the whole suite green, 2741 passed / 1 skipped, with the relationship test still
+    passing) and nothing else in the suite would notice. Keep BOTH assertions: the `<` one
+    guards that discovery must never be stricter than the gate, this one guards the criterion
+    itself.
+    """
+    from keel.compliance.screen import ScreenPolicy
+
+    assert ScreenPolicy().min_median_daily_volume == Decimal("1000000")
