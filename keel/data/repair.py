@@ -14,6 +14,21 @@ So a window that comes back still-incomplete after a real probe is recorded in
 ⚠️ That record is an ASSERTION ABOUT AN OBSERVATION ("we asked and it had nothing"), not an
 assumption. It is only ever written after an actual fetch attempt, never inferred -- which is
 why the v5 migration deliberately backfills nothing.
+
+**A gap window can be arbitrarily large.** `gaps.detect` puts no cap on `n_missing` -- an
+interior hole just accumulates for as long as the venue was unreachable or the asset was thin.
+Coinbase rejects any single request spanning more than ~350 candles, so a large-enough hole
+requested in one call 400s. Left unchunked, that failure is swallowed into `result.errors` and
+the pass moves on -- which means the same oversized request gets retried, and 400s again, on
+every single scheduled run forever, and *silently* since a logged error is easy to miss. So the
+widened window is paged in `MAX_CANDLES_PER_REQUEST`-sized chunks, each upserted as it arrives:
+a fetch that fails partway through still leaves the earlier chunks persisted, and the next run
+resumes further along instead of repeating the whole doomed request.
+
+That chunking is PREVENTATIVE. No cached series is anywhere near the cap today -- the largest
+interior gap across the deployment is 15 bars -- but a multi-day venue outage, a delisting and
+relisting, or a product added back after a long absence would each clear ~349 in a single hole,
+and the trap only announces itself as a series that quietly never repairs.
 """
 
 from __future__ import annotations
@@ -22,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 
 from keel.data import gaps as gaps_mod
-from keel.data.history import GRANULARITY_SECONDS
+from keel.data.history import GRANULARITY_SECONDS, MAX_CANDLES_PER_REQUEST
 from keel.types import Granularity
 
 
@@ -44,6 +59,36 @@ class RepairResult:
         return sum(w.n_missing for w in self.remaining)
 
     remaining: list[gaps_mod.GapWindow] = field(default_factory=list)
+
+
+def _fetch_window_chunked(
+    client,
+    repo,
+    product: str,
+    granularity: Granularity,
+    window: gaps_mod.GapWindow,
+    step: int,
+    sleep_fn,
+    sleep_sec: float,
+) -> None:
+    """Fetch one gap window's widened range, one `MAX_CANDLES_PER_REQUEST`-sized chunk at a
+    time, upserting each chunk as it arrives.
+
+    The ±`step` widening (venues are inconsistent about endpoint inclusivity) applies only to
+    these OUTER edges -- internal chunk boundaries are contiguous, not themselves widened.
+    Upserting per chunk, rather than batching the whole window, is what lets an interior chunk
+    failure leave the earlier chunks persisted instead of losing the whole fetch.
+    """
+    fetch_start = window.start_ts - step
+    fetch_end = window.end_ts + step
+    chunk_start = fetch_start
+    while chunk_start <= fetch_end:
+        chunk_end = min(fetch_end, chunk_start + (MAX_CANDLES_PER_REQUEST - 1) * step)
+        fetched = client.get_candles(product, granularity, chunk_start, chunk_end)
+        if fetched:
+            repo.upsert_candles(product, granularity, fetched)
+        sleep_fn(sleep_sec)
+        chunk_start = chunk_end + step
 
 
 def repair_series(
@@ -84,21 +129,20 @@ def repair_series(
         result.windows_probed += 1
         try:
             # Widen by one step each side: venues are inconsistent about endpoint inclusivity,
-            # and over-asking costs nothing because `upsert_candles` is idempotent.
-            fetched = client.get_candles(
-                product, granularity, window.start_ts - step, window.end_ts + step
+            # and over-asking costs nothing because `upsert_candles` is idempotent. The window
+            # itself may be far larger than one request can hold, so this pages internally.
+            _fetch_window_chunked(
+                client, repo, product, granularity, window, step, sleep_fn, sleep_sec
             )
         except Exception as exc:  # noqa: BLE001 -- one bad window must not abort the pass
             # NOT recorded as absent: a fetch that never completed proves nothing about
-            # whether the venue holds the data.
+            # whether the venue holds the data. Chunks that DID complete before the failure
+            # were already upserted, so a later run resumes past them rather than restarting.
             result.errors.append(f"{window.start_ts}-{window.end_ts}: {exc}")
             continue
 
-        # Only a COMPLETED request can testify that the venue lacks the data.
+        # Only a window whose EVERY chunk completed can testify that the venue lacks the data.
         probed_ok.append(window)
-        if fetched:
-            repo.upsert_candles(product, granularity, fetched)
-        sleep_fn(sleep_sec)
 
     after = repo.get_candles(product, granularity)
     result.bars_recovered = max(0, len(after) - len(before))
