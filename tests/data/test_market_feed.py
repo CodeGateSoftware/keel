@@ -203,3 +203,91 @@ def test_is_fresh_false_when_no_candles_stored(repo):
     assert not is_fresh(
         repo, "BTC-USD", Granularity.ONE_HOUR, now_ts=NOW, max_age_sec=200
     )
+
+
+# -- venue candle-per-request cap ---------------------------------------------
+#
+# Coinbase rejects any candles request spanning more than ~350 intervals with a 400
+# `INVALID_ARGUMENT: "number of candles requested should be less than 350"`. `history.py`
+# has always paged under that cap; `market_feed` did not, so a product whose series had
+# fallen far enough behind made every agent cycle die on the first poll. Observed in
+# production 2026-08-14/15: ZEC-USD hourly sat 570 bars stale and took the paperforward
+# agent down for two consecutive days.
+
+
+class VenueCappedFakeClient(FakeClient):
+    """`FakeClient` that fails like the real venue when asked for too many candles.
+
+    A fake that silently serves any span cannot catch this bug -- the old code passed every
+    existing test precisely because the fakes were more permissive than Coinbase.
+    """
+
+    def get_candles(
+        self, product_id: str, granularity: Granularity, start: int, end: int
+    ) -> list[Candle]:
+        span = (end - start) // GRAN_SEC + 1
+        if span > 350:
+            raise RuntimeError(
+                "400 Client Error: Bad Request "
+                '{"error":"INVALID_ARGUMENT","error_details":"start and end argument is '
+                'invalid - number of candles requested should be less than 350 "}'
+            )
+        return super().get_candles(product_id, granularity, start, end)
+
+
+def _stale_series(hours_behind: int) -> tuple[dict, int]:
+    """A full hourly series ending at LATEST_CLOSED, plus the ts of the last *stored* bar."""
+    oldest = LATEST_CLOSED - hours_behind * GRAN_SEC
+    ts_values = list(range(oldest, LATEST_CLOSED + 1, GRAN_SEC))
+    series = {("ZEC-USD", Granularity.ONE_HOUR): [_candle(ts) for ts in ts_values]}
+    return series, oldest
+
+
+def test_poll_once_chunks_requests_under_the_venue_candle_cap(repo):
+    """The production failure: 570 hourly bars behind is one 570-candle request, and 400s."""
+    series, oldest = _stale_series(570)
+    repo.upsert_candles("ZEC-USD", Granularity.ONE_HOUR, [_candle(oldest)])
+    client = VenueCappedFakeClient(series)
+
+    written = poll_once(client, repo, ["ZEC-USD"], [Granularity.ONE_HOUR], now_ts=NOW)
+
+    assert written == 570, "every missing bar should be fetched, across as many calls as it takes"
+    assert len(client.calls) > 1, "a 570-bar gap cannot be served by a single request"
+    for _product, _gran, start, end in client.calls:
+        span = (end - start) // GRAN_SEC + 1
+        assert span <= 350, f"requested {span} candles in one call -- the venue rejects >350"
+
+
+def test_poll_once_still_uses_one_call_for_a_small_gap(repo):
+    """Chunking must not add requests for the ordinary case -- one bar behind is one call."""
+    series, oldest = _stale_series(1)
+    repo.upsert_candles("ZEC-USD", Granularity.ONE_HOUR, [_candle(oldest)])
+    client = VenueCappedFakeClient(series)
+
+    written = poll_once(client, repo, ["ZEC-USD"], [Granularity.ONE_HOUR], now_ts=NOW)
+
+    assert written == 1
+    assert len(client.calls) == 1
+
+
+def test_backfill_chunks_requests_under_the_venue_candle_cap(repo):
+    """`backfill` groups missing bars into contiguous ranges, which are likewise unbounded."""
+    hours = 400
+    oldest = LATEST_CLOSED - hours * GRAN_SEC
+    ts_values = list(range(oldest, LATEST_CLOSED + 1, GRAN_SEC))
+    series = {("ZEC-USD", Granularity.ONE_HOUR): [_candle(ts) for ts in ts_values]}
+    client = VenueCappedFakeClient(series)
+
+    backfill(
+        client,
+        repo,
+        ["ZEC-USD"],
+        [Granularity.ONE_HOUR],
+        history_days=hours // 24 + 1,
+        now_ts=NOW,
+    )
+
+    assert client.calls, "backfill should have requested something"
+    for _product, _gran, start, end in client.calls:
+        span = (end - start) // GRAN_SEC + 1
+        assert span <= 350, f"requested {span} candles in one call -- the venue rejects >350"

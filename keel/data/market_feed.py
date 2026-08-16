@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from keel.data.history import MAX_CANDLES_PER_REQUEST
 from keel.types import Candle, Granularity
 
 if TYPE_CHECKING:
@@ -48,6 +49,33 @@ def _latest_closed_ts(now_ts: int, gran_sec: int) -> int:
 def _align_up(ts: int, gran_sec: int) -> int:
     """Round `ts` up to the next multiple of `gran_sec`."""
     return ((ts + gran_sec - 1) // gran_sec) * gran_sec
+
+
+def _capped_ranges(start: int, end: int, gran_sec: int) -> list[tuple[int, int]]:
+    """Split the inclusive `[start, end]` span into requests of at most the venue's cap.
+
+    Coinbase rejects any candles request spanning more than ~350 intervals with a 400
+    `INVALID_ARGUMENT`. `history.py` has always paged under that cap; this module did not,
+    so a single unbounded request was issued no matter how far behind a series had fallen.
+    That is fine until it isn't: a product only has to go `MAX_CANDLES_PER_REQUEST` bars
+    stale for the request to 400, and because the exception propagates out of `poll_once`
+    it takes the whole agent cycle down with it -- for *every* product, not just the stale
+    one. Observed in production 2026-08-14/15, when ZEC-USD hourly sat 570 bars stale and
+    stopped the paperforward agent on two consecutive days.
+
+    Returns one `(start, end)` pair when the span already fits, so the ordinary
+    one-bar-behind poll still costs exactly one request.
+    """
+    if end < start:
+        return []
+    step = MAX_CANDLES_PER_REQUEST * gran_sec
+    ranges: list[tuple[int, int]] = []
+    window_start = start
+    while window_start <= end:
+        window_end = min(end, window_start + step - gran_sec)
+        ranges.append((window_start, window_end))
+        window_start = window_end + gran_sec
+    return ranges
 
 
 def _missing_ranges(expected: list[int], present: set[int], gran_sec: int) -> list[tuple[int, int]]:
@@ -103,15 +131,17 @@ def backfill(
                 c.ts for c in repo.get_candles(product_id, granularity, window_start, latest_closed)
             }
 
-            for range_start, range_end in _missing_ranges(expected, existing, gran_sec):
-                fetched = client.get_candles(product_id, granularity, range_start, range_end)
-                gap_candles = [
-                    c
-                    for c in fetched
-                    if window_start <= c.ts <= latest_closed and c.ts not in existing
-                ]
-                if gap_candles:
-                    total_written += repo.upsert_candles(product_id, granularity, gap_candles)
+            for gap_start, gap_end in _missing_ranges(expected, existing, gran_sec):
+                # A contiguous gap is itself unbounded, so page it under the venue's cap.
+                for range_start, range_end in _capped_ranges(gap_start, gap_end, gran_sec):
+                    fetched = client.get_candles(product_id, granularity, range_start, range_end)
+                    gap_candles = [
+                        c
+                        for c in fetched
+                        if window_start <= c.ts <= latest_closed and c.ts not in existing
+                    ]
+                    if gap_candles:
+                        total_written += repo.upsert_candles(product_id, granularity, gap_candles)
 
     return total_written
 
@@ -145,14 +175,18 @@ def poll_once(
                 continue
 
             fetch_start = last_ts + gran_sec if last_ts is not None else latest_closed
-            fetched = client.get_candles(product_id, granularity, fetch_start, latest_closed)
-            new_candles: list[Candle] = [
-                c
-                for c in fetched
-                if c.ts <= latest_closed and (last_ts is None or c.ts > last_ts)
-            ]
-            if new_candles:
-                total_written += repo.upsert_candles(product_id, granularity, new_candles)
+            # Page under the venue's per-request candle cap. A series that has fallen far
+            # enough behind would otherwise be one oversized request that 400s and, because
+            # the error propagates, kills the cycle for every other product too.
+            for range_start, range_end in _capped_ranges(fetch_start, latest_closed, gran_sec):
+                fetched = client.get_candles(product_id, granularity, range_start, range_end)
+                new_candles: list[Candle] = [
+                    c
+                    for c in fetched
+                    if c.ts <= latest_closed and (last_ts is None or c.ts > last_ts)
+                ]
+                if new_candles:
+                    total_written += repo.upsert_candles(product_id, granularity, new_candles)
 
     return total_written
 
