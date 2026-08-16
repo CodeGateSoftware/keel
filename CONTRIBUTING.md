@@ -39,7 +39,11 @@ exactly who said what.
 
 ## Development setup and the gates a PR must pass
 
-Python **3.14+** is the floor (see `.python-version`; `uv python install 3.14` gets you one).
+Python **3.11+** is the floor, and it is measured, not aspirational (#283): the full suite
+passes identically on 3.11–3.14, and the one feature binding the floor is 3.11's
+`typing.assert_never` (3.10 fails collection on it). The repo itself develops on 3.14
+(`.python-version`; `uv python install 3.14`), and CI runs the whole gate on 3.11 too, so the
+floor cannot silently rot.
 Then:
 
 ```bash
