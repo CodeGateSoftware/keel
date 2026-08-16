@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves wrong or crashes — with the build, mode, and rail/rule named.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Three things make a report actionable here, and the form
+        asks for all three: **which build** (`keel --version` stamps the commit and build
+        kind), **which account** (paper and live share nothing — a figure from one says
+        nothing about the other), and **which rail or rule** was involved.
+
+        **Security first:** if this bug could make keel trade what it should not, or expose
+        credentials, it is a security issue — do not file it here. See
+        [SECURITY.md](../blob/main/SECURITY.md) for the private channel.
+  - type: input
+    id: version
+    attributes:
+      label: "Output of `keel --version`"
+      description: "Paste it verbatim — it names the version, commit, and build kind."
+      placeholder: "keel 0.7.1+a4912bb [checkout]"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which account?
+      options:
+        - paper (synthetic cash, nothing real moves)
+        - live (real funds)
+        - backtest / simulate
+        - not mode-related
+    validations:
+      required: true
+  - type: input
+    id: component
+    attributes:
+      label: Rail or rule involved
+      description: >
+        A rail number or name from keel/execution/guards.py (e.g. "rail 14 subscription
+        allowance", "kill-switch"), a rule family (turtle_breakout, rsi_meanrev, ...), or
+        "n/a" if neither.
+      placeholder: "e.g. rail 6 concentration cap / rsi_meanrev / n/a"
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, what happened instead. Commands and log lines beat prose.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: The exact command(s), config knobs that differ from default, and whether it needs market data or a key.
+    validations:
+      required: false

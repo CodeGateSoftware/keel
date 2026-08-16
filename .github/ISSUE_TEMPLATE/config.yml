@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report (private)
+    url: ../security/advisories/new
+    about: >
+      Anything that could make keel trade what it should not, or expose credentials —
+      including a rail that can be bypassed. Report it privately via SECURITY.md; do not
+      open a public issue.
+  - name: Questions & ideas (Discussions)
+    url: https://github.com/CodeGateSoftware/keel/discussions
+    about: Ask how something works, float an idea, or join the Compliance & classification category.
+  - name: Contributing
+    url: https://github.com/CodeGateSoftware/keel/blob/main/CONTRIBUTING.md
+    about: The documentation standard, the gates a PR must pass, and scope guidance — read before your first PR.
