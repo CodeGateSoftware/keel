@@ -61,23 +61,26 @@ ScreenFn = Callable[[Repository, str, str], tuple[MarketFacts, ScreenResult]]
 DEFAULT_PROPOSALS_DIR = "~/keel/proposals"
 
 #: Mirrors `keel assets discover --min-volume-24h`'s own default (`keel/cli.py::assets_discover`).
-#: A literal here, not an import from `keel.cli`, for the same reason `ScreenFn` is injected
-#: rather than importing `_screen_product` directly: importing `keel.cli` from this module would
-#: create the cycle `cli -> tui -> admission -> cli`. `test_build_discover_report_applies_
-#: default_volume_floor_matching_assets_discover` reads the CLI option's own default and asserts
-#: it equals this constant, so the two cannot silently drift apart.
-#: Discovery's 24h-volume pre-filter, pinned EQUAL to `ScreenPolicy.min_median_daily_volume` so a
-#: sweep can never be stricter than the gate it feeds. It bounds how many products get probed; it
-#: is not a liquidity verdict (that is `--probe-liquidity`, which computes the gate's own median).
+#: Derived from `DiscoveryPolicy` rather than restated as a literal, so there is one definition of
+#: the pre-filter floor and its relationship to the admission floor. Importing `keel.cli` here
+#: would create the cycle `cli -> tui -> admission -> cli`; importing `keel.compliance.screen`
+#: does not, and this module already depends on it.
+#: It bounds how many products get probed; it is NOT a liquidity verdict (that is
+#: `--probe-liquidity`, which computes the gate's own median).
 #:
 #: Was 5,000,000 until 2026-08-08. At that floor the sweep returned 9 candidates and exactly one
 #: unsettled survivor; at a lower floor, seven more cleared BOTH mechanical gates -- FET among them
 #: at $2.94M/24h, i.e. invisible to the sweep while measuring 4.8x the admission floor. The floor,
 #: not the market, was the binding constraint on the candidate pipeline.
 #:
-#: `tests/commands/test_admission.py` pins this to the CLI option, to `DiscoveryPolicy`'s default
-#: and to the admission floor; all four move together or the suite fails.
-DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("1000000")
+#: Was then pinned EQUAL to `ScreenPolicy.min_median_daily_volume` until 2026-08-16, on the theory
+#: that equality kept the sweep from being stricter than the gate. It did not -- the two are
+#: different statistics, and the equal floor was still hiding admissible assets. See
+#: `DISCOVERY_FLOOR_MARGIN` for the measurements that changed it.
+#:
+#: `tests/commands/test_admission.py` pins this to the CLI option and to `DiscoveryPolicy`'s
+#: default, and pins the MARGIN against the admission floor; all move together or the suite fails.
+DEFAULT_MIN_QUOTE_24H_VOLUME = DiscoveryPolicy().min_quote_24h_volume
 
 
 # -- 2a. shortlist location (offline) ------------------------------------------------------------

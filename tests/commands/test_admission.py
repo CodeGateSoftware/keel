@@ -646,18 +646,22 @@ def test_build_discover_report_excludes_allowlist_assets(repo: Repository):
 
 
 def test_build_discover_report_applies_default_volume_floor_matching_assets_discover(repo):
-    """`keel assets discover --min-volume-24h` defaults to `5000000` -- read straight from the
-    CLI option's own default (by name, not position, so a decorator reorder cannot silently
-    break this pin) so the two can never drift apart silently."""
+    """`build_discover_report` and `keel assets discover --min-volume-24h` share one floor.
+
+    The CLI option's default is read by name (not position, so a decorator reorder cannot
+    silently break this pin) and compared against the shared constant rather than a restated
+    literal -- a literal here went stale once already (this docstring claimed `5000000` long
+    after the default became `1000000`) and pinned nothing while looking like it did.
+    """
     cli_option = next(
         p for p in cli_module.assets_discover.params if p.name == "min_volume_24h"
     )
     default_floor = Decimal(cli_option.default)
-    assert default_floor == Decimal("1000000")
+    assert default_floor == DEFAULT_MIN_QUOTE_24H_VOLUME
 
     config = _config(allowlist=[])
-    below = _venue_product("DOGE", volume="999999")
-    above = _venue_product("SHIB", volume="1000001")
+    below = _venue_product("DOGE", volume=str(default_floor - 1))
+    above = _venue_product("SHIB", volume=str(default_floor + 1))
 
     report = build_discover_report([below, above], config)
 
@@ -732,14 +736,29 @@ def test_every_discovery_floor_default_agrees():
     assert DiscoveryPolicy().min_quote_24h_volume == DEFAULT_MIN_QUOTE_24H_VOLUME
 
 
-def test_the_discovery_floor_matches_the_admission_liquidity_floor():
+def test_the_discovery_floor_sits_safely_below_the_admission_liquidity_floor():
     """Discovery should not hide assets the gate would admit.
 
-    The sweep's floor is a 24h snapshot and the gate's is a median over history -- different
-    statistics (which is why `--probe-liquidity` exists). Pinning the two NUMBERS equal keeps the
-    pre-filter from being stricter than the criterion it screens for: at the old 5x-higher floor,
-    FET sat at $2.94M/24h and never appeared, while measuring 4.8x the admission floor.
-    """
-    from keel.compliance.screen import ScreenPolicy
+    This test used to assert the two floors were EQUAL, on the reasoning that equality kept the
+    pre-filter from being stricter than the criterion it screens for. The goal was right and the
+    mechanism was wrong: the sweep's floor is a ONE-DAY snapshot and the gate's is a median over
+    YEARS (which is why `--probe-liquidity` exists), so equal numbers are crossed constantly by
+    ordinary variation -- and about half those crossings hide an admissible asset.
 
-    assert DEFAULT_MIN_QUOTE_24H_VOLUME == ScreenPolicy().min_median_daily_volume
+    It was hiding real ones. On 2026-08-16, FIL / OP / JASMY sat at 0.41x / 0.36x / 0.30x the
+    admission floor on 24h volume while their actual gate statistics measured 3.48x / 2.59x /
+    4.16x OVER it; none had appeared in fifteen prior discovery runs. So the invariant is now a
+    MARGIN, not an equality.
+    """
+    from keel.compliance.screen import DISCOVERY_FLOOR_MARGIN, ScreenPolicy
+
+    admission_floor = ScreenPolicy().min_median_daily_volume
+
+    assert DEFAULT_MIN_QUOTE_24H_VOLUME < admission_floor, (
+        "an equal-or-higher pre-filter hides assets the gate would admit"
+    )
+    assert DEFAULT_MIN_QUOTE_24H_VOLUME == admission_floor / DISCOVERY_FLOOR_MARGIN
+
+    # The lowest 24h/floor ratio observed on an asset that actually cleared the gate was JASMY's
+    # 0.30x. The pre-filter must stay below that, or the same class of asset is hidden again.
+    assert DEFAULT_MIN_QUOTE_24H_VOLUME < admission_floor * Decimal("0.30")

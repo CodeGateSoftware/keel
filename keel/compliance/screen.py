@@ -462,6 +462,29 @@ class Candidate:
     quote_24h_volume: Decimal
 
 
+#: How far BELOW the admission floor the discovery pre-filter sits.
+#:
+#: This is a RATIO on purpose, and it used to be 1 (the two were pinned numerically equal) with
+#: the stated intent that "discovery cannot be stricter than the criterion it screens for". That
+#: intent is right; equality does not achieve it. The pre-filter reads a ONE-DAY venue snapshot
+#: while the gate medians `volume * close` over YEARS of history -- same units, different
+#: statistics -- so an equal threshold is crossed constantly in both directions by ordinary
+#: day-to-day variation, and roughly half those crossings hide an asset the gate would admit.
+#:
+#: Measured, not assumed. On 2026-08-15 a quiet day put five already-attested assets under the
+#: equal floor while their true medians ran 3.08x-6.32x OVER it. On 2026-08-16 a sweep at a
+#: lowered floor surfaced three admissible assets that had NEVER been seen in fifteen prior
+#: discovery runs -- FIL, OP and JASMY, whose 24h snapshots sat at 0.41x, 0.36x and 0.30x the
+#: admission floor while their gate statistics measured 3.48x, 2.59x and 4.16x OVER it.
+#:
+#: 4 gives ~3x headroom below the lowest ratio actually observed on an admissible asset (0.30x).
+#: The cost is bounded and small: on the 2026-08-16 sweep it took the candidate list from 35 to
+#: 82 out of 920 venue products, which is still the "cut ~900 to a shortlist" job this filter
+#: exists to do. Raise the ratio if admissible assets are still being hidden; lower it only with
+#: evidence that probe volume has become the binding constraint.
+DISCOVERY_FLOOR_MARGIN = 4
+
+
 @dataclass(frozen=True)
 class DiscoveryPolicy:
     """The cheap pre-filter, run on venue metadata BEFORE fetching any history.
@@ -471,7 +494,11 @@ class DiscoveryPolicy:
     """
 
     quote_currency: str = "USD"
-    min_quote_24h_volume: Decimal = Decimal("1000000")
+    #: Derived from the admission floor rather than restated, so the two cannot drift and the
+    #: SAFETY MARGIN between them is the invariant -- see `DISCOVERY_FLOOR_MARGIN`.
+    min_quote_24h_volume: Decimal = (
+        ScreenPolicy().min_median_daily_volume / DISCOVERY_FLOOR_MARGIN
+    )
 
 
 def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
