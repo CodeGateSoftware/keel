@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a change to the mechanism — new capability, new venue adapter, better rails.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A note on scope before you write: changes to the **mechanism** (how things are
+        recorded, checked, audited, executed) are ordinary engineering and start here.
+        Changes to a **default classification** are rulings in code's clothing — they need a
+        cited source and discussion first (see
+        [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md), "Governance: rulings vs. machinery")
+        and belong in the *Compliance & classification* Discussions category.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What cannot be done today, or what costs more than it should. Concrete over hypothetical.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: What should exist instead, and where it would live (a rail, a command, a package, the port).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What you ruled out and why — this project records rejected alternatives on purpose.
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This changes the mechanism, not a default classification (or it changes neither)
+          required: true

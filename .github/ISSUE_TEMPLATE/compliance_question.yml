@@ -1,0 +1,54 @@
+name: Compliance & classification question
+description: "Should X be classified / treated this way? A question about rulings — not a bug, not a feature."
+labels: ["fiqh", "question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This is the distinct route for classification questions** (#285): "should this
+        asset/mechanism be treated differently" is neither broken behaviour nor a missing
+        feature, and triaging it as either gets it the wrong resolution.
+
+        Two facts about how this project treats rulings:
+
+        - **keel is not a fatwa engine.** It enforces the ruling you supply; it does not
+          issue one. A question here explores how a ruling should be *recorded and
+          enforced*, and what others attested — it does not make the project adjudicate.
+        - **Your deployment, your ruling.** If you conclude an asset should be classified
+          differently for you, the action is a local attestation — `keel assets attest
+          --source ... --attested-by ...` — not necessarily a code change here.
+  - type: input
+    id: asset_or_mechanism
+    attributes:
+      label: Asset or mechanism
+      description: The token, wrapper, venue feature, or mechanism the question is about.
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: The question
+      description: What treatment you are unsure about, and what you currently attest / run.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Sources you are weighing
+      description: >
+        Scholars, councils, standards, or venue documentation you have found. A question
+        with no source behind it can still be asked — but a proposed CHANGE to a default
+        classification cannot be merged without one (CONTRIBUTING.md, governance section).
+    validations:
+      required: false
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What would resolve it for you?
+      options:
+        - A discussion of how different operators attest this
+        - A change to how the mechanism records/enforces rulings
+        - A change to a default classification (needs sources, discussed before any PR)
+        - Not sure — that is part of the question
+    validations:
+      required: true
