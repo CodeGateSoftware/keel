@@ -58,6 +58,25 @@ def _align_up(ts: int, gran_sec: int) -> int:
     return ((ts + gran_sec - 1) // gran_sec) * gran_sec
 
 
+def _request_windows(start: int, end: int, gran_sec: int) -> list[tuple[int, int]]:
+    """Tile the inclusive `[start, end]` range into windows under the venue's candle cap.
+
+    One definition of the arithmetic for every candle request this module makes. The `- 1`
+    keeps each inclusive `[window_start, window_end]` at exactly `MAX_CANDLES_PER_REQUEST`
+    candles -- an inclusive range of `+ step` would be one over, which is the off-by-one #271
+    had to correct in `history.py`, and having it written twice here is how that happens.
+
+    Returns a single window when the range already fits, so a small gap still costs one request.
+    """
+    windows: list[tuple[int, int]] = []
+    window_start = start
+    while window_start <= end:
+        window_end = min(end, window_start + (MAX_CANDLES_PER_REQUEST - 1) * gran_sec)
+        windows.append((window_start, window_end))
+        window_start = window_end + gran_sec
+    return windows
+
+
 def _missing_ranges(expected: list[int], present: set[int], gran_sec: int) -> list[tuple[int, int]]:
     """Group the `expected` ts values not in `present` into contiguous `(start, end)` ranges."""
     missing = [ts for ts in expected if ts not in present]
@@ -112,14 +131,18 @@ def backfill(
             }
 
             for range_start, range_end in _missing_ranges(expected, existing, gran_sec):
-                fetched = client.get_candles(product_id, granularity, range_start, range_end)
-                gap_candles = [
-                    c
-                    for c in fetched
-                    if window_start <= c.ts <= latest_closed and c.ts not in existing
-                ]
-                if gap_candles:
-                    total_written += repo.upsert_candles(product_id, granularity, gap_candles)
+                # A contiguous missing range is itself unbounded -- an empty repo makes the
+                # whole history window one range -- so page it under the venue's candle cap.
+                # Upserted per window, so a mid-range failure leaves earlier windows persisted.
+                for req_start, req_end in _request_windows(range_start, range_end, gran_sec):
+                    fetched = client.get_candles(product_id, granularity, req_start, req_end)
+                    gap_candles = [
+                        c
+                        for c in fetched
+                        if window_start <= c.ts <= latest_closed and c.ts not in existing
+                    ]
+                    if gap_candles:
+                        total_written += repo.upsert_candles(product_id, granularity, gap_candles)
 
     return total_written
 
@@ -137,19 +160,14 @@ def _poll_catch_up(
     """Fetch and upsert `[fetch_start, latest_closed]`, chunked under the venue's candle cap.
 
     Mirrors `history._fill_forward`'s windowing idiom: page forward in windows of at most
-    `MAX_CANDLES_PER_REQUEST` candles each, upserting per window for incremental durability
-    (if a later window raises, earlier windows are already persisted). An empty window does
-    *not* stop the loop -- a mid-history hole must not block catch-up of newer candles.
+    `MAX_CANDLES_PER_REQUEST` candles each (see `_request_windows`), upserting per window for
+    incremental durability (if a later window raises, earlier windows are already persisted).
+    An empty window does *not* stop the loop -- a mid-history hole must not block catch-up of
+    newer candles.
     """
     total_written = 0
     seen: set[int] = set()
-    window_start = fetch_start
-    while window_start <= latest_closed:
-        # `- 1` keeps each inclusive [window_start, window_end] range at exactly
-        # MAX_CANDLES_PER_REQUEST candles (an inclusive range of `+ step` would be one over).
-        window_end = min(
-            latest_closed, window_start + (MAX_CANDLES_PER_REQUEST - 1) * gran_sec
-        )
+    for window_start, window_end in _request_windows(fetch_start, latest_closed, gran_sec):
         fetched = client.get_candles(product_id, granularity, window_start, window_end)
         new_candles: list[Candle] = [
             c
@@ -159,7 +177,6 @@ def _poll_catch_up(
         if new_candles:
             seen.update(c.ts for c in new_candles)
             total_written += repo.upsert_candles(product_id, granularity, new_candles)
-        window_start = window_end + gran_sec
 
     return total_written
 
