@@ -43,22 +43,35 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Two legs, the two ends of `requires-python = ">=3.11"` (#283):
+    #   - "3.11" is the FLOOR, stated explicitly because nothing else states it: the suite
+    #     passing there is what keeps the declared floor a measured claim instead of a hope.
+    #     3.10 fails collection on `typing.assert_never` (3.11+), which is the one concrete
+    #     feature binding the floor.
+    #   - "3.14" is the leg local development actually runs (`.python-version` pins 3.14.4);
+    #     it is named here by major only, since the matrix needs SOME explicit version and
+    #     "whatever .python-version says" is not addressable per-leg.
+    # Both legs stay inside THIS job so the required status context remains `test` -- the
+    # matrix fans out the context, it does not rename it, so every leg gates the merge.
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral/setup-uv@v6
         with:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install   # version comes from .python-version; never pin it here twice
+        run: uv python install "${{ matrix.python }}"
 
       - name: Sync dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --all-extras --dev --python "${{ matrix.python }}"
 
       - name: Lint
-        run: uv run ruff check keel tests packages
+        run: uv run --python "${{ matrix.python }}" ruff check keel tests packages
 
       # A STEP in this job, deliberately not a job of its own. The `main` ruleset requires the
       # status context `test`, which this job produces; a separate `typecheck:` job would report
@@ -70,12 +83,12 @@ jobs:
       # step is that it cannot drift back silently. A package moving in or out of the checked
       # set is then one edit there, not one edit mirrored across two workflows.
       - name: Type-check
-        run: uv run mypy
+        run: uv run --python "${{ matrix.python }}" mypy
 
       - name: Test
-        run: uv run pytest -q
+        run: uv run --python "${{ matrix.python }}" pytest -q
 
       # A build that cannot identify itself must not reach a release. This also catches an
       # import-time break in the CLI, which `pytest` alone would not surface as sharply.
       - name: Build identity
-        run: uv run keel --version
+        run: uv run --python "${{ matrix.python }}" keel --version

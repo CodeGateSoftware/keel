@@ -34,7 +34,7 @@ so upfront rather than let step 4 be a surprise.
 
 ```bash
 git clone https://github.com/CodeGateSoftware/keel.git && cd keel
-uv sync --all-extras --dev        # Python 3.14+ (uv python install 3.14)
+uv sync --all-extras --dev        # any Python 3.11+ (the repo develops on 3.14)
 cp .env.example .env              # put the CDP key/secret in it — market data only
 uv run keel rules seed            # register the rule families as candidates
 uv run keel fetch                 # pull candle history for the default allowlist

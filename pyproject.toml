@@ -7,7 +7,7 @@ readme = "README.md"
 authors = [
     { name = "CodeGate Software" }
 ]
-requires-python = ">=3.14.4"
+requires-python = ">=3.11"
 dependencies = [
     "click>=8.4.2",
     # pyyaml/python-dotenv are deliberately NOT listed here: nothing under `keel/` imports
@@ -87,7 +87,7 @@ dev = [
 # [tool.ruff] here, so keeping a copy in both places would leave silently-dead settings.
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.11"
 files = ["packages", "keel", "tests"]
 # Implied by `--strict`, but mypy rejects it in a per-module section ("Per-module sections
 # should only specify per-module flags"), so it is stated here rather than in the broker block

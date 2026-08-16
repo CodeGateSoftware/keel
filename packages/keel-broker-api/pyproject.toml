@@ -3,7 +3,7 @@ name = "keel-broker-api"
 version = "0.7.1"
 description = "Broker port, domain types, capability model, and conformance suite for keel"
 license = "Apache-2.0"
-requires-python = ">=3.14.4"
+requires-python = ">=3.11"
 # Pinned `==`: see the note in the root `pyproject.toml`. An unpinned sibling is satisfied by
 # whatever is already installed, which is how a deployment ends up running mixed versions.
 dependencies = ["keel-core==0.7.1"]
