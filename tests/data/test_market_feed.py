@@ -316,3 +316,69 @@ def test_is_fresh_false_when_no_candles_stored(repo):
     assert not is_fresh(
         repo, "BTC-USD", Granularity.ONE_HOUR, now_ts=NOW, max_age_sec=200
     )
+
+
+# -- backfill: the same candle-cap defect, on the one windowing site #269/#271 did not reach ----
+#
+# #269 chunked `poll_once` and #271 chunked `repair.py` and `history.py`. `backfill` groups
+# missing timestamps into CONTIGUOUS ranges via `_missing_ranges` and asked for each range in a
+# single request -- so a contiguous hole wider than the cap 400s exactly as the poll path did.
+# Latent today (no production caller; `keel fetch` goes through `history.ensure_history`), but
+# it is the same defect class, and #271's stated goal was that every candle-request windowing
+# site in the codebase agree.
+
+BACKFILL_HOURS = 552  # same span as the real ZEC-USD gap, comfortably over the cap
+BACKFILL_DAYS = BACKFILL_HOURS // 24 + 1
+_BACKFILL_RAW_START = NOW - BACKFILL_DAYS * 86400
+# `backfill` aligns its window start UP to the next granularity boundary; mirrored here rather
+# than importing the private helper, so the test pins the observable behaviour.
+BACKFILL_WINDOW_START = ((_BACKFILL_RAW_START + GRAN_SEC - 1) // GRAN_SEC) * GRAN_SEC
+BACKFILL_TS = list(range(BACKFILL_WINDOW_START, LATEST_CLOSED + 1, GRAN_SEC))
+
+
+def _wide_series(product_id: str = "BTC-USD") -> dict[tuple[str, Granularity], list[Candle]]:
+    return {(product_id, Granularity.ONE_HOUR): [_candle(ts) for ts in BACKFILL_TS + [NOW]]}
+
+
+def test_backfill_never_requests_more_than_the_candle_cap(repo):
+    """An empty repo makes the whole history window one contiguous missing range."""
+    client = FakeClient(_wide_series())
+
+    backfill(
+        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
+        history_days=BACKFILL_DAYS, now_ts=NOW,
+    )
+
+    assert client.calls
+    for _, _, start, end in client.calls:
+        assert start <= end
+        candle_count = (end - start) // GRAN_SEC + 1
+        assert candle_count <= MAX_CANDLES_PER_REQUEST
+
+
+def test_backfill_chunk_windows_are_contiguous_and_cover_the_gap(repo):
+    client = FakeClient(_wide_series())
+
+    written = backfill(
+        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
+        history_days=BACKFILL_DAYS, now_ts=NOW,
+    )
+
+    assert len(client.calls) > 1, "a range this wide can only tile into >1 window under the cap"
+    assert client.calls[0][2] == BACKFILL_WINDOW_START
+    assert client.calls[-1][3] == LATEST_CLOSED
+    for previous, current in zip(client.calls, client.calls[1:]):
+        assert current[2] == previous[3] + GRAN_SEC
+    assert written == len(BACKFILL_TS), "every closed candle in the window should be persisted"
+
+
+def test_backfill_still_uses_one_request_for_a_gap_within_the_cap(repo):
+    """Regression guard: chunking must not add requests to the ordinary small-window case."""
+    client = FakeClient(_full_series())
+
+    backfill(
+        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
+        history_days=HISTORY_DAYS, now_ts=NOW,
+    )
+
+    assert len(client.calls) == 1
