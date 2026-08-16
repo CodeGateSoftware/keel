@@ -2,6 +2,7 @@
 name = "keel-trader"
 version = "0.7.1"
 description = "Offline-first, broker-agnostic, rule-based spot-trading agent (halal policy by default)"
+license = "Apache-2.0"
 readme = "README.md"
 authors = [
     { name = "CodeGate Software" }

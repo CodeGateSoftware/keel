@@ -2,6 +2,7 @@
 name = "keel-broker-robinhood"
 version = "0.7.1"
 description = "Robinhood Crypto Trading API v2 adapter for keel"
+license = "Apache-2.0"
 requires-python = ">=3.14.4"
 # `pynacl` is here and nowhere else in the workspace: Robinhood signs every request with an
 # Ed25519 key, which no other venue keel talks to requires. Keeping it a dependency of this
