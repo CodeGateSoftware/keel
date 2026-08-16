@@ -4,6 +4,13 @@ An offline-first, halal (long-only, no-leverage) auto-trading agent for Coinbase
 `docs/superpowers/specs/2026-07-15-keel-autotrade-design.md` for the full design and
 `docs/superpowers/plans/2026-07-15-keel-phase1-offline-foundation.md` for the Phase 1 build plan.
 
+> **keel is not a fatwa engine. It is an enforcement engine for a ruling you supply.** keel
+> never derives a Shariah classification from market data. You record one — with a source and an
+> attributed name (`keel assets attest`) — and keel enforces it deterministically, rejecting
+> anything unattested. The ruling lives in your attestation, not in the code, so two operators
+> following different schools get different answers from the same code, by design. See
+> `CONTRIBUTING.md` for what that means for pull requests.
+
 ## How keel works
 
 keel runs as a scheduled **agent loop** (`keel agent`). Each cycle, for every allowlisted

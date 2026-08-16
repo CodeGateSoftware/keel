@@ -1,5 +1,34 @@
 # Contributing to keel
 
+## Governance: rulings vs. machinery
+
+**keel is not a fatwa engine. It is an enforcement engine for a ruling you supply.**
+
+keel never derives a Shariah classification from market data. Every classification is a human
+input — recorded with a source and an attributed name (`keel assets attest --source ...
+--attested-by ...`) — and keel's job is to enforce what was recorded, deterministically,
+rejecting anything unattested. That is what lets one codebase serve operators of different
+schools and jurisdictions: the ruling lives in the attestation, not in the code.
+
+For pull requests, that splits contributions into two kinds with different bars:
+
+- **A PR that changes a *default classification*** — what sector a well-known token falls into,
+  whether a wrapper counts as `spot`, which backings are admissible — is a ruling arriving in
+  code's clothing. It would apply one contributor's fiqh to every operator who upgrades. Such a
+  PR must cite a **source** (a scholar, a council, a standard) and is **discussed** before it
+  merges; a classification with no source behind it is not mergeable, however confident the
+  author.
+- **A PR that changes the *mechanism*** — how attestations are recorded, checked, or audited;
+  how the screen or the rails run; anything where the ruling stays in the operator's data — is
+  **ordinary engineering** and needs only ordinary review.
+
+**If you disagree with a classification, do not litigate it here.** The project does not
+adjudicate fiqh and will not become a court with a merge button. Attest your own ruling
+locally — `keel assets attest` writes to *your* database, with your source and your name on
+it — and run the enforcement engine under it. The disagreement then costs nobody anything:
+upstream stays neutral, your deployment follows your ruling, and the audit trail records
+exactly who said what.
+
 ## Licence: why Apache-2.0
 
 keel is licensed under [Apache-2.0](LICENSE). That was a decision, not a default, and the
