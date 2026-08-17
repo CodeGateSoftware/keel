@@ -232,6 +232,73 @@ The route the architecture already provides — record your own ruling locally:
   `CONTRIBUTING.md` requires a cited source and discussion before merge — a classification
   with no source behind it is not mergeable, however confident the author.
 
+## Scholarly review status
+
+**No scholarly review of keel's fiqh basis has occurred.** Not by a named scholar, not by a
+council, not by anyone. The basis is the operator's reading of the sources this document
+cites — Ayub (§65), the OIC/AAOIFI/IIFA materials (§67, §71), Mufti Faraz Adam's papers
+(§85, §86) — extracted into the knowledge base at
+`docs/superpowers/references/trading-knowledge-base/` and mapped into code here, published
+precisely so that reading can be audited and challenged. Each operator remains responsible
+for their own attestations. Until this section gains a dated review addendum (below), the
+status is plain: not reviewed.
+
+### What review will cover when a reviewer engages
+
+A review, should one ever happen, is a review of the mapping from sources to code — and
+its scope is this, in full:
+
+- **The encoded-rulings table above** — whether each screen and rail axis faithfully reflects
+  the section it cites: §28.4 for the sector and riba axes, §65.5/§67.2 for backing, §71.4a
+  for the instrument shape, §65.4 for rail 17's `qabd` test.
+- **The knowledge-base extractions** — whether each source file under
+  `docs/superpowers/references/trading-knowledge-base/sources/` is faithful to the text it
+  was extracted from, including where it records "not stated" rather than papering over a
+  gap.
+- **The per-asset attestations on the operator's own allowlist** — sector, backing, and
+  `pays_yield`, including the open questions named above (ATOM dilution, DOGE's *Māl*
+  qualification, the premise itself).
+
+### What a reviewer is NOT endorsing
+
+A reviewer would be reviewing the mapping from sources to code, nothing more. Explicitly
+not endorsed:
+
+- **Not the trading strategy or its performance.** The honest measured result is linked from
+  the README's first screen and is nothing anyone is asked to endorse.
+- **Not the prudential rails.** They are risk discipline carrying no religious claim (§65.6's
+  correction); a fiqh review has nothing to say about them either way.
+- **Not a ruling that crypto is tradable property.** The §71.1 non-ruling stands: reviewing
+  the machinery does not settle the premise the machinery presupposes.
+- **Not any particular operator's attestations.** Those carry the operator's own source and
+  name; they are not this repository's to have reviewed.
+- **Not an endorsement of trading anything.** keel states its honest result and disclaims
+  advice; a review of the mapping adds no permission to trade.
+
+### How a review is recorded
+
+If a review ever happens, it is recorded as a dated addendum to this section, naming the
+reviewer, the scope reviewed, the findings, and what changed as a result — versioned in git
+like everything else in this repository. Until such an addendum exists, the status is "not
+reviewed", and it can ratchet one way only: from not-reviewed to
+reviewed-with-a-named-scope, never to an approval with no scope attached.
+
+### The outreach shortlist (a plan, not a claim)
+
+Approaching a reviewer is the operator's action, and it has not been taken as of this
+writing. The shortlist, for when it is: the Islamic finance programmes at IIUM, INCEIF, and
+Durham, and established Islamic fintech practitioners — approached with this note, ready to
+send:
+
+> keel is an open-source enforcement engine for Shariah rulings an operator supplies —
+> classifications are attested, never inferred, and enforced deterministically
+> (https://github.com/CodeGateSoftware/keel). I am asking for a review of the mapping from
+> the cited sources — Ayub, the OIC/AAOIFI/IIFA materials, Mufti Faraz Adam's papers — to
+> the encoded screen and rail behaviour, as documented in docs/fiqh-basis.md. The review
+> would signify only that the mapping is faithful to those sources; it would not endorse
+> the trading strategy, the prudential rails, the premise that crypto is tradable property,
+> or trading at all.
+
 ## Sources index
 
 - `docs/superpowers/references/trading-knowledge-base/sources/source-65.md` — Muhammad Ayub,
