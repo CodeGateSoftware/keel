@@ -136,6 +136,19 @@ is a good read for how a test argues its own existence.
 - Anything that weakens a fails-closed path to make an operational annoyance go away; the
   annoyance is the smaller problem.
 
+## What to expect from a solo maintainer
+
+This is a solo-maintained project, and the response times below are what one person can
+actually keep — stated here (#291) so a contributor's expectations come from the repo,
+not from the 24/7 responsiveness a large project can imply:
+
+- **Issues** are triaged within **3 days** (a label and a first reply; a fix may take
+  longer, and the triage will say so).
+- **PRs** get a first review within **a week** when the gates pass. A slower review is
+  not a no.
+- **Security reports** follow [`SECURITY.md`](SECURITY.md)'s SLA, privately, and take
+  precedence over everything here.
+
 ## Licence: why Apache-2.0
 
 keel is licensed under [Apache-2.0](LICENSE). That was a decision, not a default, and the

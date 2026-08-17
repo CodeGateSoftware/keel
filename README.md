@@ -138,6 +138,9 @@ adapter, deliberately divergent, that the conformance suite runs against.
 - [`docs/experiments/`](docs/experiments) — the experiment record, including the honest
   result linked above; every document states what was measured, on what engine, with the
   defect that forced a restatement.
+- [`docs/launch.md`](docs/launch.md) — the pre-launch gate and the announcement plan:
+  what must be true before anything is announced, where, in what order, and what the
+  post says (the honest result included).
 - [`docs/RELEASING.md`](docs/RELEASING.md) — how a release is cut.
 
 ## Asking questions, and contributing
