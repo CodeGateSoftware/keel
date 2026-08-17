@@ -1746,7 +1746,11 @@ def pnl(ctx: click.Context, asset: str | None, raw_marks: tuple[str, ...]) -> No
 # table and benchmark comparison was priced at half the cost of trading
 # (`docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md` §5).
 _SIM_FEE_PCT = backtest_mod.TAKER_FEE_PCT
-_SIM_SLIPPAGE_PCT = Decimal("0.0005")
+# Aliased to the engine's floor (#259's cleanup), not repeated: the simulate report asserts
+# its flat-priced dollar sections cost "the flat SLIPPAGE_FLOOR_PCT per leg", and that claim
+# must be structurally true, not true by numeric coincidence that a retune would silently
+# break. (`portfolio_sim` and `paper` still carry their own literals -- see #335.)
+_SIM_SLIPPAGE_PCT = backtest_mod.SLIPPAGE_FLOOR_PCT
 
 
 def _sim_fee_pct(config: Config) -> Decimal:

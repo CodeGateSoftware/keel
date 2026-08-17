@@ -645,11 +645,13 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
     follow-through) production silently takes trades the rule meant to decline (#260).
 
     Logged UNCONDITIONALLY rather than past a threshold. A basis-point threshold that is right for
-    BTC is wrong for a thin book, and the per-asset liquidity model that would set it does not
-    exist yet (#259) -- gating this on that work would block the cheap half behind the expensive
-    half. This follows what #247 did with the fee rate: make the number visible first, act on it
-    second. `divergence_bps` is signed, so direction is legible without recomputing it: positive
-    means the fill came in ABOVE the rule's intended entry.
+    BTC is wrong for a thin book -- the per-asset liquidity model that would set it now exists
+    (#259, `strategy/backtest.slippage_for_quote_volume`) but lives on the RESEARCH side; the
+    live path has no such statistic in hand at fill time, and gating on the cheap half behind
+    the expensive half was declined when this shipped. This follows what #247 did with the fee
+    rate: make the number visible first, act on it second. `divergence_bps` is signed, so
+    direction is legible without recomputing it: positive means the fill came in ABOVE the
+    rule's intended entry.
 
     Never raises. This is telemetry attached to an order that has already been placed and settled;
     a formatting problem here must not fail a cycle.
@@ -682,8 +684,11 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 #:
 #: A VISIBILITY threshold, not a correctness one: crossing it changes no order, only whether
 #: the operator is told. Anchored in this repo's own cost model, where a fill is priced at a
-#: 1.2% taker fee per leg (`strategy/backtest.TAKER_FEE_PCT`) plus 5bp of slippage
-#: (`cli._SIM_SLIPPAGE_PCT`). Against that, a deviation of a few bp is microstructure -- the
+#: 1.2% taker fee per leg (`strategy/backtest.TAKER_FEE_PCT`) plus a slippage FLOOR of 5bp
+#: (`strategy/backtest.SLIPPAGE_FLOOR_PCT`; #259 scales it up to a 50bp cap on thin books --
+#: so "10x the slippage assumption" below holds at the liquid end and narrows toward the cap,
+#: where a firing is all the more truthful). Against that, a deviation of a few bp is
+#: microstructure -- the
 #: drift any enter-at-close rule (`turtle_breakout`, `rsi_meanrev`) accumulates by routing one
 #: cycle after its signal bar -- while tens of bp means the rule's entry encodes a CONDITION:
 #: `pullback_continuation` enters at `signal_candle.high + buffer_ticks`, which sits above
@@ -695,6 +700,8 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 #: enter-at-close rule's signal and the next cycle's ask CAN exceed the line in volatile
 #: stretches; that firing is truthful (the fill really is that far off intent) and
 #: informative, not spurious. This is a VISIBILITY threshold, not a correctness one.
+#: (Its 50bp is COINCIDENTALLY equal to #259's slippage CAP -- different constants, different
+#: modules, no coupling; do not retune one on the other's reasoning.)
 #: The comparison is strictly greater: a deviation exactly at the line is "at", not
 #: "beyond", and logs nothing.
 ENTRY_OVERRIDE_WARN_BP = Decimal("50")
@@ -778,7 +785,14 @@ def _warn_if_market_routing_overrides_entry(
         return
     if not expected.is_finite() or expected <= 0:
         return
-    deviation_bps = (expected - ref) / ref * Decimal(10_000)
+    # The arithmetic stays INSIDE a try, matching `_log_intent_divergence`: `is_finite()`
+    # admits extreme exponents (a rule bug like 1E+999999999 parses and compares fine), and
+    # Decimal division/multiplication on such magnitudes raises ArithmeticError -- which
+    # telemetry must swallow, never propagate into the routing it observes.
+    try:
+        deviation_bps = (expected - ref) / ref * Decimal(10_000)
+    except ArithmeticError:
+        return
     if abs(deviation_bps) <= ENTRY_OVERRIDE_WARN_BP:
         return
     log_event(
