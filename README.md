@@ -118,6 +118,9 @@ adapter, deliberately divergent, that the conformance suite runs against.
 
 ## Documentation map
 
+- [`docs/fiqh-basis.md`](docs/fiqh-basis.md) — the Shariah reasoning keel encodes, ruling by
+  ruling, each with its in-repo source: what is attested vs computed, the open questions,
+  and how to disagree.
 - [`docs/operator-runbook.md`](docs/operator-runbook.md) — operating a deployment: the
   account-level compliance obligations no rail can enforce, deploying/upgrading releases,
   and the paper-vs-live distinctions (two accounts that share nothing).
