@@ -35,7 +35,8 @@ adjudicate fiqh and will not become a court with a merge button. Attest your own
 locally — `keel assets attest` writes to *your* database, with your source and your name on
 it — and run the enforcement engine under it. The disagreement then costs nobody anything:
 upstream stays neutral, your deployment follows your ruling, and the audit trail records
-exactly who said what.
+exactly who said what. The Shariah reasoning the codebase encodes, ruling by ruling with its
+source, is written up in [`docs/fiqh-basis.md`](docs/fiqh-basis.md).
 
 ## Development setup and the gates a PR must pass
 

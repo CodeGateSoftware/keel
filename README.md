@@ -64,7 +64,7 @@ applies the confirm/autonomy gate, then places and logs. There is deliberately n
   promotion clears a two-part gate: performance floors *and* an overfitting check
   (PBO/CSCV). A rule that clears four floors on one in-sample parameter set is exactly what
   the second gate exists to be suspicious of.
-- **The rails** (`keel/execution/guards.py`) — nineteen deterministic checks no order can
+- **The rails** (`keel/execution/guards.py`) — eighteen deterministic checks no order can
   skip and nothing can override, not even autonomy: the halal allowlist, per-order and
   per-day spend caps, exposure and concentration caps, correlation-aware sizing, a
   minimum-move floor, no-martingale/no-stop-widening, a fails-closed kill-switch, total and
@@ -96,7 +96,7 @@ the stop holds, not what you spend.
 ```
 keel/                          the agent and CLI
 ├── agent.py                   the loop and RULE_REGISTRY (where rules live)
-├── execution/guards.py        the 19 rails (where enforcement lives)
+├── execution/guards.py        the 18 rails (where enforcement lives)
 ├── execution/sizing.py        position sizing
 ├── compliance/screen.py       attested allowlist admission (fails closed)
 └── commands/                  CLI command implementations
@@ -118,6 +118,9 @@ adapter, deliberately divergent, that the conformance suite runs against.
 
 ## Documentation map
 
+- [`docs/fiqh-basis.md`](docs/fiqh-basis.md) — the Shariah reasoning keel encodes, ruling by
+  ruling, each with its in-repo source: what is attested vs computed, the open questions,
+  and how to disagree.
 - [`docs/operator-runbook.md`](docs/operator-runbook.md) — operating a deployment: the
   account-level compliance obligations no rail can enforce, deploying/upgrading releases,
   and the paper-vs-live distinctions (two accounts that share nothing).
