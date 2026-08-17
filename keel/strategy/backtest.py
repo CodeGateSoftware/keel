@@ -36,7 +36,10 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   now fills on the very next bar.)
 - **Costs:** `slippage_pct` worsens the fill price on both entry (paid) and exit
   (received); `fee_pct` is charged on both legs' notional. This models spread +
-  slippage + fees (§4.2).
+  slippage + fees (§4.2). Since #259 the slippage may be PER PRODUCT: pass
+  `slippage_by_product` to price each product's fills from its own liquidity statistic
+  (`slippage_for_quote_volume`), leaving the flat `slippage_pct` as the default and the
+  fallback for products without one.
 
 Position sizing (money management) is out of scope for this module (see the future
 `money_mgmt.py`): every trade uses a fixed 1-unit notional, sufficient for computing
@@ -48,6 +51,7 @@ driven purely through the `Rule` ABC from `keel.strategy.rules.base`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -55,7 +59,16 @@ from keel.strategy.rules.base import Rule, Setup, Trade, TradeOutcome
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
 
-__all__ = ["TAKER_FEE_PCT", "BacktestResult", "backtest"]
+__all__ = [
+    "SLIPPAGE_CAP_PCT",
+    "SLIPPAGE_FLOOR_PCT",
+    "SLIPPAGE_REFERENCE_QUOTE_VOLUME",
+    "TAKER_FEE_PCT",
+    "BacktestResult",
+    "SlippageAssumption",
+    "backtest",
+    "slippage_for_quote_volume",
+]
 
 # The default rate `backtest` charges per leg, and the reason it is the TAKER rate.
 #
@@ -93,6 +106,94 @@ __all__ = ["TAKER_FEE_PCT", "BacktestResult", "backtest"]
 # `tests/strategy/test_backtest.py::test_taker_fee_constant_tracks_the_config_schema_default`
 # fails if this drifts from `FeesConfig.taker_pct`.
 TAKER_FEE_PCT = Decimal("0.012")
+
+# -- #259: per-product slippage scaled from liquidity -------------------------------------------
+#
+# Until #259 `backtest()` charged one global 5bp on both legs of every trade on every product.
+# Since #257 made entries fill at the next bar's open as MARKET orders, that constant is the
+# ONLY term modelling spread crossing and market impact -- precisely what a market order pays.
+# The 24-product corpus spans orders of magnitude of liquidity (median daily quote volume,
+# measured over the cached ONE_DAY bars on 2026-08-16: BTC $571M, ETH $337M, SOL $109M ...
+# WLD $1.2M, TON $370K -- reproduce with, from a deployment root:
+# `python -c "from decimal import Decimal; from keel.data.repository import Repository;
+# from keel.compliance.screen import median_daily_quote_volume; import sqlite3;
+# print(median_daily_quote_volume(Repository(sqlite3.connect('keel.db')).get_candles(
+# 'BTC-USD', 'ONE_DAY')))"`, full cached history, upper median on even-length series),
+# so a single rate was plausible for BTC and optimistic for the tail by
+# an unmeasured factor -- and the error ran in the flattering direction on exactly the thin
+# assets that kept surfacing as apparent outliers (TON gross PF 3.751 on n=9; WLD 2.810 on n=12).
+#
+# The mapping below is an ASSUMPTION, not a measurement, and is documented and reported as one.
+# Its functional form is the standard practitioner prior -- cost scales with the SQUARE ROOT of
+# the inverse volume ratio -- with every parameter a deliberate conservative choice:
+
+#: The per-leg rate the most liquid products pay, and the FALLBACK for any product without a
+#: liquidity statistic. Numerically the old global constant (5bp): the liquid end of the corpus
+#: was never the problem, so the correction leaves it exactly where it was.
+SLIPPAGE_FLOOR_PCT = Decimal("0.0005")
+
+#: The per-leg rate the thinnest products are charged (50bp). A round cap in the "tens of bp"
+#: the issue asked for, chosen so it binds at exactly 100x below the anchor (sqrt(100) = 10x the
+#: floor) -- a relationship a reader can recover without reading this file's source. The corpus
+#: tail (TON ~1544x below the anchor) would demand ~184bp unclamped, more than any plausible
+#: thin-book spread for the 1-unit notional this engine fills; the cap keeps the model
+#: conservative without declaring thin products untreatable by construction.
+SLIPPAGE_CAP_PCT = Decimal("0.005")
+
+#: The median daily quote volume (USD) that maps to the floor: $500M/day. Measured corpus top
+#: (BTC) is $571M, just above it -- BTC itself clamps to the floor, and so does anything more
+#: liquid. A round number rather than BTC's exact median so the anchor stays honest as the
+#: corpus re-measures itself; re-measured medians are reported beside results, this constant
+#: is not silently re-derived.
+SLIPPAGE_REFERENCE_QUOTE_VOLUME = Decimal("500000000")
+
+
+def slippage_for_quote_volume(median_daily_quote_volume: Decimal) -> Decimal:
+    """Map a product's `compliance.screen.median_daily_quote_volume` to an assumed per-leg
+    slippage: `SLIPPAGE_FLOOR_PCT * sqrt(anchor / volume)`, clamped to
+    [`SLIPPAGE_FLOOR_PCT`, `SLIPPAGE_CAP_PCT`].
+
+    An ASSUMPTION, not a measurement -- keel stores no book snapshots or realised spreads, so
+    liquidity is proxied by the one statistic it does compute. Every parameter is stated above
+    as a conservative choice, because a number whose assumptions cannot be recovered is not
+    evidence. The mapping is monotone (more liquid -> never more slippage) and bounded at both
+    ends (the floor at/below the anchor, the cap at 100x below it). Volume 0 -- what
+    `median_daily_quote_volume` returns for empty input -- maps to the cap: no evidence of
+    liquidity is maximally thin, the fail-closed direction.
+    """
+    if median_daily_quote_volume <= 0:
+        return SLIPPAGE_CAP_PCT
+    unclamped = SLIPPAGE_FLOOR_PCT * (
+        SLIPPAGE_REFERENCE_QUOTE_VOLUME / median_daily_quote_volume
+    ).sqrt()
+    return min(max(unclamped, SLIPPAGE_FLOOR_PCT), SLIPPAGE_CAP_PCT)
+
+
+@dataclass(frozen=True)
+class SlippageAssumption:
+    """One row of the per-product slippage table a run must print beside its results (#259).
+
+    `median_daily_quote_volume is None` means no statistic was available for the product and
+    the FLAT fallback rate was applied -- `fallback` derives from that, so the flag and the
+    number it explains cannot disagree. `capped` likewise derives from the rate, and marks the
+    rows where the mapping's thin-end bound did the deciding.
+    """
+
+    product_id: str
+    #: The liquidity statistic the rate was scaled from; `None` when no candles were available.
+    median_daily_quote_volume: Decimal | None
+    #: The per-leg rate actually applied to this product's fills.
+    slippage_pct: Decimal
+
+    @property
+    def fallback(self) -> bool:
+        return self.median_daily_quote_volume is None
+
+    @property
+    def capped(self) -> bool:
+        return self.median_daily_quote_volume is not None and self.slippage_pct == (
+            SLIPPAGE_CAP_PCT
+        )
 
 # Default key used to present the single candle series to `Rule.detect()`/
 # `Rule.exit_signal()` in the `dict[Granularity, list[Candle]]` shape the interface
@@ -228,7 +329,8 @@ def backtest(
     candles: list[Candle],
     finer_candles: list[Candle] | None = None,
     fee_pct: Decimal = TAKER_FEE_PCT,
-    slippage_pct: Decimal = Decimal("0.0005"),
+    slippage_pct: Decimal = SLIPPAGE_FLOOR_PCT,
+    slippage_by_product: Callable[[str], Decimal] | None = None,
 ) -> BacktestResult:
     """Simulate `rule` over `candles` (ascending by `ts`), one position at a time.
 
@@ -241,7 +343,21 @@ def backtest(
     `config.fees.taker_pct` in from a loaded `Config` when the caller has one. Whatever a
     caller passes, it should **report the rate alongside the result** -- a profit factor
     printed without its fee cannot be checked by the person reading it.
+
+    `slippage_pct` is the flat per-leg rate, unchanged from before #259 and still the default
+    for every caller that does not opt in. `slippage_by_product`, when provided, OVERRIDES it
+    per product: it is called once with `rule.product_id` and its return value prices both legs
+    of every fill this run. A caller with liquidity statistics should pass a resolver built on
+    `slippage_for_quote_volume` and answer `slippage_pct` for products it has no statistic for
+    (the fallback), then report the assumptions -- see `SlippageAssumption`. A profit factor
+    printed without its assumed slippage has the same problem a profit factor printed without
+    its fee rate had.
     """
+    #: One rate for the whole run: a rule is bound to exactly one product (`product_id`), so
+    #: "per-product slippage" resolves once, here, rather than per fill.
+    effective_slippage = (
+        slippage_by_product(rule.product_id) if slippage_by_product is not None else slippage_pct
+    )
     trades: list[Trade] = []
     position: _OpenPosition | None = None
     pending: Setup | None = None
@@ -322,7 +438,7 @@ def backtest(
             # (the Option B discussion on #257).
             position = _OpenPosition(
                 setup=pending,
-                entry_fill=candle.open * (Decimal(1) + slippage_pct),
+                entry_fill=candle.open * (Decimal(1) + effective_slippage),
                 entry_ts=candle.ts,
                 mfe=Decimal(0),
                 mae=Decimal(0),
@@ -355,7 +471,9 @@ def backtest(
             exit_price = candle.close
 
         if exit_price is not None:
-            trades.append(_close_trade(position, exit_price, candle.ts, fee_pct, slippage_pct))
+            trades.append(
+                _close_trade(position, exit_price, candle.ts, fee_pct, effective_slippage)
+            )
             position = None
 
     if position is not None:

@@ -11,7 +11,15 @@ from decimal import Decimal
 
 from keel_core.config import FeesConfig
 
-from keel.strategy.backtest import TAKER_FEE_PCT, BacktestResult, backtest
+from keel.strategy.backtest import (
+    SLIPPAGE_CAP_PCT,
+    SLIPPAGE_FLOOR_PCT,
+    SLIPPAGE_REFERENCE_QUOTE_VOLUME,
+    TAKER_FEE_PCT,
+    BacktestResult,
+    backtest,
+    slippage_for_quote_volume,
+)
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity, Side
 
@@ -45,11 +53,19 @@ class _ScriptedRule(Rule):
     name = "scripted"
     params: dict = {}
 
-    def __init__(self, trigger_ts: int, entry: Decimal, stop: Decimal, target: Decimal) -> None:
+    def __init__(
+        self,
+        trigger_ts: int,
+        entry: Decimal,
+        stop: Decimal,
+        target: Decimal,
+        product_id: str = "BTC-USD",
+    ) -> None:
         self.trigger_ts = trigger_ts
         self.entry = entry
         self.stop = stop
         self.target = target
+        self.product_id = product_id
 
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         window = next(iter(candles_by_tf.values()))
@@ -57,7 +73,7 @@ class _ScriptedRule(Rule):
         if latest.ts != self.trigger_ts:
             return None
         return Setup(
-            product_id="BTC-USD",
+            product_id=self.product_id,
             direction="long",
             entry=self.entry,
             stop=self.stop,
@@ -368,3 +384,189 @@ class TestPendingLifespanInvariant:
 
         assert len(result.trades) == 1  # filled immediately, then held to the end of the series
         assert result.trades[0].outcome == "open"
+
+
+# -- #259: per-product slippage scaled from liquidity ------------------------------------------
+#
+# Median daily quote volumes below are MEASURED, from this repo's own corpus on 2026-08-16
+# (`median_daily_quote_volume` over the cached ONE_DAY bars: BTC $571,268,510, ETH $337,185,168,
+# SOL $108,953,971, WLD $1,245,626, TON $369,944) -- three-plus orders of magnitude from top to
+# tail. They are why one global 5bp could not stand: since #257 that constant is the ONLY term
+# modelling spread crossing and market impact, and the error ran in the flattering direction on
+# exactly the thin assets that kept showing up as outliers (TON gross PF 3.751 on n=9; WLD 2.810
+# on n=12).
+
+
+class TestLiquidityScaledSlippage:
+    """The mapping `slippage_for_quote_volume`: monotone, bounded, and owned as an assumption.
+
+    These are pure unit tests over a synthetic volume ladder -- no candles, no rule -- pinning
+    the four properties the mapping is required to have (#259): the anchor maps to the floor, a
+    materially thinner product pays materially more, the cap clamps, and the whole ladder is
+    monotone (more liquid -> never more slippage).
+    """
+
+    def test_the_anchor_volume_maps_to_exactly_the_floor(self) -> None:
+        """BTC-class liquidity stays at 5bp: the liquid end of the mapping IS the old constant."""
+        assert slippage_for_quote_volume(SLIPPAGE_REFERENCE_QUOTE_VOLUME) == SLIPPAGE_FLOOR_PCT
+
+    def test_a_product_100x_thinner_pays_10x_the_slippage(self) -> None:
+        """sqrt scaling: 100x thinner -> sqrt(100) = 10x the rate, i.e. 50bp.
+
+        Pinned as a NUMBER, not an inequality: 50bp is also the cap, and that is by construction
+        (#259's cap was chosen so the clamp binds at exactly 100x below the anchor). If either
+        parameter moves, this test is the one that names the round-number relationship that broke.
+        """
+        hundred_x_thinner = SLIPPAGE_REFERENCE_QUOTE_VOLUME / Decimal(100)
+
+        assert slippage_for_quote_volume(hundred_x_thinner) == Decimal("0.005")
+        assert slippage_for_quote_volume(hundred_x_thinner) == SLIPPAGE_FLOOR_PCT * Decimal(10)
+
+    def test_the_cap_clamps_beyond_100x(self) -> None:
+        """TON's measured corpus median (~$370K, ~1544x below the anchor) clamps at the cap.
+
+        The unclamped curve would demand ~184bp -- more than any plausible thin-book spread for
+        the 1-unit notional this engine fills. The clamp keeps the model conservative without
+        making thin products untreatable by construction.
+        """
+        ton = Decimal("369944")
+        unclamped = SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / ton).sqrt()
+
+        assert unclamped > SLIPPAGE_CAP_PCT  # the clamp is genuinely load-bearing here
+        assert slippage_for_quote_volume(ton) == SLIPPAGE_CAP_PCT
+
+    def test_more_liquid_than_the_anchor_never_pays_less_than_the_floor(self) -> None:
+        """The floor is a bound, not just a starting point: BTC itself sits just above the anchor
+        (measured $571M vs $500M) and must still pay the full 5bp, never a discount below it."""
+        assert slippage_for_quote_volume(SLIPPAGE_REFERENCE_QUOTE_VOLUME * Decimal(4)) == (
+            SLIPPAGE_FLOOR_PCT
+        )
+        assert slippage_for_quote_volume(Decimal("571268510")) == SLIPPAGE_FLOOR_PCT
+
+    def test_monotone_across_a_volume_ladder(self) -> None:
+        """Thinner -> same or worse, all the way down; strictly worse through the unclamped middle.
+
+        The ladder spans more than the corpus's own range (BTC ~$571M down to ~$100K) so the
+        property is pinned beyond today's data, not just on it.
+        """
+        ladder = [
+            Decimal(v)
+            for v in (
+                "2000000000",  # more liquid than the anchor -> floor
+                "1000000000",
+                "500000000",  # the anchor -> floor
+                "100000000",  # SOL-class -> unclamped
+                "50000000",
+                "10000000",
+                "5000000",  # exactly 100x thinner -> the cap
+                "1000000",  # the admission floor -> clamped
+                "100000",
+            )
+        ]
+        rates = [slippage_for_quote_volume(v) for v in ladder]
+
+        assert all(a <= b for a, b in zip(rates, rates[1:], strict=False))
+        # Strictly increasing wherever neither end's clamp is active (anchor -> 100x-thinner).
+        assert rates[2] < rates[3] < rates[4] < rates[5] < rates[6]
+
+    def test_zero_volume_is_the_cap_not_an_error(self) -> None:
+        """`median_daily_quote_volume` returns 0 for empty input; the mapping must stay total and
+        treat 'no evidence of liquidity' as maximally thin (the cap), the fail-closed direction.
+        A NEGATIVE statistic (corrupt data, not merely absent) hits the same `<= 0` guard."""
+        assert slippage_for_quote_volume(Decimal(0)) == SLIPPAGE_CAP_PCT
+        assert slippage_for_quote_volume(Decimal("-1")) == SLIPPAGE_CAP_PCT
+
+    def test_measured_corpus_medians_map_where_the_corpus_says_they_should(self) -> None:
+        """BTC at the floor, ETH a hair above it (~6.1bp), TON at the cap -- the measured anchors
+        that motivated #259, restated as the mapping's own outputs so the model can be audited
+        against the data that produced it."""
+        btc = slippage_for_quote_volume(Decimal("571268510"))
+        eth = slippage_for_quote_volume(Decimal("337185168"))
+        ton = slippage_for_quote_volume(Decimal("369944"))
+
+        assert btc == Decimal("0.0005")
+        assert Decimal("0.0005") < eth < Decimal("0.001")  # ~6.1bp
+        assert ton == Decimal("0.005")
+
+
+class TestPerProductSlippageInBacktest:
+    """`backtest(slippage_by_product=...)` prices each product's fills from its own liquidity.
+
+    The contract has two halves, and both are tested: a run that passes the resolver gets
+    per-product costs, and a run that does not keeps the flat 5bp exactly as before -- the
+    parameter overrides, it never re-defaults (#259's requirement that every existing caller's
+    behaviour stay identical until it opts in).
+    """
+
+    _VOLUMES = {
+        "BTC-USD": Decimal("571268510"),  # measured corpus medians, 2026-08-16
+        "TON-USD": Decimal("369944"),
+    }
+
+    def _candles(self) -> list[Candle]:
+        # The TestKnownWinningTrade shape: trigger at ts=60, fill at ts=120's open (105),
+        # exit at the target (130). Liquidity plays no role in the candles -- only in the
+        # slippage the resolver returns -- so any difference between runs is the cost model's.
+        return [
+            _candle(0, "100", "101", "99", "100"),
+            _candle(60, "104", "106", "103", "105"),
+            _candle(120, "105", "112", "104", "108"),
+            _candle(180, "111", "135", "109", "132"),
+        ]
+
+    def _rule(self, product_id: str = "BTC-USD") -> _ScriptedRule:
+        return _ScriptedRule(
+            60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id
+        )
+
+    def _resolver(self, product_id: str) -> Decimal:
+        return slippage_for_quote_volume(self._VOLUMES[product_id])
+
+    def test_the_resolver_overrides_the_flat_constant_on_the_entry_fill(self) -> None:
+        result = backtest(
+            self._rule(), self._candles(), slippage_by_product=lambda pid: Decimal("0.005")
+        )
+
+        assert result.trades[0].entry == Decimal(105) * Decimal("1.005")
+
+    def test_a_thin_product_nets_strictly_less_than_a_liquid_one(self) -> None:
+        """Two products, same candles, same setup; only the liquidity statistic differs.
+
+        TON pays more to enter AND receives less on the exit -- both legs are worse, which is
+        the direction check #259 demands: the correction is conservative on thin assets, never
+        favourable.
+        """
+        btc = backtest(
+            self._rule("BTC-USD"), self._candles(), slippage_by_product=self._resolver
+        )
+        ton = backtest(
+            self._rule("TON-USD"), self._candles(), slippage_by_product=self._resolver
+        )
+
+        assert ton.trades[0].entry > btc.trades[0].entry
+        assert ton.trades[0].exit < btc.trades[0].exit
+        assert ton.trades[0].pnl is not None and btc.trades[0].pnl is not None
+        assert ton.trades[0].pnl < btc.trades[0].pnl
+
+    def test_a_resolver_returning_the_floor_is_indistinguishable_from_no_resolver(self) -> None:
+        """The fallback contract: a product with no liquidity statistic behaves EXACTLY as the
+        flat constant -- the caller's resolver answers 'flat rate' and the engine must not be
+        able to tell that apart from the default."""
+        via_resolver = backtest(
+            self._rule(), self._candles(), slippage_by_product=lambda pid: SLIPPAGE_FLOOR_PCT
+        )
+        flat = backtest(self._rule(), self._candles())
+
+        assert via_resolver.trades[0].pnl == flat.trades[0].pnl
+        assert via_resolver.trades[0].entry == flat.trades[0].entry
+
+    def test_without_the_resolver_everything_prices_at_the_flat_default(self) -> None:
+        """The existing-caller guarantee, pinned: omitting the parameter must reproduce a run
+        that passes the flat rate explicitly, trade for trade."""
+        default_run = backtest(self._rule(), self._candles())
+        explicit_run = backtest(
+            self._rule(), self._candles(), slippage_pct=Decimal("0.0005")
+        )
+
+        assert default_run.trades[0].pnl == explicit_run.trades[0].pnl
+        assert default_run.trades[0].entry == Decimal(105) * Decimal("1.0005")

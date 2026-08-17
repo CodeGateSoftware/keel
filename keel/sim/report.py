@@ -55,6 +55,7 @@ plan-prose specifics the plan leaves implicit):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -63,7 +64,14 @@ from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimResult, SimTelemetry
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
-from keel.strategy.backtest import _rule_trading_tf, backtest
+from keel.strategy.backtest import (
+    SLIPPAGE_CAP_PCT,
+    SLIPPAGE_FLOOR_PCT,
+    SLIPPAGE_REFERENCE_QUOTE_VOLUME,
+    SlippageAssumption,
+    _rule_trading_tf,
+    backtest,
+)
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
 from keel.strategy.promotion import PromotionConfig, check_floors, promotion_class_of
 from keel.strategy.rules.base import Rule
@@ -145,6 +153,7 @@ def edge_table(
     candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
     fee_pct: Decimal,
     slippage_pct: Decimal,
+    slippage_by_product: Callable[[str], Decimal] | None = None,
 ) -> dict[str, BacktestResult]:
     """Backtest every rule in `rules` over its own asset's native-timeframe series, plus a pooled
     entry.
@@ -158,6 +167,11 @@ def edge_table(
     different assets don't collide. `POOLED_KEY` (`"__pooled__"`) holds
     `strategy.stats.summarize()` over every rule's trades concatenated -- the pooled sample
     `build_verdict`'s G2 gate is checked against.
+
+    `slippage_by_product` (#259) is passed through to each rule's `backtest()` unchanged; `None`
+    (the default) keeps the flat `slippage_pct` for every rule, exactly as before #259. A caller
+    that opts in should hand the SAME assumptions it priced at to `render_markdown` (as
+    `slippage_rows`), so the printed numbers and their stated costs cannot drift apart.
 
     A rule whose asset has no cached candles for its timeframe gets an empty series (an all-zero
     `BacktestResult`, `n_trades=0`) rather than raising -- absent data is a data-coverage gap
@@ -173,7 +187,12 @@ def edge_table(
         series = per_tf.get(tf, [])
         finer = per_tf.get(Granularity.ONE_HOUR, []) if tf != Granularity.ONE_HOUR else None
         result = backtest(
-            rule, series, finer_candles=finer, fee_pct=fee_pct, slippage_pct=slippage_pct
+            rule,
+            series,
+            finer_candles=finer,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            slippage_by_product=slippage_by_product,
         )
         results[f"{rule.name}:{asset}"] = result
         pooled_trades.extend(result.trades)
@@ -598,10 +617,54 @@ def _render_coverage_section(sim: SimResult) -> list[str]:
     return lines
 
 
+def _render_slippage_rows(slippage_rows: list[SlippageAssumption]) -> list[str]:
+    """The per-product slippage table (#259), rendered directly under the fee line.
+
+    Every number here is an ASSUMPTION scaled from a liquidity statistic, and the note says so
+    with its parameters -- floor, cap, anchor -- so a reader can recompute any row. Fallback
+    rows (no statistic cached) and capped rows are flagged inline: a rate whose provenance is
+    silent is exactly the "number whose assumptions cannot be recovered" this project refuses
+    to treat as evidence.
+    """
+    lines = [
+        "Assumed slippage per leg -- an **assumption, not a measurement**, scaled from each "
+        "product's median daily quote volume as "
+        f"floor x sqrt(anchor / volume), clamped: floor {SLIPPAGE_FLOOR_PCT * 10000:.1f}bp, "
+        f"cap {SLIPPAGE_CAP_PCT * 10000:.1f}bp, anchor "
+        f"${SLIPPAGE_REFERENCE_QUOTE_VOLUME:,.0f}/day. Applies to this edge table; the dollar "
+        "account pass and the DCA benchmarks still price fills at the flat "
+        f"{SLIPPAGE_FLOOR_PCT * 10000:.1f}bp per leg.",
+        "",
+    ]
+    if not slippage_rows:
+        lines.append("_No per-product slippage assumptions recorded for this run._")
+        return lines
+    lines.extend(
+        [
+            "| Product | Median daily quote volume | Assumed slippage (per leg) |",
+            "|---|---|---|",
+        ]
+    )
+    for row in slippage_rows:
+        if row.fallback:
+            volume_cell = "(none cached)"
+            rate_cell = f"{row.slippage_pct * 10000:.1f}bp (fallback: no liquidity statistic)"
+        else:
+            volume_cell = f"{row.median_daily_quote_volume:,.0f}"
+            rate_cell = f"{row.slippage_pct * 10000:.1f}bp"
+            if row.capped:
+                rate_cell += " (capped)"
+        lines.append(f"| {row.product_id} | {volume_cell} | {rate_cell} |")
+    return lines
+
+
 def _render_edge_section(
-    edge: dict[str, BacktestResult], fee_pct: Decimal | None = None
+    edge: dict[str, BacktestResult],
+    fee_pct: Decimal | None = None,
+    slippage_rows: list[SlippageAssumption] | None = None,
 ) -> list[str]:
-    """The edge table, with the fee its numbers were priced at stated above it.
+    """The edge table, with the fee (and, since #259, the per-product slippage) its numbers
+    were priced at stated above it.
 
     The fee line is not optional furniture. A profit factor is a claim about NET edge, and for a
     strategy whose per-trade move is the same order as its costs, the fee is the dominant term --
@@ -610,20 +673,37 @@ def _render_edge_section(
     never printed beside them. `fee_pct=None` renders "not recorded" rather than omitting the
     line, so a caller that forgets to pass it produces a visible gap instead of a clean-looking
     table.
+
+    `slippage_rows` (#259) follows the same rule for the other half of the cost model: when a
+    run priced fills per product (via `edge_table`'s `slippage_by_product`), the assumed rate
+    each product paid is rendered beside the numbers it produced. `None` (the default) keeps
+    the pre-#259 line -- "plus slippage" at the flat rate -- so callers that have not adopted
+    per-product slippage render exactly what they always did.
     """
-    fee_note = (
-        f"Fills priced at **{fee_pct * 100:.4f}%** per leg (taker) plus slippage."
-        if fee_pct is not None
-        else "**Fee rate not recorded for this run** -- these figures cannot be compared "
-        "against runs priced differently."
-    )
+    if slippage_rows is None:
+        fee_note = (
+            f"Fills priced at **{fee_pct * 100:.4f}%** per leg (taker) plus slippage."
+            if fee_pct is not None
+            else "**Fee rate not recorded for this run** -- these figures cannot be compared "
+            "against runs priced differently."
+        )
+        cost_lines = [fee_note]
+    else:
+        fee_note = (
+            f"Fills priced at **{fee_pct * 100:.4f}%** per leg (taker) plus per-product "
+            "slippage (below)."
+            if fee_pct is not None
+            else "**Fee rate not recorded for this run** -- these figures cannot be compared "
+            "against runs priced differently."
+        )
+        cost_lines = [fee_note, "", *_render_slippage_rows(slippage_rows)]
     lines = [
         "## Edge table",
         "",
         "Per-rule and pooled backtest stats (unit-less R-multiples). "
         f"`{POOLED_KEY}` is the pooled sample G2 is checked against.",
         "",
-        fee_note,
+        *cost_lines,
         "",
         "| Rule | N | Win% | Expectancy | Avg win | Avg loss | Profit factor | Max DD | "
         "Losing streak | Avg MFE | Avg MAE |",
@@ -644,7 +724,7 @@ def _render_edge_section(
     return lines
 
 
-def _render_account_section(account_metrics: dict) -> list[str]:
+def _render_account_section(account_metrics: dict, slippage_rows=None) -> list[str]:
     lines = ["## Account results", "", "| Metric | Value |", "|---|---|"]
     for key, label in _ACCOUNT_METRIC_LABELS:
         if key not in account_metrics:
@@ -656,10 +736,21 @@ def _render_account_section(account_metrics: dict) -> list[str]:
         lines.append("")
         lines.append("Per-asset P&L:")
         lines.extend(f"- {asset}: {pnl}" for asset, pnl in sorted(per_asset.items()))
+    # #259: the edge table above priced fills PER PRODUCT; these dollar figures did not. The
+    # note lives HERE -- where a reader compares a thin asset's edge PF against its dollar
+    # P&L -- not only beside the edge table where it was easy to miss.
+    if slippage_rows:
+        lines.append("")
+        lines.append(
+            "_Dollar figures in this section are priced at the flat fallback slippage per "
+            "leg, NOT the per-product rates in the edge table above (#259)._"
+        )
     return lines
 
 
-def _render_benchmark_section(account_metrics: dict, benchmark: BenchmarkResult) -> list[str]:
+def _render_benchmark_section(
+    account_metrics: dict, benchmark: BenchmarkResult, slippage_rows=None
+) -> list[str]:
     lines = [
         "## Benchmark comparison",
         "",
@@ -690,6 +781,14 @@ def _render_benchmark_section(account_metrics: dict, benchmark: BenchmarkResult)
     lines.extend(
         f"| {label} | {engine_val} | {bench_val} |" for label, engine_val, bench_val in rows
     )
+    # #259: same asymmetry note as the account section -- engine edge results were priced
+    # per product, the engine's DOLLAR figures and this benchmark were not.
+    if slippage_rows:
+        lines.append("")
+        lines.append(
+            "_Engine and benchmark dollar figures are priced at the flat fallback slippage "
+            "per leg, NOT the per-product rates in the edge table (#259)._"
+        )
     return lines
 
 
@@ -835,6 +934,7 @@ def render_markdown(
     pbo_result: PBOResult | None = None,
     pbo_gate: tuple[bool, list[str]] | None = None,
     fee_pct: Decimal | None = None,
+    slippage_rows: list[SlippageAssumption] | None = None,
 ) -> str:
     """Render the full report (spec §6 structure, plus Issue #86's tier/fee matrix) as one
     Markdown string.
@@ -847,13 +947,15 @@ def render_markdown(
     "not computed" placeholder) so every existing caller of this function keeps working
     unchanged. `pbo_result`/`pbo_gate` (KB §78) follow the same backward-compatible pattern:
     the overfitting section is emitted only when a PBO run was actually performed.
+    `slippage_rows` (#259) follows it too: the per-product assumed-slippage table is rendered
+    beside the edge table's fee line only when the caller priced fills per product and says so.
     """
     sections = [
         _render_verdict_section(verdict, in_sample),
         _render_coverage_section(sim),
-        _render_edge_section(edge, fee_pct),
-        _render_account_section(account_metrics),
-        _render_benchmark_section(account_metrics, benchmark),
+        _render_edge_section(edge, fee_pct, slippage_rows),
+        _render_account_section(account_metrics, slippage_rows),
+        _render_benchmark_section(account_metrics, benchmark, slippage_rows),
         _render_tier_section(tier_results or []),
         _render_gaps_section(gaps),
         _render_caveats_section(),
