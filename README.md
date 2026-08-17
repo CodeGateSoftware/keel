@@ -1,5 +1,7 @@
 # keel
 
+**English** | [العربية](README.ar.md)
+
 **keel is an auditable Shariah-compliance engine for spot crypto trading** — deterministic
 safety rails, attested asset screening that fails closed, and §65.4 *qabd* (constructive
 possession) encoded as an executable check — with a reference auto-trading agent built on top
