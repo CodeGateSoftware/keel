@@ -61,9 +61,11 @@ KB §33.1. No pre-live action; noted here so the account-level obligation set is
 fresh, and "fresh" means a **7-day TTL** (`WITHDRAWAL_ATTESTATION_TTL_SEC`,
 `keel/execution/executor.py`). An expired attestation reads as UNKNOWN, and rail 17 fails closed on
 unknown — live DCA buys are vetoed. That is not hypothetical: on **2026-08-14** it vetoed the only
-live DCA signal because the attestation had lapsed, and both deployments' attestations were weeks
-stale as of 2026-08-17, so rail 17 was halting entries everywhere. Each deployment carries its own
-attestation (they do not share a database), so both must be refreshed.
+live DCA signal because the attestation had lapsed, and as of 2026-08-17 every deployment's
+attestation was weeks stale, so rail 17 was halting entries on the **live** deployment (it is a
+`LIVE_STATE` rail, skipped in paper, where a stale attestation matters only to the status display).
+Each deployment carries its own attestation (they do not share a database), so the live one must be
+refreshed for the rail and the paper ones to quiet their status lines.
 
 Rail 17 fails closed by itself — what it cannot do is refresh its own input, and that input is
 deliberately human (see the warning below). This entry is the cadence obligation the rail cannot

@@ -290,13 +290,15 @@ def _equity_lines(report: StatusReport) -> list[ScreenLine]:
     lines.append(ScreenLine(rail11_text, _rail11_style(report.rail11_status)))
     # `render_human`'s exact rail-17 text, so the TUI and `keel status` can never disagree
     # about whether entries are halted. Every state but `attested` fails rail 17 closed --
-    # a halt -- so each is an alert, not a warn.
+    # a halt -- so each is an alert; EXCEPT in paper mode, where the rail is not evaluated
+    # and a stale attestation halts nothing (a permanently-red alert there is fatigue, not
+    # information), so the same states downgrade to warn.
     rail17 = report.withdrawal_attestation
-    lines.append(
-        ScreenLine(
-            _rail17_line(rail17), "ok" if rail17.state == "attested" else "alert"
-        )
-    )
+    rail17_evaluated = report.mode != "paper"
+    style = "ok"
+    if rail17.state != "attested":
+        style = "alert" if rail17_evaluated else "warn"
+    lines.append(ScreenLine(_rail17_line(rail17, rail17_evaluated), style))
     if report.mode == "paper":
         lines.append(ScreenLine(f"paper_cash_usdc: {report.paper_cash_usdc}", "normal"))
     return lines

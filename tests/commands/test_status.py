@@ -341,10 +341,15 @@ def test_rail17_attested_fresh_shows_time_remaining(repo: Repository) -> None:
 
 def test_rail17_expired_names_the_halt_and_the_fix(repo: Repository) -> None:
     """19 days since attestation against the 7-day TTL -> expired 12 days ago, with the command
-    that releases it -- the 2026-08-14 event, visible in status instead of in a veto log."""
-    _attest(repo, enabled=True, age_sec=19 * 86400)
+    that releases it -- the 2026-08-14 event, visible in status instead of in a veto log.
 
-    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    The halt wording is the LIVE-mode rendering: rail 17 is a LIVE_STATE rail, so the line is
+    asserted under a non-paper mode, and the paper variant (which cannot claim a halt the rail
+    will not run) is pinned by its own test below."""
+    _attest(repo, enabled=True, age_sec=19 * 86400)
+    live = _config(auto_trade=AutoTradeConfig(mode="confirm"))
+
+    report = gather_status(repo, live, now_ts=NOW_TS)
 
     w = report.withdrawal_attestation
     assert w.state == "expired"
@@ -355,10 +360,28 @@ def test_rail17_expired_names_the_halt_and_the_fix(repo: Repository) -> None:
     )
 
 
+def test_rail17_expired_in_paper_names_the_state_not_a_halt(repo: Repository) -> None:
+    """Paper mode never evaluates rail 17 (`LIVE_STATE_RAILS`), so claiming "entries halted"
+    there would be a permanently-red alert for a halt that cannot occur -- alert fatigue,
+    the exact failure #340 exists to fix. The paper rendering names the state and says the
+    rail is not evaluated, keeping only the re-attest nudge."""
+    _attest(repo, enabled=True, age_sec=19 * 86400)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)  # _config() defaults to paper
+
+    assert (
+        "rail 17 (withdrawal capability): EXPIRED 12d ago "
+        "(rail 17 not evaluated in paper); "
+        "re-attest with keel withdrawals attest" in render_human(report)
+    )
+
+
 def test_rail17_never_attested_is_said_as_such(repo: Repository) -> None:
     """A fresh DB has no attestation at all -- rail 17 fails closed on that too, so status
     must not render the silence as health."""
-    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    report = gather_status(
+        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
+    )
 
     w = report.withdrawal_attestation
     assert w.state == "unattested"
@@ -374,7 +397,9 @@ def test_rail17_suspended_attestation_still_names_the_halt(repo: Repository) -> 
     line must say which, because the release is the same command with `--enabled`."""
     _attest(repo, enabled=False, age_sec=3600)
 
-    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    report = gather_status(
+        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
+    )
 
     w = report.withdrawal_attestation
     assert w.state == "suspended"
