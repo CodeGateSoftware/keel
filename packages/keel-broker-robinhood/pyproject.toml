@@ -14,7 +14,7 @@ dependencies = ["keel-core==0.7.1", "keel-broker-api==0.7.1", "pynacl>=1.5.0", "
 robinhood = "keel_broker_robinhood:RobinhoodAdapter"
 
 [build-system]
-requires = ["uv_build>=0.10.4,<0.11.0"]
+requires = ["uv_build>=0.10.4,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
