@@ -297,6 +297,9 @@ def test_a_hole_straddling_start_ts_is_invisible_to_the_bounded_count(repo):
         repo, "BTC-USD", Granularity.ONE_DAY, start_ts=boundary
     )
     assert bounded == 0
+    # The docstring's closing claim, asserted for THIS fixture: the whole-series default
+    # still sees all three bars, so `--fail-on-gaps` keeps its un-narrowed scope.
+    assert repair_mod.unexplained_gap_count(repo, "BTC-USD", Granularity.ONE_DAY) == 3
 
 
 def test_a_shifted_window_is_treated_as_new_and_re_probed(repo):
