@@ -21,6 +21,14 @@ one who is told upfront can read it as rigour.
 > following different schools get different answers from the same code, by design. See
 > `CONTRIBUTING.md` for what that means for pull requests.
 
+**No scholarly review of keel's fiqh basis has occurred.** The basis is one operator's
+sourced reading — published as [`docs/fiqh-basis.md`](docs/fiqh-basis.md) precisely so it
+can be audited and challenged — and each operator is responsible for their own
+attestations. What a scholarly review would cover, and what it would and would not
+signify, is defined in [that document's review-status
+section](docs/fiqh-basis.md#scholarly-review-status); unless someone walks that path, the
+status is: not reviewed.
+
 keel is a personal tool, not financial advice and not religious (Shariah) advice — see the
 disclaimers below.
 
