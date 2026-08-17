@@ -61,6 +61,10 @@ keel-broker-robinhood = { workspace = true }
 dev = [
     "mypy>=1.18.0",
     "pytest>=9.1.1",
+    # tests/test_security_scans.py parses .github/dependabot.yml directly, so the test
+    # suite imports pyyaml itself rather than riding keel-core's transitive copy (the
+    # rule the [project] comment above states for `keel/`, applied where it now applies).
+    "pyyaml>=6.0.2",
     # Only `code-quality.yml` needs this: SonarQube reports coverage as a first-class metric and
     # has nothing to show without a coverage XML to import. It is deliberately NOT wired into the
     # default `pytest` invocation -- `ci.yml` and `release.yml` still run a plain `pytest -q`,

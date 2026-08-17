@@ -1,60 +1,42 @@
 """The code-quality scans, configured for real and without secrets that don't exist (#291).
 
-The pre-launch gate (#291) names a gap that has been true since the repo opened: the CI
-story is lint + types + tests, and nothing else -- `SONAR_TOKEN` and `SNYK_TOKEN` were
-wishlist names for secrets nobody ever created, so keel has never had static analysis or
-dependency scanning. For a public financial tool that is a bad first impression waiting to
-happen, and the fix is not to go buy tokens: a public repository can run both classes of
-scan on what GitHub gives it for free. Dependabot watches the manifests; a weekly
-`pip-audit` over the exact locked set the app ships with catches vulnerable versions
-pinned in `uv.lock`; CodeQL (Python) reads the source the same way the `test` context
-reads the tests.
+The pre-launch gate (#291) names a gap that had been true since the repo opened: the CI
+story was lint + types + tests, and nothing else -- `SONAR_TOKEN` and `SNYK_TOKEN` were
+wishlist names for secrets nobody ever created, so no scan that needs them has ever run.
+The fix is not to buy tokens: a public repository can run both classes of scan on what
+GitHub gives it for free. `security.yml` is the tokenless BASELINE -- Dependabot watches
+the manifests, a weekly `pip-audit` reads the exact locked set the app ships with, and
+CodeQL (Python) reads the source -- and `code-quality.yml` stays the OPTIONAL enhanced
+tier (SonarQube + Snyk) for if those tokens are ever created.
 
-This file pins that the configuration exists and says what it must: every manifest
-directory Dependabot needs (the workspace root plus each `packages/*` distribution --
-a manifest it does not watch is a dependency that updates silently), the actions ecosystem
-so the workflows themselves stay current, the audit actually reading the lock's export,
-CodeQL on Python, and -- the honest part -- NO scan step depending on a secret: the scans
-must keep running for a contributor who has none of the tokens the old wishlist named.
+This file pins that split. The manifest lists are DERIVED FROM THE FILESYSTEM (a seventh
+distribution under packages/ that Dependabot and the export do not know about fails here,
+rather than passing because a hand-maintained list was never told), the audit is pinned to
+`uv export --frozen` (the lock as committed, never a fresh resolve), and the secrets rule
+is the honest one: the always-on scan workflows reference no secrets at all, and the
+optional tier may reference `SONAR_TOKEN`/`SNYK_TOKEN` ONLY from jobs a preflight guards
+-- so a missing token can never redden a scheduled run, only skip it with an explanation.
 """
 
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
+_WORKFLOWS = _ROOT / ".github" / "workflows"
 
-#: The six Python manifest directories of the workspace: the root distribution plus the
-#: five packages/* distributions. Dependabot needs each named; a manifest not named here
-#: is a distribution whose dependencies update without review.
-_MANIFEST_DIRS = (
-    "/",
-    "/packages/keel-core",
-    "/packages/keel-broker-api",
-    "/packages/keel-broker-coinbase",
-    "/packages/keel-broker-fake",
-    "/packages/keel-broker-robinhood",
-)
+#: The optional enhanced tier: the one workflow allowed to reference the two tokens that
+#: have never existed, and only behind its preflight guard.
+_OPTIONAL_TIER = "code-quality.yml"
 
-#: The distributions excluded when exporting the lock for audit -- excluded because they
-#: are this repo's own code (not on PyPI, not auditable there), and pinned so the audit
-#: cannot quietly start including or dropping one.
-_OWN_DISTRIBUTIONS = (
-    "keel-trader",
-    "keel-core",
-    "keel-broker-api",
-    "keel-broker-coinbase",
-    "keel-broker-fake",
-    "keel-broker-robinhood",
-)
-
-#: Secrets the scans must NOT depend on. They have never existed in this repository; a
-#: scan step that references them is a scan step that fails for everyone but whoever was
-#: supposed to create the token -- which is the gap #291 exists to close, restated as YAML.
-_FORBIDDEN_SECRETS = ("SONAR_TOKEN", "SNYK_TOKEN")
+#: Secrets the baseline must NOT reference. They have never existed in this repository;
+#: a baseline scan step that needs them is a scan that has never run -- the exact gap
+#: #291 exists to close.
+_FORBIDDEN_IN_BASELINE = ("SONAR_TOKEN", "SNYK_TOKEN")
 
 
 def _read(relative: str) -> str:
@@ -63,13 +45,26 @@ def _read(relative: str) -> str:
     return path.read_text() if path.is_file() else ""
 
 
-def test_dependabot_watches_every_python_manifest_and_the_actions():
-    """Six pip manifests and the workflows -- nothing updates silently.
+def _pyprojects() -> dict[str, dict]:
+    """The workspace's manifests, keyed by directory -- the shape Dependabot must watch.
 
-    The workspace is six distributions, and Dependabot's `pip` ecosystem works per
-    manifest directory: an unlisted directory gets no update PRs, ever. The
-    `github-actions` entry keeps the workflow actions themselves (checkout, uv, CodeQL)
-    from aging into the exact advisory-visibility problem this file exists for.
+    Mirrors tests/test_packaging.py's discovery: the root pyproject.toml plus every
+    packages/*/pyproject.toml. A distribution the dict does not contain is a distribution
+    this file cannot speak about, which is why the derivation (not a list) matters.
+    """
+    manifests = {"/": tomllib.loads((_ROOT / "pyproject.toml").read_text())}
+    for path in sorted((_ROOT / "packages").glob("*/pyproject.toml")):
+        manifests[f"/{path.parent.relative_to(_ROOT).as_posix()}"] = tomllib.loads(path.read_text())
+    return manifests
+
+
+def test_dependabot_watches_every_python_manifest_and_the_actions():
+    """Every manifest the filesystem declares -- nothing updates silently.
+
+    The workspace is six distributions today, and Dependabot's `pip` ecosystem works per
+    manifest directory: an unlisted directory gets no update PRs, ever. The expected set
+    is DERIVED from packages/*/pyproject.toml, so adding a seventh distribution without
+    telling Dependabot fails here instead of shipping a blind spot.
     """
     path = _ROOT / ".github" / "dependabot.yml"
     assert path.is_file(), (
@@ -79,11 +74,16 @@ def test_dependabot_watches_every_python_manifest_and_the_actions():
     assert config.get("version") == 2, "dependabot.yml must be the version-2 schema"
     entries = config.get("updates", [])
     pip_dirs = {e.get("directory") for e in entries if e.get("package-ecosystem") == "pip"}
-    for directory in _MANIFEST_DIRS:
+    manifests = _pyprojects()
+    for directory in manifests:
         assert directory in pip_dirs, (
             f"dependabot.yml must watch the manifest at {directory!r} -- a distribution "
             "Dependabot does not see is a distribution whose dependencies update silently"
         )
+    assert pip_dirs == set(manifests), (
+        f"dependabot.yml watches directories that no longer exist ({pip_dirs - set(manifests)}) "
+        "-- a stale entry is configuration lying about what it does"
+    )
     ecosystems = {e.get("package-ecosystem") for e in entries}
     assert "github-actions" in ecosystems, (
         "dependabot.yml must also watch github-actions -- the scan workflows' own actions "
@@ -94,8 +94,9 @@ def test_dependabot_watches_every_python_manifest_and_the_actions():
 def test_every_dependabot_entry_is_scheduled():
     """Watching is not enough; every entry must actually run on a schedule."""
     path = _ROOT / ".github" / "dependabot.yml"
-    if not path.is_file():
-        assert False, ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
+    assert path.is_file(), (
+        ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
+    )
     entries = yaml.safe_load(path.read_text()).get("updates", [])
     unscheduled = [e for e in entries if not e.get("schedule", {}).get("interval")]
     assert not unscheduled, (
@@ -105,28 +106,33 @@ def test_every_dependabot_entry_is_scheduled():
 
 
 def test_the_security_workflow_audits_the_locked_dependency_set():
-    """pip-audit reads the lock's export -- the set that ships, not what resolves today.
+    """pip-audit reads the lock's export, frozen -- the set that ships, not a resolve.
 
-    Auditing `uv export` output (not a bare `pip-audit` of the environment, not a fresh
-    resolve) is what makes the audit reproducible: the pinned versions in `uv.lock` are
-    the versions every deployment gets, so those are the versions that must be scanned.
-    The repo's own distributions are excluded because they are the code being shipped,
-    not third-party dependencies of it.
+    Auditing `uv export --frozen` output (not a bare environment audit, not a fresh
+    resolve) is what makes the audit honest about what deployments run: the pinned
+    versions in the committed `uv.lock` are the versions every deployment gets, so those
+    are the versions that must be scanned. The repo's own distributions -- derived, not
+    listed -- are excluded because they are the code being shipped, not dependencies of
+    it; dev dependencies are deliberately included (the job gates nothing, and a CVE in
+    the dev toolchain still runs on contributors' machines).
     """
     workflow = _read(".github/workflows/security.yml")
-    assert workflow, ".github/workflows/security.yml must exist -- the scans are configured in code"
-    assert "uv export" in workflow and "--all-extras" in workflow, (
-        "the audit must consume `uv export --all-extras` output -- the full locked set, "
-        "extras included, because a vulnerable optional dependency is still a dependency"
+    assert workflow, (
+        ".github/workflows/security.yml must exist -- the baseline scans are configured in code"
     )
-    for distribution in _OWN_DISTRIBUTIONS:
+    assert "uv export --frozen" in workflow and "--all-extras" in workflow, (
+        "the audit must consume a FROZEN `uv export --all-extras` -- the full locked set as "
+        "committed, extras included, never a fresh resolve in CI"
+    )
+    own = {data["project"]["name"] for data in _pyprojects().values()}
+    for distribution in sorted(own):
         assert f"--no-emit-package {distribution}" in workflow, (
             f"the export must exclude the repo's own {distribution} -- it is the code under "
             "scan, not a third-party dependency of it"
         )
     assert "pip-audit" in workflow, (
         "the workflow must run pip-audit against the exported lock -- this is the "
-        "dependency scanning #291 says has never existed here"
+        "dependency scanning #291 says has never actually run here"
     )
 
 
@@ -135,7 +141,7 @@ def test_the_security_workflow_runs_codeql_on_python():
     workflow = _read(".github/workflows/security.yml")
     assert "github/codeql-action/init" in workflow, (
         "the workflow must initialise CodeQL -- this is the static analysis #291 says has "
-        "never existed here"
+        "never actually run here"
     )
     assert "languages: python" in workflow, (
         "CodeQL must analyse Python -- the only language this repo ships"
@@ -153,34 +159,60 @@ def _code_lines(text: str) -> str:
     """The workflow with comments stripped -- a token NAMED in a comment explaining its
     absence is documentation; a token REFERENCED in code is a dependency on a secret.
 
-    Comments in these files are YAML `#` remarks (or the same inside a shell heredoc);
-    stripping them lets the forbidden-secret check scan what the runner executes.
+    The `#` remarks in these files are YAML comments; stripping them lets the
+    secret check scan what the runner executes. (No workflow here puts a meaningful `#`
+    inside an executed string; cron expressions and the folded export scalar do not.)
     """
     return "\n".join(re.split(r"(^|\s)#", line)[0] for line in text.split("\n"))
 
 
-def test_no_scan_step_depends_on_a_secret_that_does_not_exist():
-    """The scans run on what a public repo has -- no SONAR_TOKEN, no SNYK_TOKEN, none.
+def test_the_baseline_scans_reference_no_secrets_at_all():
+    """The always-on workflows run on GITHUB_TOKEN alone -- no wishlist tokens, none.
 
-    The wishlist names in #291 were never created; a scan step referencing them would be
-    a scan that works only for a hypothetical maintainer with hypothetical tokens. The
-    configuration is honest when its executable lines reference no secrets at all (the
-    workflows' comments may name the absent tokens, because that is where the decision
-    to run tokenless is documented).
+    The baseline is what makes the scans real: `security.yml` and `ci.yml` must reference
+    no secret whatsoever, or they would be scans that run only for a hypothetical
+    maintainer with hypothetical tokens -- the gap #291 exists to close, restated as YAML.
     """
-    for relative in (".github/workflows/security.yml", ".github/workflows/ci.yml"):
-        workflow = _read(relative)
-        assert workflow, f"{relative} must exist"
-        executable = _code_lines(workflow)
-        for secret in _FORBIDDEN_SECRETS:
-            assert secret not in executable, (
-                f"{relative} references {secret}, which does not exist in this repository -- "
-                "the scans must run tokenless or they do not run"
-            )
-        dangling = sorted(set(re.findall(r"secrets\.([A-Z_]+)", executable)))
-        assert not dangling, (
-            f"{relative} references secrets {dangling} -- the scan workflows must run on "
-            "GITHUB_TOKEN alone, or they fail for every contributor without them"
+    for path in sorted(_WORKFLOWS.glob("*.yml")):
+        if path.name == _OPTIONAL_TIER:
+            continue
+        executable = _code_lines(path.read_text())
+        referenced = sorted(set(re.findall(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", executable)))
+        assert not referenced or referenced == ["GITHUB_TOKEN"], (
+            f"{path.name} references secrets {referenced} -- a workflow that always runs "
+            "must run on GITHUB_TOKEN alone, or it fails for every contributor without "
+            "the missing tokens"
+        )
+
+
+def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard():
+    """code-quality.yml may name SONAR_TOKEN/SNYK_TOKEN -- but only guarded.
+
+    The optional tier's design constraint (its own header documents it): a job that needs
+    a token must declare `needs: preflight` and run under `if: needs.preflight.outputs.
+    configured == 'true'`, so a missing token SKIPS with an explanation instead of
+    reddening every scheduled run. This test pins the guard structurally, per job, so a
+    future edit cannot detach a token-referencing job from its preflight.
+    """
+    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    jobs = workflow.get("jobs", {})
+    assert "preflight" in jobs, (
+        f"{_OPTIONAL_TIER} must keep its preflight job -- it is what lets the optional "
+        "tier skip cleanly while the tokens do not exist"
+    )
+    guard = "needs.preflight.outputs.configured == 'true'"
+    for name, job in jobs.items():
+        serialized = str(job)
+        referenced = [s for s in _FORBIDDEN_IN_BASELINE if f"secrets.{s}" in serialized]
+        if not referenced or name == "preflight":
+            continue
+        assert "preflight" in (job.get("needs") or []), (
+            f"{_OPTIONAL_TIER}'s job {name!r} references {referenced} but does not declare "
+            "`needs: preflight` -- a token-referencing job must be guarded"
+        )
+        assert job.get("if") == guard, (
+            f"{_OPTIONAL_TIER}'s job {name!r} references {referenced} but is not gated on "
+            f"`{guard}` -- without the guard a missing token reddens every scheduled run"
         )
 
 
