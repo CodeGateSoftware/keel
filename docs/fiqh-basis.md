@@ -29,8 +29,8 @@ Two honesty rules the knowledge base holds, and this document inherits:
 - Where a source is silent on something, we say "not stated" — a gap is never papered over
   with a paraphrase that sounds like a ruling.
 - Where schools and councils disagree, the disagreement is named, with both sides — never
-  flattened into "scholars say". §71.7's opinion map is the worked example: prohibitions,
-  permissions, and the conditions each attaches, all recorded.
+  flattened into "scholars say". §71.7/§71.8's opinion map is the worked example:
+  prohibitions, permissions, and the conditions each attaches, all recorded.
 
 ## What is attested versus what is computed
 
@@ -77,10 +77,12 @@ not per-trade". The attested axes:
   `keel assets attest-instrument`. Unattested fails closed.
 
 The computed axes — history depth, liquidity, settlement quotability — are market facts
-about our own cache, recomputed freely, and the only ones a documented exception
-(`keel assets exempt`) may ever waive. The Shariah criteria can never be waived: nothing in
-the screen consults a waiver for them (`WAIVABLE_CRITERIA` is `{"history"}` and the code
-says why: expanding it is a deliberate future decision, not a default).
+about our own cache, recomputed freely. Of everything the screen checks, a documented
+exception (`keel assets exempt`) may waive only ONE criterion today: `history`
+(`WAIVABLE_CRITERIA` is `frozenset({"history"})`). Liquidity, settlement, and the spot
+instrument shape can NEVER be waived, and neither can any Shariah criterion — nothing in
+the screen consults a waiver for them, and the CLI's `--criterion` choice is restricted to
+that set. Expanding it is a deliberate future decision, not a default.
 
 ### Rail 1 — allowlist enforcement (`keel/execution/guards.py`)
 
@@ -99,8 +101,9 @@ asset we may not validly POSSESS — so acquiring more of it is the thing to sto
 
 The operative test is tri-sourced: "Three sources now converge on the identical operative
 test: possession is the ability to dispose, not physical custody (§65.4 Ayub · §67.1 OIC
-53/4-6 · §71.5 AAOIFI SS 18 3/5 via SRB)" — §71.5's own summary; §67.1 is the OIC Fiqh
-Academy resolution holding electronic constructive possession sufficient.
+53/4-6 · §71.5 AAOIFI SS 18 3/5 via SRB)" — §71.5's own summary; §67.1 is Al-Jarhi,
+Abuzaid & Oweida's *Handbook of Islamic Finance* (2022) quoting the OIC Fiqh Academy
+resolution (Res. 53/4-6) that holds electronic constructive possession sufficient.
 
 Mechanics: the operator attests with `keel withdrawals attest`; the attestation is live-read
 on every intent and expires after 7 days (`WITHDRAWAL_ATTESTATION_TTL_SEC`,
@@ -149,7 +152,7 @@ religious claim:
 | 10 | sells must cite a defined rule | audit discipline |
 | 11, 16 | drawdown and consecutive-loss breakers | risk discipline |
 | 12 | stale-feed + kill-switch, fails closed | operational safety |
-| 13, 14 | spend only settled USDC; monthly allowance cap | operational safety |
+| 13, 14 | spend only the settled quote currency; monthly allowance cap | operational safety |
 
 Rail 7 carries a correction this repository records prominently: §65.6 holds that
 "speculation per se, which means sale/purchase keeping in mind possible change in prices in
@@ -177,9 +180,10 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
 
 - **ATOM dilution.** Cosmos Hub's own documentation (docs.cosmos.network) says: "Delegate
   your ATOM to one or more of the validators on the Cosmos Hub blockchain to earn more ATOM
-  through Proof-of-Stake"; stakingrewards.com/asset/cosmos says: "ATOM has no supply cap. The
-  inflation rate is dynamic and adjusts algorithmically based on the staking ratio" (~12.66%
-  inflation, ~19.49% staking APY at the time of examination). Inflation is uncapped and
+  through Proof-of-Stake"; and, per stakingrewards.com/asset/cosmos as examined at the
+  time, ATOM has no supply cap, and its dynamic inflation rate adjusts algorithmically to
+  target the staking ratio (~12.66% inflation, ~19.49% staking APY as of 2026-08-14, the
+  date of examination). Inflation is uncapped and
   dynamic, and newly minted ATOM accrues only to bonded delegators — so a bare holder is
   structurally diluted, at an algorithmically maintained rate: value transfers from
   non-stakers to stakers, and the transfer does not fade. `pays_yield=NO` remains correct on
@@ -188,8 +192,21 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
 - **Staking generally (§65.14).** Contested, not settled: the honest position is "the
   question is genuinely contested, we have no scholarly determination in hand, our mandate has
   no need of it, and §29.2 directs us to the conservative branch where scholars diverge."
-  keel excludes staked positions on §29.2 conservatism, not on a ruling it holds — stop
-  implying staking is settled riba.
+  keel stakes nothing — no module in this repository can stake, so no code excludes staked
+  positions — which is why the §29.2 conservatism belongs to the premise question below,
+  not to an exclusion keel performs. Stop implying staking is settled riba.
+- **The foundational premise itself (§71.1/§29.2).** Every ruling above presupposes that
+  crypto is Shariah-recognised tradable property, and on that the highest available
+  authority has declined to rule. IIFA Resolution 237 (§71.1) convened a dedicated symposium
+  on electronic currencies, debated the matter at its 24th session (Nov 2019), and ISSUED
+  NO RULING — it identified as unresolved exactly this question ("Is cryptocurrency
+  considered by Shariah a real-valued property and a tradable item?"), noted the
+  significant risks and the instability of their transactions, and referred the matter back
+  for further research. A withheld ruling is not a prohibition; it is also not a
+  permission. keel's premise that BTC/ETH-class assets are tradable property is a
+  well-supported INTERPRETIVE POSITION held on §29.2's conservative branch, not a settled
+  ruling — and keel does not get to cite the same Academy's Res. 53/4-6 as authoritative
+  on `qabd` (§67.1) while treating it as silent here.
 - **DOGE (§86.4).** "A token that has no genuine use or benefit and survives only because
   people hope to sell it to someone else at a higher price may FAIL to qualify as *Māl*" —
   and the source's own lean is "Strong lean: EXCLUDE DOGE." DOGE also has no supply cap.
@@ -209,7 +226,8 @@ The route the architecture already provides — record your own ruling locally:
   then follows your ruling, upstream stays neutral, and the audit trail records exactly who
   said what.
 - **Document exceptions where the screen allows them.** `keel assets exempt` may waive only
-  market-fact criteria (history, liquidity) — never a Shariah criterion.
+  one criterion today — `history`: never a Shariah criterion, and never liquidity,
+  settlement, or the spot instrument shape.
 - **To change a classification for everyone**, that is a PR of a different kind:
   `CONTRIBUTING.md` requires a cited source and discussion before merge — a classification
   with no source behind it is not mergeable, however confident the author.
@@ -219,7 +237,8 @@ The route the architecture already provides — record your own ruling locally:
 - `docs/superpowers/references/trading-knowledge-base/sources/source-65.md` — Muhammad Ayub,
   *Understanding Islamic Finance* (Wiley 2007): the foundation source (§65.4 `qabd`, §65.5
   backing, §65.6 speculation, §65.9 purification, §65.14 staking).
-- `docs/superpowers/references/trading-knowledge-base/sources/source-67.md` — OIC Fiqh
+- `docs/superpowers/references/trading-knowledge-base/sources/source-67.md` — Al-Jarhi,
+  Abuzaid & Oweida, *Handbook of Islamic Finance* (ASBÜ Yayınları, 2022), quoting OIC Fiqh
   Academy Res. 53/4-6 on electronic constructive possession (§67.1), gold/`sarf` (§67.2).
 - `docs/superpowers/references/trading-knowledge-base/sources/source-71.md` — IIFA Res. 237,
   SRB (AAOIFI SS 18 3/5), SC Malaysia's `ribawi` classifier (§71.4a), digital `qabd` (§71.5).

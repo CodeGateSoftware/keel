@@ -58,6 +58,21 @@ _BARE_HOLDER = "Bare holding earns nothing, which is exactly what the field asse
 #: Two-sided, so the document cannot soften the correction the KB is blunt about.
 _PRUDENTIAL_CORRECTION = "keeps its trading justification and LOSES its shariah claim"
 
+#: The exact waiver set the doc may claim, two-sided with `screen.py`'s definition: only
+#: `history` is waivable today, and the doc must neither widen the hatch nor miss a change
+#: to it. `keel assets exempt`'s `--criterion` Choice is built from this very set.
+_HISTORY_ONLY_WAIVABLE = 'frozenset({"history"})'
+
+#: Source-67's true author, in the source file's own title: the Handbook QUOTES OIC Fiqh
+#: Academy Res. 53/4-6, it is not the resolution itself. Two-sided, so the doc cannot
+#: promote a second-hand quotation into a primary resolution again.
+_SOURCE_67_OWNER = "Handbook of Islamic Finance"
+
+#: §71.1's finding, in the KB's own capital-letter formulation. The premise caveat's
+#: load-bearing phrase: IIFA Res. 237 issued no ruling on whether crypto is tradable
+#: property, which makes keel's premise an interpretive position under §29.2, not settled.
+_ISSUED_NO_RULING = "ISSUED NO RULING"
+
 
 def _doc() -> str:
     """The document's text; empty until it exists, so a red run FAILS rather than errors."""
@@ -151,8 +166,8 @@ def test_the_fails_closed_posture_is_pinned_two_sided():
         f"{_UNKNOWN_IS_A_REJECTION!r}"
     )
     assert _UNKNOWN_IS_A_REJECTION in _rel("keel/compliance/screen.py"), (
-        "keel/compliance/screen.py must still carry 'unknown is a rejection' -- the doc quotes "
-        "it, so the two must move together"
+        "keel/compliance/screen.py must still carry 'unknown is a rejection' -- the doc "
+        "quotes it, so the two must move together"
     )
 
 
@@ -171,14 +186,15 @@ def test_the_riba_failure_wording_is_pinned_two_sided():
 
 
 def test_the_bare_holder_semantics_are_pinned_to_the_experiment_record():
-    """'Bare holding earns nothing' is evidence, not vibes -- the record that fetched it is cited.
+    """'Bare holding earns nothing' is evidence, not vibes -- the fetching record is cited.
 
     `pays_yield` asserts what holding WITHOUT staking earns; that semantics was established by
     fetching the staking docs (2026-08-07). The doc must quote the finding and the record must
     still show it.
     """
     assert _BARE_HOLDER in _unwrapped(_doc()), (
-        f"{_DOC} must state the bare-holder semantics in the record's own words: {_BARE_HOLDER!r}"
+        f"{_DOC} must state the bare-holder semantics in the record's own words: "
+        f"{_BARE_HOLDER!r}"
     )
     record = "docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md"
     assert _BARE_HOLDER in _rel(record), (
@@ -197,13 +213,13 @@ def test_rail_17s_seven_day_ttl_is_pinned_to_the_executor():
         "number is traceable to the constant that enforces it"
     )
     assert "WITHDRAWAL_ATTESTATION_TTL_SEC" in _rel("keel/execution/executor.py"), (
-        "keel/execution/executor.py must still define WITHDRAWAL_ATTESTATION_TTL_SEC -- the doc "
-        "cites it, so a rename must fail here rather than orphan the citation"
+        "keel/execution/executor.py must still define WITHDRAWAL_ATTESTATION_TTL_SEC -- "
+        "the doc cites it, so a rename must fail here rather than orphan the citation"
     )
 
 
 def test_the_prudential_rails_are_separated_from_the_fiqh_rails_with_the_65_6_correction():
-    """The doc must not let safety rails borrow religious authority -- and must say §65.6 said so.
+    """Safety rails must not borrow religious authority -- and §65.6 must be quoted saying so.
 
     Only rail 17 (and the screen behind rail 1) encode fiqh; the rest are prudential. §65.6
     stripped the anti-scalping rail of a shariah claim it never had, and the KB's wording is
@@ -224,6 +240,24 @@ def test_the_prudential_rails_are_separated_from_the_fiqh_rails_with_the_65_6_co
     )
 
 
+def test_the_waivable_criteria_claim_is_pinned_two_sided():
+    """The doc says only `history` may be waived, and `screen.py` must still mean it.
+
+    `keel assets exempt` is the one escape hatch in the curation screen. The doc's account of
+    what it can waive must match the set the code enforces, in both directions: a doc that
+    widens the hatch claims an authority the code does not have, and a code change the doc
+    misses describes a hatch that no longer exists.
+    """
+    assert _HISTORY_ONLY_WAIVABLE in _unwrapped(_doc()), (
+        f"{_DOC} must state the waiver set exactly ({_HISTORY_ONLY_WAIVABLE!r}): only "
+        "`history` is waivable today -- never a Shariah criterion, settlement, or liquidity"
+    )
+    assert _HISTORY_ONLY_WAIVABLE in _rel("keel/compliance/screen.py"), (
+        "keel/compliance/screen.py must still define WAIVABLE_CRITERIA as "
+        f"{_HISTORY_ONLY_WAIVABLE!r} -- if the set grows, the doc must be updated to match"
+    )
+
+
 def test_the_atom_dilution_open_question_is_stated_not_hidden():
     """The hardest open question stays in the doc, phrased on the screen's own axis.
 
@@ -231,30 +265,32 @@ def test_the_atom_dilution_open_question_is_stated_not_hidden():
     structurally diluted -- yet `pays_yield=NO` remains correct on the axis the field asserts.
     The doc must hold both halves at once and say plainly that this repo has no settled answer.
     """
-    open_questions = _doc().split("## How to disagree")[0]
-    assert "ATOM" in open_questions, (
+    known = _doc().split("## Known open questions", 1)[1]
+    known_open_questions = known.split("## How to disagree", 1)[0]
+    assert "ATOM" in known_open_questions, (
         f"{_DOC} must state the ATOM dilution question among the open questions"
     )
-    assert "structurally diluted" in _unwrapped(open_questions), (
-        f"{_DOC} must say a bare ATOM holder is structurally diluted -- the mechanism, not just "
-        "the worry"
+    assert "structurally diluted" in _unwrapped(known_open_questions), (
+        f"{_DOC} must say a bare ATOM holder is structurally diluted -- the mechanism, not "
+        "just the worry"
     )
-    assert "pays_yield" in open_questions, (
+    assert "pays_yield" in known_open_questions, (
         f"{_DOC} must name the pays_yield axis alongside the dilution question, so the screen "
         "field and the open question cannot be conflated"
     )
-    assert "no settled answer" in _unwrapped(open_questions).lower(), (
+    assert "no settled answer" in _unwrapped(known_open_questions).lower(), (
         f"{_DOC} must say plainly that the ATOM question has no settled answer in this repo"
     )
 
 
 def test_every_kb_citation_resolves_to_a_source_file_in_the_repo():
-    """Every §N.x the doc cites must be a real in-repo file -- citations are checkable or worthless.
+    """Every §N.x the doc cites must be a real in-repo file -- citations are checkable
+    or they are worthless.
 
     The KB's convention is that §N.x means sources/source-NN.md; a citation of a source that
     does not exist (there is no source-53 or source-77) is a dead reference wearing the costume
-    of scholarship. The load-bearing trio -- §65 (Ayub), §67 (OIC), §71 (AAOIFI/IIFA) -- must
-    all appear, because rail 17's tri-sourcing stands on them.
+    of scholarship. The load-bearing trio -- §65 (Ayub), §67 (the Handbook quoting the OIC),
+    §71 (AAOIFI/IIFA) -- must all appear, because rail 17's tri-sourcing stands on them.
     """
     text = _doc()
     cited = {int(match) for match in re.findall(r"§(\d+)", text)}
@@ -266,9 +302,48 @@ def test_every_kb_citation_resolves_to_a_source_file_in_the_repo():
     sources_dir = _ROOT / "docs/superpowers/references/trading-knowledge-base/sources"
     for source in sorted(cited):
         assert (sources_dir / f"source-{source:02d}.md").is_file(), (
-            f"{_DOC} cites §{source} but sources/source-{source:02d}.md does not exist -- every "
-            "citation must resolve to a real in-repo source file"
+            f"{_DOC} cites §{source} but sources/source-{source:02d}.md does not exist -- "
+            "every citation must resolve to a real in-repo source file"
         )
+
+
+def test_the_foundational_premise_non_ruling_is_pinned_two_sided():
+    """The premise caveat names IIFA's withheld ruling, and source-71.md must still carry it.
+
+    Everything the doc encodes presupposes crypto is tradable property; the honest caveat --
+    that IIFA Res. 237 issued no ruling on exactly that question, leaving keel's premise a
+    well-supported interpretive position under §29.2 -- must sit among the open questions and
+    stay anchored to the KB section that established it.
+    """
+    known = _doc().split("## Known open questions", 1)[1]
+    known_open_questions = known.split("## How to disagree", 1)[0]
+    assert _ISSUED_NO_RULING in _unwrapped(known_open_questions), (
+        f"{_DOC} must state the §71.1 non-ruling ({_ISSUED_NO_RULING!r}) among the open "
+        "questions: keel's premise is an interpretive position under §29.2, not a settled "
+        "ruling"
+    )
+    source = "docs/superpowers/references/trading-knowledge-base/sources/source-71.md"
+    assert _ISSUED_NO_RULING in _rel(source), (
+        f"{source} must still carry the non-ruling the doc cites -- the caveat stands on it"
+    )
+
+
+def test_source_67_is_attributed_to_its_true_author():
+    """§67 is the Handbook quoting OIC Fiqh Academy Res. 53/4-6, not the resolution itself.
+
+    The doc cites §67.1 for the `qabd` tri-sourcing; that passage is a 2022 handbook's
+    second-hand reproduction of the resolution. Attributing the quote to the Academy directly
+    would dress a quotation as a primary ruling -- the doc and the source file must agree on
+    whose document it is.
+    """
+    source = "docs/superpowers/references/trading-knowledge-base/sources/source-67.md"
+    assert _SOURCE_67_OWNER in _unwrapped(_doc()), (
+        f"{_DOC} must attribute source-67 to the {_SOURCE_67_OWNER!r} -- it quotes the OIC "
+        "resolution, it is not the resolution"
+    )
+    assert _SOURCE_67_OWNER in _rel(source), (
+        f"{source} must still name itself the {_SOURCE_67_OWNER!r} the doc cites"
+    )
 
 
 def test_the_disagreement_section_names_the_local_attestation_route():
@@ -287,8 +362,8 @@ def test_the_disagreement_section_names_the_local_attestation_route():
     )
     disagreement = text.split("## How to disagree", 1)[1]
     assert "keel assets attest" in disagreement, (
-        f"{_DOC}'s disagreement section must name the local route (`keel assets attest`) -- it "
-        "is the only dissent path the architecture provides"
+        f"{_DOC}'s disagreement section must name the local route (`keel assets attest`) "
+        "-- it is the only dissent path the architecture provides"
     )
 
 
