@@ -1,0 +1,25 @@
+#!/bin/bash
+# keel-paperhourly -- run ANY keel command against the HOURLY paper profile (issue #337),
+# with the config and database pinned together, symmetric with `keel-live`/`keel-paper`.
+#
+# Same footgun `keel-live` exists to remove: `--db` defaults to keel.db, so
+#   keel --config config.paper-hourly.yaml agent
+# without `--db keel-paperhourly.db` would drive the hourly rules against the DAILY paper
+# ledger. Config and db must always travel as a pair; here they do.
+#
+# Paper mode places NOTHING real. The rows this profile loads are `paper`-status turtle rules
+# with params.granularity="ONE_HOUR" (see docs/operator-runbook.md, "The hourly evidence
+# profile", for the bootstrap). The live READ-ONLY Coinbase API is still used for candles.
+#
+#   ./keel-paperhourly status
+#   ./keel-paperhourly agent          # one hourly cycle (same as paper-hourly-run.sh)
+#   ./keel-paperhourly rules list
+#
+# Authored in the dev repo (tracked there since 2026-08-03). DEPLOY (copy) to ~/keel.
+set -euo pipefail
+
+# Resolve the deployment dir from this script's own location, so it works from any cwd.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+exec ./.venv/bin/keel --config config.paper-hourly.yaml --db keel-paperhourly.db "$@"

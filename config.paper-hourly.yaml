@@ -1,0 +1,150 @@
+# keel runtime configuration — the HOURLY-CADENCE paper profile (issue #337).
+#
+# Same structure and same universe as config.paperforward.yaml; the ONE thing this profile
+# changes is CADENCE. The daily Turtle rules fire 1.19-3.20 times per asset-year, so the
+# promotion gate's n=100 per rule per product is 31-84 years away on the daily clock. The
+# same rules evaluated on ONE_HOUR bars fire ~50 times per asset-year (median n=268 over the
+# 5-year cached window) — the sample becomes collectable in months. See
+# docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md and the 2026-08-13 restatement.
+#
+# HONEST CAVEAT, STATED UP FRONT: the hourly configuration is measured NET-NEGATIVE — 0 of 90
+# / 0 of 82 cells at every fee this venue offers (docs/experiments/
+# 2026-08-13-restated-under-a-production-faithful-engine.md). This profile exists to produce
+# ADMISSIBLE EVIDENCE — rail vetoes, outcomes, pending lifespans, intent divergence: the
+# things a backtest cannot observe — not profitability. Do not read a positive stretch here
+# as anything but noise; n≈250 sequential, same-regime trades are not 250 independent draws.
+#
+# SEPARATE DATABASE. The rows that trade under this config live in keel-paperhourly.db
+# (seeded hourly: turtle_breakout rules with params.granularity="ONE_HOUR", status paper),
+# pinned together by the keel-paperhourly wrapper — never in keel.db (the daily paper
+# account) or keel-live.db. Bootstrap commands are in docs/operator-runbook.md, "The hourly
+# evidence profile".
+#
+# `allowlist` and `caps` are required and validated by keel.config.load_config; missing or
+# invalid values raise ConfigError naming the offending key rather than silently defaulting.
+
+allowlist:
+  - BTC
+  - ETH
+  - PAXG
+  - SOL
+  - XLM
+  - LTC
+  - ADA
+  - LINK
+
+target_weights:
+  BTC: 0.30
+  ETH: 0.20
+  PAXG: 0.20
+  SOL: 0.06
+  XLM: 0.06
+  LTC: 0.06
+  ADA: 0.06
+  LINK: 0.06
+
+risk_pct: 0.01
+
+caps:
+  # Same non-binding internal limits as the daily paper profile — deliberately NOT tighter:
+  # this profile's evidence is partly ABOUT rail behaviour (rail vetoes are admissible
+  # evidence), so silently clamping sizing here would bias exactly the thing being measured.
+  max_exposure_usd: 5000
+  max_per_asset_pct: 0.50
+
+market_data:
+  # Same three series as paperforward. The hourly rules TRADE on ONE_HOUR; ONE_DAY stays the
+  # higher-TF bias input (engine._higher_tf_bias_ok) and FIFTEEN_MINUTE stays the entry-gate
+  # confirmation series. An hourly cycle keeps them current with ~16 small read-only candle
+  # requests per hour (8 products x 2 series polled per cycle; 24 in the UTC-boundary hour
+  # when ONE_DAY also rolls), and market_feed's 300-candle chunked catch-up
+  # self-heals any downtime in one poll.
+  granularities:
+    - ONE_DAY
+    - ONE_HOUR
+    - FIFTEEN_MINUTE
+  history_days: 365
+
+auto_trade:
+  mode: paper
+  # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
+  # true or false changes nothing. Use `keel kill` to halt trading.
+  enabled: false
+  # THE CADENCE CHANGE. 3600 (one hour), not paperforward's 900: each cycle evaluates the
+  # ONE_HOUR bar that closed at the top of the hour. This value also scales the feed-staleness
+  # window (interval_sec x FEED_STALENESS_CYCLES = 3h): freshness is judged on the FINEST
+  # series, so a feed twelve FIFTEEN_MINUTE bars (3h) behind is "stale", not "one bar late".
+  interval_sec: 3600
+
+promotion:
+  min_trades: 100
+  min_expectancy: 0.0
+  min_rr: 1.5
+  min_win_rate: 0.55
+
+money_mgmt:
+  profit_trigger_pct: 0.10
+  acceleration_pct: 0.05
+  max_total_dd_pct: 0.20
+  max_weekly_dd_pct: 0.08
+  # Rail 16 (consecutive-loss breaker) — DISABLED by default (0 = off), same as paperforward.
+  max_consecutive_losses: 0
+  streak_cooloff_days: 0
+
+dca:
+  budget_usd: 50
+  cadence_days: 7
+
+paper:
+  # Same seed/contribution as the daily paper profile, deliberately: the hourly corpus's
+  # net-negative measurement was taken under these settings, and changing the sizing basis
+  # here would confound the one comparison this profile exists to enable. NOTE the documented
+  # interplay (operator-runbook, "How much money moves"): at $10k+ synthetic equity, rail 14's
+  # $500/month allowance can veto large sized setups — those vetoes are themselves evidence,
+  # and are recorded as such.
+  starting_equity_usd: 10000
+  monthly_contribution_usd: 500
+
+# The settlement currency this deployment TRADES IN — USD, same as paperforward (see that
+# file's comment for the full reasoning; nothing about cadence changes it).
+quote_currency: USD
+
+subscription:
+  # Same simulator assumptions as the daily paper profile.
+  assumed_free_volume_usd: 500
+  unsubscribed_allowance_usd: 0
+  pacing: opportunistic
+
+# Coinbase One subscription tiers (Issue #86) — same catalogue as paperforward.
+tiers:
+  - name: Basic
+    free_volume_usd: 500
+    subscription_usd_month: 4.99
+  - name: Preferred
+    free_volume_usd: 10000
+    subscription_usd_month: 29.99
+  - name: Premium
+    free_volume_usd: null
+    subscription_usd_month: 299.99
+
+# Same fee model as paperforward: paper fills are market-style, so taker is the rate this
+# account would actually pay (and the rate the net-negative measurement was taken at).
+fees:
+  taker_pct: 0.012
+  maker_pct: 0.006
+
+# Same logging posture as paperforward — and NOTE it matters MORE here: 24 cycles a day means
+# rail vetoes and no-signal reasons arrive hourly, and verbose=false would make "why no order
+# this hour?" a manual database replay. Rotation bounds the volume.
+logging:
+  verbose: true
+  file: logs/keel-paperhourly.log
+  max_file_mb: 25
+  file_count: 5
+
+# G4 overfitting gate (KB §78). NEVER tune these to obtain a desired verdict. Same floors as
+# every other profile; the hourly profile's rows are expected to FAIL them on edge (see the
+# caveat above) — that failure is the finding, not a configuration problem.
+research:
+  pbo_max: 0.05
+  slope_floor: -0.5

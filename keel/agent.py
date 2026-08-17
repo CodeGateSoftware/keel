@@ -118,9 +118,15 @@ _DECIMAL_PARAMS: dict[str, tuple[str, ...]] = {
 }
 
 # The constructor kwarg holding a `Granularity`, stored as its `.value` string, per kind.
+# `turtle_breakout`'s entry is what lets the hourly evidence profile (#337) store hourly rows:
+# without it, a `granularity` in a turtle row's params would reach the constructor as the
+# STRING "ONE_HOUR" and `isinstance(value, Granularity)` lookups (`_entry_gate_granularity`,
+# `engine._trading_granularity`) would miss it, silently re-gating the rule on the coarsest
+# configured granularity while it kept deciding on daily candles.
 _GRANULARITY_PARAMS: dict[str, str] = {
     "pullback_continuation": "granularity",
     "rsi_meanrev": "timeframe",
+    "turtle_breakout": "granularity",
 }
 
 

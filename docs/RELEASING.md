@@ -98,10 +98,12 @@ an existing rule's params (it reports drift and exits non-zero) and refuses to c
 without `--allow-live` — a manifest must never be able to resize or arm a rule by file edit, which
 is what the promotion ladder exists to prevent. Promotion stays `keel rules promote`'s job.
 
-The deployment's **configs** (`config.live-sandbox.yaml`, `config.paperforward.yaml`, the run
-scripts, the launchd plists and the `keel-live`/`keel-paper` wrappers) are tracked as of
-2026-08-03 for the same reason. They are still excluded from the wheel and the release assets —
-that exclusion comes from the packaging config, which ships only `keel/`, not from `.gitignore`.
+The deployment's **configs** (`config.live-sandbox.yaml`, `config.paperforward.yaml`,
+`config.paper-hourly.yaml`, the run scripts, the launchd plists and the `keel-live`/
+`keel-paper`/`keel-paperhourly` wrappers) are tracked as of 2026-08-03 for the same reason
+(the hourly profile joined them in #337). They are still excluded from the wheel and the
+release assets — that exclusion comes from the packaging config, which ships only `keel/`,
+not from `.gitignore`.
 
 The **Migrate database** workflow (Actions → Migrate database → Run workflow) is manual-only. Give
 it a `db_path` to migrate that database; leave it empty and it verifies the migration chain

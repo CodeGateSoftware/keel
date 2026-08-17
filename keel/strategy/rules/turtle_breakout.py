@@ -13,14 +13,25 @@ Long-only spot, no shorts: this rule only ever emits a **long** `Setup` (a close
 high channel); the opposite side (a close below the low channel) is exit-only, wired through
 `exit_signal()`, never a short entry -- consistent with every other rule in this codebase.
 
-**This is a DAILY rule** (`self.granularity = Granularity.ONE_DAY`, a fixed attribute read by
-the evaluation engine via `getattr(rule, "granularity")` -- see
-`strategy.engine._trading_granularity` -- not a persisted param). The classic Turtle system is
+**This is a DAILY rule BY DEFAULT** (`self.granularity = Granularity.ONE_DAY`, a constructor
+param persisted in `params` and read by the evaluation engine via `getattr(rule,
+"granularity")` -- see `strategy.engine._trading_granularity`). The classic Turtle system is
 a daily trend-follower, and that is not cosmetic: ADX is a *daily-scale* trend measure. On
 noisy hourly bars +DI/-DI cancel out and ADX stays structurally suppressed (measured ~7 median
 / 18 max on real hourly BTC/ETH regardless of period), so an ADX>25 gate on hourly data never
 fires and the rule produces zero trades. On daily candles ADX(14) has a ~26 median and
 Donchian-high breakouts routinely coincide with ADX>25. So the lookback defaults are DAY counts.
+
+**The `granularity` param exists to make the rule MEASURABLE on another clock, not profitable
+on one (issue #337).** The hourly evidence profile (`config.paper-hourly.yaml`) runs the SAME
+rule at `granularity=ONE_HOUR`, where the 40/20/14/20 defaults become BAR counts on hourly
+candles: measured at n≈250 trades per 5 years (vs 4-13 daily) and NET-NEGATIVE -- 0 of 90 /
+0 of 82 cells at every reachable fee (docs/experiments/2026-08-13). That profile collects
+admissible forward evidence (rail vetoes, outcomes, pending lifespans) at a rate the daily
+clock cannot supply; the param defaults to `ONE_DAY` so every row written before it existed
+keeps meaning exactly what it meant. It follows `RsiMeanReversion.timeframe`'s persisted-param
+convention, not `PullbackContinuation`'s non-persisted one (which `keel rules add` refuses
+rather than silently rebuilding the rule at the default on a different candle series).
 The entry/exit default to **40/20** -- a longer channel than the classic Turtle System-1 20/10 --
 chosen by **walk-forward out-of-sample validation** on cached 5yr BTC/ETH/PAXG (every entry
 lookback longer than 20 beat 20 out-of-sample; 40 was the most robust across held-out years). The
@@ -92,8 +103,9 @@ def _completed_days(candles_by_tf: dict[Granularity, list[Candle]]) -> list[Cand
 class TurtleBreakout(Rule):
     """Donchian-breakout trend-follower: ADX-gated entry, asymmetric channel exit, 2xATR stop.
 
-    One instance trades a single `product_id` on `ONE_DAY` candles only (`self.granularity`,
-    fixed -- not one of the tunable `params`).
+    One instance trades a single `product_id` on the candles of its declared `granularity`
+    (default `ONE_DAY`; a persisted param -- see the module docstring for why it exists and
+    why the default is daily).
 
     `promotion_class = "trend_follow"` routes it to the low-win/high-R:R promotion floor
     (`strategy.promotion.floor_for_class`): a breakout trend-follower wins under half its trades
@@ -110,6 +122,10 @@ class TurtleBreakout(Rule):
     def __init__(
         self,
         product_id: str,
+        # Trading timeframe; the lookbacks below are BAR counts at THIS granularity, so the
+        # daily defaults mean what they always meant and an hourly row reinterprets them as
+        # hours -- the hourly corpus's exact configuration (docs/experiments/2026-08-11 §2).
+        granularity: Granularity = Granularity.ONE_DAY,
         entry_lookback: int = 40,  # Donchian-high entry (days); walk-forward OOS default (was 20)
         exit_lookback: int = 20,  # Donchian-low asymmetric exit (days); half the entry (was 10)
         adx_period: int = 14,  # 14 days -- classic ADX
@@ -137,8 +153,9 @@ class TurtleBreakout(Rule):
 
         self.name = name
         self.product_id = product_id
-        self.granularity = Granularity.ONE_DAY
+        self.granularity = granularity
         self.params: dict = {
+            "granularity": granularity.value,
             "entry_lookback": entry_lookback,
             "exit_lookback": exit_lookback,
             "adx_period": adx_period,
@@ -181,6 +198,24 @@ class TurtleBreakout(Rule):
         self.last_rejection = {"gate": gate, **numbers}
         return None
 
+    def _trading_series(
+        self, candles_by_tf: dict[Granularity, list[Candle]]
+    ) -> list[Candle]:
+        """The series this rule decides on: `candles_by_tf[self.granularity]`.
+
+        At the `ONE_DAY` default that is `_completed_days`'s forming-bar-guarded daily series,
+        exactly as it always was. At any other declared granularity it is that series verbatim
+        (no forming-day guard applies): the agent's `data.market_feed` persists only CLOSED
+        candles, and the account sim presents the current bar as decided-on at its close --
+        the same contract `PullbackContinuation`/`RsiMeanReversion` already trade under. An
+        absent key yields an empty series, which `detect()` declines as insufficient history
+        rather than silently falling back to some other granularity's bars -- a rule configured
+        for hourly must never quietly decide on daily candles.
+        """
+        if self.granularity is Granularity.ONE_DAY:
+            return _completed_days(candles_by_tf)
+        return candles_by_tf.get(self.granularity, [])
+
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         """Confirmed close above the prior entry-lookback Donchian high, ADX>threshold, and
         (optionally) a positive MACD histogram -- then a 2xATR stop and a distant nominal
@@ -188,10 +223,9 @@ class TurtleBreakout(Rule):
         this target; it only exists to clear the evaluation engine's rr>=1 kill-zone gate and
         let winners run past a fixed 1:1/2:1 cap).
         """
-        # Drop the last daily bar only when it is genuinely still forming -- see
-        # `_completed_days`. The daily-only edge backtest has no ONE_HOUR key and every daily
-        # bar is already closed, so it uses them all.
-        daily = _completed_days(candles_by_tf)
+        # The declared granularity's series; at the ONE_DAY default this drops a genuinely
+        # still-forming last bar -- see `_completed_days`/`_trading_series`.
+        daily = self._trading_series(candles_by_tf)
 
         entry_lookback = self.params["entry_lookback"]
         exit_lookback = self.params["exit_lookback"]
@@ -306,8 +340,9 @@ class TurtleBreakout(Rule):
         nominal target are the backtester/account-sim's job to enforce separately.
         """
         del held
-        # Same forming-bar guard as detect() -- see `_completed_days`.
-        daily = _completed_days(candles_by_tf)
+        # Same declared-granularity series (and, at the ONE_DAY default, forming-bar guard)
+        # as detect() -- see `_trading_series`/`_completed_days`.
+        daily = self._trading_series(candles_by_tf)
 
         exit_lookback = self.params["exit_lookback"]
         if len(daily) <= exit_lookback + 1:
