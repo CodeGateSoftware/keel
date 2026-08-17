@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.keel.paper-hourly</string>
+
+    <!-- NOTE ON COMMENT STYLE, same as com.keel.live.plist: the rest of this repo separates
+         asides with a double hyphen. XML forbids a double hyphen inside a comment, and while
+         Apple's CoreFoundation parser is lenient enough to accept one (plutil -lint says OK),
+         a strict parser such as expat does not, which makes the file unreadable to ordinary
+         XML tooling and to the tests that assert on the schedule below. Do not "fix" it back.
+
+         HOURLY-CADENCE PAPER profile (issue #337): one paper cycle per UTC hour, against
+         config.paper-hourly.yaml and its OWN database keel-paperhourly.db (pinned by
+         paper-hourly-run.sh). It places NOTHING real. It exists because the daily-turtle
+         rules fire 1.19 to 3.20 times per asset-year, so the promotion gate's n=100 is 31 to
+         84 years away on the daily clock, while the SAME rules on ONE_HOUR bars fire ~50
+         times per asset-year (median n=268 over the cached 5-year window): evidence at a
+         rate a human can collect. MEASURED NET-NEGATIVE, 0 of 90 / 0 of 82 cells at every
+         reachable fee (docs/experiments/2026-08-13-restated-under-a-production-faithful-
+         engine.md). This job collects ADMISSIBLE EVIDENCE (rail vetoes, outcomes, pending
+         lifespans, intent divergence: the things a backtest cannot observe), not profit.
+
+         WHY :20 AND NOT :00. Same reason as com.keel.live.plist: twenty minutes of margin
+         for Coinbase to publish the hourly candle that closed at the top of the hour and
+         for data.market_feed to persist it. That candle is the bar this cycle exists to
+         evaluate; a trigger at exactly :00 would race the very bar it consumes. The entry
+         gate (freshness.entry_bar_ready, keel/agent.py's pre-pass) withholds entries when
+         the bar has not arrived, keel agent then exits nonzero, the runner leaves the hour
+         unstamped, and the NEXT hour's trigger runs instead: at :00 the profile would
+         systematically trade one hour late; at :20 it trades the bar it means to.
+
+         WHY AN HOURLY STAMP AND NOT THE DAILY ONE. com.keel.paperforward's day-stamp is
+         daily-grained by design: the daily Turtle wants exactly one cycle per local day.
+         This profile wants exactly one cycle per UTC hour, so paper-hourly-run.sh stamps
+         the UTC hour itself (YYYY-MM-DDThh, from date -u). The stamp here is cadence
+         bookkeeping, NOT the correctness mechanism it is on the live path: the paper path
+         already refuses a second entry while a product is open (strategy/paper.py), so a
+         duplicate cycle is inert. It still matters for evidence quality: two cycles in one
+         hour would double-log the same bar's evaluation and inflate the rail-veto counts.
+
+         THE 24 TRIGGERS ARE ONE PER LOCAL HOUR, so every UTC hour gets a trigger under any
+         local offset, DST transitions included. launchd re-runs a missed
+         StartCalendarInterval on wake from SLEEP but NOT when the trigger passed while the
+         machine was powered OFF (observed 2026-07-28 on the paperforward job), and no runner
+         can replay bars that closed while the machine was down: a powered-off hour is an
+         hour of evidence lost, permanently. RunAtLoad catches up the CURRENT hour immediately
+         on boot; hours before the outage are simply gone. Spring-forward's skipped local
+         hour costs one UTC hour per year the same way. Both holes are documented, not fixed:
+         this is an evidence collector with a known ~99.9% duty-cycle requirement, not a
+         money path. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elmehdiaitbrahim/keel/paper-hourly-run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>20</integer></dict>
+    </array>
+
+    <!-- Run on load, so a boot between triggers runs the CURRENT hour's cycle immediately
+         instead of waiting up to an hour. The runner's hour-stamp makes a repeated load
+         harmless. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elmehdiaitbrahim/keel</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paper-hourly.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paper-hourly.err.log</string>
+</dict>
+</plist>

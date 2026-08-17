@@ -36,6 +36,7 @@ from keel.execution import executor
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Candle, Granularity, Side
 from tests.conftest import attest_subscription
 
@@ -608,6 +609,30 @@ def test_build_rule_populates_rule_id_from_the_row(repo):
     assert rule.rule_id == rule_id
 
 
+def test_build_rule_reconstructs_a_turtle_rule_with_its_declared_granularity():
+    """The hourly paper profile (#337) stores turtle rows at `ONE_HOUR`; the coercion boundary
+    must turn the stored `.value` string back into the enum, exactly as it does for
+    `RsiMeanReversion.timeframe`. A row with NO `granularity` key keeps the constructor's
+    `ONE_DAY` default, which is what every pre-existing turtle row keeps meaning (pinned in
+    tests/strategy/test_turtle_breakout.py, `TestDeclaredGranularity`)."""
+    row = {
+        "kind": "turtle_breakout",
+        "params": {
+            "product_id": PRODUCT,
+            "granularity": "ONE_HOUR",
+            "entry_lookback": 40,
+            "atr_stop_mult": "2",
+            "target_rr": "6",
+        },
+    }
+
+    rule = _build_rule(row)
+
+    assert isinstance(rule, TurtleBreakout)
+    assert rule.granularity is Granularity.ONE_HOUR
+    assert rule.params["atr_stop_mult"] == Decimal("2")
+
+
 def test_build_rule_leaves_rule_id_none_for_a_row_with_no_id():
     """A hand-built row (no "id" key -- e.g. a caller assembling params directly, not via
     `repo.get_rules()`) must not raise; `rule_id` just stays at its default `None`."""
@@ -657,7 +682,7 @@ def test_coerced_param_keys_names_every_param_that_arrives_as_a_string():
     )
     assert agent.coerced_param_keys("dca") == frozenset({"budget_usd", "dip_bonus_pct"})
     assert agent.coerced_param_keys("turtle_breakout") == frozenset(
-        {"atr_stop_mult", "target_rr"}
+        {"atr_stop_mult", "target_rr", "granularity"}
     )
 
 

@@ -152,18 +152,20 @@ histories. **A figure from one says nothing about the other.** Checking a paper 
 against live account equity — or a live cap against paper cash — yields a confident wrong answer,
 and has already produced one. Establish which account a number came from before reasoning about it.
 
-| | paper | live |
-| --- | --- | --- |
-| config | `config.paperforward.yaml` | `config.live-sandbox.yaml` |
-| database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) |
-| `auto_trade.mode` | `paper` | `confirm` |
-| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) |
-| `caps.max_exposure_usd` | 5000 | 200 |
-| money spent | synthetic `paper_cash_usdc` | the real broker balance |
-| sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy |
-| rail 14 allowance | $500/month (Basic tier) | $200/month |
-| `equity_state_mode` | `paper` | `live` |
-| launchd job | `com.keel.paperforward` | `com.keel.live` |
+| | paper | live | paper-hourly |
+| --- | --- | --- | --- |
+| config | `config.paperforward.yaml` | `config.live-sandbox.yaml` | `config.paper-hourly.yaml` |
+| database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) | `keel-paperhourly.db` (must be passed) |
+| `auto_trade.mode` | `paper` | `confirm` | `paper` |
+| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | same 8 as paper |
+| `caps.max_exposure_usd` | 5000 | 200 | 5000 |
+| money spent | synthetic `paper_cash_usdc` | the real broker balance | synthetic `paper_cash_usdc` |
+| sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy | the hourly account's own equity |
+| rail 14 allowance | $500/month (Basic tier) | $200/month | $500/month |
+| `equity_state_mode` | `paper` | `live` | `paper` |
+| launchd job | `com.keel.paperforward` | `com.keel.live` | `com.keel.paper-hourly` |
+| cadence | once per local day (hourly triggers, day-stamp) | once per UTC day (hourly triggers, UTC day-stamp) | once per **UTC hour** (hourly triggers, UTC **hour**-stamp) |
+| rules traded | daily turtle, `paper` status | daily turtle + DCA, `live` status | **hourly** turtle (`params.granularity="ONE_HOUR"`), `paper` status |
 
 **Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures
@@ -183,7 +185,9 @@ places nothing — *unless autonomy is armed*, which is exactly what makes an un
 place. Autonomy changes who is asked, never what is allowed; check the flag before assuming a
 live cycle is supervised, rather than inferring it from `confirm`.
 
-**Both fire hourly; both run once a day.** Each launchd job has a list of hourly triggers plus
+**Both fire hourly; both run once a day** (the third job, `com.keel.paper-hourly`, is the
+exception that runs once per UTC *hour* — see "The hourly evidence profile" below). Each
+launchd job has a list of hourly triggers plus
 `RunAtLoad`, and each runner is day-stamped: the first eligible trigger that finds no stamp for
 today runs the cycle and writes the stamp, and every later trigger that day is a no-op. The
 trigger count is **catch-up breadth, not cadence** — launchd re-runs a calendar interval missed
@@ -201,6 +205,68 @@ daily bar (`tests/test_schedule.py` pins it).
 `caps.max_exposure_usd` as a proxy (`keel/execution/executor.py`). The same rule, the same setup and
 the same day therefore produce different quantities on the two accounts, and neither is an estimate
 of the other. The settings behind those numbers are covered next.
+
+## The hourly evidence profile (paper-hourly)
+
+A third deployment, `config.paper-hourly.yaml` + `keel-paperhourly.db`, running the **same**
+turtle rules on a different bar clock: one paper cycle per **UTC hour** (`com.keel.paper-hourly.plist`
+fires hourly at :20; `paper-hourly-run.sh` stamps the UTC hour). Use `./keel-paperhourly <command>`
+so the config and database always travel as a pair.
+
+**Why it exists: evidence cadence, not profitability.** The daily-turtle rules fire 1.19–3.20
+times per asset-year, so a promotion gate demanding n=100 per rule per product is 31–84 years
+away — waiting is not a slower path, it is no path. The same rules evaluated on `ONE_HOUR` bars
+fire ~50 times per asset-year (median n=268 over the 5-year cached window;
+`docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md`), which makes the sample
+collectable in months.
+
+**The honest caveat, which changes nothing about the decision: the hourly configuration is
+measured NET-NEGATIVE** — 0 of 90 / 0 of 82 cells at every fee this venue offers, restated
+2026-08-13 under the production-faithful engine
+(`docs/experiments/2026-08-13-restated-under-a-production-faithful-engine.md`). This profile
+produces **admissible evidence** — rail vetoes, outcomes, pending lifespans, intent divergence:
+the things a backtest cannot observe — not profit. Do not promote from it on a positive stretch:
+n≈250 sequential trades inside one regime are not 250 independent draws. Daily-tuned parameters
+on an hourly clock is also, legitimately, a different strategy (the experiment's own §7) — which
+is exactly why the forward evidence this profile accrues is the only kind that can settle it.
+
+**Bootstrap.** The database is created at deploy time by the operator and is empty until then
+(24 hourly cycles against an unseeded database log `signals=0` and do nothing else — there are
+no rules to evaluate):
+
+```bash
+keel migrate --db keel-paperhourly.db        # schema only; never seeds
+# Seed the hourly rules. `rules seed` cannot do this (it writes each kind's constructor
+# defaults, i.e. daily), so add each row with the one param that makes it hourly:
+for p in BTC ETH PAXG SOL XLM LTC ADA LINK; do
+  keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules add \
+    --kind turtle_breakout --product "${p}-USD" --params '{"granularity": "ONE_HOUR"}'
+done
+# Advance each printed id candidate -> paper. --force is the documented bypass for a rule
+# whose backtest can never clear the gate; for hourly turtle the backtest clears min_trades
+# easily and fails on EDGE (the net-negative finding above), so force is deliberate here and
+# the warning it prints is the caveat restated:
+keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules promote --force <id>
+# Warm the candle cache (ONE_HOUR/ONE_DAY/FIFTEEN_MINUTE x 365d) before the first cycle:
+keel --config config.paper-hourly.yaml --db keel-paperhourly.db fetch
+```
+
+**The rows differ from every other turtle row by one param.** `params.granularity: "ONE_HOUR"`
+— `TurtleBreakout`'s declared trading timeframe, persisted the way `RsiMeanReversion.timeframe`
+is and coerced back by `keel/agent.py`'s registry. A row with no `granularity` key (every row
+written before the param existed) keeps meaning daily. `keel rules list` shows the param; it is
+the one thing to check when a cycle logs `signals=0` and you need to know which clock a row trades.
+
+**Cadence mechanics.** Hourly candles close at the top of each UTC hour; the :20 trigger gives
+Coinbase twenty minutes to publish and `data.market_feed` to persist the bar (the same margin
+`com.keel.live` uses for the same reason). The runner stamps the UTC **hour**
+(`date -u '+%Y-%m-%dT%H'`) — the paperforward day-stamp is daily-grained and would collapse 23
+of the 24 cycles into no-ops. The stamp is cadence bookkeeping, not the duplicate-entry barrier
+it is on live: the paper path already refuses a second entry while a product is open
+(`strategy/paper.py`). A failed cycle leaves the hour unstamped and the next trigger retries
+against the then-newest bar. An hour lost to the machine being powered off is lost — the runner
+cannot replay bars that closed while it was down; that is an hour of evidence, not an hour of
+money, and it is why the profile's duty cycle matters more than its exact schedule.
 
 ## How much money moves
 

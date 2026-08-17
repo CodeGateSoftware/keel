@@ -1,9 +1,14 @@
 """Tests for keel.strategy.rules.turtle_breakout.TurtleBreakout.
 
-TurtleBreakout is a DAILY rule: `detect()`/`exit_signal()` read the `ONE_DAY` key. Small
-parameter values (`entry_lookback=5, exit_lookback=3, adx_period=5, atr_period=5`) are used
-throughout so short, hand-built daily series are enough to exercise every gate: the Donchian-
-high breakout, the ADX trend-confirmation filter, and the asymmetric Donchian-low channel exit.
+TurtleBreakout is a DAILY rule BY DEFAULT: `detect()`/`exit_signal()` read the `ONE_DAY` key
+that its `granularity` param declares. That param is persisted (`RsiMeanReversion.timeframe`'s
+convention, not `PullbackContinuation`'s non-persisted one) so an hourly evidence profile
+(issue #337) can run the SAME rule on `ONE_HOUR` bars -- measured there at n≈250 per 5 years
+but NET-NEGATIVE (docs/experiments/2026-08-13, 0 of 90 / 0 of 82 cells); the param exists to
+make that measurement collectable, not profitable. Small parameter values (`entry_lookback=5,
+exit_lookback=3, adx_period=5, atr_period=5`) are used throughout so short, hand-built daily
+series are enough to exercise every gate: the Donchian-high breakout, the ADX
+trend-confirmation filter, and the asymmetric Donchian-low channel exit.
 
 The edge backtester passes only the rule's native series (`{ONE_DAY: ...}`, no `ONE_HOUR`
 key), so these edge-style fixtures use every daily bar. A separate class exercises the
@@ -160,6 +165,96 @@ class TestGranularity:
         assert rule.params["exit_lookback"] == 20
         assert rule.params["adx_period"] == 14
         assert rule.params["atr_period"] == 20
+
+
+class TestDeclaredGranularity:
+    """The `granularity` param: how the hourly evidence profile (issue #337) runs this rule.
+
+    Everything downstream keys off the rule's DECLARED timeframe -- `engine.
+    _trading_granularity`, `agent._entry_gate_granularity`, `backtest._rule_trading_tf` -- so
+    an hourly turtle requires the declaration itself to be a param, persisted the way
+    `RsiMeanReversion.timeframe` is (its `.value` string inside `params`, coerced back by
+    `agent._GRANULARITY_PARAMS`). `PullbackContinuation` is the counter-example this must not
+    copy: it accepts `granularity` but does NOT persist it, so `rules add` refuses it outright
+    rather than silently rebuild the rule at the default on a different candle series.
+    """
+
+    def test_the_default_is_daily_and_is_persisted(self) -> None:
+        rule = TurtleBreakout(product_id="BTC-USD")
+
+        assert rule.granularity is Granularity.ONE_DAY
+        # `.value` (a plain string), so `describe()`'s params are JSON-plain and the row
+        # round-trips without a second serialization step.
+        assert rule.params["granularity"] == "ONE_DAY"
+
+    def test_an_hourly_rule_detects_on_the_one_hour_series(self) -> None:
+        rule = _rule(granularity=Granularity.ONE_HOUR)
+
+        setup = rule.detect({Granularity.ONE_HOUR: _breakout_candles()})
+
+        assert setup is not None
+        assert setup.ts == _breakout_candles()[-1].ts
+
+    def test_an_hourly_rule_does_not_read_the_one_day_series(self) -> None:
+        """A daily-keyed breakout alone must not fire an hourly rule: the declared series is
+        absent, exactly like `test_missing_granularity_key_returns_none` for the daily default.
+
+        This is the discrimination that makes the param real rather than decorative -- before
+        it existed, `detect()` read `ONE_DAY` unconditionally, so no configuration could point
+        the rule at another series (docs/experiments/2026-08-11 §7: the hourly corpus had to
+        hand hourly bars to a rule that "believed they were days").
+        """
+        rule = _rule(granularity=Granularity.ONE_HOUR)
+
+        assert rule.detect({Granularity.ONE_DAY: _on_days(_breakout_candles())}) is None
+
+    def test_an_hourly_exit_reads_the_one_hour_series(self) -> None:
+        rule = _rule(granularity=Granularity.ONE_HOUR)
+        held = rule.detect({Granularity.ONE_HOUR: _breakout_candles()})
+        assert held is not None
+
+        fires = rule.exit_signal(held, {Granularity.ONE_HOUR: _falling_candles()})
+
+        assert fires is True
+
+    def test_an_hourly_rule_round_trips_through_agent_build_rule(self) -> None:
+        """A stored hourly row must rebuild as an hourly rule -- the whole point of persisting
+        the param, since `keel-paperhourly`'s rows are read back by every agent cycle."""
+        rule = _rule(granularity=Granularity.ONE_HOUR)
+        params = dict(rule.describe()["params"])
+        # Simulate the DB round trip: Decimal params get JSON-serialized to strings, and
+        # `product_id` is re-applied by the writer (turtle's describe() does not carry it).
+        params["atr_stop_mult"] = str(params["atr_stop_mult"])
+        params["target_rr"] = str(params["target_rr"])
+        params["product_id"] = "BTC-USD"
+
+        rebuilt = agent._build_rule({"kind": "turtle_breakout", "params": params})
+
+        assert rebuilt.granularity is Granularity.ONE_HOUR
+        assert rebuilt.detect({Granularity.ONE_HOUR: _breakout_candles()}) is not None
+        assert rebuilt.detect({Granularity.ONE_DAY: _on_days(_breakout_candles())}) is None
+
+    def test_a_row_written_before_the_param_existed_defaults_to_daily(self) -> None:
+        """Default-compatibility: turtle rows already sit in `keel.db`/`keel-live.db` with no
+        `granularity` key, and they must keep meaning exactly what they meant -- daily. This is
+        the same asymmetry `_params_delta` (keel/commands/rules.py) already documents for any
+        kind that grows a param: an old row simply has no such key.
+        """
+        params = {
+            "product_id": "BTC-USD",
+            "entry_lookback": 5,
+            "exit_lookback": 3,
+            "adx_period": 5,
+            "atr_period": 5,
+            "adx_threshold": 25.0,
+            "atr_stop_mult": "2",
+            "target_rr": "6",
+        }
+
+        rebuilt = agent._build_rule({"kind": "turtle_breakout", "params": params})
+
+        assert rebuilt.granularity is Granularity.ONE_DAY
+        assert rebuilt.detect({Granularity.ONE_DAY: _on_days(_breakout_candles())}) is not None
 
 
 class TestDetectFires:
