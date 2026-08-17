@@ -75,9 +75,10 @@ def test_the_arabic_readme_exists_and_declares_rtl():
     to send.
     """
     text = _read(_AR)
-    assert '<div dir="rtl">' in text, (
-        f"{_AR} must wrap its content in <div dir=\"rtl\"> so GitHub renders the page "
-        "right-to-left"
+    assert '<div dir="rtl">\n\n' in text and "\n\n</div>" in text, (
+        f"{_AR} must wrap its content in <div dir=\"rtl\"> -- with blank lines after the "
+        "opening tag and before the closing one, or GitHub's HTML-block rule stops "
+        "rendering the markdown inside it -- so the page renders right-to-left"
     )
 
 
@@ -187,6 +188,10 @@ def test_the_five_terms_appear_in_their_established_renderings():
             f"{_AR} must use and define the established rendering of {term!r} -- the "
             "glossary is where an Arabic reader meets these terms defined"
         )
+    assert "| --- |" in text, (
+        f"{_AR}'s glossary must be a real GFM table (header row plus '| --- |' separator), "
+        "not a drawing that stops rendering as a table"
+    )
 
 
 def test_the_scope_is_stated_entry_point_not_translation_promise():
@@ -212,4 +217,7 @@ def test_disclaimers_are_stated_in_arabic():
     )
     assert "وليست فتوى" in text or "ولا نصيحةً شرعية" in text, (
         f"{_AR} must carry the not-Shariah-advice disclaimer in Arabic"
+    )
+    assert "Apache-2.0" in text and "(LICENSE)" in text, (
+        f"{_AR} must state the licence with its link, as the English README does"
     )
