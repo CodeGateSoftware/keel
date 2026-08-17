@@ -26,6 +26,7 @@ from keel.cli import cli
 from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT
 from keel.types import Candle, Granularity
 from tests.conftest import VALID_CONFIG_YAML
 
@@ -981,6 +982,11 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
     A profit factor printed without its assumed slippage has the same problem a profit factor
     printed without its fee rate had (#247): the reader cannot check the number.
     """
+    # The flat rate simulate's dollar sections use is ALIASED to the engine's floor, not a
+    # repeated literal: the report asserts those sections cost "the flat SLIPPAGE_FLOOR_PCT
+    # per leg", and that claim must be structurally true -- a retuned floor with a stray
+    # 0.0005 literal here would make the report's own cost statement silently false.
+    assert cli_module._SIM_SLIPPAGE_PCT == SLIPPAGE_FLOOR_PCT
     db_path = tmp_path / "sim.db"
     out_path = tmp_path / "report.md"
     repo = _repo_at(db_path)

@@ -1868,6 +1868,13 @@ class TestEntryOverrideWarningAtRouting:
             _warn_if_market_routing_overrides_entry(
                 self._intent(entry="0"), _quoted_preview("50000")
             )
+            # An extreme-but-finite exponent (a rule bug, not venue data): parses, is_finite,
+            # and compares fine -- the DIVISION is what raises (Decimal Overflow, an
+            # ArithmeticError). Telemetry must swallow it, matching intent_divergence's
+            # inside-the-try arithmetic.
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="1E+999999999"), _quoted_preview("50000")
+            )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
 
