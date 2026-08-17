@@ -55,8 +55,9 @@ from keel.research.cscv import PBOResult
 from keel.strategy.backtest import BacktestResult
 
 # Lifecycle order; `transition()` advances one step at a time (or demotes to the
-# terminal state). `disabled` is terminal in v1 — reactivation is a future decision,
-# not modeled here.
+# terminal state). `disabled` is terminal ON THIS PATH — reactivation is the operator
+# verb `keel rules enable` (keel/commands/rules.py), which restores the row at
+# `candidate`, deliberately not through the promotion machinery.
 _PROMOTE_NEXT: dict[str, str] = {"candidate": "paper", "paper": "live"}
 
 

@@ -4,8 +4,9 @@ The paper-mode-fidelity spec explicitly deferred a dedicated status command as a
 ("A dedicated `keel status` command is deferred as a follow-up"); this is that follow-up. Its
 job is narrow: let an operator running a paper-forward see the agent's state at a glance,
 **purely from the local DB and config** -- mode, kill-switch, autonomy, Rail 11 drawdown/equity
-state, open positions, rule counts, and per-product data freshness. It NEVER calls the broker;
-that is the whole point (`monitor`/`agent` are the commands that touch the network).
+state, rail 17's withdrawal-attestation freshness, open positions, rule counts, and per-product
+data freshness. It NEVER calls the broker; that is the whole point (`monitor`/`agent` are the
+commands that touch the network).
 
 Two layers, matching the rest of `keel/commands/*`:
 
@@ -32,6 +33,7 @@ from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands._products import _default_sim_products
 from keel.config import Config
 from keel.data.repository import Repository
+from keel.execution import executor
 from keel.types import Granularity
 
 # -- the pure report shape ---------------------------------------------------------------------
@@ -87,6 +89,24 @@ class SubscriptionStatusRow:
 
 
 @dataclass(frozen=True)
+class WithdrawalAttestationStatus:
+    """Rail 17's input, as a displayable state (§65.4) -- the same reading `keel withdrawals
+    show` prints, so the two commands can never disagree about whether entries are halted.
+
+    `expires_in_sec` is set only when `state == "attested"` (a fresh `--enabled` attestation);
+    `expired_for_sec` only when `state == "expired"` -- how long ago the 7-day TTL lapsed, not
+    how old the attestation is, because "unknown for 12 days" is the fact that matters to an
+    operator deciding how urgently to re-attest.
+    """
+
+    state: str  # "attested" | "suspended" | "expired" | "unattested"
+    enabled: bool | None
+    attested_at: int | None
+    expires_in_sec: int | None
+    expired_for_sec: int | None
+
+
+@dataclass(frozen=True)
 class StatusReport:
     now_ts: int
     mode: str
@@ -99,6 +119,7 @@ class StatusReport:
     max_total_dd_pct: Decimal
     max_weekly_dd_pct: Decimal
     rail11_status: str
+    withdrawal_attestation: WithdrawalAttestationStatus
     paper_cash_usdc: Decimal | None
     open_positions: list[OpenPositionStatus]
     rule_counts: dict[str, int]
@@ -211,6 +232,35 @@ def _subscription_rows(
     ]
 
 
+def _withdrawal_attestation(repo: Repository, now_ts: int) -> WithdrawalAttestationStatus:
+    """Rail 17's input, resolved and aged for display.
+
+    Resolution goes through the executor's OWN `_withdrawals_enabled` and expiry math goes
+    through the executor's OWN `WITHDRAWAL_ATTESTATION_TTL_SEC` -- never a restated 7 days --
+    so this display can never call an attestation fresh on the very cycle the rail vetoes it.
+    Staleness takes precedence over suspension, matching `withdrawals show`: a stale attested
+    suspension is UNKNOWN, not a fresh claim that withdrawals are down.
+    """
+    resolved = executor._withdrawals_enabled(repo, now_ts)
+    attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
+
+    if not attested_at:
+        return WithdrawalAttestationStatus("unattested", None, None, None, None)
+    if resolved is None:
+        expired_for = max((now_ts - attested_at) - executor.WITHDRAWAL_ATTESTATION_TTL_SEC, 0)
+        return WithdrawalAttestationStatus(
+            "expired",
+            repo.get_state("withdrawals_enabled", default=None),
+            attested_at,
+            None,
+            expired_for,
+        )
+    if resolved is False:
+        return WithdrawalAttestationStatus("suspended", False, attested_at, None, None)
+    expires_in = max((attested_at + executor.WITHDRAWAL_ATTESTATION_TTL_SEC) - now_ts, 0)
+    return WithdrawalAttestationStatus("attested", True, attested_at, expires_in, None)
+
+
 def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport:
     """Assemble the full status report from `repo`/`config` alone -- no broker, no network.
 
@@ -241,6 +291,7 @@ def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport
         max_total_dd_pct=max_total,
         max_weekly_dd_pct=max_weekly,
         rail11_status=_rail11_status(dd_total, dd_weekly, max_total, max_weekly),
+        withdrawal_attestation=_withdrawal_attestation(repo, now_ts),
         paper_cash_usdc=(
             repo.get_state("paper_cash_usdc") if config.auto_trade.mode == "paper" else None
         ),
@@ -266,6 +317,41 @@ def _human_age(age_sec: int) -> str:
         return f"{hours}h ago"
     days = age_sec // 86400
     return f"{days}d ago"
+
+
+def _human_remaining(remaining_sec: int) -> str:
+    """`_human_age`'s mirror image, for time still left rather than time already gone -- the
+    same ladder (s/m/h/d) so the two read as one convention on adjacent lines."""
+    if remaining_sec < 60:
+        return f"{remaining_sec}s"
+    minutes = remaining_sec // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = remaining_sec // 3600
+    if hours < 24:
+        return f"{hours}h"
+    days = remaining_sec // 86400
+    return f"{days}d"
+
+
+def _rail17_line(w: WithdrawalAttestationStatus) -> str:
+    """The rail-17 line, naming the halt and the release in the same breath whenever entries
+    are halted -- the 2026-08-14 event was invisible until the veto fired precisely because
+    nothing surfaced the attestation's age BEFORE rail 17 acted on it (#340)."""
+    prefix = "rail 17 (withdrawal capability)"
+    if w.state == "attested":
+        return f"{prefix}: attested, expires in {_human_remaining(w.expires_in_sec or 0)}"
+    if w.state == "suspended":
+        return (
+            f"{prefix}: SUSPENDED -- entries halted; "
+            "re-attest with keel withdrawals attest --enabled"
+        )
+    if w.state == "expired":
+        return (
+            f"{prefix}: EXPIRED {_human_age(w.expired_for_sec or 0)} -- entries halted; "
+            "re-attest with keel withdrawals attest"
+        )
+    return f"{prefix}: never attested -- entries halted; re-attest with keel withdrawals attest"
 
 
 def render_human(report: StatusReport) -> list[str]:
@@ -299,6 +385,7 @@ def render_human(report: StatusReport) -> list[str]:
         f"weekly={dd_weekly} (ceiling {report.max_weekly_dd_pct})"
     )
     lines.append(f"rail11 (drawdown breaker): {report.rail11_status}")
+    lines.append(_rail17_line(report.withdrawal_attestation))
     if report.mode == "paper":
         lines.append(f"paper_cash_usdc: {report.paper_cash_usdc}")
 
@@ -355,10 +442,12 @@ def _report_to_jsonable(report: StatusReport) -> dict[str, Any]:
 def status_cmd(ctx: click.Context, as_json: bool) -> None:
     """Operator-observability snapshot of the agent's state -- read-only, no broker call.
 
-    Shows mode, the kill-switch, autonomy, Rail 11 drawdown/equity state, open positions, rule
-    counts, and per-product data freshness, all read straight from the local DB and config. This
-    is the interim of the deferred `keel status` TUI: same underlying report (`--json` is its
-    forward-compatible shape), just rendered to the terminal.
+    Shows mode, the kill-switch, autonomy, Rail 11 drawdown/equity state, rail 17's
+    withdrawal-attestation state (fresh with time remaining, or EXPIRED with how long ago and
+    the command that re-attests), open positions, rule counts, and per-product data freshness,
+    all read straight from the local DB and config. This is the interim of the deferred
+    `keel status` TUI: same underlying report (`--json` is its forward-compatible shape), just
+    rendered to the terminal.
 
     `--json` deliberately skips the disclaimer footer every other command prints
     (`with_disclaimer`): it exists for scripting/the future TUI, and a trailing line of prose

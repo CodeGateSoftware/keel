@@ -23,7 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
-from keel.commands.status import gather_status
+from keel.commands.status import gather_status, render_human
 from keel.config import (
     AutoTradeConfig,
     Caps,
@@ -34,6 +34,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution.executor import WITHDRAWAL_ATTESTATION_TTL_SEC
 from keel.types import Candle, Granularity
 
 NOW_TS = 1_800_000_000
@@ -318,6 +319,97 @@ def test_subscriptions_surfaced_when_attested(repo: Repository) -> None:
     assert row.effective_status == "active"
 
 
+# -- rail 17 (withdrawal attestation, §65.4) -------------------------------------------------
+
+
+def _attest(repo: Repository, enabled: bool, age_sec: int) -> None:
+    repo.set_state("withdrawals_enabled", enabled)
+    repo.set_state("withdrawals_attested_at", NOW_TS - age_sec)
+
+
+def test_rail17_attested_fresh_shows_time_remaining(repo: Repository) -> None:
+    """A fresh attestation is visible BEFORE it vetoes: 4 days of the 7 spent -> 3 days left."""
+    _attest(repo, enabled=True, age_sec=4 * 86400)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    w = report.withdrawal_attestation
+    assert w.state == "attested"
+    assert w.expires_in_sec == 3 * 86400
+    assert "rail 17 (withdrawal capability): attested, expires in 3d" in render_human(report)
+
+
+def test_rail17_expired_names_the_halt_and_the_fix(repo: Repository) -> None:
+    """19 days since attestation against the 7-day TTL -> expired 12 days ago, with the command
+    that releases it -- the 2026-08-14 event, visible in status instead of in a veto log."""
+    _attest(repo, enabled=True, age_sec=19 * 86400)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    w = report.withdrawal_attestation
+    assert w.state == "expired"
+    assert w.expired_for_sec == 12 * 86400
+    assert (
+        "rail 17 (withdrawal capability): EXPIRED 12d ago -- entries halted; "
+        "re-attest with keel withdrawals attest" in render_human(report)
+    )
+
+
+def test_rail17_never_attested_is_said_as_such(repo: Repository) -> None:
+    """A fresh DB has no attestation at all -- rail 17 fails closed on that too, so status
+    must not render the silence as health."""
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    w = report.withdrawal_attestation
+    assert w.state == "unattested"
+    assert w.attested_at is None
+    assert (
+        "rail 17 (withdrawal capability): never attested -- entries halted; "
+        "re-attest with keel withdrawals attest" in render_human(report)
+    )
+
+
+def test_rail17_suspended_attestation_still_names_the_halt(repo: Repository) -> None:
+    """A FRESH `--suspended` attestation is a deliberate rail-17 halt, not staleness -- the
+    line must say which, because the release is the same command with `--enabled`."""
+    _attest(repo, enabled=False, age_sec=3600)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    w = report.withdrawal_attestation
+    assert w.state == "suspended"
+    assert (
+        "rail 17 (withdrawal capability): SUSPENDED -- entries halted; "
+        "re-attest with keel withdrawals attest --enabled" in render_human(report)
+    )
+
+
+def test_rail17_freshness_uses_the_executors_own_ttl(repo: Repository) -> None:
+    """Pin the boundary to `WITHDRAWAL_ATTESTATION_TTL_SEC` itself, at ±1s: status must age the
+    attestation with the SAME constant the executor vetoes on, never a restated 7 days -- a
+    drift between the two would report "attested" on the very cycle rail 17 vetoes."""
+    _attest(repo, enabled=True, age_sec=WITHDRAWAL_ATTESTATION_TTL_SEC - 1)
+    fresh = gather_status(repo, _config(), now_ts=NOW_TS).withdrawal_attestation
+    assert fresh.state == "attested"
+    assert fresh.expires_in_sec == 1
+
+    _attest(repo, enabled=True, age_sec=WITHDRAWAL_ATTESTATION_TTL_SEC + 1)
+    stale = gather_status(repo, _config(), now_ts=NOW_TS).withdrawal_attestation
+    assert stale.state == "expired"
+    assert stale.expired_for_sec == 1
+
+
+def test_rail17_line_sits_beside_rail11(repo: Repository) -> None:
+    """The two halt-rails render adjacently, so one glance answers "can the agent enter today?"
+    for both the drawdown breaker and the possession rail."""
+    _attest(repo, enabled=True, age_sec=3600)
+    lines = render_human(gather_status(repo, _config(), now_ts=NOW_TS))
+
+    rail11_at = next(i for i, line in enumerate(lines) if line.startswith("rail11"))
+    rail17_at = next(i for i, line in enumerate(lines) if line.startswith("rail 17"))
+    assert rail17_at == rail11_at + 1
+
+
 # -- the `keel status` command --------------------------------------------------------------
 
 
@@ -339,6 +431,9 @@ def test_status_command_runs_read_only_and_prints_key_facts(tmp_path, valid_conf
     assert "mode: paper" in result.output
     assert "kill_switch: clear" in result.output.lower() or "clear" in result.output.lower()
     assert "no open positions" in result.output.lower()
+    # A fresh DB has never been attested -- rail 17 is halting entries, and status says so
+    # rather than rendering the silence as health.
+    assert "rail 17 (withdrawal capability): never attested" in result.output
 
 
 def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_path) -> None:
@@ -356,6 +451,7 @@ def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_pa
     assert payload["mode"] == "paper"
     assert payload["kill_switch_engaged"] is False
     assert payload["rail11_status"] in {"ok", "HALTED", "unknown"}
+    assert payload["withdrawal_attestation"]["state"] == "unattested"
     assert "open_positions" in payload
     assert "rule_counts" in payload
     assert "data_freshness" in payload

@@ -820,6 +820,61 @@ def test_rules_disable_sets_terminal_status(tmp_path):
     assert row["status"] == "disabled"
 
 
+def test_rules_enable_restores_a_disabled_rule_to_candidate(tmp_path):
+    """`enable` is the inverse of `disable`'s WRITE but not of its effect: nothing about the
+    prior status was recorded, so the rule comes back at `candidate` -- the bottom of the
+    ladder -- and the output must print the path onward (promote, with --force named for the
+    paper-forwards that can never reach the min_trades floor)."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="disabled")
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "enable", str(rule_id)])
+
+    assert result.exit_code == 0, result.output
+    assert "status -> candidate" in result.output
+    assert "rules promote" in result.output
+    assert "--force" in result.output
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "candidate"
+
+
+def test_rules_enable_on_a_non_disabled_rule_is_an_error(tmp_path):
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "enable", str(rule_id)])
+
+    assert result.exit_code != 0
+    assert "Error" in result.output
+    assert "not disabled" in result.output
+    # Refused, not partially applied: the rule keeps the status it had.
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "live"
+
+
+def test_rules_disable_then_enable_round_trip_lands_at_candidate(tmp_path):
+    """Documents the round-trip's one-way ratchet: a rule disabled from `live` re-enables at
+    `candidate`, NOT at `live` -- `disable` records no prior status to restore, so re-entry to
+    the trading set is a promotion decision, not an undo. What #339's re-enable of the
+    disabled paper DCA twins depends on."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    runner = CliRunner()
+
+    disabled = runner.invoke(cli, ["--db", str(db_path), "rules", "disable", str(rule_id)])
+    assert disabled.exit_code == 0, disabled.output
+    enabled = runner.invoke(cli, ["--db", str(db_path), "rules", "enable", str(rule_id)])
+    assert enabled.exit_code == 0, enabled.output
+
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "candidate"
+
+
 # -- rules seed (Issue #81 -- the `rules` table starts empty, seed candidates from the built-in
 # `RULE_REGISTRY` so the engine has something to trade) --------------------------------------
 

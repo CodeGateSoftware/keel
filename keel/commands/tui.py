@@ -132,7 +132,7 @@ from keel.commands.admission import (
     render_propose_view,
     render_screen_report,
 )
-from keel.commands.status import StatusReport, _human_age, gather_status
+from keel.commands.status import StatusReport, _human_age, _rail17_line, gather_status
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Granularity
@@ -288,6 +288,15 @@ def _equity_lines(report: StatusReport) -> list[ScreenLine]:
     )
     rail11_text = f"rail11 (drawdown breaker): {report.rail11_status}"
     lines.append(ScreenLine(rail11_text, _rail11_style(report.rail11_status)))
+    # `render_human`'s exact rail-17 text, so the TUI and `keel status` can never disagree
+    # about whether entries are halted. Every state but `attested` fails rail 17 closed --
+    # a halt -- so each is an alert, not a warn.
+    rail17 = report.withdrawal_attestation
+    lines.append(
+        ScreenLine(
+            _rail17_line(rail17), "ok" if rail17.state == "attested" else "alert"
+        )
+    )
     if report.mode == "paper":
         lines.append(ScreenLine(f"paper_cash_usdc: {report.paper_cash_usdc}", "normal"))
     return lines
