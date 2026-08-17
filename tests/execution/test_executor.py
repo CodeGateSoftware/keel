@@ -1855,6 +1855,19 @@ class TestEntryOverrideWarningAtRouting:
                 self._intent(entry="50300"),
                 {**_quoted_preview("50000"), "best_ask": "not-a-number"},
             )
+            # "nan" PARSES -- Decimal('NaN') constructs fine, and NaN > 0 raises
+            # InvalidOperation. cb_client does Decimal(value) on venue strings with no
+            # finiteness check, so this input is reachable; telemetry must swallow it,
+            # not abort the routing (the sibling intent_divergence path guards the same
+            # hazard inside its try).
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="50300"),
+                {**_quoted_preview("50000"), "best_ask": "nan"},
+            )
+            # A zero/unusable intended entry has no meaningful deviation either.
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="0"), _quoted_preview("50000")
+            )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
 

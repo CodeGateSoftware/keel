@@ -689,10 +689,14 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 #: `pullback_continuation` enters at `signal_candle.high + buffer_ticks`, which sits above
 #: the market by however much follow-through the rule demands, and THAT gap is what market
 #: routing silently removes (#260 measured it: 124 trades taken where the rule intended 58).
-#: 50bp sits between the two: 10x the slippage assumption, so ordinary noise can never trip
-#: it, yet small enough that any deliberate entry condition -- at least a fraction of a bar's
-#: range from spot, by construction -- does. The comparison is strictly greater: a deviation
-#: exactly at the line is "at", not "beyond", and logs nothing.
+#: 50bp sits between the two: 10x the slippage assumption, so ordinary conditions do not
+#: trip it, yet small enough that any deliberate entry condition -- at least a fraction of
+#: a bar's range from spot, by construction -- does. A genuine >50bp gap-up between an
+#: enter-at-close rule's signal and the next cycle's ask CAN exceed the line in volatile
+#: stretches; that firing is truthful (the fill really is that far off intent) and
+#: informative, not spurious. This is a VISIBILITY threshold, not a correctness one.
+#: The comparison is strictly greater: a deviation exactly at the line is "at", not
+#: "beyond", and logs nothing.
 ENTRY_OVERRIDE_WARN_BP = Decimal("50")
 
 
@@ -717,7 +721,11 @@ def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
         ask = Decimal(str(raw))
     except (InvalidOperation, TypeError, ValueError):
         return None
-    return ask if ask > 0 else None
+    # `is_finite()` first, deliberately outside any try: Decimal('NaN') > 0 RAISES
+    # InvalidOperation, and a venue string of "NaN" parses into exactly that -- the
+    # sibling `_log_intent_divergence` keeps the same hazard inside its own try for the
+    # same reason. A non-finite ask is a degraded preview, not a routing failure.
+    return ask if ask.is_finite() and ask > 0 else None
 
 
 def _warn_if_market_routing_overrides_entry(
@@ -737,8 +745,8 @@ def _warn_if_market_routing_overrides_entry(
 
     The market reference is the venue's own `best_ask` from the preview `_run_order` JUST
     fetched -- the price a market BUY actually pays, drawn from the one book quote already in
-    the hot path (no new broker call; a mid would understate the deviation by half the
-    spread). Below `ENTRY_OVERRIDE_WARN_BP` nothing is logged: a warning that fires every
+    the hot path (no new broker call; a mid would misstate the gap by half the spread either
+    way). Below `ENTRY_OVERRIDE_WARN_BP` nothing is logged: a warning that fires every
     order is a warning nobody reads.
 
     Scoped to BUYs on the market configuration only. SELL intents (exits, brackets, stop
@@ -747,7 +755,10 @@ def _warn_if_market_routing_overrides_entry(
     #260's remediation plan -- is not on the override path at all. Never raises: telemetry
     must not be able to fail a routing. `deviation_bps` is signed, positive meaning the rule
     intended to enter ABOVE the market (follow-through demanded, pullback's case), negative
-    below it (a dip the market has not offered).
+    below it (a dip the market has not offered) -- the OPPOSITE sense of
+    `executor.intent_divergence`'s `divergence_bps`, which measures the venue's fill against
+    the intent; for one overridden trade the two readings have opposite signs, and a
+    dashboard must not average across them.
     """
     if preview is None or intent.side != Side.BUY:
         return
@@ -765,7 +776,7 @@ def _warn_if_market_routing_overrides_entry(
         expected = Decimal(str(intent.entry))
     except (InvalidOperation, TypeError, ValueError):
         return
-    if expected <= 0:
+    if not expected.is_finite() or expected <= 0:
         return
     deviation_bps = (expected - ref) / ref * Decimal(10_000)
     if abs(deviation_bps) <= ENTRY_OVERRIDE_WARN_BP:
