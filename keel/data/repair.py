@@ -166,9 +166,32 @@ def repair_series(
     return result
 
 
-def unexplained_gap_count(repo, product: str, granularity: Granularity) -> int:
-    """Missing bars NOT yet proven absent at the venue -- what `--fail-on-gaps` should judge."""
+def unexplained_gap_count(
+    repo, product: str, granularity: Granularity, start_ts: int | None = None
+) -> int:
+    """Missing bars NOT yet proven absent at the venue -- what `--fail-on-gaps` should judge.
+
+    `start_ts` exists because the fetch display subtracts this number from `coverage()`'s gap
+    count, and `coverage()` counts gaps over `get_candles(.., requested_start_ts, None)` -- a
+    window-bounded slice. The two counts must describe the SAME window or the subtraction goes
+    negative: on 2026-08-17 `keel fetch` printed `5 internal gaps (-1 proven absent at venue)`
+    for a series whose whole-series unexplained count (6) exceeded its window-bounded gap
+    count (5) because bars were missing older than the fetch window. Default `None` reads the
+    whole series, exactly the pre-parameter behavior -- which is the scope `--fail-on-gaps`
+    keeps, since `repair_series` probes holes wherever they sit, not only inside a fetch
+    window.
+
+    Honest boundary caveat: a hole that STRADDLES `start_ts` is seen by the bounded read only
+    in its in-window remainder, which is not interior to the bounded slice (the bar before the
+    hole falls outside the window) -- so neither this count nor `coverage()`'s can see it, and
+    a `candle_gap_probes` record keyed by the whole-series window applies to nothing the
+    bounded view detects. Such a hole therefore displays as neither gapped nor unexplained.
+    That is the conservative direction (the window can only under-report a hole crossing its
+    own start boundary, never claim one absent) and it is rare: it requires a hole crossing
+    the fetch window's start exactly.
+    """
     granularity = Granularity(granularity)
-    windows = gaps_mod.detect(repo.get_candles(product, granularity), product, granularity)
+    candles = repo.get_candles(product, granularity, start_ts, None)
+    windows = gaps_mod.detect(candles, product, granularity)
     known = set(repo.get_gap_probes(product, granularity))
     return gaps_mod.total_missing(gaps_mod.subtract_known_absent(windows, known))
