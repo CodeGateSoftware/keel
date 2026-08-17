@@ -361,6 +361,13 @@ def rules_promote(
             f"{census} -- {reading.products_contributing} products contribute, "
             f"min contribution {reading.min_contribution}"
         )
+        # Say in WORDS when the pooled path carried the promotion: a log auditor should
+        # not have to infer it from n_trades being below the floor on the line above.
+        if decision.promotable and stats.n_trades < promo_cfg.min_trades:
+            click.echo(
+                "  promotion carried by the POOLED reading "
+                "(the rule's own sample is below min_trades)"
+            )
 
     click.echo(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
     for reason in decision.reasons:

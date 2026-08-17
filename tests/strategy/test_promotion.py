@@ -36,6 +36,7 @@ from keel.strategy.promotion import (
     next_status,
     paper_sibling_rows,
     pbo_gate_from_config,
+    pool_stats,
     promotion_class_of,
     should_demote,
     transition,
@@ -575,6 +576,35 @@ def _seven_paper_siblings() -> list[tuple[str, BacktestResult]]:
     ]
 
 
+def test_pool_stats_field_arithmetic_is_the_documented_weighting() -> None:
+    """The docstring's field-by-field claims, asserted directly -- not only through the
+    gate's pass/fail, which reads n/win-rate/expectancy and could stay green while
+    avg_win/avg_loss/rr pool wrongly (a mis-weighted loss side that never crosses a
+    floor is still a lie in the census an operator reads).
+
+    Sibling: n=16, 10 wins (0.625), avg_win 30, avg_loss -10.
+    Candidate: n=16, 4 wins (0.25), avg_win 60, avg_loss -20, expectancy -2.
+    Pooled: n=32; wins 14; win_rate 14/32 = 0.4375; avg_win (10*30 + 4*60)/14 = 540/14;
+    avg_loss (6*-10 + 12*-20)/18 = -300/18; gross_win 540, gross_loss 300, PF 1.8;
+    expectancy (16*-2 + 16*14)/32 = 6 -- the trade-weighted mean, exact.
+    """
+    own = _stats(
+        n_trades=16, win_rate=0.25, avg_win=Decimal("60"),
+        avg_loss=Decimal("-20"), expectancy=Decimal("-2"),
+    )
+    pooled, reading = pool_stats(
+        _pool("BTC-USD", own, _seven_paper_siblings()[:1])
+    )
+    assert reading.n_pooled == 32
+    assert dict(reading.per_product) == {"BTC-USD": 16, "ASSET-1-USD": 16}
+    assert pooled.n_trades == 32
+    assert pooled.win_rate == 0.4375
+    assert pooled.avg_win == Decimal("540") / 14
+    assert pooled.avg_loss == Decimal("-300") / 18
+    assert pooled.expectancy == Decimal("6")
+    assert pooled.profit_factor == Decimal("1.8")
+
+
 def test_no_pool_supplied_is_exactly_todays_decision() -> None:
     """Without pooled samples the decision carries no pooled reading -- the single-product
     path is byte-for-byte the pre-#338 behavior, not a special case of the pooled one."""
@@ -773,6 +803,12 @@ def test_params_mismatch_is_not_a_sibling(repo: Repository) -> None:
     )
     _insert_rule(  # wrong kind, same params
         repo, "rsi_meanrev", status="paper", params={"entry_lookback": 55, "product_id": "SOL-USD"}
+    )
+    _insert_rule(  # the docstring's own example: "55" (str) vs 55 (int) is a real mismatch
+        repo,
+        "pullback_continuation",
+        status="paper",
+        params={"entry_lookback": "55", "product_id": "LINK-USD"},
     )
 
     assert paper_sibling_rows(repo, "pullback_continuation", _CANDIDATE_PARAMS) == []

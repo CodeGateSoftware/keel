@@ -251,7 +251,13 @@ def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, Pooled
                              trades (0 when the union has no wins).
     - pooled ``avg_loss``  = ``Σ(losses_i * avg_loss_i) / Σ losses_i`` with
                              ``losses_i = n_i - wins_i`` -- the same argument on the
-                             loss side (0 when the union has no losses).
+                             loss side (0 when the union has no losses). ⚠️ One stated
+                             inexactness: ``n_i - wins_i`` counts SCRATCH trades
+                             (``outcome == "scratch"``, pnl exactly 0) as losses, while
+                             ``stats.summarize`` excludes them from ``avg_loss``, so a
+                             pool containing scratches overstates the loss side's weight.
+                             A scratch requires pnl exactly zero net of taker fees, which
+                             the corpus does not produce; stated rather than papered over.
     - pooled ``expectancy``= ``Σ(n_i * expectancy_i) / Σ n_i`` -- the trade-weighted
                              mean; a size-weighted mean of means IS the overall mean,
                              so this is exactly the union's expectancy.
