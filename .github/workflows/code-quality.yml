@@ -2,6 +2,11 @@ name: Code Quality
 
 # SonarQube (static analysis + coverage) and Snyk (dependency vulnerabilities).
 #
+# NOTE (#291): the tokenless baseline now lives in `security.yml` -- Dependabot, a weekly
+# `pip-audit` over the exported lock, and CodeQL, all on GITHUB_TOKEN alone, always on.
+# This workflow is the OPTIONAL enhanced tier: SonarQube and Snyk run only if the two
+# secrets below are ever created, and its `preflight` skips them cleanly (never red) while
+# they are not. The two workflows disagree about nothing: baseline there, depth here.
 # ┌─ BEFORE THIS CAN RUN ─────────────────────────────────────────────────────────────────────────
 # │ Two repository secrets must exist. As of 2026-08-16, NEITHER DOES -- `gh secret list` is empty
 # │ at both repo and org level:

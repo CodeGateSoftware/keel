@@ -1,0 +1,84 @@
+# The security scans -- configured for a public repo, which means: no tokens (#291).
+#
+# Why this workflow exists: the pre-launch gate names a gap that has been true since the
+# repo opened -- `SONAR_TOKEN` and `SNYK_TOKEN` were names for secrets nobody created, so
+# keel had no static analysis or dependency scanning that actually runs. This workflow is
+# the tokenless BASELINE: it runs on GITHUB_TOKEN alone, always, on every push and weekly.
+# `code-quality.yml` remains the optional enhanced tier (SonarQube + Snyk) for IF those
+# tokens are ever created -- its preflight skips cleanly while they are not, so the two
+# workflows disagree about nothing: baseline here, optional depth there.
+#
+# Why these jobs are NOT the `test` job in ci.yml: the `main` ruleset requires the status
+# context `test`, which ci.yml produces. A vulnerable dependency or a CodeQL finding is
+# information about the state of the world, not a verdict on a proposed change -- a new
+# CVE published against an already-pinned version must surface without waiting for a
+# merge to blame. So these jobs run alongside (on push, on PRs, and weekly on the
+# calendar, because CVEs are published against pinned versions whether or not anyone
+# pushes) without gating merges.
+name: security
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+
+# Not cancel-in-progress: a cancelled audit run leaves the last completed scan older than
+# it needs to be, and these jobs are short enough that waiting beats losing a result.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      # Audit the LOCK, not a fresh resolve: `uv export --frozen` emits exactly the pinned
+      # versions every deployment gets from `uv.lock` as committed (`--frozen` is the same
+      # never-re-resolve-in-CI stance `code-quality.yml` documents), so those are the
+      # versions scanned. Unlike the Snyk export there, dev dependencies are INCLUDED
+      # deliberately: this job gates nothing, so the wider advisory net costs nothing, and
+      # a CVE in the dev toolchain is still something a contributor's machine runs. Extras
+      # are included for the same reason; the repo's own six distributions are excluded
+      # because they are the code under scan, not third-party dependencies of it.
+      - name: Export the locked dependency set
+        run: >
+          uv export --frozen --all-extras --no-hashes
+          --no-emit-package keel-trader
+          --no-emit-package keel-core
+          --no-emit-package keel-broker-api
+          --no-emit-package keel-broker-coinbase
+          --no-emit-package keel-broker-fake
+          --no-emit-package keel-broker-robinhood
+          > requirements.lock.txt
+
+      - name: Audit the locked dependency set
+        run: uvx pip-audit --requirement requirements.lock.txt
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # CodeQL uploads its findings to the repo's Security tab; without this permission
+      # the scan runs and its results go nowhere.
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - uses: github/codeql-action/analyze@v3

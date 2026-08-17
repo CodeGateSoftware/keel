@@ -1,0 +1,68 @@
+# Dependabot, watching every manifest the workspace ships (#291).
+#
+# The `pip` ecosystem works per manifest directory, and this workspace is six
+# distributions: the root plus five under packages/. A directory not listed here is a
+# distribution whose dependencies update without review -- tests/test_security_scans.py
+# pins the full set so adding a seventh distribution means adding it here or failing CI.
+# Updates are grouped (one PR per week per ecosystem, not one per package) because this
+# is a solo-maintained repo: review bandwidth is the scarce resource, and a wall of
+# single-package PRs is how "ignore Dependabot" becomes the policy.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /packages/keel-core
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /packages/keel-broker-api
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /packages/keel-broker-coinbase
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /packages/keel-broker-fake
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /packages/keel-broker-robinhood
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  # The scan and CI workflows pin their actions like any other dependency; unwatched,
+  # they age into exactly the advisory-visibility problem #291 exists to close.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
