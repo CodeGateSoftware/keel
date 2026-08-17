@@ -164,8 +164,8 @@ and has already produced one. Establish which account a number came from before 
 | rail 14 allowance | $500/month (Basic tier) | $200/month | $500/month |
 | `equity_state_mode` | `paper` | `live` | `paper` |
 | launchd job | `com.keel.paperforward` | `com.keel.live` | `com.keel.paper-hourly` |
-| cadence | once per local day (hourly triggers, day-stamp) | once per UTC day (hourly triggers, UTC day-stamp) | once per **UTC hour** (hourly triggers, UTC **hour**-stamp) |
-| rules traded | daily turtle, `paper` status | daily turtle + DCA, `live` status | **hourly** turtle (`params.granularity="ONE_HOUR"`), `paper` status |
+| cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) |
+| rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` |
 
 **Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures

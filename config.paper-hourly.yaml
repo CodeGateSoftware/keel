@@ -55,8 +55,9 @@ caps:
 market_data:
   # Same three series as paperforward. The hourly rules TRADE on ONE_HOUR; ONE_DAY stays the
   # higher-TF bias input (engine._higher_tf_bias_ok) and FIFTEEN_MINUTE stays the entry-gate
-  # confirmation series. An hourly cycle keeps all three current with ~15 small read-only
-  # candle requests (5 products x 3 series), and market_feed's 300-candle chunked catch-up
+  # confirmation series. An hourly cycle keeps them current with ~16 small read-only candle
+  # requests per hour (8 products x 2 series polled per cycle; 24 in the UTC-boundary hour
+  # when ONE_DAY also rolls), and market_feed's 300-candle chunked catch-up
   # self-heals any downtime in one poll.
   granularities:
     - ONE_DAY
@@ -71,8 +72,8 @@ auto_trade:
   enabled: false
   # THE CADENCE CHANGE. 3600 (one hour), not paperforward's 900: each cycle evaluates the
   # ONE_HOUR bar that closed at the top of the hour. This value also scales the feed-staleness
-  # window (interval_sec x FEED_STALENESS_CYCLES = 3h), so an hourly series three bars behind
-  # on the FIFTEEN_MINUTE confirmation series is "stale", not "one bar late".
+  # window (interval_sec x FEED_STALENESS_CYCLES = 3h): freshness is judged on the FINEST
+  # series, so a feed twelve FIFTEEN_MINUTE bars (3h) behind is "stale", not "one bar late".
   interval_sec: 3600
 
 promotion:
