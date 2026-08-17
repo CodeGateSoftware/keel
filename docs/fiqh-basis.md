@@ -243,7 +243,7 @@ precisely so that reading can be audited and challenged. Each operator remains r
 for their own attestations. Until this section gains a dated review addendum (below), the
 status is plain: not reviewed.
 
-### What review will cover when a reviewer engages
+### What a review would cover
 
 A review, should one ever happen, is a review of the mapping from sources to code — and
 its scope is this, in full:
@@ -255,9 +255,9 @@ its scope is this, in full:
   `docs/superpowers/references/trading-knowledge-base/sources/` is faithful to the text it
   was extracted from, including where it records "not stated" rather than papering over a
   gap.
-- **The per-asset attestations on the operator's own allowlist** — sector, backing, and
-  `pays_yield`, including the open questions named above (ATOM dilution, DOGE's *Māl*
-  qualification, the premise itself).
+- **The open questions named above** — ATOM dilution, DOGE's *Māl* qualification, the
+  premise itself — as questions about the reading, not about any operator's recorded
+  attestations.
 
 ### What a reviewer is NOT endorsing
 
@@ -271,7 +271,7 @@ not endorsed:
 - **Not a ruling that crypto is tradable property.** The §71.1 non-ruling stands: reviewing
   the machinery does not settle the premise the machinery presupposes.
 - **Not any particular operator's attestations.** Those carry the operator's own source and
-  name; they are not this repository's to have reviewed.
+  name; a review of this document does not review them — each operator owns their own.
 - **Not an endorsement of trading anything.** keel states its honest result and disclaims
   advice; a review of the mapping adds no permission to trade.
 
@@ -286,16 +286,16 @@ reviewed-with-a-named-scope, never to an approval with no scope attached.
 ### The outreach shortlist (a plan, not a claim)
 
 Approaching a reviewer is the operator's action, and it has not been taken as of this
-writing. The shortlist, for when it is: the Islamic finance programmes at IIUM, INCEIF, and
-Durham, and established Islamic fintech practitioners — approached with this note, ready to
-send:
+writing. The shortlist, for that day if it comes: the Islamic finance programmes at IIUM,
+INCEIF, and Durham, and established Islamic fintech practitioners — approached with this
+note, ready to send:
 
 > keel is an open-source enforcement engine for Shariah rulings an operator supplies —
 > classifications are attested, never inferred, and enforced deterministically
 > (https://github.com/CodeGateSoftware/keel). I am asking for a review of the mapping from
 > the cited sources — Ayub, the OIC/AAOIFI/IIFA materials, Mufti Faraz Adam's papers — to
 > the encoded screen and rail behaviour, as documented in docs/fiqh-basis.md. The review
-> would signify only that the mapping is faithful to those sources; it would not endorse
+> would signify only whether the mapping is faithful to those sources; it would not endorse
 > the trading strategy, the prudential rails, the premise that crypto is tradable property,
 > or trading at all.
 

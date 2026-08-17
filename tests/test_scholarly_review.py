@@ -5,8 +5,8 @@ who checked the fiqh? The honest answer today is nobody -- the basis is one oper
 sourced reading, and #289's judgement is that an ambiguous claim here is worse than a modest
 one, because "an overstated claim is not a marketing problem, it is a trust-destroying one."
 What shipped is the modest claim said out loud -- no scholarly review has occurred, each
-operator owns their own attestations -- plus the documented path a review would take when a
-reviewer engages: what would be reviewed, what a reviewer would and would not be endorsing,
+operator owns their own attestations -- plus the documented path a review would take if a
+reviewer ever engages: what would be reviewed, what a reviewer would and would not be endorsing,
 how a review would be recorded, and who might be asked.
 
 This file pins that stance so it can only harden, never soften. The no-review sentence is
@@ -33,12 +33,8 @@ _DOC = "docs/fiqh-basis.md"
 _NO_REVIEW = "No scholarly review of keel's fiqh basis has occurred"
 
 #: The section heading (#289), whose placement between "How to disagree" and "Sources index"
-#: is part of its meaning.
+#: is part of its meaning. The README's link anchor is derived from it in the test below.
 _SECTION_HEADING = "## Scholarly review status"
-
-#: Where the README's link must land -- the heading's GitHub anchor, pinned so the README
-#: cannot cite a section that has been renamed away.
-_SECTION_LINK = "docs/fiqh-basis.md#scholarly-review-status"
 
 #: The knowledge base the basis was extracted into, named in the status section so "the
 #: operator's reading" is a checkable path, not a gesture at one.
@@ -101,21 +97,31 @@ def test_the_readme_first_screen_states_the_no_review_fact():
     the boundary sentence for the same reason: a reader deciding whether to trust keel must
     not have to scroll to learn that nobody has checked the fiqh.
     """
-    assert _NO_REVIEW in _unwrapped(_first_screen("README.md")), (
+    first = _unwrapped(_first_screen("README.md"))
+    assert _NO_REVIEW in first, (
         "the README's first screen must state, verbatim, that "
         f"{_NO_REVIEW!r} -- the modest claim said out loud is the only claim available"
+    )
+    assert "keel is not a fatwa engine" in first and first.index(
+        "keel is not a fatwa engine"
+    ) < first.index(_NO_REVIEW), (
+        "the no-review statement must come after the not-a-fatwa-engine blockquote -- the "
+        "boundary says whose ruling keel enforces, and 'nobody has checked this one' is the "
+        "very next thing a reader is owed"
     )
 
 
 def test_the_readme_no_review_statement_links_the_fiqh_basis_review_section():
     """The statement does not stand alone: it hands the reader the section that elaborates.
 
-    Pinned two-sided -- the README must carry the link, and the link must point at a heading
-    the document actually has -- so a rename of the section fails here instead of leaving a
-    link into thin air.
+    Pinned two-sided -- the README must carry the link, and the link's anchor must be the
+    one GitHub derives from the heading the document actually has -- so a rename of the
+    section fails here instead of leaving a link into thin air.
     """
-    assert _SECTION_LINK in _first_screen("README.md"), (
-        f"the README's no-review statement must link {_SECTION_LINK} -- the status claim "
+    heading = _SECTION_HEADING.removeprefix("## ")
+    expected_anchor = "docs/fiqh-basis.md#" + heading.lower().replace(" ", "-")
+    assert expected_anchor in _first_screen("README.md"), (
+        f"the README's no-review statement must link {expected_anchor} -- the status claim "
         "and the path that defines it travel together"
     )
     assert _SECTION_HEADING in _read(_DOC), (

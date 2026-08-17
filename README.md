@@ -26,7 +26,7 @@ sourced reading — published as [`docs/fiqh-basis.md`](docs/fiqh-basis.md) prec
 can be audited and challenged — and each operator is responsible for their own
 attestations. What a scholarly review would cover, and what it would and would not
 signify, is defined in [that document's review-status
-section](docs/fiqh-basis.md#scholarly-review-status); until someone walks that path, the
+section](docs/fiqh-basis.md#scholarly-review-status); unless someone walks that path, the
 status is: not reviewed.
 
 keel is a personal tool, not financial advice and not religious (Shariah) advice — see the
