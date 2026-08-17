@@ -322,7 +322,7 @@ def test_rule_track_record_degrades_gracefully_for_unrecognized_kind(repo: Repos
 
 
 def test_account_summary_projects_verbatim_from_status_report() -> None:
-    from keel.commands.status import AutonomyStatus
+    from keel.commands.status import AutonomyStatus, WithdrawalAttestationStatus
 
     status_report = StatusReport(
         now_ts=NOW_TS,
@@ -339,6 +339,10 @@ def test_account_summary_projects_verbatim_from_status_report() -> None:
         max_total_dd_pct=Decimal("0.20"),
         max_weekly_dd_pct=Decimal("0.08"),
         rail11_status="ok",
+        withdrawal_attestation=WithdrawalAttestationStatus(
+            state="attested", enabled=True, attested_at=NOW_TS - 86400,
+            expires_in_sec=6 * 86400, expired_for_sec=None,
+        ),
         paper_cash_usdc=Decimal("955.25"),
         open_positions=[],
         rule_counts={},

@@ -19,7 +19,8 @@ Design home: `docs/superpowers/specs/2026-07-16-keel-broker-abstraction-design.m
 ## Pre-live checklist
 
 Run through this **before arming the agent for live trading**, and re-check after any change to the
-Coinbase account.
+Coinbase account. Item 3 is not a one-time check: it recurs **weekly** for as long as the agent
+runs.
 
 ### 1. ⛔ Disable interest / rewards on idle balances — **required**
 
@@ -53,6 +54,40 @@ This is not a trading decision the system can veto; it is an account setting onl
 A zakat estimate (~2.5% of holdings' market value per lunar year) is a **positive** obligation, unlike
 item 1's prohibition, and it is informational: keel reports, you decide and discharge it. Tracked at
 KB §33.1. No pre-live action; noted here so the account-level obligation set is complete in one place.
+
+### 3. Withdrawal-capability attestation — **weekly refresh** (rail 17)
+
+**Why.** Rail 17 (§65.4 *qabd*) halts all BUY entries unless the withdrawal-capability attestation is
+fresh, and "fresh" means a **7-day TTL** (`WITHDRAWAL_ATTESTATION_TTL_SEC`,
+`keel/execution/executor.py`). An expired attestation reads as UNKNOWN, and rail 17 fails closed on
+unknown — live DCA buys are vetoed. That is not hypothetical: on **2026-08-14** it vetoed the only
+live DCA signal because the attestation had lapsed, and as of 2026-08-17 every deployment's
+attestation was weeks stale, so rail 17 was halting entries on the **live** deployment (it is a
+`LIVE_STATE` rail, skipped in paper, where a stale attestation matters only to the status display).
+Each deployment carries its own attestation (they do not share a database), so the live one must be
+refreshed for the rail and the paper ones to quiet their status lines.
+
+Rail 17 fails closed by itself — what it cannot do is refresh its own input, and that input is
+deliberately human (see the warning below). This entry is the cadence obligation the rail cannot
+enforce, which is why it lives here rather than in `guards.py`.
+
+**How to verify.** `keel status` prints the rail-17 line with days-to-expiry (`attested, expires in
+3d`, `EXPIRED 12d ago`, or `never attested`) — staleness is visible there *before* it vetoes, not
+only in the veto log. `keel withdrawals show` reads the same state with the age to one decimal.
+
+**Cadence.** Re-attest **weekly** — a calendar reminder is the intended mechanism. Confirm the
+balances really are withdrawable on demand, then, per deployment:
+
+```bash
+keel withdrawals attest --enabled
+keel --config config.live-sandbox.yaml --db keel-live.db withdrawals attest --enabled
+```
+
+> ⚠️ **The typed confirmation is deliberately human.** `--enabled` RELEASES a rail-17 entry halt and
+> demands a typed `yes` at a terminal — so that a scheduled job can never release a §65.4 halt, the
+> same posture as `keel autonomy on`. Do not script this command and do not pipe a `yes` into it:
+> the weekly habit is the fix for staleness, and automating the release would undo the rail. If a
+> calendar reminder ever feels like it should be a cron job, re-read this warning.
 
 ---
 

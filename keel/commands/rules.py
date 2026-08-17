@@ -402,11 +402,52 @@ def rules_demote(ctx: click.Context, rule_id: int) -> None:
 @click.pass_context
 @with_disclaimer
 def rules_disable(ctx: click.Context, rule_id: int) -> None:
-    """Disable a rule (terminal status; it will never trade again)."""
+    """Disable a rule (nothing promotes from here; `keel rules enable` can restore it, at
+    `candidate` -- never at the status it held when disabled)."""
     repo = _open_repo(ctx)
     row = _require_rule_row(ctx, repo, rule_id)
     repo.update_rule_status(rule_id, "disabled")
     click.echo(f"rule {rule_id} ({row['kind']}): status -> disabled")
+
+
+@rules_group.command("enable")
+@click.argument("rule_id", type=int)
+@click.pass_context
+@with_disclaimer
+def rules_enable(ctx: click.Context, rule_id: int) -> None:
+    """Re-enable a disabled rule at `candidate` -- the bottom of the lifecycle ladder.
+
+    This is the inverse of `rules disable`'s WRITE, not of its effect: `disable` records
+    nothing about the status a rule held before it was disabled (it stamps only `demoted_at`),
+    so there is nothing to restore, and a rule disabled from `live` comes back as `candidate`
+    too. That is deliberate -- re-entry to the trading set is a promotion decision the gate
+    must see again, not an undo.
+
+    The path onward from `candidate` is `keel rules promote <id>` (gated); its `--force` is
+    the documented bypass for a paper-forward whose backtest can never reach the min_trades
+    floor -- a DCA rule produces no backtest trades at all, so force is the only way it can
+    reach `paper` (see `promote`'s own docstring).
+    """
+    repo = _open_repo(ctx)
+    row = _require_rule_row(ctx, repo, rule_id)
+    if row["status"] != "disabled":
+        click.echo(
+            f"Error: rule {rule_id} ({row['kind']}) is {row['status']!r}, not disabled -- "
+            "`enable` only restores a disabled rule. To advance this one, use "
+            "`keel rules promote`.",
+            err=True,
+        )
+        ctx.exit(1)
+        return
+    repo.update_rule_status(rule_id, "candidate")
+    click.echo(f"rule {rule_id} ({row['kind']}): status -> candidate")
+    click.echo(
+        f"rule {rule_id} ({row['kind']}): re-enabled at CANDIDATE, the lifecycle floor -- "
+        "a rule disabled from `live` lands here too (disable records no prior status to "
+        f"restore). Advance with `keel rules promote {rule_id}`; `--force` is the documented "
+        "bypass for a paper-forward whose backtest can never reach the min_trades floor "
+        "(e.g. DCA)."
+    )
 
 
 def _json_plain(value: Any) -> Any:

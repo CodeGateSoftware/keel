@@ -47,6 +47,7 @@ from keel.commands.status import (
     RuleSummary,
     StatusReport,
     SubscriptionStatusRow,
+    WithdrawalAttestationStatus,
 )
 from keel.commands.tui import (
     _BALANCE_TIMEOUT_SEC,
@@ -155,6 +156,13 @@ def _base_report(**overrides: Any) -> StatusReport:
         max_total_dd_pct=Decimal("0.20"),
         max_weekly_dd_pct=Decimal("0.08"),
         rail11_status="ok",
+        withdrawal_attestation=WithdrawalAttestationStatus(
+            state="attested",
+            enabled=True,
+            attested_at=NOW_TS - 86400,
+            expires_in_sec=6 * 86400,
+            expired_for_sec=None,
+        ),
         paper_cash_usdc=Decimal("955.25"),
         open_positions=[],
         rule_counts={},
@@ -567,6 +575,82 @@ def test_rail11_style_matches_status(rail11_status: str, expected_style: str) ->
     lines = build_screen(report, NOW_TS)
     rail_line = next(line for line in lines if "rail11" in line.text.lower())
     assert rail_line.style == expected_style
+
+
+def _attestation(state: str, **fields: Any) -> WithdrawalAttestationStatus:
+    defaults: dict[str, Any] = dict(
+        state=state,
+        enabled=True,
+        attested_at=NOW_TS - 86400,
+        expires_in_sec=6 * 86400,
+        expired_for_sec=None,
+    )
+    defaults.update(fields)
+    return WithdrawalAttestationStatus(**defaults)
+
+
+@pytest.mark.parametrize(
+    "attestation,expected_style",
+    [
+        (_attestation("attested"), "ok"),
+        (_attestation("expired", enabled=True, attested_at=NOW_TS - 19 * 86400,
+                      expires_in_sec=None, expired_for_sec=12 * 86400), "warn"),
+        (_attestation("unattested", enabled=None, attested_at=None,
+                      expires_in_sec=None, expired_for_sec=None), "warn"),
+        (_attestation("suspended", enabled=False, expires_in_sec=None), "warn"),
+    ],
+    ids=["attested", "expired", "unattested", "suspended"],
+)
+def test_rail17_line_renders_with_halt_severity(
+    attestation: WithdrawalAttestationStatus, expected_style: str
+) -> None:
+    """The TUI reuses `render_human`'s exact rail-17 text, colored by whether entries are
+    halted. `_base_report` is PAPER mode (the TUI's home turf), where rail 17 is not
+    evaluated and a stale attestation halts nothing -- so every halted-state reading is a
+    WARN there: a permanently-red paper dashboard is fatigue, not information (#340). The
+    live-mode alert is pinned by its own test below."""
+    report = _base_report(withdrawal_attestation=attestation)
+    lines = build_screen(report, NOW_TS)
+    rail_line = next(line for line in lines if line.text.startswith("rail 17"))
+    assert rail_line.style == expected_style
+
+
+def test_rail17_halted_states_are_alerts_when_the_rail_runs() -> None:
+    """In a mode where rail 17 actually evaluates (live/confirm), every state but
+    `attested` fails it closed -- an alert, the reading the 2026-08-14 veto deserved."""
+    report = _base_report(
+        mode="confirm",
+        withdrawal_attestation=_attestation(
+            "expired", enabled=True, attested_at=NOW_TS - 19 * 86400,
+            expires_in_sec=None, expired_for_sec=12 * 86400,
+        ),
+    )
+    lines = build_screen(report, NOW_TS)
+    rail_line = next(line for line in lines if line.text.startswith("rail 17"))
+    assert rail_line.style == "alert"
+    assert rail_line.text == (
+        "rail 17 (withdrawal capability): EXPIRED 12d ago -- entries halted; "
+        "re-attest with keel withdrawals attest"
+    )
+
+
+def test_rail17_expired_line_names_the_halt_and_the_fix() -> None:
+    report = _base_report(
+        mode="confirm",
+        withdrawal_attestation=_attestation(
+            "expired",
+            enabled=True,
+            attested_at=NOW_TS - 19 * 86400,
+            expires_in_sec=None,
+            expired_for_sec=12 * 86400,
+        ),
+    )
+    lines = build_screen(report, NOW_TS)
+    rail_line = next(line for line in lines if line.text.startswith("rail 17"))
+    assert rail_line.text == (
+        "rail 17 (withdrawal capability): EXPIRED 12d ago -- entries halted; "
+        "re-attest with keel withdrawals attest"
+    )
 
 
 def test_autonomy_live_is_alert_style() -> None:
