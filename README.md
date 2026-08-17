@@ -73,7 +73,11 @@ applies the confirm/autonomy gate, then places and logs. There is deliberately n
   `pullback_continuation`, `rsi_meanrev`). A rule must walk `candidate → paper → live`, and
   promotion clears a two-part gate: performance floors *and* an overfitting check
   (PBO/CSCV). A rule that clears four floors on one in-sample parameter set is exactly what
-  the second gate exists to be suspicious of.
+  the second gate exists to be suspicious of. The sample-size floor keeps its 100-trade bar
+  but may be met two ways: the rule's own backtest, or — when its own sample is short — the
+  same parameters pooled across other products in paper, provided at least five products
+  each contribute ten trades (a diversity floor: crypto assets correlate, and a pool of
+  correlated samples overstates its power).
 - **The rails** (`keel/execution/guards.py`) — eighteen deterministic checks no order can
   skip and nothing can override, not even autonomy: the halal allowlist, per-order and
   per-day spend caps, exposure and concentration caps, correlation-aware sizing, a

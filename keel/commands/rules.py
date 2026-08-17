@@ -249,6 +249,15 @@ def rules_promote(
     parameter set is exactly what PBO exists to be suspicious of, so "nobody checked" is
     reported as a failing reason rather than quietly treated as fine (#247).
 
+    The sample-size axis has a SECOND, pooled reading (#338): when the same parameters
+    already run as `paper` rules on other products, their backtests are pooled with this
+    rule's own (pooled n >= 100 AND a diversity floor of at least 5 products contributing
+    >= 10 trades each). The pooled reading is printed BESIDE the per-rule one -- both
+    readings, always -- and a promotion that clears on one product alone is judged
+    exactly as before, untouched by the pool. `min_trades` itself is unchanged: 100
+    stays 100; what changed is the unit of evaluation, with the operator's 2026-08-17
+    agreement (see #338).
+
     With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
     directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can
     NEVER produce `min_trades` (default 100) trades -- without a bypass such a rule could never
@@ -293,6 +302,38 @@ def rules_promote(
         f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}"
     )
 
+    # #338: the sample-size axis also has a POOLED reading -- the same parameters'
+    # evidence on other products. Siblings are `paper` rows with identical params
+    # (minus the product), one per product; each is backtested against its own
+    # product's candles at the same fee, and this rule's own reading joins the pool
+    # exactly once. A rule with no siblings is judged exactly as before, with no pooled
+    # lines in the output at all.
+    candidate_product = (row["params"] or {}).get("product_id")
+    pooled_samples: list[promotion_mod.ProductSample] | None = None
+    sibling_rows = (
+        promotion_mod.paper_sibling_rows(repo, row["kind"], row["params"])
+        if candidate_product
+        else []
+    )
+    if sibling_rows:
+        samples = [promotion_mod.ProductSample(str(candidate_product), stats)]
+        for sib in sibling_rows:
+            sib_product = (sib["params"] or {}).get("product_id")
+            sib_rule = agent._build_rule(sib)
+            if _resolve_granularity(sib_rule, granularity) is None:
+                click.echo(
+                    f"warning: pooled sibling rule {sib['id']} ({sib_product}) has no "
+                    "granularity to backtest against; excluded from the pool",
+                    err=True,
+                )
+                continue
+            sib_stats = _run_backtest(ctx, repo, sib_rule, granularity, fee_pct)
+            samples.append(promotion_mod.ProductSample(str(sib_product), sib_stats))
+        # A pool of one (every sibling skipped) is no pool: judge the rule alone rather
+        # than printing a "diversity 1 < 5" failure the operator cannot act on.
+        if len(samples) > 1:
+            pooled_samples = samples
+
     promo_cfg = promotion_mod.PromotionConfig(
         min_trades=config.promotion.min_trades,
         min_expectancy=config.promotion.min_expectancy,
@@ -302,12 +343,32 @@ def rules_promote(
     pbo_result = _load_pbo(ctx, pbo_session, pbo_blocks)
     gate = promotion_mod.pbo_gate_from_config(config.research)
 
-    decision = promotion_mod.can_promote(stats, promo_cfg, pbo_result, gate)
+    decision = promotion_mod.can_promote(stats, promo_cfg, pbo_result, gate, pooled_samples)
+
+    # BOTH readings, whenever a pool existed -- the operator approving the promotion
+    # is entitled to see which path carried it, and a pooled failure to see why.
+    if decision.pooled is not None:
+        reading = decision.pooled
+        census = ", ".join(f"{product}={n}" for product, n in reading.per_product)
+        click.echo(
+            f"rule {rule_id} ({row['kind']}): sample readings -- per-rule "
+            f"n_trades={stats.n_trades}, pooled n_trades={reading.n_pooled} across "
+            f"{len(reading.per_product)} products"
+        )
+        click.echo(
+            f"  pooled census (diversity floor {promotion_mod.MIN_POOLED_PRODUCTS} "
+            f"products x >= {promotion_mod.MIN_TRADES_PER_PRODUCT_POOLED} trades): "
+            f"{census} -- {reading.products_contributing} products contribute, "
+            f"min contribution {reading.min_contribution}"
+        )
+
     click.echo(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
     for reason in decision.reasons:
         click.echo(f"  - {reason}")
 
-    new_status = promotion_mod.transition(repo, row["kind"], stats, promo_cfg, pbo_result, gate)
+    new_status = promotion_mod.transition(
+        repo, row["kind"], stats, promo_cfg, pbo_result, gate, pooled_samples, rule_id
+    )
     click.echo(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
 
 

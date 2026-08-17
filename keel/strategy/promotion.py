@@ -21,6 +21,18 @@ wave); `paper.track_record()` returns a `BacktestResult`, so any caller that has
 (from a backtest or from paper trading) can drive `can_promote`/`should_demote`/
 `transition` identically.
 
+**Cross-product pooling of the sample-size axis (#338).** `min_trades` used to be judged
+per rule per product, which at this project's measured daily rates (1.19–3.20
+trades/asset-year) made the floor a 31–84-year wait. The operator-approved change
+(2026-08-17, the agreement a gate change requires) is to the gate's UNIT OF EVALUATION,
+not its floors: the sample-size axis may be cleared EITHER by the rule's own backtest
+exactly as before OR by the same parameter set's pooled evidence across products in
+paper — pooled n ≥ min_trades AND a diversity floor (see `MIN_POOLED_PRODUCTS`).
+`min_trades = 100` itself is untouched: the win-rate axis was relaxed ALONE once, and
+axes move only with their own justification. The G4/overfitting gate is NOT pooled: it
+judges the parameter SELECTION (the trial matrix behind `--pbo-session`), which is
+per-parameter-set evidence already, and this change does not alter its scope.
+
 **Rules-table access:** `data/repository.py`'s `Repository` exposes typed `rules`-table
 methods (`insert_rule`/`get_rules`/`update_rule_status`, P3 Task 1); this module drives
 the lifecycle transitions purely through that surface. The `rules` table (see
@@ -31,8 +43,10 @@ is matched against `rules.kind`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from keel_core.config import ResearchConfig
 
@@ -169,6 +183,228 @@ def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, lis
     return (len(reasons) == 0, reasons)
 
 
+# -- Cross-product pooling of the sample-size axis (#338) -----------------------
+#
+# `min_trades` judged per rule per product made the floor unreachable in a human
+# timespan at this project's measured daily rates (1.19-3.20 trades/asset-year: the
+# go-live runbook's own table puts a single product at 31-84 years to 100 trades).
+# The operator approved (2026-08-17) changing the gate's UNIT OF EVALUATION -- the same
+# parameter set's evidence may be POOLED across products in paper -- not its floors:
+# 100 stays 100. The recorded discipline above (the win-rate axis was relaxed ALONE;
+# axes move only with their own justification) is respected: nothing here edits
+# `PromotionConfig`.
+#
+# The diversity floor is the honest discount on pooling: crypto assets correlate, so a
+# pool of correlated samples carries less information than its trade count claims --
+# pooled-but-correlated evidence overstates its statistical power. Requiring breadth
+# (several products each with an independently meaningful sample) is how the pooled
+# path pays for the larger n instead of just collecting it.
+MIN_POOLED_PRODUCTS = 5
+MIN_TRADES_PER_PRODUCT_POOLED = 10
+
+
+@dataclass(frozen=True)
+class ProductSample:
+    """One product's evidence for a shared parameter set: its id and its stats.
+
+    `product_id` rides beside the `BacktestResult` (which is product-agnostic) because
+    the pooled path's diversity floor is a claim about DISTINCT PRODUCTS, not about
+    rows or results.
+    """
+
+    product_id: str
+    stats: BacktestResult
+
+
+@dataclass(frozen=True)
+class PooledReading:
+    """The pooled half of the gate's two readings, for reporting.
+
+    `n_pooled` is the pool's total trades. `per_product` is the census (one entry per
+    distinct product, its total contribution). `products_contributing` counts only
+    products meeting `MIN_TRADES_PER_PRODUCT_POOLED` -- the diversity floor's question
+    is how many products have independently meaningful samples, not how many exist.
+    `min_contribution` is the smallest per-product total in the pool (the weakest link,
+    whatever its size).
+    """
+
+    n_pooled: int
+    per_product: tuple[tuple[str, int], ...]
+    products_contributing: int
+    min_contribution: int
+
+
+def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, PooledReading]:
+    """Pool per-product stats into one aggregate plus the diversity census.
+
+    The pooling arithmetic, stated field by field. Everything is recomputed from the
+    per-result aggregates `BacktestResult` carries; the underlying trade lists are NOT
+    merged (see the note on path-dependent fields below):
+
+    - pooled ``n_trades``  = ``Σ n_i``.
+    - per-result wins      = ``round(n_i * win_rate_i)``: `win_rate` is stored as the
+                             float ``wins / n_trades``, whose round-trip error (~1e-16)
+                             is far below 0.5, so this recovers the integer win count.
+    - pooled ``win_rate``  = ``Σ wins_i / Σ n_i``.
+    - pooled ``avg_win``   = ``Σ(wins_i * avg_win_i) / Σ wins_i`` -- the win-weighted
+                             mean, i.e. exactly the avg_win of the union's winning
+                             trades (0 when the union has no wins).
+    - pooled ``avg_loss``  = ``Σ(losses_i * avg_loss_i) / Σ losses_i`` with
+                             ``losses_i = n_i - wins_i`` -- the same argument on the
+                             loss side (0 when the union has no losses).
+    - pooled ``expectancy``= ``Σ(n_i * expectancy_i) / Σ n_i`` -- the trade-weighted
+                             mean; a size-weighted mean of means IS the overall mean,
+                             so this is exactly the union's expectancy.
+    - pooled ``profit_factor`` = ``Σ(wins_i * avg_win_i) / |Σ(losses_i * avg_loss_i)|``,
+                             with `stats.summarize`'s Infinity / 0 conventions.
+    - pooled ``avg_mfe``/``avg_mae`` = trade-weighted means, same as expectancy.
+    - ``trades``/``max_drawdown``/``max_losing_streak`` are NOT pooled: drawdown and
+                             streak are path-dependent -- they depend on the ORDER of
+                             trades across the union, which no per-result aggregate
+                             carries -- so any value would be fabricated. They are set
+                             to empty/0, and the promotion gate reads none of them; a
+                             caller wanting real cross-product drawdown must pool
+                             equity curves, not stats.
+    """
+    n_total = sum(s.stats.n_trades for s in samples)
+    wins = [round(s.stats.n_trades * s.stats.win_rate) for s in samples]
+    losses = [s.stats.n_trades - w for s, w in zip(samples, wins)]
+    wins_total = sum(wins)
+    losses_total = sum(losses)
+
+    gross_win = sum((w * s.stats.avg_win for w, s in zip(wins, samples)), Decimal(0))
+    gross_loss = sum(
+        (n_losses * s.stats.avg_loss for n_losses, s in zip(losses, samples)), Decimal(0)
+    )
+
+    counts: dict[str, int] = {}
+    for sample in samples:
+        counts[sample.product_id] = counts.get(sample.product_id, 0) + sample.stats.n_trades
+
+    pooled_stats = BacktestResult(
+        trades=[],
+        n_trades=n_total,
+        win_rate=(wins_total / n_total) if n_total else 0.0,
+        avg_win=(gross_win / wins_total) if wins_total else Decimal(0),
+        avg_loss=(gross_loss / losses_total) if losses_total else Decimal(0),
+        expectancy=(
+            sum((s.stats.n_trades * s.stats.expectancy for s in samples), Decimal(0)) / n_total
+            if n_total
+            else Decimal(0)
+        ),
+        profit_factor=(
+            (gross_win / abs(gross_loss))
+            if gross_loss != 0
+            else (Decimal("Infinity") if gross_win > 0 else Decimal(0))
+        ),
+        # path-dependent fields, not pooled -- see docstring; the gate reads neither
+        max_drawdown=Decimal(0),
+        max_losing_streak=0,
+        avg_mfe=(
+            sum((s.stats.n_trades * s.stats.avg_mfe for s in samples), Decimal(0)) / n_total
+            if n_total
+            else Decimal(0)
+        ),
+        avg_mae=(
+            sum((s.stats.n_trades * s.stats.avg_mae for s in samples), Decimal(0)) / n_total
+            if n_total
+            else Decimal(0)
+        ),
+    )
+
+    reading = PooledReading(
+        n_pooled=n_total,
+        per_product=tuple(sorted(counts.items())),
+        products_contributing=sum(
+            1 for n in counts.values() if n >= MIN_TRADES_PER_PRODUCT_POOLED
+        ),
+        min_contribution=min(counts.values()) if counts else 0,
+    )
+    return pooled_stats, reading
+
+
+def _pooled_floors(
+    pooled: BacktestResult, reading: PooledReading, cfg: PromotionConfig
+) -> tuple[bool, list[str]]:
+    """Path (b): pooled n ≥ `cfg.min_trades` AND the diversity floor AND the quality
+    floors judged on the POOLED aggregates.
+
+    The floors themselves are the same `PromotionConfig` the per-rule path uses --
+    100 stays 100; what differs is which sample answers the sample-size question, and
+    the diversity requirement that pooled sample must additionally clear. Reasons name
+    their path ("pooled ..."), so an operator can tell a pooled failure from a per-rule
+    one at a glance.
+    """
+    reasons: list[str] = []
+
+    if reading.n_pooled < cfg.min_trades:
+        reasons.append(
+            f"pooled n {reading.n_pooled} < min_trades {cfg.min_trades} across "
+            f"{len(reading.per_product)} products"
+        )
+
+    if reading.products_contributing < MIN_POOLED_PRODUCTS:
+        reasons.append(
+            f"pooled diversity {reading.products_contributing} products < required "
+            f"{MIN_POOLED_PRODUCTS} -- each contributing product must supply at least "
+            f"{MIN_TRADES_PER_PRODUCT_POOLED} trades (crypto assets correlate, so a "
+            "pool narrow enough to be correlated overstates its power; breadth is the "
+            "discount pooled evidence pays for its larger n)"
+        )
+
+    if pooled.expectancy <= cfg.min_expectancy:
+        reasons.append(
+            f"pooled expectancy {pooled.expectancy} <= min_expectancy {cfg.min_expectancy}"
+        )
+
+    rr = _realized_rr(pooled)
+    if rr < cfg.min_rr:
+        reasons.append(f"pooled rr {rr} < min_rr {cfg.min_rr}")
+
+    if pooled.win_rate < cfg.min_win_rate:
+        reasons.append(f"pooled win_rate {pooled.win_rate} < min_win_rate {cfg.min_win_rate}")
+
+    return (len(reasons) == 0, reasons)
+
+
+def paper_sibling_rows(
+    repo: Repository, kind: str, params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The `rules` rows that count as pooled evidence for the (kind, params) being
+    promoted: same `kind`, params IDENTICAL to `params` after dropping `product_id`,
+    a DIFFERENT `product_id`, and status `paper`.
+
+    Exact equality on the stored JSON-plain form (`"2"` vs `2` is a real difference --
+    they rebuild differently), because pooling another parameter set's trades would
+    launder a different experiment's sample into this one's evidence. Status `paper`
+    because the pooled path exists to count out-of-sample paper track record, which is
+    what that status means.
+
+    One row per product, the most recently inserted (like `_fetch_rule`): two rows for
+    one (params, product) are one rule observed twice, and pooling both would
+    double-count its trades. The candidate's OWN product never appears here -- its
+    trades enter the pool through the candidate's own stats, exactly once.
+    """
+    own_product = (params or {}).get("product_id")
+    fingerprint = {k: v for k, v in (params or {}).items() if k != "product_id"}
+
+    by_product: dict[str, dict[str, Any]] = {}
+    for row in repo.get_rules(status="paper"):
+        if row["kind"] != kind:
+            continue
+        row_params = row["params"] or {}
+        product = row_params.get("product_id")
+        if product is None or product == own_product:
+            continue
+        row_fingerprint = {k: v for k, v in row_params.items() if k != "product_id"}
+        if row_fingerprint != fingerprint:
+            continue
+        current = by_product.get(product)
+        if current is None or row["id"] > current["id"]:
+            by_product[product] = row
+    return list(by_product.values())
+
+
 # -- G4: PBO overfitting gate (spec §7, KB §78) --------------------------------
 
 
@@ -239,12 +475,17 @@ class PromotionDecision:
     `promotable` is the only field that authorises a status change. `floors_pass` is reported
     separately because a rule can be perfect on performance and still un-promotable for want of
     an overfitting check -- an operator needs to see which of the two they are looking at.
+
+    `pooled` is the pooled half of the sample-size reading (#338) when pooled samples were
+    supplied, else `None`. It is REPORTING, not authorisation: it is present whenever a pool
+    existed, whether or not the pooled path carried the decision.
     """
 
     promotable: bool
     reasons: list[str]
     floors_pass: bool
     overfitting: str
+    pooled: PooledReading | None = None
 
 
 def can_promote(
@@ -252,6 +493,7 @@ def can_promote(
     cfg: PromotionConfig,
     pbo: PBOResult | None = None,
     gate: PBOGate | None = None,
+    pooled_samples: Sequence[ProductSample] | None = None,
 ) -> PromotionDecision:
     """The promotion decision: performance floors (G2) **and** the overfitting gate (G4).
 
@@ -260,10 +502,30 @@ def can_promote(
     `keel trials pbo`). `gate` supplies the thresholds; omit it to use `PBOGate()`'s defaults,
     or build one from the deployment's own config with `pbo_gate_from_config`.
 
+    `pooled_samples` (#338) is the cross-product evidence pool for this rule's parameter
+    set — the candidate's own sample PLUS one `ProductSample` per same-parameter `paper`
+    sibling (see `paper_sibling_rows`). It changes the UNIT OF EVALUATION for the
+    sample-size axis, never the floors:
+
+    - With no pool (`pooled_samples=None` or empty), the decision is byte-for-byte the
+      pre-#338 one: `check_floors(stats, cfg)` alone answers the floors.
+    - With a pool, the per-rule reading is computed exactly as before, and — only when
+      the rule's OWN sample is short (`n_trades < cfg.min_trades`) — the pooled path is
+      also evaluated: pooled n ≥ `cfg.min_trades` AND the diversity floor
+      (`MIN_POOLED_PRODUCTS` products each contributing `MIN_TRADES_PER_PRODUCT_POOLED`
+      trades) AND the quality floors judged on the POOLED aggregates. If the pooled path
+      clears, IT carries the decision and the per-rule sample-size/quality failures do
+      not count against it. A rule whose own backtest already clears `min_trades` is
+      judged on its own stats exactly as before: this is a unit change for rules that
+      lack a sample, not a loosening for rules that have one.
+
+    The G4/overfitting gate is NOT pooled: `pbo` judges the parameter selection (the
+    trial matrix), which is per-parameter-set evidence, and its scope is unchanged.
+
     **`pbo=None` is not a pass.** It is `NOT_RUN`, it appears in `reasons`, and it makes
     `promotable` False. This is the entire point of the function: the four floors and the G4
     thresholds both already existed, `config.research.pbo_max`/`slope_floor` shipped in every
-    config, and nothing ever called `g4_pbo_gate` — so promotion was decided on performance
+    config, and nothing ever called either — so promotion was decided on performance
     alone while the overfitting gate sat dormant, which is indistinguishable from having no
     gate except that it looked like having one.
 
@@ -279,6 +541,23 @@ def can_promote(
     caller might read the wrong way round.
     """
     floors_pass, reasons = check_floors(stats, cfg)
+
+    pooled: PooledReading | None = None
+    if pooled_samples:
+        pooled_stats, pooled = pool_stats(pooled_samples)
+        # The pooled path is reached only when the rule's OWN sample is short: a rule
+        # whose backtest clears min_trades has its own adequate sample and is judged on
+        # it, exactly as before. Anything else would turn a unit change for the
+        # sample-starved into a quality rescue for the sample-rich.
+        if stats.n_trades < cfg.min_trades:
+            pooled_ok, pooled_reasons = _pooled_floors(pooled_stats, pooled, cfg)
+            if pooled_ok:
+                # The pooled path carries the decision; `reasons` on a pass is [] by
+                # the same invariant `check_floors` keeps. The per-rule reading stays
+                # visible to the caller through `stats` and `decision.pooled`.
+                floors_pass, reasons = True, []
+            else:
+                reasons = reasons + pooled_reasons
 
     if pbo is None:
         overfitting = NOT_RUN
@@ -299,6 +578,7 @@ def can_promote(
         reasons=reasons,
         floors_pass=floors_pass,
         overfitting=overfitting,
+        pooled=pooled,
     )
 
 
@@ -319,8 +599,27 @@ def should_demote(rolling_stats: BacktestResult, cfg: PromotionConfig) -> bool:
     return False
 
 
-def _fetch_rule(repo: Repository, rule_name: str) -> tuple[int, str]:
-    """The most recently inserted `rules` row for `kind == rule_name` (id/status)."""
+def _fetch_rule(repo: Repository, rule_name: str, rule_id: int | None = None) -> tuple[int, str]:
+    """The `rules` row to act on (id/status): the row with `rule_id` when one is named,
+    else the most recently inserted row for `kind == rule_name`.
+
+    The kind-level fallback predates multi-row kinds (`rules seed` writes one row per
+    (kind, product)); with several rows of one kind it targets the NEWEST, which is
+    only right for the single-row case it was written for. A caller that knows which
+    row it means -- `keel rules promote <id>` always does -- must not have that guess
+    made for it: promoting "the latest row of this kind" would advance a sibling the
+    operator never named, which is exactly the wrong row now that pooling (#338) makes
+    same-kind sibling rows the normal shape of the table.
+    """
+    if rule_id is not None:
+        for r in repo.get_rules():
+            if r["id"] == rule_id:
+                if r["kind"] != rule_name:
+                    raise ValueError(
+                        f"rule id {rule_id} is kind {r['kind']!r}, not {rule_name!r}"
+                    )
+                return r["id"], r["status"]
+        raise ValueError(f"no rule found in the rules table with id={rule_id}")
     matches = [r for r in repo.get_rules() if r["kind"] == rule_name]
     if not matches:
         raise ValueError(f"no rule found in the rules table for kind={rule_name!r}")
@@ -335,32 +634,41 @@ def transition(
     cfg: PromotionConfig,
     pbo: PBOResult | None = None,
     gate: PBOGate | None = None,
+    pooled_samples: Sequence[ProductSample] | None = None,
+    rule_id: int | None = None,
 ) -> str:
     """Advance (or demote) `rule_name`'s lifecycle status in the `rules` table given
     fresh `stats`, and return the resulting status.
 
     - `candidate`/`paper`: promotes one step (to `paper`/`live`) if `can_promote(stats, cfg,
-      pbo, gate)` passes, else stays put. **Without `pbo` it never promotes** -- see
+      pbo, gate, pooled_samples)` passes, else stays put. `pooled_samples` is the same
+      cross-product pool the caller showed the operator (#338) — passing it here is what
+      keeps the decision the DB obeys identical to the decision the operator read.
+      **Without `pbo` it never promotes** -- see
       `can_promote` for why an unrun overfitting check blocks rather than waves through.
     - `live`: demotes to `disabled` if `should_demote(stats, cfg)`, else stays `live`.
     - `disabled`: terminal; always stays `disabled`.
+
+    `rule_id`, when supplied, is the exact row to act on (see `_fetch_rule`); omit it for
+    the historical kind-level lookup. The CLI always names the row, so a promotion lands
+    on the rule the operator typed, never on a same-kind sibling that happens to be newer.
 
     Demotion deliberately does NOT consult `pbo`, and the asymmetry is the safety property:
     missing evidence must block a rule moving toward real money and must never block pulling
     one back from it.
     """
-    rule_id, status = _fetch_rule(repo, rule_name)
+    target_id, status = _fetch_rule(repo, rule_name, rule_id)
 
     if status in _PROMOTE_NEXT:
-        if can_promote(stats, cfg, pbo, gate).promotable:
+        if can_promote(stats, cfg, pbo, gate, pooled_samples).promotable:
             new_status = _PROMOTE_NEXT[status]
-            repo.update_rule_status(rule_id, new_status)
+            repo.update_rule_status(target_id, new_status)
             return new_status
         return status
 
     if status == "live":
         if should_demote(stats, cfg):
-            repo.update_rule_status(rule_id, "disabled")
+            repo.update_rule_status(target_id, "disabled")
             return "disabled"
         return status
 

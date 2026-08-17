@@ -644,6 +644,155 @@ def test_rules_promote_errors_rather_than_downgrading_an_unusable_pbo_session(
     assert "no usable trial columns" in result.output
 
 
+# -- rules promote: cross-product pooling of min_trades (#338) ------------------
+#
+# The gate's unit of evaluation, not its floors: the sample-size axis may be cleared
+# by the same parameters' pooled PAPER evidence on other products, discounted by a
+# diversity floor. The command must show BOTH readings -- the per-rule number and the
+# pooled census -- so the operator approving the promotion sees which path carried it.
+
+
+def _pbo_pass():
+    """A clean CSCV result, so these tests exercise the SAMPLE-SIZE axis without the
+    overfitting axis also blocking (its wiring is covered by its own tests above)."""
+    from keel.research.cscv import PBOResult
+
+    return PBOResult(
+        pbo=Decimal("0.01"),
+        n_combinations=20,
+        n_columns=12,
+        n_blocks=16,
+        rows_used=800,
+        rows_dropped=0,
+        logits=[],
+        is_performance=[],
+        oos_performance=[],
+        degradation_slope=Decimal("-0.2"),
+    )
+
+
+def test_rules_promote_reports_both_readings_and_promotes_via_the_pooled_path(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A rule with 16 of its own trades and 7 same-parameter paper siblings promotes,
+    and the output names BOTH readings: per-rule n, pooled n, and the diversity census.
+
+    The backtest and PBO seams are faked (each has its own owning tests): this test is
+    about what the COMMAND counts, decides, and prints. BTC-USD's reading fails the
+    per-rule floors outright (16 trades, 25% win rate, negative expectancy); the seven
+    siblings' pooled reading clears everything -- pooled n 128 across 8 products, 8
+    products each >= 10 trades, pooled win rate 74/128 -- so the promotion carries on
+    the pooled path and says so.
+    """
+    from keel.commands import rules as rules_cmd
+    from keel.strategy.backtest import BacktestResult
+
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    for product in ("ETH-USD", "SOL-USD", "ADA-USD", "XLM-USD", "PAXG-USD", "LTC-USD", "DOGE-USD"):
+        repo.insert_rule("pullback_continuation", {"product_id": product}, status="paper")
+
+    def fake_backtest(rule, candles, **kwargs):
+        return BacktestResult(
+            trades=[],
+            n_trades=16,
+            win_rate=0.25 if rule.product_id == "BTC-USD" else 0.625,
+            avg_win=Decimal("30"),
+            avg_loss=Decimal("-10"),
+            expectancy=Decimal("-2") if rule.product_id == "BTC-USD" else Decimal("14"),
+            profit_factor=Decimal("2"),
+            max_drawdown=Decimal("50"),
+            max_losing_streak=4,
+            avg_mfe=Decimal("20"),
+            avg_mae=Decimal("8"),
+        )
+
+    monkeypatch.setattr(rules_cmd.backtest_mod, "backtest", fake_backtest)
+    monkeypatch.setattr(rules_cmd, "_load_pbo", lambda ctx, session, blocks: _pbo_pass())
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "rules", "promote", str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "per-rule n_trades=16" in result.output
+    assert "pooled n_trades=128 across 8 products" in result.output
+    assert "pooled census" in result.output
+    assert "8 products contribute" in result.output
+    assert "BTC-USD=16" in result.output and "DOGE-USD=16" in result.output
+    assert "status -> paper" in result.output
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "paper"
+
+
+def test_rules_promote_names_the_diversity_failure_when_the_pool_is_too_narrow(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """4 products of 30 trades each: the pooled total clears 100, the diversity floor
+    (5 products) does not, and the failure reason says which path and which axis."""
+    from keel.commands import rules as rules_cmd
+    from keel.strategy.backtest import BacktestResult
+
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+    for product in ("ETH-USD", "SOL-USD", "ADA-USD"):
+        repo.insert_rule("pullback_continuation", {"product_id": product}, status="paper")
+
+    def fake_backtest(rule, candles, **kwargs):
+        return BacktestResult(
+            trades=[],
+            n_trades=30,
+            win_rate=0.6,
+            avg_win=Decimal("30"),
+            avg_loss=Decimal("-10"),
+            expectancy=Decimal("14"),
+            profit_factor=Decimal("2"),
+            max_drawdown=Decimal("50"),
+            max_losing_streak=4,
+            avg_mfe=Decimal("20"),
+            avg_mae=Decimal("8"),
+        )
+
+    monkeypatch.setattr(rules_cmd.backtest_mod, "backtest", fake_backtest)
+    monkeypatch.setattr(rules_cmd, "_load_pbo", lambda ctx, session, blocks: _pbo_pass())
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "rules", "promote", str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "pooled n_trades=120 across 4 products" in result.output
+    assert "pooled diversity 4 products < required 5" in result.output
+    assert "status -> candidate" in result.output
+
+
+def test_rules_promote_with_no_siblings_prints_no_pooled_reading(
+    tmp_path, valid_config_path
+):
+    """Default behavior for a single-product promotion is unchanged: no siblings in the
+    table means no pooled reading in the output -- the per-rule decision, alone, exactly
+    as before #338."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "rules", "promote", str(rule_id)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "pooled" not in result.output
+    assert "status -> candidate" in result.output
+
+
 def test_rules_demote_steps_back_one_stage(tmp_path):
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)
