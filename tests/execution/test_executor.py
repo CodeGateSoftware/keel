@@ -1695,3 +1695,225 @@ class TestIntentDivergenceLog:
             _log_intent_divergence(order_id=10, intent=None, realized=Decimal("50000"))
             _log_intent_divergence(order_id=11, intent=self._intent("0"), realized=Decimal("1"))
             _log_intent_divergence(order_id=12, intent=self._intent(), realized="not-a-number")
+
+
+# -- #260: the routing-time entry-override warning --------------------------------------------
+
+
+#: The stable event id the routing-time warning emits -- a name, never a sentence, per
+#: `keel_core.telemetry`'s contract, so tests (and any aggregation) key on it.
+_OVERRIDE_EVENT = "executor.entry_override_market_routed"
+
+
+def _override_fields(caplog) -> dict:
+    """The structured payload of the last `executor.entry_override_market_routed` record.
+
+    Same shape as `_divergence_fields` above: `log_event` attaches fields via `extra`, so
+    `caplog.text` shows only the event name and asserting on it would pass for any values.
+    """
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    records = [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+    assert records, f"no {_OVERRIDE_EVENT} record was emitted"
+    return getattr(records[-1], _FIELDS_ATTR)
+
+
+def _quoted_preview(best_ask: str) -> dict[str, Any]:
+    """A `CoinbaseClient.preview_order`-shaped dict carrying the venue's own book.
+
+    The real client maps `best_bid`/`best_ask` to `Decimal` when the venue returns them; the
+    default `FakeBroker` preview omits them, which is exactly the degraded shape the warning
+    code has to survive (a preview with no book is not an error, it is just not a reference).
+    """
+    return {
+        "order_total": Decimal("50.00"),
+        "commission_total": Decimal("0.30"),
+        "errs": [],
+        "warning": [],
+        "best_ask": Decimal(best_ask),
+    }
+
+
+class TestEntryOverrideWarningAtRouting:
+    """#260's minimum viable mitigation, at ROUTING time (the divergence class above reports
+    after the fill; this warns before/at placement).
+
+    Every entry is routed market (`_order_configuration` -> `market_market_ioc`), so a rule
+    whose `Setup.entry` encodes a CONDITION -- `pullback_continuation` demands follow-through
+    via `signal_candle.high + buffer_ticks` -- has that condition silently bypassed in
+    production. The warning makes the override visible using the one market price already in
+    the hot path: the `best_ask` the executor's own `preview_order` call just returned.
+    """
+
+    @staticmethod
+    def _intent(entry: str = "50000") -> OrderIntent:
+        return OrderIntent(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            qty=Decimal("0.001"),
+            entry=Decimal(entry),
+            stop=Decimal("49000"),
+            notional=Decimal("50"),
+            is_dca=False,
+            rule_kind="pullback_continuation",
+        )
+
+    def test_routing_an_offset_entry_warns_loudly_at_warning_level(self, repo, caplog) -> None:
+        """The pullback case: entry ABOVE the market by more than the threshold.
+
+        50,300 intended against a 50,000 ask is +60bp -- beyond `ENTRY_OVERRIDE_WARN_BP` -- so
+        the order the rule meant to make conditional is about to go out unconditional, and the
+        log must say so at WARNING (loud, not the divergence class's after-the-fact INFO).
+        """
+        broker = FakeBroker(preview=_quoted_preview("50000"))
+        signal = _enter_signal(_setup(entry=Decimal("50300")))
+
+        with caplog.at_level(logging.WARNING):
+            execute(signal, broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        fields = _override_fields(caplog)
+        assert fields["rule"] == "pullback_continuation"
+        assert fields["product"] == "BTC-USD"
+        assert fields["expected_fill"] == "50300"
+        assert fields["market_ref"] == "50000"
+        assert fields["deviation_bps"] == "60.00"
+        assert fields["market_ref_source"] == "preview_best_ask"
+        # The sentence is the point: an operator must read WHAT was overridden, not just that
+        # a number differed -- the event id alone cannot say "your rule's design was bypassed".
+        assert "OVERRIDDEN" in fields["detail"]
+        assert "market" in fields["detail"]
+        records = [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+        assert records[-1].levelno == logging.WARNING
+
+    def test_a_deviation_within_the_threshold_is_silent(self, repo, caplog) -> None:
+        """A warning that fires every order is a warning nobody reads.
+
+        50,010 against a 50,000 ask is +2bp -- the microstructure drift any enter-at-close rule
+        (`turtle_breakout`, `rsi_meanrev`) accumulates by routing one cycle after its signal
+        bar. That is noise, and noise must not train the operator to skip this line.
+        """
+        broker = FakeBroker(preview=_quoted_preview("50000"))
+        signal = _enter_signal(_setup(entry=Decimal("50010")))
+
+        with caplog.at_level(logging.WARNING):
+            execute(signal, broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+    def test_exactly_at_the_threshold_does_not_warn(self, caplog) -> None:
+        """The boundary is pinned: strictly greater than `ENTRY_OVERRIDE_WARN_BP` warns.
+
+        `>` rather than `>=` so an operator comparing a logged deviation against the documented
+        threshold reads "warned" as "beyond", never "at". Computed FROM the constant so this
+        test keeps pinning the boundary if the constant is ever retuned.
+        """
+        from keel.execution.executor import (
+            ENTRY_OVERRIDE_WARN_BP,
+            _warn_if_market_routing_overrides_entry,
+        )
+
+        market = Decimal("50000")
+        at_the_line = market * (Decimal(1) + ENTRY_OVERRIDE_WARN_BP / Decimal(10_000))
+
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry=str(at_the_line)), _quoted_preview("50000")
+            )
+
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+    def test_entry_below_market_warns_with_a_negative_sign(self, caplog) -> None:
+        """The other direction: a rule whose entry rests BELOW the market (a limit at support).
+
+        49,700 intended against a 50,000 ask is -60bp. Signed so direction is legible without
+        recomputing: positive = the rule demanded follow-through ABOVE the market (pullback's
+        case), negative = it wanted a dip the market has not offered.
+        """
+        from keel.execution.executor import _warn_if_market_routing_overrides_entry
+
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="49700"), _quoted_preview("50000")
+            )
+
+        fields = _override_fields(caplog)
+        assert fields["deviation_bps"] == "-60.00"
+        assert fields["expected_fill"] == "49700"
+
+    def test_a_preview_without_a_book_quote_is_silent_not_fatal(self, caplog) -> None:
+        """No `best_ask`, no honest reference -- and a warning built on a guess would be noise.
+
+        The default `FakeBroker` preview shape (no bid/ask keys) models a degraded venue
+        response; the cycle must proceed exactly as before this warning existed.
+        """
+        from keel.execution.executor import _warn_if_market_routing_overrides_entry
+
+        bookless = FakeBroker()._preview  # the default shape: no best_bid/best_ask keys
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(self._intent(entry="50300"), bookless)
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="50300"),
+                {**_quoted_preview("50000"), "best_ask": "not-a-number"},
+            )
+
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+    def test_the_port_preview_shape_is_read_too(self, caplog) -> None:
+        """`preview` arrives as the port's `Preview` once Phase B migrates the call, and the
+        Coinbase adapter carries the same book in `detail` -- the warning must survive the
+        migration (values are strings there, not Decimals)."""
+        from keel_broker_api.results import Preview
+
+        from keel.execution.executor import _warn_if_market_routing_overrides_entry
+
+        preview = Preview(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            est_base_size=Decimal("0.001"),
+            est_quote_size=Decimal("50"),
+            est_fee=Decimal("0.30"),
+            synthetic=False,
+            detail={"best_ask": "50000"},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(self._intent(entry="50300"), preview)
+
+        assert _override_fields(caplog)["market_ref"] == "50000"
+
+    def test_sell_intents_never_warn(self, caplog) -> None:
+        """Only the ENTRY routing is the override. A SELL intent's `entry` is a trigger or an
+        average cost, and the bracket/scale-out configurations carry their prices to the venue
+        verbatim -- warning there would be noise about orders that were NOT overridden."""
+        from keel.execution.executor import _warn_if_market_routing_overrides_entry
+
+        sell_intent = OrderIntent(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            qty=Decimal("0.001"),
+            entry=Decimal("40000"),  # 20,000bp off the ask -- deliberately absurd
+            stop=None,
+            notional=Decimal("50"),
+            is_dca=False,
+            rule_kind="position_rule",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(sell_intent, _quoted_preview("50000"))
+
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+    def test_an_explicitly_non_market_configuration_never_warns(self, caplog) -> None:
+        """A caller that passes its own order configuration (the bracket, a stop roll, and any
+        FUTURE resting-entry routing from #260's remediation plan) is not on the
+        market-override path -- its prices reach the venue, and this warning must not fire."""
+        from keel.execution.executor import _warn_if_market_routing_overrides_entry
+
+        resting = {"limit_limit_gtc": {"base_size": "0.001", "limit_price": "50300"}}
+
+        with caplog.at_level(logging.WARNING):
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="50300"), _quoted_preview("50000"), resting
+            )
+
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]

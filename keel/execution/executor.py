@@ -51,6 +51,16 @@ something guarded itself), so it is the one broker call this module makes ahead 
 gate; `_fetch_available_quote` swallows any exception from the call and returns `None`, which
 rail 13 then treats as fail-closed (vetoes the BUY) exactly like an unknown balance from a
 missing quote-currency account. SELL intents never fetch a balance (the rail exempts them).
+
+**Entry routing is unconditional market (#258, #260).** Every signal -- whatever its
+`Setup.entry` encodes -- is routed as an immediate market order; the rule's entry price is
+recorded on the order row as `expected_fill` and then not used to execute. #258 pinned that as
+the faithful-engine decision; #260 records the cost (`pullback_continuation`, whose
+`signal_candle.high + buffer_ticks` entry is a follow-through filter, took 124 trades
+market-filled where the rule intended 58, at gross PF 0.7736 vs 0.9219) and deliberately
+defers resting-order routing until a price-conditional rule earns it. What is NOT deferred is
+visibility: `_warn_if_market_routing_overrides_entry` logs at WARNING whenever a routed entry
+sits materially off the venue's own book, so the override is visible rather than silent.
 """
 
 from __future__ import annotations
@@ -468,6 +478,21 @@ def _run_order(
         mode=mode,
     )
 
+    # #260: ROUTING AN ENTRY AS MARKET OVERRIDES WHATEVER CONDITION THE RULE ENCODED IN ITS
+    # ENTRY PRICE. That is deliberate twice over. It is the behavior #258's faithful-engine
+    # decision pinned -- live and the simulator agree that every signal becomes an immediate
+    # market order, and the rule's own entry is recorded as `expected_fill` and then not used
+    # to execute. And it is deliberately unchanged here, because #260's full remediation
+    # (resting limit/stop orders, reconciliation across cycles, a cancel/replace policy) is
+    # deferred until a price-conditional rule earns it -- the only rule whose entry currently
+    # encodes a condition (`pullback_continuation`) is independently measured dead, and
+    # upgrading money-moving order routing to rescue it is a bad trade. What is NOT deferred
+    # is visibility: the landmine is the NEXT rule, which would be silently mis-executed the
+    # same way. So the moment the venue's own book -- the `best_ask` in the preview just
+    # fetched, no extra call -- says the intended entry is materially off the market, say so
+    # at WARNING, before the confirm gate and before placement.
+    _warn_if_market_routing_overrides_entry(intent, preview, order_configuration)
+
     if mode == "confirm":
         approved = confirm_fn(preview) if confirm_fn is not None else False
         if not approved:
@@ -653,7 +678,122 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
     )
 
 
+#: The routing-time entry-override visibility threshold, in basis points (#260).
+#:
+#: A VISIBILITY threshold, not a correctness one: crossing it changes no order, only whether
+#: the operator is told. Anchored in this repo's own cost model, where a fill is priced at a
+#: 1.2% taker fee per leg (`strategy/backtest.TAKER_FEE_PCT`) plus 5bp of slippage
+#: (`cli._SIM_SLIPPAGE_PCT`). Against that, a deviation of a few bp is microstructure -- the
+#: drift any enter-at-close rule (`turtle_breakout`, `rsi_meanrev`) accumulates by routing one
+#: cycle after its signal bar -- while tens of bp means the rule's entry encodes a CONDITION:
+#: `pullback_continuation` enters at `signal_candle.high + buffer_ticks`, which sits above
+#: the market by however much follow-through the rule demands, and THAT gap is what market
+#: routing silently removes (#260 measured it: 124 trades taken where the rule intended 58).
+#: 50bp sits between the two: 10x the slippage assumption, so ordinary noise can never trip
+#: it, yet small enough that any deliberate entry condition -- at least a fraction of a bar's
+#: range from spot, by construction -- does. The comparison is strictly greater: a deviation
+#: exactly at the line is "at", not "beyond", and logs nothing.
+ENTRY_OVERRIDE_WARN_BP = Decimal("50")
+
+
+def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
+    """The venue's best ask out of a preview response, in whichever of its two shapes.
+
+    Both shapes already cross this module (`ConfirmFn`'s docstring explains why they coexist):
+    the pre-port `CoinbaseClient.preview_order` dict, which maps `best_ask` to a `Decimal`, and
+    the port's `Preview`, whose Coinbase adapter carries the same book as a string inside
+    `detail`. `None` when the venue returned no usable ask -- a degraded response, not an
+    error, and nothing downstream may compute a deviation against a guess.
+    """
+    raw: Any = None
+    if isinstance(preview, Mapping):
+        raw = preview.get("best_ask")
+    else:
+        detail = getattr(preview, "detail", None)
+        raw = detail.get("best_ask") if detail is not None else None
+    if raw is None:
+        return None
+    try:
+        ask = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return ask if ask > 0 else None
+
+
+def _warn_if_market_routing_overrides_entry(
+    intent: OrderIntent,
+    preview: Preview | dict[str, Any] | None,
+    order_configuration: dict[str, Any] | None = None,
+) -> None:
+    """WARNING, at routing time, when a BUY's intended entry is materially off the market.
+
+    #260's minimum viable mitigation. Every entry is routed `market_market_ioc` (#258's
+    faithful-engine decision), so a rule whose `Setup.entry` encodes a condition has that
+    condition bypassed in production -- `pullback_continuation` demands follow-through via
+    `signal_candle.high + buffer_ticks`, and the faithful measurement showed live taking 124
+    trades the rule meant to decline at gross PF 0.7736 (vs 0.9219 intended). This reclaims
+    only the VISIBILITY, the same principle as #247 printing the fee rate: the operator can
+    see, order by order, which rule's design the routing overrode.
+
+    The market reference is the venue's own `best_ask` from the preview `_run_order` JUST
+    fetched -- the price a market BUY actually pays, drawn from the one book quote already in
+    the hot path (no new broker call; a mid would understate the deviation by half the
+    spread). Below `ENTRY_OVERRIDE_WARN_BP` nothing is logged: a warning that fires every
+    order is a warning nobody reads.
+
+    Scoped to BUYs on the market configuration only. SELL intents (exits, brackets, stop
+    rolls) either carry no entry condition or hand their prices to the venue verbatim, and a
+    caller passing its own non-market `order_configuration` -- a future resting order out of
+    #260's remediation plan -- is not on the override path at all. Never raises: telemetry
+    must not be able to fail a routing. `deviation_bps` is signed, positive meaning the rule
+    intended to enter ABOVE the market (follow-through demanded, pullback's case), negative
+    below it (a dip the market has not offered).
+    """
+    if preview is None or intent.side != Side.BUY:
+        return
+    if order_configuration is None:
+        # Same resolution `_run_order` performs: no explicit configuration means the default
+        # routing, which today is always market.
+        order_configuration = _order_configuration(intent)
+    config_type = next(iter(order_configuration), "")
+    if not config_type.startswith("market_"):
+        return
+    ref = _preview_best_ask(preview)
+    if ref is None:
+        return
+    try:
+        expected = Decimal(str(intent.entry))
+    except (InvalidOperation, TypeError, ValueError):
+        return
+    if expected <= 0:
+        return
+    deviation_bps = (expected - ref) / ref * Decimal(10_000)
+    if abs(deviation_bps) <= ENTRY_OVERRIDE_WARN_BP:
+        return
+    log_event(
+        logger,
+        logging.WARNING,
+        "executor.entry_override_market_routed",
+        rule=intent.rule_kind,
+        product=intent.product_id,
+        expected_fill=str(expected),
+        market_ref=str(ref),
+        market_ref_source="preview_best_ask",
+        deviation_bps=f"{deviation_bps:.2f}",
+        threshold_bps=f"{ENTRY_OVERRIDE_WARN_BP:.2f}",
+        detail=(
+            "the rule's conditional entry price was OVERRIDDEN -- entries are always routed "
+            "as market orders (#258), so the condition this rule encoded in its entry price "
+            "was bypassed and the order is going out at the venue's price instead (#260)"
+        ),
+    )
+
+
 def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
+    # Routed MARKET unconditionally (#258's faithful-engine decision): `expected_fill` below
+    # records the rule's intended entry even though execution ignores it -- the override
+    # #260's routing-time warning (`_warn_if_market_routing_overrides_entry` in `_run_order`)
+    # exists to make visible rather than silent.
     return dict(
         mode="live",
         product_id=intent.product_id,
