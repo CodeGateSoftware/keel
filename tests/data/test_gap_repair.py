@@ -252,6 +252,56 @@ def test_unexplained_gap_count_excludes_proven_absences(repo):
     assert repair_mod.unexplained_gap_count(repo, "BTC-USD", Granularity.ONE_DAY) == 0
 
 
+def test_unexplained_gap_count_default_still_reads_the_whole_series(repo):
+    """Pin the default: no `start_ts` means the WHOLE series, exactly as before the parameter
+    existed.
+
+    `--fail-on-gaps` judges this default. A hole older than any fetch window is still a hole
+    `repair_series` will probe (it reads the whole series itself), so the flag's count must
+    keep seeing it -- narrowing the default here would silently narrow the flag.
+    """
+    _seed(repo, missing={2, 7})
+    assert repair_mod.unexplained_gap_count(repo, "BTC-USD", Granularity.ONE_DAY) == 2
+
+
+def test_unexplained_gap_count_bounded_ignores_holes_before_start_ts(repo):
+    """With `start_ts`, only holes at/after the boundary count.
+
+    The fetch display subtracts this number from `coverage()`'s gap count, and `coverage()`
+    counts gaps over `get_candles(.., requested_start_ts, None)` -- so the two counts must
+    describe the SAME slice or the subtraction goes negative (see the field repro in
+    `tests/data/test_fetch_cli.py`).
+    """
+    _seed(repo, missing={2, 7})
+    boundary = _BASE + 5 * _DAY  # between the two holes
+    bounded = repair_mod.unexplained_gap_count(
+        repo, "BTC-USD", Granularity.ONE_DAY, start_ts=boundary
+    )
+    assert bounded == 1  # only the hole at index 7; the one at index 2 is before the window
+
+
+def test_a_hole_straddling_start_ts_is_invisible_to_the_bounded_count(repo):
+    """The honest boundary caveat, pinned.
+
+    A hole whose span crosses `start_ts` is seen by the bounded read only in its in-window
+    remainder, which is NOT interior to the bounded slice (the bar before the hole falls
+    outside the window), so neither the bounded gap count nor this count can see it -- and a
+    `candle_gap_probes` record keyed by the whole-series window does not apply to any window
+    the bounded view does see. The conservative direction: the window display can only
+    UNDER-report a hole that crosses its own start boundary, never claim one absent, and the
+    whole-series default above still sees it for `--fail-on-gaps`.
+    """
+    _seed(repo, missing={4, 5, 6})
+    boundary = _BASE + 5 * _DAY  # inside the hole
+    bounded = repair_mod.unexplained_gap_count(
+        repo, "BTC-USD", Granularity.ONE_DAY, start_ts=boundary
+    )
+    assert bounded == 0
+    # The docstring's closing claim, asserted for THIS fixture: the whole-series default
+    # still sees all three bars, so `--fail-on-gaps` keeps its un-narrowed scope.
+    assert repair_mod.unexplained_gap_count(repo, "BTC-USD", Granularity.ONE_DAY) == 3
+
+
 def test_a_shifted_window_is_treated_as_new_and_re_probed(repo):
     """Conservative on purpose: exact-key matching only.
 

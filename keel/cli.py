@@ -328,16 +328,22 @@ def _assess_products(
 ) -> list[tuple[freshness_mod.Freshness, int]]:
     """Read-only sweep over every (product, granularity). No network.
 
-    Returns `(freshness, unexplained_gaps)` -- the second being missing bars NOT yet proven
-    absent at the venue. `--fail-on-gaps` judges that number, not the raw gap count, because a
-    hole the venue genuinely does not have can never be closed and would keep the alert red
-    forever.
+    Returns `(freshness, unexplained_gaps)`, BOTH bounded to the same window starting at
+    `start_ts`. That shared window is the point: `_print_freshness` subtracts the second from
+    `freshness.gaps`, and `coverage()` counts those gaps over `get_candles(.., start_ts, None)`
+    -- so an unexplained count taken over the WHOLE series goes negative the moment bars are
+    missing older than `start_ts`. The field saw exactly that on 2026-08-17 (`keel fetch`
+    printed `-2 proven absent at venue`: an impossible claim that made still-unexplained gaps
+    look reconciled). `--fail-on-gaps` does NOT judge this count -- it keeps whole-series
+    scope, see the `check` branch of `fetch`.
     """
     out: list[tuple[freshness_mod.Freshness, int]] = []
     for product in products:
         for granularity in _SIM_GRANULARITIES:
             info = history_mod.coverage(repo, product, granularity, start_ts)
-            unexplained = repair_mod.unexplained_gap_count(repo, product, granularity)
+            unexplained = repair_mod.unexplained_gap_count(
+                repo, product, granularity, start_ts
+            )
             out.append((freshness_mod.assess(info, now_ts, tolerance_bars), unexplained))
     return out
 
@@ -358,6 +364,10 @@ def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
         if row.missing:
             detail = "nothing cached"
         else:
+            # No max(0, ...) clamp: `unexplained` comes from the same window-bounded read as
+            # `row.gaps` (see `_assess_products`), so the subtraction is consistent by
+            # construction. A clamp would only re-hide the mismatch that once printed
+            # "-2 proven absent at venue" for a series with real unexplained gaps.
             proven = row.gaps - unexplained
             suffix = f" ({proven} proven absent at venue)" if proven else ""
             detail = f"{row.bars_behind} bars behind, {row.gaps} internal gaps{suffix}"
@@ -442,17 +452,26 @@ def fetch(
 
     if check:
         actionable = [r for r, _ in before if r.needs_fetch]
-        unexplained = [r for r, gaps in before if gaps > 0]
         if actionable:
             raise click.ClickException(f"{len(actionable)} series missing or stale")
+        # `--fail-on-gaps` judges the WHOLE series, not the window the display above is bounded
+        # to: a hole older than `start_ts` is invisible to those counts, yet `repair_series`
+        # probes holes wherever they sit, so it is still fixable, still unproven, and still
+        # this flag's business. That is also why `unexplained_gap_count`'s default stays
+        # whole-series -- the two calls differ on purpose, and this is the one place that
+        # wants the unbounded number.
+        unexplained = sum(
+            repair_mod.unexplained_gap_count(repo, product, granularity) > 0
+            for product in product_list
+            for granularity in _SIM_GRANULARITIES
+        )
         if unexplained and fail_on_gaps:
             raise click.ClickException(
-                f"{len(unexplained)} series have unexplained gaps -- run `keel fetch "
-                "--repair-gaps`"
+                f"{unexplained} series have unexplained gaps -- run `keel fetch --repair-gaps`"
             )
         if unexplained:
             click.echo(
-                f"\nall series current. {len(unexplained)} have UNEXPLAINED gaps -- run "
+                f"\nall series current. {unexplained} have UNEXPLAINED gaps -- run "
                 "`keel fetch --repair-gaps` to probe them."
             )
         else:

@@ -308,6 +308,161 @@ def test_repair_gaps_runs_the_repair_pass(tmp_path, valid_config_path, monkeypat
     assert "repairing interior gaps" in result.output
 
 
+# -- the gap-proven suffix must share the fetch window (field repro, 2026-08-17) ---------------
+#
+# `keel fetch` printed, for real series:
+#
+#     GAPS  SOL-USD  ONE_DAY  n=1819  0 bars behind, 5 internal gaps (-1 proven absent at venue)
+#
+# A NEGATIVE "proven absent" count is an impossible claim -- you cannot prove fewer than zero
+# gaps absent -- and it masked the real state: the suffix subtracted a WHOLE-SERIES unexplained
+# count from a WINDOW-BOUNDED gap count, so bars missing older than the fetch window drove the
+# number negative and the still-unexplained in-window gaps looked reconciled. The two counts
+# must describe the same slice.
+
+
+class _FrozenClock:
+    """Fixed `time` stand-in for `keel.cli`, so the rendered line is deterministic.
+
+    `fetch` reads `now_ts` itself, so a real clock can cross a bar boundary between the test
+    seeding its fixture and the command computing `bars_behind` -- midnight-aligned so ONE_DAY
+    bars land exactly on the window edge.
+    """
+
+    def __init__(self, now_ts: int):
+        self._now_ts = now_ts
+
+    def time(self) -> float:
+        return float(self._now_ts)
+
+    def sleep(self, seconds: float) -> None:
+        return None
+
+
+_NOW = 1_799_971_200  # midnight UTC, day-aligned
+_START = _NOW - 365 * _DAY  # what `fetch --years 1` computes as the window start
+
+
+def _seed_sol_field_repro(repo: Repository) -> None:
+    """SOL-USD ONE_DAY with the field's exact shape: (a) an in-window hole recorded absent in
+    `candle_gap_probes`, (b) an in-window hole NOT recorded, and (c) a 2-bar hole entirely
+    OLDER than the fetch window."""
+    day = Granularity.ONE_DAY
+    last_day = _NOW - _DAY  # newest complete bar: 0 bars behind
+
+    # (c): 8 bars ending the day before the window starts, with a 2-bar hole inside them.
+    old = [_START - i * _DAY for i in range(1, 11) if i not in (5, 6)]
+    # (a)+(b): every window bar, minus one hole at +10d and one at +20d.
+    n_window_days = (last_day - _START) // _DAY + 1
+    window = [
+        _START + i * _DAY
+        for i in range(n_window_days)
+        if i not in (10, 20)
+    ]
+    _seed(repo, "SOL-USD", day, old + window)
+
+    # The venue was asked about the +10d hole and had nothing -- as `repair_series` records.
+    repo.record_gap_probe("SOL-USD", day, _START + 10 * _DAY, _START + 10 * _DAY, 1, _NOW)
+
+    # ONE_HOUR current, so `--check` is not distracted by a missing series.
+    last_hour = _NOW - _HOUR
+    _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(48)])
+
+
+def test_the_gap_suffix_shares_the_fetch_window_so_it_cannot_go_negative(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The exact rendered line for the field fixture.
+
+    Window-bounded truth: 2 in-window gaps, exactly 1 of them proven absent. The 2 bars
+    missing BEFORE the window must perturb neither number -- under the old whole-series
+    subtraction they turned the suffix into `(-1 proven absent at venue)`, and the unproven
+    +20d hole rode along looking reconciled.
+    """
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_sol_field_repro(repo)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path),
+         "fetch", "--check", "--years", "1", "--products", "SOL-USD"],
+    )
+
+    assert (
+        "  GAPS     SOL-USD      ONE_DAY   n=363     0 bars behind, "
+        "2 internal gaps (1 proven absent at venue)" in result.output
+    ), result.output
+    # The whole-series truth the display no longer pretends to state: bars are still missing
+    # outside the window, and the closing message still says so.
+    assert "1 have UNEXPLAINED gaps" in result.output
+
+
+def test_every_assessed_row_keeps_proven_absent_never_negative(tmp_path, monkeypatch):
+    """`row.gaps >= unexplained` in every `_assess_products` row, by construction.
+
+    The two counts now read the same window, so `proven = gaps - unexplained` cannot go
+    negative -- the field printed `(-2 proven absent at venue)` from exactly this pair
+    disagreeing about scope. Pinned directly so the invariant survives refactors of the
+    renderer that no longer visibly subtract.
+    """
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_sol_field_repro(repo)
+
+    rows = cli_module._assess_products(repo, ["SOL-USD"], _NOW, _START, tolerance_bars=2)
+    assert rows, "fixture must assess something for this test to mean anything"
+    for row, unexplained in rows:
+        assert row.gaps >= unexplained, (row.product, row.granularity, row.gaps, unexplained)
+
+
+def test_fail_on_gaps_still_judges_holes_older_than_the_fetch_window(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`--fail-on-gaps` scope is deliberately UNCHANGED: the whole series.
+
+    The window display cannot see a hole before `start_ts` (neither of its counts covers it),
+    but `repair_series` probes holes wherever they sit, so such a hole is still fixable, still
+    unproven, and must still fail the strict check. Narrowing the flag to the window would
+    green-light a series the repair command itself still lists work for. Born green, on
+    purpose: it pins preserved semantics, not the regression the sibling tests reproduce.
+    """
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+
+    # Current and CONTIGUOUS inside the window (displays "ok"); 4 bars missing before it.
+    last_day = _NOW - _DAY
+    n_window_days = (last_day - _START) // _DAY + 1
+    _seed(
+        repo,
+        "SOL-USD",
+        Granularity.ONE_DAY,
+        [_START - 6 * _DAY, _START - _DAY]
+        + [_START + i * _DAY for i in range(n_window_days)],
+    )
+    _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [_NOW - _HOUR - i * _HOUR for i in range(48)])
+
+    args = ["--db", str(db_path), "--config", str(valid_config_path),
+            "fetch", "--check", "--years", "1", "--products", "SOL-USD"]
+
+    plain = CliRunner().invoke(cli, args)
+    assert plain.exit_code == 0, plain.output
+    # The display is window-bounded and honest about it: the day series shows "ok"...
+    assert "  ok       SOL-USD      ONE_DAY   n=365     0 bars behind, 0 internal gaps" in (
+        plain.output
+    )
+    # ...while the whole-series judgment still counts the outside-window hole.
+    assert "1 have UNEXPLAINED gaps" in plain.output
+
+    strict = CliRunner().invoke(cli, [*args, "--fail-on-gaps"])
+    assert strict.exit_code != 0
+    assert "unexplained gaps" in strict.output
+
+
 # -- --products validation: a SHAPE error is fatal, a SETTLEMENT mismatch is not ---------------
 #
 # Feasibility study R2, corrected. Validating `--products` where the operator types it is right
