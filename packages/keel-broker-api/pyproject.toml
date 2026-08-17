@@ -12,7 +12,7 @@ dependencies = ["keel-core==0.7.1"]
 conformance = ["pytest>=9.1.1"]
 
 [build-system]
-requires = ["uv_build>=0.10.4,<0.11.0"]
+requires = ["uv_build>=0.10.4,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
