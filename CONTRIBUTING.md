@@ -145,9 +145,9 @@ not from the 24/7 responsiveness a large project can imply:
 - **Issues** are triaged within **3 days** (a label and a first reply; a fix may take
   longer, and the triage will say so).
 - **PRs** get a first review within **a week** when the gates pass. A slower review is
-  not a no — it is a week.
-- **Security reports** follow [`SECURITY.md`](SECURITY.md)'s SLA (acknowledge in 3 days,
-  severity and plan in 14), privately, and take precedence over everything here.
+  not a no.
+- **Security reports** follow [`SECURITY.md`](SECURITY.md)'s SLA, privately, and take
+  precedence over everything here.
 
 ## Licence: why Apache-2.0
 

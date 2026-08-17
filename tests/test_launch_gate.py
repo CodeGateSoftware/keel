@@ -67,7 +67,7 @@ def test_the_gate_document_exists_and_states_the_rule():
     """
     text = _unwrapped(_read(_DOC))
     assert text, f"{_DOC} must exist -- the gate is a document, not a feeling"
-    assert _NOTHING_BEFORE_THE_GATE in text.lower() or _NOTHING_BEFORE_THE_GATE in text, (
+    assert _NOTHING_BEFORE_THE_GATE in text.lower(), (
         f"{_DOC} must state the rule verbatim: {_NOTHING_BEFORE_THE_GATE!r}"
     )
 
@@ -111,11 +111,13 @@ def test_the_announcement_plan_states_the_real_numbers():
             "verdict, not a rounder figure that flatters it"
         )
     # launch.md lives in docs/, so its live link target is experiments/... relative to
-    # itself; the pin checks the link that actually resolves on GitHub, and the file
-    # existence check below keeps that link honest against renames.
-    assert "experiments/2026-08-13-restated-under-a-production-faithful-engine.md" in text, (
-        f"{_DOC} must link the experiment record beside the numbers -- the link target as "
-        "it resolves from docs/launch.md"
+    # itself. Pinned WITH the markdown link delimiter, so a docs/experiments/... form
+    # (which would not resolve from docs/launch.md) cannot satisfy it; the file
+    # existence check below keeps the link honest against renames.
+    record_link = "](experiments/2026-08-13-restated-under-a-production-faithful-engine.md)"
+    assert record_link in _read(_DOC), (
+        f"{_DOC} must link the experiment record as a markdown link with a doc-relative "
+        "target -- the form that actually resolves from docs/launch.md"
     )
     assert (_ROOT / _EXPERIMENT_RECORD).is_file(), (
         "the experiment record the gate cites no longer exists -- update the link"
@@ -157,22 +159,33 @@ def test_the_plan_states_the_non_goal():
 def test_the_announcement_draft_leads_with_the_engine_and_the_honest_result():
     """A ready-to-adapt draft exists, and it says the two things the plan demands.
 
-    The draft must lead with the compliance engine (not 'a trading bot') and carry the
-    measured result in the post body itself -- plus the boundary and the no-review
-    stance, the two facts any trust decision will be made on.
+    The assertions are scoped to the DRAFT ITSELF (the blockquote between 'The draft'
+    and 'The non-goal'), not the whole document -- the same phrases appear in the plan
+    above, and a draft whose body was deleted would pass a doc-wide check. The draft
+    must lead with the compliance engine (not 'a trading bot': asserted by position),
+    carry the measured result, and state the boundary and the no-review stance.
     """
-    draft = _unwrapped(_read(_DOC))
-    assert "draft" in _read(_DOC).lower(), f"{_DOC} must contain the announcement draft"
+    raw = _read(_DOC)
+    start = raw.find("### The draft")
+    end = raw.find("## The non-goal")
+    assert start >= 0 and end > start, (
+        f"{_DOC} must contain the announcement draft as its own section"
+    )
+    draft = _unwrapped(raw[start:end]).lower()
     for pin in (
         "compliance",
         "0 of 90",
         "not a fatwa engine",
-        "No scholarly review",
+        "no scholarly review",
     ):
-        assert pin.lower() in draft.lower(), (
+        assert pin in draft, (
             f"the announcement draft in {_DOC} must say {pin!r} -- the post is where the "
             "honest claims live, not only the repo"
         )
+    assert draft.index("engine") < draft.index("bot"), (
+        "the draft must LEAD with the engine: 'engine' before 'bot', or the post opens "
+        "as a trading-bot announcement with a compliance footnote"
+    )
 
 
 def test_contributing_states_the_solo_maintainer_response_commitment():

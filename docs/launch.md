@@ -25,8 +25,8 @@ the last box, in the order given, and never before.
   the document as a plan, not a claim (#318/#289).
 - [x] **The Arabic entry point** — `README.ar.md` with the switcher, terminology exact,
   scope stated (#319/#290).
-- [x] **CI green on `main`** — both matrix legs (3.11, 3.14), and the merge gate
-  (`test` context) enforced.
+- [x] **CI green on `main`** — both matrix legs (3.11, 3.14; the legs came in #301), and
+  the merge gate (`test` context) has been the required context since #268.
 - [x] **The code-quality scans actually configured** — tokenless and always on
   (#320): Dependabot over every manifest, a weekly `pip-audit` over the exported lock,
   CodeQL on Python. `code-quality.yml` remains the optional Sonar/Snyk tier for if those
@@ -34,7 +34,7 @@ the last box, in the order given, and never before.
   `packages/*` Dependabot entries share the root `uv.lock` — confirm they are live in
   the Dependabot log; if inert, collapse to the root entry.
 - [x] **A maintainer response commitment that is honest for one person, stated in
-  `CONTRIBUTING.md`** — triage in days, PR review in weeks-not-days when life is loud,
+  `CONTRIBUTING.md`** — issues triaged within 3 days, PRs first-reviewed within a week,
   security routed to `SECURITY.md`'s SLA.
 
 ## The audience, in order
@@ -80,16 +80,16 @@ the Arabic README.
 > execution.** The project's point is the enforcement machinery and the honest
 > measurement, not a claim of alpha.
 >
-> Two things it is not: **keel is not a fatwa engine** — it enforces the ruling you
-> supply, so two operators following different schools get different answers from the
-> same code, by design. And **no scholarly review of keel's fiqh basis has occurred** —
-> the basis is one operator's sourced reading, published as docs/fiqh-basis.md precisely
-> so it can be audited and challenged; the review path is defined and the review itself
-> is not claimed.
+> Two things it is not: **keel is not a fatwa engine. It is an enforcement engine for a
+> ruling you supply.** So two operators following different schools get different
+> answers from the same code, by design. And **no scholarly review of keel's fiqh basis
+> has occurred** — the basis is one operator's sourced reading, published as
+> docs/fiqh-basis.md precisely so it can be audited and challenged; the review path is
+> defined and the review itself is not claimed.
 >
 > There is an Arabic entry point (README.ar.md), the fiqh basis document with its
-> sources, and nine good-first-issues open. If you want an auditable screening engine
-> and are willing to help build one: https://github.com/CodeGateSoftware/keel
+> sources, and good-first-issues open. If you want an auditable screening engine and are
+> willing to help build one: https://github.com/CodeGateSoftware/keel
 
 ## The non-goal
 
