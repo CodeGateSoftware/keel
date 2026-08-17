@@ -944,6 +944,81 @@ def test_simulate_no_fetch_produces_report_and_never_touches_network(tmp_path, m
     assert "coverage" in result.output.lower()
 
 
+def _seed_liquidity_stratified_candles(repo: Repository, now_ts: int) -> None:
+    """The #259 fixture: three allowlist products at deliberately different liquidity, so the
+    simulate path's per-product slippage has something to scale from.
+
+    BTC's daily bars carry volume*close == 500,000,000 == the mapping's anchor (-> the 5bp
+    floor); PAXG's carry 100 (-> the 50bp cap); ETH has NO daily bars cached at all (-> the
+    flat fallback, flagged). Hourly bars exist for all three so the account pass runs.
+    """
+    hour = now_ts - (now_ts % 3600)
+
+    def _series(volume: str, bars: int, step: int) -> list[Candle]:
+        return [
+            Candle(
+                ts=hour - i * step,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal(volume),
+            )
+            for i in range(bars - 1, -1, -1)
+        ]
+
+    for product in ("BTC-USD", "ETH-USD", "PAXG-USD"):
+        repo.upsert_candles(product, Granularity.ONE_HOUR, _series("1", 73, 3600))
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _series("5000000", 6, 86400))
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, _series("1", 6, 86400))
+    # ETH-USD: hourly only -- deliberately no daily bars.
+
+
+def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monkeypatch):
+    """#259: the simulate path prints -- and writes into the report -- the per-product slippage
+    its edge-table numbers were actually priced at, with fallback products flagged.
+
+    A profit factor printed without its assumed slippage has the same problem a profit factor
+    printed without its fee rate had (#247): the reader cannot check the number.
+    """
+    db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
+    repo = _repo_at(db_path)
+    _seed_liquidity_stratified_candles(repo, int(time.time()))
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # The terminal states what was assumed per product, from the cached candles alone.
+    assert "slippage" in result.output.lower()
+    assert "BTC-USD" in result.output and "5.0bp" in result.output
+    assert "PAXG-USD" in result.output and "50.0bp" in result.output and "capped" in result.output
+    assert "ETH-USD" in result.output and "fallback" in result.output
+    assert "no liquidity statistic" in result.output
+
+    # And the report file carries the same table beside the fee line.
+    report_text = out_path.read_text()
+    assert "1.2000%" in report_text
+    assert "BTC-USD" in report_text and "5.0bp" in report_text
+    assert "PAXG-USD" in report_text and "50.0bp" in report_text
+    assert "ETH-USD" in report_text and "no liquidity statistic" in report_text
+    assert "assumption, not a measurement" in report_text
+
+
 def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monkeypatch):
     """A second `--no-fetch` run over the same persistent DB reuses the cached candles with no
     network -- `_build_broker` must never be constructed either time."""

@@ -29,6 +29,7 @@ from keel.sim.report import (
     render_markdown,
 )
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, compute_tier_fee_result
+from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT, SlippageAssumption
 from keel.strategy.promotion import TREND_FOLLOW, PromotionConfig, floor_for_class
 from keel.strategy.rules.base import Rule, Setup, Trade
 from keel.strategy.stats import BacktestResult
@@ -131,6 +132,64 @@ def test_edge_table_missing_asset_candles_yields_empty_result_not_crash():
     edge = edge_table([rule], candles_by_asset={}, fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
     assert edge["one_shot:SOL"].n_trades == 0
     assert edge[POOLED_KEY].n_trades == 0
+
+
+def test_edge_table_threads_per_product_slippage_into_each_rules_backtest():
+    """#259: `slippage_by_product` must reach the per-rule `backtest()` calls -- two rules on
+    identical candle shapes, priced differently because their PRODUCTS' liquidity differs.
+
+    The resolver receives the rule's product id; anything it does not know falls back to the
+    flat rate (pinned in the sibling test below).
+    """
+    rules = [
+        _OneShotRule(
+            "BTC-USD", _HOUR, entry=Decimal("100"), stop=Decimal("90"), target=Decimal("120")
+        ),
+        _OneShotRule(
+            "TON-USD", _HOUR, entry=Decimal("100"), stop=Decimal("90"), target=Decimal("120")
+        ),
+    ]
+    candles_by_asset = {
+        "BTC": {Granularity.ONE_HOUR: _winning_series("BTC")},
+        "TON": {Granularity.ONE_HOUR: _winning_series("TON")},
+    }
+
+    def _resolver(product_id: str) -> Decimal:
+        return Decimal("0.0005") if product_id == "BTC-USD" else Decimal("0.005")
+
+    edge = edge_table(
+        rules,
+        candles_by_asset,
+        fee_pct=Decimal("0"),
+        slippage_pct=SLIPPAGE_FLOOR_PCT,
+        slippage_by_product=_resolver,
+    )
+
+    # Both fill at bar 2's open (100); only the assumed slippage differs.
+    assert edge["one_shot:BTC"].trades[0].entry == Decimal("100") * Decimal("1.0005")
+    assert edge["one_shot:TON"].trades[0].entry == Decimal("100") * Decimal("1.005")
+
+
+def test_edge_table_without_a_resolver_prices_every_rule_at_the_flat_rate():
+    """Omitting `slippage_by_product` must reproduce the flat-rate run exactly (#259's
+    existing-caller guarantee, at the edge_table layer rather than the engine's)."""
+    rule = _OneShotRule(
+        "BTC-USD", _HOUR, entry=Decimal("100"), stop=Decimal("90"), target=Decimal("120")
+    )
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: _winning_series("BTC")}}
+
+    without = edge_table(
+        [rule], candles_by_asset, fee_pct=Decimal("0"), slippage_pct=SLIPPAGE_FLOOR_PCT
+    )
+    with_flat_resolver = edge_table(
+        [rule],
+        candles_by_asset,
+        fee_pct=Decimal("0"),
+        slippage_pct=SLIPPAGE_FLOOR_PCT,
+        slippage_by_product=lambda pid: SLIPPAGE_FLOOR_PCT,
+    )
+
+    assert without["one_shot:BTC"].trades[0].pnl == with_flat_resolver["one_shot:BTC"].trades[0].pnl
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +728,59 @@ def test_edge_table_says_so_loudly_when_the_fee_was_not_recorded():
     md = "\n".join(_render_edge_section({POOLED_KEY: _pooled_result()}, None))
 
     assert "not recorded" in md.lower()
+
+
+def test_edge_section_without_slippage_rows_keeps_the_legacy_fee_line():
+    """A caller that has not adopted per-product slippage (#259) must get the byte-identical
+    fee line it always got -- the new parameter extends the section, it does not rewrite it."""
+    md = "\n".join(_render_edge_section({POOLED_KEY: _pooled_result()}, Decimal("0.012")))
+
+    assert "Fills priced at **1.2000%** per leg (taker) plus slippage." in md
+    assert "BTC-USD" not in md  # no per-product table was asked for
+
+
+def test_edge_section_states_the_per_product_slippage_actually_applied():
+    """A profit factor without its assumed slippage has the same problem a profit factor without
+    its fee rate had (#259): the number cannot be checked by the person reading it.
+
+    The section must render, beside the fee line: one row per product with the volume statistic
+    and the assumed bp; the cap flag; the fallback flag for products with no statistic; and the
+    assumption stated AS an assumption, with its parameters recoverable.
+    """
+    rows = [
+        SlippageAssumption("BTC-USD", Decimal("571268510"), Decimal("0.0005")),
+        SlippageAssumption("TON-USD", Decimal("369944"), Decimal("0.005")),
+        SlippageAssumption("ETH-USD", None, Decimal("0.0005")),
+    ]
+
+    md = "\n".join(_render_edge_section({POOLED_KEY: _pooled_result()}, Decimal("0.012"), rows))
+
+    # The fee line still travels with the numbers...
+    assert "1.2000%" in md
+    # ...and the slippage now does too: per-product rows with volume and bp.
+    assert "BTC-USD" in md and "571,268,510" in md and "5.0bp" in md
+    assert "TON-USD" in md and "369,944" in md and "50.0bp" in md
+    assert "capped" in md
+    # Fallback products are flagged, not silently priced.
+    assert "ETH-USD" in md and "fallback" in md and "no liquidity statistic" in md
+    # The mapping is stated as an assumption with its parameters, per the rule that a number
+    # whose assumptions cannot be recovered is not evidence.
+    assert "assumption, not a measurement" in md
+    assert "5.0bp" in md and "50.0bp" in md  # floor and cap, stated in the note
+
+
+def test_render_markdown_carries_the_slippage_rows_into_the_written_report():
+    """The report FILE must carry the per-product slippage table, not just the terminal -- #259's
+    reporting requirement names the report alongside the results."""
+    rows = [
+        SlippageAssumption("BTC-USD", Decimal("571268510"), Decimal("0.0005")),
+        SlippageAssumption("WLD-USD", Decimal("1245626"), Decimal("0.005")),
+    ]
+
+    md = _minimal_render_markdown_args([], slippage_rows=rows)
+
+    assert "BTC-USD" in md and "5.0bp" in md
+    assert "WLD-USD" in md and "50.0bp" in md and "capped" in md
 
 
 def test_render_markdown_out_of_sample_label():

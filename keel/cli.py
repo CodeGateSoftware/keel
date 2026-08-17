@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1761,6 +1761,71 @@ _SIM_GRANULARITIES = [Granularity.ONE_HOUR, Granularity.ONE_DAY]
 _DAYS_PER_YEAR = 365
 
 
+def _slippage_assumptions(
+    candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
+    products: list[str],
+    rule_products: list[str],
+    fallback_pct: Decimal,
+) -> tuple[list[backtest_mod.SlippageAssumption], Callable[[str], Decimal]]:
+    """Per-product slippage for the edge pass (#259), from candles the run already loaded.
+
+    Scales each product's rate from its OWN liquidity via `backtest.slippage_for_quote_volume`
+    (the mapping's parameters and their rationale live there), with the statistic computed by
+    the ONE definition (`screen_mod.median_daily_quote_volume`) over the product's cached
+    ONE_DAY bars in the sim window -- no new data source, no network. A product with no daily
+    bars falls back to the flat rate and is flagged as such, so the report says "fallback (no
+    liquidity statistic)" rather than passing the flat 5bp off as a measured verdict.
+
+    Returns the rows to print/report and the resolver `edge_table` prices fills with. The
+    resolver is total: any product id it is not holding (a rule bound outside `--products`)
+    answers `fallback_pct`, never `KeyError` -- absent data is the fallback case, not a crash.
+    """
+    by_product: dict[str, Decimal] = {}
+    rows: list[backtest_mod.SlippageAssumption] = []
+    for product in sorted(set(products) | set(rule_products)):
+        asset = _sim_asset(product)
+        daily = candles_by_asset.get(asset, {}).get(Granularity.ONE_DAY, [])
+        if daily:
+            median = screen_mod.median_daily_quote_volume(daily)
+            pct = backtest_mod.slippage_for_quote_volume(median)
+            rows.append(backtest_mod.SlippageAssumption(product, median, pct))
+        else:
+            pct = fallback_pct
+            rows.append(backtest_mod.SlippageAssumption(product, None, pct))
+        by_product[product] = pct
+
+    def _resolve(product_id: str) -> Decimal:
+        return by_product.get(product_id, fallback_pct)
+
+    return rows, _resolve
+
+
+def _print_slippage_assumptions(rows: list[backtest_mod.SlippageAssumption]) -> None:
+    """Echo the per-product slippage the edge pass is about to price at (#259).
+
+    Terminal twin of the report's table: the numbers are assumptions, so they are stated
+    loudly enough that an operator comparing two runs cannot miss that they were priced
+    differently.
+    """
+    click.echo(
+        "assumed slippage per leg (scaled from median daily quote volume; "
+        f"floor {backtest_mod.SLIPPAGE_FLOOR_PCT * 10000:.1f}bp, "
+        f"cap {backtest_mod.SLIPPAGE_CAP_PCT * 10000:.1f}bp, anchor "
+        f"${backtest_mod.SLIPPAGE_REFERENCE_QUOTE_VOLUME:,.0f}/day -- "
+        "an assumption, not a measurement):"
+    )
+    for row in rows:
+        if row.fallback:
+            click.echo(f"  {row.product_id}: {row.slippage_pct * 10000:.1f}bp "
+                       "(fallback: no liquidity statistic)")
+        else:
+            note = " (capped)" if row.capped else ""
+            click.echo(
+                f"  {row.product_id}: median volume {row.median_daily_quote_volume:,.0f} "
+                f"-> {row.slippage_pct * 10000:.1f}bp{note}"
+            )
+
+
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
     """`--products` for `fetch`/`simulate`: a malformed id is refused, a cross-settled one warns.
 
@@ -2101,7 +2166,22 @@ def simulate(
     # below rather than left for the reader to assume.
     sim_fee_pct = _sim_fee_pct(config)
 
-    edge = report_mod.edge_table(rules, candles_by_asset, sim_fee_pct, _SIM_SLIPPAGE_PCT)
+    # #259: the EDGE pass prices each product's fills from its own liquidity (the flat
+    # `_SIM_SLIPPAGE_PCT` remains the fallback for products without a statistic). The account
+    # pass and benchmarks below stay flat -- `SimAccount`'s cost model is unchanged by #259 --
+    # and the report says so beside the numbers (see `report._render_slippage_rows`).
+    slippage_rows, slippage_by_product = _slippage_assumptions(
+        candles_by_asset, product_list, [rule.product_id for rule in rules], _SIM_SLIPPAGE_PCT
+    )
+    _print_slippage_assumptions(slippage_rows)
+
+    edge = report_mod.edge_table(
+        rules,
+        candles_by_asset,
+        fee_pct=sim_fee_pct,
+        slippage_pct=_SIM_SLIPPAGE_PCT,
+        slippage_by_product=slippage_by_product,
+    )
 
     sim = portfolio_sim.run(
         rules,
@@ -2203,6 +2283,7 @@ def simulate(
         in_sample=True,
         tier_results=tier_results,
         fee_pct=sim_fee_pct,
+        slippage_rows=slippage_rows,
     )
 
     out = Path(out_path) if out_path is not None else _default_report_path(now_ts)
