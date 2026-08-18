@@ -6,7 +6,7 @@ license = "Apache-2.0"
 requires-python = ">=3.11"
 # Pinned `==`: see the note in the root `pyproject.toml`. An unpinned sibling is satisfied by
 # whatever is already installed, which is how a deployment ends up running mixed versions.
-dependencies = ["keel-core==0.9.0"]
+dependencies = ["keel-core==0.9.1"]
 
 [project.optional-dependencies]
 conformance = ["pytest>=9.1.1"]
