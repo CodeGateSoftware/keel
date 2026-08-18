@@ -35,9 +35,13 @@ a tail would change which setups fire and silently re-parameterize the rule. Ins
 by exactly the appended bars — the same arithmetic the pure functions perform, one bar at a
 time, so the results are bit-identical while each bar costs O(1) (amortized; O(gap) when a
 caller jumps the window forward, O(n) only when handed an unrelated series, which rebuilds).
-The new invariant: the state always describes exactly the prefix `[first_ts .. last_ts]` it
-validates against (length + both end timestamps), and any call that does not extend that
-prefix rebuilds from the pure functions rather than trusting stale numbers.
+The state is acquired LAZILY (`_state_for`, #363 finding 2): a bar the bounded
+`regime.detect_condition` gate declines never touches it, and the next state-consuming call
+extends across the whole skipped gap. The new invariant: the state always describes exactly
+the prefix `[first_ts .. last_ts]` it validates against — length, both end timestamps, AND
+the cached boundary bar's close (#363 finding 1: ts alone is not discriminating) — and any
+call whose window does not match or extend those anchors rebuilds from the pure functions
+rather than trusting stale numbers.
 """
 
 from __future__ import annotations
@@ -112,6 +116,7 @@ class _RunningState:
         "ema_tail",
         "first_close",
         "first_ts",
+        "last_close",
         "last_ts",
         "length",
         "phase_high",
@@ -133,11 +138,13 @@ class _RunningState:
         target_low: Decimal | None,
         atr_trs: list[float],
         atr_last: float,
+        last_close: Decimal,
     ) -> None:
         self.length = length
         self.first_ts = first_ts
         self.last_ts = last_ts
         self.first_close = first_close
+        self.last_close = last_close
         self.ema_tail = ema_tail
         self.phase_high = phase_high
         self.phase_low = phase_low
@@ -151,18 +158,53 @@ class _RunningState:
     def extends(self, candles: list[Candle]) -> bool:
         """True iff `candles` is this state's prefix plus >= 1 appended bars.
 
-        Validated by length and BOTH end timestamps rather than object identity: the
-        backtester hands each call a fresh `candles[: i + 1]` slice (new list, same
-        `Candle` objects) and the live engine refetches new `Candle` objects each cycle —
-        either way, ts are unique within one product's series, so a series that starts
-        where this one started and carries this state's last bar at this state's length
-        IS this state's prefix. A window that slid, shrank, or belongs to another series
-        fails the check and rebuilds.
+        Validated by four anchors — length, the first ts, and the cached boundary bar's
+        ts AND CLOSE — rather than object identity, because identity is unavailable (the
+        backtester hands each call a fresh `candles[: i + 1]` slice) and ts alone is not
+        discriminating (#363 finding 1): two different series can share `candles[0].ts`
+        and the ts at `length - 1` (different products on the same hourly grid), and a
+        repair can rewrite a bar's values in place under the same ts. The close anchor
+        catches both collision classes for the one bar where the cached state is most
+        exposed — its own boundary — at O(1) cost.
+
+        The residual, stated honestly: with these anchors, accidental staleness requires
+        a MID-SERIES rewrite that leaves both anchor bars (the first, and the cached
+        boundary bar) identical in ts and close. Where the callers actually stand on
+        that: `strategy.backtest` and `sim.portfolio_sim` feed prefixes/suffix-windows
+        of one fixed in-memory list that is never rewritten mid-run, and the live agent
+        rebuilds its Rule instances from scratch each cycle (`agent.py`'s per-cycle
+        `_build_rule`) — so nothing that can rewrite history mid-series reuses a cached
+        state today. A caller that upserts corrected bars into a series it also drives
+        this rule with must discard the rule's state when it rewrites.
+
+        Where extension fires at all: only `strategy.backtest` (strictly-growing
+        prefixes) and `sim.portfolio_sim`'s warm-up (its window grows bar-by-bar until
+        `WINDOW_BARS` fills, then slides — and a slide changes the first ts, so it
+        rebuilds by the first anchor). The live agent never extends; each cycle's rule
+        instance starts cold.
         """
         return (
             len(candles) > self.length
             and candles[0].ts == self.first_ts
             and candles[self.length - 1].ts == self.last_ts
+            and candles[self.length - 1].close == self.last_close
+        )
+
+    def matches(self, candles: list[Candle]) -> bool:
+        """True iff `candles` is anchor-identical to exactly the prefix this state
+        describes — same length, same first/last ts, same last close (#363 finding 3).
+
+        This is the same-window no-op of `_state_for`: a call that re-reads a window the
+        state already describes (the agent and portfolio_sim call `exit_signal` then
+        `detect` on one window within a cycle) reuses the resolved state unchanged —
+        no rebuild, no extend. When `len(candles) == self.length` the boundary bar IS
+        the last bar, so the anchors checked are the same four `extends` checks.
+        """
+        return (
+            len(candles) == self.length
+            and candles[0].ts == self.first_ts
+            and candles[-1].ts == self.last_ts
+            and candles[-1].close == self.last_close
         )
 
     # -- construction ----------------------------------------------------------
@@ -197,6 +239,7 @@ class _RunningState:
             target_low=candles[target_low_idxs[-1]].low if target_low_idxs else None,
             atr_trs=atr_trs,
             atr_last=indicators.atr(candles, period=_ATR_PERIOD)[-1],
+            last_close=candles[-1].close,
         )
 
     @staticmethod
@@ -240,7 +283,8 @@ class _RunningState:
         order, using the same arithmetic the pure functions use — see the class docstring
         for the exactness argument. O(1) per appended bar, so a one-bar step (the
         backtester's steady state) is O(1) and a skipped-ahead window pays only for the
-        bars it actually skipped.
+        bars it actually skipped — including a MULTI-bar gap left by calls whose gates
+        declined before touching state (#363 finding 2's lazy acquisition).
         """
         for j in range(self.length, len(candles)):
             c = candles[j]
@@ -282,6 +326,7 @@ class _RunningState:
 
         self.length = len(candles)
         self.last_ts = candles[-1].ts
+        self.last_close = candles[-1].close
 
 
 def _tail_aligned(fan_tail: dict[int, float], direction: indicators.Direction) -> bool:
@@ -329,29 +374,61 @@ class PullbackContinuation(Rule):
             "target_method": target_method,
         }
         # Running per-bar state for the full-series reads (see `_RunningState`/#352). None
-        # until the first call with >= 2 candles; `_sync` extends or rebuilds it from there.
+        # until the first call whose gates get past `regime.detect_condition` (#363 finding
+        # 2); `_state_for` then matches/extends/rebuilds it lazily from there.
         self._state: _RunningState | None = None
 
     # ------------------------------------------------------------------
     # Rule interface
     # ------------------------------------------------------------------
 
-    def _sync(self, candles: list[Candle]) -> _RunningState:
-        """Bring `self._state` up to `candles` — extend by the appended bars when the cached
-        prefix validates, rebuild from the pure functions otherwise — and return it.
+    def _state_for(self, candles: list[Candle]) -> _RunningState:
+        """Bring `self._state` up to `candles` — validate, extend, or rebuild — and return
+        it. This is the LAZY state-acquisition step `detect()`/`exit_signal()` call at
+        their first state-CONSUMING site, never at the top (#363 finding 2: acquiring
+        before the gates made every call pay the full O(n) `build()` even when the
+        bounded `regime.detect_condition` gate — lookback 20 — declined the bar three
+        lines later, measured 11.1 ms vs main's 1.8 ms per call (~6-8x, reviewer and
+        reproduction) on portfolio_sim's sliding 8,760-bar window). A bar whose gates
+        all decline early never touches state; the next
+        state-consuming call then sees a multi-bar gap, which `extends`/`extend` fold
+        bar-by-bar exactly (O(gap), pinned equal to the pure recompute by the tests).
 
-        Called at the top of `detect()`/`exit_signal()` BEFORE any gate can return early:
-        the state must advance on every bar of the driving loop, not only on bars that get
-        deep into the gate chain, or the next call would arrive with a multi-bar gap and
-        pay a full rebuild (#352's quadratic path) every time an early gate declined.
+        Idempotent within a call WITHOUT an object-identity memo: the first resolution in
+        a call leaves the state describing exactly `candles`, so every later
+        `_state_for(candles)` in that same call takes the O(1) `matches` path — one
+        `detect()` resolves (builds or extends) at most once. Identity is deliberately
+        NOT trusted across calls: the same list object can be rewritten in place
+        (finding 1), so the anchors are re-checked every time.
+
+        Three outcomes, cheapest-first:
+          - `matches` — same length and all four anchors: the state already describes
+            this window; return it unchanged, no rebuild, no extend (finding 3: the
+            agent and portfolio_sim call `exit_signal` then `detect` on the SAME window
+            within one cycle, and that second call must not pay a full rebuild).
+          - `extends` — strictly longer and the cached boundary bar still validates:
+            fold in the appended bars (O(1) each, O(gap) across a declined stretch).
+          - otherwise — rebuild from the pure functions (cold start, slid/shrunk window,
+            unrelated or rewritten series).
         """
         state = self._state
+        if state is not None and state.matches(candles):
+            return state
         if state is not None and state.extends(candles):
             state.extend(candles)
-        else:
-            state = _RunningState.build(candles, self.params["ema_periods"])
-            self._state = state
+            return state
+        state = _RunningState.build(candles, self.params["ema_periods"])
+        self._state = state
         return state
+
+    def _sync(self, candles: list[Candle]) -> _RunningState:
+        """Eager form of `_state_for` — resolve NOW and return the state. `detect()`/
+        `exit_signal()` do NOT call this (they acquire state lazily at each first
+        state-consuming site, #363 finding 2); it is the entry point the #352
+        equivalence tests drive directly and remains exactly the operation a caller
+        that needs the state up front wants.
+        """
+        return self._state_for(candles)
 
     def _phase(self, state: _RunningState, candles: list[Candle]) -> regime.Phase:
         """`regime.detect_phase(candles)` evaluated from the running state — same reads
@@ -369,20 +446,25 @@ class PullbackContinuation(Rule):
         return regime.Phase.PULLBACK
 
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
-        """Identify -> Predict -> Decide -> Execute (source-02 §2.0), bullish side only."""
+        """Identify -> Predict -> Decide -> Execute (source-02 §2.0), bullish side only.
+
+        State is acquired LAZILY (#363 finding 2): the bounded condition gate runs before
+        any `_state_for` call, so a non-BULLISH bar never pays the O(n) state work, and
+        every site below that does read a state value resolves it through
+        `_state_for(candles)` — at most one build/extend per call (see its docstring).
+        """
         candles = candles_by_tf.get(self.granularity, [])
         if len(candles) < 2:
             return None
-        state = self._sync(candles)
 
         # Identify: bullish condition + phase-two pullback.
         if regime.detect_condition(candles) != regime.Condition.BULLISH:
             return None
-        if self._phase(state, candles) != regime.Phase.PULLBACK:
+        if self._phase(self._state_for(candles), candles) != regime.Phase.PULLBACK:
             return None
 
         # Predict: EMA fan confirms trend likely to continue.
-        fan = state.ema_tail
+        fan = self._state_for(candles).ema_tail
         if not _tail_aligned(fan, "bullish"):
             return None
 
@@ -397,11 +479,11 @@ class PullbackContinuation(Rule):
 
         # Execute: buy-stop above the signal high, stop/target per the configured methods.
         entry = signal_candle.high + self.params["buffer_ticks"]
-        stop = self._compute_stop(state, signal_candle)
+        stop = self._compute_stop(self._state_for(candles), signal_candle)
         if stop is None or stop >= entry:
             return None
 
-        target = self._compute_target(state, entry, stop)
+        target = self._compute_target(self._state_for(candles), entry, stop)
         if target is None or target <= entry:
             return None
 
@@ -432,17 +514,19 @@ class PullbackContinuation(Rule):
         `held` is accepted per the `Rule` interface but unused: this rule's exit is the
         bearish-mirror pattern trigger itself (source-02 §2.1), not a stop/target check
         against the specific held setup (that's the backtester/paper trader's job).
+
+        State is acquired lazily exactly as in `detect()` (#363 finding 2): a non-BEARISH
+        bar declines at the bounded condition gate without paying any state work.
         """
         del held
         candles = candles_by_tf.get(self.granularity, [])
         if len(candles) < 2:
             return False
-        state = self._sync(candles)
 
         if regime.detect_condition(candles) != regime.Condition.BEARISH:
             return False
 
-        fan = state.ema_tail
+        fan = self._state_for(candles).ema_tail
         if not _tail_aligned(fan, "bearish"):
             return False
 

@@ -605,3 +605,221 @@ class TestHourlyBacktestSpeed:
         elapsed = time.monotonic() - start
         assert result.n_trades >= 0  # completed the full walk, not an error path
         assert elapsed < 60.0, f"1y hourly backtest took {elapsed:.1f}s (quadratic regressions?)"
+
+
+# ---------------------------------------------------------------------------
+# #363 -- review findings on the running state: anchor validation (finding 1),
+# lazy acquisition (finding 2), same-window reuse (finding 3)
+# ---------------------------------------------------------------------------
+#
+# An adversarial review of the #352 optimisation verified the arithmetic equivalence
+# (old == new, bit-identical) but found that `extends()` validated TIMESTAMPS only, that
+# `_sync()` ran the full O(n) build BEFORE the bounded `regime.detect_condition` gate
+# (an 8.5x per-call regression on portfolio_sim's sliding 8,760-bar window), and that the
+# same window fed to two calls in one cycle rebuilt twice. These tests pin the fixes.
+
+
+def _counting_build_spy(monkeypatch) -> dict[str, int]:  # type: ignore[no-untyped-def]
+    """Patch `_RunningState.build` with a counting wrapper; returns the counter dict.
+    `extend`/`matches` are NOT wrapped -- the point is to count full O(n) rebuilds."""
+    counts: dict[str, int] = {"builds": 0}
+    real_build = _RunningState.build.__func__
+
+    def counting_build(cls, candles, ema_periods):  # type: ignore[no-untyped-def]
+        counts["builds"] += 1
+        return real_build(cls, candles, ema_periods)
+
+    monkeypatch.setattr(_RunningState, "build", classmethod(counting_build))
+    return counts
+
+
+class TestAnchorValidation:
+    """#363 finding 1: ts-only anchors let a rewritten or colliding series validate.
+    The cached boundary bar's CLOSE is a fourth anchor -- a same-ts bar whose close
+    changed must fail `extends`/`matches` so the state REBUILDS instead of serving the
+    stale running values."""
+
+    def test_boundary_bar_close_rewritten_in_place_rebuilds_not_extends(self) -> None:
+        candles = _synthetic_hourly(3, 80)
+        periods = (8, 20, 50)
+        rule = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+        state = rule._sync(candles[:60])
+
+        # Rewrite the cached boundary bar (index length-1) in place: same ts, new close --
+        # the "repair upserts corrected values" shape. ts-only anchors still validate it.
+        rewritten = list(candles[:60])
+        boundary = rewritten[-1]
+        rewritten[-1] = Candle(
+            ts=boundary.ts,
+            open=boundary.open,
+            high=boundary.high,
+            low=boundary.low,
+            close=boundary.close + Decimal("7"),
+            volume=boundary.volume,
+        )
+        rewritten.extend(candles[60:70])
+        assert rewritten[0].ts == state.first_ts
+        assert rewritten[state.length - 1].ts == state.last_ts
+        assert rewritten[state.length - 1].close != state.last_close
+
+        assert state.extends(rewritten) is False
+
+        after = rule._sync(rewritten)
+        assert _state_snapshot(after) == _state_snapshot(_RunningState.build(rewritten, periods))
+        assert after.ema_tail == {
+            p: indicators.ema_fan(rewritten, periods=periods)[p][-1] for p in periods
+        }
+
+    def test_same_length_in_place_rewrite_rebuilds(self) -> None:
+        candles = _synthetic_hourly(3, 80)
+        rule = _rule()
+        periods = rule.params["ema_periods"]
+        rule._sync(candles[:60])
+
+        rewritten = list(candles[:60])
+        boundary = rewritten[-1]
+        rewritten[-1] = Candle(
+            ts=boundary.ts,
+            open=boundary.open,
+            high=boundary.high,
+            low=boundary.low,
+            close=boundary.close - Decimal("4"),
+            volume=boundary.volume,
+        )
+
+        after = rule._sync(rewritten)
+        assert _state_snapshot(after) == _state_snapshot(_RunningState.build(rewritten, periods))
+
+    def test_other_series_sharing_the_ts_grid_rebuilds_not_stale_serves(self) -> None:
+        # `_synthetic_hourly` always uses the same hourly ts grid, so seeds 3 and 4 share
+        # first_ts AND the ts at every index -- the "different product, same hourly grid"
+        # collision. ts-only anchors would let seed 4 validate against seed 3's state and
+        # serve seed 3's numbers; the close anchor must reject it.
+        a = _synthetic_hourly(3, 80)
+        b = _synthetic_hourly(4, 80)
+        periods = (8, 20, 50)
+        rule = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+        state = rule._sync(a[:60])
+
+        assert b[0].ts == state.first_ts
+        assert b[state.length - 1].ts == state.last_ts
+        assert b[state.length - 1].close != state.last_close
+        assert state.extends(b[:70]) is False
+
+        after = rule._sync(b[:70])
+        assert _state_snapshot(after) == _state_snapshot(_RunningState.build(b[:70], periods))
+
+
+class TestSameWindowReuse:
+    """#363 finding 3: the agent and portfolio_sim call `exit_signal` then `detect` on the
+    SAME window within one cycle (and tests/cycles repeat either call on one window). A
+    same-length, all-anchors-match window must reuse the resolved state -- no second
+    O(n) build."""
+
+    def test_exit_signal_then_detect_on_the_same_window_build_once_per_window(
+        self, monkeypatch
+    ) -> None:
+        counts = _counting_build_spy(monkeypatch)
+        rule = _rule()
+        held = rule.detect({Granularity.ONE_HOUR: _bullish_pullback_candles()})
+        assert held is not None  # BULLISH window: detect consumed state -> one build
+        assert counts["builds"] == 1
+
+        fires = rule.exit_signal(held, {Granularity.ONE_HOUR: _bearish_mirror_candles()})
+        assert fires is True  # BEARISH window: exit_signal consumed state -> second build
+        assert counts["builds"] == 2
+
+        # The same-window repeats of one cycle: no further builds, identical results.
+        assert rule.exit_signal(held, {Granularity.ONE_HOUR: _bearish_mirror_candles()}) is True
+        assert rule.detect({Granularity.ONE_HOUR: _bearish_mirror_candles()}) is None
+        assert counts["builds"] == 2
+
+    def test_detect_twice_on_the_same_window_builds_once_and_repeats_the_setup(
+        self, monkeypatch
+    ) -> None:
+        counts = _counting_build_spy(monkeypatch)
+        rule = _rule()
+        by_tf = {Granularity.ONE_HOUR: _bullish_pullback_candles()}
+
+        first = rule.detect(by_tf)
+        assert first is not None
+        assert counts["builds"] == 1
+
+        second = rule.detect(by_tf)
+        assert counts["builds"] == 1  # same-length anchor match: no rebuild, no extend
+        assert second == first
+
+
+class TestLazyStateAcquisition:
+    """#363 finding 2: state must be acquired LAZILY -- a bar the bounded
+    `regime.detect_condition` gate declines must not pay the O(n) build. Bars that
+    decline early leave the state behind; the next state-consuming call must EXTEND
+    across the whole gap and still match the pure recompute exactly."""
+
+    def test_condition_declined_bars_never_build_state(self, monkeypatch) -> None:
+        counts = _counting_build_spy(monkeypatch)
+        rule = _rule()
+        candles = _choppy_candles()
+
+        for n in range(2, len(candles) + 1):
+            assert regime.detect_condition(candles[:n]) != regime.Condition.BULLISH
+            assert rule.detect({Granularity.ONE_HOUR: candles[:n]}) is None
+
+        assert counts["builds"] == 0
+        assert rule._state is None
+
+    def test_exit_signal_declined_by_condition_never_builds_state(self, monkeypatch) -> None:
+        counts = _counting_build_spy(monkeypatch)
+        minter = _rule()
+        held = minter.detect({Granularity.ONE_HOUR: _bullish_pullback_candles()})
+        assert held is not None
+        assert counts["builds"] == 1
+
+        rule = _rule()  # a fresh instance: its state must stay untouched
+        assert rule.exit_signal(held, {Granularity.ONE_HOUR: _bullish_pullback_candles()}) is False
+        assert counts["builds"] == 1
+        assert rule._state is None
+
+    def test_state_consuming_call_after_declined_bars_extends_across_the_gap(
+        self, monkeypatch
+    ) -> None:
+        candles = _synthetic_hourly(99, 400)
+        conditions = [
+            regime.detect_condition(candles[:n]) for n in range(2, len(candles) + 1)
+        ]
+        bullish_ns = [
+            n for n, cond in enumerate(conditions, start=2)
+            if cond == regime.Condition.BULLISH
+        ]
+        # A passing bar, then >= 2 declining bars (the gap), then the next passing bar.
+        pair = next(
+            (n0, n1)
+            for i, n0 in enumerate(bullish_ns)
+            for n1 in bullish_ns[i + 1 :]
+            if n1 >= n0 + 3
+            and all(conditions[n - 2] != regime.Condition.BULLISH for n in range(n0 + 1, n1))
+        )
+        n0, n1 = pair
+
+        counts = _counting_build_spy(monkeypatch)
+        rule = _rule()
+        periods = rule.params["ema_periods"]
+
+        rule.detect({Granularity.ONE_HOUR: candles[:n0]})  # BULLISH: consumes state -> builds
+        assert counts["builds"] == 1
+        assert rule._state is not None
+        assert rule._state.length == n0
+
+        for n in range(n0 + 1, n1):  # the gap: every bar declined before touching state
+            rule.detect({Granularity.ONE_HOUR: candles[:n]})
+        assert counts["builds"] == 1
+        assert rule._state.length == n0  # left behind by the declined bars
+
+        rule.detect({Granularity.ONE_HOUR: candles[:n1]})  # BULLISH again: extends the gap
+        assert counts["builds"] == 1  # extend, NOT a rebuild
+        assert rule._state.length == n1
+
+        # The gap-extended state equals the pure recompute / a full rebuild exactly.
+        assert _state_snapshot(rule._state) == _state_snapshot(
+            _RunningState.build(candles[:n1], periods)
+        )
