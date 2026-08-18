@@ -479,7 +479,7 @@ wheels = [
 
 [[package]]
 name = "keel-broker-api"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "packages/keel-broker-api" }
 dependencies = [
     { name = "keel-core" },
@@ -499,7 +499,7 @@ provides-extras = ["conformance"]
 
 [[package]]
 name = "keel-broker-coinbase"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "packages/keel-broker-coinbase" }
 dependencies = [
     { name = "coinbase-advanced-py" },
@@ -516,7 +516,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-broker-fake"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "packages/keel-broker-fake" }
 dependencies = [
     { name = "keel-broker-api" },
@@ -531,7 +531,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-broker-robinhood"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "packages/keel-broker-robinhood" }
 dependencies = [
     { name = "keel-broker-api" },
@@ -550,7 +550,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-core"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "packages/keel-core" }
 dependencies = [
     { name = "python-dotenv" },
@@ -565,7 +565,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-trader"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
