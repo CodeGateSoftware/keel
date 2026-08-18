@@ -3053,7 +3053,7 @@ def test_activity_overlay_header_states_the_scope_under_the_title() -> None:
     texts = [line.text for line in build_activity_overlay(_scoped_activity_feed())]
 
     assert texts[0] == "keel tui -- activity"
-    assert texts[1].startswith("scope: today (")
+    assert texts[1].startswith("scope: today ")
     assert "1 older hidden" in texts[1]
     assert "press t to widen" in texts[1]
 
@@ -3149,7 +3149,7 @@ def test_run_live_activity_opens_scoped_to_today(
     run_live(open_state, lambda: NOW_TS, interval=0.01)
 
     painted = [call[2] for call in stdscr.calls]
-    assert any("scope: today (" in t for t in painted)
+    assert any("scope: today " in t for t in painted)
     assert any("rail veto: per_asset_concentration_cap" in t for t in painted)
     assert not any("XLM-USD" in t for t in painted)  # yesterday's, hidden
     assert any("1 older hidden" in t for t in painted)
@@ -3180,7 +3180,7 @@ def test_run_live_activity_t_widens_the_scope_to_reveal_the_earlier_day(
     run_live(open_state, lambda: NOW_TS, interval=0.01)
 
     painted = [call[2] for call in stdscr.calls]
-    assert any("scope: last 7 days (from " in t for t in painted)
+    assert any("scope: last 7 days from " in t for t in painted)
     assert any("all history in the window" in t for t in painted)
     assert any("XLM-USD" in t for t in painted)  # yesterday's cycle, now in scope
 
@@ -3212,7 +3212,7 @@ def test_run_live_activity_reopens_at_today_after_being_widened(
 
     painted = [call[2] for call in stdscr.calls]
     all_scope_frame = max(i for i, t in enumerate(painted) if "all history in the window" in t)
-    reopened_frame = max(i for i, t in enumerate(painted) if "scope: today (" in t)
+    reopened_frame = max(i for i, t in enumerate(painted) if "scope: today " in t)
 
     # The LAST activity frame painted is a `today` one, i.e. the reopen reset it.
     assert reopened_frame > all_scope_frame
