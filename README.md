@@ -16,6 +16,23 @@ The point of this project is the enforcement machinery and the honest measuremen
 runs through it, not a claim of alpha. A visitor who finds that out themselves feels misled;
 one who is told upfront can read it as rigour.
 
+**The cadence problem, and the pipeline built to solve it:** the promotion gate's 100-trade
+floor is honest only if the sample is collectable — and at the daily clock's measured
+2.15 signals per asset-year, it is 31–84 years away per asset. Waiting is not a slower
+path; it is no path. The same rules evaluated on `ONE_HOUR` bars fire **49.4 signals per
+asset-year** (median n=268 per rule-product over the 5-year cached window;
+[the hourly experiment](docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md)),
+so keel runs a third deployment profile — **paper-hourly**: its own database and config,
+one cycle per UTC hour, 19 allowlisted assets admitted through a measured 15-minute
+data-health screen — accruing **~940 entry signals per year pooled (~2.6/day)**, which
+puts the n=100 pooled forward-evidence review weeks away instead of decades (milestone
+[#353](https://github.com/CodeGateSoftware/keel/issues/353), scheduled 2026-09-30). The
+hourly configuration is **also measured net-negative** — that profile exists to collect
+admissible forward evidence (rail vetoes, outcomes, pending lifespans, intent divergence:
+the things a backtest cannot observe), not profit. The full story is in
+[the announcement](https://github.com/CodeGateSoftware/keel/discussions/359) and the
+[operator runbook](docs/operator-runbook.md).
+
 > **keel is not a fatwa engine. It is an enforcement engine for a ruling you supply.** keel
 > never derives a Shariah classification from market data. You record one — with a source and an
 > attributed name (`keel assets attest`) — and keel enforces it deterministically, rejecting
@@ -126,7 +143,7 @@ packages/
 ├── keel-broker-robinhood/     Robinhood adapter (optional venue)
 └── keel-broker-fake/          deliberately divergent fake venue, dev-only
 
-tests/                         ~2,800 tests, including the port's conformance suite
+tests/                         ~3,000 tests, including the port's conformance suite
 ```
 
 A new broker plugs in as a package under `packages/keel-broker-*`, implementing the
@@ -141,7 +158,8 @@ adapter, deliberately divergent, that the conformance suite runs against.
   and how to disagree.
 - [`docs/operator-runbook.md`](docs/operator-runbook.md) — operating a deployment: the
   account-level compliance obligations no rail can enforce, deploying/upgrading releases,
-  and the paper-vs-live distinctions (two accounts that share nothing).
+  and the three deployment profiles — daily paper, live, and the hourly evidence profile —
+  and their distinctions (accounts that share nothing).
 - [`docs/go-live-runbook.md`](docs/go-live-runbook.md) — the first supervised live order.
 - [`docs/experiments/`](docs/experiments) — the experiment record, including the honest
   result linked above; every document states what was measured, on what engine, with the
