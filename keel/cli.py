@@ -326,9 +326,18 @@ cli.add_command(db_group)
 
 
 def _assess_products(
-    repo: Repository, products: list[str], now_ts: int, start_ts: int, tolerance_bars: int
+    repo: Repository,
+    products: list[str],
+    granularities: list[Granularity],
+    now_ts: int,
+    start_ts: int,
+    tolerance_bars: int,
 ) -> list[tuple[freshness_mod.Freshness, int]]:
     """Read-only sweep over every (product, granularity). No network.
+
+    `granularities` is whatever the caller is keeping current -- `fetch` passes
+    `config.market_data.granularities`, so the sweep judges exactly the series the warm step
+    fetches and the agent polls.
 
     Returns `(freshness, unexplained_gaps)`, BOTH bounded to the same window starting at
     `start_ts`. That shared window is the point: `_print_freshness` subtracts the second from
@@ -341,7 +350,7 @@ def _assess_products(
     """
     out: list[tuple[freshness_mod.Freshness, int]] = []
     for product in products:
-        for granularity in _SIM_GRANULARITIES:
+        for granularity in granularities:
             info = history_mod.coverage(repo, product, granularity, start_ts)
             unexplained = repair_mod.unexplained_gap_count(
                 repo, product, granularity, start_ts
@@ -448,7 +457,15 @@ def fetch(
     product_list = _parse_products_option(products, config)
     start_ts = now_ts - years * _DAYS_PER_YEAR * 86400
 
-    before = _assess_products(repo, product_list, now_ts, start_ts, tolerance_bars)
+    # fetch is the data pipeline: it warms exactly what this deployment polls, i.e.
+    # `config.market_data.granularities` -- the same list `agent` and `monitor` use -- so the
+    # runbook's `keel fetch` warm step honestly covers the FIFTEEN_MINUTE confirmation series
+    # every shipped config lists. `simulate` deliberately keeps `_SIM_GRANULARITIES`
+    # ([ONE_HOUR, ONE_DAY]) instead: that pair is the backtest ENGINE's supported timeframes,
+    # an engine limit rather than a data choice (Issue #349).
+    granularities = list(config.market_data.granularities)
+
+    before = _assess_products(repo, product_list, granularities, now_ts, start_ts, tolerance_bars)
     click.echo(f"data cached in: {ctx.obj['db_path']}")
     _print_freshness(before)
 
@@ -465,7 +482,7 @@ def fetch(
         unexplained = sum(
             repair_mod.unexplained_gap_count(repo, product, granularity) > 0
             for product in product_list
-            for granularity in _SIM_GRANULARITIES
+            for granularity in granularities
         )
         if unexplained and fail_on_gaps:
             raise click.ClickException(
@@ -492,7 +509,7 @@ def fetch(
         client,
         repo,
         product_list,
-        _SIM_GRANULARITIES,
+        granularities,
         years,
         now_ts,
         sleep_fn=time.sleep,
@@ -502,7 +519,7 @@ def fetch(
     if repair_gaps:
         click.echo("\nrepairing interior gaps...")
         for product in product_list:
-            for granularity in _SIM_GRANULARITIES:
+            for granularity in granularities:
                 outcome = repair_mod.repair_series(
                     client,
                     repo,
@@ -524,7 +541,9 @@ def fetch(
                 for error in outcome.errors:
                     click.echo(f"    error: {error}", err=True)
 
-    after = _assess_products(repo, product_list, now_ts, start_ts, tolerance_bars)
+    after = _assess_products(
+        repo, product_list, granularities, now_ts, start_ts, tolerance_bars
+    )
     click.echo("\nafter fetch:")
     _print_freshness(after)
     if freshness_mod.any_needs_fetch([r for r, _ in after]):

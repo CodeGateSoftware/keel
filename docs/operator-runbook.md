@@ -282,7 +282,8 @@ done
 # easily and fails on EDGE (the net-negative finding above), so force is deliberate here and
 # the warning it prints is the caveat restated:
 keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules promote --force <id>
-# Warm the candle cache (ONE_HOUR/ONE_DAY/FIFTEEN_MINUTE x 365d) before the first cycle:
+# Warm the candle cache before the first cycle — fetch honors the config's
+# market_data.granularities (ONE_HOUR/ONE_DAY/FIFTEEN_MINUTE x 365d here):
 keel --config config.paper-hourly.yaml --db keel-paperhourly.db fetch
 ```
 
