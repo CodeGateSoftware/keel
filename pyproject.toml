@@ -54,6 +54,7 @@ members = ["packages/*"]
 keel-core = { workspace = true }
 keel-broker-api = { workspace = true }
 keel-broker-coinbase = { workspace = true }
+keel-broker-alpaca = { workspace = true }
 keel-broker-fake = { workspace = true }
 keel-broker-robinhood = { workspace = true }
 
@@ -85,6 +86,11 @@ dev = [
     # so the conformance suite actually runs against it in CI. Users who want the venue install
     # `keel-broker-robinhood` themselves and entry-point discovery picks it up.
     "keel-broker-robinhood",
+    # Dev-only for the same reason as Robinhood: Alpaca is an optional venue (the Phase 12
+    # equities milestone). It rides the dev group so the conformance suite runs against it
+    # in CI; a deployment that wants equities installs `keel-broker-alpaca` itself and
+    # entry-point discovery picks it up. Nothing in `keel/` imports it.
+    "keel-broker-alpaca",
 ]
 
 # Ruff config lives in ruff.toml at the repo root. A ruff.toml takes precedence over
@@ -115,6 +121,7 @@ warn_redundant_casts = true
 [[tool.mypy.overrides]]
 module = [
     "keel_broker_api.*",
+    "keel_broker_alpaca.*",
     "keel_broker_coinbase.*",
     "keel_broker_fake.*",
     "keel_broker_robinhood.*",
@@ -159,7 +166,7 @@ ignore_errors = true
 
 # Coverage is measured only when `--cov` is passed (see the pytest-cov note in [dependency-groups]).
 # This section exists so that a bare `--cov` -- with no value -- measures the right thing instead of
-# whatever happened to get imported: the shipped code under `keel/` and the five workspace packages,
+# whatever happened to get imported: the shipped code under `keel/` and the workspace packages,
 # and nothing else. `tests/` is excluded because a test file's own coverage is a tautology, and
 # `scripts/` because those are one-shot operator tools the suite does not drive.
 [tool.coverage.run]

@@ -191,7 +191,8 @@ responsible for your own trading decisions. Licensed under
 [Apache-2.0](LICENSE).
 
 **Trademarks:** Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
-keel is not affiliated with, endorsed by, or sponsored by any of them. Every `keel-broker-*`
+keel has no affiliation with any of them, no endorsement from any of them, and no
+sponsorship from any of them. Every `keel-broker-*`
 package is an independent, original open-source implementation of keel's broker port against
 that venue's publicly documented API — a client of the venue, not a product of it. Venue
 names appear here solely to identify what the code talks to.
