@@ -2212,3 +2212,78 @@ class TestMaxSpreadEntryGate:
         assert result.placed is False
         assert result.vetoed_by == [SPREAD_GATE_VETO]
         assert broker.place_calls == []
+
+    def test_extreme_magnitude_books_are_refused_not_swallowed(self, repo, caplog) -> None:
+        """The arithmetic arm of fail-closed: a book whose sides PARSE, are finite, and are
+        positive can still make the spread itself uncomputable. Decimal admits extreme
+        exponents (`1E+999999999` constructs and compares fine -- #336's lesson, mirrored by
+        #332's sibling test above), and `bid + ask` on such magnitudes raises Overflow; a
+        subnormal pair can round the mid to zero and raise DivisionByZero on the divide.
+        #332's warning SWALLOWS both (telemetry must never fail a routing); a money gate
+        must REFUSE on them -- an uncomputable spread is an unreadable book, never an abort
+        and never a pass."""
+        huge = FakeBroker(preview=_book_preview(Decimal("1E+999999999"), Decimal("9E+999999999")))
+
+        with caplog.at_level(logging.WARNING):
+            result = execute(
+                _enter_signal(), huge, repo, _config(), "autonomous", now_ts=NOW_TS
+            )
+
+        assert result.placed is False
+        assert result.vetoed_by == [BOOK_UNREADABLE_VETO]
+        assert "spread uncomputable" in (result.reason or "")
+        assert huge.place_calls == []
+
+        # A subnormal pair: the sum rounds to one ulp, half of which half-even rounds the mid
+        # to ZERO, while the difference survives as nonzero -- so `(ask - bid) / mid` raises
+        # DivisionByZero. Both raises are ArithmeticErrors; both must land in the same
+        # fail-closed arm, refusing (not crashing) exactly like the overflow case.
+        subnormal = FakeBroker(
+            preview=_book_preview(Decimal("4E-1000028"), Decimal("1.44E-1000026"))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            refused = execute(
+                _enter_signal(), subnormal, repo, _config(), "autonomous", now_ts=NOW_TS
+            )
+
+        assert refused.placed is False
+        assert refused.vetoed_by == [BOOK_UNREADABLE_VETO]
+        assert "spread uncomputable" in (refused.reason or "")
+        assert subnormal.place_calls == []
+        fields = _gate_fields(caplog, _BOOK_UNREADABLE_EVENT)
+        assert fields["product"] == "BTC-USD"
+        assert fields["veto"] == BOOK_UNREADABLE_VETO
+
+    def test_a_wide_book_refuses_in_confirm_mode_without_ever_consulting_the_approver(
+        self, repo
+    ) -> None:
+        """Gate BEFORE confirm, pinned: every other gate test runs autonomous, which never
+        exercises the ordering. Here a wide-book BUY runs in `mode="confirm"` with an
+        approver attached -- and is STILL refused, with the approver NEVER consulted: the
+        spread gate sits upstream of the confirm gate in `_run_order`, so a human (or any
+        approving `confirm_fn`) cannot approve around a book the gate judged too wide. A
+        gate an operator could overrule is a suggestion, not a gate."""
+        consulted: list[dict] = []
+
+        def _approve(preview) -> bool:  # would approve -- and must never get the chance
+            consulted.append(preview)
+            return True
+
+        broker = FakeBroker(preview=_book_preview(Decimal("50000"), Decimal("50300")))
+
+        result = execute(
+            _enter_signal(_setup(entry=Decimal("50150"))),  # at the mid: isolate the GATE
+            broker,
+            repo,
+            _config(),
+            mode="confirm",
+            confirm_fn=_approve,
+            now_ts=NOW_TS,
+        )
+
+        assert result.placed is False
+        assert result.vetoed_by == [SPREAD_GATE_VETO]
+        assert broker.place_calls == []
+        assert repo.get_orders() == []
+        assert consulted == []

@@ -632,7 +632,8 @@ def summarise_cycle(cycle_id: str | None, events: Sequence[ActivityEvent]) -> Ac
       counting `engine.setup_detected` for a cycle whose `signals_evaluated` records fell outside
       the read window.
     * `blocked` -- entries that did NOT become an order: an `agent.enter_evaluated` with
-      `placed=false` (rails vetoed it, or the confirm gate declined), plus an
+      `placed=false` (rails vetoed it, the routing-time entry-spread gate refused the live
+      BUY's book, or the confirm gate declined), plus an
       `agent.entry_bar_not_ready` (withheld before it was ever evaluated). One per entry, never
       one per *reason* -- the PAXG cycle of 2026-08-08 trips two guards on a single signal, and
       reporting `blocked=2` there would imply two setups where there was one.
