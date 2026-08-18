@@ -192,7 +192,7 @@ and has already produced one. Establish which account a number came from before 
 | config | `config.paperforward.yaml` | `config.live-sandbox.yaml` | `config.paper-hourly.yaml` |
 | database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) | `keel-paperhourly.db` (must be passed) |
 | `auto_trade.mode` | `paper` | `confirm` | `paper` |
-| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | same 8 as paper |
+| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | paper's 8 + 11 Tier-2 = 19 (#351) |
 | `caps.max_exposure_usd` | 5000 | 200 | 5000 |
 | money spent | synthetic `paper_cash_usdc` | the real broker balance | synthetic `paper_cash_usdc` |
 | sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy | the hourly account's own equity |
@@ -273,7 +273,7 @@ no rules to evaluate):
 keel migrate --db keel-paperhourly.db        # schema only; never seeds
 # Seed the hourly rules. `rules seed` cannot do this (it writes each kind's constructor
 # defaults, i.e. daily), so add each row with the one param that makes it hourly:
-for p in BTC ETH PAXG SOL XLM LTC ADA LINK; do
+for p in BTC ETH PAXG SOL XLM LTC ADA LINK ZEC NEAR AVAX UNI FET ICP DOT CRV ALGO BCH DOGE; do
   keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules add \
     --kind turtle_breakout --product "${p}-USD" --params '{"granularity": "ONE_HOUR"}'
 done
@@ -286,6 +286,14 @@ keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules promote --
 # market_data.granularities (ONE_HOUR/ONE_DAY/FIFTEEN_MINUTE x 365d here):
 keel --config config.paper-hourly.yaml --db keel-paperhourly.db fetch
 ```
+
+**The 2026-08-17 expansion (#351): 8 → 19 assets.** The 11 additions above — ZEC, NEAR, AVAX,
+UNI, FET, ICP, DOT, CRV, ALGO, BCH, DOGE — each passed a 15-minute data-health screen over 90
+days (coverage ≥ 95.98%, zero zero-volume bars; results recorded in the issue), and each sits at
+a flat 2% target weight: the sizing half of the spread guardrail whose live-path half is #350's
+spread gate. The 8 incumbents keep their relative shape rescaled to 78% total (rules and params
+untouched, so their evidence stays comparable across the expansion). Paperforward — the daily
+profile — deliberately stays at 8 so its evidence remains a like-for-like 8-asset series.
 
 **The rows differ from every other turtle row by one param.** `params.granularity: "ONE_HOUR"`
 — `TurtleBreakout`'s declared trading timeframe, persisted the way `RsiMeanReversion.timeframe`
