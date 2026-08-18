@@ -22,6 +22,7 @@ from tests.conftest import VALID_CONFIG_YAML
 _DAY = 86400
 _HOUR = 3600
 _FIFTEEN = 900
+_ASSETS = ("BTC", "ETH", "PAXG")
 
 
 def _repo_at(db_path: Path) -> Repository:
@@ -45,6 +46,38 @@ def _seed(repo: Repository, product: str, granularity: Granularity, timestamps) 
     repo.upsert_candles(product, granularity, [_candle(ts) for ts in timestamps])
 
 
+def _seed_current(
+    repo: Repository,
+    assets: tuple[str, ...] = _ASSETS,
+    *,
+    day_lag: int = 0,
+    skip_day: int | None = None,
+) -> None:
+    """Seed every configured granularity, 30 bars each, up to the newest COMPLETE bar.
+
+    `day_lag` ages only the ONE_DAY series by that many bars (the tolerance fixture);
+    `skip_day` drops that day's bar to punch one internal hole (the gap fixtures).
+    """
+    now = int(time.time())
+    last_day = (now // _DAY) * _DAY - (1 + day_lag) * _DAY
+    last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
+    days = [last_day - i * _DAY for i in range(30) if i != skip_day]
+    for asset in assets:
+        product = f"{asset}-USD"
+        _seed(repo, product, Granularity.ONE_DAY, days)
+        _seed(repo, product, Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)])
+        _seed(repo, product, Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(30)])
+
+
+def _seed_stale_days(repo: Repository, assets: tuple[str, ...] = _ASSETS) -> None:
+    """ONE_DAY only and 40 days behind, so exactly one series is present and it is stale."""
+    now = int(time.time())
+    stale_day = (now // _DAY) * _DAY - 40 * _DAY
+    for asset in assets:
+        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [stale_day - i * _DAY for i in range(30)])
+
+
 class _ExplodingBroker:
     """Any use of the network in `--check` mode is a bug, so make it loud."""
 
@@ -63,22 +96,8 @@ def test_check_reports_current_series_and_exits_zero(
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
     # Seed right up to the newest COMPLETE bar for every configured granularity.
-    last_day = (now // _DAY) * _DAY - _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
-        _seed(
-            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
-        )
-        _seed(
-            repo,
-            f"{asset}-USD",
-            Granularity.FIFTEEN_MINUTE,
-            [last_q - i * _FIFTEEN for i in range(30)],
-        )
+    _seed_current(repo)
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
@@ -95,10 +114,7 @@ def test_check_exits_nonzero_when_stale_so_a_scheduler_can_alert(
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    stale_day = (now // _DAY) * _DAY - 40 * _DAY
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [stale_day - i * _DAY for i in range(30)])
+    _seed_stale_days(repo)
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
@@ -132,23 +148,8 @@ def test_check_reports_gaps_without_failing_unless_asked(
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    last_day = (now // _DAY) * _DAY - _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    for asset in ("BTC", "ETH", "PAXG"):
-        # Skip day 5 -> one internal gap.
-        days = [last_day - i * _DAY for i in range(30) if i != 5]
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, days)
-        _seed(
-            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
-        )
-        _seed(
-            repo,
-            f"{asset}-USD",
-            Granularity.FIFTEEN_MINUTE,
-            [last_q - i * _FIFTEEN for i in range(30)],
-        )
+    # Skip day 5 -> one internal gap.
+    _seed_current(repo, skip_day=5)
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
     result = CliRunner().invoke(cli, args)
@@ -166,21 +167,8 @@ def test_tolerance_bars_is_honoured(tmp_path, valid_config_path, monkeypatch):
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    last_day = (now // _DAY) * _DAY - 6 * _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
-        _seed(
-            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
-        )
-        _seed(
-            repo,
-            f"{asset}-USD",
-            Granularity.FIFTEEN_MINUTE,
-            [last_q - i * _FIFTEEN for i in range(30)],
-        )
+    # ONE_DAY seeded 5 bars behind the newest complete day bar.
+    _seed_current(repo, day_lag=5)
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
     assert CliRunner().invoke(cli, args).exit_code != 0
@@ -195,21 +183,7 @@ def test_fetch_skips_the_network_when_everything_is_current(
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    last_day = (now // _DAY) * _DAY - _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
-        _seed(
-            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
-        )
-        _seed(
-            repo,
-            f"{asset}-USD",
-            Granularity.FIFTEEN_MINUTE,
-            [last_q - i * _FIFTEEN for i in range(30)],
-        )
+    _seed_current(repo)
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch"]
@@ -222,10 +196,7 @@ def test_fetch_calls_ensure_history_when_stale(tmp_path, valid_config_path, monk
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    stale_day = (now // _DAY) * _DAY - 40 * _DAY
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [stale_day - i * _DAY for i in range(30)])
+    _seed_stale_days(repo)
 
     calls: list[tuple] = []
 
@@ -250,25 +221,13 @@ def test_fetch_calls_ensure_history_when_stale(tmp_path, valid_config_path, monk
 # -- gap repair via the CLI ---------------------------------------------------
 
 
-def _seed_with_hole(repo, product: str) -> None:
-    now = int(time.time())
-    last_day = (now // _DAY) * _DAY - _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    days = [last_day - i * _DAY for i in range(30) if i != 5]
-    _seed(repo, product, Granularity.ONE_DAY, days)
-    _seed(repo, product, Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)])
-    _seed(repo, product, Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(30)])
-
-
 def test_check_reports_unexplained_gaps_and_points_at_the_repair_command(
     tmp_path, valid_config_path, monkeypatch
 ):
     _no_network(monkeypatch)
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed_with_hole(repo, f"{asset}-USD")
+    _seed_current(repo, skip_day=5)
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
     result = CliRunner().invoke(cli, args)
@@ -290,8 +249,7 @@ def test_a_gap_proven_absent_no_longer_fails_the_strict_check(
     _no_network(monkeypatch)
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed_with_hole(repo, f"{asset}-USD")
+    _seed_current(repo, skip_day=5)
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
     assert CliRunner().invoke(cli, [*args, "--fail-on-gaps"]).exit_code != 0
@@ -316,8 +274,7 @@ def test_a_gap_proven_absent_no_longer_fails_the_strict_check(
 def test_repair_gaps_runs_the_repair_pass(tmp_path, valid_config_path, monkeypatch):
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed_with_hole(repo, f"{asset}-USD")
+    _seed_current(repo, skip_day=5)
 
     calls: list[tuple] = []
 
@@ -647,21 +604,7 @@ def test_check_reports_freshness_for_every_configured_granularity(
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
 
-    now = int(time.time())
-    last_day = (now // _DAY) * _DAY - _DAY
-    last_hour = (now // _HOUR) * _HOUR - _HOUR
-    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
-    for asset in ("BTC", "ETH", "PAXG"):
-        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
-        _seed(
-            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
-        )
-        _seed(
-            repo,
-            f"{asset}-USD",
-            Granularity.FIFTEEN_MINUTE,
-            [last_q - i * _FIFTEEN for i in range(30)],
-        )
+    _seed_current(repo)
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
