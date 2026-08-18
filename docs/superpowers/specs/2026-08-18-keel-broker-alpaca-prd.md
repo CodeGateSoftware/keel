@@ -170,6 +170,18 @@ with **first-class paper trading** — which slots directly into keel's proving 
   (O4, §6.3). Nothing in any phase touches the live path; live is a later, separately-gated
   conversation with the same refusal posture as crypto.
 
+## Trademark and originality posture
+
+Alpaca is a trademark of its owner; keel is not affiliated with, endorsed by, or sponsored by
+Alpaca (nor by Coinbase or Robinhood). Venue names appear in this repo solely as nominative
+use — to identify what an adapter talks to — and never in branding, logos, or any phrasing
+that implies partnership. The adapter is an **original implementation against Alpaca's
+publicly documented API**, not a derivative of Alpaca's products. Reference to third-party
+open source (such as QuantConnect's Apache-2.0 LEAN adapter) is for requirements
+study only; if any third-party code is ever ported into this repo it must carry its license
+and attribution in the contributing PR, and original implementations are always preferred.
+The README carries the standing disclaimer.
+
 ## 8. Risks
 
 - **Data licensing/fidelity** (IEX vs SIP) silently degrading candle quality → mitigate with
