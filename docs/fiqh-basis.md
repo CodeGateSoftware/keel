@@ -330,3 +330,24 @@ note, ready to send:
   `2026-07-20-candidate-universe.md` (deferred questions),
   `2026-07-20-income-purification.md` (what purification found),
   `2026-08-05-coinbase-asset-class-feasibility.md` (rails 18/19).
+
+### External published scholarship consulted (method support, not attestation sources)
+
+Works consulted for method and framing — how possession and speculation are analyzed — with
+the explicit note that **none is an attestation source, none has been reviewed by its author
+for this repo, and none endorses trading or keel**. Analysis:
+[`docs/research/`](research/).
+
+- Abu Jib, Mu'taz & Hashem, Ashraf — *أنواع المعاملات الرقمية المشفرة* ("Types of Encrypted
+  Digital Transactions"), research paper for the International Islamic Fiqh Academy (Jeddah)
+  Seminar on Electronic Transactions, September 2019 (ARSI): taxonomy of crypto-assets; its
+  central conclusion — per-type precise definition before any ruling — is the fiqh-side
+  statement of this document's per-product attested screening.
+- Lahlou, Mohamed Talal — *Marchés financiers islamiques et risque de spéculation*
+  (doctoral thesis, Université Mohammed V – Rabat, 2020); "Speculative situations in an
+  uncertain environment: innovative proposal of a definition and distinctive tree of
+  speculative situations" (2019); "La règle de la récupération et ses fondements
+  jurisprudentiels", *Cahiers de la Finance Islamique* n°7 (2014). The thesis line treats
+  speculation as structurally definable situations (a classification tree, applied to the
+  transaction's shape) — the same genus as this repo's rails; the 2014 article is the
+  French-language jurisprudential pedigree of rail 17's possession (*qabd*) enforcement.
