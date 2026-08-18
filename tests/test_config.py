@@ -93,8 +93,29 @@ def test_a_digit_leading_ticker_is_still_accepted(write_config):
 
 
 def test_every_shipped_config_allowlist_still_loads(write_config):
-    """Blast radius, stated: the live/paper/sandbox allowlists are uppercase tickers already."""
-    for entry in ("BTC", "ETH", "PAXG", "SOL", "XLM", "LTC", "ADA", "LINK"):
+    """Blast radius, stated: the live/paper/sandbox/hourly allowlists are uppercase tickers
+    already. The Tier-2 additions ride along since #351 widened the hourly universe."""
+    for entry in (
+        "BTC",
+        "ETH",
+        "PAXG",
+        "SOL",
+        "XLM",
+        "LTC",
+        "ADA",
+        "LINK",
+        "ZEC",
+        "NEAR",
+        "AVAX",
+        "UNI",
+        "FET",
+        "ICP",
+        "DOT",
+        "CRV",
+        "ALGO",
+        "BCH",
+        "DOGE",
+    ):
         text = VALID_CONFIG_YAML.replace("  - BTC\n", f"  - {entry}\n", 1)
         assert entry in load_config(write_config(text)).allowlist
 

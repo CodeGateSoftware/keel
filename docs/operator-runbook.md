@@ -192,7 +192,7 @@ and has already produced one. Establish which account a number came from before 
 | config | `config.paperforward.yaml` | `config.live-sandbox.yaml` | `config.paper-hourly.yaml` |
 | database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) | `keel-paperhourly.db` (must be passed) |
 | `auto_trade.mode` | `paper` | `confirm` | `paper` |
-| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | same 8 as paper |
+| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | paper's 8 + 11 Tier-2 = 19 (#351) |
 | `caps.max_exposure_usd` | 5000 | 200 | 5000 |
 | money spent | synthetic `paper_cash_usdc` | the real broker balance | synthetic `paper_cash_usdc` |
 | sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy | the hourly account's own equity |
