@@ -282,6 +282,29 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionConfig:
+    """Live-execution routing-time guardrails (Issue #350).
+
+    `max_entry_spread_pct` is the threshold of the routing-time max-spread entry gate: a live
+    BUY whose previewed book shows `(best_ask - best_bid) / mid` at or above it is REFUSED
+    before the confirm gate and placement, so a thin book cannot be entered at a moment its
+    spread alone makes the fill economics materially worse than the cost model assumes.
+    SELLs are never gated (exits must execute), and paper mode never runs the gate (paper
+    fills are synthetic and see no book -- which is why the paper-hourly profile accrues no
+    evidence about it, and the gate ships before any live resumption rather than after).
+
+    The default 0.005 (50bp) is anchored to #334's `strategy/backtest.SLIPPAGE_CAP_PCT`: the
+    backtest never assumes more than 50bp of per-leg slippage on even the thinnest book, so a
+    spread AT the cap has already consumed the model's entire worst-case cost, leaving the
+    taker fee wholly outside it. Validated to (0, 0.10] at load: 0 would silently disarm the
+    gate, and anything past 10% is not a threshold a thin-book guardrail could meaningfully
+    have crossed by accident.
+    """
+
+    max_entry_spread_pct: Decimal = Decimal("0.005")
+
+
+@dataclass(frozen=True)
 class Config:
     allowlist: list[str]
     target_weights: dict[str, Decimal]
@@ -319,6 +342,7 @@ class Config:
     settlement_currencies: frozenset[str] = DEFAULT_SETTLEMENT_CURRENCIES
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
 
 # Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
@@ -620,6 +644,43 @@ def _parse_research(raw: dict[str, Any]) -> ResearchConfig:
     return ResearchConfig(pbo_max=pbo_max, slope_floor=slope_floor)
 
 
+#: The most permissive `execution.max_entry_spread_pct` a config may state. A guardrail
+#: threshold above 10% cannot meaningfully be called a thin-book protection, so a value in
+#: that territory is a typo (a misplaced decimal, a percentage typed where a fraction was
+#: meant) and is refused at load rather than silently gutting the gate.
+_MAX_ENTRY_SPREAD_PCT_CEILING = Decimal("0.10")
+
+
+def _parse_execution(raw: dict[str, Any]) -> ExecutionConfig:
+    """Parse `execution:` -- optional, falls back to `ExecutionConfig`'s defaults.
+
+    `max_entry_spread_pct` is checked for FINITENESS before the range comparison, mirroring
+    `_non_negative_decimal`: `Decimal('NaN')` parses cleanly from a YAML `nan`, and the
+    `<= 0` / `> ceiling` comparisons on it would RAISE InvalidOperation deep inside the
+    executor's gate instead of failing here where the operator is editing the file.
+    """
+    execution_raw = raw.get("execution") or {}
+    defaults = ExecutionConfig()
+
+    pct = _to_decimal(
+        execution_raw.get("max_entry_spread_pct", defaults.max_entry_spread_pct),
+        "execution.max_entry_spread_pct",
+    )
+    if not pct.is_finite():
+        raise ConfigError(
+            f"execution.max_entry_spread_pct: must be a finite number in (0, 0.10], "
+            f"got {pct!r}"
+        )
+    if pct <= 0 or pct > _MAX_ENTRY_SPREAD_PCT_CEILING:
+        raise ConfigError(
+            f"execution.max_entry_spread_pct: must be a number in (0, 0.10] -- a fraction of "
+            f"price, not basis points (0.005 = 50bp); got {pct!r}. 0 would silently disarm "
+            f"the routing-time entry-spread gate (#350), and a value above 0.10 is not a "
+            f"thin-book threshold anyone means to set."
+        )
+    return ExecutionConfig(max_entry_spread_pct=pct)
+
+
 def load_config(path: str | Path) -> Config:
     """Parse and validate `config.yaml` at `path`, returning a typed `Config`.
 
@@ -787,6 +848,7 @@ def load_config(path: str | Path) -> Config:
         settlement_currencies=settlement_currencies,
         logging=_parse_logging(raw),
         research=_parse_research(raw),
+        execution=_parse_execution(raw),
     )
 
 
@@ -823,6 +885,7 @@ __all__ = [
     "TierConfig",
     "LoggingConfig",
     "ResearchConfig",
+    "ExecutionConfig",
     "FeesConfig",
     "Config",
     "load_config",

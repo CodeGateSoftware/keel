@@ -154,6 +154,16 @@ religious claim:
 | 12 | stale-feed + kill-switch, fails closed | operational safety |
 | 13, 14 | spend only the settled quote currency; monthly allowance cap | operational safety |
 
+Beside the rails — not among them, and not numbered — sits one routing-time check with the
+same prudential character: the **max-spread entry gate** (#350, `keel/execution/executor.py`)
+refuses a live BUY whose previewed book shows `(best_ask − best_bid) / mid` at or beyond
+`execution.max_entry_spread_pct` (default 50bp). It is not a `guards.check` rail because the
+rails are broker-less by design and the book exists only in the venue's preview response.
+BUY-only (exits must execute), live-only (paper fills are synthetic and see no book), and
+fails closed on an unreadable book — the same fail-closed family as rails 12/13/17, justified
+by trading evidence (the backtest's worst-case per-leg cost assumption), carrying no
+religious claim.
+
 Rail 7 carries a correction this repository records prominently: §65.6 holds that
 "speculation per se, which means sale/purchase keeping in mind possible change in prices in
 the future, is not prohibited" — what makes speculation *maisir* is non-ownership,

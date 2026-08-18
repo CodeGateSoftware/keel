@@ -86,7 +86,11 @@ applies the confirm/autonomy gate, then places and logs. There is deliberately n
   quote-balance checks, venue **subscription/withdrawal attestations** — rail 17 encodes
   §65.4 *qabd*: an asset that cannot be withdrawn may not have been validly possessed, so
   withdrawal capability is attested and enforced, not assumed. A rail veto names itself and
-  the command that clears it.
+  the command that clears it. Beside the rails sits one routing-time check that needs the
+  venue's own book, which a broker-less rail cannot see: the **max-spread entry gate** (#350)
+  refuses a live BUY whose previewed `(best_ask − best_bid) / mid` is at or beyond
+  `execution.max_entry_spread_pct` (default 50bp) — BUY-only, live-only, and fail-closed on
+  an unreadable book.
 - **Screening** (`keel/compliance/screen.py`) — allowlist admission is split by what is
   knowable: market facts are computed; Shariah classifications are **attested, never
   inferred**, and an absent attestation is a rejection, not a default pass.

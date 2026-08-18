@@ -102,3 +102,7 @@ logging:
 research:
   pbo_max: 0.10
   slope_floor: -0.75
+
+# Non-default on purpose (the default is 0.005 = 50bp) -- see the `research` note above.
+execution:
+  max_entry_spread_pct: 0.0075

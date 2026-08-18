@@ -75,7 +75,11 @@ class _RebracketingBroker(_Broker):
 
     def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
         return {"order_total": Decimal("50"), "commission_total": Decimal("0"),
-                "errs": [], "warning": []}
+                "errs": [], "warning": [],
+                # Both book sides, as the real venue returns them: #350's spread gate
+                # fails closed on a preview without them (reconcile places SELLs only,
+                # which the gate never touches -- this keeps the fake honest anyway).
+                "best_bid": Decimal("49990"), "best_ask": Decimal("50000")}
 
     def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
         self.placed.append({"product_id": product_id, "side": side,

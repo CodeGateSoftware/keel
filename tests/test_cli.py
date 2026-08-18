@@ -55,6 +55,10 @@ class FakeBroker:
             "commission_total": Decimal("0"),
             "errs": [],
             "warning": [],
+            # Both book sides, as the real venue returns them: #350's spread gate fails
+            # closed on a preview without them.
+            "best_bid": Decimal("99.95"),
+            "best_ask": Decimal("100"),
         }
 
     def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
