@@ -6,22 +6,34 @@ rule's gates: bullish condition + pullback phase (analysis.regime), EMA fan alig
 (analysis.candles). Small `ema_periods=(3, 5, 8)` are used so a short, hand-verifiable
 series is enough to move the EMAs into alignment (the rule itself defaults to (8, 20, 50)
 per source-02 §2.1; the periods are just a tunable parameter).
+
+The `#352` block at the bottom pins the running-state optimisation: bar-by-bar equivalence
+against the pure functions it mirrors, rebuild-vs-extend identity, a golden backtest
+captured from the pre-#352 full-recompute implementation, and a wall-clock smoke bound.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
+import random
 import re
+import time
 from decimal import Decimal
+from pathlib import Path
 from typing import get_args
 
-from keel.analysis import indicators
+from keel.analysis import indicators, levels, regime
+from keel.strategy.backtest import backtest
 from keel.strategy.rules.pullback_continuation import (
     _DEFAULT_SIGNAL_PATTERNS,
     PullbackContinuation,
     SignalPattern,
+    _RunningState,
+    _tail_aligned,
 )
 from keel.types import Candle, Granularity
+from tests.baseline.serialize import serialize_result
 
 _EMA_PERIODS = (3, 5, 8)
 _BUFFER_TICKS = Decimal("0.02")
@@ -320,3 +332,276 @@ class TestSignalPatternDeclaration:
 
         assert handled == set(get_args(SignalPattern))
         assert set(_DEFAULT_SIGNAL_PATTERNS) <= handled
+
+
+# ---------------------------------------------------------------------------
+# #352 -- the running-state optimisation's exactness contract
+# ---------------------------------------------------------------------------
+#
+# `PullbackContinuation` computes every full-series quantity (EMA fan, Wilder ATR, phase
+# pivots, target swings) incrementally in `_RunningState` instead of recomputing it per bar
+# (#352). That is only a valid optimisation if the running values are BIT-IDENTICAL to the
+# pure functions applied to the same prefix -- "close enough" would silently re-parameterize
+# the rule at the ulp level and change which setups fire. The tests in this block pin that
+# contract from four angles: value-by-value equivalence against the pure recompute on every
+# prefix of two deterministic series; rebuild-vs-extend identity (a gappy or cold-started
+# walk must land on exactly the state the one-bar walk built); full-backtest goldens captured
+# from the PRE-#352 implementation at f7a0cdf (the strongest end-to-end pin: any deviation
+# anywhere in detect/exit arithmetic moves a trade price and fails the file compare); and a
+# wall-clock smoke bound for the 1-year hourly window that opened the issue.
+
+
+def _synthetic_hourly(seed: int, bars: int, start_ts: int = 1_700_000_000) -> list[Candle]:
+    """Deterministic seeded hourly OHLC random walk -- the #352 fixture generator.
+
+    Prices are quantized to 2dp and drift flips every ~43 bars, so over a few hundred bars
+    every gate in `detect()` spends time both passing and failing: trends form (condition
+    BULLISH/BEARISH), pullbacks follow (phase flips between RUN and PULLBACK), the EMA fan
+    stacks and unstacks, and both pivot radii confirm many candidates. No database, no
+    network -- the same seed always rebuilds the same candles, which is what the golden file
+    below depends on.
+    """
+    rng = random.Random(seed)
+    price = 100.0
+    out: list[Candle] = []
+    for i in range(bars):
+        drift = 0.35 if (i // 43) % 2 == 0 else -0.30
+        step = drift + rng.gauss(0.0, 1.1)
+        o = price
+        c = round(o + step, 2)
+        hi = round(max(o, c) + abs(rng.gauss(0.35, 0.25)), 2)
+        lo = round(min(o, c) - abs(rng.gauss(0.35, 0.25)), 2)
+        out.append(
+            Candle(
+                ts=start_ts + i * 3600,
+                open=Decimal(str(o)),
+                high=Decimal(str(hi)),
+                low=Decimal(str(lo)),
+                close=Decimal(str(c)),
+                volume=Decimal("1"),
+            )
+        )
+        price = c
+    return out
+
+
+def _tie_heavy_hourly(seed: int, bars: int, start_ts: int = 1_750_000_000) -> list[Candle]:
+    """Whole-number prices with frequently-zero wicks: neighbouring highs/lows TIE often, so
+    the pivot predicates' strictness (`>` / `<`, never `>=` / `<=`) is exercised on both
+    sides -- a running-state pivot that accepted a tie where the pure scan rejects it (or
+    vice versa) fails here even though every float in the series still matches.
+    """
+    rng = random.Random(seed)
+    price = 100.0
+    out: list[Candle] = []
+    for i in range(bars):
+        drift = 0.4 if (i // 17) % 2 == 0 else -0.35
+        o = price
+        c = float(round(o + drift + rng.gauss(0.0, 0.9)))
+        wick = float(round(abs(rng.gauss(0.2, 0.15))))
+        out.append(
+            Candle(
+                ts=start_ts + i * 3600,
+                open=Decimal(str(o)),
+                high=Decimal(str(max(o, c) + wick)),
+                low=Decimal(str(min(o, c) - wick)),
+                close=Decimal(str(c)),
+                volume=Decimal("1"),
+            )
+        )
+        price = c
+    return out
+
+
+def _pure_phase_pivots(prefix: list[Candle]) -> tuple[Decimal | None, Decimal | None]:
+    """The exact values `regime.detect_phase` reads: last radius-1 swing high/low, as Decimals."""
+    highs = regime._swing_highs(prefix)
+    lows = regime._swing_lows(prefix)
+    return (
+        prefix[highs[-1]].high if highs else None,
+        prefix[lows[-1]].low if lows else None,
+    )
+
+
+def _pure_target_pivots(prefix: list[Candle]) -> tuple[Decimal | None, Decimal | None]:
+    """The exact values `_compute_target`'s swing/fib branches read: last radius-2 pivots."""
+    highs = levels.swing_highs(prefix)
+    lows = levels.swing_lows(prefix)
+    return (
+        prefix[highs[-1]].high if highs else None,
+        prefix[lows[-1]].low if lows else None,
+    )
+
+
+def _state_snapshot(state: _RunningState) -> dict[str, object]:
+    """Every value the running state carries, as a comparable dict (floats/Decimals compared
+    exactly -- `==` on the dict does element-wise `==`, which for floats is ulp-exact)."""
+    return {
+        "length": state.length,
+        "first_ts": state.first_ts,
+        "last_ts": state.last_ts,
+        "first_close": state.first_close,
+        "ema_tail": dict(state.ema_tail),
+        "atr_last": state.atr_last,
+        "atr_trs": list(state.atr_trs),
+        "phase_high": state.phase_high,
+        "phase_low": state.phase_low,
+        "target_high": state.target_high,
+        "target_low": state.target_low,
+    }
+
+
+#: The three deterministic windows the #352 golden was captured on, with the rule params each
+#: ran under. Together they exercise every state-read path end-to-end: defaults (fixed stop,
+#: measured-1:1 target, ema_touch zone), the ATR stop + swing target (running `atr_last` and
+#: `target_high` flow into trade prices), and the ema_band zone + fib_ext target (mid/slow
+#: EMA tails and both target pivots).
+_352_GOLDEN_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "pullback_352_golden.json"
+_352_WINDOWS: tuple[dict[str, object], ...] = (
+    {"seed": 352, "bars": 4000, "params": {}},
+    {"seed": 352, "bars": 4000, "params": {"stop_method": "atr", "target_method": "swing"}},
+    {
+        "seed": 5,
+        "bars": 6000,
+        "params": {"stop_method": "atr", "target_method": "fib_ext", "entry_zone": "ema_band"},
+    },
+)
+
+
+class TestRunningStateMatchesPureFunctions:
+    """Every prefix of a deterministic series: the running values must equal the pure
+    recompute EXACTLY (float `==`, not approx) -- this is the bit-identical contract."""
+
+    def test_every_bar_of_two_series_matches_the_pure_recompute(self) -> None:
+        for candles, periods in (
+            (_synthetic_hourly(99, 400), (8, 20, 50)),
+            (_tie_heavy_hourly(21, 400), (3, 5, 8)),
+        ):
+            rule = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+            for n in range(2, len(candles) + 1):
+                prefix = candles[:n]
+                state = rule._sync(prefix)
+
+                fan = indicators.ema_fan(prefix, periods=periods)
+                for period in periods:
+                    assert state.ema_tail[period] == fan[period][-1], (period, n)
+
+                assert state.atr_last == indicators.atr(prefix, period=14)[-1], n
+
+                phase_high, phase_low = _pure_phase_pivots(prefix)
+                assert state.phase_high == phase_high, n
+                assert state.phase_low == phase_low, n
+
+                target_high, target_low = _pure_target_pivots(prefix)
+                assert state.target_high == target_high, n
+                assert state.target_low == target_low, n
+
+                # The state-evaluated gates equal the pure-function gates at the last index.
+                assert rule._phase(state, prefix) == regime.detect_phase(prefix), n
+                for direction in ("bullish", "bearish"):
+                    assert _tail_aligned(state.ema_tail, direction) == indicators.fan_aligned(
+                        fan, n - 1, direction
+                    ), (direction, n)
+
+
+class TestRunningStateRebuildVsExtend:
+    """The same final prefix reached by one-bar steps, by a gappy walk, and by a cold start
+    must land on byte-for-byte the same state -- and that state must equal a full rebuild."""
+
+    def test_stepwise_gappy_and_cold_start_states_are_identical(self) -> None:
+        candles = _synthetic_hourly(7, 300)
+        periods = (8, 20, 50)
+
+        stepwise = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+        for n in range(2, len(candles) + 1):
+            stepwise._sync(candles[:n])
+
+        gappy = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+        for n in (2, 3, 9, 10, 17, 40, 41, 42, 43, 120, 199, 200, 201, 298, 299, 300):
+            gappy._sync(candles[:n])
+
+        cold = PullbackContinuation(product_id="BTC-USD", ema_periods=periods)
+        cold._sync(candles[:200])
+        for n in range(201, len(candles) + 1):
+            cold._sync(candles[:n])
+
+        rebuilt = _RunningState.build(candles, periods)
+        snapshots = [
+            _state_snapshot(stepwise._state),
+            _state_snapshot(gappy._state),
+            _state_snapshot(cold._state),
+            _state_snapshot(rebuilt),
+        ]
+        assert all(snapshot == snapshots[0] for snapshot in snapshots)
+
+    def test_sync_rebuilds_when_the_window_does_not_extend_the_cache(self) -> None:
+        candles = _synthetic_hourly(11, 120)
+        rule = _rule()
+        periods = rule.params["ema_periods"]
+
+        state = rule._sync(candles[:100])
+        assert state.first_ts == candles[0].ts
+
+        # A window that slid forward (new first bar) is a different prefix: rebuild.
+        slid = rule._sync(candles[1:101])
+        assert slid is not state
+        assert _state_snapshot(slid) == _state_snapshot(
+            _RunningState.build(candles[1:101], periods)
+        )
+
+        # A shorter window cannot extend the cached prefix: rebuild.
+        shrunk = rule._sync(candles[:40])
+        assert _state_snapshot(shrunk) == _state_snapshot(
+            _RunningState.build(candles[:40], periods)
+        )
+
+        # An unrelated series sharing no endpoints: rebuild.
+        other = _tie_heavy_hourly(12, 60)
+        unrelated = rule._sync(other)
+        assert _state_snapshot(unrelated) == _state_snapshot(_RunningState.build(other, periods))
+
+
+class TestBacktestMatchesPre352Golden:
+    """The end-to-end pin: full trades + every metric on three deterministic windows must
+    reproduce, exactly, the results captured from the PRE-#352 full-recompute implementation
+    (commit f7a0cdf, run on these same fixtures via a stashed checkout and recorded to the
+    committed golden). `serialize_result` renders Decimals as strings, so a one-ulp drift
+    anywhere in detect/exit arithmetic changes a trade price and fails the compare.
+
+    This golden is a CAPTURE, not a regenerable baseline: the implementation it was recorded
+    from no longer exists on this branch. If rule semantics are ever deliberately changed,
+    re-derive these expectations consciously (re-run the old implementation from git history
+    on these windows) rather than overwriting the file with the new output.
+    """
+
+    def test_backtest_reproduces_the_pre_352_results_exactly(self) -> None:
+        golden = json.loads(_352_GOLDEN_PATH.read_text())
+        for window in golden["windows"]:
+            rule = PullbackContinuation(
+                product_id="BTC-USD", **window["params"]  # type: ignore[arg-type]
+            )
+            result = backtest(rule, _synthetic_hourly(window["seed"], window["bars"]))
+            assert serialize_result(result) == window["result"], (window["seed"], window["bars"])
+
+    def test_the_golden_windows_actually_traded(self) -> None:
+        """A zero-trade golden would pass forever while proving nothing."""
+        golden = json.loads(_352_GOLDEN_PATH.read_text())
+        trades = [t for window in golden["windows"] for t in window["result"]["trades"]]
+        outcomes = {t["outcome"] for t in trades}
+        assert len(trades) >= 10
+        assert "win" in outcomes and "loss" in outcomes
+
+
+class TestHourlyBacktestSpeed:
+    """The #352 smoke bound: the 1-year 8,784-bar hourly window that took 8.2s-8.9s before
+    (and 233.5s at 5 years -- quadratic) must finish in seconds. The bound is deliberately
+    generous (60s) so CI variance can never flake it; it exists to catch the quadratic
+    coming back, not to benchmark."""
+
+    def test_one_year_hourly_backtest_completes_under_60s(self) -> None:
+        candles = _synthetic_hourly(352, 8784)  # 366 days x 24h, the issue's 1y window
+        start = time.monotonic()
+        result = backtest(PullbackContinuation(product_id="BTC-USD"), candles)
+        elapsed = time.monotonic() - start
+        assert result.n_trades >= 0  # completed the full walk, not an error path
+        assert elapsed < 60.0, f"1y hourly backtest took {elapsed:.1f}s (quadratic regressions?)"
