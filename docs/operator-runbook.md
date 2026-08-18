@@ -295,6 +295,33 @@ spread gate. The 8 incumbents keep their relative shape rescaled to 78% total (r
 untouched, so their evidence stays comparable across the expansion). Paperforward — the daily
 profile — deliberately stays at 8 so its evidence remains a like-for-like 8-asset series.
 
+### The spread guardrail: a sizing half and a live-path half
+
+Thin books cost more to trade than the cost model assumes, and the corpus's thin tail is
+exactly where the expansion above added exposure. The guardrail has two halves, each doing the
+half it can:
+
+- **Sizing (#358):** every Tier-2 addition sits at a flat 2% target weight, so a thin book can
+  only ever be a 2% position.
+- **Live path (#350):** a **routing-time maximum-spread gate** refuses a live BUY when the
+  venue's own previewed book shows `(best_ask − best_bid) / mid` at or beyond
+  `execution.max_entry_spread_pct` — default **0.005 (50bp)**, anchored to the backtest's
+  worst-case per-leg slippage assumption (#334's `SLIPPAGE_CAP_PCT`): if the spread ALONE
+  consumes the model's entire cost estimate, the fill economics are materially worse than
+  anything the rule was measured on, and the entry waits for the book to tighten.
+
+The gate is BUY-only (exits must execute — the same principle that makes rail 17 halt entries,
+not exits), **fails closed** (a live BUY whose preview carries no readable bid/ask is refused
+with a distinct `book_unreadable` reason, never guessed past), and lives beside the eighteen
+rails rather than among them: `guards.check` is broker-less by design, and the book exists only
+in the preview the executor just fetched.
+
+**Paper accrues no evidence about it.** Paper fills are synthetic and see no book, so neither
+paper profile ever exercises the gate — a reason it ships before any live resumption (the gate
+must already be in force when live BUYs resume) rather than being validated on paper first.
+A refusal is visible in the cycle log as `executor.entry_spread_refused` (with the measured
+spread and the threshold) or `executor.entry_book_unreadable`.
+
 **The rows differ from every other turtle row by one param.** `params.granularity: "ONE_HOUR"`
 — `TurtleBreakout`'s declared trading timeframe, persisted the way `RsiMeanReversion.timeframe`
 is and coerced back by `keel/agent.py`'s registry. A row with no `granularity` key (every row

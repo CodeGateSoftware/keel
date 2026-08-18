@@ -61,6 +61,16 @@ market-filled where the rule intended 58, at gross PF 0.7736 vs 0.9219) and deli
 defers resting-order routing until a price-conditional rule earns it. What is NOT deferred is
 visibility: `_warn_if_market_routing_overrides_entry` logs at WARNING whenever a routed entry
 sits materially off the venue's own book, so the override is visible rather than silent.
+
+**The routing-time max-spread entry gate (#350).** A live BUY whose previewed book is too
+wide to enter is REFUSED after the preview and before the confirm gate/placement:
+`(best_ask - best_bid) / mid` at or beyond `execution.max_entry_spread_pct` (default 0.005,
+50bp -- #334's slippage cap as the anchor) refuses the order, and a preview with no readable
+bid/ask fails closed with a distinct reason. It sits BESIDE the eighteen rails, not among
+them: `guards.check` is broker-less by design, and the book exists only in the preview this
+module just fetched -- the same preview #332's warning reads (`_preview_book`: one helper,
+two consumers). BUY-only (exits must execute, like rail 17 halting entries not exits) and
+live-only (paper fills are synthetic, see no book, and accrue no evidence about it).
 """
 
 from __future__ import annotations
@@ -91,9 +101,13 @@ logger = logging.getLogger(__name__)
 class ExecutionResult:
     """The outcome of `execute()` (or one of the management actions below).
 
-    `vetoed_by` is non-empty only when `guards.check` rejected the intent (the specific rail
-    names, verbatim from `GuardResult.violations`) -- a confirm-gate rejection or a broker-side
-    failure leaves it `[]` and explains itself via `reason` instead.
+    `vetoed_by` is non-empty when `guards.check` rejected the intent (the specific rail
+    names, verbatim from `GuardResult.violations`) OR when the routing-time entry spread gate
+    refused a live BUY (#350 -- the tokens `max_entry_spread` / `book_unreadable`, see
+    `_entry_spread_gate`; not a `guards.check` rail, but reported the same way so a caller
+    reading `vetoed_by` sees one legible shape for "this order was refused before
+    placement"). A confirm-gate rejection or a broker-side failure leaves it `[]` and
+    explains itself via `reason` instead.
     """
 
     placed: bool
@@ -493,6 +507,21 @@ def _run_order(
     # at WARNING, before the confirm gate and before placement.
     _warn_if_market_routing_overrides_entry(intent, preview, order_configuration)
 
+    # #350: THE ROUTING-TIME MAX-SPREAD ENTRY GATE. A live BUY whose book -- read from the
+    # same preview the warning above just consumed -- is too wide (or unreadable) is refused
+    # HERE, before the confirm gate and before placement. See `_entry_spread_gate` for the
+    # full rationale; the ordering (warning first, gate second) is deliberate and pinned by
+    # #332's tests.
+    spread_refusal = _entry_spread_gate(intent, preview, config.execution.max_entry_spread_pct)
+    if spread_refusal is not None:
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[spread_refusal.veto],
+            preview=preview,
+            reason=spread_refusal.reason,
+        )
+
     if mode == "confirm":
         approved = confirm_fn(preview) if confirm_fn is not None else False
         if not approved:
@@ -707,32 +736,55 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 ENTRY_OVERRIDE_WARN_BP = Decimal("50")
 
 
+def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+    """The venue's book out of a preview response, as `(best_bid, best_ask)`, each field read
+    INDEPENDENTLY and safely, in whichever of the preview's two shapes.
+
+    One helper, two consumers (#350): #332's entry-override warning needs only the ask, and
+    the routing-time max-spread gate needs both sides plus their midpoint. Both shapes
+    already cross this module (`ConfirmFn`'s docstring explains why they coexist): the
+    pre-port `CoinbaseClient.preview_order` dict, which maps `best_bid`/`best_ask` to
+    `Decimal`s, and the port's `Preview`, whose Coinbase adapter carries the same book as
+    strings inside `detail`.
+
+    Each side is `None` when THE VENUE returned no usable value for that field -- absent key,
+    non-numeric string, or a non-finite/non-positive number -- a degraded response, not an
+    error. Per-field independence is load-bearing: the warning's contract (#332) is ask-only,
+    so a book with a readable ask but no bid must still hand the warning its reference while
+    telling the spread gate (which refuses on a half-readable book) that it cannot compute.
+    Nothing downstream may compute against a guessed side.
+
+    `is_finite()` is checked FIRST, deliberately outside any try: `Decimal('NaN') > 0`
+    RAISES InvalidOperation, and a venue string of "nan" parses into exactly that
+    (`cb_client` does `Decimal(value)` on venue strings with no finiteness check, so the
+    input is reachable). A non-finite side is a degraded preview, not a routing failure.
+    """
+    raw: dict[str, Any] = {}
+    if isinstance(preview, Mapping):
+        raw = {"best_bid": preview.get("best_bid"), "best_ask": preview.get("best_ask")}
+    else:
+        detail = getattr(preview, "detail", None)
+        raw = detail if detail is not None else {}
+
+    def _side(key: str) -> Decimal | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return parsed if parsed.is_finite() and parsed > 0 else None
+
+    return _side("best_bid"), _side("best_ask")
+
+
 def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
     """The venue's best ask out of a preview response, in whichever of its two shapes.
 
-    Both shapes already cross this module (`ConfirmFn`'s docstring explains why they coexist):
-    the pre-port `CoinbaseClient.preview_order` dict, which maps `best_ask` to a `Decimal`, and
-    the port's `Preview`, whose Coinbase adapter carries the same book as a string inside
-    `detail`. `None` when the venue returned no usable ask -- a degraded response, not an
-    error, and nothing downstream may compute a deviation against a guess.
+    A thin consumer of `_preview_book` (above): same shapes, same per-field safety, ask only.
     """
-    raw: Any = None
-    if isinstance(preview, Mapping):
-        raw = preview.get("best_ask")
-    else:
-        detail = getattr(preview, "detail", None)
-        raw = detail.get("best_ask") if detail is not None else None
-    if raw is None:
-        return None
-    try:
-        ask = Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    # `is_finite()` first, deliberately outside any try: Decimal('NaN') > 0 RAISES
-    # InvalidOperation, and a venue string of "NaN" parses into exactly that -- the
-    # sibling `_log_intent_divergence` keeps the same hazard inside its own try for the
-    # same reason. A non-finite ask is a degraded preview, not a routing failure.
-    return ask if ask.is_finite() and ask > 0 else None
+    return _preview_book(preview)[1]
 
 
 def _warn_if_market_routing_overrides_entry(
@@ -811,6 +863,158 @@ def _warn_if_market_routing_overrides_entry(
             "as market orders (#258), so the condition this rule encoded in its entry price "
             "was bypassed and the order is going out at the venue's price instead (#260)"
         ),
+    )
+
+
+# -- #350: the routing-time max-spread entry gate -------------------------------------------------
+
+
+#: The `ExecutionResult.vetoed_by` token recorded when a live BUY is refused because the
+#: previewed book's spread is at/beyond `execution.max_entry_spread_pct`. Deliberately the
+#: same "one legible token" shape `GuardResult.violations` uses for rail vetoes, so a caller
+#: (or operator) reading `vetoed_by` cannot confuse a gate refusal with a rail violation.
+SPREAD_GATE_VETO = "max_entry_spread"
+
+#: The same, for the fail-closed case: the preview carried no readable bid/ask, so the spread
+#: is not "too wide" but UNKNOWN -- a different fact, reported differently on purpose.
+SPREAD_GATE_BOOK_UNREADABLE_VETO = "book_unreadable"
+
+
+@dataclass(frozen=True)
+class _SpreadGateRefusal:
+    """Why `_entry_spread_gate` refused a BUY: the `vetoed_by` token plus the human sentence
+    for `ExecutionResult.reason` -- one return value so the two can never disagree."""
+
+    veto: str
+    reason: str
+
+
+def _entry_spread_gate(
+    intent: OrderIntent,
+    preview: Preview | dict[str, Any] | None,
+    max_entry_spread_pct: Decimal,
+) -> _SpreadGateRefusal | None:
+    """Refuse a live BUY whose previewed book is too wide to enter (#350). `None` = proceed.
+
+    **What it decides.** For a BUY on the live path, `(best_ask - best_bid) / mid` at or
+    beyond `execution.max_entry_spread_pct` (default 0.005 = 50bp) refuses the order BEFORE
+    the confirm gate and placement. The anchor is #334's backtest slippage cap
+    (`strategy.backtest.SLIPPAGE_CAP_PCT`): the backtest never assumes more than 50bp of
+    per-leg slippage even on the thinnest book, so a spread AT the cap has already consumed
+    the model's entire worst-case cost estimate and the taker fee rides outside the model --
+    the fill economics are materially worse than anything the rule was measured on. The
+    comparison is `>=`, the fail-closed side of the line, UNLIKE #332's visibility-only
+    strictly-greater: at the threshold the spread alone equals the model's worst case, which
+    is already too wide to enter on this reasoning.
+
+    **Where it sits, and why.** AFTER `guards.check` and AFTER the preview: guards are
+    broker-less by design (this module's docstring), so the book -- which only
+    `broker.preview_order` returns -- cannot reach a `guards.check` rail. The gate is a
+    routing-time check BESIDE the eighteen rails, not a numbered rail, and it consumes the
+    SAME preview #332's `_warn_if_market_routing_overrides_entry` reads (one helper,
+    `_preview_book`, two consumers). It runs after that warning so the warning's position --
+    pinned by #332's tests -- is unchanged; on a wide book both facts are true at routing
+    time (the entry was market-routed, AND the book is too wide), and the refusal event below
+    is the terminal record. Paper mode never runs it at all: `_paper_enter` fills
+    synthetically without a preview, so the paper-hourly profile accrues NO evidence about
+    this gate -- which is why it ships before any live resumption rather than being validated
+    on paper first.
+
+    **SELLs are never gated** (`intent.side != Side.BUY` returns immediately): exits, exit
+    brackets, stop rolls and scale-outs must execute -- the same principle that makes rail 17
+    halt entries, not exits. A spread gate that trapped an exit would strand a position in
+    exactly the book conditions the rule said to leave.
+
+    **Fail-closed on an unreadable book.** A preview with no readable bid AND ask (missing
+    keys, NaN, non-numeric, non-finite, non-positive, or a spread whose arithmetic
+    overflows -- the extreme-exponent hazard #336 taught the warning about, refused rather
+    than swallowed here because this is a money gate) is refused with the DISTINCT
+    `book_unreadable` token: "cannot know" is a different fact from "too wide", and a gate
+    that guessed a spread from half a book would be a gate that sometimes trades on fiction.
+    The real venue's preview carries both sides for market orders (`cb_client.preview_order`
+    maps `best_bid`/`best_ask` to `Decimal`), so an unreadable book on the live path means a
+    degraded response -- exactly the moment not to spend.
+
+    Every BUY routes market today (#258), so "every live BUY" and "every market-routed live
+    BUY" are the same set; if #260's remediation ever lands resting BUY orders, revisit the
+    scope -- a resting limit does not cross the spread it sits inside.
+    """
+    if intent.side != Side.BUY:
+        return None
+    if preview is None:
+        # Unreachable from `_run_order` (it just previewed), but the function stays honest
+        # standalone: no preview, no book, fail closed.
+        return _book_unreadable_refusal(intent, "the preview response was empty")
+
+    bid, ask = _preview_book(preview)
+    if bid is None or ask is None:
+        return _book_unreadable_refusal(
+            intent,
+            f"no readable {'best_bid' if bid is None else 'best_ask'} in the preview response",
+        )
+    # The arithmetic stays INSIDE a try, matching `_warn_if_market_routing_overrides_entry`:
+    # `is_finite()` admits extreme exponents (1E+999999999 parses and compares fine), and
+    # Decimal add/div on such magnitudes raises Overflow -- an ArithmeticError. Telemetry
+    # swallows that (#336); a money gate refuses on it: an uncomputable spread is an
+    # unreadable book, not a pass.
+    try:
+        mid = (bid + ask) / Decimal(2)
+        spread_pct = (ask - bid) / mid
+    except ArithmeticError:
+        return _book_unreadable_refusal(
+            intent, "spread uncomputable (extreme magnitudes in the book)"
+        )
+    if spread_pct < max_entry_spread_pct:
+        return None
+    log_event(
+        logger,
+        logging.WARNING,
+        "executor.entry_spread_refused",
+        rule=intent.rule_kind,
+        product=intent.product_id,
+        side=intent.side.value,
+        best_bid=str(bid),
+        best_ask=str(ask),
+        mid=str(mid),
+        spread_pct=str(spread_pct),
+        threshold_pct=str(max_entry_spread_pct),
+        veto=SPREAD_GATE_VETO,
+        detail=(
+            "refused at routing: the live book's spread alone is at/beyond "
+            "execution.max_entry_spread_pct, so the fill would cost more than the worst "
+            "per-leg cost the backtest ever models (#334's slippage cap) -- entries into "
+            "this book wait for it to tighten (#350)"
+        ),
+    )
+    return _SpreadGateRefusal(
+        veto=SPREAD_GATE_VETO,
+        reason=(
+            f"refused by the routing-time entry spread gate: spread {spread_pct} of mid "
+            f"{mid} is at/beyond execution.max_entry_spread_pct {max_entry_spread_pct}"
+        ),
+    )
+
+
+def _book_unreadable_refusal(intent: OrderIntent, why: str) -> _SpreadGateRefusal:
+    """The fail-closed arm of `_entry_spread_gate`, logged loudly: an unreadable book is a
+    DEGRADED venue response, and an operator seeing repeated refusals here needs to know it
+    is the preview shape that changed, not the market."""
+    log_event(
+        logger,
+        logging.WARNING,
+        "executor.entry_book_unreadable",
+        rule=intent.rule_kind,
+        product=intent.product_id,
+        side=intent.side.value if isinstance(intent.side, Side) else str(intent.side),
+        veto=SPREAD_GATE_BOOK_UNREADABLE_VETO,
+        detail=(
+            f"refused at routing: {why} -- the spread is UNKNOWN, not merely wide, and a "
+            f"live BUY must not be sized against a book it cannot read (#350)"
+        ),
+    )
+    return _SpreadGateRefusal(
+        veto=SPREAD_GATE_BOOK_UNREADABLE_VETO,
+        reason=f"refused by the routing-time entry spread gate: {why}",
     )
 
 

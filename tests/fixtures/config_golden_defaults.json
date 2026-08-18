@@ -17,6 +17,9 @@
     "budget_usd": "0",
     "cadence_days": 7
   },
+  "execution": {
+    "max_entry_spread_pct": "0.005"
+  },
   "fees": {
     "maker_pct": "0.006",
     "taker_pct": "0.012"

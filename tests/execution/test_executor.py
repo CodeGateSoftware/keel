@@ -69,11 +69,19 @@ class FakeBroker:
         # both USD and USDC with `usdc_balance`, so tests that only mean "the account is funded"
         # keep meaning that -- the mismatch tests below set the two independently on purpose.
         self._balances = balances
+        # The default preview carries BOTH sides of a TIGHT book, because that is what the
+        # real venue returns (`cb_client.preview_order` maps `best_bid`/`best_ask` to
+        # `Decimal`; see `tests/fixtures/cb_preview_order.json`) and #350's spread gate fails
+        # closed on a preview without them. A test that means "a degraded/bookless response"
+        # passes its own preview dict -- see the #332 warning tests and the gate's
+        # `book_unreadable` tests.
         self._preview = preview or {
             "order_total": Decimal("50.00"),
             "commission_total": Decimal("0.30"),
             "errs": [],
             "warning": [],
+            "best_bid": Decimal("49990"),
+            "best_ask": Decimal("50000"),
         }
         self._place_success = place_success
         self._place_order_id_seq = 0
@@ -972,6 +980,10 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
             "commission_total": Decimal("0.30"),
             "errs": [],
             "warning": [],
+            # Both book sides, as the real venue returns them: #350's spread gate fails
+            # closed on a preview without them, and this test is about the FEE, not the book.
+            "best_bid": Decimal("49990"),
+            "best_ask": Decimal("50000"),
         }
     )
     signal = _enter_signal()
@@ -1719,11 +1731,13 @@ def _override_fields(caplog) -> dict:
 
 
 def _quoted_preview(best_ask: str) -> dict[str, Any]:
-    """A `CoinbaseClient.preview_order`-shaped dict carrying the venue's own book.
+    """A `CoinbaseClient.preview_order`-shaped dict carrying the venue's own ASK side only.
 
-    The real client maps `best_bid`/`best_ask` to `Decimal` when the venue returns them; the
-    default `FakeBroker` preview omits them, which is exactly the degraded shape the warning
-    code has to survive (a preview with no book is not an error, it is just not a reference).
+    The real client maps `best_bid`/`best_ask` to `Decimal` when the venue returns them. This
+    helper carries only the ask -- everything the #332 warning reads -- so it doubles as the
+    half-readable shape #350's spread gate must treat as `book_unreadable` while the warning
+    still reads its reference (a preview with no book is not an error, it is just not a
+    spread).
     """
     return {
         "order_total": Decimal("50.00"),
@@ -1843,12 +1857,20 @@ class TestEntryOverrideWarningAtRouting:
     def test_a_preview_without_a_book_quote_is_silent_not_fatal(self, caplog) -> None:
         """No `best_ask`, no honest reference -- and a warning built on a guess would be noise.
 
-        The default `FakeBroker` preview shape (no bid/ask keys) models a degraded venue
-        response; the cycle must proceed exactly as before this warning existed.
+        A preview with no bid/ask keys models a degraded venue response; the warning must be
+        silent and the cycle must proceed exactly as before this warning existed. (Constructed
+        explicitly rather than borrowed from `FakeBroker`'s default, which -- since #350's
+        spread gate made a bookless live BUY a REFUSAL -- models the real venue and carries a
+        book.)
         """
         from keel.execution.executor import _warn_if_market_routing_overrides_entry
 
-        bookless = FakeBroker()._preview  # the default shape: no best_bid/best_ask keys
+        bookless = {
+            "order_total": Decimal("50.00"),
+            "commission_total": Decimal("0.30"),
+            "errs": [],
+            "warning": [],
+        }
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(self._intent(entry="50300"), bookless)
             _warn_if_market_routing_overrides_entry(
@@ -1937,3 +1959,256 @@ class TestEntryOverrideWarningAtRouting:
             )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+
+# -- #350: the routing-time maximum-spread entry gate -------------------------------------------
+
+
+#: The two stable event ids the spread gate emits -- names, never sentences, per
+#: `keel_core.telemetry`'s contract, so tests (and any aggregation) key on them.
+_SPREAD_REFUSED_EVENT = "executor.entry_spread_refused"
+_BOOK_UNREADABLE_EVENT = "executor.entry_book_unreadable"
+
+#: The `vetoed_by` reason strings the gate records on `ExecutionResult` -- deliberately the
+#: same "one legible token" shape `GuardResult.violations` uses for rail vetoes.
+SPREAD_GATE_VETO = "max_entry_spread"
+BOOK_UNREADABLE_VETO = "book_unreadable"
+
+
+def _gate_fields(caplog, event: str) -> dict:
+    """The structured payload of the last `event` record -- same rationale as
+    `_override_fields`: `log_event` attaches fields via `extra`, so `caplog.text` shows only
+    the event name and asserting on it would pass for any values."""
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    records = [r for r in caplog.records if r.getMessage() == event]
+    assert records, f"no {event} record was emitted"
+    return getattr(records[-1], _FIELDS_ATTR)
+
+
+def _book_preview(best_bid: Decimal | str, best_ask: Decimal | str) -> dict[str, Any]:
+    """A `CoinbaseClient.preview_order`-shaped dict carrying BOTH sides of the venue's book.
+
+    Like `_quoted_preview` above, but with `best_bid` too: the spread gate needs both sides
+    (the #332 warning reads only the ask). Values are passed through VERBATIM -- `Decimal` for
+    the good path (what the real client maps venue strings to), raw strings for the degraded
+    cases (`"nan"`, `"not-a-number"`), which the port's `Preview.detail` can carry un-parsed.
+    """
+    return {
+        "order_total": Decimal("50.00"),
+        "commission_total": Decimal("0.30"),
+        "errs": [],
+        "warning": [],
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+    }
+
+
+class TestMaxSpreadEntryGate:
+    """#350: a live BUY whose previewed book is too wide is REFUSED at routing time.
+
+    The gate runs AFTER `guards.check` and AFTER the preview (guards are broker-less by
+    design; the book exists only in `broker.preview_order`'s result -- the same preview
+    #332's warning reads), and BEFORE the confirm gate and placement. SELLs are never gated
+    (exits must execute -- the same principle that makes rail 17 halt entries only), and
+    paper mode never runs it (paper fills are synthetic and see no book, which is exactly why
+    the paper-hourly profile accrues NO evidence about this gate).
+
+    Default threshold under test: `execution.max_entry_spread_pct` = 0.005 (50bp), anchored to
+    #334's `SLIPPAGE_CAP_PCT` -- if the spread ALONE exceeds the worst per-leg cost the
+    backtest ever assumes, the fill economics are materially worse than modeled.
+    """
+
+    def test_a_wide_book_refuses_the_live_buy_before_any_placement(self, repo, caplog) -> None:
+        """50,000 bid / 50,300 ask is a 59.8bp spread -- beyond the 50bp default -- so the
+        entry is refused at routing: no `place_order`, no order row, the refusal recorded in
+        `vetoed_by` with the gate's own reason token, and a WARNING carrying the measured
+        spread, the threshold and the product."""
+        broker = FakeBroker(preview=_book_preview(Decimal("50000"), Decimal("50300")))
+        signal = _enter_signal(_setup(entry=Decimal("50150")))  # at the mid: the #332
+        # warning below must stay silent so this test isolates the GATE.
+
+        with caplog.at_level(logging.WARNING):
+            result = execute(signal, broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is False
+        assert result.vetoed_by == [SPREAD_GATE_VETO]
+        assert result.order_id is None
+        assert broker.place_calls == []
+        assert repo.get_orders() == []
+        fields = _gate_fields(caplog, _SPREAD_REFUSED_EVENT)
+        assert fields["product"] == "BTC-USD"
+        assert fields["best_bid"] == "50000"
+        assert fields["best_ask"] == "50300"
+        assert fields["spread_pct"] == "0.005982053838484546360917248255"
+        assert fields["threshold_pct"] == "0.005"
+        assert fields["veto"] == SPREAD_GATE_VETO
+
+    def test_a_tight_book_places_and_the_332_warning_stays_independent(self, repo, caplog) -> None:
+        """10bp spread passes the gate. The #332 warning is a SEPARATE consumer of the same
+        book: an entry materially off the ask still warns (and places), and an entry at the
+        market stays silent -- the gate changes neither behavior."""
+        tight = FakeBroker(preview=_book_preview(Decimal("50000"), Decimal("50010")))
+
+        with caplog.at_level(logging.WARNING):
+            placed = execute(
+                _enter_signal(_setup(entry=Decimal("50005"))),
+                tight,
+                repo,
+                _config(),
+                "autonomous",
+                now_ts=NOW_TS,
+            )
+
+        assert placed.placed is True
+        assert placed.vetoed_by == []
+        assert not [r for r in caplog.records if r.getMessage() == _SPREAD_REFUSED_EVENT]
+        assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
+
+        # Same tight book, entry 58bp ABOVE the ask: the #332 warning fires, the gate still
+        # passes, and the order places -- one book, two independent consumers.
+        with caplog.at_level(logging.WARNING):
+            warned = execute(
+                _enter_signal(_setup(entry=Decimal("50300"))),
+                FakeBroker(preview=_book_preview(Decimal("50000"), Decimal("50010"))),
+                repo,
+                _config(),
+                "autonomous",
+                now_ts=NOW_TS,
+            )
+
+        assert warned.placed is True
+        assert _override_fields(caplog)["market_ref"] == "50010"
+        assert not [r for r in caplog.records if r.getMessage() == _SPREAD_REFUSED_EVENT]
+
+    def test_a_spread_exactly_at_the_threshold_is_refused(self, repo) -> None:
+        """The boundary is pinned: >= refuses, a hair under passes.
+
+        49,000/51,000 is a 2,000-wide book on a 50,000 mid -- exactly 0.04. AT the line the
+        spread alone already consumes the model's entire worst-case per-leg cost, leaving the
+        taker fee wholly outside it, so "at" is already too wide -- the fail-closed side of
+        the line, unlike #332's visibility-only strictly-greater.
+        """
+        from keel.config import ExecutionConfig
+
+        at_the_line = _config(execution=ExecutionConfig(max_entry_spread_pct=Decimal("0.04")))
+        broker = FakeBroker(preview=_book_preview(Decimal("49000"), Decimal("51000")))
+        result = execute(
+            _enter_signal(_setup(entry=Decimal("50000"))),
+            broker,
+            repo,
+            at_the_line,
+            "autonomous",
+            now_ts=NOW_TS,
+        )
+        assert result.placed is False
+        assert result.vetoed_by == [SPREAD_GATE_VETO]
+        assert broker.place_calls == []
+
+        a_hair_under = _config(execution=ExecutionConfig(max_entry_spread_pct=Decimal("0.0401")))
+        broker = FakeBroker(preview=_book_preview(Decimal("49000"), Decimal("51000")))
+        result = execute(
+            _enter_signal(_setup(entry=Decimal("50000"))),
+            broker,
+            repo,
+            a_hair_under,
+            "autonomous",
+            now_ts=NOW_TS,
+        )
+        assert result.placed is True
+        assert result.vetoed_by == []
+
+    def test_a_sell_with_a_monstrous_spread_is_never_gated(self, repo, caplog) -> None:
+        """Exits must execute: a SELL through the same preview/place pipeline sees a 400bp
+        spread and places anyway. Trapping an exit in a wide book would strand the position
+        exactly when the rule says leave."""
+        broker = FakeBroker(preview=_book_preview(Decimal("48000"), Decimal("50000")))  # 400bp
+
+        with caplog.at_level(logging.WARNING):
+            result = scale_out(
+                broker,
+                repo,
+                _config(),
+                product_id="BTC-USD",
+                qty=Decimal("0.001"),
+                exit_price=Decimal("50000"),
+                rule_name="position_rule",
+                now_ts=NOW_TS,
+            )
+
+        assert result.placed is True
+        assert result.vetoed_by == []
+        assert len(broker.place_calls) == 1
+        assert not [r for r in caplog.records if r.getMessage() == _SPREAD_REFUSED_EVENT]
+        assert not [r for r in caplog.records if r.getMessage() == _BOOK_UNREADABLE_EVENT]
+
+    def test_an_unreadable_book_refuses_the_live_buy_with_a_distinct_reason(
+        self, repo, caplog
+    ) -> None:
+        """Fail-closed: a live BUY whose preview carries no readable bid/ask is refused with
+        `book_unreadable` -- missing keys (the degraded venue shape), a NaN or non-numeric
+        side, or a non-positive one. The gate must not guess a spread, and must say loudly
+        WHY it refused, distinguishing 'too wide' from 'cannot know'."""
+        bookless = FakeBroker(
+            preview={
+                "order_total": Decimal("50.00"),
+                "commission_total": Decimal("0.30"),
+                "errs": [],
+                "warning": [],
+                # no best_bid/best_ask keys at all -- the degraded response shape
+            }
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = execute(
+                _enter_signal(), bookless, repo, _config(), "autonomous", now_ts=NOW_TS
+            )
+
+        assert result.placed is False
+        assert result.vetoed_by == [BOOK_UNREADABLE_VETO]
+        assert bookless.place_calls == []
+        fields = _gate_fields(caplog, _BOOK_UNREADABLE_EVENT)
+        assert fields["product"] == "BTC-USD"
+        assert fields["veto"] == BOOK_UNREADABLE_VETO
+
+        # Each individual way a side can be unreadable, through the same `execute` path.
+        for bad in ("nan", "not-a-number", "0", "-50000"):
+            broker = FakeBroker(preview=_book_preview(bad, "50000"))
+            with caplog.at_level(logging.WARNING):
+                refused = execute(
+                    _enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS
+                )
+            assert refused.placed is False, f"bid={bad!r} must be unreadable, not traded"
+            assert refused.vetoed_by == [BOOK_UNREADABLE_VETO]
+            assert broker.place_calls == []
+
+        broker = FakeBroker(preview=_book_preview("50000", "nan"))
+        with caplog.at_level(logging.WARNING):
+            refused = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+        assert refused.vetoed_by == [BOOK_UNREADABLE_VETO]
+        assert broker.place_calls == []
+
+    def test_the_port_preview_shape_is_gated_too(self, repo, caplog) -> None:
+        """`Preview` (Phase B's shape) carries the book as strings inside `detail`; the gate
+        must read it the same way #332's warning does, or the migration would silently disarm
+        the gate."""
+        from keel_broker_api.results import Preview
+
+        preview = Preview(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            est_base_size=Decimal("0.001"),
+            est_quote_size=Decimal("50"),
+            est_fee=Decimal("0.30"),
+            synthetic=False,
+            detail={"best_bid": "50000", "best_ask": "50300"},
+        )
+        broker = FakeBroker()
+        broker.preview_order = lambda *a, **k: preview  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING):
+            result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is False
+        assert result.vetoed_by == [SPREAD_GATE_VETO]
+        assert broker.place_calls == []

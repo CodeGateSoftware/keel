@@ -151,3 +151,15 @@ logging:
 research:
   pbo_max: 0.05
   slope_floor: -0.5
+
+# Live-execution routing-time guardrails (#350). max_entry_spread_pct is the threshold of the
+# entry spread gate: a live BUY whose previewed book shows (best_ask - best_bid) / mid at or
+# beyond it is REFUSED before placement, so a thin book cannot be entered when its spread
+# alone makes the fill materially more expensive than the cost model assumes. BUY entries
+# only (SELLs/exits are never gated) and the live path only -- paper fills are synthetic and
+# see no book, so the paper profiles accrue no evidence about this gate. 0.005 = 50bp,
+# anchored to the backtest's worst-case per-leg slippage assumption (#334's slippage cap):
+# a spread AT that line has already consumed the model's entire cost estimate. Valid range
+# (0, 0.10] -- a fraction of price, not basis points.
+execution:
+  max_entry_spread_pct: 0.005

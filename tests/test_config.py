@@ -580,6 +580,40 @@ def test_load_config_logging_empty_file_raises_configerror(write_config):
         load_config(path)
 
 
+# -- execution (the #350 routing-time max-spread entry gate) ------------------------------------
+
+
+def test_load_config_execution_defaults_to_a_50bp_entry_spread_cap(valid_config_path):
+    """Omitted -> the conservative default 0.005 (50bp), anchored to #334's
+    `strategy/backtest.SLIPPAGE_CAP_PCT`: if the spread ALONE exceeds the worst per-leg cost
+    the backtest ever assumes, the fill economics are materially worse than modeled."""
+    config = load_config(valid_config_path)
+
+    assert config.execution.max_entry_spread_pct == Decimal("0.005")
+    assert isinstance(config.execution.max_entry_spread_pct, Decimal)
+
+
+def test_load_config_execution_spread_cap_overridable(write_config):
+    text = VALID_CONFIG_YAML + "\nexecution:\n  max_entry_spread_pct: 0.0075\n"
+    path = write_config(text)
+
+    config = load_config(path)
+
+    assert config.execution.max_entry_spread_pct == Decimal("0.0075")
+
+
+@pytest.mark.parametrize("bad", ["0", "-0.001", "0.2", "nan", "wide"])
+def test_load_config_execution_spread_cap_out_of_range_raises_configerror(write_config, bad):
+    """The threshold must be a finite number in (0, 0.10]: 0 disables the gate silently, a
+    huge value guts it, and NaN would raise InvalidOperation inside the gate's comparison
+    instead of failing at load where the operator is editing the file."""
+    text = VALID_CONFIG_YAML + f"\nexecution:\n  max_entry_spread_pct: {bad}\n"
+    path = write_config(text)
+
+    with pytest.raises(ConfigError, match="execution.max_entry_spread_pct"):
+        load_config(path)
+
+
 def test_load_secrets_missing_env_returns_empty_dict(tmp_path):
     missing_path = tmp_path / "does-not-exist.env"
 

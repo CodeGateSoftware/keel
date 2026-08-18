@@ -85,6 +85,11 @@ class FakeBroker:
             "commission_total": Decimal("0"),
             "errs": [],
             "warning": [],
+            # Both book sides, as the real venue returns them: #350's spread gate fails
+            # closed on a preview without them (tests that mean a degraded/bookless
+            # response pass their own preview dict).
+            "best_bid": Decimal("99.95"),
+            "best_ask": Decimal("100"),
         }
 
     def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
@@ -1457,6 +1462,31 @@ def test_paper_enter_sizes_off_paper_equity(repo):
     assert expected_qty == Decimal("30")
     assert orders[0]["qty"] == expected_qty
     assert orders[0]["qty"] != Decimal("1"), "must not fill the old fixed 1-unit qty"
+
+
+def test_paper_mode_never_runs_the_entry_spread_gate(repo):
+    """#350's max-spread gate is live-path ONLY: paper fills are synthetic and see no book, so
+    `_paper_enter` never previews an order and the gate (fail-closed on an unreadable book for
+    a live BUY) must not refuse a paper entry. The same "no readable book" condition that
+    REFUSES a live BUY therefore fills here -- which is exactly why the paper-hourly profile
+    accrues NO evidence about the gate, and why the gate ships before any live resumption
+    rather than being validated on paper first.
+    """
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()  # the gate is armed at its default 50bp threshold
+    sig = _paper_enter_signal(entry=Decimal("100"), stop=Decimal("90"), target=Decimal("130"))
+
+    result = agent._paper_enter(
+        trader, sig, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert result.placed
+    assert result.vetoed_by == []
+    assert repo.get_orders(mode="paper") and repo.get_orders(mode="live") == []
 
 
 def test_run_once_sizes_a_paper_entry_off_the_seeded_synthetic_equity(repo, monkeypatch):
