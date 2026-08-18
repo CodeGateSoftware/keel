@@ -4,8 +4,10 @@
 `keel-paperhourly` are the third deployment profile, tracked in-repo exactly like the
 paperforward and live ones (since 2026-08-03; see docs/RELEASING.md). Nothing about them is
 executed by the test suite's code paths, so like `tests/test_schedule.py` for the live
-schedule, this file pins them so they cannot drift silently: the config must stay the SAME
-universe at the hourly cadence, the plist must keep 24 hourly triggers and `RunAtLoad`, and
+schedule, this file pins them so they cannot drift silently: the config must stay a
+deliberate SUPERSET of paperforward's universe at the hourly cadence (11 Tier-2 additions
+capped at 2% each since #351; the incumbents rescaled 1.00 -> 0.78, rules/params untouched),
+the plist must keep 24 hourly triggers and `RunAtLoad`, and
 the runner must keep its once-per-UTC-hour stamp (the paperforward day-stamp would collapse
 23 of the 24 cycles into no-ops -- the exact regression a copy-paste of that script would
 ship).
@@ -24,6 +26,7 @@ import re
 import stat
 import subprocess
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from keel.config import load_config
@@ -38,19 +41,40 @@ WRAPPER = REPO_ROOT / "keel-paperhourly"
 RUNBOOK = REPO_ROOT / "docs" / "operator-runbook.md"
 
 
-# -- the config: same universe as paperforward, hourly cadence --------------------------------
+# -- the config: a deliberate SUPERSET of paperforward, hourly cadence -------------------------
+
+# The 11 Tier-2 additions that passed the 2026-08-17 15-minute data-health screen in #351
+# (coverage >= 95.98%, zero zero-volume bars over 90 days), each capped at 2% target weight.
+TIER_TWO = ["ZEC", "NEAR", "AVAX", "UNI", "FET", "ICP", "DOT", "CRV", "ALGO", "BCH", "DOGE"]
 
 
-def test_config_is_the_same_universe_as_paperforward():
-    """Everything that defines WHAT is traded matches the daily paper profile; only the
-    cadence differs. If this fails because paperforward moved, move with it or say why here:
-    the hourly corpus measurement (n≈268, net-negative) was taken on this universe, and a
-    silently different one would make the two profiles' evidence incomparable."""
+def test_config_universe_is_a_deliberate_superset_of_paperforward():
+    """Since #351 (2026-08-17) the hourly universe is a strict SUPERSET of paperforward's,
+    not a mirror of it. The 11 additions above each passed a 15-minute data-health screen
+    (coverage >= 95.98%, zero zero-volume bars over 90 days; results recorded in #351), and
+    each is capped at 2% target weight -- the sizing half of the guardrail whose live-path
+    half is #350's spread gate. The incumbents keep their rules/params untouched, so their
+    evidence stays comparable across the expansion; only their target weights rescale,
+    together, 1.00 -> 0.78 total. Paperforward (the daily profile) deliberately stays at 8
+    so its evidence remains a like-for-like 8-asset series. If this fails because
+    paperforward moved, move with it or say why here."""
     hourly = load_config(str(CONFIG))
     daily = load_config(str(PAPERFORWARD_CONFIG))
 
-    assert sorted(hourly.allowlist) == sorted(daily.allowlist)
-    assert hourly.target_weights == daily.target_weights
+    assert set(daily.allowlist) < set(hourly.allowlist)
+    assert set(TIER_TWO) == set(hourly.allowlist) - set(daily.allowlist)
+    assert len(hourly.allowlist) == 19
+
+    # Incumbents keep their relative shape, rescaled 1.00 -> 0.78; Tier-2 sits at the 2% cap.
+    assert hourly.target_weights["BTC"] == Decimal("0.23")
+    assert hourly.target_weights["ETH"] == Decimal("0.155")
+    assert hourly.target_weights["PAXG"] == Decimal("0.155")
+    for incumbent in ("SOL", "XLM", "LTC", "ADA", "LINK"):
+        assert hourly.target_weights[incumbent] == Decimal("0.048")
+    for addition in TIER_TWO:
+        assert hourly.target_weights[addition] == Decimal("0.02")
+    assert sum(hourly.target_weights.values()) == Decimal("1")
+
     assert hourly.caps == daily.caps
     assert hourly.quote_currency == daily.quote_currency
     assert hourly.fees == daily.fees

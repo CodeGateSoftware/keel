@@ -1,7 +1,8 @@
 # keel runtime configuration — the HOURLY-CADENCE paper profile (issue #337).
 #
-# Same structure and same universe as config.paperforward.yaml; the ONE thing this profile
-# changes is CADENCE. The daily Turtle rules fire 1.19-3.20 times per asset-year, so the
+# Same structure as config.paperforward.yaml; the headline change is CADENCE (the universe
+# is now a deliberate SUPERSET — 19 assets to paperforward's 8, since the #351 expansion).
+# The daily Turtle rules fire 1.19-3.20 times per asset-year, so the
 # promotion gate's n=100 per rule per product is 31-84 years away on the daily clock. The
 # same rules evaluated on ONE_HOUR bars fire ~50 times per asset-year (median n=268 over the
 # 5-year cached window) — the sample becomes collectable in months. See
@@ -32,16 +33,49 @@ allowlist:
   - LTC
   - ADA
   - LINK
+  # The #351 Tier-2 additions (2026-08-17): each passed a 15-minute data-health screen —
+  # coverage >= 95.98%, zero zero-volume bars over 90 days (results recorded in the issue).
+  - ZEC
+  - NEAR
+  - AVAX
+  - UNI
+  - FET
+  - ICP
+  - DOT
+  - CRV
+  - ALGO
+  - BCH
+  - DOGE
 
+# The #351 expansion: a 78/22 split. The 8 incumbents keep their relative shape scaled to
+# 78% total (BTC .230, ETH/PAXG .155, the rest .048 each) and their rules/params are
+# unchanged, so the evidence they accrue stays comparable across the expansion; each of the
+# 11 Tier-2 additions — the ones above that passed the 15-minute health screen (coverage
+# >= 95.98%, zero zero-volume bars over 90 days, recorded in #351) — gets a flat 2%. That 2%
+# Tier-2 cap is a deliberate guardrail: it is the sizing half of the spread protection whose
+# live-path half is #350's spread gate. Weights sum to exactly 1.000. Paperforward (the
+# daily profile) deliberately stays at 8 so its evidence remains a like-for-like 8-asset
+# series — hourly is now a strict superset, not a mirror.
 target_weights:
-  BTC: 0.30
-  ETH: 0.20
-  PAXG: 0.20
-  SOL: 0.06
-  XLM: 0.06
-  LTC: 0.06
-  ADA: 0.06
-  LINK: 0.06
+  BTC: 0.230
+  ETH: 0.155
+  PAXG: 0.155
+  SOL: 0.048
+  XLM: 0.048
+  LTC: 0.048
+  ADA: 0.048
+  LINK: 0.048
+  ZEC: 0.020
+  NEAR: 0.020
+  AVAX: 0.020
+  UNI: 0.020
+  FET: 0.020
+  ICP: 0.020
+  DOT: 0.020
+  CRV: 0.020
+  ALGO: 0.020
+  BCH: 0.020
+  DOGE: 0.020
 
 risk_pct: 0.01
 
@@ -55,8 +89,8 @@ caps:
 market_data:
   # Same three series as paperforward. The hourly rules TRADE on ONE_HOUR; ONE_DAY stays the
   # higher-TF bias input (engine._higher_tf_bias_ok) and FIFTEEN_MINUTE stays the entry-gate
-  # confirmation series. An hourly cycle keeps them current with ~16 small read-only candle
-  # requests per hour (8 products x 2 series polled per cycle; 24 in the UTC-boundary hour
+  # confirmation series. An hourly cycle keeps them current with ~38 small read-only candle
+  # requests per hour (19 products x 2 series polled per cycle; 57 in the UTC-boundary hour
   # when ONE_DAY also rolls), and market_feed's 300-candle chunked catch-up
   # self-heals any downtime in one poll.
   granularities:
