@@ -47,6 +47,11 @@ uv run keel --db keel.db fetch
 uv run keel --db keel.db fetch --refresh
 ```
 
+The granularities warmed are whatever `config.yaml`'s `market_data.granularities` lists — the
+same series the agent and `monitor` poll, so the warm step covers all of them (every shipped
+config lists ONE_DAY/ONE_HOUR/FIFTEEN_MINUTE). `keel simulate` is the deliberate exception: the
+backtest engine supports only ONE_HOUR/ONE_DAY, so it keeps pulling exactly that pair.
+
 Output states per `(product, granularity)`:
 
 | state | meaning | fails `--check`? |

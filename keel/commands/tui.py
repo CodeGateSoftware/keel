@@ -1279,10 +1279,9 @@ def _confirm_arm_autonomy(stdscr: Any, config: Config) -> bool:
 
 def _do_fetch(open_state: OpenState, now_fn: NowFn) -> str:
     """Fetch fresh candle history for every allowlisted product, money-safe (data only, never
-    places an order). Lazy-imports the fetch primitives from `keel.cli`/`keel.data.history`/
+    places an order). Lazy-imports the fetch primitives from `keel.data.history`/
     `keel.commands._common`/`keel.commands._products` to avoid a `cli` <-> `tui` import cycle at
     module load time. Thin I/O -- not unit-tested directly, only smoke-tested via `run_live`."""
-    from keel.cli import _SIM_GRANULARITIES
     from keel.commands._common import _build_broker
     from keel.commands._products import _default_sim_products
     from keel.data import history as history_mod
@@ -1292,11 +1291,15 @@ def _do_fetch(open_state: OpenState, now_fn: NowFn) -> str:
     client = _build_broker(config)
     now_ts = now_fn()
     years = 5  # matches `keel fetch --years`'s own default
+    # The same config-driven list `keel fetch` warms (Issue #349): this is the dashboard twin
+    # of THAT command, not of `simulate`, so the engine's ONE_HOUR/ONE_DAY limit does not
+    # apply -- the FIFTEEN_MINUTE confirmation series must warm here too.
+    granularities = list(config.market_data.granularities)
     history_mod.ensure_history(
         client,
         repo,
         products,
-        _SIM_GRANULARITIES,
+        granularities,
         years,
         now_ts,
         sleep_fn=time.sleep,
@@ -1310,7 +1313,7 @@ def _do_screen_report(open_state: OpenState) -> ScreenReport:
     `_screen_product` (THE single admission gate every candidate source must route through) lives
     in `keel.cli`, which itself imports THIS module to wire up `tui_cmd`/`run_live` -- importing
     it at module load time here would cycle, so it is lazy-imported inside this function, exactly
-    like `_do_fetch` lazy-imports `_SIM_GRANULARITIES` from the same module for the same reason.
+    like `_do_fetch` lazy-imports the fetch primitives for the same reason.
     Thin I/O -- not unit-tested directly, only smoke-tested via `run_live`."""
     from keel.cli import _screen_product
 

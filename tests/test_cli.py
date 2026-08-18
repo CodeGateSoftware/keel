@@ -1149,6 +1149,46 @@ def test_simulate_no_fetch_produces_report_and_never_touches_network(tmp_path, m
     assert "coverage" in result.output.lower()
 
 
+def test_simulate_still_fetches_exactly_the_engine_timeframes(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """Issue #349's deliberate asymmetry, pinned: `fetch` honors
+    `config.market_data.granularities` (which lists FIFTEEN_MINUTE too, see
+    tests/data/test_fetch_cli.py), but the backtest engine supports only ONE_HOUR/ONE_DAY,
+    so `simulate` keeps pulling exactly that pair whatever the config says. Widening this
+    list is an engine change, not a config change."""
+    db_path = tmp_path / "sim.db"
+    repo = _repo_at(db_path)
+    _seed_candles_for_allowlist(repo, int(time.time()))
+
+    grans: list[tuple] = []
+
+    def _record_ensure(client, repo_arg, products, granularities, years, now_ts, **kwargs):
+        grans.append(tuple(granularities))
+        return {}
+
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module.history_mod, "ensure_history", _record_ensure)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "simulate",
+            "--years",
+            "1",
+            "--out",
+            str(tmp_path / "report.md"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert grans == [(Granularity.ONE_HOUR, Granularity.ONE_DAY)]
+
+
 def _seed_liquidity_stratified_candles(repo: Repository, now_ts: int) -> None:
     """The #259 fixture: three allowlist products at deliberately different liquidity, so the
     simulate path's per-product slippage has something to scale from.

@@ -17,9 +17,11 @@ from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
+from tests.conftest import VALID_CONFIG_YAML
 
 _DAY = 86400
 _HOUR = 3600
+_FIFTEEN = 900
 
 
 def _repo_at(db_path: Path) -> Repository:
@@ -62,13 +64,20 @@ def test_check_reports_current_series_and_exits_zero(
     repo = _repo_at(db_path)
 
     now = int(time.time())
-    # Seed right up to the newest COMPLETE bar for both granularities.
+    # Seed right up to the newest COMPLETE bar for every configured granularity.
     last_day = (now // _DAY) * _DAY - _DAY
     last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
     for asset in ("BTC", "ETH", "PAXG"):
         _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
         _seed(
             repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
+        )
+        _seed(
+            repo,
+            f"{asset}-USD",
+            Granularity.FIFTEEN_MINUTE,
+            [last_q - i * _FIFTEEN for i in range(30)],
         )
 
     result = CliRunner().invoke(
@@ -126,12 +135,19 @@ def test_check_reports_gaps_without_failing_unless_asked(
     now = int(time.time())
     last_day = (now // _DAY) * _DAY - _DAY
     last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
     for asset in ("BTC", "ETH", "PAXG"):
         # Skip day 5 -> one internal gap.
         days = [last_day - i * _DAY for i in range(30) if i != 5]
         _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, days)
         _seed(
             repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
+        )
+        _seed(
+            repo,
+            f"{asset}-USD",
+            Granularity.FIFTEEN_MINUTE,
+            [last_q - i * _FIFTEEN for i in range(30)],
         )
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
@@ -153,10 +169,17 @@ def test_tolerance_bars_is_honoured(tmp_path, valid_config_path, monkeypatch):
     now = int(time.time())
     last_day = (now // _DAY) * _DAY - 6 * _DAY
     last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
     for asset in ("BTC", "ETH", "PAXG"):
         _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
         _seed(
             repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
+        )
+        _seed(
+            repo,
+            f"{asset}-USD",
+            Granularity.FIFTEEN_MINUTE,
+            [last_q - i * _FIFTEEN for i in range(30)],
         )
 
     args = ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
@@ -175,10 +198,17 @@ def test_fetch_skips_the_network_when_everything_is_current(
     now = int(time.time())
     last_day = (now // _DAY) * _DAY - _DAY
     last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
     for asset in ("BTC", "ETH", "PAXG"):
         _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
         _seed(
             repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
+        )
+        _seed(
+            repo,
+            f"{asset}-USD",
+            Granularity.FIFTEEN_MINUTE,
+            [last_q - i * _FIFTEEN for i in range(30)],
         )
 
     result = CliRunner().invoke(
@@ -224,9 +254,11 @@ def _seed_with_hole(repo, product: str) -> None:
     now = int(time.time())
     last_day = (now // _DAY) * _DAY - _DAY
     last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
     days = [last_day - i * _DAY for i in range(30) if i != 5]
     _seed(repo, product, Granularity.ONE_DAY, days)
     _seed(repo, product, Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)])
+    _seed(repo, product, Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(30)])
 
 
 def test_check_reports_unexplained_gaps_and_points_at_the_repair_command(
@@ -304,7 +336,7 @@ def test_repair_gaps_runs_the_repair_pass(tmp_path, valid_config_path, monkeypat
         ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--repair-gaps"],
     )
     assert result.exit_code == 0, result.output
-    assert len(calls) == 6  # 3 products x 2 granularities
+    assert len(calls) == 9  # 3 products x 3 configured granularities
     assert "repairing interior gaps" in result.output
 
 
@@ -364,9 +396,13 @@ def _seed_sol_field_repro(repo: Repository) -> None:
     # The venue was asked about the +10d hole and had nothing -- as `repair_series` records.
     repo.record_gap_probe("SOL-USD", day, _START + 10 * _DAY, _START + 10 * _DAY, 1, _NOW)
 
-    # ONE_HOUR current, so `--check` is not distracted by a missing series.
+    # ONE_HOUR and FIFTEEN_MINUTE current, so `--check` is not distracted by a missing series.
     last_hour = _NOW - _HOUR
     _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(48)])
+    last_q = _NOW - _FIFTEEN
+    _seed(
+        repo, "SOL-USD", Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(48)]
+    )
 
 
 def test_the_gap_suffix_shares_the_fetch_window_so_it_cannot_go_negative(
@@ -412,7 +448,14 @@ def test_every_assessed_row_keeps_proven_absent_never_negative(tmp_path, monkeyp
     repo = _repo_at(db_path)
     _seed_sol_field_repro(repo)
 
-    rows = cli_module._assess_products(repo, ["SOL-USD"], _NOW, _START, tolerance_bars=2)
+    rows = cli_module._assess_products(
+        repo,
+        ["SOL-USD"],
+        [Granularity.ONE_DAY, Granularity.ONE_HOUR, Granularity.FIFTEEN_MINUTE],
+        _NOW,
+        _START,
+        tolerance_bars=2,
+    )
     assert rows, "fixture must assess something for this test to mean anything"
     for row, unexplained in rows:
         assert row.gaps >= unexplained, (row.product, row.granularity, row.gaps, unexplained)
@@ -445,6 +488,12 @@ def test_fail_on_gaps_still_judges_holes_older_than_the_fetch_window(
         + [_START + i * _DAY for i in range(n_window_days)],
     )
     _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [_NOW - _HOUR - i * _HOUR for i in range(48)])
+    _seed(
+        repo,
+        "SOL-USD",
+        Granularity.FIFTEEN_MINUTE,
+        [_NOW - _FIFTEEN - i * _FIFTEEN for i in range(48)],
+    )
 
     args = ["--db", str(db_path), "--config", str(valid_config_path),
             "fetch", "--check", "--years", "1", "--products", "SOL-USD"]
@@ -536,3 +585,117 @@ def test_fetch_reports_a_shape_error_even_when_a_settlement_warning_rides_along(
 
     assert result.exit_code != 0
     assert "XLM-28AUG26-CDE" in result.output
+
+
+# -- fetch honors config.market_data.granularities (Issue #349) -------------------------------
+#
+# `fetch` is the data pipeline: what it warms must be exactly what the deployment's agent and
+# monitor poll (`config.market_data.granularities`), or the runbook's documented warm step
+# silently leaves the FIFTEEN_MINUTE confirmation series at ZERO candles in a fresh deployment
+# -- every shipped config lists ONE_DAY/ONE_HOUR/FIFTEEN_MINUTE -- and the agent's first
+# cycles then inherit a full multi-hundred-request catch-up. `simulate` is the deliberate
+# exception (the backtest engine supports only ONE_HOUR/ONE_DAY); that asymmetry is pinned in
+# tests/test_cli.py.
+
+
+class _RecordingClient:
+    """Duck-typed venue client that records every candle request and serves none.
+
+    Serving none keeps `ensure_history` to a single inception probe per series -- the tests
+    below care about WHICH granularities get asked for, not about paging.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[Granularity] = []
+
+    def get_candles(self, product_id, granularity, start, end):
+        self.requests.append(granularity)
+        return []
+
+
+def test_fetch_warms_every_configured_granularity(tmp_path, valid_config_path, monkeypatch):
+    """The warm fetch must ask the venue for FIFTEEN_MINUTE too.
+
+    The fixture config lists three granularities exactly like every shipped config, so a
+    fresh deployment following the runbook (`keel fetch`) gets all three series warm --
+    including the confirmation series the agent polls every cycle.
+    """
+    client = _RecordingClient()
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: client)
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)  # empty DB: every series is missing, so the fetch proceeds
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch"]
+    )
+    assert result.exit_code == 0, result.output
+    assert set(client.requests) == {
+        Granularity.ONE_DAY,
+        Granularity.ONE_HOUR,
+        Granularity.FIFTEEN_MINUTE,
+    }
+
+
+def test_check_reports_freshness_for_every_configured_granularity(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """`--check` is what a scheduler alerts on, so its rows must cover the same three series
+    the warm step fetches -- a granularity `--check` never mentions is one nobody notices
+    staying empty."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+
+    now = int(time.time())
+    last_day = (now // _DAY) * _DAY - _DAY
+    last_hour = (now // _HOUR) * _HOUR - _HOUR
+    last_q = (now // _FIFTEEN) * _FIFTEEN - _FIFTEEN
+    for asset in ("BTC", "ETH", "PAXG"):
+        _seed(repo, f"{asset}-USD", Granularity.ONE_DAY, [last_day - i * _DAY for i in range(30)])
+        _seed(
+            repo, f"{asset}-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(30)]
+        )
+        _seed(
+            repo,
+            f"{asset}-USD",
+            Granularity.FIFTEEN_MINUTE,
+            [last_q - i * _FIFTEEN for i in range(30)],
+        )
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "FIFTEEN_MINUTE" in result.output
+    assert "all series current" in result.output
+
+
+def _config_with_granularities(write_config, *grans: str) -> Path:
+    """The fixture config rewritten to list exactly `grans` under market_data."""
+
+    def _block(names: str) -> str:
+        return "".join(f"    - {name}\n" for name in names.split())
+
+    text = VALID_CONFIG_YAML.replace(
+        "    - ONE_DAY\n    - ONE_HOUR\n    - FIFTEEN_MINUTE\n", _block(" ".join(grans))
+    )
+    assert text != VALID_CONFIG_YAML, "the granularities block must have matched"
+    return write_config(text)
+
+
+def test_fetch_touches_only_the_configured_granularities(tmp_path, write_config, monkeypatch):
+    """The config is the single source of truth in the other direction too: a deployment
+    listing only ONE_DAY must not pay for series it never polls."""
+    client = _RecordingClient()
+    config_path = _config_with_granularities(write_config, "ONE_DAY")
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: client)
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(config_path), "fetch"]
+    )
+    assert result.exit_code == 0, result.output
+    assert set(client.requests) == {Granularity.ONE_DAY}
