@@ -444,12 +444,23 @@ class RobinhoodTransport:
         # `marketdata`, not `trading` -- see `get_estimated_price` below for why these two
         # neighbouring endpoints genuinely sit under different namespaces in v2.
         #
-        # Rows carry `symbol`, `bid` and `ask`. Nothing else, and specifically not the `price`,
-        # `buy_spread`, `sell_spread`, `ask_inclusive_of_buy_spread` or
+        # Rows carry `symbol`, `timestamp`, `bid` and `ask`. Nothing else, and specifically not
+        # the `price`, `buy_spread`, `sell_spread`, `ask_inclusive_of_buy_spread` or
         # `bid_inclusive_of_sell_spread` the fixture invented before #217 F4 replaced it -- five
         # keys, none of which this venue sends. No caller reads them today, which is the only
         # reason that cost nothing; the risk was entirely in whatever got written against them
         # next.
+        #
+        # ⚠️ **`bid` and `ask` are NOT a coherent book snapshot, and may cross** (#413). Measured
+        # live on 2026-08-19: BTC-USD and DOGE-USD returned `bid > ask` on every sample, ETH-USD
+        # on two of three, XLM-USD and ADA-USD on none. Every crossing was under 1.4 bps, and the
+        # pairs that never crossed are the ones whose real spread (2-5 bps) exceeds that -- so the
+        # two legs are sampled independently and then stamped with one `timestamp` the row does
+        # not actually earn. Anything derived from this endpoint must tolerate a non-positive
+        # spread rather than treat it as a venue error, and `translate.to_price_side`'s
+        # BUY->`ask` / SELL->`bid` mapping INVERTS on a crossed row: both directions come out
+        # optimistic, which is the one outcome that mapping exists to prevent. Nothing calls this
+        # method today; #413 owns deciding the contract before anything does.
         return self._paginate(
             "/api/v2/crypto/marketdata/best_bid_ask/", params={"symbol": symbol}
         )

@@ -1,12 +1,10 @@
 {
-  "next": null,
-  "previous": null,
   "results": [
     {
       "symbol": "BTC-USD",
-      "timestamp": "2026-08-09T22:42:19.194164275Z",
-      "bid": "65380.00",
-      "ask": "65480.00"
+      "timestamp": "2026-08-19T19:20:41.579217945Z",
+      "bid": "68329.2",
+      "ask": "68324.17"
     }
   ]
 }
