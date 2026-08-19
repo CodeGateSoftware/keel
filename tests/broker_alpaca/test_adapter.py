@@ -260,6 +260,18 @@ class TestPaperLiveIsolation:
             with pytest.raises(ValueError, match="endpoint"):
                 AlpacaAdapter(endpoint=bad)
 
+    def test_no_constructor_parameter_accepts_a_host_url(self) -> None:
+        """The `trading_host`/`data_host` keyword escapes are GONE, so the documented
+        endpoint-to-host map is the only construction path to a trading host: no
+        parameter accepts a host URL at all, which is what makes the README's "no
+        configuration path from a paper credential to the live host, by construction"
+        literally true (FR-11). `TypeError` is Python's own "no such keyword" answer --
+        there is nothing to validate because there is nothing to pass."""
+        with pytest.raises(TypeError):
+            AlpacaTransport("key-id", "secret", trading_host=LIVE_TRADING_HOST)  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            AlpacaTransport("key-id", "secret", data_host="https://example.test")  # type: ignore[call-arg]
+
     def test_the_data_tier_is_a_declared_choice_not_an_assumption(self) -> None:
         """IEX (free) vs SIP is a declared capability (FR-5): the adapter names its feed
         on every market-data request instead of letting the venue default it, because the
@@ -327,6 +339,22 @@ class TestBalances:
         balances = AlpacaAdapter(transport).get_balances()
         assert [b.currency for b in balances] == ["USD"]
 
+    def test_a_nonfinite_buying_power_is_handled_not_a_crash(self) -> None:
+        """A NaN `buying_power` arrives as `float("nan")` (the `parse_constant` path, not
+        `parse_float`), and `min()` over a NaN `Decimal` raises. The existing
+        balances convention for a money field that cannot be parsed is the same as an
+        absent one -- read as zero via the `or Decimal("0")` every balance field carries
+        -- so a garbage spendable figure never reaches a `Balance` row and nothing
+        raises."""
+        account = load_fixture("alpaca_account.json")
+        account["buying_power"] = float("nan")
+
+        balances = AlpacaAdapter(FakeTransport(account=account)).get_balances()
+
+        usd = {b.currency: b for b in balances}["USD"]
+        assert usd.available == Decimal("0"), "an unparseable buying power reads as zero"
+        assert usd.total == Decimal("102086.50"), "the parseable cash figure is untouched"
+
 
 # ---------------------------------------------------------------------------------------------
 # Candles (FR-5, FR-10's adjusted/raw policy)
@@ -366,6 +394,24 @@ class TestCandles:
         for granularity in (Granularity.ONE_MINUTE, Granularity.FIVE_MINUTE, Granularity.SIX_HOUR):
             with pytest.raises(ValueError, match="timeframe"):
                 adapter.get_candles(_PRODUCT, granularity, 0, 86_400)
+
+    def test_a_nonfinite_bar_value_is_never_stored_in_a_candle(self) -> None:
+        """A NaN high arrives as `float("nan")`, and `Decimal("NaN")` is TRUTHY -- so
+        without an explicit finiteness check the `or Decimal("0")` fallback never fires
+        and the NaN rides into `Candle.high` silently, poisoning every indicator that
+        touches the series. The module's existing convention for an unparseable bar leaf
+        is the same as an absent one: read as zero, never as the venue's garbage."""
+        bars = load_fixture("alpaca_bars_page1.json")
+        bars["bars"][0]["h"] = float("nan")
+        bars["next_page_token"] = None
+
+        candles = AlpacaAdapter(FakeTransport(bars_pages=[bars])).get_candles(
+            _PRODUCT, Granularity.ONE_DAY, 1_700_000_000, 1_700_086_400
+        )
+
+        assert len(candles) == 2, "both fixture bars survive; only the NaN leaf changes"
+        assert candles[0].high == Decimal("0"), "the unparseable-leaf-reads-as-zero rule"
+        assert candles[0].close == Decimal("131.9"), "parseable leaves are untouched"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -446,6 +492,26 @@ class TestPreview:
         assert preview.est_base_size == Decimal("0")
         assert preview.errors, "an unpriced leg must appear in errors"
         assert any("ask" in e for e in preview.errors)
+
+    def test_a_nonfinite_quote_side_is_unpriced_and_reported_never_a_crash(self) -> None:
+        """JSON `NaN`/`Infinity` tokens ride `parse_constant`, not `parse_float`, so they
+        reach the adapter as `float("nan")`/`float("inf")` -- and `Decimal(str(...))`
+        parses BOTH without raising, which means the `except` in `_decimal_or_none` never
+        fires. `Decimal("NaN")` then crashes the `bid > 0` comparison and `Decimal(
+        "Infinity")` compares `> 0` as a real price; a non-finite side must land in the
+        same "no active side" path as a zero one -- `errors` says so, nothing raises --
+        for the preview docstring's "every path that could not price the order populates
+        `errors`" invariant to hold."""
+        quote = json.loads('{"quote": {"bp": NaN, "ap": Infinity}}', parse_float=Decimal)
+        preview = AlpacaAdapter(FakeTransport(quote=quote)).preview_order(
+            MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+        )
+
+        assert preview.est_base_size == Decimal("0")
+        assert preview.errors, "a non-finite quote side must appear in errors"
+        assert any("ask" in e for e in preview.errors)
+        assert preview.detail["best_bid"] == "none"
+        assert preview.detail["best_ask"] == "none"
 
     def test_a_non_usd_product_is_refused_before_any_request_is_made(self) -> None:
         transport = _full_transport()
