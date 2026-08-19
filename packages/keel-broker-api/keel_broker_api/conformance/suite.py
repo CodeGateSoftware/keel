@@ -205,6 +205,41 @@ class BrokerConformanceTests:
             result = broker.place_order(_SPEC_BY_KIND[kind])
             assert isinstance(result, PlaceResult), f"{kind} did not return a PlaceResult"
 
+    def test_every_declared_order_kind_accepts_an_idempotency_key(self) -> None:
+        """#409. `place_order`'s `idempotency_key` is part of the port, so an adapter that does
+        not accept it is not a `Broker` -- a caller routing the same intent to two venues would
+        get a `TypeError` from one of them, at placement, on the live-money path.
+
+        The suite asserts ACCEPTANCE, not deduplication: whether the venue actually collapses two
+        attempts under one key is the venue's behaviour, observable only against the venue, and a
+        contract suite that runs on canned transports cannot honestly claim to have seen it. What
+        it can hold every adapter to is that the parameter exists and changes no result shape.
+        """
+        broker = self.broker()
+        for kind in sorted(broker.capabilities().supported_orders):
+            result = broker.place_order(
+                _SPEC_BY_KIND[kind], idempotency_key=f"conformance-{kind}"
+            )
+            assert isinstance(result, PlaceResult), (
+                f"{kind} did not return a PlaceResult when given an idempotency_key"
+            )
+
+    def test_the_same_idempotency_key_is_not_rejected_on_a_second_attempt(self) -> None:
+        """A retry is the whole point: the second call under one key must reach the adapter the
+        same way the first did. An adapter that remembered keys locally and refused the repeat
+        would defeat the mechanism -- deduplication belongs to the VENUE, which is the only party
+        that knows whether the first attempt actually landed."""
+        broker = self.broker()
+        caps = broker.capabilities()
+        kind = sorted(caps.supported_orders)[0]
+        spec = _SPEC_BY_KIND[kind]
+
+        first = broker.place_order(spec, idempotency_key="conformance-retry")
+        second = broker.place_order(spec, idempotency_key="conformance-retry")
+
+        assert isinstance(first, PlaceResult)
+        assert isinstance(second, PlaceResult)
+
     def test_every_undeclared_order_kind_is_refused(self) -> None:
         """Refusal must be explicit. Silently substituting a different order type is the
         failure mode this whole port exists to make impossible."""

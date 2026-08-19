@@ -13,12 +13,15 @@ actually needs the network raises a clear error rather than a confusing `Attribu
 from __future__ import annotations
 
 import time
-import uuid
 from decimal import Decimal
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.port import UnsupportedOrder, default_market_schedule
+from keel_broker_api.port import (
+    UnsupportedOrder,
+    default_market_schedule,
+    resolve_client_order_id,
+)
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
@@ -155,11 +158,20 @@ class CoinbaseAdapter:
             errors=errs,
         )
 
-    def place_order(self, spec: OrderSpec) -> PlaceResult:
-        """Place a live order. A fresh `client_order_id` per call gives Coinbase idempotency."""
+    def place_order(
+        self, spec: OrderSpec, *, idempotency_key: str | None = None
+    ) -> PlaceResult:
+        """Place a live order.
+
+        ⚠️ The previous wording here -- "a fresh `client_order_id` per call gives Coinbase
+        idempotency" -- was backwards, and #409 corrects it. A fresh id per call gives the venue
+        nothing to deduplicate ON: idempotency is exactly what a per-ATTEMPT id withholds. Pass
+        `idempotency_key` to get it; omit it and two attempts are two orders, which stays the
+        default for the reasons `resolve_client_order_id` sets out.
+        """
         self._reject_unsupported(spec)
         response = self._require_transport().create_order(
-            client_order_id=str(uuid.uuid4()),
+            client_order_id=resolve_client_order_id(idempotency_key),
             product_id=spec.product_id,
             side=spec.side.value,
             order_configuration=to_order_configuration(spec),

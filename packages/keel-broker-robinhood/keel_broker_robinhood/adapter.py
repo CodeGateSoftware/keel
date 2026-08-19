@@ -44,7 +44,6 @@ The other two gaps, stated once here and again in the package README:
 from __future__ import annotations
 
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -52,7 +51,11 @@ from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, OrderSpec, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder, default_market_schedule
+from keel_broker_api.port import (
+    UnsupportedOrder,
+    default_market_schedule,
+    resolve_client_order_id,
+)
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
@@ -706,17 +709,19 @@ class RobinhoodAdapter:
             errors=errors,
         )
 
-    def place_order(self, spec: OrderSpec) -> PlaceResult:
-        """Place a live order. A fresh `client_order_id` per call; the returned `state` is read.
+    def place_order(
+        self, spec: OrderSpec, *, idempotency_key: str | None = None
+    ) -> PlaceResult:
+        """Place a live order. The returned `state` is read, not just the id.
 
-        ⚠️ **A fresh uuid per call means NO placement retry is ever deduplicated.** The id is
-        required by this API, and minting one per ATTEMPT is what stops two orders a strategy
-        genuinely meant to place twice from collapsing into one. The cost of that choice is the
-        opposite failure: a caller that retries after a timeout -- where the first request may
-        well have reached the venue -- places a SECOND live order, because the retry carries a
-        different id and Robinhood has nothing to match it against. Neither default is safe in
-        both directions and the port has no "retry of" concept to disambiguate them, so the
-        behaviour is documented rather than silently chosen (README, "must fix before wiring").
+        **`idempotency_key` is what makes a placement retry safe here** (#409). Without one the
+        id is minted per ATTEMPT, which is the right default for the opposite hazard -- an id
+        derived from the order would collapse two orders a strategy genuinely meant to place
+        twice into one -- but it means a caller retrying after a timeout, exactly when the first
+        request may already have reached the venue, places a SECOND live order. With a key, every
+        attempt resolves to the same `client_order_id` and Robinhood has something to match the
+        retry against. `resolve_client_order_id` owns the derivation, including why the key is
+        hashed rather than used verbatim.
 
         **Two things are checked, not one.** An `id` must come back -- a `success=True` with no
         id is an order nobody can later reconcile or cancel. But the `id` alone is not evidence
@@ -735,7 +740,7 @@ class RobinhoodAdapter:
         where `to_port_status` maps the same unknown state to `PENDING` and keeps it observed.
         """
         self._reject_unsupported(spec)
-        body = to_order_body(spec, client_order_id=str(uuid.uuid4()))
+        body = to_order_body(spec, client_order_id=resolve_client_order_id(idempotency_key))
         response = self._require_transport().create_order(body)
 
         order_id = _field(response, "id")

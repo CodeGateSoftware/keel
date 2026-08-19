@@ -38,7 +38,6 @@ Scope posture (the PRD's Phase A, FR-1-FR-8, plus the FR-11 rate-limit and host 
 
 from __future__ import annotations
 
-import uuid
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -49,7 +48,7 @@ from keel_broker_api.orders import (
     OrderSpec,
     StopLimitGTC,
 )
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import UnsupportedOrder, resolve_client_order_id
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
@@ -467,14 +466,18 @@ class AlpacaAdapter:
             errors=tuple(errors),
         )
 
-    def place_order(self, spec: OrderSpec) -> PlaceResult:
-        """Place a live order. A fresh `client_order_id` per call, and the venue's
-        explicit refusals mapped to a failed `PlaceResult`.
+    def place_order(
+        self, spec: OrderSpec, *, idempotency_key: str | None = None
+    ) -> PlaceResult:
+        """Place a live order, with the venue's explicit refusals mapped to a failed
+        `PlaceResult`.
 
-        ⚠️ **A fresh uuid per ATTEMPT means no placement retry is ever deduplicated** --
-        the posture `keel_broker_robinhood.place_order` documents, with the same tradeoff:
-        a caller retrying after a timeout may place twice, because the retry carries a
-        different id and Alpaca has nothing to match it against.
+        **`idempotency_key` removes the retry hazard** (#409). Omitted, the id is minted per
+        ATTEMPT and a caller retrying after a timeout may place twice, because the retry
+        carries a different id and Alpaca has nothing to match it against. Supplied, every
+        attempt under that key resolves to one `client_order_id`. Alpaca accepts a string of
+        up to 128 characters here, but `resolve_client_order_id` hashes to a UUID for every
+        venue alike so one caller key means one order wherever it is routed.
 
         **Alpaca answers rejections as HTTP errors, unlike Robinhood's happy-path failed
         state.** 403 (insufficient buying power) and 422 (invalid body) are the venue
@@ -488,7 +491,7 @@ class AlpacaAdapter:
         never handed back as a handle on a resting order.
         """
         self._reject_unsupported(spec)
-        body = to_order_body(spec, client_order_id=str(uuid.uuid4()))
+        body = to_order_body(spec, client_order_id=resolve_client_order_id(idempotency_key))
         try:
             response = self._require_transport().create_order(body)
         except AlpacaAPIError as exc:

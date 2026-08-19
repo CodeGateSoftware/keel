@@ -227,7 +227,14 @@ def test_place_order_maps_failure_with_a_reason() -> None:
 
 
 def test_place_order_generates_a_fresh_client_order_id_per_call() -> None:
-    """Idempotency on Coinbase's side depends on this being unique per attempt."""
+    """With NO idempotency key, one id per attempt -- the default, unchanged by #409.
+
+    The docstring here used to say "idempotency on Coinbase's side depends on this being unique
+    per attempt", which had it backwards: a unique-per-attempt id is what WITHHOLDS idempotency,
+    because it leaves the venue nothing to deduplicate on. It is still the right default -- two
+    orders a strategy genuinely meant to place must not collapse into one -- but it is the
+    opposite of idempotent, and the test below is the one that buys that property.
+    """
     transport = FakeTransport(placed=load_fixture("cb_place_order_market.json"))
     adapter = CoinbaseAdapter(transport)
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
@@ -238,6 +245,25 @@ def test_place_order_generates_a_fresh_client_order_id_per_call() -> None:
     second = transport.calls["create_order"]["client_order_id"]
 
     assert first != second
+
+
+def test_an_idempotency_key_pins_the_client_order_id_across_attempts() -> None:
+    """#409. The retry case: two attempts under one key must reach Coinbase as one
+    `client_order_id`, so a retry after a timeout -- when the first request may already have
+    landed -- is deduplicated by the venue rather than becoming a second live order."""
+    transport = FakeTransport(placed=load_fixture("cb_place_order_market.json"))
+    adapter = CoinbaseAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+    first = transport.calls["create_order"]["client_order_id"]
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+    second = transport.calls["create_order"]["client_order_id"]
+
+    assert first == second
+    # ...and a DIFFERENT intent on the same position is still a different order.
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:stop")
+    assert transport.calls["create_order"]["client_order_id"] != first
 
 
 def test_limit_order_translates_through_to_the_transport() -> None:

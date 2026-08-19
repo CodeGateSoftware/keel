@@ -149,7 +149,17 @@ class FakeAdapter:
         """
         raise NotImplementedError("fake venue offers no order preview")
 
-    def place_order(self, spec: OrderSpec) -> PlaceResult:
+    def place_order(
+        self, spec: OrderSpec, *, idempotency_key: str | None = None
+    ) -> PlaceResult:
+        """`idempotency_key` is ACCEPTED and deliberately not acted on.
+
+        This venue has no `client_order_id` to carry it into -- order ids are minted from a
+        counter -- so there is nothing here to deduplicate against, and inventing a dedup table
+        would make the fake behave better than the real venues it stands in for. Accepting the
+        parameter is what matters: the fake must satisfy the same `Broker` signature every other
+        adapter does, or it stops being a stand-in for one.
+        """
         if spec.kind not in _CAPABILITIES.supported_orders:
             raise UnsupportedOrder(f"fake venue does not support order kind {spec.kind!r}")
 
