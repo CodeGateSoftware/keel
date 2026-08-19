@@ -3663,7 +3663,10 @@ def test_run_live_dashboard_entry_returns_to_the_landing_screen(
 @pytest.mark.parametrize(
     ("open_key", "closing_line"),
     [
-        (ord("h"), "Press q, Esc, h or ? now to return to the dashboard."),
+        # `h` opens the Help MENU since C7 (the keys/safety screen is its fourth
+        # entry); the help-menu scrolls banner-aware like every other overlay, so End
+        # must land its own closing line on the bottom row.
+        (ord("h"), "up/k down/j move · Enter/Space select · 1-4 jump · q/Esc/m to the menu"),
         (ord("i"), "Press i or Esc to return to the dashboard."),
         (ord("s"), "Press s or Esc to return to the dashboard."),
         (ord("p"), "Press p or Esc to return to the dashboard."),
@@ -4203,3 +4206,87 @@ def test_cached_scout_view_rescreens_only_when_the_file_changes(
     third = cached_scout_view(repo, config, counting_screen_fn, shortlist, cache)
     assert third.status == "ok" and third is not first
     assert screened == ["FET-USD", "FET-USD"]
+
+
+# -- run_live: the Venues browser and the Help menu (issue #394 C7) --------------------------------
+
+
+def test_run_live_the_profile_menus_venues_row_opens_the_browser(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O7's TUI half, behaviorally: the Profile menu's Venues row opens the venues
+    browser -- the SAME service payload `keel brokers list` prints, with the bound
+    deployment's venue marked [selected] and its config+db pair named."""
+    from keel.commands import brokers
+
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        # m -> menu; 2 -> Profile; j x4 -> the Venues row (below every deployment);
+        # Enter -> the browser; q -> back to the Profile menu; then quit out.
+        [ord("m"), ord("2"), ord("j"), ord("j"), ord("j"), ord("j"), 10, ord("q"), -1, ord("q")],
+    )
+    texts = [call[2] for call in stdscr.calls]
+    venues_at = next(i for i, t in enumerate(texts) if "profile / venues" in t)
+    browser = texts[venues_at:]
+    # every installed adapter renders, from the one service payload
+    for info in brokers.list_installed_brokers():
+        assert any(info.name in t for t in browser), info.name
+    # the bound deployment's venue is the marked one, and the pair is named
+    selected = [t for t in browser if "[selected]" in t]
+    assert len(selected) == 1 and "coinbase" in selected[0]
+    assert any("config.paperforward.yaml + keel.db" in t for t in browser)
+
+
+def test_run_live_question_opens_the_screens_own_help_and_closes_back(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O8's contextual overlay, behaviorally: `?` in the console MENU opens that mode's
+    own help (its subject rows, the registry's contribution), and q returns to the menu
+    -- the screen it was opened from, not the dashboard."""
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        # m -> menu; ? -> contextual help; q -> back to the menu; then quit out.
+        [ord("m"), ord("?"), ord("q"), -1, ord("q")],
+    )
+    texts = [call[2] for call in stdscr.calls]
+    overlay_at = next(i for i, t in enumerate(texts) if "help: menu" in t)
+    overlay = texts[overlay_at:]
+    assert any("the console menu" in t for t in overlay)
+    # closing returns to the MENU (the mode ? was pressed in), not the dashboard
+    after = texts[texts.index(overlay[-1]) + 1 :]
+    assert any("keel console -- menu" in t for t in after)
+
+
+def test_run_live_the_help_menu_opens_the_glossary(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Help entry is a real sub-menu since C7: it lists the glossary, the screens
+    catalog, the parameter help and the keys/safety notes; the glossary entry renders
+    docs/glossary.md's own terms."""
+    # The glossary is read from the WORKING DIRECTORY (docs/glossary.md, the CLI's own
+    # relative-path convention); the temp deployment dir has none, so the real file is
+    # copied in to exercise the render (an absent one is the empty-state test's case).
+    import shutil
+    from pathlib import Path as _Path
+
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    shutil.copyfile(
+        _Path(__file__).resolve().parents[2] / "docs" / "glossary.md",
+        tmp_path / "docs" / "glossary.md",
+    )
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        # m -> menu; 9 -> Help; Enter -> glossary (cursor 0); q -> back; then quit out.
+        [ord("m"), ord("9"), 10, ord("q"), -1, ord("q")],
+        height=120,  # the glossary is longer than a viewport; assert on the WHOLE render
+    )
+    texts = [call[2] for call in stdscr.calls]
+    menu_at = next(i for i, t in enumerate(texts) if "keel console -- help" in t)
+    assert any("glossary" in t for t in texts[menu_at:])
+    glossary_at = next(i for i, t in enumerate(texts) if "help / glossary" in t)
+    glossary = texts[glossary_at:]
+    for term in ("rail", "qabd", "kill switch", "promotion gate"):
+        assert any(term in t for t in glossary), term

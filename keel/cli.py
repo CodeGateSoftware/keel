@@ -125,6 +125,7 @@ from keel.commands.assets import (
 )
 from keel.commands.assets import screen_product as _screen_product
 from keel.commands.autonomy import autonomy_group
+from keel.commands.brokers import brokers_group
 
 # The order-preview confirmation gate lives in `keel.commands.confirm` (issue #387 C1: the CLI
 # and the TUI must hand the executor ONE confirm function, never a front-end copy). Re-imported
@@ -1314,6 +1315,15 @@ cli.add_command(insights_group)
 # this reports the whole install and exits non-zero when it disagrees with itself. Defined in
 # `keel.commands.versions` and registered here.
 cli.add_command(versions_cmd)
+
+
+# -- brokers (venues/brokers visibility: capability display over the adapter registry) ------------
+
+# The O7 brokers service (issue #394 C7) -- one payload over `discover_brokers()` and the
+# adapters' capability declarations, rendered by BOTH front-ends: this `keel brokers list`
+# surface and the console's Venues browser (`keel.commands.console.build_venues_lines`).
+# Read-only and offline; capability display only, never key-presence inference.
+cli.add_command(brokers_group)
 
 
 # -- kill / resume ------------------------------------------------------------------------------

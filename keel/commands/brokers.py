@@ -1,0 +1,236 @@
+"""`keel brokers` -- venues/brokers visibility (issue #394 C7; PRD O7): one service over
+the entry-point registry and the adapters' capability declarations, two front-ends.
+
+The service (`list_installed_brokers`) walks `keel_broker_api.registry.discover_brokers()`
+-- the same registry walk `load_broker` makes -- constructs each adapter WITHOUT a
+transport (every first-party adapter's `capabilities()` is a constant, answerable offline),
+and renders one `BrokerInfo` row per installed adapter: name (the entry-point name), venue
+id, wired-for-deployment vs optional-dev-venue, session-bound or 24/7, quote currencies,
+asset classes, the declared order kinds, preview synthesis (native / synthesized / none),
+the fee-summary declaration, the adapter's DECLARED endpoint vocabulary and data feeds
+where it has them (Alpaca's paper/live hosts and iex/sip tiers), and the adapter package's
+installed version.
+
+**Capability display, never key-presence inference (#233-aligned).** Nothing here reads an
+environment variable, a config's contents, or a credential store, and no secret VALUE is
+ever carried or shown: `BrokerInfo` is a closed vocabulary of adapter declarations, pinned
+by test. "wired-for-deployment" says a shipped deployment's config selects this venue --
+it does NOT say any operator's keys are present.
+
+The CLI (`keel brokers list`, with `--json` following `keel status --json`'s convention)
+and the console's Venues browser (`keel.commands.console.build_venues_lines`) are both
+renderings of this one payload -- the O7 acceptance ("identical information from one
+service") is pinned by test against both front-ends.
+
+Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as dist_version
+from typing import Any
+
+import click
+
+from keel.commands._common import DISCLAIMER
+
+#: The venues a SHIPPED deployment selects -- the whole wired/optional classification, in
+#: ONE explicit place:
+#
+#:   coinbase   `BrokerConfig.name`'s default (`keel_core.config`): every tracked config
+#:              without a `broker:` section (paper-forward, paper-hourly, live) is
+#:              coinbase -- keel's original venue.
+#:   alpaca     selected by `config.paper-equities.yaml` (the keel-equities wrapper's
+#:              paper deployment; `broker: name: alpaca, endpoint: paper`).
+#
+#:   fake       the in-repo deterministic dev/test venue -- never selected by a tracked
+#:              config (`keel-broker-fake` exists so tests and local runs need no venue).
+#:   robinhood  an optional install (the README's "optional venue") -- no tracked config
+#:              selects it; it is a `uv add keel-broker-robinhood` away, not a deployment.
+#
+#: No registry entry carries this signal (the entry points say only that an adapter IS
+#: installed), so the constant states it -- with its reasoning here -- rather than leaving
+#: every front-end to re-derive it. An adapter not named here is optional by default.
+WIRED_FOR_DEPLOYMENT: frozenset[str] = frozenset({"coinbase", "alpaca"})
+
+#: The deployment classification's two words, spelled once so the CLI and the Venues
+#: browser cannot disagree about them.
+WIRED = "wired-for-deployment"
+OPTIONAL = "optional-dev-venue"
+
+
+@dataclass(frozen=True)
+class BrokerInfo:
+    """One installed adapter, as a CAPABILITY DISPLAY row. Every field is a rendering of
+    the adapter's own declarations (`capabilities()`, its class's declared endpoint/feed
+    vocabulary, its installed version) -- never an inference about the operator's keys or
+    config, and never secret material (pinned by test: the field set is closed)."""
+
+    #: The entry-point name -- the `broker: name:` a config selects, and the
+    #: registry key `load_broker` resolves.
+    name: str
+    #: The venue id the adapter itself declares (`capabilities().venue`).
+    venue: str
+    #: `WIRED` or `OPTIONAL` (see `WIRED_FOR_DEPLOYMENT`).
+    deployment: str
+    #: Whether the venue CLOSES (`capabilities().session_bound`): session-bound
+    #: venues render with a market clock; the rest are 24/7.
+    session_bound: bool
+    quote_currencies: tuple[str, ...]
+    asset_classes: tuple[str, ...]
+    supported_orders: tuple[str, ...]
+    #: How order previews exist here: "native" (the venue serves preview quotes),
+    #: "synthesized" (the adapter prices them itself, labelled synthetic), or "none".
+    preview: str
+    supports_fee_summary: bool
+    #: The endpoint vocabulary the ADAPTER declares (Alpaca: paper/live), empty where the
+    #: venue has no such knob -- read off the adapter class, never a service-side table.
+    declared_endpoints: tuple[str, ...]
+    #: The market-data tiers the adapter declares (Alpaca: iex/sip), empty where undeclared.
+    supported_data_feeds: tuple[str, ...]
+    #: The adapter package's installed version, or `None` when the metadata will not say.
+    package_version: str | None
+
+    def as_json(self) -> dict[str, Any]:
+        """The row as a JSON-ready dict (tuples become lists) -- the `--json` shape."""
+        return asdict(self)
+
+
+def _declared(adapter_cls: Any, attribute: str) -> tuple[str, ...]:
+    """An adapter class's declared vocabulary (`DECLARED_ENDPOINTS`/`DECLARED_DATA_FEEDS`),
+    sorted, or `()` when the adapter declares none -- a display of what the ADAPTER says,
+    never a service-side list keyed by venue name."""
+    return tuple(sorted(getattr(adapter_cls, attribute, ())))
+
+
+def _preview_of(capabilities: Any) -> str:
+    """The preview story in one word, derived ONLY from the capability booleans -- the
+    same pair `BrokerCapabilities.can_preview` reads."""
+    if capabilities.supports_native_preview:
+        return "native"
+    if capabilities.synthesizes_preview:
+        return "synthesized"
+    return "none"
+
+
+def _package_version_of(adapter_cls: Any) -> str | None:
+    """The adapter's installed version, derived from its own module's distribution
+    name (`keel_broker_alpaca` -> `keel-broker-alpaca`), or `None` when the metadata
+    is absent (a checkout on the path with no install)."""
+    top_level = adapter_cls.__module__.split(".")[0]
+    try:
+        return dist_version(top_level.replace("_", "-"))
+    except PackageNotFoundError:
+        return None
+
+
+def list_installed_brokers() -> list[BrokerInfo]:
+    """Every installed adapter as one `BrokerInfo` row, in name order -- the ONE payload
+    both front-ends (`keel brokers list`, the console's Venues browser) render. Adapters
+    are constructed WITHOUT transports and only their offline declarations are read: no
+    broker handle, no network, no config, no credentials."""
+    from keel_broker_api.registry import discover_brokers
+
+    rows: list[BrokerInfo] = []
+    for name, adapter_cls in discover_brokers().items():
+        capabilities = adapter_cls().capabilities()
+        rows.append(
+            BrokerInfo(
+                name=name,
+                venue=capabilities.venue,
+                deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
+                session_bound=bool(capabilities.session_bound),
+                quote_currencies=tuple(sorted(capabilities.quote_currencies)),
+                asset_classes=tuple(sorted(capabilities.asset_classes)),
+                supported_orders=tuple(sorted(capabilities.supported_orders)),
+                preview=_preview_of(capabilities),
+                supports_fee_summary=bool(capabilities.supports_fee_summary),
+                declared_endpoints=_declared(adapter_cls, "DECLARED_ENDPOINTS"),
+                supported_data_feeds=_declared(adapter_cls, "DECLARED_DATA_FEEDS"),
+                package_version=_package_version_of(adapter_cls),
+            )
+        )
+    rows.sort(key=lambda row: row.name)
+    return rows
+
+
+# -- the human rendering --------------------------------------------------------------------------
+
+#: The posture line both front-ends carry, spelled once: what these screens show is the
+#: adapter's own declarations, never an inference about the operator's keys.
+NO_KEY_INFERENCE_LINE = (
+    "capability display only -- no key presence is read or implied, and no secret is shown"
+)
+
+
+def capability_facts(info: BrokerInfo) -> str:
+    """The row's capability facts as one " · "-joined phrase -- the SHARED wording the CLI
+    prints and the Venues browser wraps, so the two front-ends cannot drift. PURE."""
+    hours = "session-bound (opens and closes)" if info.session_bound else "24/7"
+    facts = [
+        info.deployment,
+        hours,
+        f"quotes {'/'.join(info.quote_currencies)}",
+        f"asset classes {'/'.join(info.asset_classes)}",
+        f"preview {info.preview}",
+        f"fee summary {'yes' if info.supports_fee_summary else 'no'}",
+    ]
+    if info.declared_endpoints:
+        facts.append(f"endpoints {'/'.join(info.declared_endpoints)}")
+    if info.supported_data_feeds:
+        facts.append(f"data feeds {'/'.join(info.supported_data_feeds)}")
+    return " · ".join(facts)
+
+
+def render_brokers_lines(infos: list[BrokerInfo]) -> list[str]:
+    """The human payload: one block per adapter -- its name and installed version, its
+    capability facts, and its declared order kinds. PURE over the service's rows."""
+    lines: list[str] = [f"{len(infos)} adapter(s) installed under keel.brokers:"]
+    for info in infos:
+        version = info.package_version or "unknown version"
+        lines.append(f"{info.name} ({version}) -- {info.venue}")
+        lines.append(f"  {capability_facts(info)}")
+        lines.append(f"  order kinds: {', '.join(info.supported_orders)}")
+    lines.append(NO_KEY_INFERENCE_LINE)
+    return lines
+
+
+# -- the CLI ---------------------------------------------------------------------------------------
+
+
+@click.group("brokers")
+def brokers_group() -> None:
+    """Venues/brokers visibility: what every installed adapter declares it can do.
+
+    Lists the installed broker adapters (the `keel.brokers` entry points) with their
+    capabilities -- wired-for-deployment vs optional-dev-venue, session-bound or 24/7,
+    quote currencies, asset classes, order kinds, preview synthesis, declared endpoints
+    and data feeds -- capability display only: never key-presence inference, never a
+    secret value. One service behind `keel brokers list` and the console's Venues browser.
+
+    Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
+    """
+
+
+@brokers_group.command("list")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON."
+)
+def brokers_list(as_json: bool) -> None:
+    """Every installed adapter with its declared capabilities (read-only, offline).
+
+    `--json` follows `keel status --json`'s convention: the service payload verbatim,
+    with no disclaimer footer after it, for scripting and the TUI. The human rendering
+    carries the disclaimer like every other keel command.
+    """
+    infos = list_installed_brokers()
+    if as_json:
+        click.echo(json.dumps([info.as_json() for info in infos], indent=2))
+        return
+    for line in render_brokers_lines(infos):
+        click.echo(line)
+    click.echo("")
+    click.echo(DISCLAIMER)

@@ -209,6 +209,59 @@ def trading_entry(ordinal: int) -> TradingEntry | None:
     return None
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders, keyed by the live loop's mode names. Plain `(subject, description)`
+#: pairs so the text stays HERE with the module that owns the screens;
+#: `keel.commands.help_console` is the registry and renderer. Every TYPED action's row
+#: states the O3 contract explicitly: the prompt cannot be pre-filled.
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "trading": (
+        (
+            "agent cycle / monitor poll",
+            "ONE cycle or ONE poll on the ACTIVE deployment -- both open ARMED with the "
+            "plan shown first, and Enter is the confirm step (a cycle can place orders; "
+            "in confirm mode the CLI's own order gate runs at the terminal)",
+        ),
+        (
+            "autonomy",
+            "arming lets the agent place orders unattended -- the ON direction asks the "
+            "CLI's own arm gate at the terminal; OFF only ever reduces capability",
+        ),
+        (
+            "kill / resume (the kill switch)",
+            "kill ENGAGES the halt immediately, one command with no ceremony -- that IS "
+            "its CLI contract; resume RELEASES it and is TYPED: you type the release "
+            "phrase yourself at the terminal, and the prompt cannot be pre-filled, "
+            "piped or bypassed",
+        ),
+        (
+            "resume-entries, reset-hwm, record-flow",
+            "the other halt-releasers and bookkeeping -- resume-entries clears the "
+            "consecutive-loss halt (TYPED, same rule: the prompt cannot be pre-filled), "
+            "reset-hwm resets the drawdown reference, record-flow records a deposit or "
+            "withdrawal against the equity base",
+        ),
+    ),
+    "trading-cycle": (
+        (
+            "the ARMED view",
+            "the plan names the profile, its paper/confirm semantics, the autonomy "
+            "state and the session honesty line -- Enter runs the cycle through the "
+            "agent pipeline itself (there is no TUI-originated order path), blocking "
+            "like a fetch, and the result lines are held here",
+        ),
+    ),
+    "trading-monitor": (
+        (
+            "the ARMED view",
+            "ONE monitor poll over the ACTIVE profile's products: Enter runs the same "
+            "monitor cycle the CLI runs, and its result lines (or a skip's logged "
+            "reason, verbatim) are held here",
+        ),
+    ),
+}
+
+
 def build_trading_menu_lines(*, cursor: int = 0, message: str | None = None) -> list[ScreenLine]:
     """The Trading sub-menu screen: every entry with its description wrapped to the
     80-column budget, the typed entries marked, exactly one cursor-marked row, and the

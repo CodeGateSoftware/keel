@@ -201,6 +201,85 @@ def strategy_entry(ordinal: int) -> StrategyEntry | None:
     return None
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders, keyed by the live loop's mode names. Plain `(subject, description)`
+#: pairs so the text stays HERE with the module that owns the screens;
+#: `keel.commands.help_console` is the registry and renderer.
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "strategy": (
+        (
+            "the tried-vs-used ledger",
+            "every rule row with its lifecycle status AND the machine's recorded reason "
+            "it sits there -- the failing promotion-gate floor, the disabled context, "
+            "the demotion; read-only, and zero backtests run to render it",
+        ),
+        (
+            "simulate + results",
+            "the deterministic replay on the ACTIVE deployment: Enter is the confirm "
+            "step, the run fetches and writes exactly as `keel simulate` does, and the "
+            "verdict (GO-LIVE / TRAIN-MORE), gates and the DCA benchmark render after",
+        ),
+        (
+            "add a strategy",
+            "the `rules add` flow at the terminal: kind, product, params -- each param "
+            "field's help renders from the rule class itself (describe_params), and the "
+            "row lands as candidate exactly as the CLI's add does",
+        ),
+        (
+            "retry, and the lifecycle actions",
+            "retry re-runs the backtest and re-attempts promote through the same "
+            "services the CLI calls: promote's confirm is a y/N, and `--force` stays "
+            "TYPED -- you type the phrase yourself at the terminal, and the prompt "
+            "cannot be pre-filled. enable is the documented restore path for a disabled "
+            "rule; disable and demote step rules back through the lifecycle",
+        ),
+        (
+            "insights",
+            "the per-rule promotion-gate distance and the trade journal, read-only",
+        ),
+    ),
+    "strategy-ledger": (
+        (
+            "the rows",
+            "one per rule: lifecycle status, the recorded reason it sits there, and "
+            "the params it runs -- built cheaply from recorded state only",
+        ),
+        (
+            "Enter",
+            "opens the rule's detail (params with their per-field help, the paper gate's "
+            "distance, and the explicit re-compute -- which is the ONE place the "
+            "strategy console runs a backtest)",
+        ),
+    ),
+    "strategy-rule": (
+        (
+            "the rule's params",
+            "every parameter with its value and the help text the rule CLASS carries "
+            "(describe_params by introspection) -- one source, the classes themselves",
+        ),
+        (
+            "re-compute (ARMED)",
+            "Enter runs the FULL-WINDOW backtest over the cached candles and judges it "
+            "through the promotion gate -- real work that can take minutes; Esc or q "
+            "returns without running anything",
+        ),
+    ),
+    "strategy-simulate": (
+        (
+            "the ARMED view",
+            "the plan (products, window, the deployment's db) renders first; Enter is "
+            "the confirm step, and the run blocks the loop exactly like a fetch",
+        ),
+        (
+            "the verdict",
+            "GO-LIVE or TRAIN-MORE with the gates' own numbers, the DCA benchmark "
+            "comparison and the tier matrix; the written report is browsable from the "
+            "Research menu",
+        ),
+    ),
+}
+
+
 def build_strategy_menu_lines(*, cursor: int = 0, message: str | None = None) -> list[ScreenLine]:
     """The Rules sub-menu screen: every entry with its description wrapped to the 80-column
     budget, exactly one cursor-marked row, and the last action's confirmation lines as the

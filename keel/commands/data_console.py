@@ -144,6 +144,54 @@ def data_entry(ordinal: int) -> DataEntry | None:
     return None
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders, keyed by the live loop's mode names. Plain `(subject, description)`
+#: pairs so the text stays HERE with the module that owns the screens;
+#: `keel.commands.help_console` is the registry and renderer.
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "data": (
+        (
+            "fetch and its variants",
+            "warm the candle cache from the ACTIVE profile's config -- the fetch and "
+            "repair-gaps variants open ARMED with the plan (products x granularities x "
+            "window) shown first, and Enter runs the SAME flow `keel fetch` runs, "
+            "blocking the loop until it ends",
+        ),
+        (
+            "fetch --check",
+            "the scheduler's dry-run: a freshness verdict with NO network connection -- "
+            "the same sweep `keel fetch --check` runs, with its exit verdict rendered",
+        ),
+        (
+            "freshness overview",
+            "every series' current freshness, read-only and offline, rebuilt per poll",
+        ),
+        (
+            "db import",
+            "import Coinbase transaction-history CSV exports into this deployment's db "
+            "through the CLI's own importer -- read-only with respect to the exchange",
+        ),
+    ),
+    "data-fetch": (
+        (
+            "the ARMED view",
+            "the fetch plan (or the check's verdict, or the repair's per-series ask) "
+            "renders BEFORE anything runs; Enter dispatches to `run_fetch` itself, the "
+            "progress lines the CLI would stream are held and rendered, and Ctrl-C "
+            "exits the whole console (disclosed on the screen)",
+        ),
+    ),
+    "data-freshness": (
+        (
+            "the rows",
+            "one per product and granularity with its age and staleness verdict, from "
+            "the same offline assessment the CLI prints -- a broker is never "
+            "constructed for this view",
+        ),
+    ),
+}
+
+
 def build_data_menu_lines(*, cursor: int = 0, message: str | None = None) -> list[ScreenLine]:
     """The Data sub-menu screen: every entry with its description wrapped to the
     80-column budget, exactly one cursor-marked row, and the last action's confirmation
