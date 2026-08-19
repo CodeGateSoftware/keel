@@ -37,6 +37,7 @@ from keel_core.products import quote_currency_of
 
 from keel.commands._products import _history_product
 from keel.compliance import screen as screen_mod
+from keel.commands.fetch import DAYS_PER_YEAR
 from keel.compliance.screen import (
     Candidate,
     DiscoveryExclusions,
@@ -537,7 +538,7 @@ def run_discovery(
     )
 
     screen_policy = screen_mod.ScreenPolicy()
-    four_years_ago = now_ts - 4 * 365 * 86400
+    four_years_ago = now_ts - 4 * DAYS_PER_YEAR * 86400
     liquidity_window_start = now_ts - LIQUIDITY_PROBE_DAYS * 86400
     rows: list[DiscoverRow] = []
     for candidate in result.candidates[:shown]:

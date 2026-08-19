@@ -89,8 +89,8 @@ def test_no_commands_module_imports_the_cli() -> None:
     offenders: list[str] = []
     for path in sorted(COMMANDS_DIR.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in tree.body:  # top-level statements only: function-level lazy imports are
-            # the TUI's documented dodge and would need their own conversation
+        for node in ast.walk(tree):  # the WHOLE tree: a function-level `from keel.cli import`
+            # is the same cycle, one frame later -- C1 removed the TUI's last legitimate one
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
@@ -100,3 +100,29 @@ def test_no_commands_module_imports_the_cli() -> None:
             if any(name == "keel.cli" or name.startswith("keel.cli.") for name in names):
                 offenders.append(f"{path.name}: imports {', '.join(names)}")
     assert not offenders, f"keel/commands modules importing the CLI composition root: {offenders}"
+
+
+def test_the_scan_catches_a_function_level_lazy_import() -> None:
+    """The regression this file exists for: a lazy `from keel.cli import ...` inside a function
+    body. `ast.walk` (not `tree.body`) is what makes it uncatchable-proof -- this test feeds
+    the scan's own logic the dodge and asserts it is reported."""
+    dodging_source = (
+        "def _dodge() -> None:\n"
+        "    from keel.cli import _screen_product  # the old TUI seam\n"
+        "\n"
+        "def innocent() -> None:\n"
+        "    from keel.commands.assets import screen_product\n"
+        "    return screen_product\n"
+    )
+    tree = ast.parse(dodging_source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        else:
+            continue
+        if any(name == "keel.cli" or name.startswith("keel.cli.") for name in names):
+            offenders.append(names[0])
+    assert offenders == ["keel.cli"], "the function-level dodge must be caught"
