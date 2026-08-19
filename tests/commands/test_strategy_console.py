@@ -213,6 +213,45 @@ def test_the_recompute_verdict_renders_no_backtest_on_record_without_candles(
     assert "no backtest on record" in "\n".join(verdict.reason_lines)
 
 
+def test_the_recompute_verdict_delegates_its_backtest_half_to_the_service(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verdict view never re-derives a backtest: its BACKTEST half is the `rules`
+    service's own compute core (`resolve_rule_backtest` + `backtest_resolved`, the same
+    read/build/backtest `keel rules backtest` runs), not a console-side twin of the
+    granularity loop and the input assembly. Pinned by spy because the thinness pin's
+    allowance for a console-side engine call is GONE -- a verdict that assembles its own
+    inputs again would pass every behavior test and still be the drifting second copy
+    (issue #392 C6's review finding)."""
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": "BTC-USD", "entry_lookback": 40},
+        status="candidate",
+        now_ts=NOW_TS,
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(60))
+
+    calls: list[str] = []
+    real_resolve = sc.resolve_rule_backtest
+    real_run = sc.backtest_resolved
+    monkeypatch.setattr(
+        sc,
+        "resolve_rule_backtest",
+        lambda *a, **k: calls.append("resolve") or real_resolve(*a, **k),
+    )
+    monkeypatch.setattr(
+        sc,
+        "backtest_resolved",
+        lambda resolved: calls.append("run") or real_run(resolved),
+    )
+
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+    verdict = sc.compute_rule_verdict(repo, _config(), ledger[0])
+
+    assert calls == ["resolve", "run"]
+    assert verdict.stats_line is not None and "n_trades=" in verdict.stats_line
+
+
 def test_one_poisoned_row_neither_blanks_the_ledger_nor_kills_its_recompute(
     repo: Repository,
 ) -> None:

@@ -12,8 +12,10 @@ write another status, and only for the supervised live-order test. `add` cannot,
 see its docstring.
 
 Two layers, the house split since issue #390 C4 (the TUI-operator-console PRD, O2): the
-validation/write logic lives in SERVICE functions (`add_rule_row`, `run_rule_backtest`,
-`attempt_promotion`, `apply_rule_enable`/`disable`/`demote`, `describe_params`) that take a
+validation/write logic lives in SERVICE functions (`add_rule_row`, `run_rule_backtest` --
+itself `resolve_rule_backtest` + `backtest_resolved`, the backtest compute core the
+strategy console's per-rule verdict also delegates to -- `attempt_promotion`,
+`apply_rule_enable`/`disable`/`demote`, `describe_params`) that take a
 repo, a config and values and echo their operator-facing lines through injected sinks; the
 click commands above them parse options and dispatch. The strategy console
 (`keel.commands.strategy_console`) is the second front-end over the same services -- one
@@ -50,7 +52,7 @@ from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
-from keel.types import Granularity
+from keel.types import Candle, Granularity
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,28 @@ def _describe_fee(fee_pct: Decimal, source: str) -> str:
     return f"fee_pct={fee_pct * 100:.4f}% ({source})"
 
 
+def _resolve_backtest_inputs(
+    repo: Repository,
+    rule: Any,
+    granularity_opt: str | None,
+    echo_err: Callable[[str], None],
+) -> tuple[Granularity, list[Candle]]:
+    """The product/granularity/candles resolution every stored-rule backtest path shares
+    (`_backtest_rule` here, `resolve_rule_backtest` in the service section below): a rule
+    with no product or no resolvable granularity is a refusal, not a crash. THE one copy
+    of the input assembly -- extracted so the strategy console's per-rule verdict
+    resolves through it too instead of re-deriving the loop."""
+    product_id = getattr(rule, "product_id", None)
+    if product_id is None:
+        echo_err("Error: rule has no product_id to backtest against")
+        raise RulesRefused("rule has no product_id")
+    granularity = _resolve_granularity(rule, granularity_opt)
+    if granularity is None:
+        echo_err("Error: could not determine a granularity; pass --granularity")
+        raise RulesRefused("no granularity")
+    return granularity, repo.get_candles(product_id, granularity)
+
+
 def _backtest_rule(
     repo: Repository,
     rule: Any,
@@ -210,15 +234,7 @@ def _backtest_rule(
     """Backtest `rule` against its own cached candles at `fee_pct` -- the one backtest path
     `rules backtest`/`rules promote` (and the strategy console's ledger/retry) all share.
     A rule with no product or no resolvable granularity is a refusal, not a crash."""
-    product_id = getattr(rule, "product_id", None)
-    if product_id is None:
-        echo_err("Error: rule has no product_id to backtest against")
-        raise RulesRefused("rule has no product_id")
-    granularity = _resolve_granularity(rule, granularity_opt)
-    if granularity is None:
-        echo_err("Error: could not determine a granularity; pass --granularity")
-        raise RulesRefused("no granularity")
-    candles = repo.get_candles(product_id, granularity)
+    _granularity, candles = _resolve_backtest_inputs(repo, rule, granularity_opt, echo_err)
     return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
 
 
@@ -297,6 +313,65 @@ def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) ->
         ctx.exit(1)
 
 
+@dataclass(frozen=True)
+class ResolvedBacktest:
+    """What `resolve_rule_backtest` assembled: the row, the rebuilt rule, the fee rate its
+    fills will be priced at (and where that rate came from), the rule's resolved
+    granularity, and the repo's cached candles for it. The INPUT half of the `rules
+    backtest` compute core, split from the run so a second front-end (the strategy
+    console's per-rule verdict) can inspect what was resolved -- an empty candle list is
+    its "no backtest on record" case, distinct from a backtest that ran and found nothing
+    -- and then execute the same backtest the CLI runs."""
+
+    row: dict[str, Any]
+    rule: Any
+    fee_pct: Decimal
+    fee_source: str
+    granularity: Granularity
+    candles: list[Candle]
+
+
+def resolve_rule_backtest(
+    repo: Repository,
+    config: Any | None,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    echo_err: Callable[[str], None] = _noop,
+) -> ResolvedBacktest:
+    """THE `rules backtest` input core: read the row, rebuild the rule, derive the fee,
+    resolve the product/granularity and fetch its cached candles -- everything both
+    front-ends need before a backtest runs, with NOTHING echoed and nothing written (the
+    summary line is `run_rule_backtest`'s rendering; the console's verdict renders its
+    own).
+
+    Raises exactly what the pieces raise, so each front-end maps them its own way: the
+    `RulesRefused` refusal shapes (unknown id, no product, no granularity), and
+    `agent._build_rule`'s `ValueError` for a kind no longer in RULE_REGISTRY or params the
+    constructor rejects."""
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
+    rule = agent._build_rule(row)
+    fee_pct, fee_source = _backtest_fee(config)
+    granularity, candles = _resolve_backtest_inputs(repo, rule, granularity_opt, echo_err)
+    return ResolvedBacktest(
+        row=row,
+        rule=rule,
+        fee_pct=fee_pct,
+        fee_source=fee_source,
+        granularity=granularity,
+        candles=candles,
+    )
+
+
+def backtest_resolved(resolved: ResolvedBacktest) -> backtest_mod.BacktestResult:
+    """THE backtest execution over `resolve_rule_backtest`'s output -- the service seam the
+    strategy console's per-rule verdict runs the engine's backtest through, at the fee the
+    resolution derived, so no front-end ever assembles the engine call itself. Whatever
+    the backtest raises on a poisoned row propagates untouched: the caller renders the
+    failure (the CLI as a crash, the console as its honest per-row error line)."""
+    return backtest_mod.backtest(resolved.rule, resolved.candles, fee_pct=resolved.fee_pct)
+
+
 def run_rule_backtest(
     repo: Repository,
     config: Any | None,
@@ -306,24 +381,28 @@ def run_rule_backtest(
     echo: Callable[[str], None] = _noop,
     echo_err: Callable[[str], None] = _noop,
 ) -> tuple[RulesOutcome, backtest_mod.BacktestResult]:
-    """THE `rules backtest` service: the row, the backtest, the fee-honest summary line.
+    """THE `rules backtest` service: the row, the backtest, the fee-honest summary line --
+    `resolve_rule_backtest` + `backtest_resolved` with the CLI's rendering over them.
 
     Returns the outcome (its single echoed line) beside the raw `BacktestResult` -- the
-    strategy console's retry flow and ledger render both, and a caller that only wants the
-    CLI's line reads `outcome.lines`. Refusals (unknown id, no granularity) are the
-    service's two `RulesRefused` shapes, already echoed to `echo_err`."""
-    row = _rule_row_or_refuse(repo, rule_id, echo_err)
-    rule = agent._build_rule(row)
-    fee_pct, fee_source = _backtest_fee(config)
-    stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
+    strategy console's retry flow renders both, and a caller that only wants the CLI's
+    line reads `outcome.lines`. Refusals (unknown id, no granularity) are the service's
+    `RulesRefused` shapes, already echoed to `echo_err`."""
+    resolved = resolve_rule_backtest(
+        repo, config, rule_id, granularity_opt=granularity_opt, echo_err=echo_err
+    )
+    stats = backtest_resolved(resolved)
     sink, recorded = _line_sink(echo)
     sink(
-        f"rule {rule_id} ({row['kind']}): n_trades={stats.n_trades} "
+        f"rule {rule_id} ({resolved.row['kind']}): n_trades={stats.n_trades} "
         f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
         f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown} "
-        f"{_describe_fee(fee_pct, fee_source)}"
+        f"{_describe_fee(resolved.fee_pct, resolved.fee_source)}"
     )
-    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"]), stats
+    return (
+        RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=resolved.row["status"]),
+        stats,
+    )
 
 
 @rules_group.command("promote")

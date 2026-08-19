@@ -38,6 +38,7 @@ import importlib
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -281,9 +282,11 @@ CEREMONY: dict[tuple[str, str], tuple[Cell, ...]] = {
         Cell(
             T,
             "the `--force` bypass is offered only after a declined/refused promote and "
-            "runs ONLY behind the CLI's own typed gate "
-            "(`clis_typed_promote_force_gate`); a wrong phrase writes nothing and "
-            "the status does not move",
+            "runs ONLY behind the console's TYPED gate "
+            "(`clis_typed_promote_force_gate` -- the CLI's `--force` is a bare flag with "
+            "no gate of its own; the console is deliberately STRICTER, quoting the CLI's "
+            "own force warning over the shared typed-confirmation gate); a wrong phrase "
+            "writes nothing and the status does not move",
             (
                 (
                     "test_strategy_console",
@@ -574,14 +577,28 @@ CEREMONY: dict[tuple[str, str], tuple[Cell, ...]] = {
         Cell(
             U,
             "`f` fetches candle history -- money-safe by construction (data only, never "
-            "an order), the dashboard's own pre-console key, ungated like `keel fetch`",
-            (("test_tui", "test_message_style_fetch_complete_is_ok"),),
+            "an order), the dashboard's own pre-console key, ungated like `keel fetch`; "
+            "the console's own path to the SAME write is Data -> fetch, which IS gated "
+            "(ARMED; Enter is the confirm step)",
+            (
+                (
+                    "test_data_console",
+                    "test_run_live_fetch_is_armed_until_enter_and_enter_runs_exactly_one",
+                ),
+            ),
         ),
     ),
 }
 
 #: The write paths that are NOT menu entries -- declared, so the coverage equality in
 #: the teeth test cannot be satisfied by an accidental extra row for them either.
+#: HOW TO KEEP THIS COMPLETE (the audit's own method): the non-menu writes are exactly
+#: the KEY BRANCHES in `run_live` that dispatch work -- walk the loop's `ch ==`/`elif`
+#: chain in every mode (the dashboard `normal` screen's keys, and per-mode keys such as
+#: the scout browser's `a`) and list every branch whose body is not a pure view or
+#: navigation action; re-walk the chain whenever a key branch is added, because a brand
+#: new write key has no registry entry for the teeth test to derive and only a row here
+#: classifies it.
 EXTRA_KEYS: frozenset[tuple[str, str]] = frozenset(
     {
         ("scout-view", "a"),
@@ -829,8 +846,6 @@ def test_the_live_binding_moves_only_through_the_guards_switch() -> None:
     `confirm_fn` -- pinned structurally over the whole console layer (an AST scan: any
     other `.rebind(` call site fails). Direct binding via the CLI's own flags remains
     the wrapper's documented path, outside this code entirely."""
-    from pathlib import Path
-
     import keel.commands as commands_pkg
 
     rebind_sites: list[str] = []
@@ -884,14 +899,100 @@ def test_no_console_action_originates_an_order_outside_the_agent_pipeline() -> N
     assert signature.parameters["run_fn"].default is keel.agent.run_once
 
 
+def _seam_runner_groups() -> list[tuple[str, ...]]:
+    """One entry per `_run_terminal_form(...)` call site in the console layer, in source
+    order: every dotted runner name (`<module>.<runner>(...)`) reachable from the call's
+    runner argument -- named inline in a lambda, or inside the local helper def a bare
+    Name argument refers to (resolved within the call site's own enclosing function, so a
+    same-named def elsewhere is not picked up).
+
+    DERIVED, never hand-listed: a form-runner added at the seam is covered the day it
+    lands (the hand-maintained tuple this replaces had already missed three of the
+    trading forms), and a seam call site whose runner the extraction cannot read yields
+    an EMPTY entry, which the canary test below fails loudly on."""
+    from tests.commands import test_console_thinness as thin
+
+    groups: list[tuple[str, ...]] = []
+    for path in thin._console_module_paths():
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        all_defs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        sites = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_terminal_form"
+        ]
+        for call in sorted(sites, key=lambda c: c.lineno):
+            names: set[str] = set()
+            for arg in call.args[1:]:
+                if isinstance(arg, ast.Lambda):
+                    names |= _dotted_runner_calls(arg)
+                elif isinstance(arg, ast.Name):
+                    enclosing = max(
+                        (d for d in all_defs if d.lineno < call.lineno <= d.end_lineno),
+                        key=lambda d: d.lineno,
+                        default=None,
+                    )
+                    if enclosing is None:
+                        continue
+                    for defn in all_defs:
+                        if (
+                            defn.name == arg.id
+                            and enclosing.lineno <= defn.lineno
+                            and defn.end_lineno <= enclosing.end_lineno
+                        ):
+                            names |= _dotted_runner_calls(defn)
+            groups.append(tuple(sorted(names)))
+    return groups
+
+
+def _dotted_runner_calls(node: ast.AST) -> set[str]:
+    """Every `x.y(...)` call inside `node` (a lambda body or a helper def handed to the
+    seam) -- the runner dispatches, as dotted names. Bare-name calls (`open_state()`,
+    `now_fn()`, ...) are plumbing, not runners, and are excluded by shape."""
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and isinstance(sub.func.value, ast.Name)
+        ):
+            names.add(f"{sub.func.value.id}.{sub.func.attr}")
+    return names
+
+
+def test_the_seam_runner_derivation_covers_every_call_site() -> None:
+    """The canary for the derived runners: the console layer's `_run_terminal_form(` call
+    sites -- counted independently, by text -- are exactly one list entry each, and no
+    entry is empty. Without this, an extraction that silently matched nothing (an AST
+    change, a rename of the seam) would hand the suspend test an empty runner set and it
+    would pass vacuously; with it, every seam call site contributes the runners it
+    dispatches, or the suite says so."""
+    import re
+
+    from tests.commands import test_console_thinness as thin
+
+    text_sites = 0
+    for path in thin._console_module_paths():
+        text = Path(path).read_text(encoding="utf-8")
+        text_sites += len(re.findall(r"_run_terminal_form\(", text))
+        text_sites -= len(re.findall(r"def _run_terminal_form\(", text))
+    groups = _seam_runner_groups()
+    assert text_sites == len(groups), (text_sites, groups)
+    assert all(groups), groups
+
+
 def test_every_blocking_run_that_can_prompt_suspends_curses() -> None:
     """Every terminal-prompting run in the live loop goes through the ONE shared
     suspend/restore seam (`_run_terminal_form` -- `def_prog_mode` -> `endwin` -> the
     run -> `reset_prog_mode` -> refresh), pinned structurally: no form-runner or cycle
     dispatch inside `run_live` may execute outside a `_run_terminal_form(...)` call
-    span, or outside a helper def that the seam is handed. The end-to-end dance proofs
-    are the named per-row tests (the cycle's mid-flight gate, the db-import form,
-    resume's typed yes)."""
+    span, or outside a helper def that the seam is handed. The runners scanned for are
+    DERIVED from the seam's own call sites (`_seam_runner_groups`), so a form-runner
+    added at the seam is covered without anyone remembering to extend a hand-listed
+    tuple. The end-to-end dance proofs are the named per-row tests (the cycle's
+    mid-flight gate, the db-import form, resume's typed yes)."""
     source = inspect.getsource(run_live)
     tree = ast.parse(source)
     seam_calls: list[ast.Call] = []
@@ -923,19 +1024,8 @@ def test_every_blocking_run_that_can_prompt_suspends_curses() -> None:
                     if defn.name == arg.id and enclosing.lineno <= defn.lineno:
                         covered.append((defn.lineno, defn.end_lineno))
 
-    runners = (
-        "compliance_console.run_form",
-        "compliance_console.run_attest_form",
-        "strategy_console.run_add_form",
-        "strategy_console.run_retry_form",
-        "strategy_console.run_enable_form",
-        "strategy_console.run_disable_form",
-        "strategy_console.run_demote_form",
-        "trading_console.run_autonomy_form",
-        "trading_console.run_record_flow_form",
-        "trading_console.run_agent_cycle",
-        "data_console.run_db_import_form",
-    )
+    runners = sorted({name for group in _seam_runner_groups() for name in group})
+    assert runners, "the derivation found no runners -- it has rotted"
     lines = source.splitlines()
     for index, line in enumerate(lines, start=1):
         for runner in runners:

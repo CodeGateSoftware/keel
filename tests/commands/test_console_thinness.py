@@ -86,10 +86,11 @@ def _is_compute(dotted: str) -> bool:
 IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         # strategy_console: the recorded-paper-track read the insights service itself
-        # performs (insights.py calls the same function the same way), and the engine's
-        # own backtest -- both dispatched, never re-implemented, and both call-pinned.
+        # performs (insights.py calls the same function the same way) -- dispatched,
+        # never re-implemented, and call-pinned. (The verdict view's backtest half rides
+        # `keel.commands.rules.resolve_rule_backtest`/`backtest_resolved` now, so the
+        # engine's backtest needs no console-side import allowance.)
         ("strategy_console", "keel.strategy.paper.track_record"),
-        ("strategy_console", "keel.strategy.backtest.backtest"),
         # tui: the §65.9 report COMPUTE home the CLI's own `keel purification` body calls
         # (one implementation, two front-ends), and the executor's two READ helpers (the
         # rail-17 state read and the live-balance read rail 13 funds) -- reads, never the
@@ -111,11 +112,13 @@ CALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
         # builder takes the record as an input.
         ("strategy_console", "_paper_gate_lines", "keel.strategy.promotion.PromotionConfig"),
         ("strategy_console", "_paper_gate_lines", "keel.strategy.paper.track_record"),
-        # The detail view's Enter-gated verdict: assembles the row, the cached candles
-        # and the config's floors, then hands them to the engine's OWN backtest and
-        # promotion gate -- the same functions the `keel.commands.rules` services call.
-        # It cannot go through `rules.run_rule_backtest` because that service WRITES a
-        # backtest row and the verdict view deliberately does not.
+        # The detail view's Enter-gated verdict: its BACKTEST half is fully delegated to
+        # the `keel.commands.rules` compute core (`resolve_rule_backtest` +
+        # `backtest_resolved` -- the same read/build/backtest `keel rules backtest` runs;
+        # the console-side granularity loop and input assembly are gone, so there is no
+        # engine-backtest allowance here). What remains is the GATE half's dispatch: the
+        # config's floor values and the engine's own `can_promote` judgment -- the same
+        # dispatched-never-reimplemented pattern `_paper_gate_lines` above keeps.
         (
             "strategy_console",
             "compute_rule_verdict",
@@ -127,7 +130,6 @@ CALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
             "keel.strategy.promotion.pbo_gate_from_config",
         ),
         ("strategy_console", "compute_rule_verdict", "keel.strategy.promotion.can_promote"),
-        ("strategy_console", "compute_rule_verdict", "keel.strategy.backtest.backtest"),
         # The retry form names the typed --force gate's from->to pair through the
         # lifecycle vocabulary -- a pure status mapping, no gate math.
         ("strategy_console", "run_retry_form", "keel.strategy.promotion.next_status"),
@@ -152,8 +154,11 @@ READ_SITES: frozenset[tuple[str, str, str]] = frozenset(
         ("console", "venue_session_bound", "load_broker"),
         # The dashboard's pre-console bounded reads: the slow-cadence balance line, the
         # compliance menu's two Enter-gated venue reads, the discover overlay's one
-        # product read, and the `f` fetch key's history warm -- all display/data reads
-        # with the CLI's own timeouts, none an order path.
+        # product read, and the `f` fetch key's history warm -- all display/data reads,
+        # none an order path. The first three construct with the CLI's own bounded
+        # timeouts; `_do_fetch` deliberately constructs WITHOUT one, mirroring `keel
+        # fetch`'s own unbounded client -- the documented frozen-screen behavior (the
+        # screen freezes for as long as honest work takes, exactly like the CLI).
         ("tui", "_balance_fn", "_build_broker"),
         ("tui", "_do_compliance_network", "_build_broker"),
         ("tui", "_do_discover_report", "_build_broker"),

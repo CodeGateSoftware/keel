@@ -69,10 +69,14 @@ def test_the_section_documents_the_session_banner() -> None:
 def test_the_section_documents_the_typed_contracts() -> None:
     section = _section().lower()
     assert "typed" in section
-    # identical to the CLI, never pre-filled
-    assert "pre-filled" in section or "pre-filled" in section.replace("pre-filled", "pre-filled")
-    assert "identical to the cli" in section or "same prompt" in section
-    for action in ("resume", "kill"):
+    # never pre-filled
+    assert "pre-filled" in section
+    # the SIX CLI-own typed prompts run in-console; the two the console adds (attest's
+    # asset code, promote --force's typed yes) are stated as STRICTER than the CLI --
+    # never as identical to it, because the CLI's own gates for those two do not exist
+    assert "the cli's own typed prompt" in section
+    assert "stricter" in section
+    for action in ("resume", "attest", "kill"):
         assert action in section
     # kill's one-key contract stated as its own
     assert "one key" in section or "one-key" in section
@@ -83,6 +87,12 @@ def test_the_section_documents_the_armed_views_and_ctrl_c() -> None:
     assert "armed" in section
     assert "enter" in section
     assert "ctrl-c" in section or "ctrl+c" in section or "control-c" in section
+    # the code's own disclosure wording: Ctrl-C exits gracefully, discards held results,
+    # and the in-flight run does NOT complete (the handlers catch Exception only, so the
+    # interrupt propagates out of the run) -- pinned so "it does not abort a run in
+    # flight" cannot come back
+    assert "does not complete" in section
+    assert "gracefully" in section
 
 
 def test_the_section_documents_the_venues_browser_and_brokers_list() -> None:

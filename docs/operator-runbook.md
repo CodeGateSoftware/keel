@@ -540,7 +540,9 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 
 `keel tui` (or any wrapper, e.g. `./keel-live tui`) opens the **operator console**: the dashboard is
 still the landing screen, and `m` opens a menu tree over it — Profile, Trading, Rules, Compliance,
-Data, Research, Account, Help — covering every read and every safe write the CLI knows. The console
+Data, Research, Account, Help — covering every operational read and write the CLI knows (the
+setup-only writes are deliberately absent: `rules seed` is bootstrap, and schema migration rides
+along every database open rather than being a menu action). The console
 is **thin by construction**: each entry dispatches to the same `keel/commands/*` service layer the
 CLI commands call, and an architectural test (`tests/commands/test_console_thinness.py`) pins that
 the TUI layer contains no business logic — no sizing, screening, gating or reporting math, no
@@ -563,25 +565,35 @@ next open/close, `24/7` for always-open venues, and **CLOCK UNAVAILABLE** render
 the recorded clock is absent or stale, exactly as `fetch --check` treats it. The banner reads the
 recorded session state; there is no TUI-side calendar.
 
-**The typed contracts are the CLI's own.** Actions that release a halt or bypass a gate —
-`resume`, `resume-entries`, `record-flow`, `reset-hwm`, `withdrawals attest --enabled`, `rules
-promote --force`, asset `attest`, `autonomy on` — run the CLI's own typed prompt in-console
-(curses suspends around it so the prompt renders at the terminal). The prompts are identical to
-the CLI's, word for word, and **cannot be pre-filled, piped or bypassed**; a wrong phrase or a
-decline writes nothing. `kill` is the deliberate exception: **one key, no confirmation**, its own
-CLI contract — engaging the halt is the safe direction — and the console adds no ceremony to it.
-The whole ceremony map (every state-mutating console action → typed-phrase / confirm-step /
-ARMED+Enter / ungated-by-design, each with its refusal proof) is pinned as a table-driven suite,
-`tests/commands/test_console_ceremony.py`, so a newly added mutating action without a classified
-ceremony row fails the tests.
+**The typed contracts: six of the CLI's own, two the console adds.** Six actions run the
+CLI's own typed prompt in-console, word for word (curses suspends around it so the prompt
+renders at the terminal): `resume`, `resume-entries`, `record-flow`, `reset-hwm`,
+`withdrawals attest --enabled`, and `autonomy on` — each the same
+`_require_interactive_confirmation` gate the CLI command runs, demanding a typed `yes` and
+failing closed off a TTY. Two more typed prompts are **ceremony the console adds on top of
+an ungated CLI action** — deliberately *stricter* than the CLI, not identical to it: asset
+`attest` makes you type the **asset code** back (the CLI's `keel assets attest` is not
+gated — an attestation only ever admits to a list rail 1 still enforces per-trade), and the
+retry flow's `rules promote --force` demands a typed `yes` quoting the CLI's own force
+warning (the CLI's `--force` is a bare flag). Both are built on the same shared
+typed-confirmation gate as the CLI's six. Every typed prompt **cannot be pre-filled, piped
+or bypassed**; a wrong phrase or a decline writes nothing. `kill` is the deliberate
+exception: **one key, no confirmation**, its own CLI contract — engaging the halt is the
+safe direction — and the console adds no ceremony to it. The whole ceremony map (every
+state-mutating console action → typed-phrase / confirm-step / ARMED+Enter /
+ungated-by-design, each with its refusal proof) is pinned as a table-driven suite,
+`tests/commands/test_console_ceremony.py`, so a newly added mutating action without a
+classified ceremony row fails the tests.
 
 **ARMED and blocking surfaces.** The runs that do real work — one agent cycle, one monitor poll,
 fetch and its check/repair variants, one simulate — open **ARMED**: nothing runs until Enter,
 which is the confirm step. While a run executes the screen freezes (it can take minutes, exactly
-like the CLI) and the result is held on screen afterwards. **Ctrl-C exits the whole console**, as
-every frozen screen states; it does not abort a run in flight. The one entry that can place
-orders, the agent cycle, goes through `agent.run_once` with the CLI's own order-confirmation
-gate — there is no TUI-originated order path.
+like the CLI) and the result is held on screen afterwards. **Ctrl-C exits the console
+gracefully, discards held results, and the in-flight run does not complete** — as every frozen
+screen states; the interrupt propagates out of the run itself (the loop's failure handlers
+catch `Exception` only), which is what restores the terminal cleanly. The one entry that can
+place orders, the agent cycle, goes through `agent.run_once` with the CLI's own
+order-confirmation gate — there is no TUI-originated order path.
 
 **Venues and help.** The Profile menu's **Venues** entry browses every installed adapter and its
 declared capabilities — the same payload `keel brokers list` prints, one service, both
