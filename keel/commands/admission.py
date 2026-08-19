@@ -120,6 +120,53 @@ def latest_shortlist(directory: Path) -> Path | None:
         return None
 
 
+@dataclass(frozen=True)
+class ScoutFile:
+    """One shortlist file a scout run produced, with the display facts the console's Scout
+    results browser (issue #389 C3, PRD O6) renders beside the name: WHEN it was written
+    (mtime) and how big it is. Carried rather than re-`stat`-ed per render, because the
+    browser builds its list once per entry and repaints from the value."""
+
+    path: Path
+    mtime_ts: float
+    size_bytes: int
+
+
+def list_shortlists(directory: Path) -> tuple[ScoutFile, ...]:
+    """EVERY `*shortlist.json` under `directory`, newest first -- the service read behind
+    the Scout results browser (O6). The browser is a LIST-and-choose surface: unlike
+    `latest_shortlist` (which answers "the one newest file" for the propose overlay), it
+    must show the operator every scout run their directory holds, so an older shortlist
+    stays reachable instead of being shadowed by whichever sibling wrote last.
+
+    Same contract as `latest_shortlist` otherwise: the SAME `SHORTLIST_GLOB` convention
+    (never a bare `*.json` -- the scout writes sibling outputs beside its shortlists, and
+    a bare glob would list `*-param-proposals.json` as a malformed shortlist), the same
+    `(mtime, name)` tiebreak (descending -- `latest_shortlist`'s own ordering, reversed
+    for a list), never creates the directory, and `()` rather than an exception for every
+    absent/strangled path -- a browser must render a calm empty state, not a traceback.
+    """
+    try:
+        if not directory.is_dir():
+            return ()
+    except OSError:
+        return ()
+    found: list[ScoutFile] = []
+    for candidate in directory.glob(SHORTLIST_GLOB):
+        # Per-file, not per-directory: one file vanishing between the glob and the stat
+        # (another process mid-write, a rotation) must cost THAT row, not the whole list.
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        found.append(
+            ScoutFile(path=candidate, mtime_ts=stat.st_mtime, size_bytes=stat.st_size)
+        )
+    found.sort(key=lambda f: (f.mtime_ts, f.path.name), reverse=True)
+    return tuple(found)
+
+
+
 # -- 2b. screen report (offline, DB reads only) --------------------------------------------------
 
 

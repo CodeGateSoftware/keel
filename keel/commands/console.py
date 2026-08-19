@@ -1,11 +1,13 @@
 """The console shell around the dashboard -- menu navigation, the deployment profiles, and
 the session banner (issue #388 C2; PRD O4, O9 and §5 C2).
 
-The PRD's ask for this slice is structure, not features: the TUI grows a menu/sub-menu
+The PRD's ask for this slice was structure, not features: the TUI grows a menu/sub-menu
 navigation whose entries are the PRD §3 tree, with everything beyond Dashboard/Profile/Help
-a named placeholder ("lands in C3/C4/C5") owned by a later slice. The dashboard stays the
-landing screen, untouched -- the shell lands AROUND it (`run_live` gains menu modes; the
-pre-existing modes and every pure builder are unchanged).
+a named placeholder ("lands in C3/C4/C5") owned by a later slice. C3 (issue #389) since
+landed the Compliance entry -- its sub-menu lives in `keel.commands.compliance_console`;
+the remaining placeholders are owned by C4/C5. The dashboard stays the landing screen,
+untouched -- the shell lands AROUND it (`run_live` gains menu modes; the pre-existing modes
+and every pure builder are unchanged).
 
 Three pure surfaces live here, all directly unit-testable without curses (the
 `build_*`/`discover_*`/`switch_*` functions take their inputs as values), mirroring
@@ -243,8 +245,10 @@ class MenuEntry:
     menu item is ever a dead click and no future slice has to restructure the tree.
 
     `action` is what selecting the entry does in the shell: `"dashboard"`/`"profile"`/
-    `"help"` are this slice's three live destinations, `"placeholder"` everything else --
-    a closed vocabulary the live loop dispatches on, rather than string-matching labels."""
+    `"help"` are this slice's three live destinations, `"compliance"` is C3's (issue #389)
+    -- the Compliance sub-menu, `keel.commands.compliance_console` -- and `"placeholder"`
+    everything else: a closed vocabulary the live loop dispatches on, rather than
+    string-matching labels."""
 
     ordinal: int
     label: str
@@ -258,9 +262,9 @@ class MenuEntry:
 
 
 #: The PRD §3 tree's top level, in tree order. The placeholder owners are the PRD §5
-#: phasing's own assignments: Compliance -> C3, Rules/Research -> C4, Trading/Data -> C5.
-#: Account is unassigned by the PRD's phasing; it rides with C5 (the last menu slice), and
-#: the description says so plainly rather than inventing precision.
+#: phasing's own assignments: Rules/Research -> C4, Trading/Data -> C5. Compliance landed
+#: with C3 (issue #389); Account is unassigned by the PRD's phasing, rides with C5 (the
+#: last menu slice), and the description says so plainly rather than inventing precision.
 CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=1,
@@ -289,8 +293,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=5,
         label="Compliance",
-        lands_in="C3",
         description="screen, propose, attest, exemptions, subscription, purification",
+        action="compliance",
     ),
     MenuEntry(
         ordinal=6,

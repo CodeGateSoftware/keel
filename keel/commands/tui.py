@@ -1495,6 +1495,85 @@ def _do_screen_report(open_state: OpenState) -> ScreenReport:
     return build_screen_report(repo, config, screen_product)
 
 
+def _do_compliance_payload(open_state: OpenState, now_fn: NowFn, kind: str) -> Any:
+    """Gather the payload one Compliance view renders (issue #389 C3): the OFFLINE kinds
+    only -- a service report, rebuilt each poll, fail-soft in the caller. The two
+    network-gated kinds (holdings/discover) are NOT gathered here; they go through
+    `_do_compliance_network` behind an explicit Enter, the discover overlay's own gating
+    story. Thin I/O -- every branch dispatches to a service function; nothing is computed
+    here."""
+    from keel.commands import compliance_console
+
+    if kind == "screen":
+        return _do_screen_report(open_state)
+    if kind == "propose":
+        return _do_propose_view(open_state)
+    repo, config = open_state()
+    if kind == "purification":
+        from keel.commands.purification import render_purification_report
+        from keel.compliance.purification import build_report
+
+        return render_purification_report(build_report(repo.get_transactions()))
+    if kind == "subscription":
+        from keel.commands.subscription import subscription_show_lines
+
+        return subscription_show_lines(repo, config, now_fn())
+    if kind == "shariah":
+        from keel.commands.assets import gather_attestations_in_force
+        from keel.execution.executor import _withdrawals_enabled
+
+        inventory = gather_attestations_in_force(repo, config)
+        return compliance_console.build_shariah_lines(
+            inventory, withdrawals_enabled=_withdrawals_enabled(repo, now_fn()), now_ts=now_fn()
+        )
+    raise ValueError(f"unknown offline compliance view: {kind}")
+
+
+def _do_compliance_network(open_state: OpenState, kind: str) -> Any:
+    """The ONE live call each network-gated Compliance view makes, run only from an
+    explicit Enter (issue #389 C3): `get_accounts` for holdings (the same balance read
+    the dashboard's live-balance line makes) or `list_products` for discover (the same
+    product-metadata read `_do_discover_report` makes). Both are BOUNDED, for the same
+    reason `_refresh_balance`/`_do_discover_report` are: the operator is actively waiting
+    on a frozen screen. Thin I/O -- the report compute is the service's."""
+    from keel.commands._common import _build_broker
+
+    if kind == "discover":
+        _repo, config = open_state()
+        products = _build_broker(config, timeout=_DISCOVER_TIMEOUT_SEC).list_products()
+        return build_discover_report(products, config)
+    if kind == "holdings":
+        from keel.commands.assets import gather_holdings
+
+        repo, config = open_state()
+        # min-balance 0 and no screen: `keel assets holdings`'s own defaults.
+        accounts = _build_broker(config, timeout=_BALANCE_TIMEOUT_SEC).get_accounts()
+        return gather_holdings(repo, config, accounts, Decimal("0"))
+    raise ValueError(f"unknown network compliance view: {kind}")
+
+
+def _run_terminal_form(stdscr: Any, fn: Callable[[], str]) -> str:
+    """Run one Compliance form at the TERMINAL, inside the console session: suspend
+    curses (the same `def_prog_mode` -> `endwin` -> `reset_prog_mode` dance
+    `_confirm_arm_autonomy`/`_confirm_live_profile` keep), let the form's prompts and
+    O3's typed gates render in-console, restore the screen, and return the form's result
+    line (the confirmation of what was written). A form that cannot run at all (an
+    exception outside its own fail-soft handling) becomes a readable toast, never a
+    crash of the loop."""
+    import curses
+
+    try:
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return fn()
+        finally:
+            curses.reset_prog_mode()
+            stdscr.refresh()
+    except Exception as exc:
+        return f"form failed: {exc}"[:200]
+
+
 def _do_propose_view(open_state: OpenState) -> ProposeView:
     """Build a fresh `ProposeView` over the newest shortlist in `config.proposals_dir` -- OFFLINE
     (DB + local filesystem reads only), rebuilt every poll while the propose overlay is open.
@@ -1561,6 +1640,16 @@ def run_live(
     byte-for-byte: no banner, no `m`, none of the new modes -- which is what every caller
     that predates the shell (and every pre-existing test) passes.
 
+    C3 (issue #389) adds the Compliance sub-tree's four modes, all console-bound only:
+    `compliance` (the sub-menu; a form entry runs its form at the TERMINAL through
+    `_run_terminal_form` -- curses suspended, O3's typed gates rendering in-console -- and
+    the write's confirmation line toasts on the menu), `compliance-view` (one service
+    report overlay; the offline kinds rebuild per poll fail-soft, the network kinds --
+    holdings/discover -- open ARMED and hold what an explicit Enter fetched),
+    `scout-list`/`scout-view` (the scout-results browser, O6: list the config-named
+    proposals directory, screen the chosen shortlist through the admission services, and
+    offer -- never auto-run -- the TYPED attest step for a selected candidate).
+
     Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
     action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
     `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
@@ -1615,6 +1704,13 @@ def run_live(
     those are the only three places this whole dashboard ever touches the network -- everything
     else, including all of `screen`/`propose`/`discover`'s own reads, is DB/filesystem-only.
 
+    C3's Compliance menu adds two more EXPLICITLY-GATED network touches, both behind their
+    own Enter inside an ARMED view (never on open, never on a poll): the holdings view's
+    one `get_accounts` (the same read the slow-cadence balance line makes) and the discover
+    view's one `list_products` (the same read `d`+Enter makes, reached from the menu).
+    Both are bounded (`_BALANCE_TIMEOUT_SEC`/`_DISCOVER_TIMEOUT_SEC`) and both hold their
+    result until re-Enter or close, the discover overlay's own story.
+
     Quits on `q`/`Q` in normal mode; a `KeyboardInterrupt` (Ctrl-C) exits gracefully rather than
     dumping a traceback onto a terminal `curses.wrapper` may not have fully restored."""
     import curses
@@ -1622,7 +1718,7 @@ def run_live(
     # Lazy import, the established cycle-dodge for this module (see `insights`): console
     # imports THIS module at load time (its builders speak `ScreenLine`), so importing it
     # here keeps the two modules loadable in either order.
-    from keel.commands import console
+    from keel.commands import compliance_console, console
 
     def _balance_fn(cfg: Config) -> Decimal | None:
         # Lazy imports -- `keel.commands._common` and `keel.execution.executor` both import
@@ -1672,6 +1768,8 @@ def run_live(
                 return "profile", 0, 0, None
             if action == "help":
                 return "help", 0, 0, None
+            if action == "compliance":
+                return "compliance", 0, 0, None
             return "placeholder", 0, 0, entry
 
         mode = "normal"
@@ -1696,10 +1794,75 @@ def run_live(
         activity_expanded: frozenset[str] = frozenset()
         discover_result: DiscoverReport | None = None
         discover_error: str | None = None
+        # -- the Compliance menu (issue #389 C3): sub-menu cursor, the open view's kind,
+        # its held network result (holdings/discover open ARMED and hold what Enter ran),
+        # and the scout browser's listing/selection state.
+        compliance_cursor = 0
+        compliance_offset = 0
+        compliance_view_kind: str | None = None
+        compliance_result: Any = None
+        compliance_error: str | None = None
+        scout_files: tuple[Any, ...] = ()
+        scout_dir: Any = None
+        scout_cursor = 0
+        scout_selected: Any = None
+        scout_view_offset = 0
+        scout_candidate_cursor = 0
         message: str | None = None
         message_ts = 0
         available: AvailableBalance | None = None
         last_balance_ts = 0
+
+        def _toast_ttl() -> str | None:
+            """The current toast, if it has not aged out -- the compliance screens render
+            it too (a write's confirmation belongs on the screen it was invoked from)."""
+            if message is not None and now_fn() - message_ts <= _MESSAGE_TTL_SEC:
+                return message
+            return None
+
+        def _form_prompt(text: str) -> str:
+            """One form field, asked at the terminal while curses is suspended -- the
+            prompt side of every Compliance form (the typed gates run their own
+            `click.prompt` inside `_require_interactive_confirmation`, unchanged)."""
+            return click.prompt(text, default="", show_default=False)
+
+        def _run_form_at_terminal(form_target: str) -> None:
+            """A record-write entry: open the state through the console's own loaders and
+            run the form through `compliance_console.run_form` -- THE dispatch seam, the
+            same function the unit tests drive -- inside the suspend/restore dance. The
+            form's result line (confirmation or cancellation) becomes the toast."""
+            nonlocal message, message_ts
+
+            form_repo, form_config = open_state()
+            message = _run_terminal_form(
+                stdscr,
+                lambda: compliance_console.run_form(
+                    form_target, form_repo, form_config, _form_prompt, now_fn()
+                ),
+            )
+            message_ts = now_fn()
+
+        def _enter_compliance_entry(entry: compliance_console.ComplianceEntry) -> None:
+            """Where a Compliance selection goes -- the same closed-mapping rule
+            `_enter_menu_entry` keeps, for the sub-tree: a view (the network-gated ones
+            open ARMED), the scout browser, or a form run right here at the terminal."""
+            nonlocal mode, compliance_view_kind, compliance_result, compliance_error
+            nonlocal compliance_offset, scout_files, scout_dir, scout_cursor
+            nonlocal scout_selected, scout_view_offset, scout_candidate_cursor
+            if entry.kind == "view":
+                compliance_view_kind = entry.target
+                compliance_result = None
+                compliance_error = None
+                compliance_offset = 0
+                mode = "compliance-view"
+            elif entry.kind == "scout":
+                _scout_repo, scout_config = open_state()
+                scout_files, scout_dir = compliance_console.scout_listing(scout_config)
+                scout_cursor = 0
+                scout_selected = None
+                mode = "scout-list"
+            else:
+                _run_form_at_terminal(entry.target)
 
         while True:
             if mode == "menu":
@@ -1810,6 +1973,212 @@ def run_live(
                 # Clamp every poll: the discovered list can change under the cursor (a
                 # config file appearing/disappearing between polls).
                 profile_cursor = max(0, min(profile_cursor, max(0, len(profiles) - 1)))
+                continue
+
+            if mode == "compliance":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Compliance sub-menu (issue #389 C3): PRD §3's Compliance branch,
+                # one cursor-marked row, the typed entries marked. A FORM entry runs at
+                # the terminal right here (curses suspended) and its confirmation line
+                # becomes the toast on this screen; views and the scout browser are
+                # separate modes that close back HERE -- the shell is a hierarchy.
+                compliance_lines = compliance_console.build_compliance_menu_lines(
+                    cursor=compliance_cursor, message=_toast_ttl()
+                )
+                _paint(stdscr, [*_console_banner(), *compliance_lines])
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    compliance_cursor = max(0, compliance_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    compliance_cursor = min(
+                        len(compliance_console.COMPLIANCE_MENU) - 1, compliance_cursor + 1
+                    )
+                elif ord("1") <= ch <= ord("9"):
+                    compliance_selected = compliance_console.compliance_entry(ch - ord("0"))
+                    if compliance_selected is not None:
+                        _enter_compliance_entry(compliance_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_compliance_entry(compliance_console.COMPLIANCE_MENU[compliance_cursor])
+                continue
+
+            if mode == "compliance-view" and compliance_view_kind is not None:
+                # One service-report overlay, FAIL-SOFT like the screen/propose branches:
+                # the offline kinds rebuild each poll inside the try (a locked DB paints
+                # an alert line and keeps polling); the network kinds (holdings/discover)
+                # do NOT rebuild -- `compliance_result`/`compliance_error` are HELD from
+                # the last Enter (ARMED until one is pressed), the discover overlay's own
+                # gating story, so a poll can never fire a venue call.
+                if compliance_view_kind in ("holdings", "discover"):
+                    view_lines = compliance_console.build_compliance_view_lines(
+                        compliance_view_kind, compliance_result, error=compliance_error
+                    )
+                else:
+                    try:
+                        view_lines = compliance_console.build_compliance_view_lines(
+                            compliance_view_kind,
+                            _do_compliance_payload(open_state, now_fn, compliance_view_kind),
+                        )
+                    except Exception as exc:
+                        view_lines = compliance_console.build_compliance_view_lines(
+                            compliance_view_kind, None, error=str(exc)[:200]
+                        )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *view_lines], compliance_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("c")):
+                    mode = "compliance"
+                    compliance_view_kind = None
+                    compliance_offset = 0
+                    # Closing discards a held network result -- reopening is armed again.
+                    compliance_result = None
+                    compliance_error = None
+                elif (
+                    compliance_view_kind in ("holdings", "discover")
+                    and ch in (10, 13, curses.KEY_ENTER)
+                ):
+                    _paint(stdscr, [ScreenLine("contacting venue... please wait", "normal")])
+                    try:
+                        compliance_result = _do_compliance_network(
+                            open_state, compliance_view_kind
+                        )
+                        compliance_error = None
+                    except Exception as exc:
+                        compliance_result = None
+                        compliance_error = str(exc)[:200]
+                    compliance_offset = 0
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    compliance_offset = _scroll_offset(
+                        ch,
+                        compliance_offset,
+                        height,
+                        len(banner) + len(view_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "scout-list":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The scout-results browser's file list (O6): every shortlist in the
+                # CONFIG-named proposals directory, newest first, with a clear empty
+                # state. No network, no repo read -- a directory listing, re-read only on
+                # entry (the files do not change under a held screen the way a DB does).
+                scout_lines = compliance_console.build_scout_list_lines(
+                    scout_files, scout_dir, cursor=scout_cursor
+                )
+                _paint(stdscr, [*_console_banner(), *scout_lines])
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27):
+                    mode = "compliance"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    scout_cursor = max(0, scout_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    scout_cursor = scout_cursor + 1
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and 0 <= scout_cursor < len(
+                    scout_files
+                ):
+                    scout_selected = scout_files[scout_cursor].path
+                    scout_view_offset = 0
+                    scout_candidate_cursor = 0
+                    mode = "scout-view"
+                scout_cursor = max(0, min(scout_cursor, max(0, len(scout_files) - 1)))
+                continue
+
+            if mode == "scout-view" and scout_selected is not None:
+                # The selected shortlist, screened through THE admission services each
+                # poll (fail-soft: `build_propose_view` itself never raises for file
+                # problems; this catches a locked DB), with a cursor over the candidate
+                # rows. `a` offers the TYPED attest step for the selected candidate --
+                # proposer-never-decider, so nothing attests without the human's phrase.
+                from keel.commands.assets import screen_product
+
+                scout_repo, scout_config = open_state()
+                try:
+                    scout_view = build_propose_view(
+                        scout_repo, scout_config, screen_product, path=scout_selected
+                    )
+                except Exception as exc:
+                    scout_view = ProposeView(
+                        source=scout_selected,
+                        status="unreadable",
+                        detail=str(exc)[:200],
+                        report=None,
+                    )
+                scout_view_lines, scout_cursor_line, scout_candidates = (
+                    compliance_console.build_scout_file_lines(
+                        scout_view, cursor=scout_candidate_cursor
+                    )
+                )
+                scout_candidate_cursor = max(
+                    0, min(scout_candidate_cursor, max(0, scout_candidates - 1))
+                )
+                toast = _toast_ttl()
+                if toast is not None:
+                    scout_view_lines = [
+                        *scout_view_lines,
+                        _blank(),
+                        ScreenLine(toast, _message_style(toast)),
+                    ]
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                scout_view_offset = _follow_cursor(
+                    scout_view_offset, scout_cursor_line + len(banner), height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *scout_view_lines], scout_view_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27):
+                    mode = "scout-list"
+                    scout_view_offset = 0
+                elif ch == ord("a") and scout_candidates > 0:
+                    # `scout_candidates > 0` implies an "ok" view with a report
+                    # (`build_scout_file_lines` counts `report.screened`); the assert
+                    # states that invariant for the type checker, not the runtime.
+                    assert scout_view.report is not None
+                    selected_candidate = scout_view.report.screened[
+                        scout_candidate_cursor
+                    ].candidate.asset
+                    message = _run_terminal_form(
+                        stdscr,
+                        lambda: compliance_console.run_attest_form(
+                            scout_repo,
+                            _form_prompt,
+                            now_fn(),
+                            asset=selected_candidate,
+                        ),
+                    )
+                    message_ts = now_fn()
+                elif ch in (curses.KEY_UP, ord("k")):
+                    scout_candidate_cursor = max(0, scout_candidate_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    if scout_candidates:
+                        scout_candidate_cursor = min(
+                            scout_candidates - 1, scout_candidate_cursor + 1
+                        )
+                else:
+                    scout_view_offset = _scroll_offset(
+                        ch,
+                        scout_view_offset,
+                        height,
+                        len(banner) + len(scout_view_lines),
+                        curses,
+                    )
                 continue
 
             if mode == "help":
@@ -2254,7 +2623,17 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     console shell. Profile switches the deployment (the config+db pair -- paper-forward,
     paper-hourly, paper-equities, live) in one action, rebinding everything the console
     reads; selecting LIVE asks an explicit y/N at the terminal first and is marked
-    unmistakably in the header once active. Trading/Rules/Compliance/Data/Research/Account
+    unmistakably in the header once active. Compliance (issue #389 C3) opens the
+    Compliance sub-menu: screen/propose/holdings/discover/subscription-show/purification
+    as browsable service reports (holdings and discover ARMED -- one live venue read each,
+    only on Enter), the record-writes (attest [typed: type the asset code back],
+    attest-instrument, exempt/unexempt, subscription attest/set, withdrawals attest [typed
+    'yes' when enabling -- the CLI's own gate, in-console]) as terminal forms that call the
+    same services the CLI calls, the Scout results browser (the proposals directory from
+    config, screened through the admission services, attest offered but never auto-run),
+    and the read-only "Shariah in force" browser (the attestations, exemptions and
+    fiqh-derived rails in force for the active profile, quoted and cited from
+    docs/fiqh-basis.md, honesty lines always visible). Trading/Rules/Data/Research/Account
     are placeholders for later console slices and say which one they land in. Every screen
     carries the session banner: the active deployment, then the venue's market session and
     clock (24/7, or OPEN/CLOSED with the next open/close, or CLOCK UNAVAILABLE fail-loud)

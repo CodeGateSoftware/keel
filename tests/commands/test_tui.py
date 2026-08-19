@@ -3671,3 +3671,186 @@ def test_run_live_m_in_the_profile_menu_returns_to_the_menu(
     # that keypress did.
     assert any("keel console -- profile" in t for t in frames[3])
     assert any("keel console -- menu" in t for t in frames[4])
+
+
+# -- run_live: the Compliance menu (issue #389 C3) -------------------------------------------------
+
+
+def test_run_live_compliance_entry_opens_the_sub_menu_and_esc_steps_back(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Compliance entry is C3's landing: selecting it opens the Compliance sub-menu
+    (every PRD §3 entry under Compliance visible), and Esc steps back to the console menu
+    -- the shell is a hierarchy, never a jump."""
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("5"), -1, 27, -1, 27]
+    )
+
+    compliance_idx = next(
+        i for i, t in enumerate(painted) if "compliance" in t.lower() and "menu" in t.lower()
+    )
+    compliance_text = "\n".join(painted[compliance_idx:])
+    for label in (
+        "screen", "propose", "attest", "attest-instrument", "exempt", "unexempt",
+        "holdings", "discover", "Scout results", "Shariah in force", "subscription show",
+        "subscription attest", "subscription set", "withdrawals attest", "purification",
+    ):
+        assert label in compliance_text, label
+    # Esc stepped back to the console menu, not the dashboard.
+    after = painted[compliance_idx:]
+    assert any("keel console -- menu" in t for t in after)
+
+
+def test_run_live_compliance_screen_view_is_the_services_own_report(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The screen view renders the SAME report `keel assets screen` computes
+    (`build_screen_report` over `screen_product`), offline: the verdict summary line is
+    painted, and no broker is ever constructed."""
+
+    def _no_broker(cfg: Any, timeout: Any = None) -> Any:
+        raise AssertionError("the screen view must never construct a broker")
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _no_broker)
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [ord("m"), ord("5"), 10, -1, 27, -1, 27, ord("q")],
+    )
+
+    assert any("0/1 admitted" in t for t in painted)
+    view_idx = next(i for i, t in enumerate(painted) if "compliance" in t and "screen" in t)
+    assert any("REJECT" in t for t in painted[view_idx:])
+
+
+def test_run_live_compliance_attest_form_dispatches_and_suspends_curses(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting a form entry runs the FORM at the terminal (curses suspended for the
+    prompts, restored after -- the same dance `_confirm_arm_autonomy` keeps) and shows
+    the write's confirmation line on the Compliance menu. The form itself is
+    `compliance_console.run_form` -- the same seam the unit tests drive -- spied here to
+    prove the dispatch carries the loop's own repo/config/now."""
+    from keel.commands import compliance_console as cc
+
+    calls: list[dict[str, Any]] = []
+
+    def _spy_form(name: str, repo: Any, config: Any, prompt_fn: Any, now_ts: int) -> str:
+        calls.append({"name": name, "now_ts": now_ts})
+        return "attested BTC: sector=payments backing=ayn pays_yield=False"
+
+    monkeypatch.setattr(cc, "run_form", _spy_form)
+
+    # m -> menu; 5 -> Compliance; j j -> cursor on 'attest' (index 2); Enter runs the
+    # form; then step back out and quit.
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [ord("m"), ord("5"), ord("j"), ord("j"), 10, -1, 27, -1, 27, ord("q")],
+    )
+
+    assert calls == [{"name": "attest", "now_ts": NOW_TS}]
+    assert any("attested BTC: sector=payments" in t for t in painted)
+    # the suspend/restore dance ran around the form (the fake curses records it)
+    import sys as _sys
+
+    fake_curses = _sys.modules["curses"]
+    assert "def_prog_mode" in fake_curses.calls
+    assert "reset_prog_mode" in fake_curses.calls
+
+
+def test_run_live_scout_browser_lists_selects_and_screens_a_shortlist(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O6 end to end through the live loop: the Scout results browser lists the
+    operator-local shortlists (path from config), Enter opens one, and the view renders
+    the admission services' own verdicts for THAT file -- propose → screen through
+    `build_propose_view`, no auto-attest anywhere."""
+    deployment = _deployment_dir(tmp_path)
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "2026-08-15-shortlist.json").write_text(
+        '{"candidates": [{"asset": "FET", "rationale": "ai compute", '
+        '"sources": ["https://example.com/fet"]}]}'
+    )
+    # the config the console loads names the proposals dir (config.proposals_dir)
+    (deployment / "config.paperforward.yaml").write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        f"proposals_dir: {proposals}\n"
+    )
+
+    keys = [ord("m"), ord("5")]
+    keys += [ord("j")] * 8  # cursor to 'Scout results' (index 8)
+    keys += [10]  # Enter -> the scout list
+    keys += [-1]
+    keys += [10]  # Enter -> the selected shortlist, screened
+    keys += [-1, 27]  # Esc -> back to the list
+    keys += [-1, 27]  # Esc -> back to Compliance
+    keys += [-1, 27, ord("q")]
+    painted, _binding = _console_run(deployment, monkeypatch, keys)
+
+    list_idx = next(
+        i for i, t in enumerate(painted) if t.startswith("keel console -- compliance / Scout")
+    )
+    assert "2026-08-15-shortlist.json" in "\n".join(painted[list_idx : list_idx + 8])
+    view = "\n".join(painted[list_idx:])
+    assert "REJECT" in view  # the gate ran on the unattested candidate
+    assert "FET" in view
+    assert any("never" in t.lower() and "attest" in t.lower() for t in painted[list_idx:])
+
+
+def test_run_live_scout_attest_key_drives_the_typed_form_end_to_end(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O6's acceptance, through the LIVE loop: a real proposal file, screened by the real
+    services, attested by the `a` key running the REAL typed form -- the prompt answered
+    by a scripted `click.prompt` stand-in, the write landing in the deployment's own
+    database, and a WRONG typed phrase on a second candidate writing nothing."""
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository as Repo
+
+    deployment = _deployment_dir(tmp_path)
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "2026-08-15-shortlist.json").write_text(
+        '{"candidates": ['
+        '{"asset": "FET", "rationale": "ai compute", "sources": ["https://x.example/fet"],'
+        ' "shariah_hypothesis": "compute, not lending"},'
+        '{"asset": "ATOM", "rationale": "staking chain", "sources": ["https://x.example/atom"]}'
+        "]}"
+    )
+    (deployment / "config.paperforward.yaml").write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        f"proposals_dir: {proposals}\n"
+    )
+
+    # The form's terminal prompts, scripted: FET answered fully (typed phrase = the asset
+    # code); ATOM refused at the typed gate.
+    answers = iter(
+        [
+            "payments", "ayn", "n", "https://x.example/fet-attest", "operator", "FET",
+            "payments", "native", "n", "https://x.example/atom-attest", "operator", "nope",
+        ]
+    )
+    monkeypatch.setattr(
+        click, "prompt", lambda text, **kwargs: next(answers), raising=True
+    )
+
+    keys = [ord("m"), ord("5")]
+    keys += [ord("j")] * 8  # Scout results
+    keys += [10]  # the list
+    keys += [10]  # open the shortlist (screened by the services)
+    keys += [ord("a")]  # attest candidate 0 (FET) -- the typed form runs
+    keys += [-1]
+    keys += [ord("j")]  # candidate 1 (ATOM)
+    keys += [ord("a")]  # the typed form runs, and the phrase is wrong
+    keys += [-1, 27, -1, 27, -1, 27, ord("q")]
+    painted, _binding = _console_run(deployment, monkeypatch, keys)
+
+    conn = connect(str(deployment / "keel.db"))
+    migrate(conn)
+    rows = Repo(conn).get_asset_attestations()
+    assert [row["asset"] for row in rows] == ["FET"]  # ATOM was refused at the gate
+    assert rows[0]["sector"] == "payments" and rows[0]["backing"] == "ayn"
+    assert any("attested FET" in t for t in painted)
+    assert any("cancelled" in t.lower() and "ATOM" in t for t in painted)
