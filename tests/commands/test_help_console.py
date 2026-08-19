@@ -17,6 +17,7 @@ Three surfaces, pinned here:
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from pathlib import Path
@@ -87,7 +88,16 @@ def test_fiqh_definitions_are_anchored_verbatim_to_fiqh_basis() -> None:
     docs/fiqh-basis.md (whitespace-normalized), carrying the document's own section as its
     citation -- never a help-authored summary that could drift from the document."""
     squashed = " ".join(_FIQH_BASIS.split())
-    for name in ("qabd", "riba", "maisir", "purification", "attestation", "exemption"):
+    for name in (
+        "qabd",
+        "riba",
+        "maisir",
+        "purification",
+        "attestation",
+        "exemption",
+        "screening",
+        "instrument attestation",
+    ):
         term = _terms()[name]
         assert term.fiqh, name
         assert term.stated, name
@@ -118,6 +128,51 @@ def test_gharar_is_honestly_not_stated_in_fiqh_basis_like_c3_rendered_it() -> No
     assert gharar.fiqh
     assert not gharar.stated
     assert "not stated" in gharar.definition.lower()
+
+
+def test_the_rail_entry_counts_eighteen_and_cites_the_table_honestly() -> None:
+    """[review #406] SAFETY-CRITICAL honesty pin. The glossary is the console's single
+    source of vocabulary, and this entry claimed NINETEEN rails while both authorities
+    say eighteen -- `keel/execution/guards.py` ("eighteen in all, since there is no
+    rail 15") and docs/fiqh-basis.md ("Eighteen rails exist (1-14, 16, 17, 18, 19 --
+    there is no rail 15)"). The Source line must not overclaim either: the fiqh-basis
+    rails TABLE enumerates the prudential rails (2-14, 16); rails 1, 17, 18 and 19 are
+    stated in that document's own prose sections, and the citation says so."""
+    rail = _terms()["rail"]
+    definition = " ".join(rail.definition.split())
+    assert "Eighteen exist" in definition
+    assert "1-14, 16, 17, 18, 19" in definition
+    assert "nineteen" not in definition.lower()
+    source = " ".join(rail.source.split())
+    assert "nineteen" not in source.lower()
+    # the honest split: the table's coverage is named as the prudential rails, and the
+    # prose-only rails are named as prose -- not folded into "the table enumerates all".
+    assert "2-14" in source
+    assert "prose" in source
+
+
+def test_the_promotion_gate_entry_states_the_real_gate() -> None:
+    """[review #406] SAFETY-CRITICAL honesty pin. The entry previously invented a
+    DCA-benchmark floor (there is none in the promote path -- the DCA comparison lives
+    in the simulate report), hid two of the four real floors, and described pooling as
+    kind-wide when `keel/strategy/promotion.py` pools per parameter SET, on the
+    sample-size axis only, with the overfitting gate explicitly NOT pooled."""
+    gate = _terms()["promotion gate"]
+    d = " ".join(gate.definition.split()).lower()
+    # the four performance floors, by their own names
+    for floor in ("min_trades", "min_expectancy", "min_rr", "min_win_rate"):
+        assert floor in d, floor
+    # the overfitting gate is the PBO/degradation-slope CONJUNCTION, not a bare bound
+    assert "pbo" in d
+    assert "degradation slope" in d
+    # pooling's real scope, in promotion.py's own docstring wording
+    assert "parameter set" in d
+    assert "sample-size" in d
+    assert "not pooled" in d
+    # the DCA comparison lives in the simulate report, and is not a floor of this gate
+    assert "dca" in d
+    assert "simulate" in d
+    assert "not a floor" in d
 
 
 def test_the_glossary_agrees_with_the_shariah_screens_vocabulary() -> None:
@@ -292,23 +347,43 @@ def test_the_registry_covers_every_mode_the_live_loop_dispatches_on() -> None:
     assert not unknown, unknown
 
 
+def _dispatched_modes(test: ast.expr) -> list[str]:
+    """The `mode == "..."` constants an `if` test carries (`mode == "x" and guard`
+    included) -- an `if` whose test names none is not a dispatch branch. PURE."""
+    if (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "mode"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and isinstance(test.comparators[0].value, str)
+    ):
+        return [test.comparators[0].value]
+    if isinstance(test, ast.BoolOp):
+        return [m for value in test.values for m in _dispatched_modes(value)]
+    return []
+
+
 def test_the_question_key_is_handled_in_every_console_mode_branch() -> None:
     """The `?` overlay is reachable from EVERY console mode -- pinned structurally: each
     `mode ==` branch of `run_live` must handle `ord("?")` (open the overlay, or close it
-    for the overlay's own two modes), so a future mode cannot silently ship without it."""
-    source = inspect.getsource(tui.run_live).splitlines()
+    for the overlay's own mode), so a future mode cannot silently ship without it.
+
+    [review #406] The extraction is AST-based, and each `If` node's TRUE span
+    (`lineno`..`end_lineno`) is the block. The previous regex scan never stopped at a
+    dedent, so the last block silently absorbed every line after it -- including the
+    normal mode's own `?` handler -- and a mode that shipped without the key (discover,
+    in that review) passed this test dishonestly. Nothing outside a branch's own span
+    can satisfy the assertion now."""
+    source = inspect.getsource(tui.run_live)
+    lines = source.splitlines()
     blocks: list[tuple[str, list[str]]] = []
-    current: tuple[str, list[str]] | None = None
-    for line in source:
-        match = re.match(r'\s+if mode == "([a-z-]+)"', line)
-        if match:
-            if current is not None:
-                blocks.append(current)
-            current = (match.group(1), [])
-        elif current is not None:
-            current[1].append(line)
-    if current is not None:
-        blocks.append(current)
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.If):
+            for mode in _dispatched_modes(node.test):
+                blocks.append((mode, lines[node.lineno - 1 : node.end_lineno]))
     assert len(blocks) >= 20, "the scan found no dispatch blocks -- it has rotted"
     for mode, body in blocks:
         assert any('ord("?")' in line for line in body), mode
@@ -326,6 +401,27 @@ def test_the_typed_actions_help_says_the_prompt_cannot_be_pre_filled() -> None:
     for mode in ("trading", "compliance", "strategy"):
         mode_text = " ".join(e.description for e in hc.contextual_help(mode))
         assert "cannot be pre-filled" in mode_text, mode
+
+
+def test_record_flow_and_reset_hwm_help_disclose_their_own_typed_gates() -> None:
+    """[review #406] record-flow and reset-hwm ARE typed gates in the CLI
+    (`_require_interactive_confirmation`, exactly like resume/resume-entries), so their
+    help row must scope the typed disclosure to ALL three actions it names -- not leave
+    it attached to resume-entries alone, which read as though the other two could be
+    pre-filled."""
+    row = next(
+        e
+        for e in hc.contextual_help("trading")
+        if e.subject == "resume-entries, reset-hwm, record-flow"
+    )
+    lowered = row.description.lower()
+    assert "cannot be pre-filled" in lowered
+    # the disclosure LEADS the row, before any per-action sentence, so it reads as the
+    # rule for all three -- not as resume-entries' parenthetical (which left the other
+    # two reading as pre-fillable)
+    assert lowered.index("cannot be pre-filled") < lowered.index("resume-entries")
+    for action in ("resume-entries", "reset-hwm", "record-flow"):
+        assert action in lowered, action
 
 
 def test_the_help_menu_lists_the_prd_help_branch() -> None:

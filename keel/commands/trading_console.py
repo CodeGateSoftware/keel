@@ -236,10 +236,14 @@ CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         (
             "resume-entries, reset-hwm, record-flow",
-            "the other halt-releasers and bookkeeping -- resume-entries clears the "
-            "consecutive-loss halt (TYPED, same rule: the prompt cannot be pre-filled), "
-            "reset-hwm resets the drawdown reference, record-flow records a deposit or "
-            "withdrawal against the equity base",
+            # [review #406] the typed disclosure LEADS the row: all three ARE typed
+            # gates in the CLI (`_require_interactive_confirmation`), so scoping it to
+            # resume-entries' parenthetical read as though the other two could be
+            # pre-filled.
+            "the other halt-releasers and bookkeeping, all three TYPED at the terminal "
+            "-- the prompt cannot be pre-filled, piped or bypassed: resume-entries "
+            "clears the consecutive-loss halt, reset-hwm resets the drawdown reference, "
+            "record-flow records a deposit or withdrawal against the equity base",
         ),
     ),
     "trading-cycle": (

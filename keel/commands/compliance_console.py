@@ -936,7 +936,18 @@ class VocabTerm:
 VOCABULARY: tuple[VocabTerm, ...] = (
     VocabTerm(
         term="attestation",
-        definition="A human records them, with a source and a name, via `keel assets attest`.",
+        definition=(
+            # [review #406] the full contiguous passage, so "records them" carries its
+            # antecedent -- the sentence alone dangled ("them" what?). The glossary's
+            # entry is pinned equal to this, whitespace-normalized.
+            "market facts are computed, Shariah classifications are **ATTESTED, never "
+            "inferred**. Whether a token's core purpose is a haram sector (§28.4), "
+            "whether it is asset-backed `'ayn` or a claim `dayn` (§65.5/§67.2), and "
+            "whether it pays a riba-like yield are questions of fact-plus-scholarship "
+            "about the world. No module in this repository derives them from candles, "
+            "and none pretends to. A human records them, with a source and a name, via "
+            "`keel assets attest`."
+        ),
         citation="## What is attested versus what is computed",
     ),
     VocabTerm(

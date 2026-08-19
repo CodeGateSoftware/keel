@@ -565,7 +565,8 @@ def build_help_screen() -> list[ScreenLine]:
 
     _row("Normal mode")
     _row("  q            quit")
-    _row("  h  /  ?      open this help")
+    _row("  h            open the Help menu (glossary, screens, params, keys & safety)")
+    _row("  ?            open the current screen's own help, wherever you are")
     _row("  i            open the insights overlay (per-rule track record + promotion gates)")
     _row("  r            refresh now (poll immediately, instead of waiting for the interval)")
     _row("  a            toggle autonomy (arm / disarm the agent placing orders unattended)")
@@ -594,11 +595,12 @@ def build_help_screen() -> list[ScreenLine]:
     _note("    keel --config config.live-sandbox.yaml --db keel-live.db tui")
     lines.append(_blank())
     _row("Console menu (m)")
-    _note("  The shell is NAVIGATION: the PRD's menu tree with one entry per area. Dashboard")
-    _note("  returns here; Profile switches deployment; Help opens this screen; every other")
-    _note("  entry (Trading, Rules, Compliance, Data, Research, Account) is a placeholder")
-    _note("  owned by a later console slice and says which one ('lands in C3'...C5) -- the")
-    _note("  shell renders them so the tree is stable, but nothing in them is invokable yet.")
+    _note("  The console's tree over this dashboard. Dashboard returns here; Profile")
+    _note("  switches deployment; Help holds the glossary and this screen. Trading (agent")
+    _note("  cycle, kill/resume, autonomy), Rules (the strategy console: ledger, simulate,")
+    _note("  add), Compliance (screen, attest, scout, Shariah in force), Data (fetch,")
+    _note("  freshness) and Research (docs, trials) are LIVE menus; Account is the one")
+    _note("  placeholder left (it lands in C6).")
     _note("  Keys: up/k down/j move, Enter/Space select, 1-9 jump, q/Esc/m back to here.")
     _row("  Profile")
     _note("    Lists the four deployments by their config+db pair (the pairs the keel-paper /")
@@ -656,7 +658,8 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  PgDn         scroll down one page")
     _row("  Home         jump to the top")
     _row("  End          jump to the bottom")
-    _row("  q / Esc / h / ?    close help, back to the dashboard")
+    _row("  q / Esc / h  close this screen, back to the Help menu")
+    _row("  ?            open this screen's own help (the context overlay)")
     lines.append(_blank())
     _row("Insights overlay (i)")
     _note("  Read-only, like the whole dashboard: per-rule track record, distance to the")
@@ -788,7 +791,7 @@ def build_help_screen() -> list[ScreenLine]:
     _row("Every action shows a one-line result at the bottom of the dashboard until the next")
     _row("action replaces it.")
     lines.append(_blank())
-    _row("Press q, Esc, h or ? now to return to the dashboard.")
+    _row("Press q, Esc or h to return to the Help menu; ? opens this screen's own help.")
     return lines
 
 
@@ -877,7 +880,7 @@ CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
         (
             "this overlay",
             "the screen you pressed ? in, explained: its rows come from the module "
-            "that owns it. q, Esc or ? returns to that screen, unmoved",
+            "that owns it. q, Esc, ? or m returns to that screen, unmoved",
         ),
     ),
     "insights": (
@@ -2662,14 +2665,16 @@ def run_live(
                     profile_cursor = max(0, profile_cursor - 1)
                 elif ch in (curses.KEY_DOWN, ord("j")):
                     profile_cursor = profile_cursor + 1
-                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and profile_cursor == len(
-                    profiles
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and profile_cursor == (
+                    console.profile_menu_venues_at(profiles)
                 ):
                     # The Venues row (C7 / O7): open the installed-adapter browser. The
                     # payload is read ONCE per entry (an import scan plus one
                     # credential-less construction per adapter -- never per poll), and
                     # the ACTIVE deployment's binding facts are resolved with it so the
                     # browser's header describes the pair that is actually bound.
+                    # `profile_menu_venues_at` is the ONE statement of where the Venues
+                    # row sits -- the render and this dispatch cannot drift apart.
                     venues_infos = brokers.list_installed_brokers()
                     try:
                         _venues_repo, venues_config = open_state()
@@ -2691,8 +2696,8 @@ def run_live(
                         venues_data_feed = None
                     venues_offset = 0
                     mode = "venues"
-                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and 0 <= profile_cursor < len(
-                    profiles
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and 0 <= profile_cursor < (
+                    console.profile_menu_venues_at(profiles)
                 ):
                     selected_profile = profiles[profile_cursor]
                     before_pair = console_binding.pair
@@ -2720,8 +2725,11 @@ def run_live(
                     mode = "context-help"
                 # Clamp every poll: the discovered list can change under the cursor (a
                 # config file appearing/disappearing between polls) -- to the VENUES row,
-                # which is part of the same cursor range.
-                profile_cursor = max(0, min(profile_cursor, len(profiles)))
+                # which is part of the same cursor range (same one statement of where it
+                # sits as the dispatch above).
+                profile_cursor = max(
+                    0, min(profile_cursor, console.profile_menu_venues_at(profiles))
+                )
                 continue
 
             if mode == "venues":
@@ -4112,7 +4120,11 @@ def run_live(
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (ord("q"), 27, ord("?")):
+                if ch in (ord("q"), 27, ord("?"), ord("m")):
+                    # `m` closes the overlay too, like every console screen ([review
+                    # #406]): the key that steps back one level must not be dead inside
+                    # the help overlay -- it returns to the screen `?` was pressed in,
+                    # unmoved, exactly like q/Esc/?.
                     mode = context_help_for
                     context_help_offset = 0
                 else:
@@ -4135,11 +4147,18 @@ def run_live(
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (ord("q"), 27, ord("h"), ord("?")):
+                if ch in (ord("q"), 27, ord("h")):
                     # The keys/safety screen is the Help MENU's fourth entry since C7,
                     # so it closes onto the menu -- the shell is a hierarchy.
                     mode = "help-menu"
                     help_offset = 0
+                elif ch == ord("?"):
+                    # [review #406] `?` opens THIS screen's own contextual rows, like
+                    # every console screen -- it was previously in the close-set, which
+                    # made the "everywhere" claim in the Help menu false here.
+                    context_help_for = "help"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # The banner is PART of the scrolled list (`_visible_slice` slices the
                     # combined `[banner, help]`), so the scroll math must count it too --
@@ -4396,6 +4415,13 @@ def run_live(
                         # full-screen verbatim.
                         discover_error = str(exc)[:200]
                     discover_offset = 0
+                elif ch == ord("?"):
+                    # [review #406] `?` was the one dispatched mode without it: the
+                    # overlay opens from the ARMED state too, reads nothing and runs
+                    # nothing -- only Enter (above) ever touches the network.
+                    context_help_for = "discover"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     discover_offset = _scroll_offset(

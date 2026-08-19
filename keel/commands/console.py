@@ -551,6 +551,12 @@ def build_venues_lines(
         lines.append(ScreenLine(wrapped, "muted"))
     lines.append(_blank())
     for info in infos:
+        if info.error is not None:
+            # A raising adapter renders its honest error block (the service's own shared
+            # wording) -- never a fabricated capability row (#406 review).
+            for row in brokers.adapter_error_block(info):
+                lines.append(ScreenLine(row, "warn"))
+            continue
         selected = selected_venue is not None and info.name == selected_venue
         version = info.package_version or "unknown version"
         head = f"{info.name} ({version}) · {info.venue}"
