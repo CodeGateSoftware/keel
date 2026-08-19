@@ -7,6 +7,11 @@
     "interval_sec": 900,
     "mode": "paper"
   },
+  "broker": {
+    "data_feed": "iex",
+    "endpoint": "paper",
+    "name": "coinbase"
+  },
   "caps": {
     "max_exposure_usd": "1000",
     "max_per_asset_pct": "0.5",

@@ -51,9 +51,12 @@ religious-advice disclaimer footer via the `with_disclaimer` decorator on their 
 always, even when the command errors out or is refused at a confirmation prompt. (Pure-reporting
 commands such as `trials *`, `withdrawals show` and `assets list` deliberately omit it.)
 
-**No live network in tests.** `_build_broker` is the one seam that would construct a real
-`CoinbaseClient` (from `.env` secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
-to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker`.
+**No live network in tests.** `_build_broker` is the one seam that would construct a real,
+network-talking broker (a `CoinbaseClient` for the default/absent `broker:` section, or the
+configured venue's adapter otherwise — venue selection, #370 B2); tests monkeypatch it to
+inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker` (the
+venue-selection branches themselves are driven against fakes and network-free construction
+in `tests/test_paper_equities_profile.py`).
 
 **Module layout.** This file is the composition root: it defines the root `cli` group, the
 broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
