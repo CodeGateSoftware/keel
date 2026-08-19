@@ -53,6 +53,7 @@ from keel_broker_api.port import UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
+    MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
@@ -121,6 +122,20 @@ _PLACEMENT_REJECTED_STATUSES: frozenset[str] = frozenset(
 #: placement is an UNKNOWN outcome -- mapping it to a refusal would invite a caller to
 #: place again while the first order may be live.
 _VENUE_REFUSAL_STATUSES: frozenset[int] = frozenset({403, 422})
+
+
+def _optional_unix_seconds(clock: Any, field: str) -> int | None:
+    """One `/v2/clock` schedule field as epoch seconds, or `None` when the venue did not
+    send a usable one -- the schedule half of `market_schedule()`'s fail-soft rule. Absent,
+    null, non-string and unparseable values all answer `None`; only a real RFC3339 timestamp
+    with an explicit offset (`to_unix_seconds`'s own refusal rule) is claimed."""
+    raw = _field(clock, field)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return to_unix_seconds(raw)
+    except ValueError:
+        return None
 
 
 class AlpacaAdapter:
@@ -209,6 +224,37 @@ class AlpacaAdapter:
         -- so a caller still using the boolean form gets the same posture the port expresses.
         """
         return self.market_clock() is SessionState.OPEN
+
+    def market_schedule(self) -> MarketSchedule:
+        """The regular session's state WITH its schedule, from the venue's own `/v2/clock`
+        (issue #388 C2, the console session banner's port read).
+
+        `/v2/clock` already carries `next_open`/`next_close` as RFC3339 strings; this is the
+        SAME endpoint `market_clock()` reads, with those two fields crossed as epoch ints
+        instead of dropped. The state half keeps `market_clock()`'s exact posture -- a
+        transport error, a missing transport or a body without a usable boolean `is_open`
+        answers `CLOCK_UNAVAILABLE`, never an exception and never a guess -- and an
+        unreadable clock claims NO schedule (nulls, not timestamps nobody vouches for).
+
+        The schedule half fails SOFT where the state fails closed: a `next_open`/`next_close`
+        that is absent or unparseable degrades to `None` for that field alone, because the
+        venue's open/closed answer stands on its own and a data nit in an extra field must
+        not launder a readable clock into an unreadable one.
+        """
+        try:
+            clock = self._require_transport().get_clock()
+            if clock is None:
+                return MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE)
+            is_open = _field(clock, "is_open")
+            if not isinstance(is_open, bool):
+                return MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE)
+            return MarketSchedule(
+                state=SessionState.OPEN if is_open else SessionState.CLOSED,
+                next_open_ts=_optional_unix_seconds(clock, "next_open"),
+                next_close_ts=_optional_unix_seconds(clock, "next_close"),
+            )
+        except Exception:
+            return MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE)
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

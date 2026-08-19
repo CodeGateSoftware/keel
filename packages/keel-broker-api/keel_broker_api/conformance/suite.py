@@ -41,6 +41,7 @@ from keel_broker_api.port import UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
+    MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
@@ -152,6 +153,44 @@ class BrokerConformanceTests:
         if broker.capabilities().session_bound:
             pytest.skip("session-bound venue: open/closed answers are the adapter's own tests")
         assert broker.market_clock() is SessionState.OPEN
+
+    def test_market_schedule_answers_the_port_type(self) -> None:
+        """The schedule read (issue #388 C2) crosses the port as a `MarketSchedule`, never a
+        venue-native shape -- exactly the guarantee `market_clock`'s own type check makes for
+        the state, extended to the value object that carries it plus the next open/close.
+
+        A session-bound adapter may answer any of the three states here (and may or may not
+        carry timestamps); what the PORT guarantees is the type, so a renderer can branch on
+        `schedule.state is SessionState.OPEN` and on `next_open_ts is None` without probing
+        venue fields.
+        """
+        schedule = self.broker().market_schedule()
+        assert isinstance(schedule, MarketSchedule)
+        assert isinstance(schedule.state, SessionState)
+        assert isinstance(schedule.next_open_ts, int | None)
+        assert isinstance(schedule.next_close_ts, int | None)
+
+    def test_market_schedule_agrees_with_the_clock_for_every_venue(self) -> None:
+        """`market_schedule()` is the SUPERSET read: its state must be the same answer
+        `market_clock()` gives, or the two port reads disagree about whether the venue is
+        open -- and every caller (the engine's session gate, the console's banner) would be
+        free to pick the one it prefers.
+        """
+        broker = self.broker()
+        assert broker.market_schedule().state is broker.market_clock()
+
+    def test_market_schedule_claims_no_times_for_24x7_venues(self) -> None:
+        """A venue that declares `session_bound=False` is 24/7: always open, and there is no
+        schedule to carry. `next_open`/`next_close` must be `None` -- a 24/7 adapter that
+        synthesized timestamps would be inventing a calendar the venue does not have.
+        """
+        broker = self.broker()
+        if broker.capabilities().session_bound:
+            pytest.skip("session-bound venue: timestamps are the adapter's own tests")
+        schedule = broker.market_schedule()
+        assert schedule.state is SessionState.OPEN
+        assert schedule.next_open_ts is None
+        assert schedule.next_close_ts is None
 
     # --- capabilities cannot lie about orders ---------------------------------------------
 

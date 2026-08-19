@@ -40,6 +40,7 @@ SERVICE_MODULES = [
     "keel.commands.assets",
     "keel.commands.autonomy",
     "keel.commands.confirm",
+    "keel.commands.console",
     "keel.commands.db",
     "keel.commands.fetch",
     "keel.commands.insights",

@@ -152,6 +152,20 @@ def test_coinbase_is_not_session_bound_and_answers_open_without_a_transport() ->
     assert CoinbaseAdapter().market_clock() is SessionState.OPEN
 
 
+def test_market_schedule_is_the_port_default_open_with_no_times() -> None:
+    """Issue #388 C2: the 24/7 venues ship the port's DEFAULT schedule read -- the clock's
+    OPEN answer with NO next_open/next_close claimed. Constructed without a transport for
+    the same reason the clock test above is: a schedule call that touched the network would
+    raise here, so this passing IS the no-call guarantee. A 24/7 adapter that synthesized
+    timestamps would be inventing a calendar the venue does not have."""
+    from keel_broker_api.port import default_market_schedule
+    from keel_broker_api.results import MarketSchedule
+
+    adapter = CoinbaseAdapter()
+    assert adapter.market_schedule() == MarketSchedule(state=SessionState.OPEN)
+    assert adapter.market_schedule() == default_market_schedule(adapter)
+
+
 def test_get_candles_returns_ascending_domain_candles() -> None:
     """The fixture is deliberately out of order; the adapter must sort."""
     adapter = CoinbaseAdapter(FakeTransport(candles=load_fixture("cb_candles.json")))

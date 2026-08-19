@@ -89,9 +89,25 @@ otherwise, and a fortnight of scrollback is not an answer to it. Two consequence
 it: the scope is a parameter that RESETS to `today` on every open (a widened view answers one
 question once; it does not become tomorrow's default), and an empty "today" -- the normal state
 of a once-a-day deployment every morning before 09:00 -- renders `describe_empty_scope`, which
-names when keel last ran and when the next cycle is due. A blank panel there would be worse than
-the dead-looking state dashboard the whole feature exists to fix, since a blank panel and a dead
-agent look exactly alike.
+names when keel last ran and when the next cycle is due. A blank panel there would be worse
+than the dead-looking state dashboard the whole feature exists to fix, since a blank panel and a
+dead agent look exactly alike.
+
+v6 (issue #388 C2, the PRD's operator-console slice 2) wraps the whole thing in the CONSOLE
+SHELL -- `keel/commands/console.py`, whose own docstring owns the design. The dashboard stays
+the landing screen and every existing mode is unchanged: the shell adds an `m` menu mode over
+the PRD §3 tree (future slices' entries render a "lands in C3/C4/C5" notice), a Profile menu
+that rebinds the console's config+db pair through the same `_load_cfg`/`_open_repo` loaders
+every CLI command uses (LIVE guarded by an explicit y/N, never O3's typed contract), and the
+session banner (O9): a two-line header on EVERY screen -- active deployment, then the recorded
+market session + clock (24/7, or OPEN/CLOSED with the recorded next open/close, or CLOCK
+UNAVAILABLE fail-loud when the record is absent or stale) -- composed from `keel.agent`'s
+recording alone. `run_live` takes the shell as an OPTIONAL `console_binding`; a caller that
+passes none gets the pre-C2 dashboard byte-for-byte, which is what keeps every existing test --
+and `--once`, and any embedded consumer -- on the unchanged path. The shell adds NO network
+touch of its own: the banner reads the repo and the adapter's offline capabilities
+declaration, profile switching reads local files, and the three deliberate network exceptions
+below are still the only three.
 """
 
 from __future__ import annotations
@@ -105,7 +121,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
+from keel.commands._common import DISCLAIMER
 from keel.commands.activity import (
     ACTIVITY_HEADER,
     DEFAULT_ACTIVITY_SCOPE,
@@ -462,22 +478,25 @@ def _footer_lines() -> list[ScreenLine]:
 
     Two lines, not one: the first (kept byte-for-byte as it was before the admission overlays
     existed, so nothing that already reads it needs to change) is already close to 80 columns,
-    and cramming `[s] screen [p] propose [d] discover` onto the end of it would either wrap on a
-    normal terminal or silently truncate (`_paint` clips every line to the window width). A
-    second line costs one more row of screen -- cheap, next to a footer line an operator can no
-    longer read.
+    and cramming more keys onto the end of it would either wrap on a normal terminal or
+    silently truncate (`_paint` clips every line to the window width). A second line costs one
+    more row of screen -- cheap, next to a footer line an operator can no longer read.
 
     That second line was labelled `admission:` while all three keys on it belonged to the
-    admission workflow. v4's `v` activity does not, so the label is now the accurate
-    `overlays:` -- a footer that mis-files a key is worse than one that groups it loosely, since
-    an operator hunting for the activity feed would not think to look under "admission"."""
+    admission workflow. v4's `v` activity did not, so the label became the accurate
+    `overlays:` -- a footer that mis-files a key is worse than one that groups it loosely.
+    The console shell's `m` (issue #388 C2) joins the same line, single-spaced so the row
+    still fits the 80-column budget the two-line split exists to protect: `m` opens a
+    whole mode (the menu), not an overlay, but it is a one-key destination exactly like
+    the others, and an operator hunting for the console would not think to look anywhere
+    but the footer."""
     return [
         ScreenLine(
             "keys: [q] quit  [h] help  [i] insights  [r] refresh  [a] autonomy  [f] fetch",
             "muted",
         ),
         ScreenLine(
-            "overlays: [s] screen  [p] propose  [d] discover (network)  [v] activity",
+            "overlays: [s] screen [p] propose [d] discover (network) [v] activity [m] menu",
             "muted",
         ),
     ]
@@ -554,16 +573,43 @@ def build_help_screen() -> list[ScreenLine]:
     _row("  v            open the activity feed (what keel has been DOING, cycle by cycle)")
     _note("               reads the engine log, offline -- see 'Activity overlay' below")
     _note("               opens scoped to TODAY; press t inside it to widen")
+    _row("  m            open the console menu (the shell over this dashboard)")
+    _note("               deployment switching + the PRD's menu tree -- see 'Console menu' below")
     lines.append(_blank())
     _row("Which account is this?")
     _note("  paper and live are SEPARATE deployments -- separate config, database, allowlist,")
     _note("  caps and history -- and no figure on this screen describes the other one. Read")
     _note("  `equity_state_mode` to tell which is on screen; paper_cash_usdc appears in paper")
     _note("  mode only.")
-    _note("  There is no in-app switch: the account is fixed by the --config/--db pair this")
-    _note("  process started with, and --db DEFAULTS to keel.db, so omitting it shows PAPER.")
-    _note("  Quit and relaunch against the other pair to change it, e.g.")
+    _note("  Switching is now in-app: press m for the console menu, then Profile -- each entry")
+    _note("  is a config+db PAIR, selecting LIVE asks an explicit y/N first, and every screen's")
+    _note("  banner names the active pair. The command line keeps the same rule, and --db")
+    _note("  DEFAULTS to keel.db, so omitting it shows PAPER. The explicit pair still works:")
     _note("    keel --config config.live-sandbox.yaml --db keel-live.db tui")
+    lines.append(_blank())
+    _row("Console menu (m)")
+    _note("  The shell is NAVIGATION: the PRD's menu tree with one entry per area. Dashboard")
+    _note("  returns here; Profile switches deployment; Help opens this screen; every other")
+    _note("  entry (Trading, Rules, Compliance, Data, Research, Account) is a placeholder")
+    _note("  owned by a later console slice and says which one ('lands in C3'...C5) -- the")
+    _note("  shell renders them so the tree is stable, but nothing in them is invokable yet.")
+    _note("  Keys: up/k down/j move, Enter/Space select, 1-9 jump, q/Esc/m back to here.")
+    _row("  Profile")
+    _note("    Lists the four deployments by their config+db pair (the pairs the keel-paper /")
+    _note("    keel-live / keel-paperhourly / keel-equities wrappers pin). Selecting one")
+    _note("    rebinds config AND database together everywhere, in one action -- the header")
+    _note("    banner on every screen names the active pair. Selecting LIVE asks an explicit")
+    _note("    y/N at the terminal first and is marked unmistakably once active; declining")
+    _note("    changes nothing. This is a VIEW switch (which deployment the console answers")
+    _note("    about), not an engine switch -- the running agent keeps its own pair.")
+    _row("  The session banner (on every screen)")
+    _note("    The two header lines: the active deployment, then the market session + clock")
+    _note("    for its venue. 24/7 venues (crypto) say so; session-bound venues (equities)")
+    _note("    show OPEN or CLOSED with the recorded NEXT OPEN / NEXT CLOSE; CLOCK")
+    _note("    UNAVAILABLE means the recorded clock is absent or stale and is rendered")
+    _note("    fail-loud on purpose. All of it comes from what the agent cycle RECORDED --")
+    _note("    the same session state `fetch --check` and `keel status` read -- never from a")
+    _note("    clock call or calendar of the TUI's own.")
     lines.append(_blank())
     _row("Live balance")
     _note("  'live account' shows the REAL account's spendable quote balance (e.g. USDC),")
@@ -1042,7 +1088,9 @@ def build_activity_overlay(
     return _activity_lines(feed, cursor=cursor, expanded=expanded)[0]
 
 
-def _activity_cursor(ch: int, cursor: int, height: int, total: int, curses_mod: Any) -> int:
+def _activity_cursor(
+    ch: int, cursor: int, height: int, total: int, curses_mod: Any, *, banner_lines: int = 0
+) -> int:
     """The new, clamped SELECTED-ROW index for a keypress in the activity overlay -- the cursor
     analogue of `_scroll_offset`, taking `curses_mod` as a parameter for the identical reasons
     (lazy `curses` import; testable against the suite's existing fake curses module).
@@ -1054,10 +1102,15 @@ def _activity_cursor(ch: int, cursor: int, height: int, total: int, curses_mod: 
     events. `_follow_cursor` then does the scrolling, so the view still moves.
 
     `total` is the number of CYCLES. A page is `height - 3` rows (leaving the title, blank and
-    header rows in view), floored at 1 so a two-line terminal still advances."""
+    header rows in view), floored at 1 so a two-line terminal still advances.
+    `banner_lines` is the console banner's height -- the feed is PAINTED with the banner
+    prepended (the same combined list `_follow_cursor` already accounts for at its call site),
+    so a page must leave those rows in view too or it over-advances by exactly the banner and
+    lands the selection further down than the rows the operator actually saw. `0` (the
+    default) is the pre-console shape, when no binding supplied a banner."""
     if total <= 0:
         return 0
-    page = max(height - 3, 1)
+    page = max(height - 3 - banner_lines, 1)
     if ch in (curses_mod.KEY_UP, ord("k")):
         cursor -= 1
     elif ch in (curses_mod.KEY_DOWN, ord("j")):
@@ -1116,8 +1169,12 @@ def _scroll_offset(ch: int, offset: int, height: int, total: int, curses_mod: An
     `curses` module the rest of the `run_live` test suite already builds, with no real terminal
     or `curses.wrapper` involved.
 
-    `total` is the number of lines in the overlay being scrolled (`len(lines)`), used exactly the
-    way `help_offset`/`insights_offset` always were: `End` jumps toward the bottom (clamped, like
+    `total` is the number of lines in the list being SCROLLED, banner included when one is
+    prepended (`len(banner) + len(overlay_lines)` at every call site in `run_live`): the list
+    this offset is applied to is the same combined list `_visible_slice` slices, so the clamp
+    here and the window there must agree about its length -- a banner-excluded total left `End`
+    short of the true last page by exactly the banner's height. Used exactly the way
+    `help_offset`/`insights_offset` always were: `End` jumps toward the bottom (clamped, like
     every other result, to the last full page) and every key's result is clamped to `[0, max(0,
     total - height)]` so the view can never scroll past either end."""
     if ch in (curses_mod.KEY_UP, ord("k")):
@@ -1291,23 +1348,44 @@ def _refresh_balance(
         return AvailableBalance(None, "?", now_fn(), error)
 
 
-def run_once(open_state: OpenState, now_fn: NowFn, echo: Echo) -> None:
+def run_once(
+    open_state: OpenState,
+    now_fn: NowFn,
+    echo: Echo,
+    banner_fn: Callable[[Any, Any, int], list[ScreenLine]] | None = None,
+) -> None:
     """Render a single frame and hand each line to `echo` -- drives `--once` (pipes/CI) and is
-    directly testable with fakes, no CliRunner or terminal needed."""
+    directly testable with fakes, no CliRunner or terminal needed.
+
+    `banner_fn(repo, config, now_ts)` (v6, the console shell) optionally prepends the
+    session banner's lines to the frame -- the same header every interactive screen
+    carries, so a piped snapshot names its deployment and market session too. Keyword-only
+    and defaulted so every existing caller renders exactly as before."""
     repo, config = open_state()
     now_ts = now_fn()
+    if banner_fn is not None:
+        for line in banner_fn(repo, config, now_ts):
+            echo(line.text)
     report = gather_status(repo, config, now_ts)
-    for line in render_plain(report, now_ts):
-        echo(line)
+    for text in render_plain(report, now_ts):
+        echo(text)
 
 
 def _message_style(message: str) -> str:
-    """`"alert"` for a message that reports a failure OR arms autonomy ON (the one dangerous
-    transition -- it must never read as reassuring green); `"warn"` for a cancelled/unchanged
-    action; `"ok"` for everything else (autonomy OFF, fetch complete) -- purely cosmetic, so a
-    quick glance at the toast's colour tells you which it was."""
+    """`"alert"` for a message that reports a failure, arms autonomy ON, or switches the
+    console to the LIVE deployment -- the transitions that must never read as reassuring
+    green, because real money is what they change (a green `profile -> LIVE` would be the
+    toast colour saying all is well about real-account data starting to answer from every
+    screen); `"warn"` for a cancelled/unchanged action; `"ok"` for everything else (autonomy
+    OFF, fetch complete, a PAPER profile switch) -- purely cosmetic, so a quick glance at the
+    toast's colour tells you which it was."""
     lowered = message.lower()
-    if "-> on" in lowered or "without asking" in lowered or "failed" in lowered:
+    if (
+        "-> on" in lowered
+        or "without asking" in lowered
+        or "failed" in lowered
+        or "-> live" in lowered
+    ):
         return "alert"
     if "cancelled" in lowered or "unchanged" in lowered:
         return "warn"
@@ -1337,6 +1415,36 @@ def _confirm_arm_autonomy(stdscr: Any, config: Config) -> bool:
                 f"Tip: prefer a supervised window via `keel autonomy on --for-hours N`.",
             )
             return True
+        finally:
+            curses.reset_prog_mode()
+            stdscr.refresh()
+    except Exception:
+        return False
+
+
+def _confirm_live_profile(stdscr: Any, profile: Any) -> bool:
+    """The Profile menu's LIVE guard (issue #388 C2): suspends curses and asks an explicit
+    y/N at the terminal -- the same suspend/restore dance `_confirm_arm_autonomy` keeps,
+    over `click.confirm` rather than the typed-word gate.
+
+    Deliberately a confirm STEP, not O3's typed contract: pointing the console at the live
+    deployment changes what the operator is LOOKING at, not what the engine does (the
+    running agent keeps its own pair), so the ceremony matches `click.confirm`'s, not
+    `resume`'s. Fails CLOSED -- any exception anywhere here (including while restoring the
+    screen, or a Ctrl-C/EOF out of `click.confirm`) returns `False` and the binding stays
+    exactly where it was."""
+    import curses
+
+    try:
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return click.confirm(
+                f"Switch the console to the LIVE deployment "
+                f"({profile.config_path} + {profile.db_path})? "
+                "Real-account data answers from here on",
+                default=False,
+            )
         finally:
             curses.reset_prog_mode()
             stdscr.refresh()
@@ -1432,11 +1540,26 @@ def _do_discover_report(open_state: OpenState) -> DiscoverReport:
     return build_discover_report(products, config)
 
 
-def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
+def run_live(
+    open_state: OpenState,
+    now_fn: NowFn,
+    interval: float,
+    console_binding: Any | None = None,
+) -> None:
     """The auto-refreshing, interactive dashboard: `curses.wrapper` a loop that re-opens the repo
     (via `open_state`) every poll -- so it reflects writes committed by a separate `keel agent`
     process -- gathers a fresh report, paints it, then waits up to `interval` seconds for a
     keypress.
+
+    Ten modes when `console_binding` is supplied (v6, issue #388 C2 -- the console shell),
+    the seven below plus `menu` (the PRD §3 tree over `console.build_menu_lines`), `profile`
+    (the deployment menu over `console.build_profile_menu_lines`, switching through
+    `console.switch_profile` with `_confirm_live_profile` guarding the LIVE pair) and
+    `placeholder` (a future slice's "lands in Cx" notice). EVERY screen -- all ten -- is
+    prepended the session banner (`console.console_banner_lines`, fail-soft), and `m` in
+    normal mode opens the menu. `console_binding is None` is the pre-C2 dashboard
+    byte-for-byte: no banner, no `m`, none of the new modes -- which is what every caller
+    that predates the shell (and every pre-existing test) passes.
 
     Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
     action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
@@ -1451,10 +1574,13 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     the handler's `try` only ever catches `open_state()` failing). Five of the six scrollable
     overlays share one scrolling helper, `_scroll_offset`; `activity` is the exception, driving
     `_activity_cursor` + `_follow_cursor` instead because its up/down keys move a SELECTED ROW
-    (which may be one line or seventy) rather than one line of a fixed body.
+    (which may be one line or seventy) rather than one line of a fixed body. The console's
+    `menu`/`profile` modes move a selected row the same way `activity` does, and `placeholder`
+    does not scroll (a notice is one screen).
 
     Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `s` open screen; `p`
-    open propose; `d` open discover; `v` open activity; `r` refresh now; `a` toggle autonomy
+    open propose; `d` open discover; `v` open activity; `m` open the console menu (when a
+    console binding was supplied); `r` refresh now; `a` toggle autonomy
     (`toggle_autonomy`,
     gated by `_confirm_arm_autonomy` on the OFF->ON direction only); `f` fetch all data
     (`_do_fetch`, money-safe). `a` and `f` are both wrapped in `_guarded` so a failure becomes a
@@ -1462,7 +1588,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     `PgUp`/`PgDn`, `Home`/`End`) and close back to normal on `q`/`Esc`/<their own open key>.
     `activity` binds the same keys to moving its selected row, and adds Enter/Space to expand or
     collapse that row's cycle into its individual events, plus `t` to cycle the day scope
-    (`today` -> `7d` -> `all`). `t` was free: `q Q h ? i r a f s p d v` are the dashboard's keys,
+    (`today` -> `7d` -> `all`). `t` was free: `q Q h ? i r a f s p d v m` are the dashboard's keys,
     `k`/`j`/Enter/Space the in-overlay ones, and nothing bound `t` anywhere. The scope is reset to
     `today` both when `v` opens the overlay and when any close key leaves it, so it can never
     become sticky across visits.
@@ -1476,8 +1602,12 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     `_build_broker(config).list_products()` call in this entire workflow. The result (or error)
     is then HELD in `discover_result`/`discover_error`: every later poll while the overlay stays
     open just repaints what is held, with NO further network calls, until Enter is pressed again.
-    Closing the overlay (`q`/`Esc`/`d`) discards the held result, so reopening it is armed but not
-    yet run again. `discover` still scrolls with the same keys as the other four.
+    Closing the overlay (`q`/`Esc`/`d`) discards the held result, so reopening it is armed but
+    not yet run again. `discover` still scrolls with the same keys as the other four.
+
+    The console shell adds NO network touch of its own: the banner reads the repo and the
+    adapter's offline capabilities declaration, profile switching reads local files, and a
+    switch RESETS the held live-balance line (it described the previous venue's account).
 
     Also refreshes the live "available to buy" balance (`_refresh_balance`) on its own slow
     cadence (`_BALANCE_REFRESH_SEC`, not every repaint -- it's a real broker call), and
@@ -1488,6 +1618,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
     Quits on `q`/`Q` in normal mode; a `KeyboardInterrupt` (Ctrl-C) exits gracefully rather than
     dumping a traceback onto a terminal `curses.wrapper` may not have fully restored."""
     import curses
+
+    # Lazy import, the established cycle-dodge for this module (see `insights`): console
+    # imports THIS module at load time (its builders speak `ScreenLine`), so importing it
+    # here keeps the two modules loadable in either order.
+    from keel.commands import console
 
     def _balance_fn(cfg: Config) -> Decimal | None:
         # Lazy imports -- `keel.commands._common` and `keel.execution.executor` both import
@@ -1509,6 +1644,36 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
             # Not every terminal has a hideable cursor -- never fatal to the dashboard.
             pass
 
+        def _console_banner() -> list[ScreenLine]:
+            """The session banner for the screen about to be painted -- O9's per-screen
+            header, read fresh each poll from the RECORDED state. Empty when no console
+            binding was supplied (the pre-C2 dashboard, unchanged), and FAIL-SOFT with a
+            warn line when the read itself fails: a banner read must never take the screen
+            it heads down with it."""
+            if console_binding is None:
+                return []
+            try:
+                banner_repo, banner_config = open_state()
+                return console.console_banner_lines(
+                    console_binding, banner_repo, banner_config, now_fn()
+                )
+            except Exception as exc:
+                return [ScreenLine(f"console header read failed: {exc}", "warn")]
+
+        def _enter_menu_entry(
+            action: str, entry: console.MenuEntry
+        ) -> tuple[str, int, int, console.MenuEntry | None]:
+            """Where a menu selection goes: a closed mapping in one place, so the rendered
+            tree, the ordinals and the dispatch can never disagree about what an entry
+            does. Every destination opens at the top (cursor 0, offset 0)."""
+            if action == "dashboard":
+                return "normal", 0, 0, None
+            if action == "profile":
+                return "profile", 0, 0, None
+            if action == "help":
+                return "help", 0, 0, None
+            return "placeholder", 0, 0, entry
+
         mode = "normal"
         help_offset = 0
         insights_offset = 0
@@ -1517,6 +1682,9 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         discover_offset = 0
         activity_offset = 0
         activity_cursor = 0
+        menu_cursor = 0
+        profile_cursor = 0
+        placeholder_entry: console.MenuEntry | None = None
         # ALWAYS reset to `today` on open (below), never carried across one -- see this module's
         # docstring. A widened scope answers a question the operator asked once; making it sticky
         # would quietly turn "what is keel doing" back into "here is a fortnight of scrollback".
@@ -1534,17 +1702,137 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
         last_balance_ts = 0
 
         while True:
+            if mode == "menu":
+                if console_binding is None:  # unreachable via 'm'; kept total anyway
+                    mode = "normal"
+                    continue
+                # The console menu (v6): the PRD §3 tree, one cursor-marked row, ordinals
+                # 1-9 as direct shortcuts. Not scrolled -- the nine entries plus the banner
+                # fit the terminals this dashboard has always targeted, and `_paint` clips
+                # a tiny window harmlessly.
+                profiles = console.discover_profiles()
+                menu_lines = console.build_menu_lines(
+                    console.active_profile(
+                        console_binding.config_path, console_binding.db_path, profiles
+                    ),
+                    cursor=menu_cursor,
+                    profiles=profiles,
+                )
+                _paint(stdscr, [*_console_banner(), *menu_lines])
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "normal"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    menu_cursor = max(0, menu_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    menu_cursor = min(len(console.CONSOLE_MENU) - 1, menu_cursor + 1)
+                elif ord("1") <= ch <= ord("9"):
+                    selected = console.menu_entry(ch - ord("0"))
+                    if selected is not None:
+                        mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
+                            selected.action, selected
+                        )
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    selected = console.CONSOLE_MENU[menu_cursor]
+                    mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
+                        selected.action, selected
+                    )
+                continue
+
+            if mode == "placeholder":
+                if console_binding is None or placeholder_entry is None:  # unreachable; total
+                    mode = "normal"
+                    continue
+                # A future slice's entry: the notice names the owning slice and says the
+                # shell renders navigation only. Any close key returns to the MENU (the
+                # parent screen), not the dashboard -- the shell is a hierarchy.
+                _paint(
+                    stdscr,
+                    [
+                        *_console_banner(),
+                        *console.build_placeholder_lines(placeholder_entry),
+                    ],
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                continue
+
+            if mode == "profile":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Profile menu (O4): every discovered deployment with its config+db
+                # pair visible, LIVE marked as guarded. Selecting rebinds through the same
+                # loaders the CLI uses (`console.switch_profile` -> `ConsoleBinding.
+                # open_state`), guarded by `_confirm_live_profile` for the LIVE pair only.
+                profiles = console.discover_profiles()
+                profile_lines = console.build_profile_menu_lines(
+                    profiles, cursor=profile_cursor, binding_pair=console_binding.pair
+                )
+                _paint(stdscr, [*_console_banner(), *profile_lines])
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("p"), ord("m")):
+                    # `m` closes profile mode too -- the same q/Esc/<open-key-or-m>
+                    # consistency the menu and placeholder modes keep, so the key that
+                    # opened the shell can always step back one level out of it.
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    profile_cursor = max(0, profile_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    profile_cursor = profile_cursor + 1
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and 0 <= profile_cursor < len(
+                    profiles
+                ):
+                    selected_profile = profiles[profile_cursor]
+                    before_pair = console_binding.pair
+                    message = _guarded(
+                        "profile switch",
+                        lambda: console.switch_profile(
+                            console_binding,
+                            selected_profile,
+                            confirm_fn=lambda: _confirm_live_profile(stdscr, selected_profile),
+                        ),
+                    )
+                    message_ts = now_fn()
+                    if console_binding.pair != before_pair:
+                        # The whole console now answers about the other deployment: back
+                        # to the landing screen so the rebinding is visible everywhere,
+                        # the live-balance line dropped (it described the previous
+                        # venue's account) and re-read on the next poll.
+                        mode = "normal"
+                        profile_cursor = 0
+                        available = None
+                        last_balance_ts = 0
+                # Clamp every poll: the discovered list can change under the cursor (a
+                # config file appearing/disappearing between polls).
+                profile_cursor = max(0, min(profile_cursor, max(0, len(profiles) - 1)))
+                continue
+
             if mode == "help":
                 help_lines = build_help_screen()
                 height, _width = stdscr.getmaxyx()
-                _paint(stdscr, _visible_slice(help_lines, help_offset, height))
+                banner = _console_banner()
+                _paint(
+                    stdscr, _visible_slice([*banner, *help_lines], help_offset, height)
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("h"), ord("?")):
                     mode = "normal"
                     help_offset = 0
                 else:
-                    help_offset = _scroll_offset(ch, help_offset, height, len(help_lines), curses)
+                    # The banner is PART of the scrolled list (`_visible_slice` slices the
+                    # combined `[banner, help]`), so the scroll math must count it too --
+                    # clamping against the banner-EXCLUDED length left `End` two lines short
+                    # and the help tail permanently hidden whenever a console binding was
+                    # supplied. No binding -> the banner is empty and the total is unchanged.
+                    help_offset = _scroll_offset(
+                        ch, help_offset, height, len(banner) + len(help_lines), curses
+                    )
                 continue
 
             if mode == "insights":
@@ -1576,15 +1864,21 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     ]
 
                 height, _width = stdscr.getmaxyx()
-                _paint(stdscr, _visible_slice(insights_lines, insights_offset, height))
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *insights_lines], insights_offset, height),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("i")):
                     mode = "normal"
                     insights_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above: the
+                    # clamp must land on the same last page the combined slice shows.
                     insights_offset = _scroll_offset(
-                        ch, insights_offset, height, len(insights_lines), curses
+                        ch, insights_offset, height, len(banner) + len(insights_lines), curses
                     )
                 continue
 
@@ -1602,15 +1896,20 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     ]
 
                 height, _width = stdscr.getmaxyx()
-                _paint(stdscr, _visible_slice(screen_lines, screen_offset, height))
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *screen_lines], screen_offset, height),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("s")):
                     mode = "normal"
                     screen_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     screen_offset = _scroll_offset(
-                        ch, screen_offset, height, len(screen_lines), curses
+                        ch, screen_offset, height, len(banner) + len(screen_lines), curses
                     )
                 continue
 
@@ -1632,15 +1931,20 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     ]
 
                 height, _width = stdscr.getmaxyx()
-                _paint(stdscr, _visible_slice(propose_lines, propose_offset, height))
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *propose_lines], propose_offset, height),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("p")):
                     mode = "normal"
                     propose_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     propose_offset = _scroll_offset(
-                        ch, propose_offset, height, len(propose_lines), curses
+                        ch, propose_offset, height, len(banner) + len(propose_lines), curses
                     )
                 continue
 
@@ -1683,8 +1987,13 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     activity_lines, activity_cursor_line = _activity_lines(activity_feed)
 
                 height, _width = stdscr.getmaxyx()
-                activity_offset = _follow_cursor(activity_offset, activity_cursor_line, height)
-                _paint(stdscr, _visible_slice(activity_lines, activity_offset, height))
+                banner = _console_banner()
+                activity_offset = _follow_cursor(
+                    activity_offset, activity_cursor_line + len(banner), height
+                )
+                _paint(
+                    stdscr, _visible_slice([*banner, *activity_lines], activity_offset, height)
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("v")):
@@ -1707,7 +2016,12 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     activity_offset = 0
                 else:
                     activity_cursor = _activity_cursor(
-                        ch, activity_cursor, height, len(activity_feed.cycles), curses
+                        ch,
+                        activity_cursor,
+                        height,
+                        len(activity_feed.cycles),
+                        curses,
+                        banner_lines=len(banner),
                     )
                 continue
 
@@ -1721,7 +2035,11 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 discover_lines = build_discover_overlay(discover_result, error=discover_error)
 
                 height, _width = stdscr.getmaxyx()
-                _paint(stdscr, _visible_slice(discover_lines, discover_offset, height))
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *discover_lines], discover_offset, height),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("d")):
@@ -1743,8 +2061,9 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                         discover_error = str(exc)[:200]
                     discover_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     discover_offset = _scroll_offset(
-                        ch, discover_offset, height, len(discover_lines), curses
+                        ch, discover_offset, height, len(banner) + len(discover_lines), curses
                     )
                 continue
 
@@ -1761,7 +2080,7 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                     message = None
                 if message is not None:
                     lines = [*lines, ScreenLine(message, _message_style(message))]
-                _paint(stdscr, lines)
+                _paint(stdscr, [*_console_banner(), *lines])
             except Exception as exc:
                 # A transient read error (e.g. `sqlite3.OperationalError: database is locked`
                 # from a concurrent `keel agent` writer) must never kill the dashboard --
@@ -1810,6 +2129,12 @@ def run_live(open_state: OpenState, now_fn: NowFn, interval: float) -> None:
                 # Opens fully collapsed: the feed's value is the shape of the WHOLE run, and an
                 # overlay that reopened with one cycle already exploded would bury it.
                 activity_expanded = frozenset()
+                continue
+            if console_binding is not None and ch == ord("m"):
+                # v6: the console menu over the whole dashboard -- bound only when a
+                # console binding was supplied (the pre-C2 dashboard has no `m`).
+                mode = "menu"
+                menu_cursor = 0
                 continue
             if ch == ord("d"):
                 mode = "discover"
@@ -1925,23 +2250,48 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     terminal, exactly like `keel autonomy on`); `f` fetches fresh candle history for every
     configured product (money-safe: no orders); `r` refreshes immediately. Quit with `q`.
 
+    `m` opens the CONSOLE MENU (issue #388 C2): the menu tree over this dashboard -- the
+    console shell. Profile switches the deployment (the config+db pair -- paper-forward,
+    paper-hourly, paper-equities, live) in one action, rebinding everything the console
+    reads; selecting LIVE asks an explicit y/N at the terminal first and is marked
+    unmistakably in the header once active. Trading/Rules/Compliance/Data/Research/Account
+    are placeholders for later console slices and say which one they land in. Every screen
+    carries the session banner: the active deployment, then the venue's market session and
+    clock (24/7, or OPEN/CLOSED with the next open/close, or CLOCK UNAVAILABLE fail-loud)
+    -- rendered from the agent cycle's own recorded session state, never a clock call of
+    the TUI's own. The shell itself adds no network touch.
+
     `--once` renders a single, static frame to stdout and exits without touching curses, for
     pipes/CI, matching `status`'s scripting-friendliness (and prints the disclaimer footer after
     the frame) -- none of the interactive actions (including `screen`/`propose`/`discover`) are
-    available there. The default, interactive path owns the whole screen via `curses.wrapper` and
-    re-opens the repo every poll so it reflects writes committed by a separate `keel agent`
-    process.
+    available there, but the session banner still heads the frame so a piped snapshot names its
+    deployment and market session. The default, interactive path owns the whole screen via
+    `curses.wrapper` and re-opens the repo every poll so it reflects writes committed by a
+    separate `keel agent` process.
     """
     if interval <= 0:
         raise click.ClickException("--interval must be > 0")
 
-    def open_state() -> tuple[Repository, Config]:
-        return _open_repo(ctx), _load_cfg(ctx)
+    # v6: the console binding IS the open_state -- the same `_load_cfg`/`_open_repo` pair
+    # every CLI command uses, held mutable so the Profile menu can rebind it in one action.
+    from keel.commands.console import ConsoleBinding, console_banner_lines
+
+    console_binding = ConsoleBinding(
+        ctx, config_path=ctx.obj["config_path"], db_path=ctx.obj["db_path"]
+    )
+    open_state: OpenState = console_binding.open_state
 
     now_fn: NowFn = lambda: int(time.time())  # noqa: E731
 
     if once:
-        run_once(open_state, now_fn, click.echo)
+        run_once(
+            open_state,
+            now_fn,
+            click.echo,
+            banner_fn=lambda repo, config, now_ts: console_banner_lines(
+                console_binding, repo, config, now_ts
+            ),
+        )
         click.echo("")
         click.echo(DISCLAIMER)
         return
@@ -1952,4 +2302,4 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
             "Run it directly in a terminal, or use `keel tui --once` for a one-shot snapshot."
         )
 
-    run_live(open_state, now_fn, interval)
+    run_live(open_state, now_fn, interval, console_binding=console_binding)

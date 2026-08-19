@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
 
-from keel_broker_api.results import SessionState
+from keel_broker_api.results import MarketSchedule, SessionState
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
@@ -796,6 +796,12 @@ def _close_tranches(
 MARKET_SESSION_KEY = "market_session"
 MARKET_SESSION_TS_KEY = "market_session_ts"
 MARKET_SESSION_INTERVAL_KEY = "market_session_interval_sec"
+#: The schedule half of the recording (issue #388 C2): the venue's next open/close, recorded
+#: under the same venue-namespaced rule so the console session banner renders RECORDED data
+#: and never makes a clock call of its own. `None` is a legal recorded value -- an
+#: unreadable clock claims no schedule, and re-recording clears the previous cycle's times.
+MARKET_SESSION_NEXT_OPEN_KEY = "market_session_next_open"
+MARKET_SESSION_NEXT_CLOSE_KEY = "market_session_next_close"
 
 
 def market_session_key(venue: str) -> str:
@@ -814,6 +820,16 @@ def market_session_interval_key(venue: str) -> str:
     window is derived from THIS value (see `recorded_market_closed`), not from whatever
     config the reading surface happens to be holding."""
     return f"{MARKET_SESSION_INTERVAL_KEY}:{venue}" if venue else MARKET_SESSION_INTERVAL_KEY
+
+
+def market_session_next_open_key(venue: str) -> str:
+    """The recorded next-open timestamp, same namespacing rule (issue #388 C2)."""
+    return f"{MARKET_SESSION_NEXT_OPEN_KEY}:{venue}" if venue else MARKET_SESSION_NEXT_OPEN_KEY
+
+
+def market_session_next_close_key(venue: str) -> str:
+    """The recorded next-close timestamp, same namespacing rule (issue #388 C2)."""
+    return f"{MARKET_SESSION_NEXT_CLOSE_KEY}:{venue}" if venue else MARKET_SESSION_NEXT_CLOSE_KEY
 
 
 def recorded_session_venues(repo: Repository) -> list[str]:
@@ -840,43 +856,66 @@ def _effective_interval_sec(config: Config, interval_sec: float | None) -> int:
 
 
 def _venue_session(broker: Any) -> tuple[str, SessionState, bool]:
-    """The venue's identity, session-boundness and its clock answer, fail-closed.
+    """`(venue, state, session_bound)` -- the state half of `_venue_schedule`, kept as its
+    own seam because `record_market_session`'s RETURN and the cycle's session gate both
+    speak `SessionState`, and will keep doing so."""
+    venue, schedule, session_bound = _venue_schedule(broker)
+    return venue, schedule.state, session_bound
 
-    Returns `(venue, state, session_bound)`. `venue` comes from the same
+
+def _venue_schedule(broker: Any) -> tuple[str, MarketSchedule, bool]:
+    """The venue's identity, session-boundness and its clock+schedule answer, fail-closed.
+
+    Returns `(venue, schedule, session_bound)`. `venue` comes from the same
     `capabilities()` read as `session_bound` (empty for a capabilities-less broker, which
     never records anyway). `session_bound=False` is also the answer for a broker that does
     not implement the broker port at all (`keel/data/cb_client.py`'s `CoinbaseClient`, the
     live path until the broker-port migration lands): a 24/7 posture with no clock to
     consult, which keeps every existing crypto behavior byte-identical.
 
+    The schedule read prefers the port's `market_schedule()` (issue #388 C2) and falls back
+    to a DERIVED schedule -- `market_clock()`'s answer with null next open/close -- for a
+    broker built against the pre-#388 port, so the extension breaks no existing adapter.
+
     **Fail-closed** (FR-9): a session-bound broker whose clock RAISES -- a third-party
     adapter violating the port's "answer `CLOCK_UNAVAILABLE`, never raise" -- is treated as
-    `CLOCK_UNAVAILABLE` here too, and so is one whose `market_clock()` returns anything that
-    is not a `SessionState` (a `None`, a dict, a bool): the port's answer type is part of
-    its contract, and `session.value` downstream must never be an `AttributeError` that
+    `CLOCK_UNAVAILABLE` here too, and so is one whose read returns anything that is not the
+    port's answer type (a `None`, a dict, a bool): the port's answer type is part of its
+    contract, and `schedule.state.value` downstream must never be an `AttributeError` that
     kills the loop. The cycle must skip, not crash, and must never trade on an unknown
     session state. A `capabilities()` that itself raises reads as not-bound for the same
-    reason the portless broker does: nothing about such a broker is known well enough
-    to gate on, and its first network call will fail loudly through the ordinary paths.
+    reason the portless broker does: nothing about such a broker is known well enough to
+    gate on, and its first network call will fail loudly through the ordinary paths.
     """
     caps_fn = getattr(broker, "capabilities", None)
     if caps_fn is None:
-        return "", SessionState.OPEN, False
+        return "", MarketSchedule(state=SessionState.OPEN), False
     try:
         caps = caps_fn()
         session_bound = bool(caps.session_bound)
         venue = str(getattr(caps, "venue", "") or "")
     except Exception:
-        return "", SessionState.OPEN, False
+        return "", MarketSchedule(state=SessionState.OPEN), False
     if not session_bound:
-        return venue, SessionState.OPEN, False
+        return venue, MarketSchedule(state=SessionState.OPEN), False
+    schedule_fn = getattr(broker, "market_schedule", None)
+    if callable(schedule_fn):
+        try:
+            schedule = schedule_fn()
+        except Exception:
+            return venue, MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE), True
+        if isinstance(schedule, MarketSchedule) and isinstance(schedule.state, SessionState):
+            return venue, schedule, True
+        return venue, MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE), True
+    # A pre-#388 port adapter: derive the schedule from its clock answer, claiming no
+    # next open/close (the port default's exact derivation, applied at the caller side).
     try:
         session = broker.market_clock()
     except Exception:
-        return venue, SessionState.CLOCK_UNAVAILABLE, True
+        return venue, MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE), True
     if not isinstance(session, SessionState):
-        return venue, SessionState.CLOCK_UNAVAILABLE, True
-    return venue, session, True
+        return venue, MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE), True
+    return venue, MarketSchedule(state=session), True
 
 
 def record_market_session(
@@ -887,14 +926,20 @@ def record_market_session(
     *,
     interval_sec: float | None = None,
 ) -> tuple[SessionState, bool]:
-    """Read the venue's session through `_venue_session` and record it -- state, stamp, and
-    the cycle interval to trust it for -- under the venue's own namespaced keys.
+    """Read the venue's session through `_venue_schedule` and record it -- state, stamp, the
+    cycle interval to trust it for, and the schedule's next open/close (issue #388 C2) --
+    under the venue's own namespaced keys.
 
     THE one shared recording step for every loop that holds a broker (the agent cycle here,
     `keel monitor --loop` in `keel/cli.py`), so the broker-free surfaces (`fetch --check`,
-    `status`, the TUI) read one recording no matter which loop is cycling. A 24/7 venue
-    records nothing. Returns `(state, session_bound)` so the caller can gate on the answer
-    it just recorded.
+    `status`, the TUI, the console session banner) read one recording no matter which loop
+    is cycling. A 24/7 venue records nothing. Returns `(state, session_bound)` so the
+    caller can gate on the answer it just recorded.
+
+    The schedule keys are ALWAYS written once a record exists, `None` included: a degraded
+    clock must CLEAR the previous cycle's next open/close, not leave them rendering as
+    current fact -- a stale `next_open` presented as truth is exactly the TUI-side calendar
+    the port's schedule read exists to avoid.
 
     `interval_sec` is the interval THIS caller actually cycles at (`loop`'s effective
     interval, `--interval` override included); absent/degenerate values fall back to the
@@ -902,14 +947,16 @@ def record_market_session(
     deployment's real cadence, or a record written every 2h under a 15-minute config window
     false-positives the weekend between cycles.
     """
-    venue, session, session_bound = _venue_session(broker)
+    venue, schedule, session_bound = _venue_schedule(broker)
     if session_bound:
-        repo.set_state(market_session_key(venue), session.value)
+        repo.set_state(market_session_key(venue), schedule.state.value)
         repo.set_state(market_session_ts_key(venue), now_ts)
         repo.set_state(
             market_session_interval_key(venue), _effective_interval_sec(config, interval_sec)
         )
-    return session, session_bound
+        repo.set_state(market_session_next_open_key(venue), schedule.next_open_ts)
+        repo.set_state(market_session_next_close_key(venue), schedule.next_close_ts)
+    return schedule.state, session_bound
 
 
 def recorded_market_closed(
@@ -955,6 +1002,85 @@ def recorded_market_closed(
     """
     slots = [venue] if venue is not None else recorded_session_venues(repo)
     return any(_slot_market_closed(repo, config, now_ts, slot) for slot in slots)
+
+
+@dataclass(frozen=True)
+class RecordedSession:
+    """One venue's recorded session, as a display surface reads it (issue #388 C2): the
+    state, its stamp, the schedule's next open/close, and the honesty flag the banner
+    renders -- `fresh` (the record is still inside its trust window, `recorded_market_
+    closed`'s own window).
+
+    Raw, not interpreted: a stale record is returned as-is with `fresh=False`, and the
+    CALLER decides what that means (the session banner renders CLOCK UNAVAILABLE off it;
+    `status` keeps rendering the recorded state). No field here is ever derived from a
+    clock call -- everything came from the recording.
+
+    There is deliberately no `defused` here (closed AND fresh): defusal is FR-9's
+    staleness-ALERT concern, owned by `recorded_market_closed` and surfaced through
+    `MarketSessionStatus.defused` -- a display record that also carried it invited a
+    banner rendering decision the banner has no business making.
+    """
+
+    venue: str
+    state: str
+    recorded_ts: int | None
+    interval_sec: int | None
+    next_open_ts: int | None
+    next_close_ts: int | None
+    fresh: bool
+
+
+def latest_recorded_session(
+    repo: Repository, config: Config, now_ts: int
+) -> RecordedSession | None:
+    """The most recently stamped venue's session record, or `None` when nothing is recorded
+    -- the broker-free read the console session banner (O9) composes from. Pure
+    repo/config reads, the same seam `recorded_market_closed` already is: the agent cycle
+    recorded it, this reads it, and no reading surface ever makes a clock call.
+
+    The newest-stamp tiebreak is the same one `keel/commands/status.py`'s own session read
+    uses, so the two surfaces can never disagree about which venue is on screen. The
+    freshness window is `recorded_market_closed`'s (the RECORDED interval x
+    `FEED_STALENESS_CYCLES`), so a record the staleness rails would no longer trust is
+    reported `fresh=False` here too -- one window, everywhere.
+    """
+    best: tuple[int, str] | None = None
+    for venue in recorded_session_venues(repo):
+        if repo.get_state(market_session_key(venue)) is None:
+            continue
+        recorded_ts = repo.get_state(market_session_ts_key(venue))
+        stamped = recorded_ts if isinstance(recorded_ts, int) and not isinstance(
+            recorded_ts, bool
+        ) else -1
+        if best is None or stamped > best[0]:
+            best = (stamped, venue)
+    if best is None:
+        return None
+    venue = best[1]
+    state = str(repo.get_state(market_session_key(venue)))
+    recorded_ts = repo.get_state(market_session_ts_key(venue))
+    interval = repo.get_state(market_session_interval_key(venue))
+    interval_sec = (
+        interval
+        if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0
+        else None
+    )
+    fresh = (
+        isinstance(recorded_ts, int)
+        and not isinstance(recorded_ts, bool)
+        and now_ts - recorded_ts
+        <= (interval_sec or config.auto_trade.interval_sec) * FEED_STALENESS_CYCLES
+    )
+    return RecordedSession(
+        venue=venue,
+        state=state,
+        recorded_ts=recorded_ts if isinstance(recorded_ts, int) else None,
+        interval_sec=interval_sec,
+        next_open_ts=repo.get_state(market_session_next_open_key(venue)),
+        next_close_ts=repo.get_state(market_session_next_close_key(venue)),
+        fresh=fresh,
+    )
 
 
 def _slot_market_closed(
