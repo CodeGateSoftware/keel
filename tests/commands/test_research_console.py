@@ -150,6 +150,21 @@ def test_the_doc_list_renders_files_and_an_honest_empty_state(tmp_path: Path) ->
     assert "no documents" in joined
 
 
+def test_the_doc_list_rows_fit_the_80_column_clip(tmp_path: Path) -> None:
+    """A long report filename's row wraps to the budget rather than clipping: the tail of
+    the name is exactly the part that identifies the file."""
+    long_name = (
+        "2026-08-17-engine-validation-hourly-with-a-very-long-descriptive-name.md"
+    )
+    _write(tmp_path / long_name, "x", mtime=1.0)
+    files = rc.list_documents(tmp_path)
+    lines = rc.build_doc_list_lines("reports", files, tmp_path)
+    for line in lines:
+        assert len(line.text) <= 80, line.text
+    joined = "\n".join(line.text for line in lines)
+    assert long_name[:20] in joined  # the name renders (wrapped), not truncated away
+
+
 def test_the_doc_screen_renders_the_documents_own_lines(tmp_path: Path) -> None:
     doc = tmp_path / "experiment.md"
     doc.write_text("# What we tried\n\nresult: net negative\n")

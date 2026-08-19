@@ -5,11 +5,14 @@ Four surfaces, all pinned here:
 
 * **The sub-menu** -- PRD §3's Rules branch as the strategy console: the ledger, simulate,
   add, retry (backtest + promote, `--force` typed), enable/disable/demote, insights.
-* **The tried-vs-used ledger (O11.2)** -- every rule with its lifecycle status AND the
-  machine's recorded reason it sits there: the promotion gate's own failing-floor wording
-  from a real backtest over the repo's cached candles, the insights gate distance for paper
-  rules, the recorded stamps for live/disabled rows. A rule with no candles to backtest
-  against renders "no backtest on record" -- never a TUI-authored narrative.
+* **The tried-vs-used ledger (O11.2)** -- every rule with its lifecycle status and its
+  RECORDED context, rendered CHEAPLY on entry (rule rows, stamps, and the insights gate
+  distance for paper rules -- never a backtest: the entry render invokes ZERO backtests,
+  pinned by spy, because a 19-rule hourly deployment costs real hours to re-backtest). The
+  per-rule backtest verdict is an EXPLICIT, Enter-gated re-compute ("re-compute this rule's
+  verdict") that runs the full-window backtest exactly once per Enter and is held in the
+  ledger's state; a rule with no candles to backtest against renders "no backtest on
+  record" -- never a TUI-authored narrative.
 * **Simulate (O11.1)** -- an ARMED view that shows the target report path BEFORE any run
   (the confirm step), `run_simulation` spied (never really computed here), and the results
   rendering the service's own verdict/report verbatim.
@@ -136,10 +139,50 @@ def test_the_menu_screen_renders_every_entry_and_the_keys() -> None:
 # -- the tried-vs-used ledger (O11.2) ----------------------------------------------------------
 
 
-def test_the_ledger_names_the_exact_failing_floor_from_a_real_backtest(repo: Repository) -> None:
-    """A candidate with candles on record but far too few trades: the ledger renders the
-    gate's OWN reason for that floor -- `n_trades N < min_trades 100` -- sourced from a real
-    backtest judged through `can_promote`, not a TUI summary of it."""
+def test_opening_the_ledger_runs_zero_backtests_on_a_19_rule_deployment(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE entry contract (the blocker this view was redesigned around): building the ledger
+    invokes the backtest fn ZERO times, even when every row HAS candles a backtest could run
+    over -- the old design re-backtested every rule synchronously on entry (measured on 5y of
+    hourly candles: one rsi_meanrev rule alone took ~7.5 minutes; a 19-rule deployment ~2.4
+    hours, uncancellable). 19 fixture rows -- the flagship deployment's size -- prove it."""
+    from keel.strategy import backtest as backtest_mod
+
+    kinds = [
+        "turtle_breakout",
+        "pullback_continuation",
+        "rsi_meanrev",
+        "dca",
+    ]
+    for index in range(19):
+        repo.insert_rule(
+            kinds[index % len(kinds)],
+            {"product_id": "BTC-USD"},
+            status=["live", "paper", "candidate", "disabled"][index % 4],
+            now_ts=NOW_TS,
+        )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(60))
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, _daily_candles(60))
+
+    calls: list[int] = []
+    real_backtest = backtest_mod.backtest
+    monkeypatch.setattr(
+        backtest_mod, "backtest", lambda *a, **k: calls.append(1) or real_backtest(*a, **k)
+    )
+
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+
+    assert len(ledger) == 19
+    assert calls == []
+
+
+def test_the_recompute_verdict_names_the_exact_failing_floor_from_a_real_backtest(
+    repo: Repository,
+) -> None:
+    """A candidate with candles on record but far too few trades: the EXPLICIT per-rule
+    re-compute renders the gate's OWN reason for that floor -- `n_trades N < min_trades 100`
+    -- sourced from a real backtest judged through `can_promote`, not a TUI summary of it."""
     repo.insert_rule(
         "turtle_breakout",
         {"product_id": "BTC-USD", "entry_lookback": 40},
@@ -149,26 +192,77 @@ def test_the_ledger_names_the_exact_failing_floor_from_a_real_backtest(repo: Rep
     repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(60))
 
     ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
-    assert len(ledger) == 1
-    entry = ledger[0]
-    assert entry.status == "candidate"
-    joined = "\n".join(entry.reason_lines)
+    verdict = sc.compute_rule_verdict(repo, _config(), ledger[0])
+    joined = "\n".join(verdict.reason_lines)
     assert "n_trades" in joined and "min_trades" in joined
-    # The overfitting axis is honestly NOT_RUN, in the machine's own words.
+    # The overfitting axis is honestly NOT RUN, in the machine's own words.
     assert "NOT RUN" in joined
+    assert verdict.stats_line is not None and "n_trades=" in verdict.stats_line
 
 
-def test_the_ledger_renders_no_backtest_on_record_for_a_never_backtested_rule(
+def test_the_recompute_verdict_renders_no_backtest_on_record_without_candles(
     repo: Repository,
 ) -> None:
-    """No cached candles for the product: no backtest can have ever run, and the ledger says
-    exactly that rather than inventing a verdict."""
+    """No cached candles for the product: no backtest can have ever run, and the re-computed
+    verdict says exactly that rather than inventing one."""
     repo.insert_rule(
         "turtle_breakout", {"product_id": "ETH-USD"}, status="candidate", now_ts=NOW_TS
     )
     ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
-    joined = "\n".join(ledger[0].reason_lines)
-    assert "no backtest on record" in joined
+    verdict = sc.compute_rule_verdict(repo, _config(), ledger[0])
+    assert "no backtest on record" in "\n".join(verdict.reason_lines)
+
+
+def test_one_poisoned_row_neither_blanks_the_ledger_nor_kills_its_recompute(
+    repo: Repository,
+) -> None:
+    """A row whose stored params crash the backtest (a quoted float, the exact shape the add
+    service now refuses but a pre-guard row can still carry) must cost ONLY its own verdict:
+    the healthy row still renders and still computes, the poisoned row renders at entry with
+    its error carried in its re-computed verdict -- `build_rule_track_record`'s
+    graceful-degradation precedent, applied per row."""
+    repo.insert_rule(
+        "rsi_meanrev",
+        {"product_id": "BTC-USD", "oversold": "10.0"},  # poisoned: a quoted float
+        status="candidate",
+        now_ts=NOW_TS,
+    )
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": "BTC-USD", "entry_lookback": 40},
+        status="candidate",
+        now_ts=NOW_TS,
+    )
+    # rsi_meanrev decides on ONE_HOUR (its own timeframe); turtle on ONE_DAY -- the
+    # poisoned row must actually REACH its poisoned arithmetic, not dodge it.
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(60))
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, _daily_candles(60))
+
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+    # ENTRY renders BOTH rows -- one poisoned row never blanks the ledger.
+    assert len(ledger) == 2
+    lines = sc.build_ledger_lines(ledger)
+    texts = [line.text for line in lines]
+    assert any("rsi_meanrev" in t for t in texts)
+    assert any("turtle_breakout" in t for t in texts)
+
+    by_kind = {entry.kind: entry for entry in ledger}
+    poisoned = sc.compute_rule_verdict(repo, _config(), by_kind["rsi_meanrev"])
+    healthy = sc.compute_rule_verdict(repo, _config(), by_kind["turtle_breakout"])
+    assert any("failed" in reason for reason in poisoned.reason_lines)
+    assert healthy.stats_line is not None and "n_trades=" in healthy.stats_line
+
+    # And the rendered ledger carries the healthy verdict and the poisoned error alike.
+    lines = sc.build_ledger_lines(
+        ledger,
+        verdicts={
+            by_kind["rsi_meanrev"].rule_id: poisoned,
+            by_kind["turtle_breakout"].rule_id: healthy,
+        },
+    )
+    joined = "\n".join(line.text for line in lines)
+    assert "n_trades" in joined
+    assert "failed" in joined
 
 
 def test_the_ledger_groups_every_lifecycle_status_with_its_recorded_context(
@@ -212,13 +306,17 @@ def test_the_ledger_groups_every_lifecycle_status_with_its_recorded_context(
     # The paper row carries the insights service's own gate-distance reading (an empty
     # track record reads as the floor it still owes, not a fabricated absence).
     assert "trades_remaining" in joined
+    # Entry never claims a backtest ran: rows without a held verdict say so honestly.
+    assert "re-compute" in joined
 
 
 def test_the_paper_row_carries_the_insights_gate_distance_when_one_exists(
     repo: Repository,
 ) -> None:
     """A paper rule with a paper track record: the ledger renders the insights service's own
-    gate-distance blocking reasons (trades_remaining wording), not a recomputation."""
+    gate-distance blocking reasons (trades_remaining wording) AT ENTRY -- recorded paper
+    trades, never a backtest -- and DISCLOSES on the rendered line that the distance is
+    kind-wide (insights' own semantics), not this row's alone."""
     import json
 
     repo.insert_rule(
@@ -291,9 +389,30 @@ def test_the_paper_row_carries_the_insights_gate_distance_when_one_exists(
 
     ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
     paper = next(e for e in ledger if e.status == "paper")
-    joined = "\n".join(paper.reason_lines)
+    joined = "\n".join(paper.paper_gate_lines)
     assert "trades_remaining" in joined
     assert "n_trades 1 < min_trades" in joined
+    # The kind-wide disclosure rides ON the rendered line, not in a code comment.
+    assert "kind-wide" in joined
+
+
+def test_the_paper_row_renders_its_recorded_demotion_context(repo: Repository) -> None:
+    """A rule demoted live->paper carries its stamp in the `promoted_at` column
+    (`update_rule_status` writes every non-disabled transition there), and the PAPER group
+    renders it with wording that names the column honestly -- a demoted-to-paper row is no
+    longer indistinguishable from every other paper row."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": "BTC-USD"}, status="live", now_ts=NOW_TS
+    )
+    repo.update_rule_status(rule_id, "paper")  # the runbook's demotion path
+
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+    assert ledger[0].status == "paper"
+    lines = sc.build_ledger_lines(ledger)
+    joined = "\n".join(line.text for line in lines)
+    assert "paper since" in joined
+    assert "promoted_at" in joined
+    assert "demotion" in joined
 
 
 def test_the_ledger_detail_renders_params_with_their_docs(repo: Repository) -> None:
@@ -313,6 +432,56 @@ def test_the_ledger_detail_renders_params_with_their_docs(repo: Repository) -> N
     assert "55" in joined
     # The class's own docstring renders beside the value.
     assert "Donchian-high entry" in joined
+
+
+def test_the_ledger_detail_is_armed_with_the_recompute_warning(repo: Repository) -> None:
+    """The detail view without a held verdict is the re-compute's ARMED state: the warning
+    that Enter runs the FULL-WINDOW backtest (minutes on long series, the screen frozen like
+    simulate/fetch) renders BEFORE any Enter can start one."""
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS
+    )
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+
+    lines = sc.build_ledger_detail_lines(ledger[0])
+    joined = "\n".join(line.text for line in lines)
+    assert "re-compute this rule's verdict" in joined
+    assert "FULL-WINDOW backtest" in joined
+    assert "minutes" in joined
+
+    # With a held verdict, the detail renders the verdict itself (and may re-compute again).
+    verdict = sc.compute_rule_verdict(repo, _config(), ledger[0])
+    lines = sc.build_ledger_detail_lines(ledger[0], verdict=verdict)
+    joined = "\n".join(line.text for line in lines)
+    assert "no backtest on record" in joined  # no candles were cached for this row
+
+
+def test_the_ledger_lines_fit_the_80_column_clip(repo: Repository) -> None:
+    """The same budget every console screen keeps: `_paint` clips at the window width and
+    this dashboard targets 80 columns -- a reason sentence, the restore-path instruction
+    or the paper row's demotion context must wrap to its own row rather than lose its
+    tail there."""
+    paper_id = repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": "BTC-USD"},
+        status="live",
+        now_ts=NOW_TS,
+    )
+    repo.update_rule_status(paper_id, "paper")  # stamps promoted_at (the demotion stamp)
+    repo.insert_rule(
+        "dca", {"product_id": "ETH-USD"}, status="disabled", now_ts=NOW_TS
+    )
+    ledger = sc.build_strategy_ledger(repo, _config(), NOW_TS)
+    verdicts = {
+        entry.rule_id: sc.compute_rule_verdict(repo, _config(), entry)
+        for entry in ledger
+    }
+    for lines in (
+        sc.build_ledger_lines(ledger, verdicts=verdicts),
+        sc.build_ledger_detail_lines(ledger[0], verdict=verdicts[ledger[0].rule_id]),
+    ):
+        for line in lines:
+            assert len(line.text) <= 80, line.text
 
 
 # -- simulate (O11.1): the ARMED view, the spied service, the results ------------------------------
@@ -362,6 +531,10 @@ def test_run_simulate_dispatches_to_run_simulation_with_the_active_profile(
     assert calls[0]["kwargs"]["years"] == 5
     assert calls[0]["kwargs"]["monthly_contribution"] == Decimal("500")
     assert calls[0]["kwargs"]["products"] == ["BTC-USD", "ETH-USD"]
+    # The path the ARMED screen pre-showed is the path the run writes: pinned INTO the run
+    # (`out_path`), so a run crossing UTC midnight cannot write a different filename than
+    # the one the operator confirmed.
+    assert calls[0]["kwargs"]["out_path"] == plan.report_path
     assert outcome.verdict_status == "TRAIN-MORE"
 
 
@@ -400,6 +573,37 @@ def test_the_simulate_verdict_footer_is_pinned_outside_the_scroll() -> None:
     joined = "\n".join(line.text for line in footer)
     assert "TRAIN-MORE" in joined
     assert "docs/reports/x.md" in joined
+
+
+def test_the_simulate_screens_fit_the_80_column_clip() -> None:
+    """Same budget as every other console screen, on the PINNED/load-bearing lines
+    specifically: a verdict+path footer that clipped would hide exactly what the run
+    concluded and where it was written, so the verdict and the path each get their own
+    row and the results footer wraps rather than losing its tail."""
+    long_path = Path(
+        "docs/superpowers/reports/2026-08-17-engine-validation-with-a-long-name.md"
+    )
+    outcome = SimulationOutcome(
+        verdict_status="GO-LIVE",
+        verdict_reasons=("a failing gate sentence that is long enough to need wrapping "
+                         "on an 80-column terminal, honestly",),
+        report_path=long_path,
+        report_markdown="# report\n\nverdict: GO-LIVE\n",
+        artifact_path=long_path,
+    )
+    for lines in (
+        sc.simulate_verdict_footer(outcome),
+        sc.build_simulate_result_lines(outcome, progress=("a progress line long enough "
+                                                          "to need wrapping too",)),
+    ):
+        for line in lines:
+            assert len(line.text) <= 80, line.text
+    # The pinned footer keeps both load-bearing facts, the verdict first and the report
+    # path on its own row(s) beneath it.
+    footer = [line.text for line in sc.simulate_verdict_footer(outcome)]
+    assert "GO-LIVE" in footer[0]
+    assert "report:" in footer[1]
+    assert long_path.name[:20] in "\n".join(footer[1:])
 
 
 # -- the add form (O11.3) ----------------------------------------------------------------------
@@ -670,13 +874,14 @@ def test_run_live_simulate_enter_runs_the_service_once_and_holds_the_result(
     assert any("TRAIN-MORE" in t for t in painted)
 
 
-def test_run_live_the_ledger_renders_the_machines_reasons(
+def test_run_live_the_ledger_entry_runs_no_backtest_and_enter_recomputes_once(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Loop-level: Rules -> ledger paints every rule row with the gate's own wording
-    (computed on entry, held), and Esc closes back to the Rules menu."""
+    """Loop-level, THE blocker regression: opening Rules -> ledger (and polling it) invokes
+    the backtest fn ZERO times; the verdict happens only on Enter -- ONCE per Enter, in the
+    rule's detail view -- and the machine's own floor wording paints once it has."""
     from keel.commands import tui as tui_mod
-    from tests.commands.test_tui import _KeySequenceStdscr
+    from keel.strategy import backtest as backtest_mod
 
     config = _config()
     repo.insert_rule(
@@ -687,21 +892,75 @@ def test_run_live_the_ledger_renders_the_machines_reasons(
     )
     repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(30))
 
-    # m -> menu; 4 -> Rules; 1 -> ledger; poll; Esc closes; q quits.
+    calls: list[int] = []
+    real_backtest = backtest_mod.backtest
+    monkeypatch.setattr(
+        backtest_mod,
+        "backtest",
+        lambda *a, **k: calls.append(1) or real_backtest(*a, **k),
+    )
+
+    from tests.commands.test_tui import _KeySequenceStdscr
+
+    # Entry only: m -> menu; 4 -> Rules; 1 -> ledger; poll; Esc closes; q quits.
     keys = [ord("m"), ord("4"), ord("1"), -1, 27]
     stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
     _fake_curses_mod(monkeypatch, stdscr)
-
     binding = _binding(repo, config)
     tui_mod.run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
 
-    painted = [call[2] for call in stdscr.calls]
-    # `stdscr.calls` records one entry per PAINTED LINE; the whole visit is the join.
-    joined = "\n".join(painted)
-    assert "tried-vs-used ledger" in joined
-    assert "min_trades" in joined  # the gate's own floor wording
-    # The compute happened once and the ledger view painted with the machine's reasons.
-    assert "n_trades 0 < min_trades 100" in joined
+    assert calls == []  # ENTRY rendered the ledger without one backtest
+    painted = "\n".join(call[2] for call in stdscr.calls)
+    assert "tried-vs-used ledger" in painted
+    assert "re-compute" in painted  # the honest no-verdict-yet line
+
+    # Now the explicit re-compute: 1 -> ledger; Enter -> the rule's detail (ARMED);
+    # Enter -> ONE backtest; poll repaints the held verdict; Esc; Esc; q quits.
+    keys = [ord("m"), ord("4"), ord("1"), 10, 10, -1, 27, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+    _fake_curses_mod(monkeypatch, stdscr)
+    tui_mod.run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
+
+    assert calls == [1]  # exactly one backtest for exactly one Enter
+    painted = "\n".join(call[2] for call in stdscr.calls)
+    assert "min_trades" in painted  # the gate's own floor wording, held and repainted
+
+
+def test_run_live_simulate_failure_keeps_the_progress_lines_it_streamed(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed simulate run must not discard the progress it streamed before failing: the
+    lines render above the error, exactly as they head the results on success."""
+    from keel.commands import tui as tui_mod
+    from tests.commands.test_tui import _KeySequenceStdscr
+
+    config = _config()
+
+    def failing_run(*args: Any, **kwargs: Any) -> SimulationOutcome:
+        progress = kwargs.get("progress")
+        if progress is not None:
+            progress.append("fetching BTC-USD history...")
+        raise RuntimeError("coverage gap: no candles")
+
+    monkeypatch.setattr(sc, "run_simulate", failing_run)
+
+    # m -> menu; 4 -> Rules; 2 -> simulate; Enter RUNS and fails; poll repaints; Esc; q.
+    keys = [ord("m"), ord("4"), ord("2"), 10, -1, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+    _fake_curses_mod(monkeypatch, stdscr)
+    binding = _binding(repo, config)
+    tui_mod.run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
+
+    painted = "\n".join(call[2] for call in stdscr.calls)
+    assert "simulate failed" in painted
+    assert "fetching BTC-USD history" in painted
+    # The progress renders ABOVE the error line, not below it.
+    first_error = next(
+        i for i, call in enumerate(stdscr.calls) if "simulate failed" in call[2]
+    )
+    assert any(
+        "fetching BTC-USD history" in stdscr.calls[i][2] for i in range(first_error)
+    )
 
 
 def _binding(repo: Repository, config: Config) -> Any:

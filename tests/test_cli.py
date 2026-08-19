@@ -751,6 +751,55 @@ def test_rules_promote_force_prints_a_loud_bypass_warning(tmp_path):
     assert "bypass" in result.output.lower()
 
 
+def test_rules_promote_unknown_id_refuses_before_the_config_load(tmp_path):
+    """Byte-compat with origin/main's ordering: the config loads only AFTER the row
+    refusal (there, `config = _load_cfg(ctx)` sat below `_require_rule_row`), so
+    `keel --config missing.yaml rules promote 999` prints `Error: no rule with id 999` to
+    stderr and exits 1 -- the unreadable config must not mask the id error."""
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(tmp_path / "missing.yaml"),
+            "rules", "promote", "999",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == "Error: no rule with id 999\n"
+
+
+def test_rules_promote_known_id_still_loads_the_config_on_the_gated_path(
+    tmp_path, valid_config_path
+):
+    """The OTHER order, unchanged: a KNOWN id on the gated path still needs the config (the
+    gate's floors come from it), so an unreadable one surfaces exactly where it always
+    did -- after the row was found, never as the id refusal."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"})
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(tmp_path / "missing.yaml"),
+            "rules", "promote", str(rule_id),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "no rule with id" not in result.stderr
+    assert result.exception is not None  # the config error itself, unmasked
+    row = {r["id"]: r for r in repo.get_rules()}[rule_id]
+    assert row["status"] == "candidate"  # nothing was promoted
+
+
 def test_rules_promote_without_force_still_gates_on_the_backtest(tmp_path, valid_config_path):
     """Unchanged non-force behavior: no candles -> the backtest can't clear the floor -> the
     rule stays `candidate`, exactly as `test_rules_promote_stays_when_floor_not_cleared` covers."""
@@ -997,6 +1046,22 @@ def test_rules_disable_sets_terminal_status(tmp_path):
     assert result.exit_code == 0, result.output
     row = {r["id"]: r for r in repo.get_rules()}[rule_id]
     assert row["status"] == "disabled"
+
+
+def test_rules_disable_on_an_unknown_id_prints_the_error_to_stderr_byte_compatible(
+    tmp_path,
+):
+    """`keel rules disable 999` refuses exactly as it always did: the `Error: no rule with
+    id 999` line on STDERR (origin/main's `_require_rule_row` wording, byte-identical) and
+    exit 1 -- never a silent exit, which would look like success at a terminal."""
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "disable", "999"])
+
+    assert result.exit_code == 1
+    assert result.stderr == "Error: no rule with id 999\n"
 
 
 def test_rules_enable_restores_a_disabled_rule_to_candidate(tmp_path):

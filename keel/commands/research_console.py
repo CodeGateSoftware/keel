@@ -268,8 +268,14 @@ def build_doc_list_lines(
     for index, doc in enumerate(files):
         marker = ">" if index == cursor else " "
         day = time.strftime("%Y-%m-%d %H:%M", time.localtime(doc.mtime_ts))
-        text = f"{marker} {doc.path.name}  · written {day} · {doc.size_bytes} bytes"
-        lines.append(ScreenLine(text, "heading" if index == cursor else "normal"))
+        # Wrapped to the budget, not clipped: a long report filename's tail is exactly the
+        # part that identifies the file (the same rule every console screen keeps).
+        for wrapped in _wrap(
+            f"{marker} {doc.path.name} · written {day} · {doc.size_bytes} bytes", indent=""
+        ):
+            lines.append(
+                ScreenLine(wrapped, "heading" if index == cursor else "normal")
+            )
     lines.append(_blank())
     lines.append(
         ScreenLine(

@@ -117,6 +117,7 @@ below are still the only three.
 from __future__ import annotations
 
 import sys
+import textwrap
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1723,10 +1724,15 @@ def run_live(
     C4 (issue #390) adds the strategy console and the research readers, all
     console-bound only: `strategy` (the Rules sub-menu over
     `strategy_console.STRATEGY_MENU`; forms run at the terminal like Compliance's),
-    `strategy-ledger` (the tried-vs-used ledger -- every rule with the machine's recorded
-    reason, COMPUTED ONCE on entry, each row's backtest being real work, and held),
-    `strategy-rule` (one rule's detail: params rendered through `describe_params`, the
-    O8 per-field help), `strategy-simulate` (the O11.1 ARMED view -- Enter is the confirm
+    `strategy-ledger` (the tried-vs-used ledger -- every rule row with its RECORDED
+    context, read CHEAPLY once on entry: zero backtests run there, because the
+    entry-time re-backtest this view shipped with cost minutes per rule on long
+    series), `strategy-rule` (one rule's detail: params rendered through
+    `describe_params`, the O8 per-field help, and the rule's backtest verdict -- ARMED
+    until an explicit Enter, the ONE place the strategy console runs a rule backtest:
+    warned first, honestly blocking while it runs like simulate/fetch, held in
+    `strategy_verdicts` and rendered under its row once computed),
+    `strategy-simulate` (the O11.1 ARMED view -- Enter is the confirm
     step; the run fetches/writes exactly as `keel simulate` does, blocks the loop exactly
     like `f` fetch, and its verdict+report render under a pinned footer), and the four
     `research*` modes (the O5 evidence readers over `research_console`: a corpus list, a
@@ -1906,10 +1912,13 @@ def run_live(
         scout_list_offset = 0
         scout_view_cache: dict[tuple[str, int], ProposeView] = {}
         # -- the strategy console (issue #390 C4 / PRD O11): the Rules sub-menu's cursor,
-        # the ledger's HELD compute (built once per entry -- every row's backtest is real
-        # work, the scout browser's hold-don't-recompute lesson), the simulate view's
-        # ARMED/held state (Enter is the confirm step, the discover overlay's gating
-        # story), and the research readers' list/selection state.
+        # the ledger's HELD rows (built CHEAPLY once per entry -- recorded state only,
+        # ZERO backtests; the entry-time re-backtest this view shipped with cost minutes
+        # per rule on long series), the per-rule verdicts the operator EXPLICITLY
+        # re-computes (Enter-gated in the rule's detail; held here and dropped with the
+        # rows when the ledger is re-entered -- the rules-table-write invalidation), the
+        # simulate view's ARMED/held state (Enter is the confirm step, the discover
+        # overlay's gating story), and the research readers' list/selection state.
         strategy_cursor = 0
         strategy_menu_offset = 0
         strategy_ledger: list[Any] = []
@@ -1918,6 +1927,7 @@ def run_live(
         strategy_ledger_offset = 0
         strategy_rule_detail: Any = None
         strategy_rule_offset = 0
+        strategy_verdicts: dict[int, Any] = {}
         strategy_simulate_plan: Any = None
         strategy_simulate_result: Any = None
         strategy_simulate_error: str | None = None
@@ -2033,21 +2043,18 @@ def run_live(
 
         def _enter_strategy_entry(entry: Any) -> None:
             """Where a Rules selection goes -- the closed-mapping rule again: the ledger
-            (its compute happens ONCE, here, because every row's backtest is real work),
-            the ARMED simulate view, a form at the terminal, or the insights overlay with
-            a back-pointer to this menu."""
+            (a CHEAP recorded-state read -- no backtest runs on entry; the per-rule
+            verdict is the detail view's explicit Enter-gated re-compute), the ARMED
+            simulate view, a form at the terminal, or the insights overlay with a
+            back-pointer to this menu."""
             nonlocal mode, strategy_ledger, strategy_ledger_built, strategy_ledger_cursor
             nonlocal strategy_ledger_offset, strategy_rule_detail, strategy_rule_offset
+            nonlocal strategy_verdicts
             nonlocal strategy_simulate_plan, strategy_simulate_result
             nonlocal strategy_simulate_error, strategy_simulate_progress
             nonlocal strategy_simulate_offset, insights_back
             nonlocal message, message_ts, insights_offset
             if entry.kind == "view":  # the tried-vs-used ledger
-                _paint(
-                    stdscr,
-                    [ScreenLine("computing the ledger (backtesting every rule)... please wait",
-                                "normal")],
-                )
                 try:
                     ledger_repo, ledger_config = open_state()
                     strategy_ledger = strategy_console.build_strategy_ledger(
@@ -2058,6 +2065,10 @@ def run_live(
                     message = f"ledger read failed: {str(exc)[:160]}"
                     message_ts = now_fn()
                     return
+                # Re-entering rebuilds the rows from the rules table AND drops every held
+                # verdict -- a rules-table write between visits can never keep a stale
+                # verdict on a changed row.
+                strategy_verdicts = {}
                 strategy_ledger_built = True
                 strategy_ledger_cursor = 0
                 strategy_ledger_offset = 0
@@ -2547,12 +2558,16 @@ def run_live(
                 if console_binding is None or not strategy_ledger_built:
                     mode = "strategy"
                     continue
-                # The tried-vs-used ledger (O11.2): every rule row with the machine's
-                # recorded reason, HELD from the entry-time compute (each row's backtest
-                # is real work -- a poll repaint must never re-run it; re-entering the
-                # view recomputes). A cursor over the rule rows; Enter opens the detail.
+                # The tried-vs-used ledger (O11.2): every rule row with its RECORDED
+                # context, HELD from the entry-time read (a poll repaint must never
+                # re-read, and never backtests -- entry runs zero of them). Any verdicts
+                # the operator re-computed in the detail view render under their rows.
+                # A cursor over the rule rows; Enter opens the detail (whose own Enter
+                # is the explicit, warned re-compute).
                 ledger_lines = strategy_console.build_ledger_lines(
-                    strategy_ledger, cursor=strategy_ledger_cursor
+                    strategy_ledger,
+                    cursor=strategy_ledger_cursor,
+                    verdicts=strategy_verdicts,
                 )
                 height, _width = stdscr.getmaxyx()
                 banner = _console_banner()
@@ -2593,10 +2608,15 @@ def run_live(
 
             if mode == "strategy-rule" and strategy_rule_detail is not None:
                 # One rule's detail: the params rendered through `describe_params` (the
-                # O8 per-field help) and the recorded reason again. Static content --
-                # no per-poll rebuild needed, it describes the HELD ledger row.
+                # O8 per-field help), the recorded paper-gate distance, and the rule's
+                # backtest verdict -- ARMED until an explicit Enter. That Enter is the
+                # ONE place the strategy console runs a rule backtest: warned first (the
+                # detail screen says what it costs), honestly blocking while it runs
+                # (exactly like simulate/fetch), and held in `strategy_verdicts` when it
+                # ends -- repaints render the held verdict, they never recompute.
+                detail = strategy_rule_detail
                 rule_lines = strategy_console.build_ledger_detail_lines(
-                    strategy_rule_detail
+                    detail, verdict=strategy_verdicts.get(detail.rule_id)
                 )
                 height, _width = stdscr.getmaxyx()
                 banner = _console_banner()
@@ -2608,6 +2628,35 @@ def run_live(
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("m")):
                     mode = "strategy-ledger"
+                    strategy_rule_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine(
+                            f"re-computing rule {detail.rule_id}'s verdict (the "
+                            "full-window backtest)... please wait -- this can take "
+                            "minutes on long series; the screen is frozen like "
+                            "simulate/fetch",
+                            "normal",
+                        )],
+                    )
+                    try:
+                        verdict_repo, verdict_config = open_state()
+                        strategy_verdicts[detail.rule_id] = (
+                            strategy_console.compute_rule_verdict(
+                                verdict_repo, verdict_config, detail
+                            )
+                        )
+                    except Exception as exc:
+                        strategy_verdicts[detail.rule_id] = (
+                            strategy_console.RuleVerdict(
+                                stats_line=None,
+                                reason_lines=(
+                                    f"the re-compute failed before the backtest could "
+                                    f"run: {str(exc)[:160]}",
+                                ),
+                            )
+                        )
                     strategy_rule_offset = 0
                 else:
                     strategy_rule_offset = _scroll_offset(
@@ -2632,11 +2681,25 @@ def run_live(
                         strategy_simulate_result, tuple(strategy_simulate_progress)
                     )
                 elif strategy_simulate_error is not None:
-                    sim_lines = [
-                        ScreenLine(f"simulate failed: {strategy_simulate_error}", "alert"),
-                        _blank(),
-                        ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"),
-                    ]
+                    # A failed run keeps the progress it streamed BEFORE failing, above
+                    # the error (they head the results on success; dropping them here
+                    # would hide exactly the lines that say how far it got).
+                    sim_lines = []
+                    if strategy_simulate_progress:
+                        sim_lines.append(
+                            ScreenLine("run progress (what the CLI streamed):", "muted")
+                        )
+                        for line in strategy_simulate_progress:
+                            for wrapped in textwrap.wrap(line, width=78) or [""]:
+                                sim_lines.append(ScreenLine(wrapped, "muted"))
+                        sim_lines.append(_blank())
+                    sim_lines.extend(
+                        [
+                            ScreenLine(f"simulate failed: {strategy_simulate_error}", "alert"),
+                            _blank(),
+                            ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"),
+                        ]
+                    )
                 else:
                     sim_lines = strategy_console.build_simulate_armed_lines(
                         strategy_simulate_plan
@@ -3312,10 +3375,11 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     paper-hourly, paper-equities, live) in one action, rebinding everything the console
     reads; selecting LIVE asks an explicit y/N at the terminal first and is marked
     unmistakably in the header once active. Rules (issue #390 C4) opens the STRATEGY
-    CONSOLE: the tried-vs-used ledger (every rule with the machine's own recorded reason
-    it sits where it sits -- the promotion gate's failing floors from a fresh backtest,
-    the insights gate distance for paper rules, the recorded stamps), simulate + results
-    (ARMED; Enter confirms a run that fetches and writes the report exactly as the CLI
+    CONSOLE: the tried-vs-used ledger (every rule with its recorded lifecycle context --
+    status, stamps, and the insights gate distance for paper rules; NO backtest runs on
+    entry: each rule's verdict is an explicit, warned, per-rule re-compute on Enter),
+    simulate + results (ARMED; Enter confirms a run that fetches and writes the report
+    exactly as the CLI
     does, then holds the verdict and the report verbatim), add-a-strategy (per-field
     parameter help from the rule classes themselves, landing as candidate), retry
     (re-backtest + re-attempt promote with its y/N confirm and the TYPED `--force`

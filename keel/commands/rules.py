@@ -387,9 +387,12 @@ def rules_promote(
     try:
         attempt_promotion(
             _open_repo(ctx),
-            # Loaded ONLY on the gated path, exactly as the old body did: `--force` never
-            # needed a config, and an unreadable one must not newly refuse it.
-            None if force else _load_cfg(ctx),
+            # Loaded ONLY on the gated path, exactly as the old body did -- there, AFTER
+            # the row refusal: `--force` never needed a config, an unreadable one must
+            # not newly refuse it, and NEITHER may mask the unknown-id refusal
+            # (`--config missing.yaml rules promote 999` prints the id error, exit 1).
+            # Passed LAZY (a zero-arg loader) so the service resolves it at that point.
+            lambda: None if force else _load_cfg(ctx),
             rule_id,
             granularity_opt=granularity,
             force=force,
@@ -427,6 +430,11 @@ def attempt_promotion(
     loader (`_load_pbo_for`); the CLI passes its `ctx`-carrying `_load_pbo` seam so the
     tests that pin the G4 verdict keep working unchanged.
 
+    `config` may be a loaded `Config`, `None`, or a zero-arg CALLABLE producing either --
+    resolved only on the gated path, after the row refusal, at the exact point the old
+    command body loaded it: the CLI passes a lazy loader so an unreadable config cannot
+    mask `Error: no rule with id N` (origin loaded config only after the row check).
+
     FORCE carries no gate HERE (the CLI's `--force` is a flag the operator already typed at
     a terminal); the strategy console's retry flow runs its own TYPED gate before calling
     with `force=True` -- the O3 contract is the front-end's to keep, never the service's to
@@ -463,6 +471,10 @@ def attempt_promotion(
         sink(f"rule {rule_id} ({row['kind']}): status -> {target}")
         return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=target)
 
+    # The lazy config resolves HERE -- after the row refusal, exactly where the old
+    # command body loaded it (`config = _load_cfg(ctx)` sat below the force return).
+    if callable(config):
+        config = config()
     rule = agent._build_rule(row)
     fee_pct, fee_source = _backtest_fee(config)
     stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
@@ -594,7 +606,12 @@ def rules_disable(ctx: click.Context, rule_id: int) -> None:
     """Disable a rule (nothing promotes from here; `keel rules enable` can restore it, at
     `candidate` -- never at the status it held when disabled)."""
     try:
-        apply_rule_disable(_open_repo(ctx), rule_id, echo=click.echo)
+        apply_rule_disable(
+            _open_repo(ctx),
+            rule_id,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
     except RulesRefused:
         ctx.exit(1)
 
@@ -1416,7 +1433,13 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
     `Literal` it declares (`_declared_choices`' own read), and `quotable` from
     `agent.coerced_param_keys` -- the coercion tables themselves -- so the help can never
     disagree with what `rules add` accepts. `product_id` (supplied by `--product`, one
-    source of truth) and `name` (the kind's identity, not a knob) are excluded.
+    source of truth) and `name` (the kind's identity, not a knob) are excluded, and so is
+    any constructor kwarg the kind does not PERSIST: the same `describe()["params"]` the
+    add service's dropped-param refusal reads is the one source here, so the help can never
+    offer a param the add flow would refuse as silently lost (pullback_continuation's
+    `granularity` -- accepted by the constructor, never stored in the row). A kind's
+    `PARAM_DOCS` entry for such a param stays where it is, documenting the class; the FORM
+    simply does not offer it.
 
     Raises `ValueError` for a kind not in `RULE_REGISTRY`, naming the known kinds -- the
     same refusal `add_rule_row` makes."""
@@ -1425,12 +1448,25 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
         raise ValueError(
             f"unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}"
         )
+    # ONE source for "does the row persist this param?": the constructed rule's own
+    # `describe()["params"]` -- exactly the dict `add_rule_row` stores and
+    # `agent._build_rule` rebuilds from. A kind whose defaults cannot even construct
+    # offers everything it accepts (the honest fallback; no registered kind hits it).
+    try:
+        persisted = set(
+            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
+            .describe()["params"]
+        )
+    except (TypeError, ValueError, ArithmeticError):
+        persisted = None
     docs = getattr(rule_cls, "PARAM_DOCS", {})
     hints = _init_hints(rule_cls)
     quotable = agent.coerced_param_keys(kind)
     params: dict[str, ParamHelp] = {}
     for name, param in inspect.signature(rule_cls).parameters.items():
         if name in ("self", "product_id", "name"):
+            continue
+        if persisted is not None and name not in persisted:
             continue
         type_name, choices = _param_type(hints.get(name), param.default)
         params[name] = ParamHelp(

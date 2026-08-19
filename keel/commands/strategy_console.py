@@ -1,11 +1,11 @@
 """The Rules menu -- the console's strategy console (issue #390 C4; PRD O11 and §3's tree).
 
 Everything here is DISPATCH, never behavior (PRD O2, the discipline `compliance_console`
-keeps): the ledger reads the rules table and runs the SAME backtest-and-gate pass
-`keel rules promote` runs (through `keel.commands.rules`' extracted services and
-`strategy.promotion`'s own decision), simulate is `commands.simulate.run_simulation` with the
-active profile's config/db, and every form collects fields at the terminal and calls the same
-service the CLI command calls. No sizing, gating or reporting math lives here.
+keeps): the ledger reads the rules table and the recorded paper track (through
+`keel.commands.rules`' extracted services, `strategy.promotion`'s own decision, and the
+`insights` service's own gate distance), simulate is `commands.simulate.run_simulation`
+with the active profile's config/db, and every form collects fields at the terminal and
+calls the same service the CLI command calls. No sizing, gating or reporting math lives here.
 
 The surfaces, all pure (or injected-I/O) and unit-testable without curses:
 
@@ -13,27 +13,37 @@ The surfaces, all pure (or injected-I/O) and unit-testable without curses:
   console: the tried-vs-used ledger, simulate + results, add, retry (backtest + promote,
   `--force` TYPED), enable/disable/demote, insights.
 * **The tried-vs-used ledger (O11.2)** -- one view answering "which strategies are in use,
-  which were tried, and WHY are the tried ones not used": every rule row with its lifecycle
-  status AND the machine's recorded reason -- the promotion gate's own failing-floor
-  wording from a fresh backtest over the repo's cached candles (`can_promote`'s `reasons`,
-  the exact lines `rules promote` prints on a refusal), the `insights` service's
-  promotion-gate distance for `paper` rules, and the rows' own recorded stamps
-  (`promoted_at`/`demoted_at`) for live/disabled. A rule with no cached candles to backtest
-  against renders "no backtest on record" -- the honest absent case, never a TUI-authored
-  narrative. G4/PBO is honestly NOT RUN here (the ledger names no `--pbo-session`), and
-  `can_promote`'s own reason says so.
+  which were tried, and WHY are the tried ones not used", split by COST. The ENTRY render is
+  CHEAP and sources only recorded state: every rule row with its lifecycle status, kind,
+  product and recorded stamps (`promoted_at`/`demoted_at`), plus the `insights` service's
+  promotion-gate distance for `paper` rules (kind-wide, over the recorded paper orders --
+  bounded, never a backtest). It invokes ZERO backtests, pinned by spy: the entry-time
+  re-backtest this view shipped with measured ~7.5 minutes for ONE rsi_meanrev rule over 5y
+  of hourly candles (the walk is intrinsically quadratic), ~2.4 hours for a 19-rule hourly
+  deployment, uncancellable -- so it is gone. Nothing persists a last-backtest result
+  (`rules backtest`/`promote` write no rows; the schema's `backtests` table has no writer),
+  so the entry invents no storage either. The full per-rule backtest verdict is an EXPLICIT,
+  per-rule, Enter-gated re-compute in the rule's detail view ("re-compute this rule's
+  verdict"), warned before it runs (full-window backtest, minutes on long series), honestly
+  blocking during the one rule (like simulate/fetch) and Esc-cancellable between rules; the
+  result is HELD in the ledger's state and invalidated when the ledger is rebuilt from the
+  rules table on the next entry. G4/PBO is honestly NOT RUN there (no `--pbo-session` is
+  named), and `can_promote`'s own reason says so.
 * **Simulate (O11.1)** -- an ARMED view that shows the TARGET REPORT PATH before anything
-  runs (the confirm step), `run_simulation` on Enter (the CLI's own defaults: 5y, $500/month,
-  the allowlist's products, history fetched when the cache does not cover the window), and a
-  results screen rendering the service's own verdict/report verbatim under a pinned
-  verdict+path footer. The run blocks the loop exactly like `f` fetch does -- the CLI's own
-  UX, mirrored honestly -- with the progress lines the CLI would have streamed collected and
-  shown at the head of the results.
+  runs (the confirm step) and pins that exact path INTO the run (`out_path`), so a run
+  crossing UTC midnight cannot write a different filename than the one confirmed;
+  `run_simulation` on Enter (the CLI's own defaults: 5y, $500/month, the allowlist's
+  products, history fetched when the cache does not cover the window), and a results screen
+  rendering the service's own verdict/report verbatim under a pinned verdict+path footer.
+  The run blocks the loop exactly like `f` fetch does -- the CLI's own UX, mirrored
+  honestly -- with the progress lines the CLI would have streamed collected and shown at
+  the head of the results (and kept above the error line when the run fails).
 * **The forms (O11.3/O11.4)** -- add (per-field help from `rules.describe_params`, the O8
-  single source; lands as `candidate` exactly as the CLI does, with the SERVICE's own
-  validation messages rendered), retry (re-backtest always; promote only on an explicit y/N;
-  `--force` behind `clis_typed_promote_force_gate` -- the CLI's OWN typed gate, exact phrase,
-  never pre-filled, failing closed), and enable as the documented restore path.
+  single source, offering only the params the kind PERSISTS; lands as `candidate` exactly
+  as the CLI does, with the SERVICE's own validation messages rendered), retry (re-backtest
+  always; promote only on an explicit y/N; `--force` behind
+  `clis_typed_promote_force_gate` -- the CLI's OWN typed gate, exact phrase, never
+  pre-filled, failing closed), and enable as the documented restore path.
 """
 
 from __future__ import annotations
@@ -115,8 +125,8 @@ STRATEGY_MENU: tuple[StrategyEntry, ...] = (
         ordinal=1,
         label="tried-vs-used ledger",
         description=(
-            "every rule with its lifecycle status AND the machine's recorded reason "
-            "(read-only; a fresh backtest judged by the promotion gate)"
+            "every rule with its lifecycle status and recorded context (read-only; no "
+            "backtest runs here -- each rule's verdict is an explicit per-rule re-compute)"
         ),
         kind="view",
         target="ledger",
@@ -232,10 +242,11 @@ _LEDGER_GROUPS: tuple[tuple[str, str], ...] = (
 
 @dataclass(frozen=True)
 class LedgerRule:
-    """One rules-table row as the ledger sees it: the lifecycle status, the row's own
-    recorded stamps, and the machine's recorded reason the row sits there -- `stats_line`
-    is the backtest summary and `reason_lines` the promotion gate's own wording (or the
-    honest "no backtest on record" when the repo holds no candles to backtest against)."""
+    """One rules-table row as the ledger sees it AT ENTRY: the RECORDED lifecycle facts
+    only -- status, kind, product, the row's own stamps, its params -- plus (paper rows)
+    the insights service's kind-wide gate distance over the recorded paper trades.
+    Building one runs NO backtest; the backtest verdict is `RuleVerdict`, computed only by
+    the explicit per-rule re-compute (`compute_rule_verdict`)."""
 
     rule_id: int
     kind: str
@@ -243,30 +254,30 @@ class LedgerRule:
     product_id: str | None
     promoted_at: int | None
     demoted_at: int | None
-    stats_line: str | None
-    reason_lines: tuple[str, ...]
+    paper_gate_lines: tuple[str, ...]
     params: dict[str, Any]
 
 
-def _ledger_rule(
-    repo: Repository, config: Config, row: dict[str, Any]
-) -> LedgerRule:
-    """The ledger's read of ONE rule row: a fresh backtest over the repo's cached candles,
-    judged by the promotion gate exactly as `rules promote` judges it (`can_promote`, no
-    PBO session -- so the G4 axis renders as its own honest NOT RUN reason), plus the
-    insights service's paper-track gate distance for `paper` rows and the row's recorded
-    stamps. The reason is the ENGINE's verdict or the honest absence -- never a summary
-    authored here."""
-    from keel.commands.insights import build_rule_track_record
-    from keel.commands.rules import _backtest_fee, _describe_fee
-    from keel.strategy import promotion as promotion_mod
-    from keel.strategy.backtest import backtest as backtest_fn
-    from keel.strategy.paper import track_record
+@dataclass(frozen=True)
+class RuleVerdict:
+    """One rule's EXPLICITLY-computed backtest verdict (the Enter-gated re-compute): the
+    fee-honest backtest summary (`stats_line`) and the promotion gate's own reasons --
+    exactly what `rules backtest` measures and `rules promote`'s gate answers -- or the
+    honest absence ("no backtest on record") / honest failure (a backtest that raised).
+    Held in the ledger's state per rule, never recomputed by a repaint."""
 
-    params = row["params"] or {}
-    product_id = params.get("product_id")
-    stats_line: str | None = None
-    reasons: list[str] = []
+    stats_line: str | None
+    reason_lines: tuple[str, ...]
+
+
+def _paper_gate_lines(repo: Repository, config: Config, row: dict[str, Any]) -> list[str]:
+    """The insights service's kind-wide paper-gate distance for a `paper` row -- its own
+    reading of the recorded paper track record (by kind, exactly as `keel insights summary`
+    reads it), with the kind-wide semantics disclosed ON the rendered line. Recorded
+    orders only: no backtest is involved, so this is cheap enough for the entry render."""
+    from keel.commands.insights import build_rule_track_record
+    from keel.strategy import promotion as promotion_mod
+    from keel.strategy.paper import track_record
 
     promo_cfg = promotion_mod.PromotionConfig(
         min_trades=config.promotion.min_trades,
@@ -274,26 +285,86 @@ def _ledger_rule(
         min_rr=config.promotion.min_rr,
         min_win_rate=float(config.promotion.min_win_rate),
     )
-    gate = promotion_mod.pbo_gate_from_config(config.research)
-    fee_pct, fee_source = _backtest_fee(config)
+    record = build_rule_track_record(row, track_record(repo, row["kind"]), promo_cfg)
+    lines: list[str] = []
+    if record.gate is not None:
+        verdict = "PASSING" if record.gate.passing else "blocked"
+        lines.append(
+            f"paper gate ({record.gate.promotion_class} floor): {verdict} -- "
+            f"trades_remaining={record.gate.trades_remaining} "
+            f"(n>={record.gate.min_trades}, win_rate>={record.gate.min_win_rate}, "
+            f"rr>={record.gate.min_rr}, expectancy>{record.gate.min_expectancy})"
+        )
+        lines.extend(record.gate.blocking_reasons)
+    else:
+        # `render_summary`'s own wording for a row whose kind the registry no longer
+        # knows -- the insights service's honest unavailable, not a TUI line.
+        lines.append("paper gate: unavailable (rule kind not recognized -- stale row?)")
+    lines.append(
+        "distance is kind-wide (insights' own semantics): the floor reading pools every "
+        "paper trade this KIND recorded, on any product -- not this row's trades alone"
+    )
+    return lines
+
+
+def _ledger_rule(repo: Repository, config: Config, row: dict[str, Any]) -> LedgerRule:
+    """The ledger's CHEAP read of ONE rule row: the recorded lifecycle facts, plus the
+    paper-gate distance for `paper` rows. No backtest runs here -- the entry render must
+    stay cheap on any deployment size (see the module docstring for what the entry-time
+    re-backtest cost). One poisoned row degrades to its own error line, never a crash."""
+    params = row["params"] or {}
+    paper_gate: tuple[str, ...] = ()
+    if row["status"] == "paper":
+        try:
+            paper_gate = tuple(_paper_gate_lines(repo, config, row))
+        except Exception as exc:  # noqa: BLE001 -- one row's read must cost only that row
+            paper_gate = (
+                f"paper gate unreadable for this row: {exc!r} -- see `keel insights "
+                "summary` for the kind's own reading",
+            )
+    return LedgerRule(
+        rule_id=row["id"],
+        kind=row["kind"],
+        status=row["status"],
+        product_id=params.get("product_id"),
+        promoted_at=row.get("promoted_at"),
+        demoted_at=row.get("demoted_at"),
+        paper_gate_lines=paper_gate,
+        params=params,
+    )
+
+
+def compute_rule_verdict(
+    repo: Repository, config: Config, entry: LedgerRule
+) -> RuleVerdict:
+    """THE explicit per-rule re-compute (Enter-gated in the console): the full-window
+    backtest over the repo's cached candles, judged by the promotion gate exactly as
+    `rules promote` judges it (`can_promote`, no PBO session -- so the G4 axis renders as
+    its own honest NOT RUN reason). This is REAL WORK -- minutes on long series -- which is
+    precisely why nothing calls it from a render path. A backtest that raises (stale
+    params, e.g. a quoted float a pre-guard row still carries) is an honest per-row error
+    line, following `build_rule_track_record`'s graceful-degradation precedent."""
+    from keel.commands.rules import _backtest_fee, _describe_fee
+    from keel.strategy import promotion as promotion_mod
+    from keel.strategy.backtest import backtest as backtest_fn
+
+    row = {
+        "id": entry.rule_id,
+        "kind": entry.kind,
+        "params": entry.params,
+        "status": entry.status,
+    }
+    reasons: list[str] = []
 
     try:
         rule = agent._build_rule(row)
     except ValueError:
-        reasons.append(
-            f"rule kind {row['kind']!r} is no longer in RULE_REGISTRY -- a stale row the "
-            "engine cannot rebuild (see `keel rules list`)"
-        )
-        return LedgerRule(
-            rule_id=row["id"],
-            kind=row["kind"],
-            status=row["status"],
-            product_id=product_id,
-            promoted_at=row.get("promoted_at"),
-            demoted_at=row.get("demoted_at"),
+        return RuleVerdict(
             stats_line=None,
-            reason_lines=tuple(reasons),
-            params=params,
+            reason_lines=(
+                f"rule kind {entry.kind!r} is no longer in RULE_REGISTRY -- a stale row "
+                "the engine cannot rebuild (see `keel rules list`)",
+            ),
         )
 
     granularity = None
@@ -304,64 +375,58 @@ def _ledger_rule(
             break
 
     candles = (
-        repo.get_candles(product_id, granularity) if product_id and granularity else []
+        repo.get_candles(entry.product_id, granularity)
+        if entry.product_id and granularity
+        else []
     )
     if not candles:
         gran_name = granularity.value if granularity is not None else "its own"
         reasons.append(
             f"no backtest on record -- the repo holds no cached {gran_name} candles for "
-            f"{product_id or 'this product'} to backtest against"
+            f"{entry.product_id or 'this product'} to backtest against"
         )
-    else:
-        stats = backtest_fn(rule, candles, fee_pct=fee_pct)
-        decision = promotion_mod.can_promote(stats, promo_cfg, None, gate)
-        stats_line = (
-            f"backtest: n_trades={stats.n_trades} win_rate={stats.win_rate:.2%} "
-            f"expectancy={stats.expectancy} profit_factor={stats.profit_factor} "
-            f"{_describe_fee(fee_pct, fee_source)}"
-        )
-        reasons.extend(decision.reasons)
+        return RuleVerdict(stats_line=None, reason_lines=tuple(reasons))
 
-    if row["status"] == "paper":
-        # The insights service's own reading of the paper track record (by kind, as
-        # `keel insights summary` reads it) -- the gate distance TO the live floor.
-        record = build_rule_track_record(row, track_record(repo, row["kind"]), promo_cfg)
-        if record.gate is not None:
-            verdict = "PASSING" if record.gate.passing else "blocked"
-            reasons.append(
-                f"paper gate ({record.gate.promotion_class} floor): {verdict} -- "
-                f"trades_remaining={record.gate.trades_remaining} "
-                f"(n>={record.gate.min_trades}, win_rate>={record.gate.min_win_rate}, "
-                f"rr>={record.gate.min_rr}, expectancy>{record.gate.min_expectancy})"
-            )
-            reasons.extend(record.gate.blocking_reasons)
-        else:
-            # `render_summary`'s own wording for a row whose kind the registry no longer
-            # knows -- the insights service's honest unavailable, not a TUI line.
-            reasons.append(
-                "paper gate: unavailable (rule kind not recognized -- stale row?)"
-            )
-
-    return LedgerRule(
-        rule_id=row["id"],
-        kind=row["kind"],
-        status=row["status"],
-        product_id=product_id,
-        promoted_at=row.get("promoted_at"),
-        demoted_at=row.get("demoted_at"),
-        stats_line=stats_line,
-        reason_lines=tuple(reasons),
-        params=params,
+    promo_cfg = promotion_mod.PromotionConfig(
+        min_trades=config.promotion.min_trades,
+        min_expectancy=config.promotion.min_expectancy,
+        min_rr=config.promotion.min_rr,
+        min_win_rate=float(config.promotion.min_win_rate),
     )
+    gate = promotion_mod.pbo_gate_from_config(config.research)
+    fee_pct, fee_source = _backtest_fee(config)
+    try:
+        stats = backtest_fn(rule, candles, fee_pct=fee_pct)
+    except Exception as exc:  # noqa: BLE001 -- the row's own error, never the view's
+        return RuleVerdict(
+            stats_line=None,
+            reason_lines=(
+                f"the backtest itself failed on this row's stored params: {exc!r} -- "
+                f"see `keel rules backtest {entry.rule_id}` for the same failure "
+                "(a stale param shape the add service now refuses)",
+            ),
+        )
+    decision = promotion_mod.can_promote(stats, promo_cfg, None, gate)
+    stats_line = (
+        f"backtest: n_trades={stats.n_trades} win_rate={stats.win_rate:.2%} "
+        f"expectancy={stats.expectancy} profit_factor={stats.profit_factor} "
+        f"{_describe_fee(fee_pct, fee_source)}"
+    )
+    reasons.extend(decision.reasons)
+    return RuleVerdict(stats_line=stats_line, reason_lines=tuple(reasons))
 
 
 def build_strategy_ledger(
     repo: Repository, config: Config, now_ts: int
 ) -> list[LedgerRule]:
     """Every rules-table row as a `LedgerRule`, grouped in-use-first (live, paper,
-    candidate, disabled; by id within a group) -- the tried-vs-used ledger's data. Compute
-    happens ONCE per call (each row's backtest is real work); the console builds this on
-    entering the view and holds it, the scout browser's own hold-don't-recompute lesson."""
+    candidate, disabled; by id within a group) -- the tried-vs-used ledger's data. CHEAP by
+    contract: recorded rows plus the bounded paper-track read, ZERO backtests (pinned by
+    spy in the tests -- the entry-time re-backtest this view shipped with cost minutes per
+    rule on long series). The console builds this on entering the view and holds it,
+    together with any re-computed verdicts; re-entering rebuilds both, which is the
+    held-verdict invalidation: a rules-table write between visits can never leak a stale
+    verdict onto a changed row."""
     del now_ts  # the ledger renders the RECORDS' stamps, never "now"
     rows = repo.get_rules()
     grouped: list[dict[str, Any]] = []
@@ -383,18 +448,25 @@ def _date(ts: int | None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
-def build_ledger_lines(ledger: list[LedgerRule], *, cursor: int = 0) -> list[ScreenLine]:
-    """The ledger screen: every lifecycle group with its rows, each row's recorded reason
-    beneath it, exactly one cursor-marked rule row. PURE."""
+def build_ledger_lines(
+    ledger: list[LedgerRule],
+    *,
+    cursor: int = 0,
+    verdicts: dict[int, RuleVerdict] | None = None,
+) -> list[ScreenLine]:
+    """The ledger screen: every lifecycle group with its rows, each row's RECORDED context
+    and any HELD re-computed verdict beneath it, exactly one cursor-marked rule row. PURE --
+    no verdict is computed here; `verdicts` is the held state the loop owns."""
     lines: list[ScreenLine] = [
         ScreenLine("keel console -- rules / tried-vs-used ledger", "heading"),
-        ScreenLine(
-            "which strategies are in use, which were tried, and why the tried ones are not "
-            "used -- the engine's own verdicts, freshly computed",
-            "muted",
-        ),
-        _blank(),
     ]
+    for wrapped in _wrap(
+        "which strategies are in use, which were tried -- recorded state, freshly read; "
+        "verdicts are per-rule re-computes (Enter), never entry-time backtests",
+        indent="",
+    ):
+        lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
     if not ledger:
         lines.append(
             ScreenLine("no rules found -- `add a strategy` or `keel rules seed`.", "normal")
@@ -422,16 +494,42 @@ def build_ledger_lines(ledger: list[LedgerRule], *, cursor: int = 0) -> list[Scr
                 )
             )
             index += 1
-            for reason in entry.reason_lines:
-                for wrapped in _wrap(f"- {reason}", indent="      "):
-                    lines.append(ScreenLine(wrapped, "warn"))
-            if entry.stats_line is not None:
-                for wrapped in _wrap(entry.stats_line, indent="      "):
+            if status == "paper":
+                for reason in entry.paper_gate_lines:
+                    for wrapped in _wrap(f"- {reason}", indent="      "):
+                        lines.append(ScreenLine(wrapped, "warn"))
+            verdict = (verdicts or {}).get(entry.rule_id)
+            if verdict is not None:
+                for reason in verdict.reason_lines:
+                    for wrapped in _wrap(f"- {reason}", indent="      "):
+                        lines.append(ScreenLine(wrapped, "warn"))
+                if verdict.stats_line is not None:
+                    for wrapped in _wrap(verdict.stats_line, indent="      "):
+                        lines.append(ScreenLine(wrapped, "muted"))
+            else:
+                for wrapped in _wrap(
+                    "- no verdict computed in this view -- Enter opens the rule, where "
+                    "Enter again re-computes it (a full-window backtest; minutes on "
+                    "long series)",
+                    indent="      ",
+                ):
                     lines.append(ScreenLine(wrapped, "muted"))
             if status == "live" and entry.promoted_at is not None:
                 lines.append(
                     ScreenLine(f"      promoted {_date(entry.promoted_at)} (recorded)", "muted")
                 )
+            if status == "paper" and entry.promoted_at is not None:
+                # `update_rule_status` writes every non-disabled transition into
+                # `promoted_at` (repository.py's own column choice), so a paper row's
+                # stamp is its demotion stamp when it arrived live->paper -- rendered
+                # with wording that names the column, never a false "was promoted".
+                for wrapped in _wrap(
+                    f"paper since {_date(entry.promoted_at)} -- the column is "
+                    "promoted_at; the runbook's documented demotion path (live->paper) "
+                    "writes here too",
+                    indent="      ",
+                ):
+                    lines.append(ScreenLine(wrapped, "muted"))
             if status == "disabled":
                 if entry.demoted_at is not None:
                     lines.append(
@@ -439,20 +537,19 @@ def build_ledger_lines(ledger: list[LedgerRule], *, cursor: int = 0) -> list[Scr
                             f"      disabled {_date(entry.demoted_at)} (recorded)", "muted"
                         )
                     )
-                lines.append(
-                    ScreenLine(
-                        "      restore path: `keel rules enable` -- returns the rule at "
-                        "candidate, never at the status it held",
-                        "muted",
-                    )
-                )
+                for wrapped in _wrap(
+                    "restore path: `keel rules enable` -- returns the rule at candidate, "
+                    "never at the status it held",
+                    indent="      ",
+                ):
+                    lines.append(ScreenLine(wrapped, "muted"))
         lines.append(_blank())
-    lines.append(
-        ScreenLine(
-            "up/k down/j move · Enter the rule's detail (params + help) · q/Esc/m back",
-            "muted",
-        )
-    )
+    for wrapped in _wrap(
+        "up/k down/j move · Enter the rule's detail (params; Enter there re-computes its "
+        "verdict) · q/Esc/m back",
+        indent="",
+    ):
+        lines.append(ScreenLine(wrapped, "muted"))
     return lines
 
 
@@ -474,10 +571,14 @@ def _default_display(help_: ParamHelp) -> str:
 _DEFAULT_MISS = object()
 
 
-def build_ledger_detail_lines(entry: LedgerRule) -> list[ScreenLine]:
-    """One rule's detail: its lifecycle status, the recorded reason again, and EVERY param
-    rendered through `describe_params` -- the O8 per-field help, single-sourced from the
-    class. PURE."""
+def build_ledger_detail_lines(
+    entry: LedgerRule, *, verdict: RuleVerdict | None = None
+) -> list[ScreenLine]:
+    """One rule's detail: its lifecycle status, EVERY param rendered through
+    `describe_params` (the O8 per-field help, single-sourced from the class), the paper
+    gate's recorded distance again, and -- without a held `verdict` -- the ARMED
+    re-compute: the warning renders BEFORE any Enter can start the work, exactly the
+    simulate view's confirm step. PURE."""
     lines: list[ScreenLine] = [
         ScreenLine(
             f"keel console -- rules / rule {entry.rule_id} ({entry.kind})", "heading"
@@ -507,18 +608,49 @@ def build_ledger_detail_lines(entry: LedgerRule) -> list[ScreenLine]:
             ScreenLine(f"  (params: {json.dumps(entry.params, default=str)})", "normal")
         )
     lines.append(_blank())
-    lines.append(ScreenLine("the machine's recorded reason this row sits here:", "heading"))
-    if entry.reason_lines:
-        for reason in entry.reason_lines:
+    if entry.status == "paper":
+        lines.append(
+            ScreenLine("the recorded paper-gate distance (kind-wide):", "heading")
+        )
+        for reason in entry.paper_gate_lines:
             for wrapped in _wrap(f"- {reason}", indent="      "):
                 lines.append(ScreenLine(wrapped, "warn"))
+        lines.append(_blank())
+    if verdict is not None:
+        lines.append(
+            ScreenLine("this session's re-computed verdict (the machine's own):", "heading")
+        )
+        for reason in verdict.reason_lines:
+            for wrapped in _wrap(f"- {reason}", indent="      "):
+                lines.append(ScreenLine(wrapped, "warn"))
+        if verdict.stats_line is not None:
+            for wrapped in _wrap(verdict.stats_line, indent="      "):
+                lines.append(ScreenLine(wrapped, "muted"))
     else:
-        lines.append(ScreenLine("      (none recorded)", "muted"))
-    if entry.stats_line is not None:
-        for wrapped in _wrap(entry.stats_line, indent="      "):
-            lines.append(ScreenLine(wrapped, "muted"))
+        lines.append(
+            ScreenLine("re-compute this rule's verdict -- ARMED, nothing has run", "heading")
+        )
+        for wrapped in _wrap(
+            "Enter runs the FULL-WINDOW backtest over the repo's cached candles and "
+            "judges it through the promotion gate -- the same numbers `keel rules "
+            f"backtest {entry.rule_id}` prints and `rules promote` refuses on.",
+            indent="      ",
+        ):
+            lines.append(ScreenLine(wrapped, "normal"))
+        for wrapped in _wrap(
+            "WARNING: this is real work -- on long series it can take MINUTES (one "
+            "rsi_meanrev rule over 5y of hourly candles measured ~7.5 minutes); the "
+            "screen freezes while it runs, exactly like simulate/fetch, and the result "
+            "is held here when it ends. Esc or q returns without running anything.",
+            indent="      ",
+        ):
+            lines.append(ScreenLine(wrapped, "warn"))
     lines.append(_blank())
-    lines.append(ScreenLine("Press q, Esc or m to return to the ledger.", "muted"))
+    lines.append(
+        ScreenLine(
+            "Enter re-computes the verdict · q/Esc/m back to the ledger", "muted"
+        )
+    )
     return lines
 
 
@@ -626,6 +758,11 @@ def run_simulate(
         years=plan.years,
         monthly_contribution=plan.monthly_contribution,
         now_ts=now_ts,
+        # The path the ARMED screen pre-showed is the path the run writes: pinned here so
+        # a run crossing UTC midnight cannot write a different filename than the one the
+        # operator confirmed (`default_report_path(now_ts)` inside the service would
+        # otherwise re-derive the date from the run-time `now_ts`).
+        out_path=plan.report_path,
         echo=sink,
     )
 
@@ -653,14 +790,19 @@ def build_simulate_result_lines(
         ScreenLine("keel console -- rules / simulate results", "heading"),
         ScreenLine(f"verdict: {outcome.verdict_status}", _verdict_style(outcome.verdict_status)),
     ]
-    lines.append(ScreenLine(f"report: {outcome.report_path}", "muted"))
+    # The paths wrap rather than clip: the tail of a report path is exactly the part that
+    # identifies the file (and this screen's own footer carries them pinned, unwrapped,
+    # on their own rows).
+    for wrapped in _wrap(f"report: {outcome.report_path}", indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
     if outcome.verdict_reasons:
         lines.append(ScreenLine("failing gates:", "normal"))
         for reason in outcome.verdict_reasons:
             for wrapped in _wrap(f"- {reason}", indent="      "):
                 lines.append(ScreenLine(wrapped, "warn"))
     if outcome.artifact_path is not None:
-        lines.append(ScreenLine(f"artifact: {outcome.artifact_path}", "muted"))
+        for wrapped in _wrap(f"artifact: {outcome.artifact_path}", indent=""):
+            lines.append(ScreenLine(wrapped, "muted"))
     if progress:
         lines.append(_blank())
         lines.append(ScreenLine("run progress (what the CLI streamed):", "muted"))
@@ -676,26 +818,31 @@ def build_simulate_result_lines(
         for wrapped in textwrap.wrap(line, width=_WIDTH) or [""]:
             lines.append(ScreenLine(wrapped, "normal"))
     lines.append(_blank())
-    lines.append(
-        ScreenLine(
-            "Enter re-runs the pass · q/Esc/m back to the Rules menu (the report stays on "
-            "disk -- reachable from Research / promotion reports)",
-            "muted",
-        )
-    )
+    for wrapped in _wrap(
+        "Enter re-runs the pass · q/Esc/m back to the Rules menu (the report stays on "
+        "disk -- reachable from Research / promotion reports)",
+        indent="",
+    ):
+        lines.append(ScreenLine(wrapped, "muted"))
     return lines
 
 
 def simulate_verdict_footer(outcome: SimulationOutcome) -> list[ScreenLine]:
     """The simulate results' PINNED footer: the verdict and the report path, reserved off
     the window before the body is sliced (`compliance_console.pinned_frame`) so no scroll
-    offset can hide what the run concluded or where it was written. PURE."""
-    return [
+    offset can hide what the run concluded or where it was written. PURE -- the verdict
+    and the path each get their own row (the path wraps if it must), so neither
+    load-bearing fact can lose its tail to the 80-column clip."""
+    footer = [
         ScreenLine(
-            f"verdict: {outcome.verdict_status} · report: {outcome.report_path}",
-            _verdict_style(outcome.verdict_status),
+            f"verdict: {outcome.verdict_status}", _verdict_style(outcome.verdict_status)
         )
     ]
+    footer.extend(
+        ScreenLine(wrapped, "muted")
+        for wrapped in _wrap(f"report: {outcome.report_path}", indent="")
+    )
+    return footer
 
 
 # -- the forms (O11.3 add / O11.4 retry + restore) ---------------------------------------------

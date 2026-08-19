@@ -135,20 +135,44 @@ def test_describe_params_carries_the_literals_the_rule_itself_declares() -> None
 
 
 def test_describe_params_covers_every_kind_and_every_param_minus_identity() -> None:
-    """Every registered kind documents every operator-facing param: the identity pair
-    (`product_id`, supplied by --product, and `name`) is excluded, everything else the
-    constructor accepts must carry a doc -- a missing doc is a missing O8 help line, not a
-    calm blank."""
+    """Every registered kind documents every operator-facing param it PERSISTS: the
+    identity pair (`product_id`, supplied by --product, and `name`) is excluded, and so is
+    any constructor kwarg the kind does not persist (the same `describe()["params"]` source
+    `add_rule_row`'s dropped-param refusal reads) -- everything the row can actually carry
+    must carry a doc, because a missing doc is a missing O8 help line, not a calm blank."""
     for kind, rule_cls in agent.RULE_REGISTRY.items():
         params = describe_params(kind)
+        persisted = set(
+            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
+            .describe()["params"]
+        )
         accepted = {
             name
             for name in rules_mod._accepted_params(rule_cls)
             if name not in ("product_id", "name")
         }
-        assert set(params) == accepted, f"{kind}: params mismatch"
+        assert set(params) == accepted & persisted, f"{kind}: params mismatch"
         for name, help_ in params.items():
             assert help_.doc.strip(), f"{kind}.{name} carries no PARAM_DOCS entry"
+
+
+def test_describe_params_offers_only_params_the_kind_persists() -> None:
+    """The help never offers a param the add flow would REFUSE: pullback_continuation
+    ACCEPTS `granularity` but does not persist it (`describe()["params"]` carries no such
+    key -- `add_rule_row` refuses it as silently-lost), so the form must not offer it;
+    turtle_breakout persists its `granularity` and keeps offering it."""
+    pullback = describe_params("pullback_continuation")
+    assert "granularity" not in pullback
+    # Every offered pullback param is one the row persists.
+    persisted = set(
+        agent.build_rule_from_params(
+            "pullback_continuation", {"product_id": "BTC-USD"}
+        ).describe()["params"]
+    )
+    assert set(pullback) <= persisted
+
+    turtle = describe_params("turtle_breakout")
+    assert "granularity" in turtle  # turtle DOES persist it (params carries the key)
 
 
 def test_describe_params_quotable_matches_the_coercion_tables() -> None:
