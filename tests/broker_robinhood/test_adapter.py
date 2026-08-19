@@ -19,7 +19,14 @@ from typing import Any
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_broker_robinhood import RobinhoodAdapter
 from keel_core.types import Granularity, Side
 
@@ -1049,6 +1056,16 @@ def test_a_transportless_adapter_refuses_network_calls_clearly() -> None:
     assert adapter.capabilities().venue == "robinhood"
     with pytest.raises(RuntimeError, match="without a transport"):
         adapter.get_balances()
+
+
+def test_robinhood_crypto_is_not_session_bound_and_answers_open_offline() -> None:
+    """This adapter is scoped to Robinhood's CRYPTO api (24/7), so the venue declares
+    `session_bound=False` and the clock answers OPEN as a constant. Constructed with NO
+    transport -- the proof that a 24/7 clock answer touches no network: a transport call
+    here would raise the RuntimeError the test above pins (FR-9: crypto venues are always
+    open)."""
+    assert RobinhoodAdapter().capabilities().session_bound is False
+    assert RobinhoodAdapter().market_clock() is SessionState.OPEN
 
 
 def test_entry_point_discovery_finds_the_robinhood_adapter() -> None:

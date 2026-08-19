@@ -16,6 +16,7 @@ Fixtures mirror `tests/test_agent.py::repo` (in-memory `Repository`, `set_state`
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from decimal import Decimal
 from typing import Any
 
@@ -317,6 +318,85 @@ def test_subscriptions_surfaced_when_attested(repo: Repository) -> None:
     row = report.subscriptions[0]
     assert row.venue == "coinbase"
     assert row.effective_status == "active"
+
+
+# -- market session (FR-9: a closed venue is not a stale feed) --------------------------------
+#
+# The session answer is RECORDED by the agent cycle (`keel/agent.py`) into `agent_state`;
+# `status` stays broker-free by reading that record -- the same #345 rail-17 pattern: name
+# the state that gates the cycle, on its own line, before an operator wonders why nothing
+# trades. No record (a 24/7 venue, or a deployment whose agent has not run) renders NO line
+# at all, so crypto dashboards stay byte-identical.
+
+
+def test_no_market_session_record_renders_no_line(repo: Repository) -> None:
+    """Crypto unchanged: a venue that is not session-bound never writes the state keys, so
+    the dashboard cannot grow a new line for it."""
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.market_session.state is None
+    assert not any("market" in line for line in render_human(report))
+
+
+def test_market_session_open_renders_the_venue_clock(repo: Repository) -> None:
+    repo.set_state("market_session", "open")
+    repo.set_state("market_session_ts", NOW_TS - 60)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.market_session.state == "open"
+    assert "market session: open (venue clock)" in render_human(report)
+
+
+def test_market_session_closed_names_the_skip_and_the_alert_relief(repo: Repository) -> None:
+    """The line an operator reads on a Saturday: the cycles are skipping and the staleness
+    alerts are quiet BY DESIGN -- naming both, so the quiet reads as expected rather than as
+    a dead deployment."""
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", NOW_TS - 60)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.market_session.state == "closed"
+    rendered = render_human(report)
+    assert any(line.startswith("market session: CLOSED (venue clock)") for line in rendered)
+    assert any("cycles skip" in line for line in rendered)
+
+
+def test_market_session_clock_unreadable_names_the_fail_closed_posture(
+    repo: Repository,
+) -> None:
+    """A clock that could not be read is NOT a closed market -- it is an unknown one, held
+    closed. The line says so, because 'skipping while unknown' is worth an operator's eyes
+    in a way a weekend never is."""
+    repo.set_state("market_session", "clock_unavailable")
+    repo.set_state("market_session_ts", NOW_TS - 60)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    assert report.market_session.state == "clock_unavailable"
+    rendered = render_human(report)
+    assert any(line.startswith("market session: clock UNREADABLE") for line in rendered)
+    assert any("fail-closed" in line for line in rendered)
+
+
+def test_market_session_line_sits_beside_the_kill_switch(repo: Repository) -> None:
+    """Both lines answer 'why is the cycle not trading': the kill switch (operator halt)
+    first, the venue clock (session) right after it -- one glance, one place."""
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", NOW_TS - 60)
+
+    lines = render_human(gather_status(repo, _config(), now_ts=NOW_TS))
+    kill_at = next(i for i, line in enumerate(lines) if line.startswith("kill_switch"))
+    session_at = next(i for i, line in enumerate(lines) if line.startswith("market session"))
+    assert session_at == kill_at + 1
+
+
+def test_market_session_state_is_json_serialisable_for_the_tui(repo: Repository) -> None:
+    """`--json` is the TUI's forward-compatible shape: the new block must ride along, not
+    break it."""
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", NOW_TS - 60)
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    payload = json.dumps(asdict(report), default=str)
+    assert '"state": "closed"' in payload
 
 
 # -- rail 17 (withdrawal attestation, §65.4) -------------------------------------------------

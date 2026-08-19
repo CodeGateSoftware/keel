@@ -122,6 +122,47 @@ def test_custom_tolerance_is_honoured():
     assert assess(info, _NOW, tolerance_bars=1).stale is True
 
 
+# -- market_closed (FR-9: a closed venue is not a stale feed) ---------------------------------
+#
+# `market_closed` is the venue-clock answer threaded into the assessment so a session-bound
+# venue's weekend/holiday reads as the expected state, not a feed failure. It defuses STALE
+# only: `missing` stays actionable because a closed venue still serves HISTORICAL bars, so
+# warming a cold cache is exactly what a fetch can and should do on a Saturday.
+
+
+def test_a_stale_series_on_a_closed_market_is_not_actionable():
+    """The FR-9 hazard, stated as the policy: a series behind the tolerance while the venue
+    is closed is the EXPECTED state -- `stale` stays true (the bars ARE behind) but it is
+    not a fetch's job to fix and must not alert."""
+    result = assess(_info(_NOW - 5 * _DAY), _NOW, market_closed=True)
+    assert result.stale is True
+    assert result.market_closed is True
+    assert result.needs_fetch is False
+
+
+def test_market_closed_defaults_to_false_so_24x7_venues_are_byte_identical():
+    """Every existing caller passes nothing and must keep yesterday's answer: staleness on
+    a 24/7 venue is a real feed failure, whatever the calendar says."""
+    result = assess(_info(_NOW - 5 * _DAY), _NOW)
+    assert result.market_closed is False
+    assert result.needs_fetch is True
+
+
+def test_a_missing_series_still_needs_a_fetch_even_on_a_closed_market():
+    """A closed venue serves history; `missing` is a cold cache, not a session artifact --
+    defusing it would hide a pipeline that has never warmed."""
+    result = assess(_info(None), _NOW, market_closed=True)
+    assert result.missing is True
+    assert result.needs_fetch is True
+
+
+def test_a_current_series_on_a_closed_market_is_simply_ok():
+    result = assess(_info(_NOW - _DAY), _NOW, market_closed=True)
+    assert result.stale is False
+    assert result.needs_fetch is False
+    assert result.market_closed is True
+
+
 def test_any_needs_fetch_and_any_gaps_are_independent():
     fresh = assess(_info(_NOW - _DAY), _NOW)
     stale = assess(_info(_NOW - 30 * _DAY), _NOW)

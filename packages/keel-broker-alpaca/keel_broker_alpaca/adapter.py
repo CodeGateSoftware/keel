@@ -17,8 +17,9 @@ Scope posture (the PRD's Phase A, FR-1-FR-8, plus the FR-11 rate-limit and host 
 
 * **Cash account, long-only, regular session.** No margin, no shorting, no extended
   hours -- `extended_hours: False` is pinned on every order body, and the session's
-  open/closed state comes from the venue's own clock (`is_market_open`), never a locally
-  maintained calendar that drifts (FR-9's posture, wired ahead of the staleness rails).
+  open/closed state comes from the venue's own clock (`market_clock`, the port method
+  `is_market_open` now delegates to), never a locally maintained calendar that drifts
+  (FR-9's posture, wired ahead of the staleness rails).
 * **Preview is synthesized** (`synthesizes_preview=True`, `supports_native_preview=
   False`): Alpaca has no preview endpoint, so `preview_order` reads the venue's latest
   quote (best bid/ask, FR-4) and prices the order itself, with the regulatory fee model
@@ -49,7 +50,14 @@ from keel_broker_api.orders import (
     StopLimitGTC,
 )
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.types import Candle, Granularity, Side
 
 from keel_broker_alpaca.fees import estimate_regulatory_fees
@@ -86,6 +94,10 @@ _CAPABILITIES = BrokerCapabilities(
     supports_fee_summary=False,
     quote_currencies=frozenset({"USD"}),
     asset_classes=frozenset({"equity"}),
+    # The regular session binds everything this venue serves (FR-9): weekends and holidays
+    # exist here, so the engine must consult `market_clock()` before trading -- unlike the
+    # 24/7 crypto venues, whose always-open answer is a constant.
+    session_bound=True,
 )
 
 #: Alpaca's own page caps a bars query at 10,000 rows per page; twenty pages is already
@@ -157,16 +169,46 @@ class AlpacaAdapter:
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
 
-    def is_market_open(self) -> bool:
-        """The regular session's open/closed state, from the venue's own clock.
+    def market_clock(self) -> SessionState:
+        """The regular session's state, from the venue's own `/v2/clock` (the port method).
 
-        A venue-specific extra (not part of the `Broker` port): equities are not 24/7,
-        and the PRD's session-awareness rule (FR-9) is that a weekend or market holiday
-        reads "market closed", never "feed stale". The clock endpoint is the source so
-        holidays and half-days come from the venue, not a local calendar that drifts.
+        Equities are not 24/7, and the PRD's session-awareness rule (FR-9) is that a
+        weekend or market holiday reads "market closed", never "feed stale". The clock
+        endpoint is the source so holidays and half-days come from the venue, not a local
+        calendar that drifts.
+
+        **A clock that cannot be read is `CLOCK_UNAVAILABLE`, never an exception and never
+        a guess of open** -- fail-closed (FR-9): a transport error, a missing transport, or
+        a response that is not a clock are all "unknown session", and trading on an unknown
+        session state is precisely what the fail-closed rule exists to prevent. The caller
+        decides what to do; this method's answer is the venue's, or an honest "could not
+        read".
+
+        **Only an actual boolean `is_open` answers OPEN/CLOSED.** A 2xx body whose
+        `is_open` is absent, null, or not a bool is `CLOCK_UNAVAILABLE` too, not CLOSED:
+        CLOSED defuses staleness alerting (re-recorded fresh each cycle, so effectively
+        forever), and a malformed body must never buy that silence. Unreadable clocks are
+        fail-loud for alerting and fail-closed for trading -- the same split the engine's
+        session gate applies to `clock_unavailable`.
         """
-        clock = self._require_transport().get_clock()
-        return bool(_field(clock, "is_open", False))
+        try:
+            clock = self._require_transport().get_clock()
+            if clock is None:
+                return SessionState.CLOCK_UNAVAILABLE
+            is_open = _field(clock, "is_open")
+            if not isinstance(is_open, bool):
+                return SessionState.CLOCK_UNAVAILABLE
+            return SessionState.OPEN if is_open else SessionState.CLOSED
+        except Exception:
+            return SessionState.CLOCK_UNAVAILABLE
+
+    def is_market_open(self) -> bool:
+        """Phase A's adapter-specific extra, kept answerable and now derived from the port's
+        `market_clock()` so the two can never disagree: True only when the venue's own clock
+        says the regular session is open. `CLOCK_UNAVAILABLE` reads False here -- fail-closed
+        -- so a caller still using the boolean form gets the same posture the port expresses.
+        """
+        return self.market_clock() is SessionState.OPEN
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

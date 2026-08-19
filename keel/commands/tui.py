@@ -132,7 +132,13 @@ from keel.commands.admission import (
     render_propose_view,
     render_screen_report,
 )
-from keel.commands.status import StatusReport, _human_age, _rail17_line, gather_status
+from keel.commands.status import (
+    StatusReport,
+    _human_age,
+    _rail17_line,
+    _session_line,
+    gather_status,
+)
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Granularity
@@ -167,16 +173,28 @@ _GRANULARITY_PERIOD_SEC: dict[str, int] = {
 }
 
 
-def _freshness_style(granularity: str | None, age_sec: int | None) -> str:
+def _freshness_style(
+    granularity: str | None, age_sec: int | None, *, market_closed: bool = False
+) -> str:
     """`"ok"` when a product's newest candle is within 2x its own granularity's period, `"warn"`
     when it is staler than that -- or when there is no local data / unknown granularity to begin
-    with (a daily series a couple of days old is fine; a couple of *periods* old is stale)."""
+    with (a daily series a couple of days old is fine; a couple of *periods* old is stale).
+
+    `market_closed` (the report's own session answer, closed AND inside its trust window --
+    `MarketSessionStatus.defused`) downgrades the AGE-based warn to `"muted"`: a behind
+    series during a closure is the expected weekend shape, and painting it warn while the
+    session line two rows up says CLOSED muted would be one screen disagreeing with itself.
+    The no-data/unknown-granularity warn is deliberately NOT downgraded -- a closed venue
+    still serves history, so a cold cache is a pipeline problem, not a session artifact (the
+    `fetch --check` rule, carried into colour)."""
     if granularity is None or age_sec is None:
         return "warn"
     period = _GRANULARITY_PERIOD_SEC.get(granularity)
     if period is None:
         return "warn"
-    return "warn" if age_sec > 2 * period else "ok"
+    if age_sec > 2 * period:
+        return "muted" if market_closed else "warn"
+    return "ok"
 
 
 def _blank() -> ScreenLine:
@@ -234,6 +252,40 @@ def _kill_switch_lines(report: StatusReport) -> list[ScreenLine]:
     if report.kill_switch_engaged:
         return [ScreenLine("kill_switch: ENGAGED (halted)", "alert")]
     return [ScreenLine("kill_switch: clear", "ok")]
+
+
+def _market_session_style(state: str) -> str:
+    """Colour for the session line, by what the state MEANS to an operator:
+
+    * `open` is the working state -- `ok`, the same green a clear kill-switch gets.
+    * `closed` is an EXPECTED state (every weekend, every holiday) -- `muted`, deliberately
+      NOT warn/alert: a closed market is the system working as designed, and painting it
+      yellow would spend the warning colour on ~2 days of every 7 until an operator stops
+      looking at it. The line still names the skip and the alert relief, so the quiet is
+      legible without being loud.
+    * `clock_unavailable` is a degraded read the fail-closed posture is papering over --
+      `warn`. Unlike a weekend it is never routine, and it is one clock outage away from
+      every cycle skipping silently.
+
+    No paper-mode divergence (unlike rail 17's): the session gate skips PAPER cycles too, so
+    the same severity is truthful in every mode.
+    """
+    if state == "open":
+        return "ok"
+    if state == "clock_unavailable":
+        return "warn"
+    return "muted"
+
+
+def _market_session_lines(report: StatusReport) -> list[ScreenLine]:
+    """`render_human`'s exact session text, styled -- the `_rail17_line` discipline: the TUI
+    and `keel status` render ONE string, so they can never disagree about whether the venue
+    is closed. Nothing to say (a 24/7 venue, no cycle recorded) renders nothing, matching the
+    text renderer byte for byte."""
+    line = _session_line(report.market_session)
+    if line is None:
+        return []
+    return [ScreenLine(line, _market_session_style(report.market_session.state or ""))]
 
 
 def _autonomy_lines(report: StatusReport) -> list[ScreenLine]:
@@ -374,9 +426,17 @@ def _rule_lines(report: StatusReport) -> list[ScreenLine]:
 
 
 def _freshness_lines(report: StatusReport) -> list[ScreenLine]:
+    # The session answer the dashboard's own session line renders (`_market_session_lines`
+    # reads the same `report.market_session`): closed AND still inside its trust window
+    # (`defused`) mutes the staleness colour, so the cells and the line cannot disagree
+    # about the same weekend. Anything else -- open, unreadable clock, an expired record --
+    # keeps the ordinary warn.
+    market_closed = (
+        report.market_session.state == "closed" and report.market_session.defused
+    )
     lines: list[ScreenLine] = [ScreenLine("data freshness:", "normal")]
     for f in report.data_freshness:
-        style = _freshness_style(f.granularity, f.age_sec)
+        style = _freshness_style(f.granularity, f.age_sec, market_closed=market_closed)
         if f.last_ts is None:
             lines.append(ScreenLine(f"  {f.product_id}: no data", style))
         else:
@@ -437,6 +497,7 @@ def build_screen(
     lines: list[ScreenLine] = []
     lines.extend(_title_lines(report, now_ts))
     lines.extend(_kill_switch_lines(report))
+    lines.extend(_market_session_lines(report))
     lines.extend(_autonomy_lines(report))
     lines.append(_blank())
     lines.extend(_equity_lines(report))

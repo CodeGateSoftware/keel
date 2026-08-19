@@ -42,6 +42,7 @@ from keel.commands.insights import (
 )
 from keel.commands.status import (
     AutonomyStatus,
+    MarketSessionStatus,
     OpenPositionStatus,
     ProductFreshness,
     RuleSummary,
@@ -653,6 +654,53 @@ def test_rail17_expired_line_names_the_halt_and_the_fix() -> None:
     )
 
 
+# -- market session (FR-9) -----------------------------------------------------------------------
+#
+# The TUI reuses `render_human`'s exact session text (the `_rail17_line` discipline: two
+# renderings of one state can never disagree). Unlike rail 17 there is NO paper-mode carve
+# out: the session gate skips PAPER cycles too, so the same line is truthful in every mode.
+
+
+def test_no_session_record_renders_no_session_line() -> None:
+    """Crypto unchanged: a 24/7 venue never writes the state keys, so the dashboard does
+    not grow a line that would only ever say 'open'."""
+    lines = build_screen(_base_report(), NOW_TS)
+    assert not any(line.text.startswith("market session") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_style"),
+    [
+        ("open", "ok"),
+        ("closed", "muted"),
+        ("clock_unavailable", "warn"),
+    ],
+    ids=["open", "closed", "clock-unavailable"],
+)
+def test_session_line_styles_expected_severity(state: str, expected_style: str) -> None:
+    """A closed market is an EXPECTED state (every weekend) -- muted, never an alert, or
+    the dashboard would train its operator to ignore colour. An unreadable clock is a
+    degraded read worth a warn; an open market is simply ok."""
+    report = _base_report(
+        market_session=MarketSessionStatus(state=state, recorded_ts=NOW_TS - 60)
+    )
+    lines = build_screen(report, NOW_TS)
+    session_line = next(line for line in lines if line.text.startswith("market session"))
+    assert session_line.style == expected_style
+
+
+def test_session_line_sits_directly_under_the_kill_switch() -> None:
+    report = _base_report(
+        market_session=MarketSessionStatus(state="closed", recorded_ts=NOW_TS - 60)
+    )
+    lines = build_screen(report, NOW_TS)
+    kill_at = next(i for i, line in enumerate(lines) if line.text.startswith("kill_switch"))
+    session_at = next(
+        i for i, line in enumerate(lines) if line.text.startswith("market session")
+    )
+    assert session_at == kill_at + 1
+
+
 def test_autonomy_live_is_alert_style() -> None:
     autonomy = AutonomyStatus(
         live=True, autonomous=True, autonomous_until=None, updated_ts=NOW_TS, profile_readable=True
@@ -717,6 +765,61 @@ def test_bracketless_position_has_warn_line() -> None:
 )
 def test_freshness_style(granularity: str | None, age_sec: int | None, expected: str) -> None:
     assert _freshness_style(granularity, age_sec) == expected
+
+
+def test_freshness_style_mutes_the_staleness_colour_under_a_closed_market() -> None:
+    """`market_closed` mutes only the AGE-based warn: a behind series during a (still
+    trusted) closure is the expected weekend shape. Fresh stays ok, and the no-data /
+    unknown-granularity cells keep their warn -- a closed venue still serves history, so a
+    cold cache is a pipeline problem, not a session artifact (the `fetch --check` rule)."""
+    assert _freshness_style("ONE_HOUR", 3600 * 3, market_closed=True) == "muted"
+    assert _freshness_style("ONE_HOUR", 60, market_closed=True) == "ok"
+    assert _freshness_style(None, None, market_closed=True) == "warn"
+    assert _freshness_style("NOT_A_GRANULARITY", 60, market_closed=True) == "warn"
+
+
+def test_freshness_cells_render_muted_not_warn_while_the_market_is_closed() -> None:
+    """Finding: `_freshness_style` painted warn for age > 2x period even while the
+    dashboard's own session line said CLOSED -- two parts of one screen disagreeing about
+    the same weekend. The session record is the source of truth: closed AND inside its
+    trust window -> the behind series' cell is muted, like the session line itself."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=True
+        ),
+        data_freshness=[ProductFreshness("BTC-USD", "ONE_HOUR", NOW_TS - 4 * 3600, 4 * 3600)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  BTC-USD"))
+    assert freshness_line.style == "muted"
+
+
+def test_freshness_cells_still_warn_once_the_closed_record_is_stale() -> None:
+    """`defused=False` (record outside its trust window) means the closure no longer
+    vouches for the quiet -- the staleness colour comes back with the alert."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=False
+        ),
+        data_freshness=[ProductFreshness("BTC-USD", "ONE_HOUR", NOW_TS - 4 * 3600, 4 * 3600)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  BTC-USD"))
+    assert freshness_line.style == "warn"
+
+
+def test_no_data_freshness_cells_still_warn_while_the_market_is_closed() -> None:
+    """The `fetch --check` rule, carried into colour: MISSING stays actionable when closed
+    because a closed venue still serves history -- so 'no data' keeps the warning."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=True
+        ),
+        data_freshness=[ProductFreshness("ETH-USD", None, None, None)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  ETH-USD"))
+    assert freshness_line.style == "warn"
 
 
 # -- render_plain -----------------------------------------------------------------------------

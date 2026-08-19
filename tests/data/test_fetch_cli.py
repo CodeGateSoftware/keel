@@ -218,6 +218,247 @@ def test_fetch_calls_ensure_history_when_stale(tmp_path, valid_config_path, monk
     assert years == 5
 
 
+# -- market_closed: a closed venue is not a stale feed (FR-9) ---------------------------------
+#
+# The session answer is RECORDED by the agent cycle (the one component with a broker) into
+# `agent_state`; `--check` stays offline by reading that record. A stale series while the
+# record says closed is the expected weekend state: displayed as CLOSED, not counted by the
+# exit code. Missing series still alert (a closed venue serves history), and a record older
+# than the feed-heartbeat window (`interval_sec * FEED_STALENESS_CYCLES`, the same trust
+# window rail 12 gives the feed) is ignored, so a dead agent cannot silence the alerts.
+
+
+def _record_session(repo: Repository, state: str, *, age_sec: int = 0) -> None:
+    repo.set_state("market_session", state)
+    repo.set_state("market_session_ts", int(time.time()) - age_sec)
+
+
+def _seed_all_stale(repo: Repository, assets: tuple[str, ...] = _ASSETS) -> None:
+    """Every configured granularity PRESENT but 40 bars behind -- stale with nothing
+    missing, the shape a closed equities venue actually leaves behind (a weekend where the
+    bars simply stopped, not a cache that was never warmed)."""
+    now = int(time.time())
+    series = (
+        (_DAY, Granularity.ONE_DAY),
+        (_HOUR, Granularity.ONE_HOUR),
+        (_FIFTEEN, Granularity.FIFTEEN_MINUTE),
+    )
+    for asset in assets:
+        product = f"{asset}-USD"
+        for step, granularity in series:
+            last = (now // step) * step - 40 * step
+            _seed(repo, product, granularity, [last - i * step for i in range(30)])
+
+
+def test_check_exits_zero_when_stale_only_because_the_market_is_closed(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The FR-9 promise, at the operator surface: a weekend must not page anyone. Series
+    that are present but behind exit zero once the recorded venue clock says closed -- and
+    the display says WHY, so the quiet is legible rather than suspicious."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "CLOSED" in result.output
+    assert "STALE" not in result.output
+    assert "missing or stale" not in result.output
+
+
+def test_check_still_alerts_when_the_closed_record_has_gone_stale(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The record is trusted only for the feed-heartbeat window (`interval_sec` 900 x
+    `FEED_STALENESS_CYCLES` 3 = 45 minutes here): an agent that died Friday night must not
+    silence Saturday's staleness alerts with its last reading."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed", age_sec=10 * 3600)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
+def test_check_still_alerts_on_missing_even_when_the_market_is_closed(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A closed venue still serves HISTORICAL bars, so a cache with nothing in it is a cold
+    pipeline, not a session artifact -- it must keep alerting."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)  # migrated but empty
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "MISSING" in result.output
+
+
+def test_check_does_not_defuse_staleness_on_an_unreadable_clock(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """Fail-closed for trading, fail-LOUD for alerting: a recorded clock_unavailable must
+    not read as closed -- the venue state is unknown, and suppressing the staleness alert on
+    an unknown clock would hide exactly the outage the clock failure itself hints at."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "clock_unavailable")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
+# -- the trust window's exact boundary (review finding on #385) --------------------------------
+#
+# The window is `interval_sec * FEED_STALENESS_CYCLES` (900 x 3 = 45 minutes for the fixture
+# config). Its edges are load-bearing for the whole "a dead agent cannot silence the alerts"
+# promise: one second inside the window the weekend is still defused, one second outside it
+# the alert fires. Pinned with a frozen clock so the boundary cannot drift with real time.
+
+_WINDOW_SEC = 900 * 3  # the fixture config's interval x FEED_STALENESS_CYCLES
+
+
+def _record_session_at(repo: Repository, state: str, ts: int) -> None:
+    """`_record_session` for the frozen-clock tests: stamp the record at an explicit ts."""
+    repo.set_state("market_session", state)
+    repo.set_state("market_session_ts", ts)
+
+
+def test_a_record_exactly_at_the_window_edge_still_defuses(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """age == window is INSIDE the trust window (`<=`, matching rail 12's own staleness
+    comparison): a record refreshed exactly one window ago is the newest reading a
+    slow-cycling-but-alive deployment can have."""
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session_at(repo, "closed", _NOW - _WINDOW_SEC)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "CLOSED" in result.output
+
+
+def test_a_record_one_second_past_the_window_no_longer_defuses(
+    tmp_path, valid_config_path, monkeypatch
+):
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session_at(repo, "closed", _NOW - _WINDOW_SEC - 1)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
+def test_a_fresh_record_with_a_nonzero_age_still_defuses(tmp_path, valid_config_path, monkeypatch):
+    """Age zero is not a special case: a record written a minute ago by the last cycle is
+    exactly the healthy weekend shape."""
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session_at(repo, "closed", _NOW - 60)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "CLOSED" in result.output
+
+
+def test_an_unparseable_recorded_ts_does_not_defuse(tmp_path, valid_config_path, monkeypatch):
+    """The junk branch of `recorded_market_closed`: a closed state whose stamp is not an
+    int is a value nobody vouches for -- alerts resume rather than trusting it."""
+    _no_network(monkeypatch)
+    monkeypatch.setattr(cli_module, "time", _FrozenClock(_NOW))
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", "not-a-timestamp")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
+# -- the summary lines must be truthful while closed and behind (review finding on #385) ---------
+
+
+def test_check_summary_names_the_closed_market_when_staleness_is_defused(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """Every series is behind and the closed record explains it: the closing line must SAY
+    so, not claim a plain 'all series current' (or the older 'all series actionable') --
+    the quiet has to be legible, which is the whole point of the summary."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "market closed -- staleness does not alert" in result.output
+    assert "all series actionable" not in result.output
+
+
+def test_plain_fetch_does_not_claim_all_series_current_while_closed_and_behind(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A plain `keel fetch` on a closed weekend skips the network (nothing can fetch bars a
+    shut venue is not minting) -- but it must not print 'all series current -- nothing to
+    fetch' over series that are 40 bars behind. The skip is kept; the wording tells the
+    truth about why."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "all series current -- nothing to fetch" not in result.output
+    assert "market closed" in result.output
+    assert "nothing to fetch" in result.output  # the skip itself is unchanged
+
+
 # -- gap repair via the CLI ---------------------------------------------------
 
 

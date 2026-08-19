@@ -14,7 +14,14 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_broker_coinbase import CoinbaseAdapter
 from keel_core.types import Candle, Granularity, Side
 
@@ -133,6 +140,16 @@ def test_capabilities_declare_coinbase() -> None:
     assert caps.supports_native_preview and not caps.synthesizes_preview
     assert caps.supports_fee_summary
     assert caps.can_preview
+
+
+def test_coinbase_is_not_session_bound_and_answers_open_without_a_transport() -> None:
+    """Crypto trades 24/7, so the venue declares `session_bound=False` and the clock answers
+    OPEN as a constant. Constructed with NO transport: the proof that answering the clock for
+    a 24/7 venue touches no network -- a clock call here would raise RuntimeError (the
+    adapter's own "constructed without a transport" guard), so this passing IS the no-call
+    guarantee (FR-9: crypto venues are always open)."""
+    assert CoinbaseAdapter().capabilities().session_bound is False
+    assert CoinbaseAdapter().market_clock() is SessionState.OPEN
 
 
 def test_get_candles_returns_ascending_domain_candles() -> None:

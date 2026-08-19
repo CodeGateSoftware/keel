@@ -5,8 +5,11 @@ the `live` rules (`repo.get_rules("live")` -> real `Rule` instances, `RULE_REGIS
 `strategy.engine.evaluate` them for ENTER `Signal`s, drive EXIT `Signal`s off currently-held
 positions, and run every signal through `execution.executor.execute` (confirm|autonomous, from
 `config.auto_trade.mode`) -- respecting the kill-switch (`repo.get_state("kill_switch")`)
-throughout. `loop()` is the scheduled wrapper: call `run_once` every `interval_sec` until
-`stop_flag()` returns `True`.
+throughout, and gated before any of that by the venue's market clock for session-bound venues
+(FR-9: a closed equities market skips the cycle, it is not a stale feed). The clock answer is
+read and recorded FIRST, before either gate can return, so even a halted cycle keeps the
+recording fresh for the broker-free surfaces. `loop()` is the
+scheduled wrapper: call `run_once` every `interval_sec` until `stop_flag()` returns `True`.
 
 **This closes the Phase-2 gap** `strategy/engine.py`'s own docstring calls out: `evaluate()`
 only ever emits ENTER signals (rules + read-only market data, no notion of what's currently
@@ -62,6 +65,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
 
+from keel_broker_api.results import SessionState
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
@@ -761,6 +765,205 @@ def _close_tranches(
         repo.close_position(position["id"], closed_at=now_ts)
 
 
+# -- venue session (FR-9: a closed market is not a stale feed) --------------------------------
+
+#: `agent_state` key PREFIXES the cycle writes each run when (and only when) the broker is a
+#: session-bound port adapter. The full keys are venue-namespaced via `market_session_key`:
+#: `market_session:{venue}` / `market_session_ts:{venue}` / `market_session_interval_sec:
+#: {venue}` -- one pair per venue, so two deployments sharing a repo cannot clobber or
+#: impersonate each other's clock, and each carries its OWN trust window (the interval that
+#: deployment actually cycles at). The broker-free surfaces (`fetch --check`, `status`, the
+#: TUI) read this recording instead of making a clock call of their own -- the same shape as
+#: the `last_feed_ts` heartbeat: the one component holding a broker records, everyone else
+#: reads. A 24/7 venue (or a pre-port broker) writes NOTHING, so every existing crypto
+#: deployment keeps byte-identical state and output. A session-bound broker that declares no
+#: `venue` in its capabilities records into the un-namespaced legacy keys -- every real
+#: `BrokerCapabilities` carries `venue`, so that slot is the anonymous exception, not a
+#: second global.
+MARKET_SESSION_KEY = "market_session"
+MARKET_SESSION_TS_KEY = "market_session_ts"
+MARKET_SESSION_INTERVAL_KEY = "market_session_interval_sec"
+
+
+def market_session_key(venue: str) -> str:
+    """The state key for `venue`'s recorded session: `market_session:{venue}`, or the legacy
+    un-namespaced `market_session` for the anonymous slot (see the prefix docs above)."""
+    return f"{MARKET_SESSION_KEY}:{venue}" if venue else MARKET_SESSION_KEY
+
+
+def market_session_ts_key(venue: str) -> str:
+    """`market_session_key`'s stamp twin, same namespacing rule."""
+    return f"{MARKET_SESSION_TS_KEY}:{venue}" if venue else MARKET_SESSION_TS_KEY
+
+
+def market_session_interval_key(venue: str) -> str:
+    """The cycle interval the record was written at, same namespacing rule -- the trust
+    window is derived from THIS value (see `recorded_market_closed`), not from whatever
+    config the reading surface happens to be holding."""
+    return f"{MARKET_SESSION_INTERVAL_KEY}:{venue}" if venue else MARKET_SESSION_INTERVAL_KEY
+
+
+def recorded_session_venues(repo: Repository) -> list[str]:
+    """Every venue with a session record in this repo: the anonymous legacy slot first, then
+    each `market_session:<venue>` key (discovered by prefix -- the reading surfaces hold no
+    broker to ask for a venue id; see `Repository.get_state_keys`)."""
+    prefix = f"{MARKET_SESSION_KEY}:"
+    venues = [""]
+    venues.extend(
+        key[len(prefix):] for key in repo.get_state_keys(prefix) if len(key) > len(prefix)
+    )
+    return venues
+
+
+def _effective_interval_sec(config: Config, interval_sec: float | None) -> int:
+    """The cycle interval a session record will be trusted for: the one the caller ACTUALLY
+    cycles at (`loop`'s / `monitor --loop`'s effective interval, which `--interval` can
+    override away from the config's), falling back to the config value when absent or
+    degenerate -- a 0-interval loop is a test fiction, and recording it would hand the
+    record a zero-length trust window."""
+    if interval_sec is not None and interval_sec > 0:
+        return int(interval_sec)
+    return config.auto_trade.interval_sec
+
+
+def _venue_session(broker: Any) -> tuple[str, SessionState, bool]:
+    """The venue's identity, session-boundness and its clock answer, fail-closed.
+
+    Returns `(venue, state, session_bound)`. `venue` comes from the same
+    `capabilities()` read as `session_bound` (empty for a capabilities-less broker, which
+    never records anyway). `session_bound=False` is also the answer for a broker that does
+    not implement the broker port at all (`keel/data/cb_client.py`'s `CoinbaseClient`, the
+    live path until the broker-port migration lands): a 24/7 posture with no clock to
+    consult, which keeps every existing crypto behavior byte-identical.
+
+    **Fail-closed** (FR-9): a session-bound broker whose clock RAISES -- a third-party
+    adapter violating the port's "answer `CLOCK_UNAVAILABLE`, never raise" -- is treated as
+    `CLOCK_UNAVAILABLE` here too, and so is one whose `market_clock()` returns anything that
+    is not a `SessionState` (a `None`, a dict, a bool): the port's answer type is part of
+    its contract, and `session.value` downstream must never be an `AttributeError` that
+    kills the loop. The cycle must skip, not crash, and must never trade on an unknown
+    session state. A `capabilities()` that itself raises reads as not-bound for the same
+    reason the portless broker does: nothing about such a broker is known well enough
+    to gate on, and its first network call will fail loudly through the ordinary paths.
+    """
+    caps_fn = getattr(broker, "capabilities", None)
+    if caps_fn is None:
+        return "", SessionState.OPEN, False
+    try:
+        caps = caps_fn()
+        session_bound = bool(caps.session_bound)
+        venue = str(getattr(caps, "venue", "") or "")
+    except Exception:
+        return "", SessionState.OPEN, False
+    if not session_bound:
+        return venue, SessionState.OPEN, False
+    try:
+        session = broker.market_clock()
+    except Exception:
+        return venue, SessionState.CLOCK_UNAVAILABLE, True
+    if not isinstance(session, SessionState):
+        return venue, SessionState.CLOCK_UNAVAILABLE, True
+    return venue, session, True
+
+
+def record_market_session(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
+    *,
+    interval_sec: float | None = None,
+) -> tuple[SessionState, bool]:
+    """Read the venue's session through `_venue_session` and record it -- state, stamp, and
+    the cycle interval to trust it for -- under the venue's own namespaced keys.
+
+    THE one shared recording step for every loop that holds a broker (the agent cycle here,
+    `keel monitor --loop` in `keel/cli.py`), so the broker-free surfaces (`fetch --check`,
+    `status`, the TUI) read one recording no matter which loop is cycling. A 24/7 venue
+    records nothing. Returns `(state, session_bound)` so the caller can gate on the answer
+    it just recorded.
+
+    `interval_sec` is the interval THIS caller actually cycles at (`loop`'s effective
+    interval, `--interval` override included); absent/degenerate values fall back to the
+    config's (see `_effective_interval_sec`) -- the trust window must describe the
+    deployment's real cadence, or a record written every 2h under a 15-minute config window
+    false-positives the weekend between cycles.
+    """
+    venue, session, session_bound = _venue_session(broker)
+    if session_bound:
+        repo.set_state(market_session_key(venue), session.value)
+        repo.set_state(market_session_ts_key(venue), now_ts)
+        repo.set_state(
+            market_session_interval_key(venue), _effective_interval_sec(config, interval_sec)
+        )
+    return session, session_bound
+
+
+def recorded_market_closed(
+    repo: Repository, config: Config, now_ts: int, venue: str | None = None
+) -> bool:
+    """Read the cycle's recorded venue clock and say whether staleness is defused (FR-9).
+
+    Pure repo/config reads -- this is the seam that lets `fetch --check` stay offline while
+    honoring the venue's own session answer: the agent cycle recorded it, this reads it.
+
+    `venue` scopes the read. A NAMED venue answers only from its own key pair, so one
+    venue's CLOSED never defuses another venue's staleness -- the shared-repo hazard this
+    signature exists to close. `None` (the CLI surfaces' default) answers for this
+    deployment's data as a whole: a deployment has one venue, and its broker-free surfaces
+    hold no broker to ask which, so every recorded slot is consulted (see
+    `recorded_session_venues`).
+
+    **Pre-close staleness attenuation, stated plainly.** Staleness that BEGAN during
+    trading -- a feed break in the hour before the close -- is silenced the moment a closed
+    record exists, not just staleness that starts after it: `closed` defuses the alert
+    without asking when the staleness started. That is a deliberate trade-off: the
+    alternative (letting pre-close breaks keep alerting through the weekend) re-introduces
+    exactly the weekend pages FR-9 exists to stop, and the silence is BOUNDED -- when the
+    market reopens, the record either refreshes to `open` or expires out of the trust
+    window below, and the still-pending staleness re-alerts. Closures postpone the alert;
+    they never cancel it.
+
+    Three honest limits, all deliberate:
+
+    * Only a recorded `closed` defuses anything. `clock_unavailable` is fail-closed for
+      TRADING but fail-LOUD for ALERTING -- suppressing a staleness alert on an unknown
+      clock would hide exactly the outage the unreadable clock hints at.
+    * The recording is trusted only for the feed-heartbeat window (`FEED_STALENESS_CYCLES`
+      cycles, rail 12's own constant) of the RECORDED interval -- the cadence the writing
+      deployment actually loops at, which `keel agent --loop --interval N` can set away
+      from the config's. A recording older than that means the agent that wrote it has
+      stopped cycling, and its last reading must not silence staleness alerts forever:
+      alerts resume, which is also how the dead agent surfaces. A healthy deployment
+      re-records every cycle, so on a real weekend the recording is always fresh. Records
+      that predate the recorded interval fall back to `config.auto_trade.interval_sec`.
+    * A stamp that is not an int never defuses -- no alert is silenced off a value nobody
+      vouches for.
+    """
+    slots = [venue] if venue is not None else recorded_session_venues(repo)
+    return any(_slot_market_closed(repo, config, now_ts, slot) for slot in slots)
+
+
+def _slot_market_closed(
+    repo: Repository, config: Config, now_ts: int, venue: str
+) -> bool:
+    """`recorded_market_closed` for one venue slot -- see that function for the policy."""
+    if repo.get_state(market_session_key(venue)) != SessionState.CLOSED.value:
+        return False
+    recorded_ts = repo.get_state(market_session_ts_key(venue))
+    if not isinstance(recorded_ts, int) or isinstance(recorded_ts, bool):
+        return False  # unreadable stamp: do not defuse alerts off a value nobody vouches for
+    recorded_interval = repo.get_state(market_session_interval_key(venue))
+    interval_sec = (
+        recorded_interval
+        if isinstance(recorded_interval, int)
+        and not isinstance(recorded_interval, bool)
+        and recorded_interval > 0
+        else config.auto_trade.interval_sec
+    )
+    return now_ts - recorded_ts <= interval_sec * FEED_STALENESS_CYCLES
+
+
 # -- one cycle -----------------------------------------------------------------------------
 
 
@@ -831,24 +1034,65 @@ def run_once(
     config: Config,
     now_ts: int,
     confirm_fn: executor.ConfirmFn | None = None,
+    interval_sec: float | None = None,
 ) -> LoopResult:
-    """One agent cycle: poll -> (kill-switch / stale-data gates) -> evaluate -> exits -> entries.
+    """One agent cycle: (kill-switch / market-session gates) -> poll -> evaluate -> exits
+    -> entries.
 
-    The kill-switch is checked *before* anything else (no poll, no evaluation, no orders) --
+    The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
+    session-bound venue's clock answer under its own namespaced keys, with the interval
+    this deployment actually cycles at (`interval_sec`, which `loop` threads in; the config
+    value when absent). Recording on every path is load-bearing: the kill-switch skip and
+    the session skip both return BEFORE anything else, and a recording that stopped at
+    either return would leave a halted-but-healthy deployment unable to track the venue
+    clock -- a weekend under a kill switch would false-positive STALE, and a Friday-pre-close
+    halt would freeze `market_session="open"` (which `status` would render as "open (venue
+    clock)") all weekend. The clock read is not a poll, an evaluation or an order; the halt
+    still owns the skip reason.
+
+    The kill-switch is checked next (no poll, no evaluation, no orders) --
     `repo.get_state("kill_switch", default=True)` fails closed exactly like `guards.check`'s
-    rail 12, so an agent that has never been explicitly `resume`d never trades. Per-product
-    staleness (`market_feed.is_fresh`) is checked after polling and only skips *that* product;
-    the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
+    rail 12, so an agent that has never been explicitly `resume`d never trades. The venue
+    session gate (FR-9) sits directly after it and skips the same way: a session-bound venue
+    whose clock says closed (or cannot be read -- fail-closed) is a closed market, not a
+    stale feed, so the cycle does nothing rather than poll a shut venue and log
+    staleness-gated noise. The session answer is recorded first either way, so the
+    broker-free surfaces (`fetch --check`, `status`) can render it without a clock call.
+    Per-product staleness (`market_feed.is_fresh`) is checked after polling and only skips
+    *that* product; the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
     """
     cycle_token = bind_cycle(new_cycle_id())
     try:
         log_event(logger, logging.INFO, "agent.cycle_start", now_ts=now_ts)
+
+        # FR-9's session read + recording, BEFORE any gate can return -- see the docstring.
+        # `market_feed.poll_once` is never reached for a closed venue, so this clock call is
+        # the one network touch a skipped cycle makes, and only for session-bound venues.
+        session, session_bound = record_market_session(
+            broker, repo, config, now_ts, interval_sec=interval_sec
+        )
 
         if repo.get_state("kill_switch", default=True):
             log_event(logger, logging.INFO, "agent.cycle_skipped", reason="kill_switch")
             return LoopResult(
                 ts=now_ts, skipped=True, skip_reason="kill_switch", mode=None, polled=0
             )
+
+        # FR-9's session gate, mirroring the kill-switch skip exactly (no poll, no
+        # evaluation, no orders). Two distinct reasons, because "the venue says shut" and
+        # "the clock could not be read" are different operator facts: a weekend is expected
+        # and logged at INFO, an unreadable clock is a degraded read worth a WARNING.
+        if session_bound and session is not SessionState.OPEN:
+            reason = (
+                "market_closed" if session is SessionState.CLOSED else "market_clock_unavailable"
+            )
+            log_event(
+                logger,
+                logging.INFO if session is SessionState.CLOSED else logging.WARNING,
+                "agent.cycle_skipped",
+                reason=reason,
+            )
+            return LoopResult(ts=now_ts, skipped=True, skip_reason=reason, mode=None, polled=0)
 
         # Which rules run depends on the MODE, because the lifecycle is
         # candidate -> paper -> live (`promotion._PROMOTE_NEXT`). Paper mode exists to prove
@@ -1257,11 +1501,23 @@ def loop(
     already `True` runs zero cycles. Tests drive this deterministically with a call-counting
     closure (e.g. "stop after N cycles") and `interval_sec=0` so the loop doesn't actually
     sleep.
+
+    `interval_sec` is also threaded into each cycle's session record (see
+    `run_once`/`record_market_session`): THIS loop's cadence is the one the record's trust
+    window must describe, `--interval` overrides included -- a record trusted for the
+    config's 15 minutes would expire between 2-hour cycles and false-positive the weekend.
     """
     results: list[LoopResult] = []
     while not stop_flag():
         results.append(
-            run_once(broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn)
+            run_once(
+                broker,
+                repo,
+                config,
+                now_ts=int(time.time()),
+                confirm_fn=confirm_fn,
+                interval_sec=interval_sec,
+            )
         )
         if interval_sec:
             time.sleep(interval_sec)

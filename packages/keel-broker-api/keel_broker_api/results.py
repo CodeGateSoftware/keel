@@ -10,8 +10,28 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
 
 from keel_core.types import Side
+
+
+class SessionState(str, Enum):
+    """The venue's market clock, as `market_clock()` answers it (FR-9).
+
+    Equities are not 24/7: a weekend or holiday is "market closed", never "feed stale", and
+    the only honest source for that answer is the venue's own clock/calendar endpoints -- a
+    locally maintained calendar drifts. Three members, not two, because "the clock could not
+    be read" is a different fact from "the venue says closed": `CLOCK_UNAVAILABLE` is the
+    fail-closed answer a session-bound adapter returns when the clock read fails, so a caller
+    can log WHY it is treating the session as shut rather than guessing.
+
+    Venues that are not session-bound never produce anything but `OPEN`: a 24/7 venue has no
+    clock to read, and answering with a constant keeps crypto adapters network-free here.
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+    CLOCK_UNAVAILABLE = "clock_unavailable"
 
 
 @dataclass(frozen=True)
@@ -91,4 +111,4 @@ class FeeSummary:
             raise ValueError(f"volume_window must be one of {sorted(allowed)}")
 
 
-__all__ = ["Balance", "FeeSummary", "OrderStatus", "PlaceResult", "Preview"]
+__all__ = ["Balance", "FeeSummary", "OrderStatus", "PlaceResult", "Preview", "SessionState"]

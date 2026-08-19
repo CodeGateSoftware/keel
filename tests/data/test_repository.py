@@ -238,6 +238,29 @@ def test_set_state_overwrites_existing_key(repo):
     assert repo.get_state("kill_switch") is True
 
 
+def test_get_state_keys_discovers_a_prefix_without_wildcard_semantics(repo):
+    """The venue-namespaced session records are discovered by prefix (surfaces that hold no
+    broker to ask which venue they serve). `_` in a prefix must match ITSELF -- `LIKE`
+    wildcard semantics would silently over-match."""
+    repo.set_state("market_session:alpaca", "closed")
+    repo.set_state("market_session:nyse", "open")
+    repo.set_state("market_session_ts:alpaca", 123)
+    repo.set_state("market_session", "closed")  # the legacy un-namespaced slot
+    repo.set_state("kill_switch", False)
+
+    assert repo.get_state_keys("market_session:") == [
+        "market_session:alpaca",
+        "market_session:nyse",
+    ]
+    assert repo.get_state_keys("market_session") == [
+        "market_session",
+        "market_session:alpaca",
+        "market_session:nyse",
+        "market_session_ts:alpaca",
+    ]
+    assert repo.get_state_keys("no_such_prefix:") == []
+
+
 # -- rules -------------------------------------------------------------------
 
 

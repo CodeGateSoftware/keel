@@ -13,11 +13,15 @@ it's modeled on -- against an in-memory `Repository` (`connect(":memory:")`).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from keel_broker_api.results import SessionState
+from keel_core.telemetry import _FIELDS_ATTR
 
 from keel import agent
 from keel.agent import LoopResult, _build_rule, loop, run_once
@@ -273,6 +277,357 @@ def test_kill_switch_unset_defaults_to_engaged_fails_closed(repo):
 
     assert result.skipped is True
     assert result.skip_reason == "kill_switch"
+
+
+# -- run_once: session awareness (FR-9: a closed venue is not a stale feed) --------------------
+
+
+def _skip_events(caplog) -> list[tuple[str, dict]]:
+    """`(event, fields)` for every `agent.cycle_skipped` record, via `telemetry`'s own
+    structured-fields attribute -- the same read `tests/execution/test_executor.py` uses."""
+    return [
+        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        for record in caplog.records
+        if record.getMessage() == "agent.cycle_skipped"
+    ]
+
+
+class _SessionClockBroker(FakeBroker):
+    """A `FakeBroker` that also answers the broker PORT's session surface.
+
+    `capabilities()` duck-types the fields the engine reads (`session_bound`, and `venue`
+    when the test wants the namespaced recording): the live path's `CoinbaseClient` has no
+    `capabilities()` at all, and the engine must treat that broker as 24/7 rather than
+    crash -- the tests below exercise both sides of that split. `venue=""` (the default)
+    is the anonymous slot: a session-bound broker that declares no venue records into the
+    legacy un-namespaced keys, exactly as every real `BrokerCapabilities.venue`-carrying
+    adapter's negative space does not.
+    """
+
+    def __init__(self, clock_answer: Any, series=None, venue: str = "") -> None:
+        super().__init__(series=series)
+        self._clock_answer = clock_answer
+        self._venue = venue
+        self.clock_calls = 0
+
+    def capabilities(self) -> Any:
+        return SimpleNamespace(session_bound=True, venue=self._venue)
+
+    def market_clock(self) -> Any:
+        self.clock_calls += 1
+        if isinstance(self._clock_answer, Exception):
+            raise self._clock_answer
+        return self._clock_answer
+
+
+def test_closed_market_skips_the_cycle_like_the_kill_switch(repo, caplog):
+    """FR-9: a weekend or holiday on a session-bound venue reads "market closed", never
+    "feed stale". The skip mirrors the kill-switch skip exactly -- no poll, no evaluation,
+    no orders -- so a closed venue can neither log staleness-gated noise nor hammer the feed."""
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = _SessionClockBroker(
+        SessionState.CLOSED, series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]}
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_closed"
+    assert result.mode is None
+    assert result.polled == 0
+    assert broker.get_candles_calls == []  # no feed polling while closed
+    assert broker.place_calls == []  # and no evaluation ever ran
+    assert _skip_events(caplog) == [("agent.cycle_skipped", {"reason": "market_closed"})]
+
+
+def test_the_closed_session_is_recorded_for_the_staleness_surfaces(repo):
+    """The cycle records the venue's session answer so the broker-free surfaces (`fetch
+    --check`, `status`, the TUI) can show "market closed" without a clock call of their own."""
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session") == "closed"
+    assert repo.get_state("market_session_ts") == 90_000
+
+
+def test_open_market_session_runs_the_cycle_exactly_as_today(repo):
+    """An open session changes nothing: the clock is consulted once, then the cycle proceeds
+    through its ordinary poll -> evaluate path, and the open answer is recorded too."""
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = _SessionClockBroker(
+        SessionState.OPEN, series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]}
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert result.skip_reason is None
+    assert broker.clock_calls == 1
+    assert broker.get_candles_calls  # polled as usual
+    assert repo.get_state("market_session") == "open"
+
+
+def test_a_24x7_broker_is_never_asked_its_clock_and_records_nothing(repo):
+    """Crypto unchanged, byte for byte: a broker without the port's session surface (the
+    live path's `CoinbaseClient` today) runs the cycle exactly as before, and no session
+    state is written -- so every broker-free surface renders what it rendered yesterday."""
+
+    class _NoPortBroker(FakeBroker):
+        """Deliberately no `capabilities()`/`market_clock()`: the pre-port broker shape."""
+
+    broker = _NoPortBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]})
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert broker.get_candles_calls  # the ordinary cycle ran
+    assert repo.get_state("market_session") is None
+    assert repo.get_state("market_session_ts") is None
+
+
+def test_a_port_broker_that_declares_24x7_is_never_asked_its_clock_either(repo):
+    """The other half of the 24/7 guarantee, at the engine seam: a broker that DOES answer
+    the port but declares `session_bound=False` (the crypto adapters) has no clock consulted
+    -- even one that would explode -- and records nothing."""
+
+    class _AlwaysOpenBroker(FakeBroker):
+        def capabilities(self) -> Any:
+            return SimpleNamespace(session_bound=False)
+
+        def market_clock(self) -> Any:
+            raise AssertionError("a 24/7 venue must never be asked for a clock")
+
+    broker = _AlwaysOpenBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]})
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert repo.get_state("market_session") is None
+
+
+def test_unreadable_clock_fails_closed_with_a_distinct_reason(repo, caplog):
+    """FR-9's fail-closed rule: a clock that cannot be read is TREATED as closed -- the
+    cycle skips and never crashes -- but the reason is DISTINCT from a venue that says
+    closed, because "we could not know" and "we know it is shut" are different facts for
+    an operator."""
+    broker = _SessionClockBroker(SessionState.CLOCK_UNAVAILABLE)
+
+    with caplog.at_level(logging.WARNING):
+        result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+    assert broker.get_candles_calls == []
+    assert repo.get_state("market_session") == "clock_unavailable"
+    assert _skip_events(caplog) == [
+        ("agent.cycle_skipped", {"reason": "market_clock_unavailable"})
+    ]
+
+
+def test_a_clock_that_raises_rather_than_answering_fails_closed(repo):
+    """A third-party adapter that RAISES instead of answering `CLOCK_UNAVAILABLE` (the port
+    says never do that) still fails closed here -- the engine never lets a clock read crash
+    the cycle."""
+    broker = _SessionClockBroker(RuntimeError("venue clock endpoint exploded"))
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+
+
+def test_kill_switch_still_outranks_a_closed_market(repo):
+    """The operator's halt still owns the SKIP REASON -- a closed market never masks an
+    engaged kill-switch in the logs. The clock IS now consulted (once) before that check,
+    so the session record stays fresh even while halted; see the recording-on-every-path
+    tests below for why that ordering is load-bearing."""
+    repo.set_state("kill_switch", True)
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "kill_switch"
+    assert broker.clock_calls == 1
+    assert repo.get_state("market_session") == "closed"
+
+
+# -- run_once: the session record survives every skip path (review finding on #385) --------------
+
+
+def test_a_halted_agent_still_records_and_refreshes_the_session(repo):
+    """The kill-switch return used to sit BEFORE the session gate, so a halted agent never
+    recorded or refreshed the session: weekends under a kill switch false-positived STALE,
+    and a Friday-pre-close halt froze `market_session="open"` for the whole weekend. The
+    session (and its ts) is now recorded first, on every path a cycle can return through."""
+    repo.set_state("kill_switch", True)
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    first = run_once(broker, repo, _config(), now_ts=90_000)
+    second = run_once(broker, repo, _config(), now_ts=140_000)
+
+    assert first.skip_reason == "kill_switch"  # the halt still owns the reason
+    assert second.skip_reason == "kill_switch"
+    assert repo.get_state("market_session") == "closed"
+    assert repo.get_state("market_session_ts") == 140_000  # refreshed, not frozen at 90_000
+
+
+def test_a_frozen_open_record_thaws_once_the_halted_agent_cycles_the_weekend(repo):
+    """The frozen-"open" weekend, end to end: the halt happened Friday pre-close, the last
+    record said open, and `status` rendered "market session: open (venue clock)" all
+    weekend. Once that stale record is outside its trust window, the (still-halted) agent's
+    next cycle re-records the venue's actual answer -- closed."""
+    repo.set_state("kill_switch", True)
+    repo.set_state("market_session", "open")
+    # Friday's record, now older than the trust window (config 50_000 x FEED_STALENESS_CYCLES 3).
+    repo.set_state("market_session_ts", 90_000)
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    saturday = 90_000 + 200_000
+    # Before the cycle, the expired open record defuses nothing -- the old code left it as
+    # the deployment's only answer all weekend ("open (venue clock)", staleness alerting or
+    # not, per whatever Friday froze).
+    assert agent.recorded_market_closed(repo, _config(), saturday) is False
+
+    result = run_once(broker, repo, _config(), now_ts=saturday)
+
+    assert result.skip_reason == "kill_switch"
+    # The cycle itself refreshed the venue's actual answer:
+    assert repo.get_state("market_session") == "closed"
+    assert repo.get_state("market_session_ts") == saturday
+
+
+# -- recorded_market_closed: venue namespacing + the trust window -------------------------------
+
+
+def test_the_record_is_namespaced_by_the_declared_venue(repo):
+    """A session-bound broker that declares a venue records under `market_session:{venue}`,
+    so two deployments sharing a repo cannot clobber (or impersonate) each other's clock."""
+    broker = _SessionClockBroker(SessionState.CLOSED, venue="alpaca")
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session:alpaca") == "closed"
+    assert repo.get_state("market_session_ts:alpaca") == 90_000
+    # The anonymous (legacy) slot stays untouched -- nothing impersonates it.
+    assert repo.get_state("market_session") is None
+
+
+def test_one_venues_closed_record_does_not_defuse_another_venue(repo):
+    """The shared-DB hazard, pinned at the seam that answers it: an equities agent's CLOSED
+    must silence only the equities venue's staleness -- a 24/7 deployment asking for its own
+    venue reads right through that record."""
+    now_ts = 90_000
+    repo.set_state("market_session:alpaca", "closed")
+    repo.set_state("market_session_ts:alpaca", now_ts)
+    config = _config()
+
+    assert agent.recorded_market_closed(repo, config, now_ts, venue="alpaca") is True
+    assert agent.recorded_market_closed(repo, config, now_ts, venue="coinbase") is False
+
+
+def test_two_venues_coexist_in_one_repo(repo):
+    """Namespacing is per-venue state, not a single shared pair: one repo can hold a closed
+    equities venue and an open one at the same time, and each venue's question gets its own
+    venue's answer."""
+    now_ts = 90_000
+    repo.set_state("market_session:alpaca", "closed")
+    repo.set_state("market_session_ts:alpaca", now_ts)
+    repo.set_state("market_session:nyse", "open")
+    repo.set_state("market_session_ts:nyse", now_ts)
+    config = _config()
+
+    assert repo.get_state("market_session:alpaca") == "closed"
+    assert repo.get_state("market_session:nyse") == "open"
+    assert agent.recorded_market_closed(repo, config, now_ts, venue="alpaca") is True
+    assert agent.recorded_market_closed(repo, config, now_ts, venue="nyse") is False
+
+
+def test_a_none_clock_answer_fails_closed_without_raising(repo):
+    """A third-party adapter returning None (or any non-`SessionState`) from
+    `market_clock()` used to raise `AttributeError` at `session.value` and kill the loop.
+    It is `CLOCK_UNAVAILABLE`: the same fail-closed skip, the same distinct reason, and the
+    degraded answer is still recorded."""
+    broker = _SessionClockBroker(None)
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+    assert repo.get_state("market_session") == "clock_unavailable"
+
+
+def test_the_trust_window_uses_the_recorded_cycle_interval_not_the_config_one(repo):
+    """`keel agent --loop --interval 7200` with a config interval of 900: the record is
+    trusted for the interval the deployment ACTUALLY cycles at, so a record sitting between
+    two long cycles (3h old -- long past the config-only 45-minute window) stays trusted
+    instead of false-positiving the weekend."""
+    config = _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=900))
+    now_ts = 90_000
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", now_ts - 10_800)  # 3h old
+    repo.set_state("market_session_interval_sec", 7_200)
+
+    assert agent.recorded_market_closed(repo, config, now_ts) is True
+
+
+def test_the_trust_window_falls_back_to_config_when_no_interval_was_recorded(repo):
+    """Records written before the interval was recorded alongside the session keep the
+    config-derived window -- the pre-existing behaviour, unchanged."""
+    config = _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=900))
+    now_ts = 90_000
+    repo.set_state("market_session", "closed")
+
+    repo.set_state("market_session_ts", now_ts - 2_700)  # exactly 900 x 3
+    assert agent.recorded_market_closed(repo, config, now_ts) is True
+    repo.set_state("market_session_ts", now_ts - 2_701)  # one second past it
+    assert agent.recorded_market_closed(repo, config, now_ts) is False
+
+
+def test_the_loop_threads_the_interval_it_actually_cycles_at_into_the_record(repo, monkeypatch):
+    """`loop` knows the effective interval (`--interval` override included); `run_once`
+    alone would only know the config's. The record carries the deployment's real cadence."""
+    config = _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=900))
+    broker = _SessionClockBroker(SessionState.CLOSED)
+    monkeypatch.setattr(agent.time, "sleep", lambda seconds: None)  # no real 2h sleep
+    cycles = [0]
+
+    def stop_flag() -> bool:
+        cycles[0] += 1
+        return cycles[0] > 1
+
+    loop(broker, repo, config, 7_200, stop_flag)
+
+    assert repo.get_state("market_session_interval_sec") == 7_200
+
+
+def test_staleness_that_began_before_the_close_is_attenuated_until_the_record_expires(repo):
+    """The deliberate trade-off `recorded_market_closed`'s docstring states: staleness that
+    begins DURING trading (a feed break before the close) is excused once the closed record
+    exists -- a bounded silence -- and re-alerts after the record expires post-reopen, when
+    the deployment that stopped re-recording can no longer vouch for the quiet."""
+    config = _config()  # interval 50_000 -> trust window 150_000
+    staleness_started = 90_000
+
+    # Break-before-close: the venue was still open, so nothing defuses the alert.
+    repo.set_state("market_session", "open")
+    repo.set_state("market_session_ts", staleness_started)
+    assert agent.recorded_market_closed(repo, config, staleness_started) is False
+
+    # The venue closes and the (healthy) agent records it: the pending staleness goes quiet,
+    # even though it predates the close.
+    repo.set_state("market_session", "closed")
+    repo.set_state("market_session_ts", staleness_started + 1_000)
+    repo.set_state("market_session_interval_sec", 50_000)
+    assert agent.recorded_market_closed(repo, config, staleness_started + 2_000) is True
+
+    # Post-reopen, the record has expired out of its trust window: the staleness re-alerts.
+    expired = staleness_started + 1_000 + 150_000 + 1
+    assert agent.recorded_market_closed(repo, config, expired) is False
 
 
 # -- run_once: the happy path (real merged Dca rule) -------------------------------------------

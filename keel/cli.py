@@ -77,7 +77,7 @@ from pathlib import Path
 from typing import Any
 
 import click
-from keel_broker_api.results import Preview
+from keel_broker_api.results import Preview, SessionState
 from keel_core.products import quote_currency_of
 
 from keel import agent
@@ -332,12 +332,17 @@ def _assess_products(
     now_ts: int,
     start_ts: int,
     tolerance_bars: int,
+    market_closed: bool = False,
 ) -> list[tuple[freshness_mod.Freshness, int]]:
     """Read-only sweep over every (product, granularity). No network.
 
     `granularities` is whatever the caller is keeping current -- `fetch` passes
     `config.market_data.granularities`, so the sweep judges exactly the series the warm step
     fetches and the agent polls.
+
+    `market_closed` (FR-9) is the recorded venue-clock answer (`agent.recorded_market_closed`)
+    threaded into every verdict, so a session-bound venue's weekend reads CLOSED rather than
+    STALE. Defaulted False: a 24/7 venue never records a session and keeps yesterday's verdicts.
 
     Returns `(freshness, unexplained_gaps)`, BOTH bounded to the same window starting at
     `start_ts`. That shared window is the point: `_print_freshness` subtracts the second from
@@ -355,7 +360,14 @@ def _assess_products(
             unexplained = repair_mod.unexplained_gap_count(
                 repo, product, granularity, start_ts
             )
-            out.append((freshness_mod.assess(info, now_ts, tolerance_bars), unexplained))
+            out.append(
+                (
+                    freshness_mod.assess(
+                        info, now_ts, tolerance_bars, market_closed=market_closed
+                    ),
+                    unexplained,
+                )
+            )
     return out
 
 
@@ -364,8 +376,16 @@ def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
         # A series can be BOTH stale and gapped. The state label reports the most urgent
         # condition, but the detail always carries BOTH numbers -- an earlier version showed
         # only the label and silently hid gaps behind staleness.
+        #
+        # A stale verdict under a closed market (FR-9) is its own state, ahead of plain
+        # STALE: the bars ARE behind, but the venue's clock explains why, and the label must
+        # say so rather than teach an operator to ignore STALE every weekend. MISSING stays
+        # MISSING even when closed -- a closed venue still serves history, so a cold cache
+        # remains the fetch pipeline's problem, not the calendar's.
         if row.missing:
             state = "MISSING"
+        elif row.stale and row.market_closed:
+            state = "CLOSED"
         elif row.stale:
             state = "STALE"
         elif row.gaps:
@@ -374,6 +394,13 @@ def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
             state = "ok"
         if row.missing:
             detail = "nothing cached"
+        elif row.stale and row.market_closed:
+            proven = row.gaps - unexplained
+            suffix = f" ({proven} proven absent at venue)" if proven else ""
+            detail = (
+                f"{row.bars_behind} bars behind, market closed -- not alerting, "
+                f"{row.gaps} internal gaps{suffix}"
+            )
         else:
             # No max(0, ...) clamp: `unexplained` comes from the same window-bounded read as
             # `row.gaps` (see `_assess_products`), so the subtraction is consistent by
@@ -465,7 +492,18 @@ def fetch(
     # an engine limit rather than a data choice (Issue #349).
     granularities = list(config.market_data.granularities)
 
-    before = _assess_products(repo, product_list, granularities, now_ts, start_ts, tolerance_bars)
+    # FR-9: the venue's session answer, as recorded by the last cycle of whatever loop is
+    # running (the agent, or `keel monitor --loop`). A closed session-bound venue defuses
+    # STALE (nothing can fetch bars a shut venue is not minting, and a weekend must not page
+    # an operator); see `agent.recorded_market_closed` for the trust window -- derived from
+    # the interval the recording deployment actually cycles at, config only as the fallback
+    # -- and the deliberate clock_unavailable/missing carve-outs. A 24/7 venue never records
+    # a session, so this is False and every verdict stays byte-identical.
+    market_closed = agent.recorded_market_closed(repo, config, now_ts)
+
+    before = _assess_products(
+        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
+    )
     click.echo(f"data cached in: {ctx.obj['db_path']}")
     _print_freshness(before)
 
@@ -488,19 +526,40 @@ def fetch(
             raise click.ClickException(
                 f"{unexplained} series have unexplained gaps -- run `keel fetch --repair-gaps`"
             )
+        # Truthful, not reassuring: series that ARE behind must not be called "current".
+        # When the closed record explains the staleness, the summary says so -- the quiet
+        # has to be legible, which is the whole point of a closing line (and the older
+        # "all series actionable" wording said the opposite of what it meant).
+        closed_explained = market_closed and any(r.stale for r, _ in before)
+        summary = (
+            "all series current or closed-explained"
+            if closed_explained
+            else "all series current"
+        )
         if unexplained:
             click.echo(
-                f"\nall series current. {unexplained} have UNEXPLAINED gaps -- run "
+                f"\n{summary}. {unexplained} have UNEXPLAINED gaps -- run "
                 "`keel fetch --repair-gaps` to probe them."
             )
+        elif closed_explained:
+            click.echo(f"\n{summary} (market closed -- staleness does not alert)")
         else:
-            click.echo("\nall series current")
+            click.echo(f"\n{summary}")
         return
 
     if not refresh and not repair_gaps and not freshness_mod.any_needs_fetch(
         [r for r, _ in before]
     ):
-        click.echo("\nall series current -- nothing to fetch")
+        # The no-network skip is deliberate (nothing a fetch does can produce bars a closed
+        # venue is not minting) -- but a behind series must not be called "current" to
+        # justify it. Name the closure instead.
+        if market_closed and any(r.stale for r, _ in before):
+            click.echo(
+                "\nmarket closed -- staleness does not alert; behind series are "
+                "expected, nothing to fetch"
+            )
+        else:
+            click.echo("\nall series current -- nothing to fetch")
         return
 
     click.echo("\nfetching...")
@@ -542,7 +601,7 @@ def fetch(
                     click.echo(f"    error: {error}", err=True)
 
     after = _assess_products(
-        repo, product_list, granularities, now_ts, start_ts, tolerance_bars
+        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
     )
     click.echo("\nafter fetch:")
     _print_freshness(after)
@@ -1359,10 +1418,33 @@ def monitor(
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
 
     cycles = 0
+    # FR-9 at the polling surface: while a session-bound venue reports closed, there is
+    # nothing to poll (a shut venue mints no bars), so the cycle skips -- but the session
+    # is still recorded, so `fetch --check` stays quiet over the weekend even when monitor
+    # is the only loop cycling. The skip line is emitted ONCE PER STATE CHANGE (a weekend
+    # is ~60 hourly ticks of the same fact, and repeating it would train an operator to
+    # stop reading monitor output), which is what `last_session` tracks. Crypto venues
+    # (no session surface) poll exactly as before -- `record_market_session` records
+    # nothing for them.
+    last_session: SessionState | None = None
     while True:
         now_ts = int(time.time())
-        written = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
-        click.echo(f"[{now_ts}] polled {written} new candle row(s) across {products}")
+        session, session_bound = agent.record_market_session(
+            broker, repo, config, now_ts, interval_sec=interval
+        )
+        if session_bound and session is not SessionState.OPEN:
+            if session is not last_session:
+                reason = (
+                    "market closed -- skipping poll"
+                    if session is SessionState.CLOSED
+                    else "market clock unreadable (fail-closed) -- skipping poll"
+                )
+                click.echo(f"[{now_ts}] {reason}")
+                last_session = session
+        else:
+            last_session = session if session_bound else None
+            written = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
+            click.echo(f"[{now_ts}] polled {written} new candle row(s) across {products}")
         cycles += 1
         if not loop or (max_cycles is not None and cycles >= max_cycles):
             break

@@ -11,10 +11,19 @@ from decimal import Decimal
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, OrderStatus, PlaceResult
+from keel_broker_api.results import Balance, OrderStatus, PlaceResult, SessionState
 from keel_broker_fake import FakeAdapter
 from keel_broker_fake.adapter import MAX_CANDLES_PER_CALL
 from keel_core.types import Granularity, Side
+
+
+def test_not_session_bound_and_the_clock_answers_open_as_a_constant() -> None:
+    """The fake venue has no clock endpoint at all: `session_bound=False` and the port's
+    clock answers OPEN without a network call -- the 24/7 half of FR-9's split, held here so
+    the conformance suite's session tests have a no-network venue to run against."""
+    adapter = FakeAdapter()
+    assert adapter.capabilities().session_bound is False
+    assert adapter.market_clock() is SessionState.OPEN
 
 
 def test_market_ioc_quote_is_unsupported() -> None:

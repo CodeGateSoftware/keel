@@ -47,6 +47,13 @@ class BrokerCapabilities:
     supports_fee_summary: bool
     quote_currencies: frozenset[str]
     asset_classes: frozenset[str]
+    #: Whether this venue CLOSES (FR-9): equities and other session-bound markets have
+    #: weekends and holidays, crypto does not. Deliberately REQUIRED, not defaulted -- a
+    #: default would be an answer to a question only the venue knows, and the likeliest
+    #: default (the 24/7 crypto posture keel grew up on) is exactly the one that reads a
+    #: closed equities venue as a stale feed. An adapter declaring `True` must answer
+    #: `market_clock()` from the venue's own clock, never a locally maintained calendar.
+    session_bound: bool
 
     def __post_init__(self) -> None:
         unknown = self.supported_orders - ORDER_KINDS
