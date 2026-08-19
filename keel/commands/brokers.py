@@ -28,6 +28,7 @@ Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
 from __future__ import annotations
 
 import json
+import textwrap
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as dist_version
@@ -93,6 +94,13 @@ class BrokerInfo:
     supported_data_feeds: tuple[str, ...]
     #: The adapter package's installed version, or `None` when the metadata will not say.
     package_version: str | None
+    #: NOT a capability: set (with the construction error) on the one honest row an
+    #: adapter that RAISED while being built gets (#406 review) -- an adapter that could
+    #: not be constructed has declared nothing, so every capability field on such a row
+    #: is the empty/neutral placeholder and never a fact. Both human renderers check
+    #: this FIRST and render only `adapter_error_block`, never the placeholders; the
+    #: JSON front-end carries it so a script can tell a failed row from a sparse one.
+    error: str | None = None
 
     def as_json(self) -> dict[str, Any]:
         """The row as a JSON-ready dict (tuples become lists) -- the `--json` shape."""
@@ -127,32 +135,75 @@ def _package_version_of(adapter_cls: Any) -> str | None:
         return None
 
 
+def _safe_version(adapter_cls: Any) -> str | None:
+    """`_package_version_of`, made total: version metadata is display sugar on an error
+    row, never worth a second raise inside the error handler itself."""
+    try:
+        return _package_version_of(adapter_cls)
+    except Exception:
+        return None
+
+
+#: How much of a raising adapter's error the error row will ever carry -- the same
+#: truncation discipline `run_live`'s discover overlay keeps: a stray huge or sensitive
+#: blob (an HTTP error body, say) must never be painted or JSON-dumped in full.
+_MAX_ADAPTER_ERROR_CHARS = 200
+
+
 def list_installed_brokers() -> list[BrokerInfo]:
     """Every installed adapter as one `BrokerInfo` row, in name order -- the ONE payload
     both front-ends (`keel brokers list`, the console's Venues browser) render. Adapters
     are constructed WITHOUT transports and only their offline declarations are read: no
-    broker handle, no network, no config, no credentials."""
+    broker handle, no network, no config, no credentials.
+
+    TOTAL by design (#406 review): a raising adapter (construction, `capabilities()`,
+    any of it) becomes one honest error row -- its name and the error -- instead of
+    killing the listing, because both front-ends ride this service and one broken
+    third-party package must never take the `brokers` command or the console's Venues
+    screen down with it."""
     from keel_broker_api.registry import discover_brokers
 
     rows: list[BrokerInfo] = []
     for name, adapter_cls in discover_brokers().items():
-        capabilities = adapter_cls().capabilities()
-        rows.append(
-            BrokerInfo(
-                name=name,
-                venue=capabilities.venue,
-                deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
-                session_bound=bool(capabilities.session_bound),
-                quote_currencies=tuple(sorted(capabilities.quote_currencies)),
-                asset_classes=tuple(sorted(capabilities.asset_classes)),
-                supported_orders=tuple(sorted(capabilities.supported_orders)),
-                preview=_preview_of(capabilities),
-                supports_fee_summary=bool(capabilities.supports_fee_summary),
-                declared_endpoints=_declared(adapter_cls, "DECLARED_ENDPOINTS"),
-                supported_data_feeds=_declared(adapter_cls, "DECLARED_DATA_FEEDS"),
-                package_version=_package_version_of(adapter_cls),
+        try:
+            capabilities = adapter_cls().capabilities()
+            rows.append(
+                BrokerInfo(
+                    name=name,
+                    venue=capabilities.venue,
+                    deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
+                    session_bound=bool(capabilities.session_bound),
+                    quote_currencies=tuple(sorted(capabilities.quote_currencies)),
+                    asset_classes=tuple(sorted(capabilities.asset_classes)),
+                    supported_orders=tuple(sorted(capabilities.supported_orders)),
+                    preview=_preview_of(capabilities),
+                    supports_fee_summary=bool(capabilities.supports_fee_summary),
+                    declared_endpoints=_declared(adapter_cls, "DECLARED_ENDPOINTS"),
+                    supported_data_feeds=_declared(adapter_cls, "DECLARED_DATA_FEEDS"),
+                    package_version=_package_version_of(adapter_cls),
+                )
             )
-        )
+        except Exception as exc:
+            # The deployment classification is NAME-derived and needs no construction,
+            # so the row keeps its honest half; every capability field is the empty
+            # placeholder (see `BrokerInfo.error`) and the renderers never print them.
+            rows.append(
+                BrokerInfo(
+                    name=name,
+                    venue="",
+                    deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
+                    session_bound=False,
+                    quote_currencies=(),
+                    asset_classes=(),
+                    supported_orders=(),
+                    preview="none",
+                    supports_fee_summary=False,
+                    declared_endpoints=(),
+                    supported_data_feeds=(),
+                    package_version=_safe_version(adapter_cls),
+                    error=f"{type(exc).__name__}: {exc}"[:_MAX_ADAPTER_ERROR_CHARS],
+                )
+            )
     rows.sort(key=lambda row: row.name)
     return rows
 
@@ -185,11 +236,31 @@ def capability_facts(info: BrokerInfo) -> str:
     return " · ".join(facts)
 
 
+def adapter_error_block(info: BrokerInfo) -> list[str]:
+    """The honest block a raising adapter's row renders as: its name and installed
+    version, then the construction error wrapped to the 78-column budget -- the SAME
+    wording both front-ends render (the one-phrase rule `capability_facts` keeps), so a
+    broken adapter reads identically everywhere. PURE, and deliberately states NO
+    capability fact: an adapter that could not be constructed has declared nothing."""
+    return [
+        f"{info.name} ({info.package_version or 'unknown version'}) -- unavailable",
+        *textwrap.wrap(
+            f"construction failed: {info.error}", width=78, initial_indent="  ",
+            subsequent_indent="  ",
+        ),
+    ]
+
+
 def render_brokers_lines(infos: list[BrokerInfo]) -> list[str]:
     """The human payload: one block per adapter -- its name and installed version, its
-    capability facts, and its declared order kinds. PURE over the service's rows."""
+    capability facts, and its declared order kinds. PURE over the service's rows; a row
+    whose construction raised renders `adapter_error_block` instead, never a fabricated
+    capability line."""
     lines: list[str] = [f"{len(infos)} adapter(s) installed under keel.brokers:"]
     for info in infos:
+        if info.error is not None:
+            lines.extend(adapter_error_block(info))
+            continue
         version = info.package_version or "unknown version"
         lines.append(f"{info.name} ({version}) -- {info.venue}")
         lines.append(f"  {capability_facts(info)}")

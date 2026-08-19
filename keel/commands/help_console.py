@@ -418,7 +418,7 @@ def build_context_help_lines(mode: str) -> list[ScreenLine]:
     row, its description wrapped), and the close note. PURE over the registry."""
     lines: list[ScreenLine] = [
         ScreenLine(f"keel console -- help: {mode}", "heading"),
-        ScreenLine("what am I looking at (press q, Esc or ? to return)", "muted"),
+        ScreenLine("what am I looking at (press q, Esc, ? or m to return)", "muted"),
         _blank(),
     ]
     for entry in contextual_help(mode):
