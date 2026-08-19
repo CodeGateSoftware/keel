@@ -103,6 +103,23 @@ dashboard (rails/positions/freshness/activity), `versions`.
   `next_open`/`next_close` where the venue provides them (Alpaca's `/v2/clock` already does);
   no new session logic is born in the TUI. A stale/absent record renders CLOCK UNAVAILABLE,
   fail-loud, exactly as `fetch --check` treats it.
+- **O10 — "Shariah in force" for the current session:** a Compliance browser showing, for the
+  ACTIVE profile, exactly what the engine is enforcing right now — read-only, rendered from
+  existing records and documents, never re-deriving anything:
+  * the **per-instrument attestations in force** over the active allowlist (each with its
+    attributed source, ruling, and recorded date — the `assets list` data through its
+    service), plus any documented exemptions in effect;
+  * the **fiqh-derived constraints the rails encode** — each rendered with its plain-English
+    explanation and its citation into `docs/fiqh-basis.md` (the no-leverage/no-interest
+    posture, spot-only/no-derivatives, the *qabd* withdrawal-capability rail, screening that
+    fails closed on absent attestations, purification) — sourced from the fiqh basis's own
+    rulings table, not a TUI-written summary;
+  * the standing honesty states: "keel is not a fatwa engine" and the scholarly-review status
+    ("no scholarly review has occurred"), always visible on this screen, never buried.
+  The help menu (O8) explains the vocabulary this screen uses — *qabd*, *riba*, *gharar*,
+  *maysir*, attestation, exemption, purification — from the same single-source glossary, with
+  the fiqh terms' definitions anchored to `docs/fiqh-basis.md` so they cannot drift from the
+  document that actually states them.
 
 ## Menu tree (v1 shape — final naming in implementation)
 
@@ -116,8 +133,8 @@ Trading              agent cycle (confirm) · monitor poll · autonomy · record
 Rules                list/select · backtest · promote (confirm/--force typed) ·
                      disable · enable · demote · add · insights
 Compliance           screen · propose · attest (typed) · attest-instrument · exempt/unexempt ·
-                     holdings · discover · [Scout results…] · subscription (show/attest) ·
-                     withdrawals attest (typed) · purification
+                     holdings · discover · [Scout results…] · [Shariah in force…] (O10) ·
+                     subscription (show/attest) · withdrawals attest (typed) · purification
 Data                 fetch · fetch --check · repair gaps · freshness overview · db import
 Research             experiments · research docs · promotion reports · trials (list/verify) ·
 Account              pnl · versions
@@ -144,7 +161,10 @@ service layer and both front-ends get it.
   with next open/close, sourced from the recorded state + the (extended) `market_clock()`
   service.
 - **C3 — Compliance menu + the scout-results handler (O6).** The admission flow through real
-  services; the proposals browser reading the operator-local path via config.
+  services; the proposals browser reading the operator-local path via config. **Owns the
+  "Shariah in force" browser (O10)** — attestations/exemptions in force over the active
+  allowlist, the fiqh-derived rails with their fiqh-basis citations, the standing honesty
+  states; help vocabulary anchored to `docs/fiqh-basis.md`.
 - **C4 — Rules + Research menus.** Rule lifecycle actions; the evidence readers (O5).
 - **C5 — Trading + Data menus.** Cycle/poll invocations with their confirmations; fetch/repair
   surfaces; every typed action contract preserved (O3).
@@ -171,6 +191,10 @@ service layer and both front-ends get it.
    state and the venue clock (next open/close for session-bound venues; "24/7" for always-open
    ones; CLOCK UNAVAILABLE rendered fail-loud) — from the same session state the engine and
    `fetch --check` use, never a TUI-side calendar.
+9. The "Shariah in force" screen reflects the ACTIVE profile's actual records — attestations
+   with sources, exemptions, and the fiqh-derived rails with citations into
+   `docs/fiqh-basis.md` — with the not-a-fatwa-engine and review-status lines always visible;
+   nothing on it is derived by the TUI.
 
 ## 7. Risks
 
