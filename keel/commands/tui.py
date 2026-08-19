@@ -1966,14 +1966,19 @@ def run_live(
     MENU, and its `?` opens the dashboard's own contextual help.
 
     C6 (issue #392) lands the Account menu -- the tree's last placeholder -- all
-    console-bound only and all READ-ONLY: `account` (the sub-menu over
-    `account_console.ACCOUNT_MENU`: pnl and versions, no form, no ARMED run, no
-    immediate action), `account-pnl` (the EXACT `keel pnl` report through the C1
-    services over the active deployment's imported transactions, offline and rebuilt
-    per poll, with the honest empty state when nothing is imported), and
-    `account-versions` (the same lines `keel versions` prints through the ONE shared
-    renderer, its environment scan run ONCE per entry and the rows held -- the venues
-    browser's contract).
+    console-bound only: `account` (the sub-menu over `account_console.ACCOUNT_MENU`:
+    pnl and versions as read-only views, plus the #415 update entry), `account-pnl`
+    (the EXACT `keel pnl` report through the C1 services over the active deployment's
+    imported transactions, offline and rebuilt per poll, with the honest empty state
+    when nothing is imported), `account-versions` (the same lines `keel versions`
+    prints through the ONE shared renderer, its environment scan run ONCE per entry
+    and the rows held -- the venues browser's contract), and `account-update`
+    (issue #415's self-update view: the entry-time release check runs ONCE and the
+    plan is held; Enter opens the CLI's OWN typed gate at the terminal through the
+    suspend dance, the blocking run's lines are held, and a verified success execv's
+    the new build's keel entry -- the process is replaced, terminal already
+    restored). The subprocess/HTTP/execv orchestration is all the update service's
+    (`keel.commands.update`); this loop only renders and asks.
 
     Normal-mode keys: `q`/`Q` quit; `h` opens the Help menu; `?` the contextual help;
     `i` open insights; `s` open screen; `p`
@@ -2041,6 +2046,7 @@ def run_live(
         research_console,
         strategy_console,
         trading_console,
+        update,
     )
 
     def _balance_fn(cfg: Config) -> Decimal | None:
@@ -2194,6 +2200,14 @@ def run_live(
         account_pnl_offset = 0
         account_versions_rows: list[tuple[str, bool]] | None = None
         account_versions_offset = 0
+        # the update view's HELD state (the versions view's contract): the plan (or
+        # the check's error), the streamed step lines, and the finished result --
+        # read/computed ONCE, never per poll.
+        account_update_plan: Any = None
+        account_update_error: str | None = None
+        account_update_progress: list[str] = []
+        account_update_result: Any = None
+        account_update_offset = 0
         # -- the Venues browser (issue #394 C7 / PRD O7): the O7 payload, read ONCE per
         # entry (an importlib-metadata scan plus one credential-less adapter
         # construction per adapter -- the same walk `venue_session_bound` makes, never
@@ -2520,12 +2534,16 @@ def run_live(
                 _run_data_form_at_terminal(entry.target)
 
         def _enter_account_entry(entry: Any) -> None:
-            """Where an Account selection goes -- the read-only area's whole dispatch:
-            the pnl view (offline, rebuilt per poll like every offline view) or the
-            versions view (its environment scan read ONCE here, the rows HELD -- the
-            Venues browser's contract, so a repaint never re-walks importlib.metadata)."""
+            """Where an Account selection goes: the pnl view (offline, rebuilt per
+            poll like every offline view), the versions view (its environment scan
+            read ONCE here, the rows HELD -- the Venues browser's contract, so a
+            repaint never re-walks importlib.metadata), or the update view -- whose
+            entry-time CHECK (one public-API read + the plan) is held the same way;
+            the run itself happens only on Enter, behind the typed gate."""
             nonlocal mode, account_pnl_offset
             nonlocal account_versions_rows, account_versions_offset
+            nonlocal account_update_plan, account_update_error
+            nonlocal account_update_progress, account_update_result, account_update_offset
             if entry.target == "versions":
                 try:
                     account_versions_rows = account_console.versions_rows()
@@ -2535,9 +2553,60 @@ def run_live(
                     ]
                 account_versions_offset = 0
                 mode = "account-versions"
+            elif entry.target == "update":
+                try:
+                    account_update_plan = account_console.update_check()
+                except Exception as exc:
+                    account_update_plan = None
+                    account_update_error = str(exc)[:400]
+                else:
+                    account_update_error = None
+                account_update_progress = []
+                account_update_result = None
+                account_update_offset = 0
+                mode = "account-update"
             else:  # "pnl"
                 account_pnl_offset = 0
                 mode = "account-pnl"
+
+        def _recheck_account_update() -> None:
+            """Re-run the update view's entry-time check (Enter on a refused plan or a
+            failed check): one more public read, held again -- never per poll."""
+            nonlocal account_update_plan, account_update_error
+            nonlocal account_update_progress, account_update_result, account_update_offset
+            try:
+                account_update_plan = account_console.update_check()
+            except Exception as exc:
+                account_update_plan = None
+                account_update_error = str(exc)[:400]
+            else:
+                account_update_error = None
+            account_update_progress = []
+            account_update_result = None
+            account_update_offset = 0
+
+        def _run_account_update_at_terminal() -> str:
+            """THE update run, dispatched at the terminal through the shared
+            suspend/restore seam: the service's own typed gate renders there, the
+            streamed lines collect into the held progress list, the RESULT is held
+            for the view, and a verified success execv's the new build's keel entry
+            with the ORIGINAL TUI argv (the terminal is already restored -- the run
+            happens after endwin, so the replacement starts on a clean terminal)."""
+            nonlocal account_update_progress, account_update_result
+            import sys as _sys
+
+            relaunch = None
+            if account_update_plan is not None and account_update_plan.offered:
+                relaunch = update.relaunch_tui(
+                    account_update_plan.venv_python, list(_sys.argv)
+                )
+            assert account_update_plan is not None
+            account_update_result = account_console.run_update_at_terminal(
+                account_update_plan,
+                progress=account_update_progress,
+                relaunch_fn=relaunch,
+            )
+            return "update run finished -- the results are held on screen"
 
         def _enter_help_entry(entry: Any) -> None:
             """Where a Help sub-menu selection goes -- the same closed-mapping rule
@@ -4095,6 +4164,74 @@ def run_live(
                         account_versions_offset,
                         height,
                         len(banner) + len(versions_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "account-update":
+                if console_binding is None:  # unreachable via the menu; kept total
+                    mode = "normal"
+                    continue
+                # The update view (#415): the held plan (or the check's held error)
+                # renders -- repaints never re-check, the versions view's contract.
+                # The plan's ARMED screen says what Enter asks; the RUN itself
+                # happens only on Enter, at the terminal, behind the typed gate.
+                if account_update_error is not None:
+                    update_lines = account_console.build_update_error_lines(
+                        account_update_error
+                    )
+                elif account_update_result is not None:
+                    update_lines = account_console.build_update_result_lines(
+                        account_update_result, list(account_update_progress)
+                    )
+                else:
+                    assert account_update_plan is not None
+                    update_lines = account_console.build_update_lines(
+                        account_update_plan
+                    )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *update_lines], account_update_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "account"
+                    account_update_plan = None
+                    account_update_error = None
+                    account_update_progress = []
+                    account_update_result = None
+                    account_update_offset = 0
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    plan_offered = (
+                        account_update_plan is not None and account_update_plan.offered
+                    )
+                    if plan_offered and account_update_result is None:
+                        # ARMED -> the terminal run: the typed gate renders at the
+                        # terminal (curses suspended around it), the service's lines
+                        # stream, and a verified success execv's the new build with
+                        # the terminal already restored -- the process is replaced.
+                        _run_terminal_form(stdscr, _run_account_update_at_terminal)
+                    else:
+                        # A refusal, an up-to-date plan, a failed check, or a
+                        # finished run: Enter re-checks the release (one public
+                        # read, held again).
+                        _recheck_account_update()
+                elif ch == ord("?"):
+                    context_help_for = "account-update"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    account_update_offset = _scroll_offset(
+                        ch,
+                        account_update_offset,
+                        height,
+                        len(banner) + len(update_lines),
                         curses,
                     )
                 continue

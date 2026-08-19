@@ -179,6 +179,59 @@ If the deployment runs on a schedule (LaunchAgents, cron), a new build takes eff
 cycle with nothing to restart — each cycle is a fresh process. A **long-running** process is the
 exception: a `keel tui` left open keeps the build it started with until you quit and relaunch it.
 
+### Self-update: `keel update` and the console's update view
+
+The four commands above are what `keel update` runs for you (issue #415) — same order, same
+tools, one service (`keel/commands/update.py`) behind two front-ends: the `keel update` CLI
+command and the Account menu's `update` entry in the TUI console (see "The TUI console" for the
+ceremony). `keel update --check` mutates nothing: it prints current vs latest and the whole plan.
+
+**What it does, in the manual procedure's own order.** It reads the latest release from the
+public GitHub API (no auth, no tokens — an unauthenticated read is rate-limited to 60/hour per
+IP, which a human-gated check never approaches; a rate-limit or network failure is an honest
+error, not a guessed "up to date"). It downloads exactly the **four production wheels** —
+`keel_core`, `keel_broker_api`, `keel_broker_coinbase`, `keel_trader`, by exact name, never
+`Release/*.whl`, so the fake and Robinhood wheels can never ride along — into `Release/` in the
+launch folder, verifying each file landed non-empty. **Backups first**: every `keel*.db` in the
+launch folder is copied to `<db>.bak-before-<version>-<timestamp>` before anything is installed,
+and the backups are **never deleted** — not on success, not on failure. It installs the four
+wheels by path into the RUNNING
+venv with `uv pip install --python <venv> <the four paths>` — uv is a **deployment dependency**
+of self-update for exactly the reason the manual procedure uses it; an absent uv is an honest
+error naming this section. It runs `keel migrate --db` for each database **with the new build**,
+then **verifies** with the new build's `keel versions` — every keel distribution must report the
+new version, the check that can actually fail. Only a verified success removes the **superseded
+wheels** (the old version's four) from `Release/`; the new four stay for the next update.
+
+**Never automatic — always typed.** The full run demands a typed `yes` at a terminal (the CLI's
+own confirmation gate, inside the service: there is no ungated code path to the writes), and the
+gate fails closed off a TTY, so no cron job or script can ever update a deployment. The wording
+names the version pair, the launch folder, and that the running binary is replaced.
+
+**A failed verify is loud, never papered over.** pip replaces the packages at install time, so
+there is no cheap rollback; the updater says exactly that state, re-installs the **previous**
+wheels best-effort when they are still in `Release/` (they are — cleanup only happens on
+success), and names this section as the manual recovery. The backups are untouched either way.
+
+**It refuses dev/source checkouts.** The plan refuses when the running build is not a release
+install, when no keel distributions are installed (an `uv run keel` checkout), or when the
+running `keel` package resolves from the launch folder itself — deploying wheels into a source
+tree would shadow it, not update it. From a checkout, this section's four commands by hand
+remain the procedure.
+
+**The relaunch split.** On a verified success the **TUI relaunches itself** — it replaces its
+own process with the new build's `keel` entry (`os.execv`, the terminal restored first, the
+original TUI arguments carried over), because a console left running would keep the replaced
+binary it started with. The **CLI prints the command instead** and does NOT relaunch anything:
+`keel update` ends by telling you to run `keel tui` (or your deployment wrapper). A wrapper
+invoked directly (`./keel-live tui`) relaunches through the venv's `keel` entry with the same
+flags.
+
+**The manual fallback is unchanged.** The four commands at the top of this section still work
+and remain the documented procedure when uv is absent, the API is rate-limiting, or you simply
+prefer the hand run: `gh release download`, `uv pip install --python .venv` the four wheel
+paths, `keel versions`, `keel status`.
+
 ## Paper vs. live
 
 A deployment such as `~/keel` runs **two of them side by side**, and they share nothing: separate
@@ -565,10 +618,11 @@ next open/close, `24/7` for always-open venues, and **CLOCK UNAVAILABLE** render
 the recorded clock is absent or stale, exactly as `fetch --check` treats it. The banner reads the
 recorded session state; there is no TUI-side calendar.
 
-**The typed contracts: six of the CLI's own, two the console adds.** Six actions run the
+**The typed contracts: seven of the CLI's own, two the console adds.** Seven actions run the
 CLI's own typed prompt in-console, word for word (curses suspends around it so the prompt
 renders at the terminal): `resume`, `resume-entries`, `record-flow`, `reset-hwm`,
-`withdrawals attest --enabled`, and `autonomy on` — each the same
+`withdrawals attest --enabled`, `autonomy on`, and `update` (the self-update run — the same
+gate `keel update` demands; see "Self-update" under "Deploying a new version") — each the same
 `_require_interactive_confirmation` gate the CLI command runs, demanding a typed `yes` and
 failing closed off a TTY. Two more typed prompts are **ceremony the console adds on top of
 an ungated CLI action** — deliberately *stricter* than the CLI, not identical to it: asset
@@ -605,9 +659,12 @@ from the rule classes themselves.
 
 **Safety design notes.** Re-entering any sub-menu resets its cursor to the top — a remembered
 row is a loaded one (leave Trading with the cursor on kill and a replayed Enter would engage the
-halt with no ceremony). The Account menu (pnl — the FIFO report over imported transactions, with
-an honest empty state until `keel db import` has loaded any — and versions, the deploy check) is
-read-only; there is no write path in it at all. The console runs no loop of its own and schedules
+halt with no ceremony). The Account menu's pnl (the FIFO report over imported transactions, with
+an honest empty state until `keel db import` has loaded any) and versions (the deploy check)
+entries are read-only views; the branch's **one** write path is the update entry (issue #415) —
+an ARMED view whose run demands the CLI's own typed gate, and which on a verified success
+relaunches the console on the new build ("Self-update" under "Deploying a new version" is its
+procedure). The console runs no loop of its own and schedules
 nothing: it is a front-end over the same services, and closing it never stops a deployment's own
 scheduled cycles.
 

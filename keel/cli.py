@@ -188,6 +188,7 @@ from keel.commands.trading import (
 from keel.commands.trading import record_flow as record_declared_flow
 from keel.commands.trials import trials_group
 from keel.commands.tui import tui_cmd
+from keel.commands.update import update_cmd
 from keel.commands.versions import versions_cmd
 from keel.commands.withdrawals import withdrawals_group
 from keel.compliance import purification as purification_mod
@@ -1315,6 +1316,16 @@ cli.add_command(insights_group)
 # this reports the whole install and exits non-zero when it disagrees with itself. Defined in
 # `keel.commands.versions` and registered here.
 cli.add_command(versions_cmd)
+
+
+# -- update (self-update: pull the latest release into the launch folder) -------------------------
+
+# The self-update service (issue #415): ONE service (`keel.commands.update`) behind
+# TWO front-ends -- this `keel update` / `keel update --check` surface and the
+# console's Account-menu update view. Never automatic (a typed gate at a terminal),
+# backups-first, verify-before-cleanup; the runbook's manual procedure remains the
+# documented fallback.
+cli.add_command(update_cmd)
 
 
 # -- brokers (venues/brokers visibility: capability display over the adapter registry) ------------

@@ -130,3 +130,81 @@ def test_the_section_is_honest_about_scope() -> None:
     section = _section().lower()
     assert "does not" in section or "doesn't" in section or "never" in section
     assert "loop" in section  # the console is not a scheduler
+
+
+# -- the Self-update subsection (issue #415) -------------------------------------------------------
+
+
+def _self_update_section() -> str:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    match = re.search(r"^### Self-update.*?\n(.*)", text, flags=re.S | re.M)
+    assert match, "the runbook has no '### Self-update' subsection"
+    rest = match.group(1)
+    next_section = re.search(r"^#{2,3} ", rest, flags=re.M)
+    body = rest[: next_section.start()] if next_section else rest
+    return " ".join(body.split())
+
+
+def test_the_runbook_has_a_self_update_subsection_under_deploying() -> None:
+    """The subsection lives under 'Deploying a new version' -- the manual procedure it
+    automates -- and cross-links the console section for the ceremony."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    deploy = re.search(r"^## Deploying a new version\n(.*?)(?=^## )", text, flags=re.S | re.M)
+    assert deploy, "no '## Deploying a new version' section"
+    assert "### Self-update" in deploy.group(1)
+    assert "The TUI console" in _self_update_section()
+
+
+def test_the_self_update_section_states_what_it_does() -> None:
+    section = _self_update_section()
+    lowered = section.lower()
+    # the four production wheels, by path; the fake/robinhood exclusion travels with it
+    for prefix in ("keel_core", "keel_broker_api", "keel_broker_coinbase", "keel_trader"):
+        assert prefix in section, prefix
+    assert "release/" in lowered
+    assert "back" in lowered and ".bak-before-" in section  # backups FIRST, named
+    assert "migrate" in lowered
+    assert "keel versions" in lowered  # the verify
+    assert "superseded" in lowered or "old wheels" in lowered
+
+
+def test_the_self_update_section_states_the_typed_gate_and_never_automatic() -> None:
+    section = _self_update_section().lower()
+    assert "typed" in section
+    assert "never" in section and ("automatic" in section or "auto-update" in section)
+
+
+def test_the_self_update_section_states_uv_is_a_deployment_dependency() -> None:
+    section = _self_update_section().lower()
+    assert "uv" in section
+    assert "dependency" in section or "required" in section
+
+
+def test_the_self_update_section_keeps_the_manual_fallback() -> None:
+    section = _self_update_section().lower()
+    assert "manual" in section
+    # the manual fallback IS the four commands above -- the docs stay true
+    assert "gh release download" in section or "uv pip install" in section
+
+
+def test_the_self_update_section_states_the_dev_checkout_refusal() -> None:
+    section = _self_update_section().lower()
+    assert "checkout" in section or "source" in section
+    assert "refus" in section
+
+
+def test_the_self_update_section_states_backups_are_never_deleted() -> None:
+    section = _self_update_section().lower()
+    assert "backup" in section
+    assert "never deleted" in section or "not deleted" in section or "never be deleted" in (
+        section
+    )
+
+
+def test_the_self_update_section_states_the_relaunch_split() -> None:
+    """The TUI relaunches itself (execv); the CLI prints the command and does NOT
+    auto-relaunch -- one honest rule, stated."""
+    section = _self_update_section().lower()
+    assert "relaunch" in section
+    assert "execv" in section or "replaces itself" in section
+    assert "cli" in section and ("prints" in section or "does not" in section)

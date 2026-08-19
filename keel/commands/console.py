@@ -330,7 +330,7 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=8,
         label="Account",
-        description="pnl, versions",
+        description="pnl, versions, update (the typed self-update)",
         action="account",
     ),
     MenuEntry(

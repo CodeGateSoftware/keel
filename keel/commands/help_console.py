@@ -347,6 +347,7 @@ CONSOLE_MODES: tuple[str, ...] = (
     "account",
     "account-pnl",
     "account-versions",
+    "account-update",
     # the dashboard and its overlays, the help surfaces (keel.commands.tui)
     "normal",
     "help",
@@ -393,6 +394,7 @@ _MODE_OWNERS: dict[str, str] = {
     "account": "account_console",
     "account-pnl": "account_console",
     "account-versions": "account_console",
+    "account-update": "account_console",
 }
 # Every other mode (the dashboard's own overlays and the help surfaces) is owned by the
 # TUI module itself.
