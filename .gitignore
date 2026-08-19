@@ -66,3 +66,7 @@ htmlcov/
 # the release assets by the packaging config, not by this file -- but ignoring them meant the only
 # copy of the running deployment's configuration lived on one laptop, with no history and no
 # offsite copy. They are now tracked. They contain no credentials; those stay in `.env` (line 2).
+
+# Raw venue responses recorded by scripts/robinhood_order_probe.py. Recorded from a REAL
+# account, so they are reviewed by hand before any of it becomes a committed fixture.
+.robinhood-probe/
