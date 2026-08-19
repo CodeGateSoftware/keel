@@ -295,8 +295,10 @@ def test_the_menu_is_the_prd_tree_in_order() -> None:
 
 def test_only_the_landed_slices_do_anything() -> None:
     """C2 shipped the SHELL; C3 (issue #389) landed Compliance; C4 (issue #390) landed
-    Rules and Research; C5 (issue #391) landed Trading and Data -- everything else is
-    still a placeholder owned by a later slice, and must say so rather than dead-click."""
+    Rules and Research; C5 (issue #391) landed Trading and Data; C6 (issue #392) landed
+    Account -- the PRD §3 tree is whole, every entry is a live destination, and the
+    placeholder MECHANISM (`lands_in`, the placeholder mode) stays for a future slice's
+    entry, unused today."""
     available = [e.label for e in console.CONSOLE_MENU if e.lands_in is None]
     assert available == [
         "Dashboard",
@@ -306,12 +308,21 @@ def test_only_the_landed_slices_do_anything() -> None:
         "Compliance",
         "Data",
         "Research",
+        "Account",
         "Help",
     ]
-    owners = {e.label: e.lands_in for e in console.CONSOLE_MENU if e.lands_in is not None}
-    assert owners == {
-        "Account": "C6",
-    }
+    assert [e for e in console.CONSOLE_MENU if e.lands_in is not None] == []
+
+
+def test_the_account_entry_opens_the_account_menu() -> None:
+    """C6's dispatch: the tree's Account entry is no longer a placeholder -- selecting
+    it opens the Account sub-menu (`keel.commands.account_console`), the branch's
+    read-only pnl and versions views."""
+    account = console.menu_entry(8)
+    assert account is not None
+    assert account.label == "Account"
+    assert account.action == "account"
+    assert account.available
 
 
 def test_the_trading_entry_opens_the_trading_menu() -> None:
@@ -388,25 +399,27 @@ def test_the_menu_screen_renders_every_entry_and_the_lands_in_notices(tmp_path: 
     for entry in console.CONSOLE_MENU:
         assert any(entry.label in t for t in texts), entry.label
     joined = "\n".join(texts)
-    # C5 landed (issue #391): Trading and Data are live entries now, so no "lands in C5"
-    # notice remains anywhere in the tree -- only Account's C6 one does.
-    assert "lands in C5" not in joined
-    assert "lands in C4" not in joined
-    assert "lands in C6" in joined
+    # C6 landed (issue #392): Account is a live entry now, so NO "lands in Cx" notice
+    # remains anywhere in the tree -- every PRD §3 entry dispatches.
+    assert "lands in" not in joined
     # The cursor marks exactly one row (Trading, index 2 of the entries).
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "Trading" in marked[0]
 
 
 def test_the_placeholder_screen_names_its_slice_and_says_navigation_only() -> None:
-    """Selecting a future entry lands on a notice, not a blank screen: which slice owns the
-    behavior, and that the shell renders navigation only -- nothing is invokable from it."""
-    account = console.menu_entry(8)
-    assert account is not None and account.label == "Account"
-    lines = console.build_placeholder_lines(account)
+    """Selecting a FUTURE slice's entry lands on a notice, not a blank screen: which
+    slice owns the behavior, and that the shell renders navigation only -- nothing is
+    invokable from it. No current entry is a placeholder (C6 landed the last one), so
+    the MECHANISM is pinned over a synthetic entry of the same shape the tree would
+    carry -- the shell keeps the mode for the next slice, tested dead today."""
+    future = console.MenuEntry(
+        ordinal=10, label="Future", lands_in="C8", description="what C8 will own"
+    )
+    lines = console.build_placeholder_lines(future)
     joined = "\n".join(line.text for line in lines)
-    assert "C6" in joined
-    assert "Account" in joined
+    assert "C8" in joined
+    assert "Future" in joined
     assert "navigation" in joined.lower()
 
 

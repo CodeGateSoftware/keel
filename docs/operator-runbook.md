@@ -536,6 +536,69 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 - **Trademark posture** — unchanged and stated where it lives: the README's standing
   disclaimer covers Alpaca alongside every other venue, and nothing here duplicates it.
 
+## The TUI console
+
+`keel tui` (or any wrapper, e.g. `./keel-live tui`) opens the **operator console**: the dashboard is
+still the landing screen, and `m` opens a menu tree over it — Profile, Trading, Rules, Compliance,
+Data, Research, Account, Help — covering every read and every safe write the CLI knows. The console
+is **thin by construction**: each entry dispatches to the same `keel/commands/*` service layer the
+CLI commands call, and an architectural test (`tests/commands/test_console_thinness.py`) pins that
+the TUI layer contains no business logic — no sizing, screening, gating or reporting math, no
+`Decimal` arithmetic beyond display, and no broker construction outside the service seams. If a
+feature is missing, the fix lands in the service layer and both front-ends get it.
+
+**Profile switching and the live guard.** The Profile menu lists every deployment as its config+db
+**pair** — the same pairs the table above pins — and switching rebinds both halves everywhere, in
+one action: every screen, banner and read answers about the new deployment on the next paint.
+Selecting **LIVE** asks an explicit y/N at the terminal first; declining keeps the binding exactly
+where it was, and no key path can rebind around that confirm (the one guarded entry point is
+pinned by test). The switch rebinds the **console only** — a `keel agent` process keeps the pair
+its own command line gave it, so pointing the console at live never changes what a running agent
+trades. Binding a deployment directly through the CLI's `--config`/`--db` flags remains the
+wrappers' documented path.
+
+**The session banner.** Every screen's header names the active deployment (LIVE styled
+unmistakably) and the market session state with the venue clock — OPEN/CLOSED with the recorded
+next open/close, `24/7` for always-open venues, and **CLOCK UNAVAILABLE** rendered fail-loud when
+the recorded clock is absent or stale, exactly as `fetch --check` treats it. The banner reads the
+recorded session state; there is no TUI-side calendar.
+
+**The typed contracts are the CLI's own.** Actions that release a halt or bypass a gate —
+`resume`, `resume-entries`, `record-flow`, `reset-hwm`, `withdrawals attest --enabled`, `rules
+promote --force`, asset `attest`, `autonomy on` — run the CLI's own typed prompt in-console
+(curses suspends around it so the prompt renders at the terminal). The prompts are identical to
+the CLI's, word for word, and **cannot be pre-filled, piped or bypassed**; a wrong phrase or a
+decline writes nothing. `kill` is the deliberate exception: **one key, no confirmation**, its own
+CLI contract — engaging the halt is the safe direction — and the console adds no ceremony to it.
+The whole ceremony map (every state-mutating console action → typed-phrase / confirm-step /
+ARMED+Enter / ungated-by-design, each with its refusal proof) is pinned as a table-driven suite,
+`tests/commands/test_console_ceremony.py`, so a newly added mutating action without a classified
+ceremony row fails the tests.
+
+**ARMED and blocking surfaces.** The runs that do real work — one agent cycle, one monitor poll,
+fetch and its check/repair variants, one simulate — open **ARMED**: nothing runs until Enter,
+which is the confirm step. While a run executes the screen freezes (it can take minutes, exactly
+like the CLI) and the result is held on screen afterwards. **Ctrl-C exits the whole console**, as
+every frozen screen states; it does not abort a run in flight. The one entry that can place
+orders, the agent cycle, goes through `agent.run_once` with the CLI's own order-confirmation
+gate — there is no TUI-originated order path.
+
+**Venues and help.** The Profile menu's **Venues** entry browses every installed adapter and its
+declared capabilities — the same payload `keel brokers list` prints, one service, both
+front-ends — with the selected adapter highlighted; no key presence is read or implied, and no
+secret is ever shown. `?` on any screen opens that screen's own "what am I looking at" help, and
+the Help menu holds the glossary (one source, `docs/glossary.md`, the fiqh terms anchored to
+`docs/fiqh-basis.md`), every screen's rows consolidated, and the per-rule-parameter help rendered
+from the rule classes themselves.
+
+**Safety design notes.** Re-entering any sub-menu resets its cursor to the top — a remembered
+row is a loaded one (leave Trading with the cursor on kill and a replayed Enter would engage the
+halt with no ceremony). The Account menu (pnl — the FIFO report over imported transactions, with
+an honest empty state until `keel db import` has loaded any — and versions, the deploy check) is
+read-only; there is no write path in it at all. The console runs no loop of its own and schedules
+nothing: it is a front-end over the same services, and closing it never stops a deployment's own
+scheduled cycles.
+
 ## How much money moves
 
 Four settings decide position size and how much can be spent. Three live in `config.yaml`; the

@@ -343,6 +343,10 @@ CONSOLE_MODES: tuple[str, ...] = (
     "data",
     "data-fetch",
     "data-freshness",
+    # the account menu (keel.commands.account_console)
+    "account",
+    "account-pnl",
+    "account-versions",
     # the dashboard and its overlays, the help surfaces (keel.commands.tui)
     "normal",
     "help",
@@ -386,6 +390,9 @@ _MODE_OWNERS: dict[str, str] = {
     "data": "data_console",
     "data-fetch": "data_console",
     "data-freshness": "data_console",
+    "account": "account_console",
+    "account-pnl": "account_console",
+    "account-versions": "account_console",
 }
 # Every other mode (the dashboard's own overlays and the help surfaces) is owned by the
 # TUI module itself.

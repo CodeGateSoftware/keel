@@ -3,11 +3,13 @@ the session banner (issue #388 C2; PRD O4, O9 and §5 C2).
 
 The PRD's ask for this slice was structure, not features: the TUI grows a menu/sub-menu
 navigation whose entries are the PRD §3 tree, with everything beyond Dashboard/Profile/Help
-a named placeholder ("lands in C3/C4/C5") owned by a later slice. C3 (issue #389) since
-landed the Compliance entry -- its sub-menu lives in `keel.commands.compliance_console`;
-the remaining placeholders are owned by C4/C5. The dashboard stays the landing screen,
-untouched -- the shell lands AROUND it (`run_live` gains menu modes; the pre-existing modes
-and every pure builder are unchanged).
+a named placeholder ("lands in C3/C4/C5") owned by a later slice. C3 (issue #389) landed
+Compliance (`keel.commands.compliance_console`), C4 (issue #390) the strategy console and
+the research readers, C5 (issue #391) the Trading and Data menus, and C6 (issue #392) the
+Account menu (`keel.commands.account_console`) -- the tree is whole, no entry is a
+placeholder anymore, and the placeholder MECHANISM stays for a future slice's entry. The
+dashboard stays the landing screen, untouched -- the shell lands AROUND it (`run_live`
+gains menu modes; the pre-existing modes and every pure builder are unchanged).
 
 Three pure surfaces lived here at C2; C7 (issue #394) added the Venues browser and
 the module's contextual-help rows. All directly unit-testable without curses (the
@@ -257,9 +259,11 @@ class MenuEntry:
     `"help"` are this slice's three live destinations, `"compliance"` is C3's (issue #389)
     -- the Compliance sub-menu, `keel.commands.compliance_console` -- `"strategy"` and
     `"research"` are C4's (issue #390), `"trading"` and `"data"` are C5's (issue #391) --
-    `keel.commands.trading_console` and `keel.commands.data_console` -- and
-    `"placeholder"` everything else: a closed vocabulary the live loop dispatches on,
-    rather than string-matching labels."""
+    `keel.commands.trading_console` and `keel.commands.data_console` -- `"account"` is
+    C6's (issue #392, `keel.commands.account_console`), and `"placeholder"` everything a
+    FUTURE slice has not landed yet: a closed vocabulary the live loop dispatches on,
+    rather than string-matching labels. Since C6 no current entry uses it -- the
+    mechanism stays for the next slice, unused today."""
 
     ordinal: int
     label: str
@@ -272,14 +276,14 @@ class MenuEntry:
         return self.lands_in is None
 
 
-#: The PRD §3 tree's top level, in tree order. The placeholder owners are the PRD §5
-#: phasing's own assignments: Compliance landed with C3 (issue #389); Rules and Research
-#: with C4 (issue #390) -- the strategy console (`keel.commands.strategy_console`) and
-#: the evidence readers (`keel.commands.research_console`); Trading and Data with C5
-#: (issue #391) -- `keel.commands.trading_console` and `keel.commands.data_console`.
-#: Account is unassigned by the PRD's phasing and rides with the next slice (C6, the
-#: safety & polish pass), and the description says so plainly rather than inventing
-#: precision.
+#: The PRD §3 tree's top level, in tree order. The slice owners are the PRD §5 phasing's
+#: own assignments: Compliance landed with C3 (issue #389); Rules and Research with C4
+#: (issue #390) -- the strategy console (`keel.commands.strategy_console`) and the
+#: evidence readers (`keel.commands.research_console`); Trading and Data with C5
+#: (issue #391) -- `keel.commands.trading_console` and `keel.commands.data_console`;
+#: Account with C6 (issue #392) -- `keel.commands.account_console`, the tree's last
+#: placeholder turned real. No entry points at a placeholder anymore: the MECHANISM
+#: (`lands_in`, the placeholder mode) stays for a future slice's entry, unused today.
 CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=1,
@@ -326,8 +330,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=8,
         label="Account",
-        lands_in="C6",
         description="pnl, versions",
+        action="account",
     ),
     MenuEntry(
         ordinal=9,

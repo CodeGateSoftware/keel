@@ -3634,17 +3634,46 @@ def test_run_live_m_opens_the_menu_and_esc_returns_to_the_dashboard(
     assert any("paper mode" in t for t in painted[menu_idx:])
 
 
-def test_run_live_a_placeholder_entry_lands_in_its_slice_notice(
+def test_run_live_the_account_entry_opens_the_account_sub_menu(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Selecting a future slice's entry (8 = Account, C6 -- Trading and Data went live
-    with C5, issue #391) renders the notice, not a dead click and not a feature -- the
-    shell is navigation only."""
+    """C6 (issue #392) landed the tree's last placeholder: 8 opens the Account sub-menu
+    (`keel.commands.account_console`), a read-only branch -- its two entries render with
+    descriptions and the console keys, and no 'lands in Cx' notice paints anywhere."""
     painted, _binding = _console_run(
         _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("8"), -1, 27, 27]
     )
 
-    assert any("lands in C6" in t for t in painted)
+    assert any("keel console -- account" in t for t in painted)
+    assert any("pnl" in t for t in painted)
+    assert any("versions" in t for t in painted)
+    assert not any("lands in" in t for t in painted)
+
+
+def test_run_live_a_future_placeholder_entry_lands_in_its_slice_notice(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The placeholder MECHANISM stays for the next slice, dead today (C6 landed the
+    tree's last placeholder, Account): pinned over a synthetic future entry grafted onto
+    the tree -- selecting it renders the notice, not a dead click and not a feature; the
+    shell is navigation only for an entry no slice has landed."""
+    from keel.commands import console as console_mod
+
+    future = console_mod.MenuEntry(
+        ordinal=10, label="Future", lands_in="C8", description="what C8 will own"
+    )
+    monkeypatch.setattr(
+        console_mod, "CONSOLE_MENU", (*console_mod.CONSOLE_MENU, future)
+    )
+    # 'm' menu -> j j j j j j j j j to the grafted row (index 9 of 10) -> Enter opens the
+    # notice -> Esc returns to the menu -> Esc returns to the dashboard.
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [ord("m"), *([ord("j")] * 9), 10, -1, 27, 27],
+    )
+
+    assert any("lands in C8" in t for t in painted)
     assert any("navigation" in t.lower() for t in painted)
 
 

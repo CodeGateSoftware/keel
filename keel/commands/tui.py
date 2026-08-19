@@ -1965,6 +1965,16 @@ def run_live(
     returns to the screen it was opened from. Normal mode's `h` now opens the Help
     MENU, and its `?` opens the dashboard's own contextual help.
 
+    C6 (issue #392) lands the Account menu -- the tree's last placeholder -- all
+    console-bound only and all READ-ONLY: `account` (the sub-menu over
+    `account_console.ACCOUNT_MENU`: pnl and versions, no form, no ARMED run, no
+    immediate action), `account-pnl` (the EXACT `keel pnl` report through the C1
+    services over the active deployment's imported transactions, offline and rebuilt
+    per poll, with the honest empty state when nothing is imported), and
+    `account-versions` (the same lines `keel versions` prints through the ONE shared
+    renderer, its environment scan run ONCE per entry and the rows held -- the venues
+    browser's contract).
+
     Normal-mode keys: `q`/`Q` quit; `h` opens the Help menu; `?` the contextual help;
     `i` open insights; `s` open screen; `p`
     open propose; `d` open discover; `v` open activity; `m` open the console menu (when a
@@ -2022,6 +2032,7 @@ def run_live(
     # which resolves THIS module's own CONTEXT_HELP rows) and the brokers service (the
     # O7 payload the Venues browser renders).
     from keel.commands import (
+        account_console,
         brokers,
         compliance_console,
         console,
@@ -2173,6 +2184,16 @@ def run_live(
         data_fetch_error: str | None = None
         data_fetch_offset = 0
         data_freshness_offset = 0
+        # -- the Account menu (issue #392 C6): the sub-menu's cursor/scroll, the pnl
+        # view's scroll (the view itself is offline and rebuilt per poll), and the
+        # versions view's HELD rows -- the environment scan (an importlib.metadata walk
+        # through build_info/check_install) runs ONCE per entry and every repaint
+        # renders what is held, the Venues browser's contract, never per poll.
+        account_cursor = 0
+        account_menu_offset = 0
+        account_pnl_offset = 0
+        account_versions_rows: list[tuple[str, bool]] | None = None
+        account_versions_offset = 0
         # -- the Venues browser (issue #394 C7 / PRD O7): the O7 payload, read ONCE per
         # entry (an importlib-metadata scan plus one credential-less adapter
         # construction per adapter -- the same walk `venue_session_bound` makes, never
@@ -2498,6 +2519,26 @@ def run_live(
             else:
                 _run_data_form_at_terminal(entry.target)
 
+        def _enter_account_entry(entry: Any) -> None:
+            """Where an Account selection goes -- the read-only area's whole dispatch:
+            the pnl view (offline, rebuilt per poll like every offline view) or the
+            versions view (its environment scan read ONCE here, the rows HELD -- the
+            Venues browser's contract, so a repaint never re-walks importlib.metadata)."""
+            nonlocal mode, account_pnl_offset
+            nonlocal account_versions_rows, account_versions_offset
+            if entry.target == "versions":
+                try:
+                    account_versions_rows = account_console.versions_rows()
+                except Exception as exc:
+                    account_versions_rows = [
+                        (f"versions read failed: {str(exc)[:160]}", True),
+                    ]
+                account_versions_offset = 0
+                mode = "account-versions"
+            else:  # "pnl"
+                account_pnl_offset = 0
+                mode = "account-pnl"
+
         def _enter_help_entry(entry: Any) -> None:
             """Where a Help sub-menu selection goes -- the same closed-mapping rule
             `_enter_menu_entry` keeps, for the Help branch: every entry opens its own
@@ -2536,6 +2577,7 @@ def run_live(
             nonlocal trading_cursor, trading_menu_offset
             nonlocal data_cursor, data_menu_offset
             nonlocal help_cursor
+            nonlocal account_cursor, account_menu_offset
             if action == "compliance":
                 compliance_cursor = 0
                 compliance_menu_offset = 0
@@ -2551,6 +2593,9 @@ def run_live(
             elif action == "data":
                 data_cursor = 0
                 data_menu_offset = 0
+            elif action == "account":
+                account_cursor = 0
+                account_menu_offset = 0
             elif action == "help":
                 help_cursor = 0
             if action == "dashboard":
@@ -2572,6 +2617,8 @@ def run_live(
                 return "trading", 0, 0, None
             if action == "data":
                 return "data", 0, 0, None
+            if action == "account":
+                return "account", 0, 0, None
             return "placeholder", 0, 0, entry
 
         while True:
@@ -3911,6 +3958,143 @@ def run_live(
                         data_freshness_offset,
                         height,
                         len(banner) + len(freshness_view),
+                        curses,
+                    )
+                continue
+
+            if mode == "account":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Account sub-menu (issue #392 C6): PRD §3's Account branch -- the
+                # tree's last placeholder turned real. Both entries are READ-ONLY views
+                # (pnl, versions); there is no form, no ARMED run and no immediate
+                # action in this branch at all. Cursor-driven like every sub-menu,
+                # scrolled with the cursor-follow rule for the same reason the others
+                # are: wrapped descriptions outgrow a small window.
+                account_lines = account_console.build_account_menu_lines(
+                    cursor=account_cursor
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(account_lines)
+                account_menu_offset = _follow_cursor(
+                    account_menu_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *account_lines], account_menu_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    account_cursor = max(0, account_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    account_cursor = min(
+                        len(account_console.ACCOUNT_MENU) - 1, account_cursor + 1
+                    )
+                elif ord("1") <= ch <= ord("9"):
+                    account_selected = account_console.account_entry(ch - ord("0"))
+                    if account_selected is not None:
+                        _enter_account_entry(account_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_account_entry(
+                        account_console.ACCOUNT_MENU[account_cursor]
+                    )
+                elif ch == ord("?"):
+                    context_help_for = "account"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    account_menu_offset = _scroll_offset(
+                        ch,
+                        account_menu_offset,
+                        height,
+                        len(banner) + len(account_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "account-pnl":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The pnl view: OFFLINE (a transactions read, no broker, no network) and
+                # rebuilt per poll, fail-soft -- the offline views' contract, so an
+                # import landing in another terminal shows up on the next repaint.
+                try:
+                    pnl_repo, _pnl_config = open_state()
+                    pnl_lines = account_console.build_pnl_lines(
+                        pnl_repo.get_transactions()
+                    )
+                except Exception as exc:
+                    pnl_lines = [
+                        ScreenLine(f"pnl read failed: {exc} -- retrying...", "alert")
+                    ]
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *pnl_lines], account_pnl_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "account"
+                    account_pnl_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "account-pnl"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    account_pnl_offset = _scroll_offset(
+                        ch,
+                        account_pnl_offset,
+                        height,
+                        len(banner) + len(pnl_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "account-versions" and account_versions_rows is not None:
+                # The versions view: the HELD rows from the entry-time scan (see
+                # `_enter_account_entry`) -- a repaint never re-walks importlib.metadata,
+                # the Venues browser's contract. Closing drops the rows, so re-entering
+                # scans fresh (a deployment upgrade mid-session deserves a fresh read).
+                versions_lines = account_console.build_versions_lines(
+                    account_versions_rows
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *versions_lines], account_versions_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "account"
+                    account_versions_rows = None
+                    account_versions_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "account-versions"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    account_versions_offset = _scroll_offset(
+                        ch,
+                        account_versions_offset,
+                        height,
+                        len(banner) + len(versions_lines),
                         curses,
                     )
                 continue
