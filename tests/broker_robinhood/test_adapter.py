@@ -235,6 +235,18 @@ def _placed_with_state(state: str) -> dict[str, Any]:
     return placed
 
 
+def _pairs() -> dict:
+    """The BTC-USD `trading_pairs` row, freshly loaded per call.
+
+    `preview_order` reads the venue's sizing bounds, so a fake that answers `accounts` and
+    `estimated_price` but not this one is an INCOMPLETE venue, not a neutral one -- it makes
+    every preview report that the bounds could not be checked. Tests about pricing therefore
+    supply it, and the ones that genuinely mean "the venue did not answer" leave it out on
+    purpose and assert the note that produces.
+    """
+    return load_fixture("rh_trading_pairs.json")
+
+
 def test_capabilities_declare_robinhood() -> None:
     """The engine gates live spend on these declarations, so each clause here is a promise the
     rest of the suite must keep: no native preview, a synthesized one instead, fee summaries
@@ -350,6 +362,7 @@ def test_preview_order_reads_the_ask_column_because_the_venue_sends_no_price_fie
     assert "ask" in row
 
     transport = FakeTransport(
+        trading_pairs=_pairs(),
         accounts=load_fixture("rh_accounts.json"),
         estimated_price=load_fixture("rh_estimated_price.json"),
     )
@@ -378,13 +391,13 @@ def test_preview_order_reads_the_column_named_after_the_side_it_asked_for() -> N
 
     sell = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=_QUOTED_SIZE)
     priced = RobinhoodAdapter(
-        FakeTransport(accounts=accounts, estimated_price=bid_only)
+        FakeTransport(trading_pairs=_pairs(), accounts=accounts, estimated_price=bid_only)
     ).preview_order(sell)
     assert priced.errors == ()
     assert priced.est_quote_size == _QUOTED_SIZE * Decimal(bid_row["bid"])
 
     unpriced = RobinhoodAdapter(
-        FakeTransport(accounts=accounts, estimated_price=ask_only)
+        FakeTransport(trading_pairs=_pairs(), accounts=accounts, estimated_price=ask_only)
     ).preview_order(sell)
     assert unpriced.errors, "a sell priced off an ask-only row must not be reported as priced"
 
@@ -410,7 +423,11 @@ def test_preview_order_prices_a_sell_without_the_est_total_cost_the_venue_omits(
     row = fixture["results"][0]
     assert "est_total_cost" not in row, "the venue sends no total on the bid side -- see #217 F7"
 
-    transport = FakeTransport(accounts=load_fixture("rh_accounts.json"), estimated_price=fixture)
+    transport = FakeTransport(
+        trading_pairs=_pairs(),
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=fixture,
+    )
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=_QUOTED_SIZE)
 
     preview = RobinhoodAdapter(transport).preview_order(spec)
@@ -501,6 +518,7 @@ def test_preview_order_accepts_a_fee_exclusive_est_total_cost_unchanged() -> Non
     row = dict(fixture["results"][0])
     row["est_total_cost"] = Decimal(row["ask"]) * Decimal(row["quantity"])
     transport = FakeTransport(
+        trading_pairs=_pairs(),
         accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
     )
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
@@ -542,6 +560,7 @@ def test_preview_order_falls_back_to_price_times_quantity_without_a_total() -> N
     fixture = load_fixture("rh_estimated_price.json")
     row = {k: v for k, v in fixture["results"][0].items() if k != "est_total_cost"}
     transport = FakeTransport(
+        trading_pairs=_pairs(),
         accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
     )
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
@@ -1212,6 +1231,7 @@ def test_preview_order_reports_an_error_when_the_account_reports_no_fee_ratio() 
 def test_preview_order_on_a_fully_priced_order_reports_no_errors() -> None:
     """The control case: `errors` must stay empty when everything priced, or it means nothing."""
     transport = FakeTransport(
+        trading_pairs=_pairs(),
         accounts=load_fixture("rh_accounts.json"),
         estimated_price=load_fixture("rh_estimated_price.json"),
     )
@@ -1492,3 +1512,162 @@ def test_best_bid_ask_legs_cross_on_a_tight_pair_and_that_is_the_venue_not_the_f
     # different, worse finding it would be.
     gap = abs(Decimal(crossed["bid"]) - Decimal(crossed["ask"])) / Decimal(crossed["bid"])
     assert gap < Decimal("0.0005"), "a crossing this wide would not be a sampling artefact"
+
+
+# --- pre-flight sizing (#410) ------------------------------------------------------------------
+# Reported through `Preview.errors`, never enforced in `place_order`. Every order this adapter can
+# place is an exit or a protective leg, and the venue's behaviour on an out-of-bounds order has
+# never been observed (#412) -- so refusing locally could invent a failure the venue would not
+# have produced. These pin the reporting, and the denominations, which are the part that bites.
+
+
+def _priced_transport(**kwargs: Any) -> Any:
+    return FakeTransport(
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price=load_fixture("rh_estimated_price.json"),
+        **kwargs,
+    )
+
+
+def test_min_order_amount_is_measured_against_the_QUOTE_size_not_the_base_size() -> None:
+    """The finding this whole check turns on, as an executable claim.
+
+    `min_order_amount` is `0.1` on all 63 pairs that carry it, from BTC at ~$68,000 to DOGE at
+    ~$0.07 -- a venue-wide $0.10 floor in QUOTE currency, not a base-denominated minimum. Read as
+    base it would mean 0.1 BTC, so a check written `base_size >= min_order_amount` would reject
+    every BTC order under ~$6,800, on the exit path included. This order is 0.001 BTC -- far below
+    `0.1` as a base size, far above it as a dollar amount -- so it separates the two readings.
+    """
+    adapter = RobinhoodAdapter(_priced_transport(trading_pairs=_pairs()))
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
+
+    preview = adapter.preview_order(spec)
+
+    assert preview.est_base_size < Decimal("0.1")  # below the bound read as BASE
+    assert preview.est_quote_size > Decimal("0.1")  # above it read as QUOTE, which is correct
+    assert preview.errors == ()
+    assert preview.detail["min_order_amount_quote"] == "0.1"
+
+
+def test_an_order_under_the_quote_minimum_is_reported() -> None:
+    """A genuinely sub-minimum order: one satoshi, worth a small fraction of a cent."""
+    adapter = RobinhoodAdapter(_priced_transport(trading_pairs=_pairs()))
+    spec = LimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("0.00000001"),
+        limit_price=Decimal("65000"),
+    )
+
+    errors = adapter.preview_order(spec).errors
+
+    assert any("below the venue's min_order_amount" in e for e in errors)
+    assert any("QUOTE currency (USD) -- not in base units" in e for e in errors)
+
+
+def test_an_order_over_the_base_maximum_is_reported() -> None:
+    """`max_order_size` is base-denominated -- 20 BTC here -- so this compares against base."""
+    adapter = RobinhoodAdapter(_priced_transport(trading_pairs=_pairs()))
+    spec = LimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("21"),
+        limit_price=Decimal("65000"),
+    )
+
+    errors = adapter.preview_order(spec).errors
+
+    assert any("exceeds the venue's max_order_size" in e for e in errors)
+    assert any("both in base units" in e for e in errors)
+
+
+def test_an_off_increment_size_is_reported_without_claiming_the_venue_will_reject_it() -> None:
+    """Half a satoshi. The note must NOT assert an outcome: whether Robinhood rounds or refuses
+    has never been observed, and stating either would be a guess on a live-money path."""
+    adapter = RobinhoodAdapter(_priced_transport(trading_pairs=_pairs()))
+    spec = LimitGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("0.000000005"),
+        limit_price=Decimal("65000"),
+    )
+
+    errors = adapter.preview_order(spec).errors
+
+    note = next(e for e in errors if "asset_increment" in e)
+    assert "never been observed" in note
+
+
+def test_an_unpriced_market_order_is_not_accused_of_being_below_the_minimum() -> None:
+    """`quote_size` is zero when the venue priced nothing, and zero is an ABSENCE here, not a
+    number. Comparing it against the minimum would manufacture a second, false error underneath
+    the real one -- the module's cardinal sin, stated in `_decimal_or_none`."""
+    adapter = RobinhoodAdapter(
+        FakeTransport(accounts=load_fixture("rh_accounts.json"), trading_pairs=_pairs())
+    )
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
+
+    preview = adapter.preview_order(spec)
+
+    assert preview.est_quote_size == 0
+    assert any("no usable estimated price" in e for e in preview.errors)
+    assert not any("min_order_amount" in e for e in preview.errors)
+
+
+def test_a_pair_without_a_minimum_says_so_rather_than_checking_against_nothing() -> None:
+    """26 of the venue's 89 pairs carry no `min_order_amount` (#230). Absent must read as
+    "unchecked", never as a bound of zero that everything trivially clears."""
+    row = dict(load_fixture("rh_trading_pairs.json")["results"][0])
+    del row["min_order_amount"]
+    adapter = RobinhoodAdapter(_priced_transport(trading_pairs={"results": [row]}))
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
+
+    preview = adapter.preview_order(spec)
+
+    assert any("no min_order_amount" in e for e in preview.errors)
+    assert preview.detail["min_order_amount_quote"] == "unknown"
+
+
+def test_bounds_the_venue_never_answered_are_reported_as_unchecked_not_as_passing() -> None:
+    """A `trading_pairs` call that fails or returns nothing must not read as "size is fine"."""
+    adapter = RobinhoodAdapter(_priced_transport())
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
+
+    preview = adapter.preview_order(spec)
+
+    assert any("did not state this pair's sizing bounds" in e for e in preview.errors)
+    assert preview.detail["max_order_size_base"] == "unknown"
+
+
+def test_the_sizing_read_asks_the_venue_to_filter_rather_than_picking_results_zero() -> None:
+    """#230's lesson, pinned. The unfiltered endpoint returns 89 rows and `results[0]` is
+    BILL-USD, one of the 26 without a minimum -- which is exactly how a real field came to be
+    declared non-existent and deleted from a fixture."""
+    transport = _priced_transport(trading_pairs=_pairs())
+    adapter = RobinhoodAdapter(transport)
+
+    adapter.preview_order(
+        MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
+    )
+
+    assert transport.calls["get_trading_pairs"] == {"symbol": "BTC-USD"}
+
+
+def test_place_order_does_not_consult_the_sizing_bounds() -> None:
+    """The boundary, pinned so it cannot erode by accident. Enforcement is a separate decision
+    that needs #412's observation of a real rejection first; until then `place_order` must place
+    exactly what it was given, and must not spend a request deciding not to."""
+    transport = FakeTransport(placed=load_fixture("rh_order_open.json"), trading_pairs=_pairs())
+    adapter = RobinhoodAdapter(transport)
+
+    result = adapter.place_order(
+        LimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=Decimal("0.00000001"),  # below the $0.10 minimum by any reading
+            limit_price=Decimal("65000"),
+        )
+    )
+
+    assert result.success
+    assert "get_trading_pairs" not in transport.calls
