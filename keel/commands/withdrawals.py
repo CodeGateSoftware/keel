@@ -20,6 +20,16 @@ def withdrawals_group() -> None:
     """Withdrawal-capability attestation -- rail 17's input (KB §65.4 qabd/possession)."""
 
 
+#: The typed gate's exact action/detail wording (O3), module-level so the console's
+#: withdrawals form runs the SAME gate with the SAME words -- one home, two front-ends,
+#: never a second wording that can drift from the CLI's. Pinned by test against both
+#: call sites (`keel.commands.compliance_console.clis_typed_withdrawals_gate`).
+WITHDRAWALS_ATTEST_ACTION = "attest withdrawals as ENABLED"
+WITHDRAWALS_ATTEST_DETAIL = (
+    "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle."
+)
+
+
 @withdrawals_group.command("attest")
 @click.option(
     "--enabled/--suspended",
@@ -49,8 +59,7 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     repo = _open_repo(ctx)
     if enabled:
         _require_interactive_confirmation(
-            "attest withdrawals as ENABLED",
-            "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle.",
+            WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL
         )
     now_ts = int(time.time())
     repo.set_state("withdrawals_enabled", bool(enabled))

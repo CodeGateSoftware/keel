@@ -214,13 +214,38 @@ def test_the_compliance_menu_screen_renders_every_entry_with_one_cursor() -> Non
         assert any(entry.label in t for t in texts), entry.label
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "attest-instrument" in marked[0]
-    assert any("q/Esc" in t and "Compliance menu" in t for t in texts)
+    assert any("q/Esc/m" in t and "menu" in t for t in texts)
 
 
 def test_the_compliance_menu_renders_a_result_toast() -> None:
     """Every write shows a confirmation line -- on the menu itself, where the form ran."""
     lines = cc.build_compliance_menu_lines(message="attested BTC: sector=payments backing=ayn")
     assert any("attested BTC" in line.text for line in lines)
+
+
+def test_the_menu_toast_style_follows_the_message_semantics() -> None:
+    """The toast is not always "ok": a line that reports a FAILURE renders in the alert
+    style and a cancelled/unchanged one in the warn style -- `_message_style`'s own
+    semantics, the same rule every other console toast keeps (a green "failed" toast is
+    the colour saying all is well about something that is not)."""
+    failed = cc.build_compliance_menu_lines(message="profile switch failed: boom")
+    assert any(
+        line.style == "alert" and "failed" in line.text for line in failed
+    )
+    cancelled = cc.build_compliance_menu_lines(message="attest cancelled -- nothing recorded")
+    assert any(
+        line.style == "warn" and "cancelled" in line.text for line in cancelled
+    )
+
+
+def test_the_compliance_menu_lines_fit_the_80_column_clip() -> None:
+    """Same budget as every other console screen: `_paint` clips at the window width and
+    this dashboard targets 80 columns -- an entry's description must wrap to its own row
+    rather than lose its tail there (the profile menu's guarded-note style)."""
+    lines = cc.build_compliance_menu_lines(cursor=7, message="attested BTC")
+    assert len(lines) > 10  # the whole tree, not a truncated proxy
+    for line in lines:
+        assert len(line.text) <= 80, line.text
 
 
 # -- the forms: dispatch to the same calls the CLI makes ---------------------------------------
@@ -286,14 +311,16 @@ def test_the_attest_typed_gate_never_leaks_the_phrase_into_the_question(
 ) -> None:
     """The gate must ASK without pre-filling: the question names the asset, and the answer
     is whatever the human types -- so the recorded question carries the asset code but the
-    function cannot supply the answer."""
+    function cannot supply the answer. The answer must BE the code, EXACTLY: the CLI's own
+    typed gate (`_require_interactive_confirmation`) accepts exactly `yes` -- not `YES`,
+    not ` yes ` -- and the console's asset gate is exactly as strict. Only the prompt's
+    trailing newline is discarded."""
     prompt = _prompt(["BTC"])
     assert cc.typed_asset_confirmation("BTC", prompt) is True
     assert any("BTC" in q for q in prompt.asked)
-    prompt2 = _prompt(["btc "])
-    assert cc.typed_asset_confirmation("BTC", prompt2) is True  # whitespace-tolerant
-    prompt3 = _prompt(["BT"])
-    assert cc.typed_asset_confirmation("BTC", prompt3) is False
+    # case-sensitive, whitespace-intolerant: none of these are the code
+    for wrong in ("btc", "btc ", " BTC", "BTC ", "BT"):
+        assert cc.typed_asset_confirmation("BTC", _prompt([wrong])) is False, wrong
 
 
 def test_instrument_attest_form_uppercases_the_product_like_the_cli(
@@ -319,6 +346,31 @@ def test_instrument_attest_form_uppercases_the_product_like_the_cli(
         )
     ]
     assert result == "attested BTC-USD on coinbase: wrapper=spot"
+
+
+def test_instrument_attest_validation_raises_form_input_error_and_the_form_renders_it(
+    repo: Repository,
+) -> None:
+    """One error convention for every form: field validation raises `FormInputError` from
+    the COLLECT step (`collect_instrument_attest`, the same shape `collect_attest` keeps)
+    and the `run_*` wrapper renders the `Error: ...` line -- never a second, inline
+    error-string convention that can drift from the first."""
+    bad_wrapper = ["coinbase", "btc-usd", "swap", "", "operator"]
+    with pytest.raises(cc.FormInputError, match="wrapper must be one of"):
+        cc.collect_instrument_attest(_prompt(bad_wrapper))
+
+    spy = _RecordingRepo(repo)
+    result = cc.run_instrument_attest_form(spy, _prompt(bad_wrapper), NOW_TS)
+    assert spy.calls == []  # refused before any write
+    assert result.startswith("Error:") and "wrapper" in result
+
+    blank_source = ["coinbase", "btc-usd", "spot", "", "operator"]
+    with pytest.raises(cc.FormInputError, match="source is required"):
+        cc.collect_instrument_attest(_prompt(blank_source))
+
+    blank_attestor = ["coinbase", "btc-usd", "spot", "https://example.com/spec", ""]
+    with pytest.raises(cc.FormInputError, match="attested-by is required"):
+        cc.collect_instrument_attest(_prompt(blank_attestor))
 
 
 def test_exempt_form_records_a_documented_exception_and_refuses_a_blank_rationale(
@@ -504,10 +556,20 @@ def test_the_withdrawals_typed_gate_is_the_clis_own(
 ) -> None:
     """The enabled-direction gate must be the CLI's `_require_interactive_confirmation`
     with the CLI's own action wording -- not a TUI-invented second gate -- and it fails
-    CLOSED (a refusal, a Ctrl-C, any exception) so the halt is never released silently."""
+    CLOSED (a refusal, a Ctrl-C, any exception) so the halt is never released silently.
+    The wording is pinned against the SHARED constants (`withdrawals.py`, their one home)
+    and the CLI's own call site is pinned to reference the same constants, so the console
+    and the CLI can never drift into two wordings for the same gate."""
+    import inspect
+
     import click as click_mod
 
     import keel.commands._common as common
+    from keel.commands import withdrawals
+    from keel.commands.withdrawals import (
+        WITHDRAWALS_ATTEST_ACTION,
+        WITHDRAWALS_ATTEST_DETAIL,
+    )
 
     asked: list[tuple[str, str]] = []
 
@@ -524,8 +586,15 @@ def test_the_withdrawals_typed_gate_is_the_clis_own(
     monkeypatch.setattr(common, "_require_interactive_confirmation", accepting_gate)
     assert cc.clis_typed_withdrawals_gate() is True
 
+    # the console's prompt words ARE the CLI's: identity against the shared constants
+    assert asked[0] == (WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL)
     assert asked[0][0] == "attest withdrawals as ENABLED"
     assert "rail 17" in asked[0][1].lower()
+    # and the CLI command itself runs the gate on those same constants -- one home, two
+    # front-ends, no second wording
+    cli_source = inspect.getsource(withdrawals.withdrawals_attest.callback)
+    assert "WITHDRAWALS_ATTEST_ACTION" in cli_source
+    assert "WITHDRAWALS_ATTEST_DETAIL" in cli_source
 
 
 def test_run_form_dispatches_by_name_to_every_registered_form(
@@ -592,13 +661,40 @@ def test_scout_list_renders_every_file_and_a_clear_empty_state(tmp_path: Path) -
     assert all(f.path.name in "\n".join(texts) for f in files)
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "2026-08-01-shortlist.json" in marked[0]
-    assert any("proposals" in t.lower() and "shortlist" in t.lower() for t in texts)
+    # the header names the directory and its config key (wrapped, so joined -- not one line)
+    joined_header = " ".join(t for t in texts if "newest first" in t or "shortlists in" in t)
+    assert "proposals" in joined_header.lower() and "shortlist" in joined_header.lower()
 
     empty = cc.build_scout_list_lines((), tmp_path / "missing", cursor=0)
     joined = "\n".join(line.text for line in empty)
     assert "no proposals" in joined.lower()
     assert "missing" in joined  # names where it looked
     assert "shortlist" in joined  # names the convention, so one rename fixes it
+
+
+def test_the_scout_list_lines_fit_the_80_column_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same budget as every other console screen (`_paint` clips at the window width;
+    80-column terminals are the target): the directory-bearing header, the empty state
+    and the footer hint all WRAP rather than losing their tail to the clip. A path's
+    tail is exactly the part that identifies it. (The directory is passed SHORT, the
+    way a deployment-relative proposals_dir renders: wrapping splits on spaces, and a
+    single path token longer than the budget is a `_paint` clip, not a wrap miss --
+    this test pins the builder's own words, which is what it controls.)"""
+    monkeypatch.chdir(tmp_path)
+    populated = Path("proposals")
+    populated.mkdir()
+    (populated / "2026-08-15-shortlist.json").write_text("{}")
+    files = list_shortlists(populated)
+
+    for lines in (
+        cc.build_scout_list_lines(files, populated, cursor=0),
+        cc.build_scout_list_lines((), Path("missing"), cursor=0),
+    ):
+        assert len(lines) > 3
+        for line in lines:
+            assert len(line.text) <= 80, line.text
 
 
 def test_scout_view_screens_the_chosen_file_through_the_admission_services(
@@ -742,21 +838,62 @@ def test_shariah_lines_render_the_live_rail17_state(repo: Repository) -> None:
 def test_the_honesty_lines_are_always_visible_and_sourced_from_fiqh_basis(
     repo: Repository,
 ) -> None:
-    """The two standing honesty states render on EVERY shariah screen -- never buried --
-    and each is pinned two-sided against `docs/fiqh-basis.md`, so neither the browser nor
-    the document can drift while the other stays honest."""
+    """The two standing honesty states render on EVERY shariah screen as a PINNED footer
+    (`shariah_honesty_lines`, painted outside the scroll) -- never buried in the
+    scrollable body -- and each is pinned two-sided against `docs/fiqh-basis.md`, so
+    neither the browser nor the document can drift while the other stays honest."""
     assert NOT_A_FATWA_ENGINE in _FIQH_BASIS
     assert NO_SCHOLARLY_REVIEW in _FIQH_BASIS
 
+    footer = cc.shariah_honesty_lines()
+    footer_text = "\n".join(line.text for line in footer)
+    assert NOT_A_FATWA_ENGINE in footer_text
+    assert NO_SCHOLARLY_REVIEW in footer_text
+    assert all(line.style == "alert" for line in footer if line.text)
+
+    # the BODY no longer carries them: they ride the pinned footer instead, so they cannot
+    # end up a viewport below the fold on a long allowlist
     for withdrawals in (True, False, None):
-        lines = cc.build_shariah_lines(
+        body = cc.build_shariah_lines(
             gather_attestations_in_force(repo, _config()),
             withdrawals_enabled=withdrawals,
             now_ts=NOW_TS,
         )
-        joined = "\n".join(line.text for line in lines)
-        assert NOT_A_FATWA_ENGINE in joined
-        assert NO_SCHOLARLY_REVIEW in joined
+        joined = "\n".join(line.text for line in body)
+        assert NOT_A_FATWA_ENGINE not in joined
+        assert NO_SCHOLARLY_REVIEW not in joined
+
+
+def test_the_shariah_frame_pins_the_honesty_lines_at_every_scroll_offset(
+    repo: Repository,
+) -> None:
+    """O10 made structural: with a body longer than the viewport, the built frame contains
+    the honesty lines at offset 0 AND at max offset -- asserted on the FRAME (what gets
+    painted), not the line list, because the bug was precisely that the lines existed but
+    sat below the fold."""
+    body = cc.build_compliance_view_lines(
+        "shariah",
+        cc.build_shariah_lines(
+            gather_attestations_in_force(repo, _config()),
+            withdrawals_enabled=None,
+            now_ts=NOW_TS,
+        ),
+    )
+    footer = cc.shariah_honesty_lines()
+    height = 12
+    assert len(body) > height  # the premise: a body longer than the viewport
+
+    max_offset = len(body) - (height - len(footer))
+    for offset in (0, max_offset):
+        frame = cc.pinned_frame(body, footer, offset=offset, height=height)
+        joined = "\n".join(line.text for line in frame)
+        assert NOT_A_FATWA_ENGINE in joined, offset
+        assert NO_SCHOLARLY_REVIEW in joined, offset
+        assert len(frame) <= height, offset
+        # and the pinned lines are the frame's LAST rows -- a footer, not a header
+        assert [line.text for line in frame[len(frame) - len(footer) :]] == [
+            line.text for line in footer
+        ]
 
 
 def test_every_fiqh_constraint_quotes_fiqh_basis_verbatim_and_cites_a_real_section() -> None:
@@ -867,6 +1004,12 @@ def test_the_view_overlay_reuses_the_services_own_renderers() -> None:
     missing = cc.build_compliance_view_lines("purification", None, error="database is locked")
     assert any("database is locked" in line.text for line in missing)
     assert any(line.style == "alert" for line in missing)
+    # honest about what happens next: the failure names the RETRY KEY (Enter makes the
+    # read again), never a "retrying..." nothing retried on its own -- the held-error
+    # views (holdings/discover) repaint this exact line until an Enter re-runs the read.
+    error_text = "\n".join(line.text for line in missing)
+    assert "retrying" not in error_text
+    assert "press Enter to retry" in error_text
 
 
 def test_the_network_views_render_armed_until_run() -> None:

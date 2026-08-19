@@ -49,9 +49,13 @@ builders/renderers VERBATIM rather than reimplementing any of it -- exactly the 
   result (or error) rather than re-fetching, and closing the overlay discards it, so reopening is
   armed but not yet run again.
 
-None of the three attests, admits, or trades -- `attest` (the human judgment the whole gate rests
-on) stays deliberately CLI-only, `keel assets attest`. `screen`/`propose`/`discover` only ever
-PROPOSE or REPORT; they cannot themselves put an asset on `allowlist` in `config.yaml`.
+None of the three attests, admits, or trades -- they only ever PROPOSE or REPORT, and cannot
+themselves put an asset on `allowlist` in `config.yaml`. `attest` -- the human judgment the
+whole gate rests on -- stopped being CLI-only when the console's Compliance menu grew the
+typed attest form (C3, `keel/commands/compliance_console.py`): it IS invokable from the
+console now, from the menu and from the scout browser's `a` step, but never on a keypress
+alone -- the form ends in a typed confirmation (type the ASSET CODE back; withdrawals attest
+types its own CLI phrase, `yes`), so the safety is the phrase, not CLI-only-ness.
 
 v4 (this revision) adds `v` **activity** -- `build_activity_overlay` over
 `keel.commands.activity.build_activity_feed`, reusing that module's pure grouping/summarising
@@ -117,6 +121,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import click
@@ -763,9 +768,21 @@ def build_help_screen() -> list[ScreenLine]:
         "  or REPORT -- putting an asset on `allowlist` in config.yaml still needs a human to run"
     )
     _note(
-        "  `keel assets attest` with a source. attest is deliberately CLI-only, never a keypress"
+        "  `keel assets attest` with a source, or the console's Compliance attest form. That form"
     )
-    _note("  here: it is the one step in this whole gate that rests on human judgment, not code.")
+    _note(
+        "  (and the scout browser's `a` step) never attests on a keypress alone: it ends by"
+    )
+    _note(
+        "  making you TYPE THE ASSET CODE back, and withdrawals attest types its own CLI phrase"
+    )
+    _note(
+        "  ('yes') -- the typed phrase is the safety, never where you invoked it from. attest is"
+    )
+    _note(
+        "  the one step in this whole gate that rests on human judgment, not code -- the form"
+    )
+    _note("  collects it, it never supplies it.")
     lines.append(_blank())
     _row("Every action shows a one-line result at the bottom of the dashboard until the next")
     _row("action replaces it.")
@@ -1142,6 +1159,18 @@ def _follow_cursor(offset: int, cursor_line: int, height: int) -> int:
     if cursor_line >= offset + height:
         return max(0, cursor_line - height + 1)
     return max(0, offset)
+
+
+def _cursor_line_index(lines: list[ScreenLine]) -> int:
+    """The index of the single `>`-marked cursor row in `lines`, 0 when there is none --
+    the input to `_follow_cursor`'s scroll math for the cursor-driven console lists (the
+    Compliance menu, the scout file list), whose builders mark the selected row the same
+    way. Scanning beats duplicating each builder's header height here: the two can never
+    disagree about where the cursor is. PURE."""
+    for index, line in enumerate(lines):
+        if line.text.startswith(">"):
+            return index
+    return 0
 
 
 def _visible_slice(lines: list[ScreenLine], offset: int, height: int) -> list[ScreenLine]:
@@ -1535,13 +1564,23 @@ def _do_compliance_network(open_state: OpenState, kind: str) -> Any:
     the dashboard's live-balance line makes) or `list_products` for discover (the same
     product-metadata read `_do_discover_report` makes). Both are BOUNDED, for the same
     reason `_refresh_balance`/`_do_discover_report` are: the operator is actively waiting
-    on a frozen screen. Thin I/O -- the report compute is the service's."""
+    on a frozen screen. Thin I/O -- the report compute is the service's.
+
+    The discover payload is `assets.run_discovery(client, products, config)` -- the SAME
+    sweep `keel assets discover` runs, because the view renders it through
+    `assets.render_discover` (`DiscoverSweep`'s own renderer). `admission.
+    build_discover_report`'s `DiscoverReport` is NOT that shape: it used to be handed to
+    `render_discover` here and the successful-Enter frame died on an `AttributeError`
+    (`DiscoverReport has no survivor_count`) -- the ARMED and error frames hid it, because
+    only a successful Enter ever reached the render."""
     from keel.commands._common import _build_broker
 
     if kind == "discover":
+        from keel.commands.assets import run_discovery
+
         _repo, config = open_state()
-        products = _build_broker(config, timeout=_DISCOVER_TIMEOUT_SEC).list_products()
-        return build_discover_report(products, config)
+        client = _build_broker(config, timeout=_DISCOVER_TIMEOUT_SEC)
+        return run_discovery(client, client.list_products(), config)
     if kind == "holdings":
         from keel.commands.assets import gather_holdings
 
@@ -1593,6 +1632,37 @@ def _do_propose_view(open_state: OpenState) -> ProposeView:
 
     repo, config = open_state()
     return build_propose_view(repo, config, screen_product)
+
+
+def cached_scout_view(
+    repo: Any,
+    config: Any,
+    screen_fn: Any,
+    path: Path,
+    cache: dict[tuple[str, int], ProposeView],
+) -> ProposeView:
+    """`build_propose_view` for the scout browser, cached per (path, mtime_ns): the scout
+    view repaints every poll, and re-reading, re-parsing and re-SCREENING the same
+    unchanged file through the admission gate each poll (a DB read per candidate per
+    poll, and an unbounded read besides -- `build_propose_view` now bounds it at 1 MiB)
+    is pure waste. A file whose mtime changed (or could not be stat'd -- it is rebuilt,
+    fail-soft, rather than served stale) refreshes. The cache is the CALLER'S dict, single
+    purpose: one shortlist is open at a time, and the caller clears it when a write makes
+    the screening stale (the `a` attest step) so a fresh attestation re-screens at once.
+
+    PURE over its inputs (the filesystem aside); `build_propose_view` itself never raises
+    for file problems, so an exception here is a repo problem the caller already fail-softs."""
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1  # unstatable: a key that can never be re-hit, so it never caches
+    key = (str(path), mtime_ns)
+    if key in cache:
+        return cache[key]
+    view = build_propose_view(repo, config, screen_fn, path=path)
+    cache.clear()  # single entry: only the open shortlist is worth holding
+    cache[key] = view
+    return view
 
 
 def _do_discover_report(open_state: OpenState) -> DiscoverReport:
@@ -1808,6 +1878,14 @@ def run_live(
         scout_selected: Any = None
         scout_view_offset = 0
         scout_candidate_cursor = 0
+        # The menu's own scroll offset (the sub-menu is 15 entries -- more rows than a
+        # small terminal once every description fits the 80-column budget), the scout
+        # LIST's (older shortlists sit below the fold on any but a huge window), and the
+        # scout view's per-(path, mtime) cache (`cached_scout_view` -- repaints do not
+        # re-screen an unchanged file).
+        compliance_menu_offset = 0
+        scout_list_offset = 0
+        scout_view_cache: dict[tuple[str, int], ProposeView] = {}
         message: str | None = None
         message_ts = 0
         available: AvailableBalance | None = None
@@ -1849,6 +1927,7 @@ def run_live(
             nonlocal mode, compliance_view_kind, compliance_result, compliance_error
             nonlocal compliance_offset, scout_files, scout_dir, scout_cursor
             nonlocal scout_selected, scout_view_offset, scout_candidate_cursor
+            nonlocal scout_list_offset
             if entry.kind == "view":
                 compliance_view_kind = entry.target
                 compliance_result = None
@@ -1859,6 +1938,7 @@ def run_live(
                 _scout_repo, scout_config = open_state()
                 scout_files, scout_dir = compliance_console.scout_listing(scout_config)
                 scout_cursor = 0
+                scout_list_offset = 0
                 scout_selected = None
                 mode = "scout-list"
             else:
@@ -1896,11 +1976,16 @@ def run_live(
                         mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
                             selected.action, selected
                         )
+                        if selected.action == "compliance":
+                            # Enter the sub-menu at the top, like every other destination.
+                            compliance_menu_offset = 0
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     selected = console.CONSOLE_MENU[menu_cursor]
                     mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
                         selected.action, selected
                     )
+                    if selected.action == "compliance":
+                        compliance_menu_offset = 0
                 continue
 
             if mode == "placeholder":
@@ -1984,10 +2069,24 @@ def run_live(
                 # the terminal right here (curses suspended) and its confirmation line
                 # becomes the toast on this screen; views and the scout browser are
                 # separate modes that close back HERE -- the shell is a hierarchy.
+                # SCROLLED like the other cursor-driven lists (`_visible_slice` +
+                # `_follow_cursor`): the tree is 15 entries and no longer fits a small
+                # window one-row-per-entry, so the cursor's row must follow the cursor.
                 compliance_lines = compliance_console.build_compliance_menu_lines(
                     cursor=compliance_cursor, message=_toast_ttl()
                 )
-                _paint(stdscr, [*_console_banner(), *compliance_lines])
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(compliance_lines)
+                compliance_menu_offset = _follow_cursor(
+                    compliance_menu_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *compliance_lines], compliance_menu_offset, height
+                    ),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("m")):
@@ -2004,6 +2103,15 @@ def run_live(
                         _enter_compliance_entry(compliance_selected)
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     _enter_compliance_entry(compliance_console.COMPLIANCE_MENU[compliance_cursor])
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    compliance_menu_offset = _scroll_offset(
+                        ch,
+                        compliance_menu_offset,
+                        height,
+                        len(banner) + len(compliance_lines),
+                        curses,
+                    )
                 continue
 
             if mode == "compliance-view" and compliance_view_kind is not None:
@@ -2029,9 +2137,21 @@ def run_live(
                         )
                 height, _width = stdscr.getmaxyx()
                 banner = _console_banner()
+                # The shariah browser's two standing honesty lines are a FIXED footer,
+                # reserved off the window BEFORE the body is sliced (`pinned_frame`) --
+                # O10's "always visible" holds at EVERY scroll offset, where riding the
+                # body's tail left them one viewport below the fold on a real allowlist.
+                pinned = (
+                    compliance_console.shariah_honesty_lines()
+                    if compliance_view_kind == "shariah"
+                    else []
+                )
                 _paint(
                     stdscr,
-                    _visible_slice([*banner, *view_lines], compliance_offset, height),
+                    compliance_console.pinned_frame(
+                        [*banner, *view_lines], pinned,
+                        offset=compliance_offset, height=height,
+                    ),
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
@@ -2057,11 +2177,12 @@ def run_live(
                         compliance_error = str(exc)[:200]
                     compliance_offset = 0
                 else:
-                    # Banner-aware total, for the same reason as help's branch above.
+                    # Banner-aware total, for the same reason as help's branch above --
+                    # and the scroll math spends only the rows the pinned footer leaves.
                     compliance_offset = _scroll_offset(
                         ch,
                         compliance_offset,
-                        height,
+                        max(height - len(pinned), 0),
                         len(banner) + len(view_lines),
                         curses,
                     )
@@ -2075,13 +2196,26 @@ def run_live(
                 # CONFIG-named proposals directory, newest first, with a clear empty
                 # state. No network, no repo read -- a directory listing, re-read only on
                 # entry (the files do not change under a held screen the way a DB does).
+                # SCROLLED with the cursor-follow rule like the Compliance menu: older
+                # shortlists sit below the fold on any but a huge window, and O6's whole
+                # point is that they stay REACHABLE.
                 scout_lines = compliance_console.build_scout_list_lines(
                     scout_files, scout_dir, cursor=scout_cursor
                 )
-                _paint(stdscr, [*_console_banner(), *scout_lines])
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(scout_lines)
+                scout_list_offset = _follow_cursor(scout_list_offset, cursor_row, height)
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *scout_lines], scout_list_offset, height),
+                )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (ord("q"), 27):
+                if ch in (ord("q"), 27, ord("m")):
+                    # `m` closes the list too -- the q/Esc/m consistency every other
+                    # console mode keeps, so the key that opened the shell can always
+                    # step back one level out of it.
                     mode = "compliance"
                 elif ch in (curses.KEY_UP, ord("k")):
                     scout_cursor = max(0, scout_cursor - 1)
@@ -2093,22 +2227,37 @@ def run_live(
                     scout_selected = scout_files[scout_cursor].path
                     scout_view_offset = 0
                     scout_candidate_cursor = 0
+                    scout_view_cache = {}  # a fresh selection starts uncached
                     mode = "scout-view"
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    scout_list_offset = _scroll_offset(
+                        ch,
+                        scout_list_offset,
+                        height,
+                        len(banner) + len(scout_lines),
+                        curses,
+                    )
                 scout_cursor = max(0, min(scout_cursor, max(0, len(scout_files) - 1)))
                 continue
 
             if mode == "scout-view" and scout_selected is not None:
-                # The selected shortlist, screened through THE admission services each
-                # poll (fail-soft: `build_propose_view` itself never raises for file
-                # problems; this catches a locked DB), with a cursor over the candidate
-                # rows. `a` offers the TYPED attest step for the selected candidate --
+                # The selected shortlist, screened through THE admission services
+                # (fail-soft: `build_propose_view` itself never raises for file problems;
+                # this catches a locked DB), with a cursor over the candidate rows. The
+                # view is cached per (path, mtime) -- the screen repaints every poll, and
+                # an UNCHANGED file must not be re-read, re-parsed and re-screened each
+                # time; a changed file (new mtime) refreshes, and the `a` attest step
+                # clears the cache because its write changes what screening says.
+                # `a` offers the TYPED attest step for the selected candidate --
                 # proposer-never-decider, so nothing attests without the human's phrase.
                 from keel.commands.assets import screen_product
 
                 scout_repo, scout_config = open_state()
                 try:
-                    scout_view = build_propose_view(
-                        scout_repo, scout_config, screen_product, path=scout_selected
+                    scout_view = cached_scout_view(
+                        scout_repo, scout_config, screen_product, scout_selected,
+                        scout_view_cache,
                     )
                 except Exception as exc:
                     scout_view = ProposeView(
@@ -2143,7 +2292,10 @@ def run_live(
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (ord("q"), 27):
+                if ch in (ord("q"), 27, ord("m")):
+                    # `m` closes the view too -- the q/Esc/m consistency every other
+                    # console mode keeps, so the key that opened the shell can always
+                    # step back one level out of it.
                     mode = "scout-list"
                     scout_view_offset = 0
                 elif ch == ord("a") and scout_candidates > 0:
@@ -2164,6 +2316,10 @@ def run_live(
                         ),
                     )
                     message_ts = now_fn()
+                    # The write changes what the gate says (an attested candidate no
+                    # longer reads REJECT) -- the cached view is stale the moment it
+                    # lands, so the next poll re-screens.
+                    scout_view_cache = {}
                 elif ch in (curses.KEY_UP, ord("k")):
                     scout_candidate_cursor = max(0, scout_candidate_cursor - 1)
                 elif ch in (curses.KEY_DOWN, ord("j")):
@@ -2613,8 +2769,11 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     opens scoped to TODAY (the local calendar day) and `t` inside it widens to 7 days or to all
     the history the bounded read covers; a day with no cycle yet says when keel last ran and when
     the next run is due rather than showing an empty panel.
-    None of `screen`/`propose`/`discover` attests, admits, or trades -- `attest` (the human
-    judgment this whole gate rests on) stays deliberately CLI-only, `keel assets attest`. `a`
+    None of `screen`/`propose`/`discover` attests, admits, or trades -- they only PROPOSE or
+    REPORT. `attest` is invokable from the console's Compliance menu (and the scout browser's
+    `a` step) but never on a keypress alone: the form ends in a typed confirmation -- type the
+    asset code back; withdrawals attest types its own CLI phrase -- so the phrase, not
+    CLI-only-ness, is the safety. `a`
     toggles autonomy (turning it OFF is instant, turning it ON needs a typed "yes" at the
     terminal, exactly like `keel autonomy on`); `f` fetches fresh candle history for every
     configured product (money-safe: no orders); `r` refreshes immediately. Quit with `q`.

@@ -38,7 +38,9 @@ resolves to a real section heading of that document. Nothing on that screen is a
 fiqh summary: the vocabulary section quotes the document too, and a term the document does not
 state (gharar) is rendered as not-stated-there rather than defined -- the document's own
 honesty rule, inherited. The two standing honesty lines are pinned to the document's wording
-and always visible.
+and to a FIXED footer of the view (`shariah_honesty_lines` + `pinned_frame`), painted outside
+the scroll so they stay on screen at every scroll offset -- not merely present at the body's
+end, one viewport below the fold.
 """
 
 from __future__ import annotations
@@ -66,7 +68,14 @@ from keel.commands.subscription import (
     apply_subscription_attest,
     apply_subscription_set,
 )
-from keel.commands.tui import ScreenLine, _admission_line_style, _blank
+from keel.commands.tui import (
+    ScreenLine,
+    _admission_line_style,
+    _blank,
+    _message_style,
+    _visible_slice,
+)
+from keel.commands.withdrawals import WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL
 from keel.compliance.screen import KNOWN_BACKINGS, KNOWN_WRAPPERS, WAIVABLE_CRITERIA
 from keel.execution.executor import WITHDRAWAL_ATTESTATION_TTL_SEC
 
@@ -226,33 +235,60 @@ def compliance_entry(ordinal: int) -> ComplianceEntry | None:
     return None
 
 
+#: The width every console line must fit: `_paint` clips at the window width and
+#: 80-column terminals are this dashboard's stated target -- a clipped entry description
+#: tail would be the "what will this do" half of the row (O8), so the menu WRAPS instead.
+_MENU_WIDTH = 80
+
+
+def _entry_rows(entry: ComplianceEntry, cursor: bool) -> list[ScreenLine]:
+    """One menu entry within the 80-column budget: the ordinal+label row (carrying the
+    `[typed]` marker), with the description on the same row when it fits and on its own
+    indented rows when it does not -- the profile menu's guarded-note style, never a
+    clipped tail. PURE."""
+    marker = ">" if cursor else " "
+    head = f"{marker} {entry.ordinal:>2}  {entry.label}"
+    if entry.typed:
+        head += "  [typed]"
+    style = "heading" if cursor else "normal"
+    if len(head) + 1 + len(entry.description) <= _MENU_WIDTH:
+        return [ScreenLine(f"{head} {entry.description}", style)]
+    return [
+        ScreenLine(head, style),
+        *(
+            ScreenLine(wrapped, "muted")
+            for wrapped in _wrap(entry.description, width=_MENU_WIDTH - 2, indent="      ")
+        ),
+    ]
+
+
 def build_compliance_menu_lines(
     *, cursor: int = 0, message: str | None = None
 ) -> list[ScreenLine]:
-    """The Compliance sub-menu screen: every PRD §3 entry with its description, the typed
-    entries marked, exactly one cursor-marked row, and the last action's confirmation line
-    (`message`) -- every write shows what it did, on the screen it was invoked from. PURE."""
+    """The Compliance sub-menu screen: every PRD §3 entry with its description (wrapped to
+    the 80-column budget, never clipped), the typed entries marked, exactly one
+    cursor-marked row, and the last action's confirmation line (`message`) -- every write
+    shows what it did, on the screen it was invoked from. PURE."""
     lines: list[ScreenLine] = [
         ScreenLine("keel console -- compliance", "heading"),
         _blank(),
     ]
     cursor = max(0, min(cursor, len(COMPLIANCE_MENU) - 1))
     for index, entry in enumerate(COMPLIANCE_MENU):
-        marker = ">" if index == cursor else " "
-        text = f"{marker} {entry.ordinal:>2}  {entry.label:<22} {entry.description}"
-        if entry.typed:
-            text += "  [typed]"
-        lines.append(ScreenLine(text, "heading" if index == cursor else "normal"))
+        lines.extend(_entry_rows(entry, cursor=index == cursor))
     lines.append(_blank())
     lines.append(
         ScreenLine(
-            "up/k down/j move · Enter/Space select · 1-9 jump · q/Esc/m to the Compliance menu",
-            "muted",
+            "up/k down/j move · Enter/Space select · 1-9 jump", "muted",
         )
     )
+    lines.append(ScreenLine("q/Esc/m to the Compliance menu", "muted"))
     if message is not None:
         lines.append(_blank())
-        lines.append(ScreenLine(message, "ok"))
+        # The toast's STYLE follows the message's own semantics (a failure is an alert,
+        # a cancellation a warning) -- `_message_style`, the rule every other console
+        # toast keeps; a hardcoded "ok" made a green "failed" line.
+        lines.append(ScreenLine(message, _message_style(message)))
     return lines
 
 
@@ -299,9 +335,14 @@ def _ask(prompt_fn: PromptFn, question: str) -> str:
 def typed_asset_confirmation(asset: str, prompt_fn: PromptFn) -> bool:
     """The attest form's typed gate (the PRD tree marks attest "(typed)"): the operator
     types the ASSET CODE back, naming the thing being recorded. Nothing is pre-filled and
-    no other phrase accepts -- the question SHOWS the code, the answer must BE it."""
-    answer = _ask(prompt_fn, f'Type "{asset}" to record this attestation (anything else cancels)')
-    return answer.upper() == asset.upper()
+    no other phrase accepts -- the question SHOWS the code, the answer must BE it, exactly:
+    case-sensitive, with no whitespace tolerance beyond the trailing newline the prompt
+    itself appends. The CLI's own typed gate (`_require_interactive_confirmation`) accepts
+    exactly `yes` -- not `YES`, not ` yes ` -- and this gate is exactly as strict."""
+    answer = prompt_fn(
+        f'Type "{asset}" to record this attestation (anything else cancels)'
+    ).rstrip("\n")
+    return answer == asset
 
 
 def collect_attest(prompt_fn: PromptFn, *, asset: str | None = None) -> AttestFields | None:
@@ -380,39 +421,60 @@ def run_attest_form(
     return apply_attest(repo, fields, now_ts)
 
 
-def run_instrument_attest_form(repo: Any, prompt_fn: PromptFn, now_ts: int) -> str:
-    """`keel assets attest-instrument` as a form. Not typed (the CLI's own gate is none);
-    the wrapper vocabulary is enforced exactly as the CLI's Choice enforces it."""
+def collect_instrument_attest(prompt_fn: PromptFn) -> InstrumentAttestFields | None:
+    """Collect the attest-instrument fields through `prompt_fn`. `None` = cancelled (empty
+    product). Raises `FormInputError` for a field the CLI's own Choice validation would
+    refuse -- the same convention `collect_attest` keeps: the COLLECT step raises, the
+    `run_*` wrapper renders (one error shape, not two)."""
     venue = _ask(prompt_fn, f"venue (empty = {VENUE}, the default)")
     if not venue:
         venue = VENUE
     product = _ask(prompt_fn, "venue product id (e.g. BTC-USD) -- empty cancels")
     if not product:
-        return "attest-instrument cancelled -- nothing recorded"
+        return None
     product = product.upper()  # matches the uppercase ids the screen looks up by
     wrapper = _ask(
         prompt_fn, f"wrapper -- one of: {', '.join(sorted(KNOWN_WRAPPERS))} (only spot admits)"
     ).lower()
     if wrapper not in KNOWN_WRAPPERS:
-        return (
-            f"Error: wrapper must be one of: {', '.join(sorted(KNOWN_WRAPPERS))}; "
-            f"got {wrapper!r}"
+        raise FormInputError(
+            f"wrapper must be one of: {', '.join(sorted(KNOWN_WRAPPERS))}; got {wrapper!r}"
         )
     source = _ask(prompt_fn, "source -- the venue's contract spec, its API docs, a filing")
     if not source:
-        return "Error: an unsourced claim is not evidence -- source is required"
+        raise FormInputError("an unsourced claim is not evidence -- source is required")
     attested_by = _ask(prompt_fn, "attested-by -- who established it")
     if not attested_by:
-        return "Error: attested-by is required"
-    repo.upsert_instrument_attestation(
+        raise FormInputError("attested-by is required")
+    return InstrumentAttestFields(
         venue=venue,
-        product_id=product,
+        product=product,
         wrapper=wrapper,
         source=source,
         attested_by=attested_by,
+    )
+
+
+def run_instrument_attest_form(repo: Any, prompt_fn: PromptFn, now_ts: int) -> str:
+    """`keel assets attest-instrument` as a form. Not typed (the CLI's own gate is none);
+    the wrapper vocabulary is enforced exactly as the CLI's Choice enforces it, as a
+    `FormInputError` from the collect step rendered here -- `run_attest_form`'s own
+    convention, never a second inline error-string shape."""
+    try:
+        fields = collect_instrument_attest(prompt_fn)
+    except FormInputError as exc:
+        return f"Error: {exc}"
+    if fields is None:
+        return "attest-instrument cancelled -- nothing recorded"
+    repo.upsert_instrument_attestation(
+        venue=fields.venue,
+        product_id=fields.product,
+        wrapper=fields.wrapper,
+        source=fields.source,
+        attested_by=fields.attested_by,
         attested_at=now_ts,
     )
-    return f"attested {product} on {venue}: wrapper={wrapper}"
+    return f"attested {fields.product} on {fields.venue}: wrapper={fields.wrapper}"
 
 
 def run_exempt_form(repo: Any, prompt_fn: PromptFn, now_ts: int) -> str:
@@ -524,7 +586,9 @@ def run_subscription_set_form(
 
 def clis_typed_withdrawals_gate() -> bool:
     """The CLI's OWN typed gate for `withdrawals attest --enabled`, called verbatim:
-    `_require_interactive_confirmation` with the command's exact action/detail wording.
+    `_require_interactive_confirmation` with the command's exact action/detail wording --
+    imported from `withdrawals.py`, their ONE home, so the console and the CLI can never
+    drift into two wordings for the same gate (pinned by test against that home).
     The console wraps it in the curses suspend/restore dance so the prompt renders
     in-console; the gate itself is untouched -- never pre-filled, never piped. Fails
     CLOSED: a wrong phrase, a Ctrl-C, any exception answers False and the halt stays."""
@@ -532,8 +596,7 @@ def clis_typed_withdrawals_gate() -> bool:
 
     try:
         _require_interactive_confirmation(
-            "attest withdrawals as ENABLED",
-            "This RELEASES rail 17's entry halt; the agent may place orders on its next cycle.",
+            WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL
         )
         return True
     except Exception:
@@ -627,27 +690,30 @@ def build_scout_list_lines(
     """The Scout results browser's file list: every shortlist newest-first with its date,
     exactly one cursor row, and an empty state that names the directory it read AND the
     filename convention -- an operator whose file is called `candidates.json` is one
-    rename away and must be able to discover that from this screen. PURE."""
+    rename away and must be able to discover that from this screen. The directory-bearing
+    lines WRAP to the 80-column budget (`_paint` clips at the window width): a path's tail
+    is exactly the part that identifies it. PURE."""
     lines: list[ScreenLine] = [
         ScreenLine("keel console -- compliance / Scout results", "heading"),
-        ScreenLine(f"shortlists in {directory} (config proposals_dir), newest first", "muted"),
-        _blank(),
     ]
+    for wrapped in _wrap(f"shortlists in {directory} (config proposals_dir), newest first",
+                         indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
     if not files:
-        lines.append(
-            ScreenLine(
-                f"no proposals -- {directory} holds no *shortlist.json file yet.", "normal"
-            )
-        )
-        lines.append(
-            ScreenLine(
-                "the keel-asset-scout writes there (operator-local); a shortlist's name must "
-                'end in "shortlist.json" and hold {"candidates": [...]}.',
-                "muted",
-            )
-        )
+        for wrapped in _wrap(f"no proposals -- {directory} holds no *shortlist.json file yet.",
+                             indent=""):
+            lines.append(ScreenLine(wrapped, "normal"))
+        for wrapped in _wrap(
+            "the keel-asset-scout writes there (operator-local); a shortlist's name must "
+            'end in "shortlist.json" and hold {"candidates": [...]}.',
+            indent="",
+        ):
+            lines.append(ScreenLine(wrapped, "muted"))
         lines.append(_blank())
-        lines.append(ScreenLine("Press q or Esc to return to the Compliance menu.", "muted"))
+        lines.append(
+            ScreenLine("Press q, Esc or m to return to the Compliance menu.", "muted")
+        )
         return lines
     cursor = max(0, min(cursor, len(files) - 1))
     for index, scout_file in enumerate(files):
@@ -658,13 +724,12 @@ def build_scout_list_lines(
         )
         lines.append(ScreenLine(text, "heading" if index == cursor else "normal"))
     lines.append(_blank())
-    lines.append(
-        ScreenLine(
-            "Enter opens a shortlist · q/Esc back -- the flow proposes and screens; it never "
-            "auto-attests",
-            "muted",
-        )
-    )
+    for wrapped in _wrap(
+        "Enter opens a shortlist · q/Esc/m back -- the flow proposes and screens; it "
+        "never auto-attests",
+        indent="",
+    ):
+        lines.append(ScreenLine(wrapped, "muted"))
     return lines
 
 
@@ -895,7 +960,9 @@ def build_shariah_lines(
       `None` rendered UNKNOWN/stale -- fail-closed is a fact worth showing);
     * the fiqh-derived constraints, each a verbatim `docs/fiqh-basis.md` quote with its
       section citation, and the vocabulary anchored the same way;
-    * the two standing honesty lines, ALWAYS visible, in the alert style.
+    * the two standing honesty lines -- as a PINNED FOOTER (`shariah_honesty_lines`,
+      painted outside the scroll by `pinned_frame`), always visible at every scroll
+      offset rather than riding the body's tail a viewport below the fold.
 
     READ-ONLY: pure over its inputs; nothing here re-derives, and no state changes."""
     del now_ts  # the dates rendered are the RECORDS' own stamps, not "now"
@@ -1001,12 +1068,39 @@ def build_shariah_lines(
         for wrapped in _wrap(f"{term.term}: {term.definition}"):
             lines.append(ScreenLine(wrapped, "normal"))
 
-    lines.append(_blank())
+    # The two standing honesty lines are NOT part of this body: they render as a pinned
+    # footer (`shariah_honesty_lines` + `pinned_frame`) so no scroll offset can hide them.
+    return lines
+
+
+def shariah_honesty_lines() -> list[ScreenLine]:
+    """The shariah view's FIXED footer: the two standing honesty lines, wrapped to the
+    80-column budget, in the alert style -- painted OUTSIDE the scroll (see
+    `pinned_frame`), so they are on screen at EVERY scroll offset. O10's "always visible"
+    made structural: as the body's tail they were one viewport below the fold on any real
+    allowlist, and an operator who never scrolled never saw them. PURE."""
+    lines: list[ScreenLine] = []
     for wrapped in _wrap(NOT_A_FATWA_ENGINE_LINE):
         lines.append(ScreenLine(wrapped, "alert"))
     for wrapped in _wrap(f"{NO_SCHOLARLY_REVIEW_LINE} (docs/fiqh-basis.md, review status)"):
         lines.append(ScreenLine(wrapped, "alert"))
     return lines
+
+
+def pinned_frame(
+    body: list[ScreenLine],
+    footer: list[ScreenLine],
+    *,
+    offset: int,
+    height: int,
+) -> list[ScreenLine]:
+    """A scrolled `body` under a FIXED `footer`: the footer's rows are reserved off the
+    window FIRST, then the body is sliced through `_visible_slice` into what remains --
+    so whatever `offset` the body is scrolled to, the frame that gets painted ENDS with
+    the footer's lines. PURE, and total: a footer taller than `height` still renders
+    (clipped by `_paint`, never raising here)."""
+    window = max(height - len(footer), 0)
+    return [*_visible_slice(body, offset, window), *footer]
 
 
 # -- the view overlay ------------------------------------------------------------------------------
@@ -1040,8 +1134,12 @@ def build_compliance_view_lines(
         _blank(),
     ]
     if error is not None:
+        # Honest about what happens next: nothing retries on its own here -- the network
+        # views HOLD this error until Enter re-runs the read (and the offline views
+        # rebuild on the next poll, which Enter also forces) -- so the line names the
+        # retry key instead of claiming a "retrying..." that never happens.
         lines.append(
-            ScreenLine(f"{kind} read failed: {error} -- retrying...", "alert")
+            ScreenLine(f"{kind} read failed: {error} -- press Enter to retry", "alert")
         )
     elif payload is None:
         # The network-gated views' ARMED state: opening them made NO call. What Enter

@@ -390,6 +390,32 @@ def test_build_propose_view_non_utf8_shortlist_is_fail_soft(repo: Repository, tm
     assert view.report is None
 
 
+def test_build_propose_view_bounds_its_shortlist_read(repo: Repository, tmp_path):
+    """The read is BOUNDED (1 MiB, the activity feed's own precedent): the scout screen
+    re-reads the file every poll, so an unbounded `read_text()` made the dashboard's cost
+    grow with whatever a runaway scout had written. An oversize shortlist is a calm,
+    file-naming status -- never a traceback, never a multi-megabyte parse."""
+    from keel.commands.admission import MAX_SHORTLIST_BYTES
+
+    config = _config()
+    directory = tmp_path / "proposals"
+    directory.mkdir()
+    path = directory / "huge-shortlist.json"
+    path.write_text("x" * (MAX_SHORTLIST_BYTES + 1))
+
+    view = build_propose_view(repo, config, cli_module._screen_product, directory=directory)
+
+    assert view.status == "oversize"
+    assert view.source == path
+    assert view.detail is not None
+    assert str(path) in view.detail  # names the file...
+    assert str(MAX_SHORTLIST_BYTES) in view.detail  # ...and the bound it broke
+    assert view.report is None
+    rendered = "\n".join(render_propose_view(view))
+    assert "Traceback" not in rendered
+    assert "too large" in rendered.lower()
+
+
 def test_build_propose_view_defaults_the_directory_to_config_proposals_dir(
     repo: Repository, tmp_path, monkeypatch: pytest.MonkeyPatch
 ):

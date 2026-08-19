@@ -10,6 +10,7 @@ freshness, or autonomy logic, only style `StatusReport` into `ScreenLine`s. Mirr
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -1729,21 +1730,26 @@ def test_build_help_screen_documents_every_key_and_safety_notes() -> None:
     text = " ".join(line.text.lower() for line in lines)
     for word in ("autonomy", "fetch", "quit", "scroll", "refresh", "help"):
         assert word in text
-    # v3: the admission workflow's three overlays and the CLI-only attest step.
+    # v3: the admission workflow's three overlays; C3: attest as a TYPED console form.
     for word in ("screen", "propose", "discover", "attest"):
         assert word in text
     assert lines[0].style == "heading"
 
 
-def test_build_help_screen_documents_discover_network_gating_and_attest_is_cli_only() -> None:
-    """The safety notes must be explicit about the two things that make `discover` different
-    from `screen`/`propose`, and that `attest` -- the one step that actually changes the
-    allowlist -- is never reachable from here."""
+def test_build_help_screen_documents_discover_network_gating_and_the_typed_attest_gate() -> None:
+    """The safety notes must be explicit about the two things that make `discover`
+    different from `screen`/`propose`, and must state attest's CURRENT contract honestly:
+    attest IS invokable from the console (the Compliance menu's form, the scout browser's
+    `a` step) -- what keeps it safe is the TYPED confirmation at the end of the form (type
+    the asset code back; withdrawals attest types its own CLI phrase), NOT a stale
+    "CLI-only, never a keypress" claim this dashboard outgrew in C3."""
     lines = build_help_screen()
     text = " ".join(line.text.lower() for line in lines)
     assert "third deliberate network exception" in text
-    assert "cli-only" in text
+    assert "cli-only" not in text
+    assert "never a keypress" not in text
     assert "keel assets attest" in text
+    assert "type the asset code" in text
 
 
 def test_help_says_which_account_is_on_screen_and_how_to_switch() -> None:
@@ -3424,11 +3430,13 @@ def _console_session(
     height: int = 30,
     start_config: str = "config.paperforward.yaml",
     start_db: str = "keel.db",
+    build_broker: Any = None,
 ) -> tuple[_FakeStdscr, Any]:
     """Run one scripted `run_live` session with a REAL console binding over the temp
     deployment dir, and return (the stdscr with its recorded `addstr` calls, the binding).
     The balance refresh's broker construction is stubbed (it fires on the first poll by
-    design) so no test touches the network."""
+    design) so no test touches the network; a test that needs to observe or count venue
+    calls (the Compliance menu's ARMED views) passes its own `build_broker`."""
     from keel.commands import console
 
     monkeypatch.chdir(tmp_path)
@@ -3448,7 +3456,9 @@ def _console_session(
 
     monkeypatch.setattr(
         "keel.commands._common._build_broker",
-        lambda cfg, timeout=None: _FakeBroker(),
+        build_broker
+        if build_broker is not None
+        else (lambda cfg, timeout=None: _FakeBroker()),
     )
 
     run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
@@ -3854,3 +3864,303 @@ def test_run_live_scout_attest_key_drives_the_typed_form_end_to_end(
     assert rows[0]["sector"] == "payments" and rows[0]["backing"] == "ayn"
     assert any("attested FET" in t for t in painted)
     assert any("cancelled" in t.lower() and "ATOM" in t for t in painted)
+
+
+def _painted_frames(stdscr: _FakeStdscr) -> list[list[str]]:
+    """The painted texts split into FRAMES (one per paint -- delimited by each frame's
+    y=0 row), so a test can assert on what one keypress actually made the loop paint."""
+    texts = [call[2] for call in stdscr.calls]
+    starts = [i for i, call in enumerate(stdscr.calls) if call[0] == 0]
+    return [
+        texts[start : starts[j + 1] if j + 1 < len(starts) else len(texts)]
+        for j, start in enumerate(starts)
+    ]
+
+
+def test_run_live_compliance_holdings_view_is_armed_until_enter(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Compliance menu's holdings view keeps the discover overlay's own gating story,
+    pinned through the LIVE loop: navigating to it, opening it, and polling it ARMED make
+    ZERO venue calls of its own -- the one `get_accounts` happens only on the explicit
+    Enter. `get_accounts` IS called once more during this run -- by the pre-existing
+    automatic first-poll balance refresh (see `test_run_live_screen_and_propose_never_
+    construct_a_broker`'s docstring); with a constant `now_fn` it fires exactly once,
+    before the menu is even open, so a total of 2 is exactly one refresh plus one
+    holdings read -- any call from opening or polling the ARMED view would make it 3."""
+    get_accounts_calls: list[int] = []
+
+    class _CountingBroker:
+        def get_accounts(self) -> list[Any]:
+            get_accounts_calls.append(1)
+            return [
+                {"currency": "SOL", "available_balance": Decimal("3.5")},
+            ]
+
+        def list_products(self) -> list[dict]:
+            return []
+
+    # m -> menu; 5 -> Compliance; 7 -> holdings (ARMED); -1, -1 -> repaints, no call;
+    # 10 -> Enter runs the ONE read; -1 -> repaint the held result, no further call;
+    # 27 -> close to the menu; 27 -> back to the console menu (then the default q quits).
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [ord("m"), ord("5"), ord("7"), -1, -1, 10, -1, 27, 27],
+        build_broker=lambda cfg, timeout=None: _CountingBroker(),
+    )
+    frames = _painted_frames(stdscr)
+
+    assert len(get_accounts_calls) == 2  # one balance refresh + exactly one holdings read
+    armed_frames = [f for f in frames if any("ARMED" in t for t in f)]
+    assert armed_frames, "the holdings view must open ARMED"
+    holdings_frames = [f for f in frames if any("SOL" in t for t in f)]
+    assert holdings_frames, "Enter's held result must paint"
+
+
+def test_run_live_compliance_discover_view_armed_until_enter_and_enter_retries_after_a_failure(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The discover console view, through the loop: ZERO `list_products` calls while
+    navigating/arming, and after a FAILED Enter the held error names the retry key (never
+    a "retrying..." nothing retries on its own) -- and that key ACTUALLY retries: a second
+    Enter runs the read again, so a transient venue failure costs one keypress, not a
+    closed screen. The successful run renders the CLI's own discover sweep (`run_discovery`
+    -> `render_discover`), so the held result paints the candidate the venue returned."""
+    list_products_calls: list[int] = []
+
+    class _FlakyBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            list_products_calls.append(1)
+            if len(list_products_calls) == 1:
+                raise RuntimeError("venue unreachable")
+            return [
+                {
+                    "product_id": "SOL-USD",
+                    "quote_currency_id": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                    "is_disabled": False,
+                    "view_only": False,
+                    "quote_24h_volume": "9000000",
+                    "base_name": "Solana",
+                }
+            ]
+
+    # m -> menu; 5 -> Compliance; 8 -> discover (ARMED); -1 -> repaint, no call; 10 ->
+    # Enter FAILS (error held); -1 -> repaint the error, no call; 10 -> Enter RETRIES and
+    # succeeds; -1 -> repaint the held result, no further call; 27, 27 -> step back out.
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [ord("m"), ord("5"), ord("8"), -1, 10, -1, 10, -1, 27, 27],
+        build_broker=lambda cfg, timeout=None: _FlakyBroker(),
+    )
+    frames = _painted_frames(stdscr)
+
+    assert len(list_products_calls) == 2  # armed: zero; each Enter: exactly one
+    error_frames = [f for f in frames if any("read failed" in t for t in f)]
+    assert error_frames, "the failed Enter must paint the failure"
+    error_text = "\n".join("\n".join(f) for f in error_frames)
+    assert "venue unreachable" in error_text
+    assert "retrying" not in error_text
+    assert "press Enter to retry" in error_text
+    assert any(
+        any("SOL-USD" in t for t in f) for f in frames
+    ), "the retried run's held result must paint"
+
+
+def test_run_live_the_compliance_menu_scrolls_to_keep_the_cursor_visible(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Compliance tree is 15 entries (more rows than a small terminal once every
+    description fits the 80-column budget): the menu must SCROLL -- painted through
+    `_visible_slice`, the cursor row kept on screen by the `_follow_cursor` rule, and
+    End/PgDn reaching the true tail (banner-aware math), exactly like the other overlays.
+    Before this, the tail entries were painted nowhere -- below the fold with no way up."""
+    fake_curses = _fake_curses()
+    # m -> menu; 5 -> Compliance (offset 0 -- purification is below the fold); j x14 ->
+    # walk the cursor down to 'purification'; -1 -> paint with the cursor followed;
+    # End -> the true last page; 27, 27 -> step back out (then the default q quits).
+    keys = [ord("m"), ord("5"), *([ord("j")] * 14), -1, fake_curses.KEY_END, -1, 27, 27]
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path), monkeypatch, keys, height=10
+    )
+    frames = _painted_frames(stdscr)
+
+    first = next(f for f in frames if any("keel console -- compliance" in t for t in f))
+    assert not any("purification" in t for t in first)  # below the fold at offset 0
+    followed = next(
+        f
+        for f in frames
+        if any(t.lstrip().startswith(">") and "purification" in t for t in f)
+    )
+    # End reached the menu's true tail: the closing hint is on screen after it.
+    assert any(
+        any("to the Compliance menu" in t for t in f)
+        for f in frames[frames.index(followed) :]
+    )
+
+
+def test_run_live_the_scout_list_scrolls_to_keep_older_shortlists_reachable(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O6's own promise, made scrollable: the Scout results browser lists EVERY shortlist
+    so an OLDER run stays reachable -- on a small window that means the cursor's row must
+    follow the cursor (`_follow_cursor`), not fall off the fold where the older files sit."""
+    deployment = _deployment_dir(tmp_path)
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    names = [f"2026-08-{day:02d}-shortlist.json" for day in range(1, 13)]
+    for index, name in enumerate(names):
+        path = proposals / name
+        path.write_text("{}")
+        stamp = 1_800_000_000 + index * 3600
+        os.utime(path, (stamp, stamp))
+    (deployment / "config.paperforward.yaml").write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        f"proposals_dir: {proposals}\n"
+    )
+
+    # m -> menu; 5 -> Compliance; 9 -> Scout results (newest first, oldest below the
+    # fold on a 10-line window); j x11 -> the cursor walks to the OLDEST shortlist;
+    # -1 -> paint with the cursor followed; 27, 27 -> back out (then q quits).
+    keys = [ord("m"), ord("5"), ord("9"), *([ord("j")] * 11), -1, 27, 27]
+    stdscr, _binding = _console_session(deployment, monkeypatch, keys, height=10)
+    frames = _painted_frames(stdscr)
+
+    oldest = names[0]
+    first_list = next(
+        f for f in frames if any("compliance / Scout results" in t for t in f)
+    )
+    assert not any(oldest in t for t in first_list)  # below the fold on entry
+    # ...and by the time the cursor has walked to it, its row is ON screen, marked.
+    assert any(
+        any(t.lstrip().startswith(">") and oldest in t for t in f) for f in frames
+    )
+
+
+def test_run_live_the_shariah_view_pins_the_honesty_lines_at_every_scroll_offset(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O10 through the live loop: the two standing honesty lines are a FIXED footer of
+    the shariah view -- painted on the frame at offset 0 AND after End scrolls the body
+    to its tail. Before this they rode the body's END, one viewport below the fold on
+    any real allowlist, and an operator who never scrolled never saw them."""
+    fake_curses = _fake_curses()
+    # m -> menu; 5 -> Compliance; j x9 -> 'Shariah in force'; 10 -> open (offset 0);
+    # -1 -> repaint; End -> the body's true last page; -1 -> repaint; 27, 27 -> back out.
+    keys = [
+        ord("m"), ord("5"), *([ord("j")] * 9), 10, -1, fake_curses.KEY_END, -1, 27, 27,
+    ]
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path), monkeypatch, keys, height=10
+    )
+    frames = _painted_frames(stdscr)
+
+    # The view stays open for exactly three paints after it opens: offset 0, the offset-0
+    # repaint during which End is pressed, and the End-scrolled repaint. Every one of
+    # them -- including the scrolled frame, whose title line has scrolled OFF -- must
+    # carry the pinned honesty lines.
+    first_idx = next(
+        i for i, f in enumerate(frames) if any("compliance / Shariah in force" in t for t in f)
+    )
+    view_frames = frames[first_idx : first_idx + 3]
+    assert len(view_frames) == 3
+    for frame in view_frames:
+        joined = "\n".join(frame)
+        assert "not a fatwa engine" in joined
+        assert "No scholarly review" in joined
+    # and the last frame really IS the scrolled one: the title is gone, the footer
+    # stayed -- that is the below-the-fold bug, inverted.
+    assert not any("compliance / Shariah in force" in t for t in view_frames[2])
+
+
+def test_run_live_m_closes_the_scout_list_and_the_scout_view(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The q/Esc/m close-key consistency every other console mode keeps: `m` -- the key
+    that opened the shell -- steps back one level out of BOTH scout modes (view -> list,
+    list -> the Compliance menu), so an operator is never trapped two levels deep."""
+    deployment = _deployment_dir(tmp_path)
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "2026-08-15-shortlist.json").write_text(
+        '{"candidates": [{"asset": "FET", "rationale": "ai compute", '
+        '"sources": ["https://example.com/fet"]}]}'
+    )
+    (deployment / "config.paperforward.yaml").write_text(
+        "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+        f"proposals_dir: {proposals}\n"
+    )
+
+    # m -> menu; 5 -> Compliance; 9 -> the scout list; 10 -> the shortlist view; m ->
+    # back to the LIST; m -> back to the COMPLIANCE MENU; 27, 27 -> back out; q quits.
+    keys = [ord("m"), ord("5"), ord("9"), 10, ord("m"), ord("m"), 27, 27]
+    stdscr, _binding = _console_session(deployment, monkeypatch, keys)
+    frames = _painted_frames(stdscr)
+
+    view_idx = next(
+        i for i, f in enumerate(frames) if any("shortlist:" in t for t in f)
+    )
+    # `m` from the VIEW landed on the list, not a jump past it...
+    assert any(
+        "2026-08-15-shortlist.json" in t for t in frames[view_idx + 1]
+    )
+    # ...and `m` from the LIST landed on the Compliance menu.
+    assert any(
+        any("keel console -- compliance" in t and "Scout results" not in t for t in f)
+        for f in frames[view_idx + 2 :]
+    )
+
+
+def test_cached_scout_view_rescreens_only_when_the_file_changes(
+    repo: Repository, tmp_path: Any
+) -> None:
+    """The scout view repaints every poll, but the shortlist FILE does not change under a
+    held screen: the parsed-and-screened view is cached per (path, mtime), so a repaint
+    re-screens nothing, while a changed file (new mtime) refreshes. Without the cache
+    every poll re-read, re-parsed and re-SCREENED the same bytes through the admission
+    gate -- a DB read per candidate per poll, for a file that had not changed."""
+    from keel.commands.tui import cached_scout_view
+    from keel.compliance.screen import MarketFacts, ScreenResult
+
+    shortlist = tmp_path / "2026-08-15-shortlist.json"
+    shortlist.write_text(
+        '{"candidates": [{"asset": "FET", "rationale": "ai compute", '
+        '"sources": ["https://example.com/fet"]}]}'
+    )
+    os.utime(shortlist, (1_800_000_000, 1_800_000_000))
+    config = _config(proposals_dir=str(tmp_path))
+    screened: list[str] = []
+
+    def counting_screen_fn(r: Any, product: str, quote: str) -> Any:
+        screened.append(product)
+        facts = MarketFacts(
+            asset="FET", daily_bars=2000, median_daily_volume=Decimal("1000"),
+            quotable_in_settlement_currency=True, product_id="FET-USD", venue="coinbase",
+        )
+        return facts, ScreenResult(asset="FET", admitted=True, failures=[], warnings=[])
+
+    cache: dict[tuple[str, int], Any] = {}
+    first = cached_scout_view(repo, config, counting_screen_fn, shortlist, cache)
+    assert first.status == "ok"
+    assert screened == ["FET-USD"]
+
+    # unchanged mtime -> the cache answers; the gate does not run again
+    second = cached_scout_view(repo, config, counting_screen_fn, shortlist, cache)
+    assert second is first
+    assert screened == ["FET-USD"]
+
+    # a changed file (new mtime) refreshes: the gate runs again on the new bytes
+    shortlist.write_text(
+        '{"candidates": [{"asset": "FET", "rationale": "compute, revised", '
+        '"sources": ["https://example.com/fet-v2"]}]}'
+    )
+    os.utime(shortlist, (1_800_000_100, 1_800_000_100))
+    third = cached_scout_view(repo, config, counting_screen_fn, shortlist, cache)
+    assert third.status == "ok" and third is not first
+    assert screened == ["FET-USD", "FET-USD"]
