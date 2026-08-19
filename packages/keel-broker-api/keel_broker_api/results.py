@@ -35,6 +35,31 @@ class SessionState(str, Enum):
 
 
 @dataclass(frozen=True)
+class MarketSchedule:
+    """The venue's market clock WITH its schedule: `market_clock()`'s session state plus the
+    NEXT OPEN and NEXT CLOSE timestamps, where the venue provides them (issue #388 C2, the
+    console session banner's port read).
+
+    Two halves, deliberately one value object rather than an extended `SessionState`:
+
+    * `state` is the same three-member answer `market_clock()` gives, with the same
+      fail-closed semantics -- `CLOCK_UNAVAILABLE` means "the clock could not be read",
+      never a guess.
+    * `next_open_ts`/`next_close_ts` are EXTRA facts, not guarantees: epoch seconds when the
+      venue's own clock endpoint states them, `None` when it does not. A 24/7 venue answers
+      the port's default (OPEN, both `None`) -- synthesizing timestamps for a market with no
+      calendar would be inventing the locally-maintained calendar FR-9 forbids. A
+      session-bound venue whose clock body omits or mangles them also answers `None` for the
+      unusable field: the session state stands on its own, and a schedule nobody vouches
+      for is dropped rather than guessed.
+    """
+
+    state: SessionState
+    next_open_ts: int | None = None
+    next_close_ts: int | None = None
+
+
+@dataclass(frozen=True)
 class Balance:
     """One currency's balance on the venue."""
 
@@ -111,4 +136,12 @@ class FeeSummary:
             raise ValueError(f"volume_window must be one of {sorted(allowed)}")
 
 
-__all__ = ["Balance", "FeeSummary", "OrderStatus", "PlaceResult", "Preview", "SessionState"]
+__all__ = [
+    "Balance",
+    "FeeSummary",
+    "MarketSchedule",
+    "OrderStatus",
+    "PlaceResult",
+    "Preview",
+    "SessionState",
+]

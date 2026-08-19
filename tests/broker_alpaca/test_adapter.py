@@ -807,6 +807,71 @@ class TestSession:
             is SessionState.CLOSED
         )
 
+    # -- market_schedule (issue #388 C2: the console session banner's port read) ----------------
+
+    def test_market_schedule_parses_the_venues_next_open_and_next_close(self) -> None:
+        """`/v2/clock` already carries `next_open`/`next_close`; the schedule read is the SAME
+        endpoint with those two fields crossed as epoch ints instead of dropped. The fixture's
+        RFC3339 values are pinned as precomputed constants -- recomputing them with the parse
+        helper under test would assert the implementation against itself."""
+        from keel_broker_api.results import MarketSchedule
+
+        open_adapter = AlpacaAdapter(FakeTransport(clock=load_fixture("alpaca_clock_open.json")))
+        assert open_adapter.market_schedule() == MarketSchedule(
+            state=SessionState.OPEN,
+            next_open_ts=1_787_059_800,  # 2026-08-18T13:30:00Z
+            next_close_ts=1_786_996_800,  # 2026-08-17T20:00:00Z
+        )
+        closed_adapter = AlpacaAdapter(
+            FakeTransport(clock=load_fixture("alpaca_clock_closed.json"))
+        )
+        assert closed_adapter.market_schedule() == MarketSchedule(
+            state=SessionState.CLOSED,
+            next_open_ts=1_786_973_400,  # 2026-08-17T13:30:00Z
+            next_close_ts=1_786_996_800,  # 2026-08-17T20:00:00Z
+        )
+
+    def test_market_schedule_fails_closed_like_the_clock_when_unreadable(self) -> None:
+        """The same fail-closed posture `market_clock` keeps: a transport error, a missing
+        transport or a body without a usable `is_open` answers CLOCK_UNAVAILABLE -- never an
+        exception, never a guess -- and claims NO schedule alongside it (nulls, not a
+        timestamp nobody vouches for)."""
+
+        class _ExplodingTransport(FakeTransport):
+            def get_clock(self) -> Any:
+                raise AlpacaAPIError(503, "clock endpoint unavailable")
+
+        for adapter in (
+            AlpacaAdapter(_ExplodingTransport()),
+            AlpacaAdapter(),
+            AlpacaAdapter(FakeTransport(clock={"is_open": None})),
+        ):
+            schedule = adapter.market_schedule()
+            assert schedule.state is SessionState.CLOCK_UNAVAILABLE
+            assert schedule.next_open_ts is None
+            assert schedule.next_close_ts is None
+
+    def test_a_malformed_schedule_timestamp_degrades_to_null_not_an_unreadable_clock(
+        self,
+    ) -> None:
+        """The state and the schedule are different guarantees: a usable `is_open` still
+        answers OPEN/CLOSED when `next_open` is garbage, and only the unusable FIELD is
+        dropped. Laundering a bad timestamp into CLOCK_UNAVAILABLE would hide the venue's
+        own session answer behind a data nit; keeping a parsed-failure value would be
+        worse still."""
+        schedule = AlpacaAdapter(
+            FakeTransport(
+                clock={
+                    "is_open": True,
+                    "next_open": "not-a-timestamp",
+                    "next_close": "2026-08-17T20:00:00Z",
+                }
+            )
+        ).market_schedule()
+        assert schedule.state is SessionState.OPEN
+        assert schedule.next_open_ts is None
+        assert schedule.next_close_ts == 1_786_996_800
+
     def test_no_order_body_ever_asks_for_extended_hours(self) -> None:
         """Overnight/extended sessions are OFF by posture (FR-9): thinner liquidity would
         hold the #350 spread gate permanently. Every body pins `extended_hours: False`."""

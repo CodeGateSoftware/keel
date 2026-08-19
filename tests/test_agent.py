@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from keel_broker_api.results import SessionState
+from keel_broker_api.results import MarketSchedule, SessionState
 from keel_core.telemetry import _FIELDS_ATTR
 
 from keel import agent
@@ -320,6 +320,34 @@ class _SessionClockBroker(FakeBroker):
         return self._clock_answer
 
 
+class _ScheduleClockBroker(_SessionClockBroker):
+    """A `_SessionClockBroker` that also answers the port's SCHEDULE read (issue #388 C2).
+
+    `market_schedule()` returns a canned `MarketSchedule` (or raises, when the test wants a
+    third-party adapter that violates the port); the clock answer is derived from the
+    schedule's own state unless the test overrides it, so the two reads agree by
+    construction the way a conformant adapter's do.
+    """
+
+    def __init__(
+        self,
+        schedule: Any,
+        series: Any = None,
+        venue: str = "",
+        clock_answer: Any = None,
+    ) -> None:
+        state = clock_answer if clock_answer is not None else getattr(schedule, "state", None)
+        super().__init__(state, series=series, venue=venue)
+        self._schedule_answer = schedule
+        self.schedule_calls = 0
+
+    def market_schedule(self) -> Any:
+        self.schedule_calls += 1
+        if isinstance(self._schedule_answer, Exception):
+            raise self._schedule_answer
+        return self._schedule_answer
+
+
 def test_closed_market_skips_the_cycle_like_the_kill_switch(repo, caplog):
     """FR-9: a weekend or holiday on a session-bound venue reads "market closed", never
     "feed stale". The skip mirrors the kill-switch skip exactly -- no poll, no evaluation,
@@ -515,6 +543,152 @@ def test_the_record_is_namespaced_by_the_declared_venue(repo):
     assert repo.get_state("market_session_ts:alpaca") == 90_000
     # The anonymous (legacy) slot stays untouched -- nothing impersonates it.
     assert repo.get_state("market_session") is None
+
+
+# -- the recorded schedule (issue #388 C2: next open/close for the session banner) ---------------
+
+
+def test_the_cycle_records_the_venues_next_open_and_next_close(repo):
+    """O9's banner needs the schedule, and the recording rule is the one B1 set: the one
+    component holding a broker records, every broker-free surface reads. The cycle now
+    records `next_open`/`next_close` under the SAME venue-namespaced keys and the SAME
+    trust window (state + ts + interval), so the banner renders recorded data and never
+    makes a clock call of its own."""
+    broker = _ScheduleClockBroker(
+        MarketSchedule(
+            state=SessionState.OPEN,
+            next_open_ts=1_787_059_800,
+            next_close_ts=1_786_996_800,
+        ),
+        venue="alpaca",
+    )
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session:alpaca") == "open"
+    assert repo.get_state("market_session_ts:alpaca") == 90_000
+    assert repo.get_state("market_session_next_open:alpaca") == 1_787_059_800
+    assert repo.get_state("market_session_next_close:alpaca") == 1_786_996_800
+
+
+def test_an_unreadable_clock_records_no_schedule_at_all(repo):
+    """A CLOCK_UNAVAILABLE cycle still records (the degraded answer is itself a fact), but
+    claims NO schedule: the two keys are written as nulls rather than left carrying the
+    last readable cycle's timestamps -- a stale `next_open` rendered as fact is exactly the
+    TUI-side calendar the PRD forbids."""
+    broker = _ScheduleClockBroker(
+        MarketSchedule(state=SessionState.CLOCK_UNAVAILABLE), venue="alpaca"
+    )
+    # A previous cycle's good record, which the degraded cycle must clear:
+    repo.set_state("market_session_next_open:alpaca", 1_787_059_800)
+    repo.set_state("market_session_next_close:alpaca", 1_786_996_800)
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session:alpaca") == "clock_unavailable"
+    assert repo.get_state("market_session_next_open:alpaca") is None
+    assert repo.get_state("market_session_next_close:alpaca") is None
+
+
+def test_a_pre_schedule_port_broker_still_records_its_session_with_null_times(repo):
+    """A third-party session-bound adapter built against the pre-#388 port (a
+    `market_clock()` but no `market_schedule()`) keeps working: the state is derived from
+    the clock answer and the schedule keys record as nulls -- the port extension breaks no
+    existing adapter."""
+    broker = _SessionClockBroker(SessionState.OPEN, venue="thirdparty")
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session:thirdparty") == "open"
+    assert repo.get_state("market_session_next_open:thirdparty") is None
+    assert repo.get_state("market_session_next_close:thirdparty") is None
+
+
+def test_a_schedule_that_raises_fails_closed_like_a_clock_that_raises(repo):
+    """The port's fail-closed rule, carried to the new read: a schedule read that explodes
+    is a CLOCK_UNAVAILABLE cycle -- the engine never lets it crash, and nothing from it is
+    recorded as fact."""
+    broker = _ScheduleClockBroker(
+        RuntimeError("schedule endpoint exploded"),
+        venue="alpaca",
+        clock_answer=SessionState.OPEN,
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+    assert repo.get_state("market_session:alpaca") == "clock_unavailable"
+    assert repo.get_state("market_session_next_open:alpaca") is None
+
+
+def test_latest_recorded_session_round_trips_what_the_cycle_recorded(repo):
+    """The broker-free read for the banner (and any other surface): one call over the
+    recorded state returns the newest-stamped venue's session WITH its schedule and its
+    freshness -- the same one-recording-everyone-reads shape `recorded_market_closed`
+    already keeps."""
+    broker = _ScheduleClockBroker(
+        MarketSchedule(
+            state=SessionState.CLOSED,
+            next_open_ts=1_787_059_800,
+            next_close_ts=1_786_996_800,
+        ),
+        venue="alpaca",
+    )
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    record = agent.latest_recorded_session(repo, _config(), now_ts=95_000)
+
+    assert record is not None
+    assert record.venue == "alpaca"
+    assert record.state == "closed"
+    assert record.recorded_ts == 90_000
+    assert record.next_open_ts == 1_787_059_800
+    assert record.next_close_ts == 1_786_996_800
+    assert record.fresh is True  # inside the recorded interval's trust window
+    assert record.defused is True  # closed AND fresh -- the alert-defusing state
+
+
+def test_latest_recorded_session_answers_none_when_nothing_was_recorded(repo):
+    """A 24/7 deployment (or one whose agent has never cycled) has no session record at
+    all; the read says `None` rather than inventing one, and the banner decides what that
+    means (24/7 vs CLOCK UNAVAILABLE) from the venue's own declaration."""
+    assert agent.latest_recorded_session(repo, _config(), now_ts=90_000) is None
+
+
+def test_latest_recorded_session_reports_stale_records_as_not_fresh(repo):
+    """The record's honesty has a window (the recorded interval x FEED_STALENESS_CYCLES,
+    exactly `recorded_market_closed`'s): beyond it the state no longer vouches for
+    anything, `fresh` goes False and `defused` goes with it -- the banner renders CLOCK
+    UNAVAILABLE off that, never a months-old 'closed'."""
+    now_ts = 90_000
+    repo.set_state("market_session:alpaca", "closed")
+    repo.set_state("market_session_ts:alpaca", now_ts - 500_000)  # far past 50_000 x 3
+    repo.set_state("market_session_interval_sec:alpaca", 50_000)
+    repo.set_state("market_session_next_open:alpaca", 1_787_059_800)
+
+    record = agent.latest_recorded_session(repo, _config(), now_ts)
+
+    assert record is not None
+    assert record.fresh is False
+    assert record.defused is False
+    assert record.next_open_ts == 1_787_059_800  # the raw record is returned as-is
+
+
+def test_latest_recorded_session_picks_the_newest_stamped_venue(repo):
+    """A repo shared by two deployments answers with the MOST RECENTLY stamped venue's
+    record -- the same tiebreak `status`'s own session read uses, so the two surfaces can
+    never disagree about which venue is on screen."""
+    repo.set_state("market_session:alpaca", "open")
+    repo.set_state("market_session_ts:alpaca", 90_000)
+    repo.set_state("market_session:nyse", "closed")
+    repo.set_state("market_session_ts:nyse", 91_000)
+
+    record = agent.latest_recorded_session(repo, _config(), now_ts=91_500)
+
+    assert record is not None
+    assert record.venue == "nyse"
+    assert record.state == "closed"
 
 
 def test_one_venues_closed_record_does_not_defuse_another_venue(repo):

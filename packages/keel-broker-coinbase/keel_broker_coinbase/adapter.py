@@ -18,10 +18,11 @@ from decimal import Decimal
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import UnsupportedOrder, default_market_schedule
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
+    MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
@@ -82,6 +83,15 @@ class CoinbaseAdapter:
         `self._transport`, which is why it works on a credential-less adapter too).
         """
         return SessionState.OPEN
+
+    def market_schedule(self) -> MarketSchedule:
+        """The port's DEFAULT schedule read, verbatim (issue #388 C2): this venue's clock
+        answer -- the constant `OPEN` -- with NO next_open/next_close claimed. A 24/7 market
+        has no calendar to carry, so synthesizing timestamps would be inventing the
+        locally-maintained calendar FR-9 forbids; `default_market_schedule(self)` is the one
+        shared derivation, not a copy of it.
+        """
+        return default_market_schedule(self)
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

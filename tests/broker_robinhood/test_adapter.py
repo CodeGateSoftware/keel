@@ -1068,6 +1068,19 @@ def test_robinhood_crypto_is_not_session_bound_and_answers_open_offline() -> Non
     assert RobinhoodAdapter().market_clock() is SessionState.OPEN
 
 
+def test_market_schedule_is_the_port_default_open_with_no_times() -> None:
+    """Issue #388 C2: the 24/7 venues ship the port's DEFAULT schedule read -- the clock's
+    OPEN answer with NO next_open/next_close claimed. Constructed with NO transport, for the
+    same reason the clock test above is: a schedule read that touched the network would
+    raise here, so this passing IS the no-call guarantee. Crypto has no calendar to carry."""
+    from keel_broker_api.port import default_market_schedule
+    from keel_broker_api.results import MarketSchedule
+
+    adapter = RobinhoodAdapter()
+    assert adapter.market_schedule() == MarketSchedule(state=SessionState.OPEN)
+    assert adapter.market_schedule() == default_market_schedule(adapter)
+
+
 def test_entry_point_discovery_finds_the_robinhood_adapter() -> None:
     """Installing this package must be sufficient to make it discoverable -- `keel add
     keel-broker-robinhood` and nothing else. A broken entry point here would silently strand the

@@ -17,6 +17,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -3344,3 +3345,206 @@ def test_run_live_activity_paints_the_empty_state_when_today_holds_no_cycle(
     assert any("keel has not run yet today." in t for t in painted)
     assert any("Last cycle:" in t for t in painted)
     assert any("Press t to widen the scope" in t for t in painted)
+
+
+# -- run_live: the console shell (issue #388 C2) ---------------------------------------------------
+
+
+_MINIMAL_CONSOLE_CONFIG = (
+    "allowlist: [BTC]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+)
+_MINIMAL_CONSOLE_CONFIG_ALT = (
+    "allowlist: [ETH]\ncaps: {max_exposure_usd: 100, max_per_asset_pct: 0.5}\n"
+)
+
+
+def _deployment_dir(tmp_path: Any) -> Any:
+    """A working directory holding every known deployment's config, the shape `discover_
+    profiles` reads -- paper-forward is the pair the console starts bound to."""
+    from keel.commands import console
+
+    for profile in console.KNOWN_PROFILES:
+        (tmp_path / profile.config_path).write_text(
+            _MINIMAL_CONSOLE_CONFIG_ALT if profile.key == "paper-hourly" else (
+                _MINIMAL_CONSOLE_CONFIG_ALT if profile.key == "live" else _MINIMAL_CONSOLE_CONFIG
+            )
+        )
+    return tmp_path
+
+
+def _console_run(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    keys: list[int],
+    *,
+    start_config: str = "config.paperforward.yaml",
+    start_db: str = "keel.db",
+) -> tuple[list[str], Any]:
+    """Run one scripted `run_live` session with a REAL console binding over the temp
+    deployment dir, and return (painted texts, the binding). The balance refresh's broker
+    construction is stubbed (it fires on the first poll by design) so no test touches the
+    network."""
+    from keel.commands import console
+
+    monkeypatch.chdir(tmp_path)
+    ctx = click.Context(click.Command("tui"), obj={})
+    ctx.obj["config_path"] = start_config
+    ctx.obj["db_path"] = start_db
+    binding = console.ConsoleBinding(ctx, config_path=start_config, db_path=start_db)
+
+    stdscr = _KeySequenceStdscr(height=30, width=120, keys=keys)
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "keel.commands._common._build_broker",
+        lambda cfg, timeout=None: _FakeBroker(),
+    )
+
+    run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
+    return [call[2] for call in stdscr.calls], binding
+
+
+def test_run_live_with_a_console_binding_paints_the_banner_on_the_dashboard(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O9: the console header IS the banner -- the landing dashboard carries the active
+    profile's config+db pair and the venue session line on EVERY frame, with no key pressed."""
+    painted, _binding = _console_run(_deployment_dir(tmp_path), monkeypatch, [-1])
+
+    assert any(t.startswith("console: paper-forward") for t in painted)
+    assert any("config.paperforward.yaml" in t and "keel.db" in t for t in painted)
+    # coinbase (the config default) is 24/7 -- the explicit always-open rendering.
+    assert any("24/7" in t for t in painted)
+
+
+def test_run_live_without_a_console_binding_is_the_pre_c2_dashboard(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pre-C2 caller (and every existing test) passes no binding: the dashboard must
+    render byte-identically to before -- no banner, no menu key -- so the shell is an
+    addition, never a rewrite."""
+    config = _config()
+    stdscr = _ScriptedStdscr(height=24, width=80, quit_after=2)
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "keel.commands._common._build_broker", lambda cfg, timeout=None: _FakeBroker()
+    )
+
+    run_live(lambda: (repo, config), lambda: NOW_TS, interval=0.01)
+
+    painted = [call[2] for call in stdscr.calls]
+    assert painted and not any(t.startswith("console:") for t in painted)
+
+
+def test_run_live_m_opens_the_menu_and_esc_returns_to_the_dashboard(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell's navigation contract: `m` opens the console menu, every PRD §3 entry is
+    on it, and Esc closes back to the landing dashboard (which stays the landing screen)."""
+    # poll1: normal -> 'm'. poll2: menu, no key. poll3: Esc closes. poll4: 'q' quits.
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), -1, 27]
+    )
+
+    menu_idx = next(i for i, t in enumerate(painted) if "keel console" in t and "menu" in t)
+    menu_text = "\n".join(painted[menu_idx:])
+    for label in (
+        "Dashboard",
+        "Profile",
+        "Trading",
+        "Rules",
+        "Compliance",
+        "Data",
+        "Research",
+        "Account",
+        "Help",
+    ):
+        assert label in menu_text, label
+    # Esc returned to the dashboard: a LATER frame paints the dashboard's own title again.
+    assert any("paper mode" in t for t in painted[menu_idx:])
+
+
+def test_run_live_a_placeholder_entry_lands_in_its_slice_notice(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting a future slice's entry (3 = Trading, C5) renders the notice, not a dead
+    click and not a feature -- the shell is navigation only."""
+    painted, _binding = _console_run(
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("3"), -1, 27, 27]
+    )
+
+    assert any("lands in C5" in t for t in painted)
+    assert any("navigation" in t.lower() for t in painted)
+
+
+def test_run_live_profile_switch_rebinds_the_console_in_one_action(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O4, pinned end to end: one Enter on the paper-hourly row rebinds config+db together,
+    and the very next dashboard frame's banner names the new pair -- the same loaders the
+    CLI uses, no relaunch."""
+    # 'm' menu -> '2' profile -> 'j','j' to paper-hourly (row 3 of 4) -> Enter switches ->
+    # (mode returns to normal) 'q' quits.
+    keys = [ord("m"), ord("2"), ord("j"), ord("j"), 10]
+    painted, binding = _console_run(_deployment_dir(tmp_path), monkeypatch, keys)
+
+    assert binding.config_path == "config.paper-hourly.yaml"
+    assert binding.db_path == "keel-paperhourly.db"
+    assert any("console: paper-hourly" in t for t in painted)
+    assert any("config.paper-hourly.yaml" in t and "keel-paperhourly.db" in t for t in painted)
+    # The switch is toasted like every other action.
+    assert any("profile" in t.lower() and "paper-hourly" in t for t in painted)
+
+
+def test_run_live_live_switch_declined_keeps_the_binding(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live guard, through the loop: selecting LIVE asks (and here, the operator says
+    no) -- the binding keeps the paper pair, the banner still says paper-forward, and the
+    decline is toasted rather than silent."""
+    from keel.commands import console as console_mod
+
+    confirmations: list[str] = []
+
+    def _decline(stdscr: Any, profile: Any) -> bool:
+        confirmations.append(profile.key)
+        return False
+
+    monkeypatch.setattr(tui_mod, "_confirm_live_profile", _decline)
+    # 'm' menu -> '2' profile -> 'j' to live (row 2 of 4) -> Enter asks, declined -> Esc
+    # (to menu) -> Esc (to normal) -> 'q'.
+    keys = [ord("m"), ord("2"), ord("j"), 10, 27, 27]
+    painted, binding = _console_run(_deployment_dir(tmp_path), monkeypatch, keys)
+
+    assert confirmations == ["live"]
+    assert binding.config_path == "config.paperforward.yaml"
+    assert binding.db_path == "keel.db"
+    assert any("unchanged" in t.lower() for t in painted)
+    assert any("console: paper-forward" in t for t in painted)
+    # The live row's guard is stated where the operator selects it.
+    assert any("LIVE" in t for t in painted)
+    assert console_mod.KNOWN_PROFILES[1].requires_confirmation is True
+
+
+def test_run_live_dashboard_entry_returns_to_the_landing_screen(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Menu entry 1 is the dashboard itself: selecting it closes the menu, the same as Esc
+    -- the dashboard remains the console's landing screen."""
+    painted, _binding = _console_run(_deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("1")])
+
+    menu_idx = next(i for i, t in enumerate(painted) if "keel console" in t and "menu" in t)
+    assert any("paper mode" in t for t in painted[menu_idx:])

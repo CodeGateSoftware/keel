@@ -52,10 +52,11 @@ from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, OrderSpec, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import UnsupportedOrder, default_market_schedule
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
+    MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
@@ -226,6 +227,13 @@ class RobinhoodAdapter:
         adapters can answer it).
         """
         return SessionState.OPEN
+
+    def market_schedule(self) -> MarketSchedule:
+        """The port's DEFAULT schedule read, verbatim (issue #388 C2): the constant OPEN
+        clock answer with NO next_open/next_close claimed. Crypto has no session calendar
+        to carry, and this never touches `self._transport` for the same reason the clock
+        read does not -- a credential-less adapter can answer it."""
+        return default_market_schedule(self)
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

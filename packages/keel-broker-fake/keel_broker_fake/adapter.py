@@ -29,10 +29,11 @@ from decimal import Decimal
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import UnsupportedOrder, default_market_schedule
 from keel_broker_api.results import (
     Balance,
     FeeSummary,
+    MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
@@ -97,6 +98,12 @@ class FakeAdapter:
         session-bound and would say so, and this one exists to keep that declaration honest.
         """
         return SessionState.OPEN
+
+    def market_schedule(self) -> MarketSchedule:
+        """The port's DEFAULT schedule read, verbatim (issue #388 C2): the constant OPEN
+        clock answer with NO next_open/next_close. This venue has no clock endpoint at all,
+        so there is no calendar to carry -- claiming timestamps would be inventing one."""
+        return default_market_schedule(self)
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

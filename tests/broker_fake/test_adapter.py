@@ -26,6 +26,18 @@ def test_not_session_bound_and_the_clock_answers_open_as_a_constant() -> None:
     assert adapter.market_clock() is SessionState.OPEN
 
 
+def test_market_schedule_is_the_port_default_open_with_no_times() -> None:
+    """Issue #388 C2: the 24/7 venues ship the port's DEFAULT schedule read -- the clock's
+    OPEN answer, no next_open/next_close claimed. There is no clock endpoint to consult, so
+    claiming timestamps would be inventing a calendar."""
+    from keel_broker_api.port import default_market_schedule
+    from keel_broker_api.results import MarketSchedule
+
+    adapter = FakeAdapter()
+    assert adapter.market_schedule() == MarketSchedule(state=SessionState.OPEN)
+    assert adapter.market_schedule() == default_market_schedule(adapter)
+
+
 def test_market_ioc_quote_is_unsupported() -> None:
     """Not every venue can size a market order in quote currency."""
     adapter = FakeAdapter()
