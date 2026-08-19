@@ -586,10 +586,12 @@ def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: An
     quote_row = _results(_transport().get_best_bid_ask(symbol="BTC-USD"))[0]
     assert quote_row["symbol"] == "BTC-USD"
     assert quote_row["timestamp"], "the venue timestamps every quote row -- #217 F8"
-    # `Decimal`, never a lexical comparison: these arrive quoted, and `"9" > "10"` as strings.
-    assert Decimal(quote_row["bid"]) < Decimal(quote_row["ask"]), (
-        "a bid at or above the ask would invert every spread-based check"
-    )
+    assert isinstance(quote_row["bid"], str), "this endpoint quotes its numbers -- #217 F6"
+    # NOT `bid < ask`. This fixture used to assert that and BTC-USD does not honour it (#413):
+    # the two legs are sampled independently, so on a pair whose real spread is under a basis
+    # point they arrive out of order. A spread check written against the old assertion would read
+    # a negative spread as a venue error on exactly the assets keel trades most.
+    assert Decimal(quote_row["bid"]) != Decimal(quote_row["ask"])
 
     # The contrast, in one place: the same transport, the same decoder, a different endpoint.
     http(_FakeResponse(text=_fixture_text("rh_estimated_price.json")))

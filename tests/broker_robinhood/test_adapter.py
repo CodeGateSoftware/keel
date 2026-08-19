@@ -1333,6 +1333,7 @@ _QUOTED_FIELDS: dict[str, tuple[str, ...]] = {
         "min_order_amount",
     ),
     "rh_best_bid_ask.json": ("bid", "ask"),
+    "rh_best_bid_ask_uncrossed.json": ("bid", "ask"),
 }
 
 
@@ -1451,8 +1452,43 @@ def test_best_bid_ask_carries_a_bid_and_an_ask_and_nothing_invented() -> None:
     """
     row = load_fixture("rh_best_bid_ask.json")["results"][0]
     assert set(row) == {"symbol", "timestamp", "bid", "ask"}
-    # `Decimal`, not a string comparison. These arrive quoted from this endpoint, and `"9" > "10"`
-    # lexically -- an ordering bug that only shows up once the price crosses a digit boundary.
-    assert Decimal(row["bid"]) < Decimal(row["ask"]), (
-        "a bid at or above the ask would invert every spread check"
+
+
+def test_best_bid_ask_legs_cross_on_a_tight_pair_and_that_is_the_venue_not_the_fixture() -> None:
+    """#413. The previous fixture asserted `bid < ask` and BTC-USD does not honour it.
+
+    This is the inverse of #217 F4's failure and the same category of harm. That fixture invented
+    keys the venue never sends; this one invented an ORDERING the venue does not produce, which is
+    harder to spot because a tidy 15 bps spread is exactly what a reader expects to see.
+
+    Measured 2026-08-19, three samples ~2s apart, five pairs: BTC-USD and DOGE-USD crossed every
+    time, ETH-USD twice of three, XLM-USD and ADA-USD never. The crossings are all under 1.4 bps
+    and the pairs that never cross are the ones whose real spread (2-5 bps) is wider than that.
+    So the legs are sampled independently and stamped with one `timestamp` -- the row asserts a
+    simultaneity it does not have, and where the true spread is thinner than the sampling jitter
+    the two legs land out of order.
+
+    Both fixtures exist because ONE of them would be a fresh false claim: a lone crossed row says
+    "always crossed" as confidently as the old one said "never". That is #230's lesson exactly --
+    a fixture can be wrong by being unrepresentative, not only by being invented -- and it is why
+    the assertion below is about the endpoint admitting both orderings rather than about either
+    row's own ordering being the rule.
+    """
+    crossed = load_fixture("rh_best_bid_ask.json")["results"][0]
+    uncrossed = load_fixture("rh_best_bid_ask_uncrossed.json")["results"][0]
+
+    # `Decimal`, never a string comparison. These arrive quoted from this endpoint, and
+    # `"9" > "10"` lexically -- an ordering bug that surfaces only once a price crosses a digit
+    # boundary.
+    assert Decimal(crossed["bid"]) > Decimal(crossed["ask"]), (
+        "BTC-USD's legs cross; a fixture that hides it lets a spread check be written against an "
+        "ordering the venue does not guarantee"
     )
+    assert Decimal(uncrossed["bid"]) < Decimal(uncrossed["ask"]), (
+        "XLM-USD's do not; the endpoint is not uniformly inverted either"
+    )
+    # The crossing is jitter-sized, not a semantic inversion -- a swapped pair of labels would be
+    # a whole spread wide. Pinned so a future row that crosses by percent gets read as the
+    # different, worse finding it would be.
+    gap = abs(Decimal(crossed["bid"]) - Decimal(crossed["ask"])) / Decimal(crossed["bid"])
+    assert gap < Decimal("0.0005"), "a crossing this wide would not be a sampling artefact"

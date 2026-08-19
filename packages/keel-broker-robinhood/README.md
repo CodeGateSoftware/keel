@@ -202,7 +202,18 @@ element, so "matches observed responses" meant "matches `results[0]`" -- which i
 63 of 89 trading pairs was declared non-existent and deleted. The probe now merges every element
 of a list and marks a partially present key `key (63/89)`, so the claim means what it says; but a
 probe run still only corroborates what the account's own data exercises, and a fixture is only as
-corroborated as its most recent run. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
+corroborated as its most recent run.
+
+⚠️ **And read it with #413 in mind too: the probe compares SHAPES, never values.** It matched
+`rh_best_bid_ask.json` on every run while that fixture carried `bid` `65380.00` / `ask`
+`65480.00` -- a tidy 15 bps spread BTC-USD does not produce. The venue returns `bid` ABOVE `ask`
+on its tightest pairs (BTC-USD and DOGE-USD on every sample taken 2026-08-19, ETH-USD on two of
+three; XLM-USD and ADA-USD never), because the two legs are sampled independently and then
+stamped with a single `timestamp`. The fixture now carries an observed crossed BTC-USD row, and
+`rh_best_bid_ask_uncrossed.json` an observed XLM-USD one, because either alone would state a rule
+the endpoint does not follow. That old fixture also invented `"next": null, "previous": null`,
+which this endpoint does not send. Anything reading this endpoint must tolerate a non-positive
+spread -- see `transport.get_best_bid_ask` and #413. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
 `rh_order_canceled.json`) remain unverified against the venue**, because observing an order
 object requires placing a real order, which that script refuses by construction. Their field
 names are still read from the documentation alone, and `place_order` / `get_order` /
