@@ -93,7 +93,7 @@ def test_read_document_lines_is_bounded(tmp_path: Path) -> None:
     big.write_text("x" * (rc.MAX_DOC_BYTES + 10))
     lines = rc.read_document_lines(big)
     joined = "\n".join(lines)
-    assert "truncated" in joined
+    assert "truncated" in (" ".join(joined.split()))
     assert len(joined) < rc.MAX_DOC_BYTES + 10_000
 
 
@@ -139,15 +139,18 @@ def test_the_doc_list_renders_files_and_an_honest_empty_state(tmp_path: Path) ->
     lines = rc.build_doc_list_lines("experiments", files, tmp_path)
     texts = [line.text for line in lines]
     joined = "\n".join(texts)
+    # Wrap-normalized: the 80-col budget can break any phrase across lines (a long
+    # tmp path shifts every wrap point), so assertions read whitespace-collapsed text.
+    collapsed = " ".join(joined.split())
     assert any("only.md" in t for t in texts)
     # The directory is named, wrapped to the budget (a long tmp path breaks across lines,
     # so the assertion reads the JOINED body, not one line).
-    assert tmp_path.name in joined or str(tmp_path) in joined
-    assert "newest first" in joined
+    assert tmp_path.name in collapsed or str(tmp_path) in collapsed
+    assert "newest first" in collapsed
 
     empty = rc.build_doc_list_lines("experiments", (), tmp_path)
     joined = "\n".join(line.text for line in empty)
-    assert "no documents" in joined
+    assert "no documents" in (" ".join(joined.split()))
 
 
 def test_the_doc_list_rows_fit_the_80_column_clip(tmp_path: Path) -> None:
@@ -223,7 +226,7 @@ def test_the_trials_view_lists_the_ledger_and_renders_the_chain_verdict(tmp_path
     assert any("t1" in t for t in texts)
     assert any("t2" in t for t in texts)
     assert "M=" in joined
-    assert "chain intact" in joined
+    assert "chain intact" in (" ".join(joined.split()))
 
 
 def test_the_trials_view_renders_a_broken_chain_fail_loud(tmp_path: Path) -> None:
@@ -238,14 +241,14 @@ def test_the_trials_view_renders_a_broken_chain_fail_loud(tmp_path: Path) -> Non
     path.write_text("\n".join(rows) + "\n")
     lines = rc.build_trials_lines(path)
     joined = "\n".join(line.text for line in lines)
-    assert "chain intact" not in joined
+    assert "chain intact" not in (" ".join(joined.split()))
     assert "CHAIN BROKEN" in joined or "error" in joined.lower()
 
 
 def test_the_trials_view_is_calm_about_an_absent_ledger(tmp_path: Path) -> None:
     lines = rc.build_trials_lines(tmp_path / "absent.jsonl")
     joined = "\n".join(line.text for line in lines)
-    assert "no trials" in joined
+    assert "no trials" in (" ".join(joined.split()))
 
 
 # -- the menu screen ----------------------------------------------------------------------------
