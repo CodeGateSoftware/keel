@@ -114,6 +114,58 @@ class TurtleBreakout(Rule):
 
     promotion_class = "trend_follow"
 
+    # Per-parameter docstrings, AT THE CLASS (issue #390 C4 / PRD O8's parameter-level
+    # requirement): the single source `keel.commands.rules.describe_params` renders by
+    # introspection, so the add-form's per-field help and the ledger's detail view can never
+    # drift from the params this constructor actually accepts. Every operator-facing param
+    # (all but `product_id` and `name`) carries one; a missing entry is a missing help line,
+    # pinned by test. Plain-English, one screen line each: what it means and which way
+    # turning it goes.
+    PARAM_DOCS: dict[str, str] = {
+        "granularity": (
+            "the candle series the rule decides on (ONE_DAY default); the lookbacks are "
+            "BAR counts at this granularity"
+        ),
+        "entry_lookback": (
+            "Donchian-high entry channel, in bars of the rule's granularity; the "
+            "walk-forward OOS default is 40 (was 20). Longer = fewer, later entries."
+        ),
+        "exit_lookback": (
+            "Donchian-low exit channel, in bars; half the entry by default. Shorter = "
+            "quicker exits that cut winners sooner."
+        ),
+        "adx_period": "ADX smoothing length for the trend-strength gate (classic 14).",
+        "adx_threshold": (
+            "minimum ADX to confirm a trend (KB §25.1: ADX<25 = ranging, stand aside). "
+            "Lower = more entries in weak trends."
+        ),
+        "atr_period": "ATR length for the 'N' the stop is sized from (Turtle's 20).",
+        "atr_stop_mult": (
+            'Stop distance in ATRs ("N"; default 2N). Wider = fewer stop-outs, bigger '
+            "risk per trade -- feeds the R:R the promotion gate floors."
+        ),
+        "use_macd_confirm": (
+            "also require a positive MACD histogram at the breakout (default off). "
+            "Tightens entries."
+        ),
+        "s1_filter": (
+            "Turtle S1 filter: skip an entry when the most recent completed prior "
+            "breakout trade would have won (default off)."
+        ),
+        "min_volume_filter": (
+            "require above-average breakout volume (default off) -- a thin-volume "
+            "breakout is a likely fakeout."
+        ),
+        "volume_ma_period": (
+            "lookback (bars) for the average-volume comparison when min_volume_filter is on."
+        ),
+        "volume_mult": "breakout volume must exceed this multiple of the average volume.",
+        "target_rr": (
+            "nominal take-profit distance in R; the real exit is the channel-low -- it "
+            "exists to clear the engine's rr>=1 kill-zone gate and let winners run."
+        ),
+    }
+
     # How many completed daily bars back the S1 filter replays to find the most recent
     # completed prior breakout trade (~16 months) -- generous enough to always contain it at
     # these channel lengths, and it only runs on a bar that breaks out, so the cost is trivial.

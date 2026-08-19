@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Literal
+from typing import ClassVar, Literal
 
 from keel.analysis.indicators import atr, rsi, rsi_divergence
 from keel.analysis.levels import (
@@ -35,6 +35,48 @@ class RsiMeanReversion(Rule):
     """RSI mean-reversion: oversold bounce at support -> long entry; overbought ->
     exit a held long. See module docstring for the exact gating logic.
     """
+
+    # Per-parameter docstrings, AT THE CLASS (issue #390 C4 / PRD O8): the single source
+    # `keel.commands.rules.describe_params` renders by introspection. `ClassVar` is what
+    # keeps the dataclass machinery from mistaking it for a constructor field -- an honest
+    # annotation for a class-level table either way.
+    PARAM_DOCS: ClassVar[dict[str, str]] = {
+        "oversold": (
+            "RSI level that marks oversold; the bounce trigger. Lower = fewer, "
+            "deeper-dip entries."
+        ),
+        "overbought": "RSI level that closes a held long. Higher = hold winners longer.",
+        "require_divergence": (
+            "also require a bullish RSI divergence (price lower low, RSI higher low) at "
+            "the bounce (default off)."
+        ),
+        "stop_method": (
+            "how the stop is computed: 'fixed' (a percent below entry) or 'atr' (a "
+            "multiple of ATR)."
+        ),
+        "target_method": "how the target is computed: 'nearest_resistance' or 'fixed_rr'.",
+        "rsi_period": "RSI length (classic 14).",
+        "atr_period": "ATR length for the 'atr' stop method.",
+        "atr_mult": "ATR multiple for the 'atr' stop method. Wider = fewer stop-outs.",
+        "fixed_stop_pct": "fraction below entry for the 'fixed' stop method (0.03 = 3%).",
+        "fixed_rr": "reward:risk multiple for the 'fixed_rr' target method.",
+        "level_tolerance": (
+            "how close two prices must be to count as one support/resistance level."
+        ),
+        "level_min_touches": (
+            "touches required before a price counts as a support/resistance level."
+        ),
+        "level_min_separation_sec": (
+            "minimum seconds between touches for them to count separately (pivots "
+            "inside one consolidation are one visit, KB §81.5)."
+        ),
+        "support_proximity_pct": (
+            "how close the bar's low must be to the support level, as a fraction of "
+            "the level's price."
+        ),
+        "divergence_lookback": "bars scanned for the RSI divergence check.",
+        "timeframe": "the candle series the rule decides on (ONE_HOUR default).",
+    }
 
     oversold: float = 20.0
     overbought: float = 80.0
