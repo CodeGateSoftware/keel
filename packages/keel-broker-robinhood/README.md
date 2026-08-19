@@ -275,12 +275,23 @@ stands** would degrade a safety property keel already has. Phase B must trip ove
    applies to `Preview.errors`, which this adapter populates whenever it could not price an
    order -- an unpriced preview currently renders as a normal one.
 
-4. **No rate limiting or backoff.** Robinhood allows 100 requests/minute sustained (300 burst)
-   and this transport does not throttle or retry. Per-call account caching keeps each public
-   adapter method to a single `GET /accounts/`, but nothing bounds the engine's aggregate rate --
-   and `get_fee_summary` is no longer a single-request method: its order-history sweep is 1 + N
-   requests, bounded at 21 by `_MAX_PAGES`. Whatever calls it in Phase B should call it on a
-   schedule, not per order.
+4. **Rate limiting is handled for reads only.** Robinhood allows 100 requests/minute sustained
+   (300 burst). Since #411 the transport retries a GET on 429 and 5xx with exponential backoff,
+   honouring `Retry-After` where the venue sends one and clamping it so a server-controlled
+   header cannot park a trading loop. A status that survives every attempt still raises, so a
+   persistent quota problem stays visible rather than becoming a hang.
+
+   ⚠️ **A POST is never retried**, and that is deliberate rather than unfinished. A 429 or 5xx on
+   `create_order` is an UNKNOWN outcome, not a refusal -- the venue may have accepted the order
+   before the response was lost -- and the transport cannot tell whether two attempts would carry
+   the same `client_order_id`, because the body arrives already built and a key-derived id (#409)
+   looks exactly like a fresh uuid4 from there. A placement retry is safe only where the
+   `idempotency_key` is known, which is above the adapter, not inside the transport.
+
+   Backoff is not throttling, and the aggregate rate is still unbounded. Per-call account caching
+   keeps each public adapter method to a single `GET /accounts/`, but `get_fee_summary` is not a
+   single-request method: its order-history sweep is 1 + N requests, bounded at 21 by
+   `_MAX_PAGES`. Whatever calls it in Phase B should call it on a schedule, not per order.
 
 5. **No candle source is composed.** Point 1 of "What does NOT work" means this adapter cannot
    be a venue's sole broker; Phase B has to decide how an engine pairs an execution venue that
