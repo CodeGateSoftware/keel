@@ -19,7 +19,14 @@ from decimal import Decimal
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.types import Candle, Granularity
 
 from keel_broker_coinbase.translate import to_order_configuration
@@ -35,6 +42,7 @@ _CAPABILITIES = BrokerCapabilities(
     supports_fee_summary=True,
     quote_currencies=frozenset({"USD", "USDC"}),
     asset_classes=frozenset({"spot"}),
+    session_bound=False,
 )
 
 
@@ -65,6 +73,15 @@ class CoinbaseAdapter:
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
+
+    def market_clock(self) -> SessionState:
+        """Crypto trades 24/7: `SessionState.OPEN` as a constant, with no transport call.
+
+        FR-9's 24/7 half -- this venue has no session to consult, and answering from the
+        transport would spend a request to learn nothing (this deliberately never touches
+        `self._transport`, which is why it works on a credential-less adapter too).
+        """
+        return SessionState.OPEN
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

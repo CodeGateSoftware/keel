@@ -21,6 +21,7 @@ def _caps(**overrides: object) -> BrokerCapabilities:
         supports_fee_summary=True,
         quote_currencies=frozenset({"USD"}),
         asset_classes=frozenset({"spot"}),
+        session_bound=False,
     )
     base.update(overrides)
     return BrokerCapabilities(**base)  # type: ignore[arg-type]
@@ -57,3 +58,20 @@ def test_the_unknown_order_kind_check_still_fires() -> None:
     with pytest.raises(ValueError) as excinfo:
         _caps(supported_orders=frozenset({"iceberg"}))
     assert "iceberg" in str(excinfo.value)
+
+
+def test_session_bound_is_a_required_declaration() -> None:
+    """FR-9: the session question has no default answer. A REQUIRED bool field means an
+    adapter author cannot leave it out and quietly inherit the 24/7 crypto semantics that
+    would read a closed equities venue as a stale feed."""
+    base: dict[str, object] = dict(
+        venue="test",
+        supported_orders=frozenset({"market_ioc_quote"}),
+        supports_native_preview=True,
+        synthesizes_preview=False,
+        supports_fee_summary=True,
+        quote_currencies=frozenset({"USD"}),
+        asset_classes=frozenset({"spot"}),
+    )
+    with pytest.raises(TypeError, match="session_bound"):
+        BrokerCapabilities(**base)  # type: ignore[arg-type]

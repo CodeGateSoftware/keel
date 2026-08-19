@@ -13,11 +13,15 @@ it's modeled on -- against an in-memory `Repository` (`connect(":memory:")`).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from keel_broker_api.results import SessionState
+from keel_core.telemetry import _FIELDS_ATTR
 
 from keel import agent
 from keel.agent import LoopResult, _build_rule, loop, run_once
@@ -273,6 +277,176 @@ def test_kill_switch_unset_defaults_to_engaged_fails_closed(repo):
 
     assert result.skipped is True
     assert result.skip_reason == "kill_switch"
+
+
+# -- run_once: session awareness (FR-9: a closed venue is not a stale feed) --------------------
+
+
+def _skip_events(caplog) -> list[tuple[str, dict]]:
+    """`(event, fields)` for every `agent.cycle_skipped` record, via `telemetry`'s own
+    structured-fields attribute -- the same read `tests/execution/test_executor.py` uses."""
+    return [
+        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        for record in caplog.records
+        if record.getMessage() == "agent.cycle_skipped"
+    ]
+
+
+class _SessionClockBroker(FakeBroker):
+    """A `FakeBroker` that also answers the broker PORT's session surface.
+
+    `capabilities()` duck-types only the one field the engine reads (`session_bound`): the
+    live path's `CoinbaseClient` has no `capabilities()` at all, and the engine must treat
+    that broker as 24/7 rather than crash -- the tests below exercise both sides of that
+    split.
+    """
+
+    def __init__(self, clock_answer: Any, series=None) -> None:
+        super().__init__(series=series)
+        self._clock_answer = clock_answer
+        self.clock_calls = 0
+
+    def capabilities(self) -> Any:
+        return SimpleNamespace(session_bound=True)
+
+    def market_clock(self) -> Any:
+        self.clock_calls += 1
+        if isinstance(self._clock_answer, Exception):
+            raise self._clock_answer
+        return self._clock_answer
+
+
+def test_closed_market_skips_the_cycle_like_the_kill_switch(repo, caplog):
+    """FR-9: a weekend or holiday on a session-bound venue reads "market closed", never
+    "feed stale". The skip mirrors the kill-switch skip exactly -- no poll, no evaluation,
+    no orders -- so a closed venue can neither log staleness-gated noise nor hammer the feed."""
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = _SessionClockBroker(
+        SessionState.CLOSED, series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]}
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_closed"
+    assert result.mode is None
+    assert result.polled == 0
+    assert broker.get_candles_calls == []  # no feed polling while closed
+    assert broker.place_calls == []  # and no evaluation ever ran
+    assert _skip_events(caplog) == [("agent.cycle_skipped", {"reason": "market_closed"})]
+
+
+def test_the_closed_session_is_recorded_for_the_staleness_surfaces(repo):
+    """The cycle records the venue's session answer so the broker-free surfaces (`fetch
+    --check`, `status`, the TUI) can show "market closed" without a clock call of their own."""
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state("market_session") == "closed"
+    assert repo.get_state("market_session_ts") == 90_000
+
+
+def test_open_market_session_runs_the_cycle_exactly_as_today(repo):
+    """An open session changes nothing: the clock is consulted once, then the cycle proceeds
+    through its ordinary poll -> evaluate path, and the open answer is recorded too."""
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = _SessionClockBroker(
+        SessionState.OPEN, series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]}
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert result.skip_reason is None
+    assert broker.clock_calls == 1
+    assert broker.get_candles_calls  # polled as usual
+    assert repo.get_state("market_session") == "open"
+
+
+def test_a_24x7_broker_is_never_asked_its_clock_and_records_nothing(repo):
+    """Crypto unchanged, byte for byte: a broker without the port's session surface (the
+    live path's `CoinbaseClient` today) runs the cycle exactly as before, and no session
+    state is written -- so every broker-free surface renders what it rendered yesterday."""
+
+    class _NoPortBroker(FakeBroker):
+        """Deliberately no `capabilities()`/`market_clock()`: the pre-port broker shape."""
+
+    broker = _NoPortBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]})
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert broker.get_candles_calls  # the ordinary cycle ran
+    assert repo.get_state("market_session") is None
+    assert repo.get_state("market_session_ts") is None
+
+
+def test_a_port_broker_that_declares_24x7_is_never_asked_its_clock_either(repo):
+    """The other half of the 24/7 guarantee, at the engine seam: a broker that DOES answer
+    the port but declares `session_bound=False` (the crypto adapters) has no clock consulted
+    -- even one that would explode -- and records nothing."""
+
+    class _AlwaysOpenBroker(FakeBroker):
+        def capabilities(self) -> Any:
+            return SimpleNamespace(session_bound=False)
+
+        def market_clock(self) -> Any:
+            raise AssertionError("a 24/7 venue must never be asked for a clock")
+
+    broker = _AlwaysOpenBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0)]})
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is False
+    assert repo.get_state("market_session") is None
+
+
+def test_unreadable_clock_fails_closed_with_a_distinct_reason(repo, caplog):
+    """FR-9's fail-closed rule: a clock that cannot be read is TREATED as closed -- the
+    cycle skips and never crashes -- but the reason is DISTINCT from a venue that says
+    closed, because "we could not know" and "we know it is shut" are different facts for
+    an operator."""
+    broker = _SessionClockBroker(SessionState.CLOCK_UNAVAILABLE)
+
+    with caplog.at_level(logging.WARNING):
+        result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+    assert broker.get_candles_calls == []
+    assert repo.get_state("market_session") == "clock_unavailable"
+    assert _skip_events(caplog) == [
+        ("agent.cycle_skipped", {"reason": "market_clock_unavailable"})
+    ]
+
+
+def test_a_clock_that_raises_rather_than_answering_fails_closed(repo):
+    """A third-party adapter that RAISES instead of answering `CLOCK_UNAVAILABLE` (the port
+    says never do that) still fails closed here -- the engine never lets a clock read crash
+    the cycle."""
+    broker = _SessionClockBroker(RuntimeError("venue clock endpoint exploded"))
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "market_clock_unavailable"
+
+
+def test_kill_switch_still_outranks_a_closed_market(repo):
+    """The operator's halt is checked first, exactly as before -- a closed market never
+    masks an engaged kill-switch (or its skip reason) in the logs."""
+    repo.set_state("kill_switch", True)
+    broker = _SessionClockBroker(SessionState.CLOSED)
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.skipped is True
+    assert result.skip_reason == "kill_switch"
+    assert broker.clock_calls == 0
 
 
 # -- run_once: the happy path (real merged Dca rule) -------------------------------------------

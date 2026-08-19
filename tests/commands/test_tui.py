@@ -42,6 +42,7 @@ from keel.commands.insights import (
 )
 from keel.commands.status import (
     AutonomyStatus,
+    MarketSessionStatus,
     OpenPositionStatus,
     ProductFreshness,
     RuleSummary,
@@ -651,6 +652,53 @@ def test_rail17_expired_line_names_the_halt_and_the_fix() -> None:
         "rail 17 (withdrawal capability): EXPIRED 12d ago -- entries halted; "
         "re-attest with keel withdrawals attest"
     )
+
+
+# -- market session (FR-9) -----------------------------------------------------------------------
+#
+# The TUI reuses `render_human`'s exact session text (the `_rail17_line` discipline: two
+# renderings of one state can never disagree). Unlike rail 17 there is NO paper-mode carve
+# out: the session gate skips PAPER cycles too, so the same line is truthful in every mode.
+
+
+def test_no_session_record_renders_no_session_line() -> None:
+    """Crypto unchanged: a 24/7 venue never writes the state keys, so the dashboard does
+    not grow a line that would only ever say 'open'."""
+    lines = build_screen(_base_report(), NOW_TS)
+    assert not any(line.text.startswith("market session") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_style"),
+    [
+        ("open", "ok"),
+        ("closed", "muted"),
+        ("clock_unavailable", "warn"),
+    ],
+    ids=["open", "closed", "clock-unavailable"],
+)
+def test_session_line_styles_expected_severity(state: str, expected_style: str) -> None:
+    """A closed market is an EXPECTED state (every weekend) -- muted, never an alert, or
+    the dashboard would train its operator to ignore colour. An unreadable clock is a
+    degraded read worth a warn; an open market is simply ok."""
+    report = _base_report(
+        market_session=MarketSessionStatus(state=state, recorded_ts=NOW_TS - 60)
+    )
+    lines = build_screen(report, NOW_TS)
+    session_line = next(line for line in lines if line.text.startswith("market session"))
+    assert session_line.style == expected_style
+
+
+def test_session_line_sits_directly_under_the_kill_switch() -> None:
+    report = _base_report(
+        market_session=MarketSessionStatus(state="closed", recorded_ts=NOW_TS - 60)
+    )
+    lines = build_screen(report, NOW_TS)
+    kill_at = next(i for i, line in enumerate(lines) if line.text.startswith("kill_switch"))
+    session_at = next(
+        i for i, line in enumerate(lines) if line.text.startswith("market session")
+    )
+    assert session_at == kill_at + 1
 
 
 def test_autonomy_live_is_alert_style() -> None:

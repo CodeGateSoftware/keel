@@ -332,12 +332,17 @@ def _assess_products(
     now_ts: int,
     start_ts: int,
     tolerance_bars: int,
+    market_closed: bool = False,
 ) -> list[tuple[freshness_mod.Freshness, int]]:
     """Read-only sweep over every (product, granularity). No network.
 
     `granularities` is whatever the caller is keeping current -- `fetch` passes
     `config.market_data.granularities`, so the sweep judges exactly the series the warm step
     fetches and the agent polls.
+
+    `market_closed` (FR-9) is the recorded venue-clock answer (`agent.recorded_market_closed`)
+    threaded into every verdict, so a session-bound venue's weekend reads CLOSED rather than
+    STALE. Defaulted False: a 24/7 venue never records a session and keeps yesterday's verdicts.
 
     Returns `(freshness, unexplained_gaps)`, BOTH bounded to the same window starting at
     `start_ts`. That shared window is the point: `_print_freshness` subtracts the second from
@@ -355,7 +360,14 @@ def _assess_products(
             unexplained = repair_mod.unexplained_gap_count(
                 repo, product, granularity, start_ts
             )
-            out.append((freshness_mod.assess(info, now_ts, tolerance_bars), unexplained))
+            out.append(
+                (
+                    freshness_mod.assess(
+                        info, now_ts, tolerance_bars, market_closed=market_closed
+                    ),
+                    unexplained,
+                )
+            )
     return out
 
 
@@ -364,8 +376,16 @@ def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
         # A series can be BOTH stale and gapped. The state label reports the most urgent
         # condition, but the detail always carries BOTH numbers -- an earlier version showed
         # only the label and silently hid gaps behind staleness.
+        #
+        # A stale verdict under a closed market (FR-9) is its own state, ahead of plain
+        # STALE: the bars ARE behind, but the venue's clock explains why, and the label must
+        # say so rather than teach an operator to ignore STALE every weekend. MISSING stays
+        # MISSING even when closed -- a closed venue still serves history, so a cold cache
+        # remains the fetch pipeline's problem, not the calendar's.
         if row.missing:
             state = "MISSING"
+        elif row.stale and row.market_closed:
+            state = "CLOSED"
         elif row.stale:
             state = "STALE"
         elif row.gaps:
@@ -374,6 +394,13 @@ def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
             state = "ok"
         if row.missing:
             detail = "nothing cached"
+        elif row.stale and row.market_closed:
+            proven = row.gaps - unexplained
+            suffix = f" ({proven} proven absent at venue)" if proven else ""
+            detail = (
+                f"{row.bars_behind} bars behind, market closed -- not alerting, "
+                f"{row.gaps} internal gaps{suffix}"
+            )
         else:
             # No max(0, ...) clamp: `unexplained` comes from the same window-bounded read as
             # `row.gaps` (see `_assess_products`), so the subtraction is consistent by
@@ -465,7 +492,16 @@ def fetch(
     # an engine limit rather than a data choice (Issue #349).
     granularities = list(config.market_data.granularities)
 
-    before = _assess_products(repo, product_list, granularities, now_ts, start_ts, tolerance_bars)
+    # FR-9: the venue's session answer, as recorded by the last agent cycle. A closed
+    # session-bound venue defuses STALE (nothing can fetch bars a shut venue is not minting,
+    # and a weekend must not page an operator); see `agent.recorded_market_closed` for the
+    # trust window and the deliberate clock_unavailable/missing carve-outs. A 24/7 venue
+    # never records a session, so this is False and every verdict stays byte-identical.
+    market_closed = agent.recorded_market_closed(repo, config, now_ts)
+
+    before = _assess_products(
+        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
+    )
     click.echo(f"data cached in: {ctx.obj['db_path']}")
     _print_freshness(before)
 
@@ -493,6 +529,8 @@ def fetch(
                 f"\nall series current. {unexplained} have UNEXPLAINED gaps -- run "
                 "`keel fetch --repair-gaps` to probe them."
             )
+        elif market_closed:
+            click.echo("\nall series actionable -- market closed, staleness not alerting")
         else:
             click.echo("\nall series current")
         return
@@ -542,7 +580,7 @@ def fetch(
                     click.echo(f"    error: {error}", err=True)
 
     after = _assess_products(
-        repo, product_list, granularities, now_ts, start_ts, tolerance_bars
+        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
     )
     click.echo("\nafter fetch:")
     _print_freshness(after)

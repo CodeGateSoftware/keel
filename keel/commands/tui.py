@@ -132,7 +132,13 @@ from keel.commands.admission import (
     render_propose_view,
     render_screen_report,
 )
-from keel.commands.status import StatusReport, _human_age, _rail17_line, gather_status
+from keel.commands.status import (
+    StatusReport,
+    _human_age,
+    _rail17_line,
+    _session_line,
+    gather_status,
+)
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Granularity
@@ -234,6 +240,40 @@ def _kill_switch_lines(report: StatusReport) -> list[ScreenLine]:
     if report.kill_switch_engaged:
         return [ScreenLine("kill_switch: ENGAGED (halted)", "alert")]
     return [ScreenLine("kill_switch: clear", "ok")]
+
+
+def _market_session_style(state: str) -> str:
+    """Colour for the session line, by what the state MEANS to an operator:
+
+    * `open` is the working state -- `ok`, the same green a clear kill-switch gets.
+    * `closed` is an EXPECTED state (every weekend, every holiday) -- `muted`, deliberately
+      NOT warn/alert: a closed market is the system working as designed, and painting it
+      yellow would spend the warning colour on ~2 days of every 7 until an operator stops
+      looking at it. The line still names the skip and the alert relief, so the quiet is
+      legible without being loud.
+    * `clock_unavailable` is a degraded read the fail-closed posture is papering over --
+      `warn`. Unlike a weekend it is never routine, and it is one clock outage away from
+      every cycle skipping silently.
+
+    No paper-mode divergence (unlike rail 17's): the session gate skips PAPER cycles too, so
+    the same severity is truthful in every mode.
+    """
+    if state == "open":
+        return "ok"
+    if state == "clock_unavailable":
+        return "warn"
+    return "muted"
+
+
+def _market_session_lines(report: StatusReport) -> list[ScreenLine]:
+    """`render_human`'s exact session text, styled -- the `_rail17_line` discipline: the TUI
+    and `keel status` render ONE string, so they can never disagree about whether the venue
+    is closed. Nothing to say (a 24/7 venue, no cycle recorded) renders nothing, matching the
+    text renderer byte for byte."""
+    line = _session_line(report.market_session)
+    if line is None:
+        return []
+    return [ScreenLine(line, _market_session_style(report.market_session.state or ""))]
 
 
 def _autonomy_lines(report: StatusReport) -> list[ScreenLine]:
@@ -437,6 +477,7 @@ def build_screen(
     lines: list[ScreenLine] = []
     lines.extend(_title_lines(report, now_ts))
     lines.extend(_kill_switch_lines(report))
+    lines.extend(_market_session_lines(report))
     lines.extend(_autonomy_lines(report))
     lines.append(_blank())
     lines.extend(_equity_lines(report))

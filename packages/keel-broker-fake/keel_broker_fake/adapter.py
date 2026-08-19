@@ -30,7 +30,14 @@ from decimal import Decimal
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.types import Candle, Granularity
 
 #: This venue quotes only hourly and daily bars. Anything else it must refuse, not silently
@@ -48,6 +55,7 @@ _CAPABILITIES = BrokerCapabilities(
     supports_fee_summary=False,
     quote_currencies=frozenset({"USD"}),
     asset_classes=frozenset({"spot"}),
+    session_bound=False,
 )
 
 
@@ -79,6 +87,16 @@ class FakeAdapter:
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
+
+    def market_clock(self) -> SessionState:
+        """This venue never closes: `SessionState.OPEN` as a constant, no state to consult.
+
+        The 24/7 half of FR-9's split, held by a venue that has no clock endpoint at all --
+        which is also the proof the answer costs nothing. There is deliberately no
+        "sometimes closed" mode to test with: an adapter that could close would be
+        session-bound and would say so, and this one exists to keep that declaration honest.
+        """
+        return SessionState.OPEN
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

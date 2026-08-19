@@ -218,6 +218,114 @@ def test_fetch_calls_ensure_history_when_stale(tmp_path, valid_config_path, monk
     assert years == 5
 
 
+# -- market_closed: a closed venue is not a stale feed (FR-9) ---------------------------------
+#
+# The session answer is RECORDED by the agent cycle (the one component with a broker) into
+# `agent_state`; `--check` stays offline by reading that record. A stale series while the
+# record says closed is the expected weekend state: displayed as CLOSED, not counted by the
+# exit code. Missing series still alert (a closed venue serves history), and a record older
+# than the feed-heartbeat window (`interval_sec * FEED_STALENESS_CYCLES`, the same trust
+# window rail 12 gives the feed) is ignored, so a dead agent cannot silence the alerts.
+
+
+def _record_session(repo: Repository, state: str, *, age_sec: int = 0) -> None:
+    repo.set_state("market_session", state)
+    repo.set_state("market_session_ts", int(time.time()) - age_sec)
+
+
+def _seed_all_stale(repo: Repository, assets: tuple[str, ...] = _ASSETS) -> None:
+    """Every configured granularity PRESENT but 40 bars behind -- stale with nothing
+    missing, the shape a closed equities venue actually leaves behind (a weekend where the
+    bars simply stopped, not a cache that was never warmed)."""
+    now = int(time.time())
+    series = (
+        (_DAY, Granularity.ONE_DAY),
+        (_HOUR, Granularity.ONE_HOUR),
+        (_FIFTEEN, Granularity.FIFTEEN_MINUTE),
+    )
+    for asset in assets:
+        product = f"{asset}-USD"
+        for step, granularity in series:
+            last = (now // step) * step - 40 * step
+            _seed(repo, product, granularity, [last - i * step for i in range(30)])
+
+
+def test_check_exits_zero_when_stale_only_because_the_market_is_closed(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The FR-9 promise, at the operator surface: a weekend must not page anyone. Series
+    that are present but behind exit zero once the recorded venue clock says closed -- and
+    the display says WHY, so the quiet is legible rather than suspicious."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "CLOSED" in result.output
+    assert "STALE" not in result.output
+    assert "missing or stale" not in result.output
+
+
+def test_check_still_alerts_when_the_closed_record_has_gone_stale(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The record is trusted only for the feed-heartbeat window (`interval_sec` 900 x
+    `FEED_STALENESS_CYCLES` 3 = 45 minutes here): an agent that died Friday night must not
+    silence Saturday's staleness alerts with its last reading."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "closed", age_sec=10 * 3600)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
+def test_check_still_alerts_on_missing_even_when_the_market_is_closed(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A closed venue still serves HISTORICAL bars, so a cache with nothing in it is a cold
+    pipeline, not a session artifact -- it must keep alerting."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)  # migrated but empty
+    _record_session(repo, "closed")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "MISSING" in result.output
+
+
+def test_check_does_not_defuse_staleness_on_an_unreadable_clock(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """Fail-closed for trading, fail-LOUD for alerting: a recorded clock_unavailable must
+    not read as closed -- the venue state is unknown, and suppressing the staleness alert on
+    an unknown clock would hide exactly the outage the clock failure itself hints at."""
+    _no_network(monkeypatch)
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    _seed_all_stale(repo)
+    _record_session(repo, "clock_unavailable")
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "fetch", "--check"]
+    )
+    assert result.exit_code != 0
+    assert "STALE" in result.output
+
+
 # -- gap repair via the CLI ---------------------------------------------------
 
 

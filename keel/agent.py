@@ -5,8 +5,9 @@ the `live` rules (`repo.get_rules("live")` -> real `Rule` instances, `RULE_REGIS
 `strategy.engine.evaluate` them for ENTER `Signal`s, drive EXIT `Signal`s off currently-held
 positions, and run every signal through `execution.executor.execute` (confirm|autonomous, from
 `config.auto_trade.mode`) -- respecting the kill-switch (`repo.get_state("kill_switch")`)
-throughout. `loop()` is the scheduled wrapper: call `run_once` every `interval_sec` until
-`stop_flag()` returns `True`.
+throughout, and gated before any of that by the venue's market clock for session-bound venues
+(FR-9: a closed equities market skips the cycle, it is not a stale feed). `loop()` is the
+scheduled wrapper: call `run_once` every `interval_sec` until `stop_flag()` returns `True`.
 
 **This closes the Phase-2 gap** `strategy/engine.py`'s own docstring calls out: `evaluate()`
 only ever emits ENTER signals (rules + read-only market data, no notion of what's currently
@@ -62,6 +63,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
 
+from keel_broker_api.results import SessionState
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
 
@@ -761,6 +763,75 @@ def _close_tranches(
         repo.close_position(position["id"], closed_at=now_ts)
 
 
+# -- venue session (FR-9: a closed market is not a stale feed) --------------------------------
+
+#: `agent_state` keys the cycle writes each run when (and only when) the broker is a
+#: session-bound port adapter. The broker-free surfaces (`fetch --check`, `status`, the TUI)
+#: read this recording instead of making a clock call of their own -- the same shape as the
+#: `last_feed_ts` heartbeat: the one component holding a broker records, everyone else reads.
+#: A 24/7 venue (or a pre-port broker) writes NOTHING, so every existing crypto deployment
+#: keeps byte-identical state and output.
+MARKET_SESSION_KEY = "market_session"
+MARKET_SESSION_TS_KEY = "market_session_ts"
+
+
+def _venue_session(broker: Any) -> tuple[SessionState, bool]:
+    """The venue's session-boundness and its clock answer, fail-closed.
+
+    Returns `(state, session_bound)`. `session_bound=False` is also the answer for a broker
+    that does not implement the broker port at all (`keel/data/cb_client.py`'s
+    `CoinbaseClient`, the live path until the broker-port migration lands): a 24/7 posture
+    with no clock to consult, which keeps every existing crypto behavior byte-identical.
+
+    **Fail-closed** (FR-9): a session-bound broker whose clock RAISES -- a third-party
+    adapter violating the port's "answer `CLOCK_UNAVAILABLE`, never raise" -- is treated as
+    `CLOCK_UNAVAILABLE` here too. The cycle must skip, not crash, and must never trade on an
+    unknown session state. A `capabilities()` that itself raises reads as not-bound for the
+    same reason the portless broker does: nothing about such a broker is known well enough
+    to gate on, and its first network call will fail loudly through the ordinary paths.
+    """
+    caps_fn = getattr(broker, "capabilities", None)
+    if caps_fn is None:
+        return SessionState.OPEN, False
+    try:
+        session_bound = bool(caps_fn().session_bound)
+    except Exception:
+        return SessionState.OPEN, False
+    if not session_bound:
+        return SessionState.OPEN, False
+    try:
+        return broker.market_clock(), True
+    except Exception:
+        return SessionState.CLOCK_UNAVAILABLE, True
+
+
+def recorded_market_closed(repo: Repository, config: Config, now_ts: int) -> bool:
+    """Read the cycle's recorded venue clock and say whether staleness is defused (FR-9).
+
+    Pure repo/config reads -- this is the seam that lets `fetch --check` stay offline while
+    honoring the venue's own session answer: the agent cycle recorded it, this reads it.
+
+    Two honest limits, both deliberate:
+
+    * Only a recorded `closed` defuses anything. `clock_unavailable` is fail-closed for
+      TRADING but fail-LOUD for ALERTING -- suppressing a staleness alert on an unknown
+      clock would hide exactly the outage the unreadable clock hints at.
+    * The recording is trusted only for the feed-heartbeat window
+      (`interval_sec * FEED_STALENESS_CYCLES`, rail 12's own constant). A recording older
+      than that means the agent that wrote it has stopped cycling, and its last reading
+      must not silence staleness alerts forever: alerts resume, which is also how the dead
+      agent surfaces. A healthy deployment re-records every cycle, so on a real weekend the
+      recording is always fresh.
+    """
+    if repo.get_state(MARKET_SESSION_KEY) != SessionState.CLOSED.value:
+        return False
+    recorded_ts = repo.get_state(MARKET_SESSION_TS_KEY)
+    if not isinstance(recorded_ts, int):
+        return False  # unreadable stamp: do not defuse alerts off a value nobody vouches for
+    trust_window_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
+    return now_ts - recorded_ts <= trust_window_sec
+
+
 # -- one cycle -----------------------------------------------------------------------------
 
 
@@ -832,13 +903,19 @@ def run_once(
     now_ts: int,
     confirm_fn: executor.ConfirmFn | None = None,
 ) -> LoopResult:
-    """One agent cycle: poll -> (kill-switch / stale-data gates) -> evaluate -> exits -> entries.
+    """One agent cycle: poll -> (kill-switch / market-session / stale-data gates) -> evaluate
+    -> exits -> entries.
 
     The kill-switch is checked *before* anything else (no poll, no evaluation, no orders) --
     `repo.get_state("kill_switch", default=True)` fails closed exactly like `guards.check`'s
-    rail 12, so an agent that has never been explicitly `resume`d never trades. Per-product
-    staleness (`market_feed.is_fresh`) is checked after polling and only skips *that* product;
-    the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
+    rail 12, so an agent that has never been explicitly `resume`d never trades. The venue
+    session gate (FR-9) sits directly after it and skips the same way: a session-bound venue
+    whose clock says closed (or cannot be read -- fail-closed) is a closed market, not a
+    stale feed, so the cycle does nothing rather than poll a shut venue and log
+    staleness-gated noise. The session answer is recorded first either way, so the
+    broker-free surfaces (`fetch --check`, `status`) can render it without a clock call.
+    Per-product staleness (`market_feed.is_fresh`) is checked after polling and only skips
+    *that* product; the cycle itself still runs (and `last_feed_ts` still updates) for the rest.
     """
     cycle_token = bind_cycle(new_cycle_id())
     try:
@@ -849,6 +926,26 @@ def run_once(
             return LoopResult(
                 ts=now_ts, skipped=True, skip_reason="kill_switch", mode=None, polled=0
             )
+
+        # FR-9's session gate, mirroring the kill-switch skip exactly (no poll, no
+        # evaluation, no orders). Two distinct reasons, because "the venue says shut" and
+        # "the clock could not be read" are different operator facts: a weekend is expected
+        # and logged at INFO, an unreadable clock is a degraded read worth a WARNING.
+        session, session_bound = _venue_session(broker)
+        if session_bound:
+            repo.set_state(MARKET_SESSION_KEY, session.value)
+            repo.set_state(MARKET_SESSION_TS_KEY, now_ts)
+        if session is not SessionState.OPEN:
+            reason = (
+                "market_closed" if session is SessionState.CLOSED else "market_clock_unavailable"
+            )
+            log_event(
+                logger,
+                logging.INFO if session is SessionState.CLOSED else logging.WARNING,
+                "agent.cycle_skipped",
+                reason=reason,
+            )
+            return LoopResult(ts=now_ts, skipped=True, skip_reason=reason, mode=None, polled=0)
 
         # Which rules run depends on the MODE, because the lifecycle is
         # candidate -> paper -> live (`promotion._PROMOTE_NEXT`). Paper mode exists to prove

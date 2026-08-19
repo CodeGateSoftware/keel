@@ -37,6 +37,13 @@ class Freshness:
     gaps: int
     missing: bool
     stale: bool
+    #: The venue's clock said CLOSED when this verdict was computed (FR-9). A session-bound
+    #: venue's weekend/holiday is the EXPECTED reason a series is behind -- the crypto
+    #: staleness semantics would false-positive there -- so `stale` under a closed market is
+    #: reported (the bars ARE behind) but not ACTIONABLE: no fetch can produce bars a closed
+    #: venue is not minting, and no alert should page an operator for a Saturday. Defaulted
+    #: False so every existing caller keeps yesterday's answer byte-identical.
+    market_closed: bool = False
 
     @property
     def needs_fetch(self) -> bool:
@@ -48,8 +55,14 @@ class Freshness:
         change nothing. Failing an alert on a condition the command cannot fix trains you to
         ignore the alert -- the same argument as the lag tolerance. Gaps are reported
         prominently instead, and `any_gaps()` is available for a caller that wants to be strict.
+
+        `market_closed` defuses `stale` only, never `missing`: a closed venue still serves
+        HISTORICAL bars, so a cold cache is a pipeline that has never warmed -- exactly what
+        a fetch fixes -- not a session artifact. Defusing `missing` too would hide that.
         """
-        return self.missing or self.stale
+        if self.missing:
+            return True
+        return self.stale and not self.market_closed
 
 
 def expected_last_ts(now_ts: int, granularity: Granularity) -> int:
@@ -63,9 +76,19 @@ def expected_last_ts(now_ts: int, granularity: Granularity) -> int:
 
 
 def assess(
-    info: CoverageInfo, now_ts: int, tolerance_bars: int = DEFAULT_TOLERANCE_BARS
+    info: CoverageInfo,
+    now_ts: int,
+    tolerance_bars: int = DEFAULT_TOLERANCE_BARS,
+    *,
+    market_closed: bool = False,
 ) -> Freshness:
-    """Assess one series. Nothing cached at all counts as both `missing` and `stale`."""
+    """Assess one series. Nothing cached at all counts as both `missing` and `stale`.
+
+    `market_closed` (FR-9) is the caller's venue-clock answer -- session-aware surfaces pass
+    it so a closed market's staleness reads as the expected state; every existing caller
+    omits it and keeps the 24/7 verdict unchanged. It labels the verdict; see
+    `Freshness.market_closed` for what it does and deliberately does not defuse.
+    """
     granularity = Granularity(info.granularity)
     step = GRANULARITY_SECONDS[granularity]
 
@@ -79,6 +102,7 @@ def assess(
             gaps=info.gaps,
             missing=True,
             stale=True,
+            market_closed=market_closed,
         )
 
     behind = max(0, (expected_last_ts(now_ts, granularity) - info.last_ts) // step)
@@ -91,6 +115,7 @@ def assess(
         gaps=info.gaps,
         missing=False,
         stale=behind > tolerance_bars,
+        market_closed=market_closed,
     )
 
 

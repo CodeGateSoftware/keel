@@ -29,6 +29,7 @@ from typing import Any
 
 import click
 
+from keel import agent
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands._products import _default_sim_products
 from keel.config import Config
@@ -107,6 +108,22 @@ class WithdrawalAttestationStatus:
 
 
 @dataclass(frozen=True)
+class MarketSessionStatus:
+    """The venue's session state as the last agent cycle recorded it (FR-9) -- the #345
+    rail-17 pattern applied to the market clock: name the state that gates the cycle, on its
+    own line, before an operator has to wonder why nothing trades.
+
+    Read from `agent_state` (`agent.MARKET_SESSION_KEY`), never from a broker call: this
+    dashboard's whole design is "local DB + config only". `state is None` means no session-
+    bound venue has recorded anything -- a 24/7 deployment, or one whose agent has not run --
+    and renders NO line, so crypto dashboards stay byte-identical.
+    """
+
+    state: str | None  # "open" | "closed" | "clock_unavailable" | None (not session-bound)
+    recorded_ts: int | None
+
+
+@dataclass(frozen=True)
 class StatusReport:
     now_ts: int
     mode: str
@@ -126,6 +143,11 @@ class StatusReport:
     live_rules: list[RuleSummary]
     data_freshness: list[ProductFreshness]
     subscriptions: list[SubscriptionStatusRow]
+    #: Defaulted to "no session recorded" so every existing `StatusReport(...)` construction
+    #: (the TUI tests' `_base_report`, any external caller) stays valid -- the same pattern
+    #: `LoopResult` uses for its later-added fields. Last for the same reason: a defaulted
+    #: field anywhere earlier would force a default on every field after it.
+    market_session: MarketSessionStatus = MarketSessionStatus(state=None, recorded_ts=None)
 
 
 # -- gather (pure) ------------------------------------------------------------------------------
@@ -232,6 +254,19 @@ def _subscription_rows(
     ]
 
 
+def _market_session(repo: Repository) -> MarketSessionStatus:
+    """The venue's recorded session answer, read through `agent`'s own state keys -- the same
+    discipline `_withdrawal_attestation` keeps toward the executor: this display reads what
+    the engine wrote, never a re-derivation that could disagree with the cycle's decision."""
+    state = repo.get_state(agent.MARKET_SESSION_KEY)
+    if state is None:
+        return MarketSessionStatus(state=None, recorded_ts=None)
+    recorded_ts = repo.get_state(agent.MARKET_SESSION_TS_KEY)
+    return MarketSessionStatus(
+        state=str(state), recorded_ts=recorded_ts if isinstance(recorded_ts, int) else None
+    )
+
+
 def _withdrawal_attestation(repo: Repository, now_ts: int) -> WithdrawalAttestationStatus:
     """Rail 17's input, resolved and aged for display.
 
@@ -312,6 +347,7 @@ def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport
         live_rules=live_rules,
         data_freshness=_data_freshness(repo, config, now_ts),
         subscriptions=_subscription_rows(repo, config, now_ts),
+        market_session=_market_session(repo),
     )
 
 
@@ -377,6 +413,30 @@ def _rail17_line(w: WithdrawalAttestationStatus, rail_evaluated: bool) -> str:
     return f"{prefix}: never attested{halt}; re-attest with keel withdrawals attest"
 
 
+def _session_line(s: MarketSessionStatus) -> str | None:
+    """The market-session line (FR-9), or `None` when there is nothing to say.
+
+    Rendered directly under the kill-switch line: both answer "why is the cycle not
+    trading". Unlike rail 17 there is deliberately NO paper-mode carve-out -- the session
+    gate skips PAPER cycles too (`keel.agent.run_once` checks the clock before the mode is
+    even resolved), so the same line is truthful in every mode.
+
+    `closed` names BOTH the skip and the alert relief in one breath: on a weekend the
+    question this line exists to answer is "is it dead, or is it the weekend?", and an answer
+    that only said "closed" would leave the staleness silence half-explained.
+    """
+    if s.state == "open":
+        return "market session: open (venue clock)"
+    if s.state == "closed":
+        return "market session: CLOSED (venue clock) -- cycles skip, staleness does not alert"
+    if s.state == "clock_unavailable":
+        return (
+            "market session: clock UNREADABLE (fail-closed) -- cycles skip until the "
+            "venue clock answers"
+        )
+    return None
+
+
 def render_human(report: StatusReport) -> list[str]:
     """The `keel status` (default, non-`--json`) rendering, as a list of lines -- kept as a pure
     function of the report so it is testable without a CliRunner."""
@@ -385,6 +445,9 @@ def render_human(report: StatusReport) -> list[str]:
     lines.append(
         "kill_switch: ENGAGED (halted)" if report.kill_switch_engaged else "kill_switch: clear"
     )
+    session_line = _session_line(report.market_session)
+    if session_line is not None:
+        lines.append(session_line)
     a = report.autonomy
     if not a.profile_readable:
         lines.append(

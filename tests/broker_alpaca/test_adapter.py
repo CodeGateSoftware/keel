@@ -33,7 +33,7 @@ from keel_broker_api.orders import (
     StopLimitGTC,
 )
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview, SessionState
 from keel_core.types import Granularity, Side
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -738,6 +738,38 @@ class TestSession:
         )
         assert open_adapter.is_market_open() is True
         assert closed_adapter.is_market_open() is False
+
+    def test_alpaca_declares_itself_session_bound(self) -> None:
+        """The one first-party equities venue: `session_bound=True` is what makes the engine
+        consult the clock at all (FR-9). A 24/7 default here would silently reinstate the
+        crypto staleness semantics on weekends and holidays."""
+        assert AlpacaAdapter().capabilities().session_bound is True
+
+    def test_market_clock_reads_the_venue_clock(self) -> None:
+        """The port-level clock reuses the same `/v2/clock` read `is_market_open` was built
+        on (Phase A): open and closed fixtures answer `SessionState.OPEN`/`CLOSED`."""
+        open_adapter = AlpacaAdapter(FakeTransport(clock=load_fixture("alpaca_clock_open.json")))
+        closed_adapter = AlpacaAdapter(
+            FakeTransport(clock=load_fixture("alpaca_clock_closed.json"))
+        )
+        assert open_adapter.market_clock() is SessionState.OPEN
+        assert closed_adapter.market_clock() is SessionState.CLOSED
+        # Phase A's adapter-specific extra stays answerable and agrees with the port answer.
+        assert open_adapter.is_market_open() is True
+        assert closed_adapter.is_market_open() is False
+
+    def test_market_clock_fails_closed_when_the_clock_cannot_be_read(self) -> None:
+        """FR-9's fail-closed rule, at the adapter: a transport error or an absent clock is
+        `CLOCK_UNAVAILABLE` -- never an exception (the agent cycle must not crash on it) and
+        never a guess of OPEN (trading on an unknown session state)."""
+
+        class _ExplodingTransport(FakeTransport):
+            def get_clock(self) -> Any:
+                raise AlpacaAPIError(503, "clock endpoint unavailable")
+
+        assert AlpacaAdapter(_ExplodingTransport()).market_clock() is SessionState.CLOCK_UNAVAILABLE
+        # No transport injected at all: the same fail-closed answer, not a RuntimeError.
+        assert AlpacaAdapter().market_clock() is SessionState.CLOCK_UNAVAILABLE
 
     def test_no_order_body_ever_asks_for_extended_hours(self) -> None:
         """Overnight/extended sessions are OFF by posture (FR-9): thinner liquidity would

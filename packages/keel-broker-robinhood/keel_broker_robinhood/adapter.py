@@ -53,7 +53,14 @@ from typing import Any
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, OrderSpec, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.types import Candle, Granularity
 
 from keel_broker_robinhood.translate import (
@@ -99,6 +106,11 @@ _CAPABILITIES = BrokerCapabilities(
     # asset underneath the caller.
     quote_currencies=frozenset({"USD"}),
     asset_classes=frozenset({"spot"}),
+    # This adapter speaks Robinhood's CRYPTO api (24/7), so `session_bound=False`. Robinhood
+    # the broker also runs equities sessions, but that is not what this package implements;
+    # declaring session awareness for a market this adapter cannot trade would be a comment,
+    # not a capability.
+    session_bound=False,
 )
 
 #: Every `Granularity` the port defines, refused with the same reason. Kept as a single message
@@ -205,6 +217,15 @@ class RobinhoodAdapter:
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
+
+    def market_clock(self) -> SessionState:
+        """Crypto trades 24/7: `SessionState.OPEN` as a constant, with no transport call.
+
+        FR-9's 24/7 half -- the crypto api this adapter implements has no session to consult,
+        so answering costs nothing and never touches `self._transport` (credential-less
+        adapters can answer it).
+        """
+        return SessionState.OPEN
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int

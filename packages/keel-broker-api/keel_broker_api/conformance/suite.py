@@ -38,7 +38,14 @@ from keel_broker_api.orders import (
     StopLimitGTC,
 )
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 
 _PRODUCT = "BTC-USD"
 
@@ -110,6 +117,41 @@ class BrokerConformanceTests:
         than false -- the failure mode nothing else here would catch.
         """
         assert self.broker().capabilities().quote_currencies
+
+    # --- session awareness (FR-9) -----------------------------------------------------------
+
+    def test_session_bound_is_declared(self) -> None:
+        """Every adapter states whether its venue is bound to a trading session.
+
+        The field is `bool`-typed and required, so what this really holds in place is the
+        declaration itself: an adapter author cannot leave the session question unanswered and
+        let the engine's default (24/7, crypto semantics) answer it for them -- which is exactly
+        the false positive FR-9 exists to close, a closed equities venue read as a stale feed.
+        """
+        assert isinstance(self.broker().capabilities().session_bound, bool)
+
+    def test_market_clock_answers_the_port_type(self) -> None:
+        """The clock crosses the port as a `SessionState`, never a venue-native shape.
+
+        A session-bound adapter may answer any of the three members here (its open/closed
+        fixtures are its own tests' business); what the PORT guarantees is the type, so the
+        engine can branch on identity (`is SessionState.OPEN`) without probing venue fields.
+        """
+        assert isinstance(self.broker().market_clock(), SessionState)
+
+    def test_market_clock_is_open_without_a_call_for_24x7_venues(self) -> None:
+        """A venue that declares `session_bound=False` is 24/7: always open, no clock call.
+
+        The suite's `broker()` factories inject canned transports, so a wrongly-chatty
+        `market_clock` would not fail loudly here -- that is why each 24/7 adapter's own tests
+        assert the same thing with NO transport injected at all. This test still earns its place:
+        it pins the CONTRACT (24/7 means `SessionState.OPEN`, not a venue's own truthiness) at
+        the one layer every adapter passes through.
+        """
+        broker = self.broker()
+        if broker.capabilities().session_bound:
+            pytest.skip("session-bound venue: open/closed answers are the adapter's own tests")
+        assert broker.market_clock() is SessionState.OPEN
 
     # --- capabilities cannot lie about orders ---------------------------------------------
 

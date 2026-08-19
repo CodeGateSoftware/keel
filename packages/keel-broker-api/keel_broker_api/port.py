@@ -8,7 +8,14 @@ from keel_core.types import Candle, Granularity
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.results import Balance, FeeSummary, OrderStatus, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    FeeSummary,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 
 
 class UnsupportedOrder(Exception):
@@ -22,6 +29,24 @@ class UnsupportedOrder(Exception):
 
 class Broker(Protocol):
     def capabilities(self) -> BrokerCapabilities: ...
+
+    def market_clock(self) -> SessionState:
+        """The venue's session state, read from the VENUE's own clock -- never a locally
+        maintained calendar that drifts (FR-9).
+
+        The two postures, exactly as `BrokerCapabilities.session_bound` declares them:
+
+        * A session-bound adapter reads the venue's clock/calendar endpoint each call.
+          A clock it cannot read answers `SessionState.CLOCK_UNAVAILABLE` -- it must not
+          raise (a clock outage must not crash the caller's cycle) and must not guess `OPEN`
+          (trading on an unknown session state is the failure fail-closed exists to prevent).
+          The caller decides what CLOSED/CLOCK_UNAVAILABLE mean for it; this method's one
+          promise is that the answer is the venue's, or an honest "could not read".
+        * A venue that is not session-bound (24/7, crypto) answers `SessionState.OPEN`
+          as a constant, with NO network call -- there is no clock to consult, and inventing
+          one would spend a request to learn nothing.
+        """
+        ...
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start_ts: int, end_ts: int
