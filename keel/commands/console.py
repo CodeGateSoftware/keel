@@ -9,7 +9,8 @@ the remaining placeholders are owned by C4/C5. The dashboard stays the landing s
 untouched -- the shell lands AROUND it (`run_live` gains menu modes; the pre-existing modes
 and every pure builder are unchanged).
 
-Three pure surfaces live here, all directly unit-testable without curses (the
+Three pure surfaces lived here at C2; C7 (issue #394) added the Venues browser and
+the module's contextual-help rows. All directly unit-testable without curses (the
 `build_*`/`discover_*`/`switch_*` functions take their inputs as values), mirroring
 `keel/commands/tui.py`'s split between a pure screen model and the thin I/O loop:
 
@@ -25,6 +26,12 @@ Three pure surfaces live here, all directly unit-testable without curses (the
   next open/close for session-bound ones, and CLOCK UNAVAILABLE fail-loud when the record
   is absent or stale. No broker, no network, no TUI-side calendar -- the recording IS the
   source, exactly as `fetch --check`/`status` read it.
+* **The Venues browser (O7, C7)** -- `build_venues_lines`, a THIN rendering of the
+  `keel.commands.brokers` service payload (the same one `keel brokers list` prints)
+  with the SELECTED adapter highlighted and the active deployment's binding named:
+  capability display only, never key-presence inference.
+* **Contextual help (O8, C7)** -- `CONTEXT_HELP`, this module's screens' rows for the
+  `?` overlay; `keel.commands.help_console` is the registry and renderer.
 
 No secrets anywhere in here: the banner and the profile menu render file NAMES and venue
 declarations only, never config contents.
@@ -32,6 +39,7 @@ declarations only, never config contents.
 
 from __future__ import annotations
 
+import textwrap
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from keel import agent
+from keel.commands import brokers
 from keel.commands._common import _load_cfg, _open_repo
 from keel.commands.tui import ScreenLine, _blank, _market_session_style
 
@@ -416,7 +425,8 @@ def build_profile_menu_lines(
 ) -> list[ScreenLine]:
     """The Profile menu: every discovered deployment with its config+db pair visible (the
     O4 rule -- the active pair is VISIBLE before any action), the active one marked, the
-    LIVE row styled as the guarded one. PURE."""
+    LIVE row styled as the guarded one -- plus the PRD §3 tree's Venues entry under the
+    deployments (O7), reached with the cursor like any row. PURE."""
     active = (
         active_profile(binding_pair[0], binding_pair[1], profiles) if binding_pair else None
     )
@@ -428,7 +438,12 @@ def build_profile_menu_lines(
         ),
         _blank(),
     ]
-    cursor = max(0, min(cursor, max(0, len(profiles) - 1)))
+    # The Venues entry rides BELOW the deployments and is part of the SAME cursor range:
+    # index len(profiles) is the Venues row, and `profile_menu_venues_at` is the one
+    # place that fact is stated, so the live loop's dispatch and this render cannot
+    # disagree about which row opens the browser.
+    venues_at = len(profiles)
+    cursor = max(0, min(cursor, venues_at))
     for index, profile in enumerate(profiles):
         marker = ">" if index == cursor else " "
         suffix = (
@@ -455,10 +470,185 @@ def build_profile_menu_lines(
     lines.append(_blank())
     lines.append(
         ScreenLine(
-            "up/k down/j move · Enter/Space switch · q/Esc/p/m back to the menu", "muted"
+            f"{'>' if cursor == venues_at else ' '} Venues -- every installed adapter and "
+            "its capabilities",
+            "heading" if cursor == venues_at else "normal",
+        )
+    )
+    lines.append(
+        ScreenLine("      (the O7 browser; the selected adapter is highlighted)", "muted")
+    )
+    lines.append(_blank())
+    lines.append(
+        ScreenLine(
+            "up/k down/j move · Enter/Space switch (Venues: open) · q/Esc/p/m to the menu",
+            "muted",
         )
     )
     return lines
+
+
+def profile_menu_venues_at(profiles: list[DeploymentProfile]) -> int:
+    """The cursor index of the Profile menu's Venues row -- the ONE statement of where
+    the browser entry sits, so the live loop's "is the cursor on Venues?" test and
+    the rendered list cannot drift."""
+    return len(profiles)
+
+
+# -- the Venues browser (O7) ----------------------------------------------------------------------
+
+
+def _wrap(text: str, *, indent: str = "  ", width: int = 78) -> list[str]:
+    """Wrap to the 80-column budget `_paint` clips at -- the same rule every console
+    module keeps. PURE."""
+    return textwrap.wrap(text, width=width, initial_indent=indent, subsequent_indent=indent) or [
+        indent
+    ]
+
+
+def build_venues_lines(
+    infos: list[brokers.BrokerInfo],
+    *,
+    selected_venue: str | None,
+    profile: DeploymentProfile | None = None,
+    binding_pair: tuple[str, str] | None = None,
+    endpoint: str | None = None,
+    data_feed: str | None = None,
+) -> list[ScreenLine]:
+    """The Venues browser (O7): every installed adapter with its declared
+    capabilities, rendered from the SAME service payload `keel brokers list` prints
+    (`brokers.list_installed_brokers` -- the equality is pinned by test), the
+    SELECTED adapter (the active deployment's `broker: name:`) highlighted, and the
+    active deployment's binding named at the top. PURE, and THIN: this renders the
+    service's rows; every fact on it comes from the adapters' own declarations --
+    capability display, never key-presence inference."""
+    lines: list[ScreenLine] = [
+        ScreenLine("keel console -- profile / venues", "heading"),
+    ]
+    for wrapped in _wrap(
+        "every installed adapter and its declared capabilities (keel brokers list "
+        "renders the same payload)",
+        indent="",
+    ):
+        lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
+    # The active deployment's binding, VISIBLE before anything else (O4's rule, applied
+    # to the venue half of the pair): which deployment is bound, which venue its config
+    # selects, and -- where the venue declares the knobs -- which endpoint and data feed.
+    if profile is not None:
+        bound = f"{profile.label} ({profile.config_path} + {profile.db_path})"
+    elif binding_pair is not None:
+        bound = f"{binding_pair[0]} + {binding_pair[1]}"
+    else:
+        bound = "no known deployment"
+    lines.append(ScreenLine(f"bound deployment: {bound}", "normal"))
+    binding_bits = [f"venue {selected_venue or '?'}"]
+    if endpoint is not None:
+        binding_bits.append(f"endpoint {endpoint}")
+    if data_feed is not None:
+        binding_bits.append(f"data feed {data_feed}")
+    for wrapped in _wrap("binding: " + " · ".join(binding_bits)):
+        lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
+    for info in infos:
+        selected = selected_venue is not None and info.name == selected_venue
+        version = info.package_version or "unknown version"
+        head = f"{info.name} ({version}) · {info.venue}"
+        if selected:
+            head += "  [selected]"
+        lines.append(ScreenLine(head, "heading" if selected else "normal"))
+        # The capability facts and order kinds render through the SERVICE's own shared
+        # wording (`brokers.capability_facts`) -- the one-phrase rule that pins the CLI
+        # and this browser to identical information.
+        for wrapped in _wrap(brokers.capability_facts(info)):
+            lines.append(ScreenLine(wrapped, "muted"))
+        for wrapped in _wrap(f"order kinds: {', '.join(info.supported_orders)}"):
+            lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
+    for wrapped in _wrap(brokers.NO_KEY_INFERENCE_LINE, indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
+    lines.append(_blank())
+    lines.append(
+        ScreenLine(
+            "up/k down/j scroll · PgUp/PgDn/Home/End · q/Esc/v/m back to the profile menu",
+            "muted",
+        )
+    )
+    return lines
+
+
+# -- contextual help (O8, issue #394 C7) ----------------------------------------------------------
+#
+#: This module's screens' contextual help -- the "what am I looking at" / "what will
+#: this do" rows the `?` overlay renders -- keyed by the live loop's mode names. Plain
+#: `(subject, description)` pairs so the text stays HERE, with the module that owns the
+#: screen; `keel.commands.help_console` is the registry and renderer (it imports THIS
+#: module lazily, so this dict imports nothing from it).
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "menu": (
+        (
+            "the console menu",
+            "the operator console's tree over the dashboard: every entry is an area "
+            "(Trading, Rules, Compliance, ...) or a destination (Dashboard, Profile, Help)",
+        ),
+        (
+            "the cursor and the ordinals",
+            "up/k and down/j move the marker, Enter or Space selects, 1-9 jump straight "
+            "to the numbered entry",
+        ),
+        (
+            "q / Esc / m",
+            "back to the dashboard -- m steps back one level out of any console screen",
+        ),
+    ),
+    "profile": (
+        (
+            "the deployments",
+            "every config+db PAIR the wrappers pin -- a deployment is the PAIR, and "
+            "switching rebinds both halves everywhere, in one action",
+        ),
+        (
+            "LIVE (guarded)",
+            "selecting the live pair asks an explicit y/N at the terminal first; this "
+            "guard is a VIEW switch, not a typed gate -- it changes what the console "
+            "answers about, not what the engine does",
+        ),
+        (
+            "Venues",
+            "the installed-adapter browser (O7): every venue's declared capabilities, "
+            "the selected one highlighted; Enter opens it",
+        ),
+    ),
+    "venues": (
+        (
+            "the rows",
+            "every installed adapter and its DECLARED capabilities -- the same one "
+            "service payload `keel brokers list` prints; both front-ends render it",
+        ),
+        (
+            "[selected]",
+            "the active deployment's venue: the `broker:` name its config selects",
+        ),
+        (
+            "bound deployment",
+            "the active config+db pair, and -- where the venue declares the knobs -- "
+            "which endpoint (paper/live) and data feed it is bound to",
+        ),
+        (
+            "capability display only",
+            "wired-for-deployment says a shipped config selects this venue; it does "
+            "NOT say any key is present. No key presence is read or implied, and no "
+            "secret is ever shown",
+        ),
+    ),
+    "placeholder": (
+        (
+            "a future slice's entry",
+            "the console tree is stable: this entry renders a 'lands in Cx' notice "
+            "naming the slice that owns it -- navigation only, nothing is invokable",
+        ),
+    ),
+}
 
 
 # -- the session banner (O9) -----------------------------------------------------------------------

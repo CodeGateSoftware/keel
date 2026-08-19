@@ -141,6 +141,15 @@ def _optional_unix_seconds(clock: Any, field: str) -> int | None:
 class AlpacaAdapter:
     """Implements the `Broker` port against Alpaca's Trading + Market Data APIs."""
 
+    #: The endpoint and data-feed VOCABULARIES this adapter declares, for the capability
+    #: display surfaces (`keel brokers list`, the console's Venues browser, issue #394
+    #: C7). Derived from the transport's own maps -- `TRADING_HOSTS`' keys and
+    #: `SUPPORTED_DATA_FEEDS` -- so the declared vocabulary is the one the constructor
+    #: actually validates against, never a second list; an adapter with no such knobs
+    #: (the 24/7 crypto venues) simply does not declare these attributes.
+    DECLARED_ENDPOINTS: frozenset[str] = frozenset(TRADING_HOSTS)
+    DECLARED_DATA_FEEDS: frozenset[str] = frozenset(SUPPORTED_DATA_FEEDS)
+
     def __init__(
         self, transport: Transport | None = None, *, endpoint: str = "paper", data_feed: str = "iex"
     ) -> None:

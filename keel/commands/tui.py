@@ -792,6 +792,134 @@ def build_help_screen() -> list[ScreenLine]:
     return lines
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders for the DASHBOARD's own modes and the help surfaces, keyed by the live
+#: loop's mode names. Plain `(subject, description)` pairs so the text stays HERE with
+#: the screens it describes; `keel.commands.help_console` is the registry and renderer
+#: (it imports THIS module, so this dict must import nothing from it).
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "normal": (
+        (
+            "the dashboard",
+            "the live view of the ACTIVE deployment: rails, the market session, "
+            "positions, data freshness, recent activity -- read-only, refreshed every "
+            "poll from the DB a separate `keel agent` process writes",
+        ),
+        (
+            "the session banner (the two header lines)",
+            "the active config+db pair, then the market session and clock from the "
+            "venue's own recorded state -- 24/7 venues say so, session-bound ones show "
+            "OPEN/CLOSED with the next open/close, CLOCK UNAVAILABLE renders fail-loud",
+        ),
+        (
+            "a / f (autonomy, fetch)",
+            "a arms/disarms unattended ordering (arming asks a typed yes at the "
+            "terminal); f pulls candle history for every configured product -- "
+            "money-safe, data only, and it can take minutes",
+        ),
+        (
+            "m",
+            "the console menu -- the operator console's tree over this dashboard",
+        ),
+    ),
+    "help": (
+        (
+            "keys & safety",
+            "the full keybinding reference, every overlay's contract, and the safety "
+            "notes for the capability-adding actions -- the screen the Help menu's "
+            "'keys & safety' entry opens",
+        ),
+    ),
+    "help-menu": (
+        (
+            "the Help menu",
+            "the glossary (every console term defined once, fiqh terms anchored to "
+            "docs/fiqh-basis.md), every screen's what-am-I-looking-at rows, every rule "
+            "kind's parameter help, and the keys/safety notes",
+        ),
+        (
+            "? anywhere",
+            "the same help, in place: pressing ? in any console screen opens that "
+            "screen's own rows",
+        ),
+    ),
+    "help-glossary": (
+        (
+            "the glossary",
+            "docs/glossary.md rendered whole -- THE single source for console term "
+            "definitions; each fiqh term cites the fiqh-basis section it is quoted "
+            "from, and a term fiqh-basis does not state says so",
+        ),
+    ),
+    "help-params": (
+        (
+            "rule parameters",
+            "one row per rule kind; opening one renders every parameter's help FROM "
+            "THE CLASS ITSELF (describe_params, by introspection) -- doc, type, "
+            "choices and default, never a hand-maintained duplicate table",
+        ),
+    ),
+    "help-params-kind": (
+        (
+            "one kind's parameters",
+            "each parameter's meaning and default as its rule class defines it -- the "
+            "same source the add form's per-field help and the ledger detail render",
+        ),
+    ),
+    "help-screens": (
+        (
+            "screens & actions",
+            "every console screen's contextual-help rows in one scroll -- the "
+            "consolidated catalog of what each screen shows and each action does",
+        ),
+    ),
+    "context-help": (
+        (
+            "this overlay",
+            "the screen you pressed ? in, explained: its rows come from the module "
+            "that owns it. q, Esc or ? returns to that screen, unmoved",
+        ),
+    ),
+    "insights": (
+        (
+            "insights (i)",
+            "read-only: each rule's track record, its distance from the promotion "
+            "gate, an account summary and a recent-trades tail",
+        ),
+    ),
+    "screen": (
+        (
+            "screen (s)",
+            "offline, read-only: the current allowlist through the SAME admission gate "
+            "`keel assets screen` uses -- ADMIT/REJECT per product, plus why",
+        ),
+    ),
+    "propose": (
+        (
+            "propose (p)",
+            "offline, read-only: the newest shortlist file screened through the same "
+            "admission gate; a missing shortlist is reported plainly, never an error",
+        ),
+    ),
+    "discover": (
+        (
+            "discover (d) -- ARMED",
+            "opening makes NO network call; only Enter, pressed inside, makes the ONE "
+            "live venue read this overlay ever makes, and the result is held until "
+            "the overlay closes -- propose and report, never attest or trade",
+        ),
+    ),
+    "activity": (
+        (
+            "activity (v)",
+            "offline, read-only: one row per engine cycle from the structured log -- "
+            "what keel has been DOING (a quiet cycle still gets a row); t widens the "
+            "day scope, Enter expands a cycle into its events",
+        ),
+    ),
+}
+
+
 def _insights_line_style(text: str) -> str:
     """Style a single rendered line from `keel.commands.insights.render_summary`/`render_journal`
     (plain, unstyled `str`s -- that module has no notion of `ScreenLine`) by its own textual
@@ -1819,7 +1947,23 @@ def run_live(
     offline freshness overview, rebuilt per poll, a check sweep that never constructs a
     broker).
 
-    Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `s` open screen; `p`
+    C7 (issue #394) adds the Venues browser and the help & glossary system, all
+    console-bound only: `venues` (under Profile -- every installed adapter's declared
+    capabilities from the ONE `keel.commands.brokers` service payload, the SELECTED
+    adapter highlighted and the active deployment's binding named; the payload is read
+    ONCE per entry, never per poll), `help-menu` (the Help entry is a real sub-menu:
+    the glossary, the screens & actions catalog, the parameter help, the keys/safety
+    notes -- the pre-C7 help screen is its fourth entry), `help-glossary` /
+    `help-params` / `help-params-kind` / `help-screens` (docs/glossary.md read BOUNDED
+    and mtime-cached like a research doc; parameter help DELEGATED whole to
+    `rules.describe_params`, never a duplicate table), and `context-help` -- the O8
+    overlay: `?` in EVERY console mode opens that mode's own help rows from the owning
+    module's `CONTEXT_HELP` (`keel.commands.help_console` is the registry), and q/Esc/?
+    returns to the screen it was opened from. Normal mode's `h` now opens the Help
+    MENU, and its `?` opens the dashboard's own contextual help.
+
+    Normal-mode keys: `q`/`Q` quit; `h` opens the Help menu; `?` the contextual help;
+    `i` open insights; `s` open screen; `p`
     open propose; `d` open discover; `v` open activity; `m` open the console menu (when a
     console binding was supplied); `r` refresh now; `a` toggle autonomy
     (`toggle_autonomy`,
@@ -1871,11 +2015,15 @@ def run_live(
     # imports THIS module at load time (its builders speak `ScreenLine`), so importing it
     # here keeps the two modules loadable in either order. The strategy/research consoles
     # follow the same rule (both speak `ScreenLine` and dispatch to the service layer),
-    # and so do the C5 trading/data consoles.
+    # and so do the C5 trading/data consoles, and the C7 help console (the O8 registry,
+    # which resolves THIS module's own CONTEXT_HELP rows) and the brokers service (the
+    # O7 payload the Venues browser renders).
     from keel.commands import (
+        brokers,
         compliance_console,
         console,
         data_console,
+        help_console,
         research_console,
         strategy_console,
         trading_console,
@@ -2022,6 +2170,34 @@ def run_live(
         data_fetch_error: str | None = None
         data_fetch_offset = 0
         data_freshness_offset = 0
+        # -- the Venues browser (issue #394 C7 / PRD O7): the O7 payload, read ONCE per
+        # entry (an importlib-metadata scan plus one credential-less adapter
+        # construction per adapter -- the same walk `venue_session_bound` makes, never
+        # per poll), with the ACTIVE deployment's binding facts (selected venue,
+        # endpoint/data feed where the venue declares them) resolved at the same moment
+        # so the browser's header cannot describe a pair other than the one bound.
+        venues_infos: list[Any] = []
+        venues_selected: str | None = None
+        venues_endpoint: str | None = None
+        venues_data_feed: str | None = None
+        venues_offset = 0
+        # -- the Help menu and the contextual overlay (issue #394 C7 / PRD O8): the
+        # Help sub-menu's cursor, the glossary's per-mtime cache (the research doc
+        # view's contract -- repaints do not re-read an unchanged file), the parameter
+        # help's kind list/detail state (the detail holds the chosen kind; the rows
+        # themselves always render fresh through describe_params), the consolidated
+        # screens catalog's scroll, and the `?` overlay's remember-where-it-was-opened
+        # mode + scroll.
+        help_cursor = 0
+        help_menu_offset = 0
+        glossary_cache: dict[tuple[str, int], list[Any]] = {}
+        glossary_offset = 0
+        help_params_cursor = 0
+        help_params_kind: str | None = None
+        help_params_offset = 0
+        help_screens_offset = 0
+        context_help_for: str = "normal"
+        context_help_offset = 0
         # Where the insights overlay closes back to: the dashboard by default, the Rules
         # menu when the strategy console opened it (the shell is a hierarchy).
         insights_back = "normal"
@@ -2319,6 +2495,27 @@ def run_live(
             else:
                 _run_data_form_at_terminal(entry.target)
 
+        def _enter_help_entry(entry: Any) -> None:
+            """Where a Help sub-menu selection goes -- the same closed-mapping rule
+            `_enter_menu_entry` keeps, for the Help branch: every entry opens its own
+            view at the top (cursor and scroll reset with it)."""
+            nonlocal mode, glossary_offset, help_params_cursor, help_params_kind
+            nonlocal help_params_offset, help_screens_offset, help_offset
+            if entry.target == "glossary":
+                glossary_offset = 0
+                mode = "help-glossary"
+            elif entry.target == "screens":
+                help_screens_offset = 0
+                mode = "help-screens"
+            elif entry.target == "params":
+                help_params_cursor = 0
+                help_params_kind = None
+                help_params_offset = 0
+                mode = "help-params"
+            else:  # "keys" -- the pre-C7 help screen, kept whole
+                help_offset = 0
+                mode = "help"
+
         def _enter_menu_entry(
             action: str, entry: console.MenuEntry
         ) -> tuple[str, int, int, console.MenuEntry | None]:
@@ -2335,6 +2532,7 @@ def run_live(
             nonlocal research_cursor, research_menu_offset
             nonlocal trading_cursor, trading_menu_offset
             nonlocal data_cursor, data_menu_offset
+            nonlocal help_cursor
             if action == "compliance":
                 compliance_cursor = 0
                 compliance_menu_offset = 0
@@ -2350,12 +2548,17 @@ def run_live(
             elif action == "data":
                 data_cursor = 0
                 data_menu_offset = 0
+            elif action == "help":
+                help_cursor = 0
             if action == "dashboard":
                 return "normal", 0, 0, None
             if action == "profile":
                 return "profile", 0, 0, None
             if action == "help":
-                return "help", 0, 0, None
+                # C7 (issue #394): the Help entry is a real SUB-MENU now -- the glossary,
+                # the screens & actions catalog, the parameter help, and the keys/safety
+                # notes (the pre-C7 help screen, which remains as its fourth entry).
+                return "help-menu", 0, 0, None
             if action == "compliance":
                 return "compliance", 0, 0, None
             if action == "strategy":
@@ -2405,6 +2608,10 @@ def run_live(
                     mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
                         selected.action, selected
                     )
+                elif ch == ord("?"):
+                    context_help_for = "menu"
+                    context_help_offset = 0
+                    mode = "context-help"
                 continue
 
             if mode == "placeholder":
@@ -2425,6 +2632,10 @@ def run_live(
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("m")):
                     mode = "menu"
+                elif ch == ord("?"):
+                    context_help_for = "placeholder"
+                    context_help_offset = 0
+                    mode = "context-help"
                 continue
 
             if mode == "profile":
@@ -2451,6 +2662,35 @@ def run_live(
                     profile_cursor = max(0, profile_cursor - 1)
                 elif ch in (curses.KEY_DOWN, ord("j")):
                     profile_cursor = profile_cursor + 1
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and profile_cursor == len(
+                    profiles
+                ):
+                    # The Venues row (C7 / O7): open the installed-adapter browser. The
+                    # payload is read ONCE per entry (an import scan plus one
+                    # credential-less construction per adapter -- never per poll), and
+                    # the ACTIVE deployment's binding facts are resolved with it so the
+                    # browser's header describes the pair that is actually bound.
+                    venues_infos = brokers.list_installed_brokers()
+                    try:
+                        _venues_repo, venues_config = open_state()
+                        venues_selected = venues_config.broker.name
+                        selected_info = next(
+                            (i for i in venues_infos if i.name == venues_selected), None
+                        )
+                        # endpoint/data feed render ONLY where the selected venue
+                        # declares the knobs (Alpaca) -- an undeclared venue shows no
+                        # binding row it would be meaningless for.
+                        declares = selected_info is not None and bool(
+                            selected_info.declared_endpoints
+                        )
+                        venues_endpoint = venues_config.broker.endpoint if declares else None
+                        venues_data_feed = venues_config.broker.data_feed if declares else None
+                    except Exception:
+                        venues_selected = None
+                        venues_endpoint = None
+                        venues_data_feed = None
+                    venues_offset = 0
+                    mode = "venues"
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and 0 <= profile_cursor < len(
                     profiles
                 ):
@@ -2474,9 +2714,63 @@ def run_live(
                         profile_cursor = 0
                         available = None
                         last_balance_ts = 0
+                elif ch == ord("?"):
+                    context_help_for = "profile"
+                    context_help_offset = 0
+                    mode = "context-help"
                 # Clamp every poll: the discovered list can change under the cursor (a
-                # config file appearing/disappearing between polls).
-                profile_cursor = max(0, min(profile_cursor, max(0, len(profiles) - 1)))
+                # config file appearing/disappearing between polls) -- to the VENUES row,
+                # which is part of the same cursor range.
+                profile_cursor = max(0, min(profile_cursor, len(profiles)))
+                continue
+
+            if mode == "venues":
+                if console_binding is None:  # unreachable via the Profile menu; total
+                    mode = "profile"
+                    continue
+                # The Venues browser (C7 / O7): every installed adapter's declared
+                # capabilities from the ONE brokers service payload, the SELECTED
+                # adapter (the bound config's venue) highlighted and the active
+                # deployment's binding shown. Scrolled, banner-aware, m-close per the
+                # established contract; the payload is HELD from entry (see the Profile
+                # branch) -- repainting never re-walks the registry.
+                venues_lines = console.build_venues_lines(
+                    venues_infos,
+                    selected_venue=venues_selected,
+                    profile=console.active_profile(
+                        console_binding.config_path, console_binding.db_path
+                    ),
+                    binding_pair=console_binding.pair,
+                    endpoint=venues_endpoint,
+                    data_feed=venues_data_feed,
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *venues_lines], venues_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("v"), ord("m")):
+                    # Back to the Profile menu -- the browser's parent (the shell is a
+                    # hierarchy), `m` included per the one-level-up contract.
+                    mode = "profile"
+                    venues_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "venues"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch: the
+                    # clamp must land on the same last page the combined slice shows.
+                    venues_offset = _scroll_offset(
+                        ch,
+                        venues_offset,
+                        height,
+                        len(banner) + len(venues_lines),
+                        curses,
+                    )
                 continue
 
             if mode == "compliance":
@@ -2522,6 +2816,10 @@ def run_live(
                         _enter_compliance_entry(compliance_selected)
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     _enter_compliance_entry(compliance_console.COMPLIANCE_MENU[compliance_cursor])
+                elif ch == ord("?"):
+                    context_help_for = "compliance"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     compliance_menu_offset = _scroll_offset(
@@ -2595,6 +2893,10 @@ def run_live(
                         compliance_result = None
                         compliance_error = str(exc)[:200]
                     compliance_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "compliance-view"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above --
                     # and the scroll math spends only the rows the pinned footer leaves.
@@ -2648,6 +2950,10 @@ def run_live(
                     scout_candidate_cursor = 0
                     scout_view_cache = {}  # a fresh selection starts uncached
                     mode = "scout-view"
+                elif ch == ord("?"):
+                    context_help_for = "scout-list"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     scout_list_offset = _scroll_offset(
@@ -2746,6 +3052,10 @@ def run_live(
                         scout_candidate_cursor = min(
                             scout_candidates - 1, scout_candidate_cursor + 1
                         )
+                elif ch == ord("?"):
+                    context_help_for = "scout-view"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     scout_view_offset = _scroll_offset(
                         ch,
@@ -2799,6 +3109,10 @@ def run_live(
                     _enter_strategy_entry(
                         strategy_console.STRATEGY_MENU[strategy_cursor]
                     )
+                elif ch == ord("?"):
+                    context_help_for = "strategy"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     strategy_menu_offset = _scroll_offset(
                         ch,
@@ -2851,6 +3165,10 @@ def run_live(
                     strategy_rule_detail = strategy_ledger[strategy_ledger_cursor]
                     strategy_rule_offset = 0
                     mode = "strategy-rule"
+                elif ch == ord("?"):
+                    context_help_for = "strategy-ledger"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     strategy_ledger_offset = _scroll_offset(
                         ch,
@@ -2913,6 +3231,10 @@ def run_live(
                             )
                         )
                     strategy_rule_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "strategy-rule"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     strategy_rule_offset = _scroll_offset(
                         ch,
@@ -3011,6 +3333,10 @@ def run_live(
                         strategy_simulate_error = str(exc)[:200]
                     strategy_simulate_progress = progress
                     strategy_simulate_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "strategy-simulate"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     strategy_simulate_offset = _scroll_offset(
                         ch,
@@ -3060,6 +3386,10 @@ def run_live(
                     _enter_research_entry(
                         research_console.RESEARCH_MENU[research_cursor]
                     )
+                elif ch == ord("?"):
+                    context_help_for = "research"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     research_menu_offset = _scroll_offset(
                         ch,
@@ -3107,6 +3437,10 @@ def run_live(
                     research_doc_cache = {}  # a fresh selection starts uncached
                     research_doc_offset = 0
                     mode = "research-doc"
+                elif ch == ord("?"):
+                    context_help_for = "research-list"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     research_list_offset = _scroll_offset(
                         ch,
@@ -3138,6 +3472,10 @@ def run_live(
                 if ch in (ord("q"), 27, ord("m")):
                     mode = "research-list"
                     research_doc_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "research-doc"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     research_doc_offset = _scroll_offset(
                         ch,
@@ -3169,6 +3507,10 @@ def run_live(
                 if ch in (ord("q"), 27, ord("m")):
                     mode = "research"
                     research_trials_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "research-trials"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     research_trials_offset = _scroll_offset(
                         ch,
@@ -3218,6 +3560,10 @@ def run_live(
                         _enter_trading_entry(trading_selected)
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     _enter_trading_entry(trading_console.TRADING_MENU[trading_cursor])
+                elif ch == ord("?"):
+                    context_help_for = "trading"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     trading_menu_offset = _scroll_offset(
@@ -3302,6 +3648,10 @@ def run_live(
 
                     _run_terminal_form(stdscr, _run_cycle)
                     trading_cycle_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "trading-cycle"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     trading_cycle_offset = _scroll_offset(
                         ch,
@@ -3364,6 +3714,10 @@ def run_live(
                         trading_monitor_result = None
                         trading_monitor_error = str(exc)[:200]
                     trading_monitor_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "trading-monitor"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     trading_monitor_offset = _scroll_offset(
                         ch,
@@ -3408,6 +3762,10 @@ def run_live(
                         _enter_data_entry(data_selected)
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     _enter_data_entry(data_console.DATA_MENU[data_cursor])
+                elif ch == ord("?"):
+                    context_help_for = "data"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     data_menu_offset = _scroll_offset(
                         ch,
@@ -3487,6 +3845,10 @@ def run_live(
                         data_fetch_error = str(exc)[:200]
                     data_fetch_progress = fetch_progress
                     data_fetch_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "data-fetch"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     data_fetch_offset = _scroll_offset(
                         ch,
@@ -3531,12 +3893,235 @@ def run_live(
                 if ch in (ord("q"), 27, ord("m")):
                     mode = "data"
                     data_freshness_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "data-freshness"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     data_freshness_offset = _scroll_offset(
                         ch,
                         data_freshness_offset,
                         height,
                         len(banner) + len(freshness_view),
+                        curses,
+                    )
+                continue
+
+            if mode == "help-menu":
+                if console_binding is None:  # unreachable via the menu; kept total
+                    mode = "normal"
+                    continue
+                # The Help sub-menu (C7 / O8): the glossary, the screens & actions
+                # catalog, the parameter help, and the keys/safety notes -- the pre-C7
+                # help screen, kept whole as the fourth entry. Cursor-driven like every
+                # other sub-menu; entries are 1-4 direct shortcuts.
+                help_lines = help_console.build_help_menu_lines(cursor=help_cursor)
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr, _visible_slice([*banner, *help_lines], help_menu_offset, height)
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    help_cursor = max(0, help_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    help_cursor = min(len(help_console.HELP_MENU) - 1, help_cursor + 1)
+                elif ord("1") <= ch <= ord("9"):
+                    picked = help_console.help_entry(ch - ord("0"))
+                    if picked is not None:
+                        help_cursor = ch - ord("0") - 1
+                        _enter_help_entry(picked)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_help_entry(help_console.HELP_MENU[help_cursor])
+                elif ch == ord("?"):
+                    context_help_for = "help-menu"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    help_menu_offset = _scroll_offset(
+                        ch,
+                        help_menu_offset,
+                        height,
+                        len(banner) + len(help_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "help-glossary":
+                # The glossary (O8): docs/glossary.md -- the ONE hand-written home for
+                # console term definitions -- rendered whole, read BOUNDED and cached
+                # per mtime exactly like the research doc view, so a repaint never
+                # re-reads an unchanged file. An absent file (an installed deployment
+                # has no docs/ checkout) is the builder's calm empty state.
+                glossary_lines = help_console.build_glossary_lines(
+                    help_console.cached_glossary(None, glossary_cache)
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *glossary_lines], glossary_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "help-menu"
+                    glossary_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "help-glossary"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    glossary_offset = _scroll_offset(
+                        ch,
+                        glossary_offset,
+                        height,
+                        len(banner) + len(glossary_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "help-params":
+                # The parameter help's kind list (O8): every RULE_REGISTRY kind; the
+                # detail renders describe_params -- the classes' own docstrings and
+                # defaults, by introspection -- never a duplicate table.
+                from keel import agent as agent_mod
+
+                params_lines = help_console.build_params_kinds_lines(
+                    cursor=help_params_cursor
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *params_lines], help_params_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "help-menu"
+                    help_params_offset = 0
+                elif ch in (curses.KEY_UP, ord("k")):
+                    help_params_cursor = max(0, help_params_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    help_params_cursor = help_params_cursor + 1  # clamped every poll
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    kinds = sorted(agent_mod.RULE_REGISTRY)
+                    if 0 <= help_params_cursor < len(kinds):
+                        help_params_kind = kinds[help_params_cursor]
+                        help_params_offset = 0
+                        mode = "help-params-kind"
+                elif ch == ord("?"):
+                    context_help_for = "help-params"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    help_params_offset = _scroll_offset(
+                        ch,
+                        help_params_offset,
+                        height,
+                        len(banner) + len(params_lines),
+                        curses,
+                    )
+                # Clamp every poll: the registry's kind list is fixed, but the cursor
+                # may arrive past its end from a stale paint.
+                help_params_cursor = max(
+                    0, min(help_params_cursor, max(0, len(agent_mod.RULE_REGISTRY) - 1))
+                )
+                continue
+
+            if mode == "help-params-kind" and help_params_kind is not None:
+                # One kind's parameter help, DELEGATED whole to describe_params (the
+                # O8 single source): the doc strings, defaults, types and choices are
+                # the rule class's own, rendered fresh through the service each poll.
+                kind_lines = help_console.build_params_help_lines(help_params_kind)
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *kind_lines], help_params_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "help-params"
+                    help_params_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "help-params-kind"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    help_params_offset = _scroll_offset(
+                        ch,
+                        help_params_offset,
+                        height,
+                        len(banner) + len(kind_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "help-screens":
+                # The consolidated catalog (O8): every console mode's contextual-help
+                # rows in one scroll -- the C7 consolidation/audit of the per-screen
+                # strings that landed with C2-C5.
+                catalog_lines = help_console.build_screens_catalog_lines()
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *catalog_lines], help_screens_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "help-menu"
+                    help_screens_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "help-screens"
+                    context_help_offset = 0
+                    mode = "context-help"
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    help_screens_offset = _scroll_offset(
+                        ch,
+                        help_screens_offset,
+                        height,
+                        len(banner) + len(catalog_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "context-help":
+                # The `?` overlay (O8): the CURRENT screen's own help rows -- the module
+                # that owns the mode contributed them (help_console.CONTEXT_HELP is the
+                # registry) -- rendered over a closed scroll; q/Esc/? returns to the
+                # screen it was opened from, exactly where it was.
+                overlay_lines = help_console.build_context_help_lines(context_help_for)
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *overlay_lines], context_help_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("?")):
+                    mode = context_help_for
+                    context_help_offset = 0
+                else:
+                    # Banner-aware total, for the same reason as help's branch below.
+                    context_help_offset = _scroll_offset(
+                        ch,
+                        context_help_offset,
+                        height,
+                        len(banner) + len(overlay_lines),
                         curses,
                     )
                 continue
@@ -3551,7 +4136,9 @@ def run_live(
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("h"), ord("?")):
-                    mode = "normal"
+                    # The keys/safety screen is the Help MENU's fourth entry since C7,
+                    # so it closes onto the menu -- the shell is a hierarchy.
+                    mode = "help-menu"
                     help_offset = 0
                 else:
                     # The banner is PART of the scrolled list (`_visible_slice` slices the
@@ -3607,6 +4194,10 @@ def run_live(
                     mode = insights_back
                     insights_back = "normal"
                     insights_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "insights"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above: the
                     # clamp must land on the same last page the combined slice shows.
@@ -3639,6 +4230,10 @@ def run_live(
                 if ch in (ord("q"), 27, ord("s")):
                     mode = "normal"
                     screen_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "screen"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     screen_offset = _scroll_offset(
@@ -3674,6 +4269,10 @@ def run_live(
                 if ch in (ord("q"), 27, ord("p")):
                     mode = "normal"
                     propose_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "propose"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     # Banner-aware total, for the same reason as help's branch above.
                     propose_offset = _scroll_offset(
@@ -3747,6 +4346,10 @@ def run_live(
                     activity_scope = next_activity_scope(activity_scope)
                     activity_cursor = 0
                     activity_offset = 0
+                elif ch == ord("?"):
+                    context_help_for = "activity"
+                    context_help_offset = 0
+                    mode = "context-help"
                 else:
                     activity_cursor = _activity_cursor(
                         ch,
@@ -3837,9 +4440,17 @@ def run_live(
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
                 break
-            if ch in (ord("h"), ord("?")):
-                mode = "help"
-                help_offset = 0
+            if ch == ord("h"):
+                # The Help MENU since C7 (the keys/safety screen is its fourth entry).
+                mode = "help-menu"
+                help_cursor = 0
+                continue
+            if ch == ord("?"):
+                # The O8 contextual overlay: the dashboard's own "what am I looking at",
+                # rendered from this module's CONTEXT_HELP rows.
+                context_help_for = "normal"
+                context_help_offset = 0
+                mode = "context-help"
                 continue
             if ch == ord("i"):
                 mode = "insights"

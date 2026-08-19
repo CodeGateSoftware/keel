@@ -235,6 +235,88 @@ def compliance_entry(ordinal: int) -> ComplianceEntry | None:
     return None
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders, keyed by the live loop's mode names. Plain `(subject, description)`
+#: pairs so the text stays HERE with the module that owns the screens;
+#: `keel.commands.help_console` is the registry and renderer. The typed actions' rows
+#: state the O3 contract explicitly: the prompt cannot be pre-filled.
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "compliance": (
+        (
+            "the screen and propose views",
+            "read-only admission verdicts -- what the allowlist's assets passed or "
+            "failed, and the newest shortlist screened the same way; both offline",
+        ),
+        (
+            "the attest / attest-instrument / exempt forms",
+            "record-write forms run at the TERMINAL (curses suspended): attest records "
+            "a human classification, attest-instrument names a listing's contract, "
+            "exempt waives one DATA criterion with a documented rationale",
+        ),
+        (
+            "attest and withdrawals attest are TYPED",
+            "their confirmation asks you to TYPE the answer (the asset code, or 'yes') "
+            "at the terminal -- the prompt cannot be pre-filled, piped or bypassed; "
+            "backing out changes nothing",
+        ),
+        (
+            "holdings and discover",
+            "the two live reads: holdings screens what you actually hold as candidates, "
+            "discover proposes from the venue's own product list. Both open ARMED -- "
+            "nothing touches the network until Enter",
+        ),
+        (
+            "Scout results / Shariah in force",
+            "the scout browser drives the real propose -> screen -> attest flow; the "
+            "shariah view renders what the engine enforces now, from records alone",
+        ),
+    ),
+    "compliance-view": (
+        (
+            "what this view is",
+            "a read-only rendering of a compliance service report -- verdicts, records "
+            "or the venue's answer, depending on the entry you opened it from",
+        ),
+        (
+            "ARMED views (holdings, discover)",
+            "the network kinds open with nothing run: Enter makes the ONE live read, "
+            "and the result is then held until the view closes -- a poll can never fire "
+            "a venue call",
+        ),
+        (
+            "q / Esc / m",
+            "back to the Compliance menu",
+        ),
+    ),
+    "scout-list": (
+        (
+            "the shortlists",
+            "every proposal file the keel-asset-scout wrote to the configured "
+            "proposals directory, newest first; an absent directory is a calm empty "
+            "state, never an error",
+        ),
+        (
+            "Enter",
+            "screen the selected shortlist through the real admission services -- "
+            "read-only; the human attest step is offered, never auto-run",
+        ),
+    ),
+    "scout-view": (
+        (
+            "the screened shortlist",
+            "each candidate with its admission verdict, rendered from the same screen "
+            "service the CLI runs -- the proposer proposes, it never decides",
+        ),
+        (
+            "a attest (TYPED)",
+            "attesting a selected candidate opens the CLI's own typed gate at the "
+            "terminal: you type the asset code yourself -- the prompt cannot be "
+            "pre-filled -- and declining changes nothing",
+        ),
+    ),
+}
+
+
 #: The width every console line must fit: `_paint` clips at the window width and
 #: 80-column terminals are this dashboard's stated target -- a clipped entry description
 #: tail would be the "what will this do" half of the row (O8), so the menu WRAPS instead.

@@ -133,6 +133,49 @@ def research_entry(ordinal: int) -> ResearchEntry | None:
     return None
 
 
+#: This module's screens' contextual help (O8, issue #394 C7) -- the rows the `?`
+#: overlay renders, keyed by the live loop's mode names. Plain `(subject, description)`
+#: pairs so the text stays HERE with the module that owns the screens;
+#: `keel.commands.help_console` is the registry and renderer.
+CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
+    "research": (
+        (
+            "the corpora",
+            "read-only browsers over the repo's evidence: the experiments corpus (what "
+            "was tried, and measured), the research docs, and the promotion reports a "
+            "simulate run writes (newest first)",
+        ),
+        (
+            "the trials ledger",
+            "the hash-chained record of every backtest trial, with the chain's own "
+            "verify verdict rendered under the rows",
+        ),
+    ),
+    "research-list": (
+        (
+            "the files",
+            "one row per document, newest first, with its written date and size; the "
+            "directories are the engine's own paths, discovered -- never a TUI-side list",
+        ),
+        ("Enter", "opens the document's own text, verbatim -- its words, not a summary"),
+    ),
+    "research-doc": (
+        (
+            "the document",
+            "the file's own lines, wrapped to the 80-column budget and read BOUNDED "
+            "(the first MiB, with a loud truncation note if the file is past it)",
+        ),
+    ),
+    "research-trials": (
+        (
+            "the rows",
+            "every trial the ledger records, with the two N accountings; the chain "
+            "verdict under them is the SAME read-only verify `keel trials verify` runs",
+        ),
+    ),
+}
+
+
 def build_research_menu_lines(*, cursor: int = 0, message: str | None = None) -> list[ScreenLine]:
     """The Research sub-menu screen: every entry with its description wrapped to the
     80-column budget, exactly one cursor-marked row. PURE."""
