@@ -363,8 +363,9 @@ measurement, not a fresh start for unproven rules (Phase C's cost-fidelity work 
 any strategy evaluation is believed).
 
 **The allowlist is PAPER CANDIDATES, and asserts nothing religiously.** MSFT, AAPL, GOOGL,
-NVDA and COST are chosen for liquidity and for being the kind of low-debt large cap a screen
-*could* be run on — not because any has been screened. Trading them here is paper evidence
+NVDA and COST are liquid US large caps, chosen so a screen *could* be run on them — not
+because any has been screened (leverage and the other screening ratios are the operator's
+attestation to make, not a fact this file asserts). Trading them here is paper evidence
 collection, full stop; see the attestation semantics below for what live consideration would
 additionally demand.
 
@@ -411,19 +412,29 @@ Alpaca paper credentials); the steps, once you have them:
    quiet — B1's session awareness records the closed clock and `--check` does not alert on
    closed-explained staleness.
 
-**Scheduling, in one paragraph.** The plist fires 10:00 through 15:00 local (ET) — *inside*
-the 09:30–16:00 regular session, deliberately not shortly after the close: B1's session gate
-skips the whole cycle whenever the venue clock answers closed, so an after-close trigger
-would log `market_closed` and never evaluate a bar. The daily bar that closes at 16:00 ET is
-evaluated at the *next* session's open — the conventional daily-system semantics (signal on
-close, execute next open) — and the 10:00 anchor gives the open thirty minutes to settle. The
-runner stamps the **UTC day** (Alpaca keys a session's ONE_DAY bar to that UTC date, and the
-UTC rollover at 19:00/20:00 local is always after the window), refuses to run outside local
-hours 10–15 (a closed-market skip exits 0 and must never be stamped as the day's work), and
-writes the stamp only after a successful cycle. The host's local zone is America/New_York, so
-the fixed local triggers keep their Eastern meaning across both US DST transitions — what
-moves is the UTC instant, never the distance from the open; on a host elsewhere, re-anchor
-the schedule.
+**Scheduling, in one paragraph.** The plist triggers at 10:00–15:00 local (ET), on the hour —
+*inside* the 09:30–16:00 regular session, deliberately not shortly after the close: B1's
+session gate skips the whole cycle whenever the venue clock answers closed, so an
+after-close trigger would log `market_closed` and never evaluate a bar. The daily bar that
+closes at 16:00 ET is evaluated at the *next* session's open — the conventional
+daily-system semantics (signal on close, execute next open) — and the 10:00 anchor gives the
+open thirty minutes to settle. The runner stamps the **UTC day** (Alpaca keys a session's
+ONE_DAY bar to that UTC date, and the UTC rollover at 19:00/20:00 local is always after the
+window), refuses to run outside its window — 10:00 inclusive to 16:00 exclusive, local (the
+15:00 trigger runs; a closed-market skip exits 0 and must never be stamped as the day's
+work) — and writes the stamp only after a successful cycle (a cycle that skipped because the
+venue clock could not be *read* exits nonzero, so a transient clock outage is retried by the
+next trigger rather than recorded as the day's work).
+
+**Where that schedule is actually correct.** On an ET-anchored host — or one within ±4h of
+ET, where the trigger hours still land inside the 09:30–16:00 ET session. The deployment
+host's local zone is America/New_York, so the fixed local triggers keep their Eastern
+meaning across both US DST transitions: what moves is the UTC instant, never the distance
+from the open. Anywhere else, re-anchor the trigger hours so they land 10:00–15:00 **ET**
+(on a host far enough ahead of ET, all six triggers can fire pre-open, and the runner's
+local-hours guard will still endorse them — it reads the host's clock, not ET — so each day
+would be stamped by a closed-market skip: permanently zero evidence). The guard is a
+backstop against off-schedule boots, not a drift absorber for a mis-anchored schedule.
 
 ### Attestation semantics for equities
 
@@ -443,6 +454,15 @@ not evidence. Two honest limits, stated rather than papered over:
   screen generalizes (#233 live-path work), equity classifications live in the operator's
   records, and this profile trades as **unattested paper candidates**. That is precisely why
   the config's allowlist carries its disclaimer and why nothing here is live.
+
+**Dividend purification is fenced to Phase B3 — planned, not forgotten.** Purification
+appears above only as a classification input (the ratio the operator attests). The walk the
+fiqh source review implies — corporate actions (dividends, splits) recorded per event as
+they occur (FR-10's recording duty), the purification amount computed against the attested
+ratio under the operator's stated policy, and the disposition (how much, and where it went)
+recorded — is the **B3 slice of this phase** (corporate actions + purification recording).
+Until B3 lands, nothing here computes or records that walk, and a holder of dividend-paying
+candidates carries the purification obligation in their own records.
 
 ### Rail 17 (withdrawal capability) for equities
 
@@ -467,6 +487,25 @@ account you cannot spend *unsettled* proceeds, so an operator manually redeployi
 sale proceeds (outside the engine, which cycles daily) is the one way to meet the constraint
 — and it is an operator act, not an engine one. The paper profile's synthetic cash does not
 model settlement at all; that honesty is on record for any future live consideration.
+
+### Account posture: cash only — never margin — and the PDT rule
+
+The equities profile runs against a **cash account, never a margin account**. Margin
+borrowing is a loan that charges interest — *riba* — so the posture is categorical, not a
+preference; a cash account also sidesteps the pattern day trader (PDT) rule's $25,000
+minimum-equity requirement, which applies to **margin** accounts only. The PDT rule: FINRA
+flags a **margin** account as a pattern day trader when it executes four or more day trades
+within five business days, and such an account then needs $25,000 of equity to keep day
+trading. A cash account running keel's daily cadence is not that pattern — the rule does not
+bind cash accounts, and in any case keel evaluates a session's bar once and holds overnight
+by construction, so it does not day-trade in the first place; settled-cash funding is what
+makes entries wait for settlement, and that interplay is the T+1 section above (not repeated
+here).
+
+Enforcement in code — the config refusing a margin posture where the venue reports one — is
+issue **#372**'s scope; this runbook carries the operator-facing half now: **create and keep
+the Alpaca account a cash account** (the paper account is one by default), and treat any
+offer to "upgrade" to margin as a posture violation to decline, not a capability to use.
 
 ### Operator-verified opt-outs (Alpaca account level)
 

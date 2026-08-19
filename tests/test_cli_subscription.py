@@ -18,8 +18,16 @@ from keel_core.subscription import SubscriptionStatus
 from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from tests.conftest import VALID_CONFIG_YAML
 
 ONE_YEAR = 31_536_000
+
+ALPACA_BROKER_YAML = """
+broker:
+  name: alpaca
+  endpoint: paper
+  data_feed: iex
+"""
 
 
 def _repo_at(db_path: Path) -> Repository:
@@ -210,3 +218,67 @@ def test_show_reports_an_overdue_record_as_suspect(
 
     result = _run(db_path, valid_config_path, "subscription", "show")
     assert "effective_status=suspect" in result.output
+
+
+# -- the venue default follows the config's bound venue (#386 review) ---------------------------
+#
+# Rail 14 gates every BUY on the DEPLOYMENT'S venue record (the binding `_load_cfg` makes via
+# `bind_venue(config.broker.name)`). A `--venue` default frozen at coinbase would make an
+# alpaca operator type `--venue alpaca` on every invocation or silently write a coinbase row
+# that nothing reads.
+
+
+def test_attest_without_venue_defaults_to_the_configs_bound_venue(
+    tmp_path: Path, write_config
+) -> None:
+    """On an alpaca config, `subscription attest` with no `--venue` must write the
+    alpaca-keyed record -- the one rail 14 actually consults on that deployment."""
+    db_path = tmp_path / "keel.db"
+    config_path = write_config(VALID_CONFIG_YAML + ALPACA_BROKER_YAML)
+
+    result = _run(db_path, config_path, "subscription", "attest", "--tier", "Basic")
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    assert repo.get_broker_subscription("alpaca") is not None
+    assert repo.get_broker_subscription("coinbase") is None, "nothing bound writes coinbase"
+
+
+def test_set_without_venue_defaults_to_the_configs_bound_venue(
+    tmp_path: Path, write_config
+) -> None:
+    db_path = tmp_path / "keel.db"
+    config_path = write_config(VALID_CONFIG_YAML + ALPACA_BROKER_YAML)
+
+    result = _run(db_path, config_path, "subscription", "set", "--free-volume-usd", "500")
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    assert repo.get_broker_subscription("alpaca") is not None
+    assert repo.get_broker_subscription("coinbase") is None
+
+
+def test_attest_without_venue_defaults_to_coinbase_when_nothing_is_bound(
+    db_path: Path, valid_config_path: Path
+) -> None:
+    """The compatibility pin: a config without a `broker:` section binds coinbase, so the
+    historical default is what an omitted `--venue` still means there."""
+    result = _run(db_path, valid_config_path, "subscription", "attest", "--tier", "Basic")
+
+    assert result.exit_code == 0, result.output
+    repo = _repo_at(db_path)
+    assert repo.get_broker_subscription("coinbase") is not None
+    assert repo.get_broker_subscription("alpaca") is None
+
+
+def test_show_names_the_bound_venue_in_its_empty_advice(tmp_path: Path, write_config) -> None:
+    """The fresh-database advice must point at the venue THIS deployment trades, or the
+    operator's copy-paste attests a record nothing reads."""
+    db_path = tmp_path / "keel.db"
+    config_path = write_config(VALID_CONFIG_YAML + ALPACA_BROKER_YAML)
+
+    result = _run(db_path, config_path, "subscription", "show")
+
+    assert result.exit_code == 0, result.output
+    assert "--venue alpaca" in result.output
+    assert "--venue coinbase" not in result.output

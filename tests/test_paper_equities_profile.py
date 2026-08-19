@@ -9,7 +9,7 @@ Two things are pinned here, and they ship together because one cannot run withou
 2. The MINIMAL engine wiring the profile needs: config-driven venue selection. Today
    `_build_broker` constructs a `CoinbaseClient` unconditionally; this profile is the first
    that must reach a different adapter (`keel-broker-alpaca`, paper host, IEX feed). The
-   `broker:` config section is that surface, and its ABSSENCE must leave the Coinbase
+   `broker:` config section is that surface, and its ABSENCE must leave the Coinbase
    construction path byte-identical -- pinned here by construction, not by assertion of
    intent, because every existing profile and test depends on that default.
 
@@ -51,7 +51,7 @@ ENV_EXAMPLE = REPO_ROOT / ".env.example"
 ET = ZoneInfo("America/New_York")
 
 # The five paper candidates (see the config's header for the disclaimer that governs them):
-# liquid, low-debt US large caps chosen so a screen COULD be run on them, not ones that have.
+# liquid US large caps chosen so a screen COULD be run on them, not ones that have.
 CANDIDATES = ["MSFT", "AAPL", "GOOGL", "NVDA", "COST"]
 
 
@@ -141,7 +141,7 @@ def test_plist_is_well_formed_xml():
 
 
 def test_plist_fires_hourly_through_the_regular_session_window():
-    """Six triggers, 10:00 through 15:00 local (ET) -- every one INSIDE the US regular
+    """Six triggers, at 10:00-15:00 local (ET) on the hour -- every one INSIDE the US regular
     session (09:30 to 16:00 ET). Deliberately NOT shortly after the 16:00 close: B1's session
     gate skips the whole cycle whenever the venue clock says closed, so an after-close
     trigger would log market_closed and never evaluate a bar. The just-closed daily bar is
@@ -182,6 +182,18 @@ def test_plist_documents_its_schedule_reasoning():
     assert "America/New_York" in text
     # The decision that contradicts the obvious copy-paste from a close-anchored schedule:
     assert "session gate" in text or "market_closed" in text
+
+
+def test_plist_dst_caveat_is_honest_about_non_et_hosts():
+    """The caveat must not overstate safety: on a host far enough ahead of ET every trigger
+    can fire pre-open, PASS the runner's local-hours guard, and stamp a closed-market skip
+    as the day's work -- permanently zero evidence. The plist must say the schedule is only
+    correct on an ET-anchored host, that other hosts re-anchor the trigger hours to land
+    10:00-15:00 ET, and that the local-hours guard is a backstop, not a drift absorber."""
+    text = PLIST.read_text()
+    assert "ET-anchored" in text
+    assert "re-anchor" in text
+    assert "backstop" in text
 
 
 # -- the runner: exactly once per UTC day, only inside the session window ------------------------
@@ -389,6 +401,57 @@ def test_the_runner_script_states_its_stamp_ordering_in_comments():
     assert invocation_at < stamp_write_at
 
 
+# -- the runner: the two skip kinds are stamped differently (#386 review) ------------------------
+#
+# B1's session gate skips a cycle two ways, and only one of them is the day's work:
+# market_closed (weekend, holiday) exits 0 and stamping it is CORRECT cadence bookkeeping --
+# nothing more can happen that day; market_clock_unavailable (a transient clock outage) is a
+# degraded read that must NOT stamp, or the day is silently lost while the log says "ran".
+
+
+def _clock_exit() -> int:
+    """The contract the runner depends on: the agent's distinct nonzero exit for a
+    market_clock_unavailable skip (`agent.MARKET_CLOCK_UNAVAILABLE_EXIT`)."""
+    from keel.agent import MARKET_CLOCK_UNAVAILABLE_EXIT
+
+    return MARKET_CLOCK_UNAVAILABLE_EXIT
+
+
+def test_a_clock_unavailable_cycle_writes_no_stamp_and_is_retried(tmp_path):
+    """A transient clock outage at the 10:00 trigger must not be recorded as the day's work:
+    the cycle exits MARKET_CLOCK_UNAVAILABLE_EXIT (nonzero), `set -e` stops the script short
+    of the stamp, and the next trigger retries -- the same recovery shape as any failed
+    cycle."""
+    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=_clock_exit())
+
+    failed = _run(script, env, _et(2026, 6, 15, 10, 30))
+    assert failed.returncode == _clock_exit(), "the script must surface the cycle's exit code"
+    assert not stamp.exists(), "a clock-unavailable skip must leave the day unstamped"
+
+    # Flip the stub to a healthy cycle, then re-fire inside the same day: the retry stamps.
+    stub = tmp_path / ".venv" / "bin" / "keel"
+    stub.write_text(f'#!/bin/bash\nprintf "cycle\\n" >> "{invocations}"\nexit 0\n')
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    ok = _run(script, env, _et(2026, 6, 15, 11, 30))
+    assert ok.returncode == 0
+    assert stamp.read_text().strip() == "2026-06-15"
+    assert _count_lines(invocations) == 2
+
+
+def test_a_market_closed_skip_still_stamps_the_utc_day(tmp_path):
+    """The other skip kind keeps its historical treatment: a closed venue (here, a Saturday)
+    skips with market_closed and exits 0, and stamping THAT is correct -- nothing more can
+    happen that day, so the day is recorded as done rather than retried forever."""
+    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=0)
+
+    # 2026-06-20 is a Saturday: the (stubbed) cycle would have skipped market_closed.
+    ok = _run(script, env, _et(2026, 6, 20, 11, 0))
+
+    assert ok.returncode == 0
+    assert stamp.read_text().strip() == "2026-06-20"
+
+
 # -- the wrapper --------------------------------------------------------------------------------
 
 
@@ -444,6 +507,34 @@ def test_runbook_notes_what_is_deliberately_not_here():
     assert "#233" in text
     assert "out of scope" in text or "deliberately NOT here" in text
     assert "README" in text
+
+
+def test_runbook_states_the_cash_no_margin_pdt_posture():
+    """PRD 5/6.4's account posture, operator-facing half: cash accounts ONLY (margin
+    borrowing is riba; a cash account also sidesteps the PDT rule's $25k margin-account
+    threshold), the PDT rule explained (what it is; why a cash account on keel's daily
+    cadence is not that pattern), the T+1 interplay CROSS-REFERENCED rather than duplicated,
+    and the fence that enforcement-in-code is #372's scope."""
+    text = RUNBOOK.read_text()
+    assert "cash account" in text.lower()
+    assert "margin" in text.lower()
+    assert "pattern day trader" in text.lower() or "PDT" in text
+    assert "25,000" in text or "$25k" in text
+    # The scope fence: config refusing a margin posture is #372's work, not undocumented.
+    assert "#372" in text
+    # And the posture cross-references the T+1 section instead of restating it.
+    assert "T+1 settlement" in text
+
+
+def test_runbook_fences_dividend_purification_as_phase_b3():
+    """Purification must not read as forgotten: the recorded-event + operator-policy walk
+    (corporate actions recorded per FR-10, purification math against the attestation's
+    ratio, disposition recorded) is fenced as the B3 slice of this phase."""
+    text = RUNBOOK.read_text()
+    assert "purification" in text.lower()
+    assert "corporate actions" in text.lower()
+    assert "B3" in text
+    assert "FR-10" in text
 
 
 def test_runbook_profile_table_gains_the_fourth_column():

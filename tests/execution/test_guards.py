@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from keel_core.products import parse_spot_product_id
 from keel_core.subscription import SubscriptionStatus
+from keel_core.telemetry import bind_venue, unbind_venue
 
 from keel.config import (
     DEFAULT_SETTLEMENT_CURRENCIES,
@@ -874,6 +875,59 @@ def test_rail14_unattested_opportunistic_pacing_ignores_the_business_day_pace() 
     result = guards.check(_intent(notional=Decimal("150")), _unattested_repo(), config, NOW_TS)
     assert result.ok is True
     assert result.violations == []
+
+
+# -- rail 14: keyed on the DEPLOYMENT'S bound venue, not the hardcoded default (#386 review) -----
+
+
+def test_rail14_reads_the_bound_venues_record_not_the_default_constants() -> None:
+    """On an alpaca deployment (`broker: {name: alpaca}` in config.yaml) the attested record
+    is alpaca-keyed; a rail that kept reading the coinbase slot would gate every BUY on a
+    record nothing writes -- out of the box that is a $0 allowance and a full veto, on the
+    wrong venue, forever. The venue arrives through the SAME binding `_load_cfg` makes for
+    telemetry (`bind_venue(config.broker.name)`), so rail 14 and the stamped events can never
+    disagree about which venue this process is trading."""
+    repo = _unattested_repo()
+    # Alpaca is attested and roomy; coinbase (the rail's historical key) is NOT.
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE, venue="alpaca")
+    token = bind_venue("alpaca")
+    try:
+        result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    finally:
+        unbind_venue(token)
+
+    assert result.ok, f"rail 14 read a venue other than the bound one: {result.violations}"
+
+
+def test_rail14_unattested_veto_names_the_bound_venue_in_its_advice() -> None:
+    """The veto's advice is actionable only if it names the venue the operator must attest:
+    on an unattested alpaca deployment, telling them to `attest --venue coinbase` writes a
+    row nothing reads and leaves every BUY vetoed -- the operator follows the instruction and
+    nothing changes."""
+    repo = _unattested_repo()
+    token = bind_venue("alpaca")
+    try:
+        result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+    finally:
+        unbind_venue(token)
+
+    violation = next(v for v in result.violations if v.startswith("subscription_unattested"))
+    assert "alpaca" in violation
+    assert "--venue alpaca" in violation
+    assert "coinbase" not in violation
+
+
+def test_rail14_with_no_venue_bound_still_reads_coinbase() -> None:
+    """The compatibility pin: nothing bound (every in-process caller, every pre-existing
+    test) keeps coinbase as the answer -- even when some OTHER venue's record exists in the
+    repo. A rail that keyed on any attested record it could find would spend an alpaca
+    allowance on a coinbase deployment."""
+    repo = _unattested_repo()
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE, venue="alpaca")
+
+    result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
+
+    assert "subscription_unattested" in _keys(result)
 
 
 def test_rail14_reads_pacing_from_the_record_not_config(repo: Repository) -> None:

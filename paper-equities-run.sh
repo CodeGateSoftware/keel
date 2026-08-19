@@ -16,29 +16,37 @@
 # and stamps it; later triggers the same UTC day are no-ops. The next day always needs, and
 # gets, its own cycle.
 #
-# THE WINDOW GUARD, and why this runner refuses to run outside local hours 10 to 15. The US
-# regular session is 09:30 to 16:00 ET and the engine's session gate (#370 B1) skips the
-# WHOLE cycle whenever the venue clock answers closed, exiting 0. So:
+# THE WINDOW GUARD, and why this runner refuses to run outside its window -- 10:00 inclusive
+# to 16:00 exclusive, LOCAL hours (the code reads: hour >= 10 and hour < 16, so the 15:00
+# trigger runs). The US regular session is 09:30 to 16:00 ET and the engine's session gate
+# (#370 B1) skips the WHOLE cycle whenever the venue clock answers closed, exiting 0. So:
 #   - BEFORE 10:00 (pre-open boots, RunAtLoad on an early login): a cycle would skip closed
 #     and exit 0, and stamping that skip would record the day as done and suppress the real
 #     evaluation at 10:00. Refuse, run nothing, stamp nothing.
 #   - AT/AFTER 16:00 (after the close): same closed-market skip, same false stamp. Refuse.
-# The plist's six triggers (10:00 through 15:00) sit inside the session by construction;
-# the guard exists for RunAtLoad and any manual cron that misses the point. Known edge,
-# documented not fixed: an early-close half-day (13:00 ET close) whose morning cycles all
-# failed could have the day stamped by a 14:00 closed-skip -- a paper-evidence gap, visible
-# in the log, never a money event.
+# The plist's six triggers (10:00-15:00 local, on the hour) sit inside the session by
+# construction; the guard exists for RunAtLoad and any manual cron that misses the point.
+# Known edge, documented not fixed: an early-close half-day (13:00 ET close) whose morning
+# cycles all failed could have the day stamped by a 14:00 closed-skip -- a paper-evidence
+# gap, visible in the log, never a money event.
 #
 # SESSION-AWARENESS COMES FREE from B1: weekends and holidays need no calendar here. The
 # agent itself reads the venue clock, records the session (which keeps `fetch --check`
 # non-alerting through the weekend) and skips with reason market_closed; that skip exits 0
 # and stamping it is CORRECT cadence bookkeeping -- nothing more can happen that day.
 #
+# THE TWO SKIP KINDS ARE STAMPED DIFFERENTLY. A clock that cannot be READ (no network on
+# wake, the clock endpoint erroring) is not the day's work either: the agent exits
+# MARKET_CLOCK_UNAVAILABLE_EXIT (nonzero) for exactly that skip, so `set -e` below stops
+# this script short of the stamp and the next trigger retries once the clock answers --
+# a transient outage costs an hour of delay, never the trading day.
+#
 # The stamp is written only AFTER a successful cycle (`set -e`), so a failed run (no network
-# on wake, the venue late publishing the bar, blocked entries returning nonzero) is retried
-# by the next trigger rather than being recorded as done. Note what a retry can and cannot
-# do: it evaluates the NEWEST closed bar at its own time, so a day whose cycle failed through
-# is covered by a later retry only in what that later evaluation sees.
+# on wake, the venue late publishing the bar, blocked entries or an unreadable clock
+# returning nonzero) is retried by the next trigger rather than being recorded as done. Note
+# what a retry can and cannot do: it evaluates the NEWEST closed bar at its own time, so a
+# day whose cycle failed through is covered by a later retry only in what that later
+# evaluation sees.
 #
 # Authored in the dev repo. DEPLOY (copy) to ~/keel and schedule via
 # com.keel.paper-equities.plist.

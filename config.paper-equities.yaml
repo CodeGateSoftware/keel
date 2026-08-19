@@ -9,7 +9,7 @@
 #
 # THE ALLOWLIST IS PAPER CANDIDATES, NOTHING MORE. MSFT, AAPL, GOOGL, NVDA and COST are
 # chosen for LIQUIDITY (deep daily books, long split-adjusted history, IEX data quality on
-# mega-caps) and for being the kind of low-debt large cap an equity screen can be RUN on —
+# mega-caps) and for being the kind of liquid large cap an equity screen can be RUN on —
 # not because any of them has been screened, and not because any of them is expected to be
 # profitable. Classification is OPERATOR-ATTESTED per (alpaca, SYMBOL), from attributed
 # sources, before any live consideration (see the runbook's attestation semantics: AAOIFI /
@@ -88,11 +88,15 @@ auto_trade:
   # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
   # true or false changes nothing. Use `keel kill` to halt trading.
   enabled: false
-  # One cycle per UTC day. The LaunchAgent (com.keel.paper-equities.plist) fires daily
-  # INSIDE the US regular session (10:00 through 15:00 local/ET) because B1's session gate
+  # One cycle per UTC day. The LaunchAgent (com.keel.paper-equities.plist) triggers daily
+  # at 10:00-15:00 local, inside the US regular session (the runner's window is 10:00
+  # inclusive to 16:00 exclusive, so the 15:00 trigger runs), because B1's session gate
   # skips any cycle the venue clock answers closed — see that plist's comment for the full
-  # reasoning. This value also scales the staleness window (86400 x FEED_STALENESS_CYCLES),
-  # which is what keeps weekends and holidays reading market-closed instead of stale.
+  # reasoning. That schedule is correct on an ET-anchored host (or one within ±4h of ET);
+  # on any other host, re-anchor the trigger hours to land 10:00-15:00 ET — the runner's
+  # local-hours guard is a backstop against off-schedule boots, not a drift absorber. This
+  # value also scales the staleness window (86400 x FEED_STALENESS_CYCLES), which is what
+  # keeps weekends and holidays reading market-closed instead of stale.
   interval_sec: 86400
 
 promotion:
