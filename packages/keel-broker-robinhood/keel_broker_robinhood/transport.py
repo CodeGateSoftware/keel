@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, Protocol
 from urllib.parse import quote, urlencode
@@ -154,6 +155,30 @@ def build_headers(api_key: str, signature: str, timestamp: int) -> dict[str, str
     }
 
 
+#: How many times a retryable request is SENT in total, first attempt included. Four attempts with
+#: the backoff below spans roughly 0.5 + 1 + 2 seconds of waiting, which comfortably outlasts the
+#: sub-second bursts a 100 req/min limiter produces while staying far inside any caller's patience.
+#: A cap rather than "retry until it works": a 429 that persists past several seconds is a quota
+#: problem, and hiding it behind an unbounded loop would turn a visible limit into a hang.
+_MAX_ATTEMPTS = 4
+
+#: Seconds before the FIRST retry. Each subsequent wait doubles.
+_BACKOFF_BASE_SEC = 0.5
+
+#: Longest this transport will EVER wait between two attempts, including a `Retry-After` the
+#: venue asked for. A server-controlled header is not a licence to block a trading loop for
+#: minutes: `Retry-After: 3600` is a legal response, and honouring it literally would park the
+#: caller for an hour inside what it believes is a bounded read.
+_MAX_BACKOFF_SEC = 8.0
+
+#: Status codes worth sending again. 429 is the rate limiter, and 5xx are the venue's own
+#: transient failures.
+#:
+#: ⚠️ **404 is deliberately absent** -- `_request` turns it into `None` before this is consulted,
+#: and that split is load-bearing (see `_request`). 401 is absent too: a signature or clock
+#: problem is not transient, and retrying it three more times turns one clear failure into four.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 #: Robinhood's `next` cursor points at another page of the same endpoint. A well-behaved account
 #: with a handful of holdings or a day's worth of orders resolves in one page; twenty pages is
 #: already an enormous account history by any realistic measure. The cap exists because a `next`
@@ -163,6 +188,47 @@ def build_headers(api_key: str, signature: str, timestamp: int) -> dict[str, str
 #: Twenty pages failing to reach the end is itself a signal something is wrong, so this raises
 #: rather than silently truncating.
 _MAX_PAGES = 20
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """The `Retry-After` header as seconds, or `None` when it does not state a usable delay.
+
+    Only the delta-seconds form is read. RFC 9110 also permits an HTTP-date, but honouring one
+    means trusting the SERVER's clock against ours, and a skewed clock would produce either an
+    instant retry (useless) or a very long sleep (worse than useless) -- while the fallback here,
+    exponential backoff, is already correct without any clock at all. A date-form header is
+    therefore ignored rather than guessed at, which is the same posture `_field` takes toward a
+    value it cannot read.
+
+    Never raises: this is an attacker-or-bug-controlled string on a live-money path.
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except (ValueError, AttributeError):
+        return None
+    if seconds < 0 or seconds != seconds:  # negative, or NaN
+        return None
+    return seconds
+
+
+def _backoff_seconds(attempt: int, retry_after: str | None) -> float:
+    """How long to wait before attempt `attempt + 1`, capped at `_MAX_BACKOFF_SEC`.
+
+    The venue's own `Retry-After` wins when it states one -- it knows when its window resets and
+    we do not -- but it is CLAMPED, never obeyed literally. See `_MAX_BACKOFF_SEC`.
+
+    No jitter, deliberately. Jitter exists to desynchronise many clients retrying in lockstep;
+    this transport is one process making one request at a time against one account, so there is
+    no herd to spread out, and a nondeterministic sleep would make the retry path untestable
+    without injecting a clock. If keel ever runs several Robinhood workers against one credential
+    that reasoning expires.
+    """
+    asked = _retry_after_seconds(retry_after)
+    if asked is not None:
+        return min(asked, _MAX_BACKOFF_SEC)
+    return min(_BACKOFF_BASE_SEC * float(2**attempt), _MAX_BACKOFF_SEC)
 
 
 class RobinhoodTransport:
@@ -190,6 +256,7 @@ class RobinhoodTransport:
         base_url: str = "https://trading.robinhood.com",
         account_number: str | None = None,
         timeout: float = 10.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._api_key = api_key
         self._private_key_b64 = private_key_b64
@@ -198,6 +265,9 @@ class RobinhoodTransport:
         self._base_url = base_url.rstrip("/")
         self._account_number = account_number
         self._timeout = timeout
+        # Injected so the retry path is testable without a test that actually sleeps for seconds.
+        # A suite that waits out real backoff is a suite people stop running.
+        self._sleep = sleep
 
     def _account(self) -> str:
         """Return the cached account number, resolving it from `GET /accounts/` on first use.
@@ -260,6 +330,27 @@ class RobinhoodTransport:
         order would then read exactly like "this order does not exist", and the adapter maps a
         `None` `get_order` result to a terminal FAILED status -- reporting a live, resting order
         as dead because a request timed out is precisely the failure this split prevents.
+
+        **GETs are retried on 429 and 5xx; nothing else is retried, ever** (#411). Robinhood
+        allows 100 requests/minute sustained and 300 in a burst, and this transport had no
+        backoff at all -- `get_fee_summary` alone can spend 21 requests in one call
+        (`_MAX_PAGES` + the account read), so the limit is reachable in ordinary use, and a bare
+        429 propagating to the caller turned a "wait half a second" into a failed cycle.
+
+        ⚠️ **A POST is never retried, and that is not a gap.** `create_order` is the only one, and
+        a 429 or a 5xx on it is an UNKNOWN outcome, not a refusal -- the venue may have accepted
+        the order before the response was lost. Sending it again would place a second live order
+        unless the two attempts carry the same `client_order_id`, and THIS LAYER CANNOT TELL
+        WHETHER THEY DO: the body arrives already built, and an id derived from a caller's
+        idempotency key looks exactly like a freshly minted uuid4 from here. Since #409 the caller
+        can make a placement retry safe by passing `idempotency_key`, so the retry belongs where
+        that knowledge lives -- above the adapter, not inside the transport. A transport that
+        retried POSTs would be guessing, on the one request where guessing costs money.
+
+        A retryable status on the final attempt raises exactly as it did before, so a persistent
+        429 is still a visible failure rather than a hang. Each attempt re-signs: the signature is
+        valid for 30 seconds, and presenting a stale one after a backoff would return a 401 that
+        reads like a bad credential.
         """
         import requests  # deferred: see module docstring "Import safety"; only the live,
         # network-backed transport needs the HTTP stack, not the Protocol or the pure signing
@@ -288,22 +379,37 @@ class RobinhoodTransport:
 
         body_str = "" if body is None else json.dumps(body)
 
-        # Robinhood's signature is only valid for 30 seconds from this timestamp, so it is taken
-        # immediately before signing and sending -- computing it earlier (e.g. once per batch of
-        # requests) would risk a stale-clock 401 on whichever request goes out last.
-        timestamp = int(time.time())
-        signature = sign_payload(
-            self._private_key_b64, self._api_key, timestamp, full_path, method.upper(), body_str
-        )
-        headers = build_headers(self._api_key, signature, timestamp)
+        # Signed inside the loop, not above it: the signature is valid for 30 seconds from its
+        # timestamp, and a retry that waited out a backoff would otherwise present a stale one and
+        # come back 401 -- a failure indistinguishable from a bad key, arrived at by retrying.
+        retryable = method.upper() == "GET"
+        for attempt in range(_MAX_ATTEMPTS):
+            timestamp = int(time.time())
+            signature = sign_payload(
+                self._private_key_b64,
+                self._api_key,
+                timestamp,
+                full_path,
+                method.upper(),
+                body_str,
+            )
+            headers = build_headers(self._api_key, signature, timestamp)
 
-        response = requests.request(
-            method,
-            f"{self._base_url}{full_path}",
-            headers=headers,
-            data=body_str if body is not None else None,
-            timeout=self._timeout,
-        )
+            response = requests.request(
+                method,
+                f"{self._base_url}{full_path}",
+                headers=headers,
+                data=body_str if body is not None else None,
+                timeout=self._timeout,
+            )
+            if (
+                not retryable
+                or response.status_code not in _RETRYABLE_STATUSES
+                or attempt == _MAX_ATTEMPTS - 1
+            ):
+                break
+            self._sleep(_backoff_seconds(attempt, response.headers.get("Retry-After")))
+
         if response.status_code == 404:
             return None
         response.raise_for_status()

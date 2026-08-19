@@ -19,6 +19,9 @@ from urllib.parse import parse_qsl, urlsplit
 import nacl.signing
 import pytest
 from keel_broker_robinhood.transport import (
+    _BACKOFF_BASE_SEC,
+    _MAX_ATTEMPTS,
+    _MAX_BACKOFF_SEC,
     _MAX_PAGES,
     RobinhoodTransport,
     _field,
@@ -210,9 +213,18 @@ class _FakeResponse:
     """The slice of `requests.Response` that `_request` actually touches."""
 
     def __init__(
-        self, status_code: int = 200, payload: Any = None, text: str | None = None
+        self,
+        status_code: int = 200,
+        payload: Any = None,
+        text: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
+        # `_request` reads `Retry-After` off a retryable response (#411). Defaulting to an empty
+        # mapping rather than omitting the attribute keeps this a faithful slice of
+        # `requests.Response`: a real one always has `.headers`, so a fake that sometimes does not
+        # would let a `getattr` bug pass here and fail live.
+        self.headers = headers or {}
         if text is not None:
             self.text = text
         elif payload is None:
@@ -287,6 +299,11 @@ def _transport(**kwargs: Any) -> RobinhoodTransport:
     resolution construct their own without it.
     """
     kwargs.setdefault("account_number", "AB1234567890")
+    # A no-op sleep by default (#411). Retryable statuses are now retried, so a transport built
+    # with the real `time.sleep` would make any test touching a 429 or a 5xx wait out several
+    # seconds of genuine backoff -- and a suite that sleeps is a suite people stop running. The
+    # tests that assert on the backoff itself pass their own recording sleep.
+    kwargs.setdefault("sleep", lambda _seconds: None)
     return RobinhoodTransport(
         api_key="rh-api-key-1", private_key_b64=_TEST_SEED_B64, **kwargs
     )
@@ -357,6 +374,10 @@ def test_request_returns_none_for_a_404_and_raises_for_every_other_error(http: A
     http(_FakeResponse(404))
     assert _transport().get_order("no-such-id") is None
 
+    # 429 and 5xx are now RETRIED (#411) -- a single `_FakeResponse` replays for every attempt,
+    # so each of these exhausts the retries. That is the property worth pinning here: a status
+    # that survives every attempt still RAISES, rather than being laundered into `None` or
+    # disappearing into an unbounded loop.
     for status in (401, 429, 500, 503):
         http(_FakeResponse(status))
         with pytest.raises(RuntimeError):
@@ -785,3 +806,156 @@ def test_account_raises_when_the_first_row_has_no_account_number_field(http: Any
 
     with pytest.raises(RuntimeError, match="account_number"):
         transport._account()
+
+
+# --- retry and backoff (#411) -------------------------------------------------------------------
+# Robinhood allows 100 requests/minute sustained and 300 in a burst, and this transport had no
+# backoff at all -- `get_fee_summary` alone can spend 21 requests in one call. These pin what is
+# retried, what is emphatically NOT, and that a persistent failure still fails.
+
+
+def _recording_sleep() -> tuple[list[float], Any]:
+    waits: list[float] = []
+    return waits, waits.append
+
+
+def test_a_429_on_a_get_is_retried_and_the_second_answer_is_used(http: Any) -> None:
+    """The case the whole change exists for: a rate-limited read is a "wait half a second", not a
+    failed cycle."""
+    waits, sleep = _recording_sleep()
+    recorder = http([_FakeResponse(429), _FakeResponse(200, payload={"results": [{"id": "o1"}]})])
+
+    result = _transport(sleep=sleep).get_order("o1")
+
+    assert _results(result)[0]["id"] == "o1"
+    assert len(recorder.calls) == 2
+    assert waits == [_BACKOFF_BASE_SEC]
+
+
+def test_a_5xx_on_a_get_is_retried_too(http: Any) -> None:
+    """A 500 is the venue's own transient failure. It is retried for the same reason a 429 is --
+    and unlike a 404 it must never become `None`, which is why the exhaustion path still raises."""
+    waits, sleep = _recording_sleep()
+    recorder = http([_FakeResponse(503), _FakeResponse(200, payload={"results": []})])
+
+    _transport(sleep=sleep).get_order("o1")
+
+    assert len(recorder.calls) == 2
+
+
+def test_backoff_doubles_and_stops_at_max_attempts(http: Any) -> None:
+    """Bounded, not "retry until it works": a 429 that persists past several seconds is a quota
+    problem, and an unbounded loop would turn a visible limit into a hang."""
+    waits, sleep = _recording_sleep()
+    recorder = http(_FakeResponse(429))
+
+    with pytest.raises(RuntimeError):
+        _transport(sleep=sleep).get_order("o1")
+
+    assert len(recorder.calls) == _MAX_ATTEMPTS
+    # One fewer wait than attempts -- nothing is slept after the final failure.
+    assert waits == [_BACKOFF_BASE_SEC * (2**n) for n in range(_MAX_ATTEMPTS - 1)]
+
+
+def test_a_retry_after_header_wins_over_the_computed_backoff(http: Any) -> None:
+    """The venue knows when its window resets and we do not."""
+    waits, sleep = _recording_sleep()
+    http([_FakeResponse(429, headers={"Retry-After": "2"}), _FakeResponse(200, payload={})])
+
+    _transport(sleep=sleep).get_order("o1")
+
+    assert waits == [2.0]
+
+
+def test_a_retry_after_is_clamped_rather_than_obeyed_literally(http: Any) -> None:
+    """`Retry-After: 3600` is a legal response. Honouring it would park a trading loop for an
+    hour inside what the caller believes is a bounded read, so a server-controlled header is
+    capped like any other."""
+    waits, sleep = _recording_sleep()
+    http([_FakeResponse(429, headers={"Retry-After": "3600"}), _FakeResponse(200, payload={})])
+
+    _transport(sleep=sleep).get_order("o1")
+
+    assert waits == [_MAX_BACKOFF_SEC]
+
+
+@pytest.mark.parametrize("value", ["", "  ", "soon", "-5", "Wed, 21 Oct 2026 07:28:00 GMT"])
+def test_an_unusable_retry_after_falls_back_to_the_computed_backoff(http: Any, value: str) -> None:
+    """Including the HTTP-date form, which is legal and deliberately ignored: honouring it means
+    trusting the server's clock against ours, and exponential backoff is already correct without
+    any clock at all."""
+    waits, sleep = _recording_sleep()
+    http([_FakeResponse(429, headers={"Retry-After": value}), _FakeResponse(200, payload={})])
+
+    _transport(sleep=sleep).get_order("o1")
+
+    assert waits == [_BACKOFF_BASE_SEC]
+
+
+def test_a_404_is_still_not_retried(http: Any) -> None:
+    """`None` means "the venue does not recognise this id", which is an ANSWER. Retrying it would
+    spend three more requests to be told the same thing."""
+    waits, sleep = _recording_sleep()
+    recorder = http(_FakeResponse(404))
+
+    assert _transport(sleep=sleep).get_order("no-such-id") is None
+    assert len(recorder.calls) == 1
+    assert waits == []
+
+
+def test_a_401_is_not_retried_because_it_is_not_transient(http: Any) -> None:
+    """A signature or clock problem does not heal in half a second. Retrying turns one clear
+    failure into four identical ones."""
+    waits, sleep = _recording_sleep()
+    recorder = http(_FakeResponse(401))
+
+    with pytest.raises(RuntimeError):
+        _transport(sleep=sleep).get_order("o1")
+
+    assert len(recorder.calls) == 1
+    assert waits == []
+
+
+def test_a_POST_IS_NEVER_RETRIED_even_on_a_429(http: Any) -> None:
+    """The most important assertion in this file.
+
+    A 429 or 5xx on `create_order` is an UNKNOWN outcome, not a refusal -- the venue may have
+    accepted the order before the response was lost. Sending it again places a second live order
+    unless both attempts carry the same `client_order_id`, and this layer cannot tell whether they
+    do: the body arrives already built, and an id derived from a caller's idempotency key (#409)
+    is indistinguishable from a freshly minted uuid4 from here. So the retry belongs above the
+    adapter, where that knowledge lives, and the transport refuses to guess.
+    """
+    waits, sleep = _recording_sleep()
+    recorder = http(_FakeResponse(429))
+
+    with pytest.raises(RuntimeError):
+        _transport(sleep=sleep).create_order({"symbol": "BTC-USD", "client_order_id": "abc"})
+
+    assert len(recorder.calls) == 1, "a second POST would be a second live order"
+    assert waits == []
+
+
+def test_every_attempt_is_signed_afresh(http: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The signature is valid for 30 seconds from its timestamp, so a retry that waited out a
+    backoff must re-sign. Presenting the first attempt's signature afterwards would return a 401
+    that reads exactly like a bad credential -- a failure invented by retrying.
+
+    The clock is advanced past the validity window between attempts, because two attempts in the
+    same wall-clock second would sign identically and the test would pass without proving
+    anything.
+    """
+    import keel_broker_robinhood.transport as transport_module
+
+    ticks = iter([1_754_733_600, 1_754_733_700])
+    monkeypatch.setattr(transport_module.time, "time", lambda: next(ticks))
+
+    waits, sleep = _recording_sleep()
+    recorder = http([_FakeResponse(429), _FakeResponse(200, payload={})])
+
+    _transport(sleep=sleep).get_order("o1")
+
+    first, second = recorder.calls
+    assert first["headers"]["x-timestamp"] == "1754733600"
+    assert second["headers"]["x-timestamp"] == "1754733700"
+    assert first["headers"]["x-signature"] != second["headers"]["x-signature"]
