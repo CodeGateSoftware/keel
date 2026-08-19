@@ -3,12 +3,12 @@ new overlays (**screen**, **propose**, **discover**) render. See
 `docs/superpowers/specs/2026-07-24-llm-asset-proposer-design.md` and `keel/proposer.py` for the
 proposal-report path this module reuses rather than duplicates.
 
-**Every verdict comes from the injected `screen_fn`** (`keel.cli._screen_product` in production),
-never from a second, laxer path -- exactly the discipline `keel/proposer.py` already keeps, for
-the same reason: `_screen_product`'s own docstring is explicit that every candidate source must
-route through it, "so none of them can drift onto a laxer path". This module never imports
-`keel.cli` (which would cycle back through here once `tui.py` wires these overlays in) and stays
-importable, and unit-testable, with nothing but a fake `screen_fn`.
+**Every verdict comes from the injected `screen_fn`** (`keel.commands.assets.screen_product` in
+production, since issue #387 C1 moved the gate out of `keel/cli.py` into the shared service
+layer), never from a second, laxer path -- exactly the discipline `keel/proposer.py` already
+keeps, for the same reason: `screen_product`'s own docstring is explicit that every candidate
+source must route through it, "so none of them can drift onto a laxer path". The injection (not
+a direct import) keeps this module unit-testable with nothing but a fake `screen_fn`.
 
 This module **admits nothing, attests nothing, writes nothing**. `build_screen_report` and
 `build_propose_view` only ever read the DB (`Repository.get_candles`/`get_asset_attestation`/
@@ -33,6 +33,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from keel.commands._products import _default_sim_products
+from keel.commands.assets import DEFAULT_DISCOVER_LIMIT, DEFAULT_MIN_QUOTE_24H_VOLUME
 from keel.compliance.screen import (
     Candidate,
     DiscoveryExclusions,
@@ -61,62 +62,18 @@ ScreenFn = Callable[[Repository, str, str], tuple[MarketFacts, ScreenResult]]
 #: pins the two together so a drift breaks a test instead of silently disagreeing.
 DEFAULT_PROPOSALS_DIR = "~/keel/proposals"
 
-#: Mirrors `keel assets discover --min-volume-24h`'s own default (`keel/cli.py::assets_discover`).
-#: A literal here, not an import from `keel.cli`, for the same reason `ScreenFn` is injected
-#: rather than importing `_screen_product` directly: importing `keel.cli` from this module would
-#: create the cycle `cli -> tui -> admission -> cli`. `test_build_discover_report_applies_
-#: default_volume_floor_matching_assets_discover` reads the CLI option's own default and asserts
-#: it equals this constant, so the two cannot silently drift apart.
-#:
-#: Discovery's 24h-volume pre-filter. It bounds how many products get probed for history; it is
-#: not a liquidity verdict (that is `--probe-liquidity`, which computes the gate's own median).
-#:
-#: Was 5,000,000 until 2026-08-08. At that floor the sweep returned 9 candidates and exactly one
-#: unsettled survivor; at a lower floor, seven more cleared BOTH mechanical gates -- FET among them
-#: at $2.94M/24h, i.e. invisible to the sweep while measuring 4.8x the admission floor. The floor,
-#: not the market, was the binding constraint on the candidate pipeline.
-#:
-#: The fix that followed pinned this EQUAL to `ScreenPolicy.min_median_daily_volume`
-#: (1,000,000), reasoning that a sweep pinned to the gate's own floor could never be stricter
-#: than the gate it feeds. That reasoning got the INTENT right and the MECHANISM wrong: the two
-#: floors measure DIFFERENT statistics -- this one is a single 24-hour venue snapshot, the
-#: admission floor is the median of volume x close over ALL cached history -- so an equal number
-#: does nothing to stop a quiet trading day from pushing the snapshot below a floor the asset's
-#: own median clears many times over. Measured 2026-08-15: five assets (ATOM, AAVE, BCH, CRV,
-#: ALGO) were silently dropped by the equal-floor sweep despite each measuring 3.1x-6.3x the
-#: admission floor on the gate's own statistic; four of the five sat in an 852,133-979,000 24h
-#: snapshot cluster on that single quiet day.
-#:
-#: The floor is now strictly BELOW the admission floor, by an order of magnitude, so a quiet-day
-#: snapshot has real room before it can hide an asset the gate would admit. See
-#: `keel.compliance.screen.DiscoveryPolicy.min_quote_24h_volume`, which carries the identical
-#: reasoning next to the number it actually applies.
-#:
-#: `tests/commands/test_admission.py` pins this to the CLI option, to `DiscoveryPolicy`'s default,
-#: and to being strictly less than the admission floor; all of those move together or the suite
-#: fails.
-DEFAULT_MIN_QUOTE_24H_VOLUME = Decimal("100000")
-
-#: Mirrors `keel assets discover --limit`'s own default (`keel/cli.py::assets_discover`), for the
-#: same "literal here, not an import from `keel.cli`" reason `DEFAULT_MIN_QUOTE_24H_VOLUME` gives
-#: above. `test_build_discover_report_applies_default_limit_matching_assets_discover` pins the two
-#: together.
-#:
-#: Was 25, set back when `--min-volume-24h`'s floor was 1,000,000 and a sweep returned ~35
-#: candidates -- 25 showed nearly all of them. Lowering that floor to 100,000 (see
-#: `DEFAULT_MIN_QUOTE_24H_VOLUME` above) grew a typical sweep to ~130 candidates, all sorted by
-#: descending 24h volume, so the five assets that floor change exists to surface (ATOM, AAVE,
-#: BCH, CRV, ALGO -- see that constant's docstring) landed at ranks 33-59: below the ~35 still
-#: above the OLD floor, and past a limit of 25. The floor fix was real but invisible at the
-#: operator's own default view.
-#:
-#: 100 costs nothing extra on its own: with neither `--probe-history` nor `--probe-liquidity`,
-#: `assets discover` makes exactly ONE venue request (`list_products`) regardless of `--limit` --
-#: the candidate list is filtered and sorted locally. The two probe flags are the ones with a
-#: per-row cost (one venue request EACH per candidate SHOWN, so two together), which is why that
-#: trade-off is called out in `--limit`'s own `help=` text rather than left for an operator to
-#: discover by combining the flags and watching the request count climb.
-DEFAULT_DISCOVER_LIMIT = 100
+#: `DEFAULT_MIN_QUOTE_24H_VOLUME` and `DEFAULT_DISCOVER_LIMIT` (the `assets discover` defaults
+#: this module's `build_discover_report` falls back to) live in `keel.commands.assets` since
+#: issue #387 C1 -- ONE home, imported here rather than mirrored by hand the way they had to be
+#: when the sweep still lived inside `keel/cli.py` and importing it would have cycled
+#: `cli -> tui -> admission -> cli`. Their full rationale (the 2026-08-08/2026-08-15 floor
+#: history and the per-row probe costs) travels with them there; the aliases below keep this
+#: module's own public names -- and the tests pinning them to the CLI options -- unchanged.
+__all__ = [
+    "DEFAULT_DISCOVER_LIMIT",
+    "DEFAULT_MIN_QUOTE_24H_VOLUME",
+    "DEFAULT_PROPOSALS_DIR",
+]
 
 
 # -- 2a. shortlist location (offline) ------------------------------------------------------------

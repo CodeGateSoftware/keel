@@ -1221,7 +1221,8 @@ def run_once(
                 repo, broker, products, latest_price_by_product, config.quote_currency
             )
         # Task 9: paper-forward observability -- the synthetic equity + drawdown scalars this
-        # cycle advanced, surfaced on `LoopResult` (`_print_loop_result` + this log line) instead
+        # cycle advanced, surfaced on `LoopResult` (rendered by
+        # `keel.commands.trading.render_loop_result` + this log line) instead
         # of only living in repo state. `None` unless this is a paper cycle that read equity.
         result_paper_equity: Decimal | None = None
         result_drawdown_total_pct: Decimal | None = None
