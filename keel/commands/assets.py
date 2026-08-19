@@ -36,8 +36,8 @@ from typing import Any
 from keel_core.products import quote_currency_of
 
 from keel.commands._products import _history_product
-from keel.compliance import screen as screen_mod
 from keel.commands.fetch import DAYS_PER_YEAR
+from keel.compliance import screen as screen_mod
 from keel.compliance.screen import (
     Candidate,
     DiscoveryExclusions,
