@@ -1088,7 +1088,9 @@ def build_activity_overlay(
     return _activity_lines(feed, cursor=cursor, expanded=expanded)[0]
 
 
-def _activity_cursor(ch: int, cursor: int, height: int, total: int, curses_mod: Any) -> int:
+def _activity_cursor(
+    ch: int, cursor: int, height: int, total: int, curses_mod: Any, *, banner_lines: int = 0
+) -> int:
     """The new, clamped SELECTED-ROW index for a keypress in the activity overlay -- the cursor
     analogue of `_scroll_offset`, taking `curses_mod` as a parameter for the identical reasons
     (lazy `curses` import; testable against the suite's existing fake curses module).
@@ -1100,10 +1102,15 @@ def _activity_cursor(ch: int, cursor: int, height: int, total: int, curses_mod: 
     events. `_follow_cursor` then does the scrolling, so the view still moves.
 
     `total` is the number of CYCLES. A page is `height - 3` rows (leaving the title, blank and
-    header rows in view), floored at 1 so a two-line terminal still advances."""
+    header rows in view), floored at 1 so a two-line terminal still advances.
+    `banner_lines` is the console banner's height -- the feed is PAINTED with the banner
+    prepended (the same combined list `_follow_cursor` already accounts for at its call site),
+    so a page must leave those rows in view too or it over-advances by exactly the banner and
+    lands the selection further down than the rows the operator actually saw. `0` (the
+    default) is the pre-console shape, when no binding supplied a banner."""
     if total <= 0:
         return 0
-    page = max(height - 3, 1)
+    page = max(height - 3 - banner_lines, 1)
     if ch in (curses_mod.KEY_UP, ord("k")):
         cursor -= 1
     elif ch in (curses_mod.KEY_DOWN, ord("j")):
@@ -1162,8 +1169,12 @@ def _scroll_offset(ch: int, offset: int, height: int, total: int, curses_mod: An
     `curses` module the rest of the `run_live` test suite already builds, with no real terminal
     or `curses.wrapper` involved.
 
-    `total` is the number of lines in the overlay being scrolled (`len(lines)`), used exactly the
-    way `help_offset`/`insights_offset` always were: `End` jumps toward the bottom (clamped, like
+    `total` is the number of lines in the list being SCROLLED, banner included when one is
+    prepended (`len(banner) + len(overlay_lines)` at every call site in `run_live`): the list
+    this offset is applied to is the same combined list `_visible_slice` slices, so the clamp
+    here and the window there must agree about its length -- a banner-excluded total left `End`
+    short of the true last page by exactly the banner's height. Used exactly the way
+    `help_offset`/`insights_offset` always were: `End` jumps toward the bottom (clamped, like
     every other result, to the last full page) and every key's result is clamped to `[0, max(0,
     total - height)]` so the view can never scroll past either end."""
     if ch in (curses_mod.KEY_UP, ord("k")):
@@ -1361,12 +1372,20 @@ def run_once(
 
 
 def _message_style(message: str) -> str:
-    """`"alert"` for a message that reports a failure OR arms autonomy ON (the one dangerous
-    transition -- it must never read as reassuring green); `"warn"` for a cancelled/unchanged
-    action; `"ok"` for everything else (autonomy OFF, fetch complete) -- purely cosmetic, so a
-    quick glance at the toast's colour tells you which it was."""
+    """`"alert"` for a message that reports a failure, arms autonomy ON, or switches the
+    console to the LIVE deployment -- the transitions that must never read as reassuring
+    green, because real money is what they change (a green `profile -> LIVE` would be the
+    toast colour saying all is well about real-account data starting to answer from every
+    screen); `"warn"` for a cancelled/unchanged action; `"ok"` for everything else (autonomy
+    OFF, fetch complete, a PAPER profile switch) -- purely cosmetic, so a quick glance at the
+    toast's colour tells you which it was."""
     lowered = message.lower()
-    if "-> on" in lowered or "without asking" in lowered or "failed" in lowered:
+    if (
+        "-> on" in lowered
+        or "without asking" in lowered
+        or "failed" in lowered
+        or "-> live" in lowered
+    ):
         return "alert"
     if "cancelled" in lowered or "unchanged" in lowered:
         return "warn"
@@ -1756,7 +1775,10 @@ def run_live(
                 _paint(stdscr, [*_console_banner(), *profile_lines])
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
-                if ch in (ord("q"), 27, ord("p")):
+                if ch in (ord("q"), 27, ord("p"), ord("m")):
+                    # `m` closes profile mode too -- the same q/Esc/<open-key-or-m>
+                    # consistency the menu and placeholder modes keep, so the key that
+                    # opened the shell can always step back one level out of it.
                     mode = "menu"
                 elif ch in (curses.KEY_UP, ord("k")):
                     profile_cursor = max(0, profile_cursor - 1)
@@ -1803,7 +1825,14 @@ def run_live(
                     mode = "normal"
                     help_offset = 0
                 else:
-                    help_offset = _scroll_offset(ch, help_offset, height, len(help_lines), curses)
+                    # The banner is PART of the scrolled list (`_visible_slice` slices the
+                    # combined `[banner, help]`), so the scroll math must count it too --
+                    # clamping against the banner-EXCLUDED length left `End` two lines short
+                    # and the help tail permanently hidden whenever a console binding was
+                    # supplied. No binding -> the banner is empty and the total is unchanged.
+                    help_offset = _scroll_offset(
+                        ch, help_offset, height, len(banner) + len(help_lines), curses
+                    )
                 continue
 
             if mode == "insights":
@@ -1835,9 +1864,10 @@ def run_live(
                     ]
 
                 height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
                 _paint(
                     stdscr,
-                    _visible_slice([*_console_banner(), *insights_lines], insights_offset, height),
+                    _visible_slice([*banner, *insights_lines], insights_offset, height),
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
@@ -1845,8 +1875,10 @@ def run_live(
                     mode = "normal"
                     insights_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above: the
+                    # clamp must land on the same last page the combined slice shows.
                     insights_offset = _scroll_offset(
-                        ch, insights_offset, height, len(insights_lines), curses
+                        ch, insights_offset, height, len(banner) + len(insights_lines), curses
                     )
                 continue
 
@@ -1864,9 +1896,10 @@ def run_live(
                     ]
 
                 height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
                 _paint(
                     stdscr,
-                    _visible_slice([*_console_banner(), *screen_lines], screen_offset, height),
+                    _visible_slice([*banner, *screen_lines], screen_offset, height),
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
@@ -1874,8 +1907,9 @@ def run_live(
                     mode = "normal"
                     screen_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     screen_offset = _scroll_offset(
-                        ch, screen_offset, height, len(screen_lines), curses
+                        ch, screen_offset, height, len(banner) + len(screen_lines), curses
                     )
                 continue
 
@@ -1897,9 +1931,10 @@ def run_live(
                     ]
 
                 height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
                 _paint(
                     stdscr,
-                    _visible_slice([*_console_banner(), *propose_lines], propose_offset, height),
+                    _visible_slice([*banner, *propose_lines], propose_offset, height),
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
@@ -1907,8 +1942,9 @@ def run_live(
                     mode = "normal"
                     propose_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     propose_offset = _scroll_offset(
-                        ch, propose_offset, height, len(propose_lines), curses
+                        ch, propose_offset, height, len(banner) + len(propose_lines), curses
                     )
                 continue
 
@@ -1980,7 +2016,12 @@ def run_live(
                     activity_offset = 0
                 else:
                     activity_cursor = _activity_cursor(
-                        ch, activity_cursor, height, len(activity_feed.cycles), curses
+                        ch,
+                        activity_cursor,
+                        height,
+                        len(activity_feed.cycles),
+                        curses,
+                        banner_lines=len(banner),
                     )
                 continue
 
@@ -1994,9 +2035,10 @@ def run_live(
                 discover_lines = build_discover_overlay(discover_result, error=discover_error)
 
                 height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
                 _paint(
                     stdscr,
-                    _visible_slice([*_console_banner(), *discover_lines], discover_offset, height),
+                    _visible_slice([*banner, *discover_lines], discover_offset, height),
                 )
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
@@ -2019,8 +2061,9 @@ def run_live(
                         discover_error = str(exc)[:200]
                     discover_offset = 0
                 else:
+                    # Banner-aware total, for the same reason as help's branch above.
                     discover_offset = _scroll_offset(
-                        ch, discover_offset, height, len(discover_lines), curses
+                        ch, discover_offset, height, len(banner) + len(discover_lines), curses
                     )
                 continue
 

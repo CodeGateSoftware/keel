@@ -2411,6 +2411,27 @@ def test_message_style_cancelled_is_warn() -> None:
     assert _message_style("autonomy unchanged (arming cancelled)") == "warn"
 
 
+def test_message_style_a_live_profile_switch_is_alert_not_ok() -> None:
+    """The one switch that must never read as reassuring green: `profile -> LIVE` points
+    the whole console at REAL MONEY, so it carries the same weight the LIVE banner line and
+    arming autonomy ON get -- green there would be the toast colour saying 'all well' about
+    real-account data starting to answer from every screen."""
+    assert (
+        _message_style("profile -> LIVE (config.live-sandbox.yaml + keel-live.db)")
+        == "alert"
+    )
+
+
+def test_message_style_a_paper_profile_switch_stays_ok() -> None:
+    """Paper switches are the calm, ungated case -- they keep the reassuring green."""
+    assert (
+        _message_style(
+            "profile -> paper-hourly (config.paper-hourly.yaml + keel-paperhourly.db)"
+        )
+        == "ok"
+    )
+
+
 def test_message_style_fetch_complete_is_ok() -> None:
     assert _message_style("fetch complete (2 products, 5y history)") == "ok"
 
@@ -2885,6 +2906,29 @@ def test_activity_cursor_ignores_an_unrelated_key() -> None:
 
     assert _activity_cursor(ord("z"), 2, 24, 5, fake_curses) == 2
     assert _activity_cursor(-1, 2, 24, 5, fake_curses) == 2  # the no-key poll timeout
+
+
+def test_activity_cursor_pages_by_the_rows_the_banner_leaves_free() -> None:
+    """A page leaves the title, blank and header rows in view -- and, when a console
+    binding is present, the two BANNER lines the feed is prepended to as well: paging used
+    to over-advance by exactly the banner, landing the selection further down than a screen
+    of rows the operator actually saw."""
+    fake_curses = _fake_curses()
+
+    # Without a banner: a page on a 24-row terminal is 21 rows.
+    assert _activity_cursor(fake_curses.KEY_NPAGE, 10, 24, 50, fake_curses) == 31
+    assert _activity_cursor(fake_curses.KEY_PPAGE, 30, 24, 50, fake_curses) == 30 - 21
+    # With the 2-line banner prepended: two fewer rows per page.
+    assert (
+        _activity_cursor(fake_curses.KEY_NPAGE, 10, 24, 50, fake_curses, banner_lines=2)
+        == 29
+    )
+    assert (
+        _activity_cursor(fake_curses.KEY_PPAGE, 30, 24, 50, fake_curses, banner_lines=2)
+        == 30 - 19
+    )
+    # The floor of 1 survives the banner: a tiny terminal still advances.
+    assert _activity_cursor(fake_curses.KEY_NPAGE, 0, 4, 50, fake_curses, banner_lines=2) == 1
 
 
 @pytest.mark.parametrize(
@@ -3372,18 +3416,19 @@ def _deployment_dir(tmp_path: Any) -> Any:
     return tmp_path
 
 
-def _console_run(
+def _console_session(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
     keys: list[int],
     *,
+    height: int = 30,
     start_config: str = "config.paperforward.yaml",
     start_db: str = "keel.db",
-) -> tuple[list[str], Any]:
+) -> tuple[_FakeStdscr, Any]:
     """Run one scripted `run_live` session with a REAL console binding over the temp
-    deployment dir, and return (painted texts, the binding). The balance refresh's broker
-    construction is stubbed (it fires on the first poll by design) so no test touches the
-    network."""
+    deployment dir, and return (the stdscr with its recorded `addstr` calls, the binding).
+    The balance refresh's broker construction is stubbed (it fires on the first poll by
+    design) so no test touches the network."""
     from keel.commands import console
 
     monkeypatch.chdir(tmp_path)
@@ -3392,7 +3437,7 @@ def _console_run(
     ctx.obj["db_path"] = start_db
     binding = console.ConsoleBinding(ctx, config_path=start_config, db_path=start_db)
 
-    stdscr = _KeySequenceStdscr(height=30, width=120, keys=keys)
+    stdscr = _KeySequenceStdscr(height=height, width=120, keys=keys)
     fake_curses = _fake_curses()
     fake_curses.wrapper = lambda fn: fn(stdscr)
     monkeypatch.setitem(sys.modules, "curses", fake_curses)
@@ -3407,6 +3452,22 @@ def _console_run(
     )
 
     run_live(binding.open_state, lambda: NOW_TS, interval=0.01, console_binding=binding)
+    return stdscr, binding
+
+
+def _console_run(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    keys: list[int],
+    *,
+    start_config: str = "config.paperforward.yaml",
+    start_db: str = "keel.db",
+) -> tuple[list[str], Any]:
+    """`_console_session` for every test that only needs the painted TEXTS (the common
+    case) -- kept so those callers read at a glance."""
+    stdscr, binding = _console_session(
+        tmp_path, monkeypatch, keys, start_config=start_config, start_db=start_db
+    )
     return [call[2] for call in stdscr.calls], binding
 
 
@@ -3548,3 +3609,65 @@ def test_run_live_dashboard_entry_returns_to_the_landing_screen(
 
     menu_idx = next(i for i, t in enumerate(painted) if "keel console" in t and "menu" in t)
     assert any("paper mode" in t for t in painted[menu_idx:])
+
+
+@pytest.mark.parametrize(
+    ("open_key", "closing_line"),
+    [
+        (ord("h"), "Press q, Esc, h or ? now to return to the dashboard."),
+        (ord("i"), "Press i or Esc to return to the dashboard."),
+        (ord("s"), "Press s or Esc to return to the dashboard."),
+        (ord("p"), "Press p or Esc to return to the dashboard."),
+        (ord("d"), "Press d or Esc to return to the dashboard."),
+    ],
+)
+def test_run_live_end_scrolls_to_the_overlays_true_last_line_with_a_banner(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, open_key: int, closing_line: str
+) -> None:
+    """The banner is part of every scrolled list, so the scroll math must count it: with a
+    2-line banner prepended, `End` on any of the five scrollable overlays must reach the
+    overlay's TRUE last line -- painted on the window's bottom row, not two rows short of
+    a help tail the clamp was hiding forever (`_scroll_offset` was clamped against the
+    banner-EXCLUDED length while `_visible_slice` sliced the combined list)."""
+    fake_curses = _fake_curses()
+    height = 6
+    # poll1: normal -> the open key. poll2: overlay at offset 0, End pressed. poll3: the
+    # End-scrolled frame. Esc closes; the post-exhaustion 'q' quits.
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path),
+        monkeypatch,
+        [open_key, fake_curses.KEY_END, 27],
+        height=height,
+    )
+
+    bottom_row = [call for call in stdscr.calls if call[0] == height - 1]
+    assert any(call[2] == closing_line for call in bottom_row), (
+        "End must land the overlay's own closing line on the bottom row -- with the banner "
+        "counted, not treated as free rows the clamp can spend"
+    )
+
+
+def test_run_live_m_in_the_profile_menu_returns_to_the_menu(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`m` closes profile mode too, the same close-key consistency menu and placeholder
+    modes keep (q/Esc/m): profile mode used to close on q/Esc/p only, so the key that
+    OPENED the shell could not step back one level out of it.
+
+    Asserted on the frame IMMEDIATELY after the `m` keypress (frames delimited by their
+    y=0 first row), not on "a menu frame appears later" -- the quit path also passes
+    through the menu, which would make a dead `m` look bound."""
+    stdscr, _binding = _console_session(
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("2"), -1, ord("m"), ord("q")]
+    )
+    texts = [call[2] for call in stdscr.calls]
+    starts = [i for i, call in enumerate(stdscr.calls) if call[0] == 0]
+    frames = [
+        texts[start : starts[j + 1] if j + 1 < len(starts) else len(texts)]
+        for j, start in enumerate(starts)
+    ]
+
+    # poll4 (frame index 3) is the profile frame whose keypress is `m`; frame 4 is what
+    # that keypress did.
+    assert any("keel console -- profile" in t for t in frames[3])
+    assert any("keel console -- menu" in t for t in frames[4])

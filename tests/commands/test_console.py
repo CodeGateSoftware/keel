@@ -28,8 +28,7 @@ from keel_broker_api.results import MarketSchedule, SessionState
 
 from keel import agent
 from keel.commands import console
-from keel.commands.console import build_banner_lines
-from keel.commands.tui import _human_dt
+from keel.commands.console import _short_dt, build_banner_lines
 from keel.config import (
     AutoTradeConfig,
     BrokerConfig,
@@ -383,7 +382,6 @@ def _recorded(
     next_open_ts: int | None = None,
     next_close_ts: int | None = None,
     fresh: bool = True,
-    defused: bool = False,
 ) -> agent.RecordedSession:
     return agent.RecordedSession(
         venue="alpaca",
@@ -393,7 +391,6 @@ def _recorded(
         next_open_ts=next_open_ts,
         next_close_ts=next_close_ts,
         fresh=fresh,
-        defused=defused,
     )
 
 
@@ -453,16 +450,22 @@ def test_banner_renders_open_with_next_open_and_close() -> None:
     )
     session = lines[1]
     assert "OPEN" in session.text
-    assert _human_dt(NOW_TS + 7_200) in session.text  # next close, local time
-    assert _human_dt(NOW_TS + 43_200) in session.text  # next open, local time
+    # Both schedule stamps on one row, at minute precision: two full `_human_dt` stamps
+    # plus their labels run past the 80-column budget `_paint` clips at.
+    assert session.text == (
+        f"market: OPEN (venue clock) · closes {_short_dt(NOW_TS + 7_200)} "
+        f"· opens {_short_dt(NOW_TS + 43_200)}"
+    )
     assert session.style == "ok"
 
 
 def test_banner_renders_closed_with_the_next_open() -> None:
-    lines = _banner(record=_recorded("closed", next_open_ts=NOW_TS + 172_800, defused=True))
+    lines = _banner(record=_recorded("closed", next_open_ts=NOW_TS + 172_800))
     session = lines[1]
     assert "CLOSED" in session.text
-    assert _human_dt(NOW_TS + 172_800) in session.text
+    assert session.text == (
+        f"market: CLOSED (venue clock) -- cycles skip · opens {_short_dt(NOW_TS + 172_800)}"
+    )
     assert session.style == "muted"  # an expected weekend, per B1's own convention
 
 
@@ -477,10 +480,13 @@ def test_banner_renders_clock_unavailable_when_nothing_is_recorded() -> None:
 
 def test_banner_renders_clock_unavailable_when_the_record_is_stale() -> None:
     """A record outside its trust window no longer vouches for anything: stale renders as
-    CLOCK UNAVAILABLE, not as the state it happened to freeze on."""
+    CLOCK UNAVAILABLE, not as the state it happened to freeze on -- leading with the
+    fail-loud headline, then the shortened when-recorded stamp (the full prose form ran
+    past column 80 and the timestamp was exactly the part that clipped)."""
     lines = _banner(record=_recorded("open", fresh=False))
     session = lines[1]
-    assert "CLOCK UNAVAILABLE" in session.text
+    assert session.text.startswith("market: CLOCK UNAVAILABLE")
+    assert _short_dt(NOW_TS - 60) in session.text
     assert session.style == "warn"
 
 
@@ -512,17 +518,20 @@ def test_console_banner_lines_composes_from_the_repo_and_config_alone(repo: Repo
     assert any("24/7" in line.text for line in lines)
     assert lines[0].text.startswith("console: paper-forward")
 
-    # The same call over a session-bound venue with a recorded schedule renders it:
+    # The same call over a session-bound venue with a recorded schedule renders it. A
+    # SECOND binding, because session-boundness is cached per binding (the config IS the
+    # bound pair's -- a different venue means a rebound pair, never a config swapped
+    # under one binding).
     alpaca = _config(broker=BrokerConfig(name="alpaca", endpoint="paper", data_feed="iex"))
     repo.set_state("market_session:alpaca", "open")
     repo.set_state("market_session_ts:alpaca", NOW_TS - 60)
     repo.set_state("market_session_interval_sec:alpaca", 900)
     repo.set_state("market_session_next_open:alpaca", NOW_TS + 43_200)
     repo.set_state("market_session_next_close:alpaca", NOW_TS + 7_200)
-    lines = console.console_banner_lines(binding, repo, alpaca, NOW_TS)
+    lines = console.console_banner_lines(_binding(), repo, alpaca, NOW_TS)
     session = lines[1]
     assert "OPEN" in session.text
-    assert _human_dt(NOW_TS + 7_200) in session.text
+    assert _short_dt(NOW_TS + 7_200) in session.text
 
 
 def test_venue_session_bound_reads_the_adapter_declaration() -> None:
@@ -546,3 +555,91 @@ def test_a_24x7_market_schedule_is_open_with_no_times() -> None:
     layer so a future port change cannot silently alter the banner's semantics."""
     schedule = MarketSchedule(state=SessionState.OPEN)
     assert schedule.next_open_ts is None and schedule.next_close_ts is None
+
+
+def test_the_banner_resolves_session_boundness_once_per_binding(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Session-boundness is STATIC per binding (the adapter's own capabilities
+    declaration), so it is resolved ONCE and cached on the `ConsoleBinding` -- not
+    re-walked per banner render, which put an `importlib.metadata` discovery
+    (`venue_session_bound` -> `load_broker` -> `discover_brokers()`) on every poll of every
+    screen, on top of the `open_state()` the banner already does. `rebind` invalidates the
+    cache, because a different pair means a possibly different venue."""
+    import keel_broker_api.registry as registry
+
+    calls: list[str] = []
+    real_load_broker = registry.load_broker
+
+    def _counting_load_broker(name: str) -> Any:
+        calls.append(name)
+        return real_load_broker(name)
+
+    monkeypatch.setattr(registry, "load_broker", _counting_load_broker)
+
+    binding = _binding()
+    config = _config()  # coinbase default -> the adapter walk resolves "coinbase"
+    for _ in range(3):
+        console.console_banner_lines(binding, repo, config, NOW_TS)
+
+    assert calls == ["coinbase"]  # ONE resolution for three banner builds
+
+    binding.rebind(console.KNOWN_PROFILES[2])
+    console.console_banner_lines(binding, repo, config, NOW_TS)
+    assert len(calls) == 2  # rebinding is the invalidation point
+
+
+def test_the_profile_menu_footer_names_q_esc_p_and_m() -> None:
+    """Profile mode closes on `m` too, like menu and placeholder modes -- the footer says
+    which keys, so the binding and the hint cannot drift."""
+    lines = console.build_profile_menu_lines(list(console.KNOWN_PROFILES))
+
+    assert "q/Esc/p/m" in lines[-1].text
+
+
+def test_banner_lines_fit_the_80_column_clip() -> None:
+    """The banner is two rows on screens `_paint` clips at the window width, and this
+    dashboard targets 80 columns: every WORST-CASE shape -- the guarded LIVE profile, the
+    unrecognized raw pair, both schedule stamps present (alpaca's `/v2/clock` carries
+    next_open AND next_close), the stale/absent-record fail-louds -- must fit whole, with
+    no load-bearing tail (a timestamp, the guard note) lost past column 80."""
+    records: list[agent.RecordedSession | None] = [
+        None,  # nothing recorded at all
+        _recorded("open", fresh=False),  # a stale record
+        _recorded("clock_unavailable"),  # a recorded unreadable clock
+        _recorded("open", next_open_ts=NOW_TS + 43_200, next_close_ts=NOW_TS + 7_200),
+        _recorded("open", next_close_ts=NOW_TS + 7_200),
+        _recorded("closed", next_open_ts=NOW_TS + 172_800),
+    ]
+    for profile in (None, console.KNOWN_PROFILES[0], console.KNOWN_PROFILES[1]):
+        for session_bound in (True, False):
+            for record in records:
+                lines = build_banner_lines(
+                    profile,
+                    session_bound,
+                    record,
+                    NOW_TS,
+                    binding_pair=("config.yaml", "keel.db"),
+                )
+                for line in lines:
+                    assert len(line.text) <= 80, line.text
+
+
+def test_profile_menu_rows_fit_the_80_column_clip(tmp_path: Any) -> None:
+    """Same budget for the Profile menu's rows: the LIVE row carries the longest pair AND
+    the [active] marker, and its guard note WRAPS to its own row rather than being clipped
+    off the end of the pair it guards."""
+    _write_all_profiles(tmp_path)
+    profiles = console.discover_profiles(base_dir=tmp_path)
+    live = console.KNOWN_PROFILES[1]
+    for cursor in range(len(profiles)):
+        lines = console.build_profile_menu_lines(
+            profiles, cursor=cursor, binding_pair=(live.config_path, live.db_path)
+        )
+        for line in lines:
+            assert len(line.text) <= 80, line.text
+    # The wrapped note is still on the screen, right under the guarded row, in the same
+    # alert style -- wrapping must not drop the guard's wording.
+    guarded = [line for line in lines if "guarded" in line.text]
+    assert guarded and all(line.style == "alert" for line in guarded)
+    assert any("confirmation" in line.text for line in guarded)

@@ -646,7 +646,6 @@ def test_latest_recorded_session_round_trips_what_the_cycle_recorded(repo):
     assert record.next_open_ts == 1_787_059_800
     assert record.next_close_ts == 1_786_996_800
     assert record.fresh is True  # inside the recorded interval's trust window
-    assert record.defused is True  # closed AND fresh -- the alert-defusing state
 
 
 def test_latest_recorded_session_answers_none_when_nothing_was_recorded(repo):
@@ -659,8 +658,8 @@ def test_latest_recorded_session_answers_none_when_nothing_was_recorded(repo):
 def test_latest_recorded_session_reports_stale_records_as_not_fresh(repo):
     """The record's honesty has a window (the recorded interval x FEED_STALENESS_CYCLES,
     exactly `recorded_market_closed`'s): beyond it the state no longer vouches for
-    anything, `fresh` goes False and `defused` goes with it -- the banner renders CLOCK
-    UNAVAILABLE off that, never a months-old 'closed'."""
+    anything, `fresh` goes False -- the banner renders CLOCK UNAVAILABLE off that, never
+    a months-old 'closed'."""
     now_ts = 90_000
     repo.set_state("market_session:alpaca", "closed")
     repo.set_state("market_session_ts:alpaca", now_ts - 500_000)  # far past 50_000 x 3
@@ -671,7 +670,6 @@ def test_latest_recorded_session_reports_stale_records_as_not_fresh(repo):
 
     assert record is not None
     assert record.fresh is False
-    assert record.defused is False
     assert record.next_open_ts == 1_787_059_800  # the raw record is returned as-is
 
 

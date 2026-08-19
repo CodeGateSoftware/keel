@@ -1007,15 +1007,19 @@ def recorded_market_closed(
 @dataclass(frozen=True)
 class RecordedSession:
     """One venue's recorded session, as a display surface reads it (issue #388 C2): the
-    state, its stamp, the schedule's next open/close, and the two honesty flags the banner
+    state, its stamp, the schedule's next open/close, and the honesty flag the banner
     renders -- `fresh` (the record is still inside its trust window, `recorded_market_
-    closed`'s own window) and `defused` (closed AND fresh, the state under which staleness
-    does not alert).
+    closed`'s own window).
 
     Raw, not interpreted: a stale record is returned as-is with `fresh=False`, and the
     CALLER decides what that means (the session banner renders CLOCK UNAVAILABLE off it;
     `status` keeps rendering the recorded state). No field here is ever derived from a
     clock call -- everything came from the recording.
+
+    There is deliberately no `defused` here (closed AND fresh): defusal is FR-9's
+    staleness-ALERT concern, owned by `recorded_market_closed` and surfaced through
+    `MarketSessionStatus.defused` -- a display record that also carried it invited a
+    banner rendering decision the banner has no business making.
     """
 
     venue: str
@@ -1025,7 +1029,6 @@ class RecordedSession:
     next_open_ts: int | None
     next_close_ts: int | None
     fresh: bool
-    defused: bool
 
 
 def latest_recorded_session(
@@ -1077,8 +1080,6 @@ def latest_recorded_session(
         next_open_ts=repo.get_state(market_session_next_open_key(venue)),
         next_close_ts=repo.get_state(market_session_next_close_key(venue)),
         fresh=fresh,
-        defused=state == SessionState.CLOSED.value
-        and _slot_market_closed(repo, config, now_ts, venue),
     )
 
 

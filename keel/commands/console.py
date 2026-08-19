@@ -30,6 +30,7 @@ declarations only, never config contents.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,7 @@ import click
 
 from keel import agent
 from keel.commands._common import _load_cfg, _open_repo
-from keel.commands.tui import ScreenLine, _blank, _human_dt, _market_session_style
+from keel.commands.tui import ScreenLine, _blank, _market_session_style
 
 if TYPE_CHECKING:
     from keel.config import Config
@@ -141,6 +142,17 @@ class ConsoleBinding:
     `rebind` swaps the pair in one assignment; the next `open_state()` (every poll, every
     screen) reflects it, which is the whole O4 acceptance -- profile switching visibly
     rebinds config/db everywhere in one action.
+
+    Everything STATIC about the bound pair is resolved once per binding and cached here,
+    not re-derived per poll: the venue's session-boundness (`session_bound`), whose
+    resolution is an adapter-registry walk (`venue_session_bound` -> `load_broker` ->
+    `discover_brokers()`, an `importlib.metadata` scan) the banner would otherwise repeat
+    on every render of every screen, a few times a minute for as long as the console runs
+    -- on top of the deliberate per-poll `open_state()` the banner's recorded-session read
+    already needs. `rebind` invalidates the cache, because a different pair means a
+    different config and possibly a different venue; a config file edited IN PLACE
+    mid-session is not picked up until the operator re-selects the profile (or restarts),
+    the same freshness a switched console already grants every other static read.
     """
 
     def __init__(
@@ -149,6 +161,7 @@ class ConsoleBinding:
         self._ctx = ctx
         self._config_path = config_path
         self._db_path = db_path
+        self._session_bound: bool | None = None
 
     @property
     def config_path(self) -> str:
@@ -163,11 +176,22 @@ class ConsoleBinding:
         """The bound (config_path, db_path) -- the value `active_profile` resolves."""
         return (self._config_path, self._db_path)
 
+    def session_bound(self, config: Config) -> bool:
+        """The bound deployment's venue session-boundness, resolved ONCE per binding (see
+        the class docstring) through the same conservative `venue_session_bound` read --
+        an unresolvable venue still answers `True`, so the banner fails loud rather than
+        assuming a 24/7 it cannot know."""
+        if self._session_bound is None:
+            self._session_bound = venue_session_bound(config)
+        return self._session_bound
+
     def rebind(self, profile: DeploymentProfile) -> None:
         """Swap the binding to `profile`'s WHOLE pair. No validation here -- `switch_
-        profile` is the guarded entry point; this is the one-line mutation beneath it."""
+        profile` is the guarded entry point; this is the one-line mutation beneath it.
+        Also drops the cached session-boundness: the new pair's venue may differ."""
         self._config_path = profile.config_path
         self._db_path = profile.db_path
+        self._session_bound = None
 
     def open_state(self) -> tuple[Repository, Config]:
         """Open the bound deployment through the CLI's own loaders (`_common._open_repo`/
@@ -404,21 +428,41 @@ def build_profile_menu_lines(
         )
         text = f"{marker} {profile.label} · {profile.config_path} + {profile.db_path}{suffix}"
         if profile.requires_confirmation:
+            # The guard note WRAPS to its own row under the guarded pair rather than riding
+            # the pair's line: the pair alone is already ~50 columns, and appending the note
+            # ran the row ~27 past the 80-column budget `_paint` clips at -- so the tail
+            # ("...asks for confirmation") was exactly the part that vanished. Same alert
+            # style on both rows, so the guard reads as one marked entry.
+            lines.append(ScreenLine(text, "alert"))
             lines.append(
-                ScreenLine(f"{text}  (guarded: selecting LIVE asks for confirmation)", "alert")
+                ScreenLine(
+                    f"      (guarded: selecting {profile.label} asks for confirmation)",
+                    "alert",
+                )
             )
         else:
             lines.append(ScreenLine(text, "heading" if index == cursor else "normal"))
     lines.append(_blank())
     lines.append(
         ScreenLine(
-            "up/k down/j move · Enter/Space switch · q/Esc/p back to the menu", "muted"
+            "up/k down/j move · Enter/Space switch · q/Esc/p/m back to the menu", "muted"
         )
     )
     return lines
 
 
 # -- the session banner (O9) -----------------------------------------------------------------------
+
+
+def _short_dt(ts: int) -> str:
+    """Local-time `YYYY-MM-DD HH:MM` -- `_human_dt` minus the seconds, for the banner's
+    line-two stamps. The banner is two rows on a screen `_paint` clips at the window width
+    (80-column terminals are this dashboard's stated target), and line two can carry TWO
+    schedule stamps beside their labels: at second precision that row ran ~11 columns past
+    the budget and the SECOND timestamp -- the part an operator scrolled for -- was exactly
+    what clipped. Seconds are not load-bearing for a next open/close; the date and minute
+    are. PURE, and total on any int (same `time.localtime` contract as `_human_dt`)."""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 def build_banner_lines(
@@ -448,17 +492,18 @@ def build_banner_lines(
       UNAVAILABLE, fail-loud -- exactly how `fetch --check` treats a record that no longer
       vouches for anything. No TUI-side calendar ever fills a gap.
 
-    Timestamps render through `_human_dt` (local time), the same formatter the dashboard's
-    absolute points in time already use.
+    Every line fits the 80-column budget `_paint` clips at, worst case first: the two
+    fail-loud CLOCK UNAVAILABLE variants lead with the headline (the reason and, for a
+    stale record, the when-recorded stamp follow it), and the schedule stamps render
+    through `_short_dt` (local time, minute precision) so an OPEN row can carry BOTH the
+    recorded next close and next open without either clipping -- the same local-time
+    contract `_human_dt` keeps for the dashboard's absolute points in time.
     """
     # Line one: the active deployment. File NAMES only -- a config path and a db path carry
     # no secrets; the config's CONTENTS are never rendered here.
     if profile is None:
         raw = f"{binding_pair[0]} + {binding_pair[1]}" if binding_pair else "the raw pair"
-        first = ScreenLine(
-            f"console: {raw} (unrecognized deployment -- not one of the four known pairs)",
-            "warn",
-        )
+        first = ScreenLine(f"console: {raw} (unrecognized deployment)", "warn")
     elif profile.requires_confirmation:
         first = ScreenLine(
             f"console: {profile.label} (REAL MONEY) · {profile.config_path} + "
@@ -478,18 +523,16 @@ def build_banner_lines(
 
     if recorded is None:
         second = ScreenLine(
-            "market: CLOCK UNAVAILABLE -- no recorded venue clock (fail-loud; the agent "
-            "cycle records it)",
+            "market: CLOCK UNAVAILABLE -- no recorded clock yet (the agent cycle records it)",
             "warn",
         )
         return [first, second]
     if not recorded.fresh:
         recorded_at = (
-            _human_dt(recorded.recorded_ts) if recorded.recorded_ts is not None else "unknown"
+            _short_dt(recorded.recorded_ts) if recorded.recorded_ts is not None else "unknown"
         )
         second = ScreenLine(
-            f"market: CLOCK UNAVAILABLE -- the recorded clock is stale (recorded "
-            f"{recorded_at}); waiting for the next cycle",
+            f"market: CLOCK UNAVAILABLE -- the record is stale (recorded {recorded_at})",
             "warn",
         )
         return [first, second]
@@ -497,19 +540,16 @@ def build_banner_lines(
     times: list[str] = []
     if recorded.state == "open":
         if recorded.next_close_ts is not None:
-            times.append(f"next close {_human_dt(recorded.next_close_ts)}")
+            times.append(f"closes {_short_dt(recorded.next_close_ts)}")
         if recorded.next_open_ts is not None:
-            times.append(f"next open {_human_dt(recorded.next_open_ts)}")
+            times.append(f"opens {_short_dt(recorded.next_open_ts)}")
         text = "market: OPEN (venue clock)"
     elif recorded.state == "closed":
         if recorded.next_open_ts is not None:
-            times.append(f"next open {_human_dt(recorded.next_open_ts)}")
+            times.append(f"opens {_short_dt(recorded.next_open_ts)}")
         text = "market: CLOSED (venue clock) -- cycles skip"
     else:
-        text = (
-            "market: CLOCK UNAVAILABLE (fail-closed) -- cycles skip until the venue clock "
-            "answers"
-        )
+        text = "market: CLOCK UNAVAILABLE (fail-closed) -- cycles skip until the clock answers"
     if times:
         text = f"{text} · {' · '.join(times)}"
     second = ScreenLine(text, _market_session_style(recorded.state))
@@ -523,6 +563,11 @@ def venue_session_bound(config: Config) -> bool:
     `capabilities()` is a constant), so this is a capability DISPLAY, not a broker handle.
     Until the C7 `brokers` service lands, this one-boolean read is the whole surface the
     banner needs from that future service.
+
+    The resolution walks the adapter registry (`load_broker` -> `discover_brokers()`, an
+    `importlib.metadata` scan), so callers re-rendering per poll go through
+    `ConsoleBinding.session_bound` -- the once-per-binding cache -- rather than calling
+    this directly on every banner build.
 
     A venue that cannot be resolved answers `True` (session-bound) -- the conservative
     direction: an unknown venue renders CLOCK UNAVAILABLE until it records, never an
@@ -540,14 +585,14 @@ def console_banner_lines(
     binding: ConsoleBinding, repo: Repository, config: Config, now_ts: int
 ) -> list[ScreenLine]:
     """The banner as one read: the binding's deployment + the recorded session + the
-    venue's session-boundness, over the repo/config the caller already holds. This is the
-    TUI loop's single entry point; the composition (and every rendering decision) lives in
-    `build_banner_lines`."""
+    venue's session-boundness (cached per binding -- see `ConsoleBinding`), over the
+    repo/config the caller already holds. This is the TUI loop's single entry point; the
+    composition (and every rendering decision) lives in `build_banner_lines`."""
     profile = active_profile(binding.config_path, binding.db_path)
     recorded = agent.latest_recorded_session(repo, config, now_ts)
     return build_banner_lines(
         profile,
-        venue_session_bound(config),
+        binding.session_bound(config),
         recorded,
         now_ts,
         binding_pair=binding.pair,
