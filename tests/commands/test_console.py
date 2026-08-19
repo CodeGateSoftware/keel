@@ -294,17 +294,45 @@ def test_the_menu_is_the_prd_tree_in_order() -> None:
 
 
 def test_only_the_landed_slices_do_anything() -> None:
-    """C2 shipped the SHELL; C3 (issue #389) landed Compliance; C4 (issue #390) lands Rules
-    and Research -- everything else is still a placeholder owned by a later slice, and must
-    say so rather than dead-click."""
+    """C2 shipped the SHELL; C3 (issue #389) landed Compliance; C4 (issue #390) landed
+    Rules and Research; C5 (issue #391) landed Trading and Data -- everything else is
+    still a placeholder owned by a later slice, and must say so rather than dead-click."""
     available = [e.label for e in console.CONSOLE_MENU if e.lands_in is None]
-    assert available == ["Dashboard", "Profile", "Rules", "Compliance", "Research", "Help"]
+    assert available == [
+        "Dashboard",
+        "Profile",
+        "Trading",
+        "Rules",
+        "Compliance",
+        "Data",
+        "Research",
+        "Help",
+    ]
     owners = {e.label: e.lands_in for e in console.CONSOLE_MENU if e.lands_in is not None}
     assert owners == {
-        "Trading": "C5",
-        "Data": "C5",
-        "Account": "C5",
+        "Account": "C6",
     }
+
+
+def test_the_trading_entry_opens_the_trading_menu() -> None:
+    """C5's dispatch: the tree's Trading entry opens the Trading sub-menu
+    (`keel.commands.trading_console`) -- the cycle/poll confirmations and the typed
+    halt-release contracts of O3."""
+    trading = console.menu_entry(3)
+    assert trading is not None
+    assert trading.label == "Trading"
+    assert trading.action == "trading"
+    assert trading.available
+
+
+def test_the_data_entry_opens_the_data_menu() -> None:
+    """C5's dispatch: the tree's Data entry opens the Data sub-menu
+    (`keel.commands.data_console`) -- fetch and its variants over the fetch service."""
+    data = console.menu_entry(6)
+    assert data is not None
+    assert data.label == "Data"
+    assert data.action == "data"
+    assert data.available
 
 
 def test_the_compliance_entry_opens_the_compliance_menu() -> None:
@@ -360,10 +388,11 @@ def test_the_menu_screen_renders_every_entry_and_the_lands_in_notices(tmp_path: 
     for entry in console.CONSOLE_MENU:
         assert any(entry.label in t for t in texts), entry.label
     joined = "\n".join(texts)
-    assert "lands in C5" in joined
-    # C4 landed (issue #390): Rules and Research are live entries now, so no "lands in C4"
-    # notice remains anywhere in the tree.
+    # C5 landed (issue #391): Trading and Data are live entries now, so no "lands in C5"
+    # notice remains anywhere in the tree -- only Account's C6 one does.
+    assert "lands in C5" not in joined
     assert "lands in C4" not in joined
+    assert "lands in C6" in joined
     # The cursor marks exactly one row (Trading, index 2 of the entries).
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "Trading" in marked[0]
@@ -372,12 +401,12 @@ def test_the_menu_screen_renders_every_entry_and_the_lands_in_notices(tmp_path: 
 def test_the_placeholder_screen_names_its_slice_and_says_navigation_only() -> None:
     """Selecting a future entry lands on a notice, not a blank screen: which slice owns the
     behavior, and that the shell renders navigation only -- nothing is invokable from it."""
-    trading = console.menu_entry(3)
-    assert trading is not None and trading.label == "Trading"
-    lines = console.build_placeholder_lines(trading)
+    account = console.menu_entry(8)
+    assert account is not None and account.label == "Account"
+    lines = console.build_placeholder_lines(account)
     joined = "\n".join(line.text for line in lines)
-    assert "C5" in joined
-    assert "Trading" in joined
+    assert "C6" in joined
+    assert "Account" in joined
     assert "navigation" in joined.lower()
 
 

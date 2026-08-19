@@ -163,9 +163,24 @@ from keel.commands.simulate import run_simulation
 from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
 from keel.commands.trading import (
+    KILL_ENGAGED_LINE,
+    RECORD_FLOW_DETAIL,
+    RESET_HWM_ACTION,
+    RESET_HWM_DETAIL,
+    RESET_HWM_DONE_LINE,
+    RESUME_ACTION,
+    RESUME_DETAIL,
+    RESUME_DISENGAGED_LINE,
+    RESUME_ENTRIES_ACTION,
+    RESUME_ENTRIES_CLEARED_LINE,
+    RESUME_ENTRIES_DETAIL,
     clear_consecutive_loss_halt,
     disengage_kill_switch,
     engage_kill_switch,
+    parse_flow_amount,
+    record_flow_action,
+    render_blocked_entries,
+    render_flow_recorded,
     render_loop_result,
     reset_high_water_mark,
 )
@@ -1048,13 +1063,8 @@ def agent_cmd(
             # Finding 1 (HIGH): a green exit here is exactly what lets a cron/LaunchAgent
             # wrapper stamp the day as done and never retry -- see `agent.DATA_NOT_READY_EXIT`'s
             # docstring for the mechanism this closes (duplicate order -> bounded delay).
-            for blocked in result.blocked_entries:
-                click.echo(
-                    f"blocked: {blocked.rule_name} on {blocked.product} needs a confirmed "
-                    f"{blocked.granularity.value} bar at {blocked.expected_ts} "
-                    f"(have {blocked.stored_ts}, reason={blocked.reason})",
-                    err=True,
-                )
+            for blocked_line in render_blocked_entries(result):
+                click.echo(blocked_line, err=True)
             ctx.exit(agent.DATA_NOT_READY_EXIT)
         return
 
@@ -1315,7 +1325,7 @@ cli.add_command(versions_cmd)
 def kill(ctx: click.Context) -> None:
     """Engage the kill-switch, halting all trading immediately. Always allowed (safe action)."""
     engage_kill_switch(_open_repo(ctx))
-    click.echo("kill-switch ENGAGED: all trading halted.")
+    click.echo(KILL_ENGAGED_LINE)
 
 
 @cli.command()
@@ -1323,12 +1333,9 @@ def kill(ctx: click.Context) -> None:
 @with_disclaimer
 def resume(ctx: click.Context) -> None:
     """Disengage the kill-switch (dangerous: asks for confirmation)."""
-    _require_interactive_confirmation(
-        "disengage the kill-switch",
-        "Trading resumes immediately: the agent may place orders on its next cycle.",
-    )
+    _require_interactive_confirmation(RESUME_ACTION, RESUME_DETAIL)
     disengage_kill_switch(_open_repo(ctx))
-    click.echo("kill-switch disengaged: trading resumed.")
+    click.echo(RESUME_DISENGAGED_LINE)
 
 
 @cli.command(name="resume-entries")
@@ -1345,12 +1352,9 @@ def resume_entries(ctx: click.Context) -> None:
     re-arm the breaker on the very next loss, which is not what an operator clearing a halt
     means. Exits, sells and DCA are never affected by rail 16 and are unaffected here.
     """
-    _require_interactive_confirmation(
-        "clear the consecutive-loss halt (rail 16)",
-        "New entries are re-permitted; the loss counter is reset with it.",
-    )
+    _require_interactive_confirmation(RESUME_ENTRIES_ACTION, RESUME_ENTRIES_DETAIL)
     clear_consecutive_loss_halt(_open_repo(ctx))
-    click.echo("consecutive-loss breaker cleared: new entries permitted.")
+    click.echo(RESUME_ENTRIES_CLEARED_LINE)
 
 
 @cli.command(name="record-flow")
@@ -1380,30 +1384,20 @@ def record_flow(ctx: click.Context, amount: str) -> None:
     will never infer a flow on its own: guessing a withdrawal would lower the HWM and silently
     mask a real trading drawdown, which is the one direction a circuit breaker must not fail in.
     """
-    _require_interactive_confirmation(
-        f"rebase rail 11's high-water mark by {amount}",
-        "A wrong amount or sign here silently mis-states drawdown from now on "
-        "(positive = deposit, negative = withdrawal).",
-    )
-    try:
-        parsed = Decimal(amount)
-    except InvalidOperation:
-        raise click.BadParameter(f"--amount must be a number, got {amount!r}") from None
-    # `Decimal("nan")`/`Decimal("inf")` parse without raising above (same trap `subscription
+    _require_interactive_confirmation(record_flow_action(amount), RECORD_FLOW_DETAIL)
+    # `Decimal("nan")`/`Decimal("inf")` parse without raising (same trap `subscription
     # attest` documents). Either would be written straight into the high-water mark, and NaN
     # poisons it permanently: every subsequent `equity > hwm` comparison is False, so the HWM
-    # can never re-seed and every drawdown comparison silently misbehaves.
-    if not parsed.is_finite():
-        raise click.BadParameter(f"--amount must be a finite number, got {amount!r}")
+    # can never re-seed and every drawdown comparison silently misbehaves -- the validation
+    # (including that finite check) lives in `parse_flow_amount`, its one home.
+    try:
+        parsed = parse_flow_amount(amount)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from None
 
     hwm = record_declared_flow(_open_repo(ctx), parsed)
-    if hwm is None:
-        click.echo(
-            f"flow of {parsed} recorded. No high-water mark yet -- the next cycle will seed it "
-            "from observed equity, which already includes this flow."
-        )
-    else:
-        click.echo(f"flow of {parsed} recorded. High-water mark rebased to {hwm}.")
+    for line in render_flow_recorded(parsed, hwm):
+        click.echo(line)
 
 
 @cli.command(name="reset-hwm")
@@ -1421,12 +1415,9 @@ def reset_hwm(ctx: click.Context) -> None:
     equity, which is the same path a fresh install takes. `drawdown_total_pct` is zeroed so the
     rail is not left vetoing on a stale scalar in the window before that next cycle runs.
     """
-    _require_interactive_confirmation(
-        "reset rail 11's high-water mark",
-        "Any real, unrecovered drawdown stops being visible to the rail.",
-    )
+    _require_interactive_confirmation(RESET_HWM_ACTION, RESET_HWM_DETAIL)
     reset_high_water_mark(_open_repo(ctx))
-    click.echo("equity high-water mark reset: it will re-seed from the next cycle's equity.")
+    click.echo(RESET_HWM_DONE_LINE)
 
 
 if __name__ == "__main__":  # pragma: no cover

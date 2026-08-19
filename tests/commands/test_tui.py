@@ -54,9 +54,13 @@ from keel.commands.status import (
 )
 from keel.commands.tui import (
     _BALANCE_TIMEOUT_SEC,
+    _CYCLE_RUN_NOTICE,
     _DISCOVER_TIMEOUT_SEC,
+    _FETCH_RUN_NOTICE,
+    _MONITOR_RUN_NOTICE,
     _REFRESH_MESSAGE,
     _SHORT_VERSION,
+    CTRL_C_DISCLOSURE,
     AvailableBalance,
     ScreenLine,
     _activity_cursor,
@@ -72,6 +76,7 @@ from keel.commands.tui import (
     _message_style,
     _paint,
     _refresh_balance,
+    _run_notice_lines,
     _scroll_offset,
     _short_version,
     _stdio_is_interactive,
@@ -965,6 +970,39 @@ def test_paint_applies_distinct_attrs_by_style() -> None:
     # Not asserting exact bit values (curses colour init may be unavailable off a real terminal)
     # -- just that the two differently-styled lines don't collapse to the same attr.
     assert attrs[0] != attrs[1]
+
+
+def test_the_loop_painted_run_notices_wrap_inside_the_80_column_clip() -> None:
+    """[review #405] The frozen-screen notices are painted straight by the loop, not
+    through a console builder -- so their fit needs its own proof. The raw bodies are
+    long (the cycle's is 144 chars) and `_paint` CLIPS at the window width: painted as
+    one line, the tail -- the part that says what happens to orders -- is exactly what
+    a 80-column terminal loses. The notice helper wraps every body to the builders'
+    78-column budget, tail included, and carries the Ctrl-C line."""
+    bodies = (
+        _CYCLE_RUN_NOTICE,
+        _MONITOR_RUN_NOTICE,
+        _FETCH_RUN_NOTICE,
+        # the C4-era simulate notice rides the same helper since the C5 review
+        # flagged its identical clipping (91 chars, tail lost),
+        "simulating... please wait (this can take minutes; the "
+        "screen is frozen exactly like the CLI)",
+    )
+    # the raw bodies genuinely need the wrapping this test exists to force
+    assert len(_CYCLE_RUN_NOTICE) > 80
+    assert len(_FETCH_RUN_NOTICE) > 80
+    for body in bodies:
+        lines = _run_notice_lines(body)
+        for line in lines:
+            assert len(line.text) <= 78, line.text
+        # nothing is lost to the wrap: every word of the body renders, tail included
+        rendered = " ".join(line.text for line in lines)
+        for word in body.replace("(", " ").replace(")", " ").replace(";", " ").split():
+            assert word in rendered, word
+        # and the Ctrl-C disclosure rides every frozen notice
+        assert any("Ctrl-C" in line.text for line in lines)
+    assert "exits the whole console" in CTRL_C_DISCLOSURE
+    assert len(CTRL_C_DISCLOSURE) > 78  # the disclosure itself needs the wrap too
 
 
 # -- run_once -------------------------------------------------------------------------------
@@ -3551,13 +3589,14 @@ def test_run_live_m_opens_the_menu_and_esc_returns_to_the_dashboard(
 def test_run_live_a_placeholder_entry_lands_in_its_slice_notice(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Selecting a future slice's entry (3 = Trading, C5) renders the notice, not a dead
-    click and not a feature -- the shell is navigation only."""
+    """Selecting a future slice's entry (8 = Account, C6 -- Trading and Data went live
+    with C5, issue #391) renders the notice, not a dead click and not a feature -- the
+    shell is navigation only."""
     painted, _binding = _console_run(
-        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("3"), -1, 27, 27]
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("8"), -1, 27, 27]
     )
 
-    assert any("lands in C5" in t for t in painted)
+    assert any("lands in C6" in t for t in painted)
     assert any("navigation" in t.lower() for t in painted)
 
 
