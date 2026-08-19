@@ -83,10 +83,20 @@ dashboard (rails/positions/freshness/activity), `versions`.
   the kill switch does, what paper mode means). Definitions live in ONE source (a glossary the
   TUI help renders and the docs link to — not a second, drifting copy), and the typed actions'
   help text says explicitly that the prompt cannot be pre-filled.
+- **O9 — The session banner on every screen (live and paper alike):** the console header
+  permanently shows, for the ACTIVE profile: the market session state (OPEN / CLOSED /
+  CLOCK UNAVAILABLE — the B1 `SessionState` vocabulary), the venue's market clock (current
+  venue time, and for session-bound venues the NEXT OPEN and NEXT CLOSE timestamps), or an
+  explicit "24/7" for always-open venues. Data comes from the existing recorded-session state
+  and the `market_clock()` service — the port's clock read is extended to carry
+  `next_open`/`next_close` where the venue provides them (Alpaca's `/v2/clock` already does);
+  no new session logic is born in the TUI. A stale/absent record renders CLOCK UNAVAILABLE,
+  fail-loud, exactly as `fetch --check` treats it.
 
 ## Menu tree (v1 shape — final naming in implementation)
 
 ```
+[header on EVERY screen]   active profile (config+db) · market session + clock (O9) · venue
 Dashboard            the current live view (rails, session, positions, freshness, activity)
 Profile              switch paper-forward | paper-hourly | paper-equities | live (guarded)
   └─ Venues          installed adapters + capabilities (O7); selected one highlighted
@@ -119,7 +129,9 @@ service layer and both front-ends get it.
   implementation. *Foundation — everything else depends on it.*
 - **C2 — Console shell + profile switching.** Menu/sub-menu framework over the current
   dashboard (which remains the landing screen); the Profile menu (O4); active-profile header on
-  every screen.
+  every screen — the header IS the session banner (O9): profile, session state, market clock
+  with next open/close, sourced from the recorded state + the (extended) `market_clock()`
+  service.
 - **C3 — Compliance menu + the scout-results handler (O6).** The admission flow through real
   services; the proposals browser reading the operator-local path via config.
 - **C4 — Rules + Research menus.** Rule lifecycle actions; the evidence readers (O5).
@@ -144,6 +156,10 @@ service layer and both front-ends get it.
    including capabilities and the selected adapter — with no secret material.
 7. Every screen and action has help text a newcomer can understand; glossary definitions have
    exactly one source and no drifted duplicates.
+8. On every screen, for live and paper profiles alike, the header shows the market session
+   state and the venue clock (next open/close for session-bound venues; "24/7" for always-open
+   ones; CLOCK UNAVAILABLE rendered fail-loud) — from the same session state the engine and
+   `fetch --check` use, never a TUI-side calendar.
 
 ## 7. Risks
 
