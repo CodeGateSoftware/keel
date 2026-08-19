@@ -937,7 +937,13 @@ def _activity_lines(
             cursor_line = len(lines)
         lines.append(
             ScreenLine(
-                render_cycle_row(cycle, selected=selected, expanded=is_open), cycle_style(cycle)
+                # `feed.now_ts` rather than a fresh `time.time()`: every row's `age` is measured
+                # against the same instant the scope boundary was, so the column cannot disagree
+                # with the header above it or drift row-to-row within one repaint.
+                render_cycle_row(
+                    cycle, now_ts=feed.now_ts, selected=selected, expanded=is_open
+                ),
+                cycle_style(cycle),
             )
         )
         if not is_open:

@@ -51,16 +51,27 @@ are instead gathered into synthetic groups: a contiguous run of uncorrelated eve
 neighbours are within `_UNCORRELATED_GAP_SEC` of each other becomes one row, which is what such
 events actually are -- one failed attempt at something.
 
+**Everything here is on the UTC clock, and that is not a detail.** The deployment's unit of work
+is one cycle per **UTC** date: `keel-live-run.sh` gates and stamps on `date -u`, firing at the
+first trigger at or after 01:00 UTC, because 01:00 UTC is the earliest instant
+`turtle_breakout._completed_days` stops withholding the daily bar that closed at 00:00 UTC. This
+module renders and scopes in the same frame the work is defined in. It did not always: rendering
+in local time printed that 01:20 UTC cycle as `21:20` on the PREVIOUS date at UTC-4, so a
+deployment that had run correctly hours earlier read as a full day stale, and a local `"today"`
+excluded its own only cycle every single day. Timestamps carry a `when (UTC)` heading, and each
+row carries an `age` beside it (`_age`) so freshness needs no timezone arithmetic to read.
+
 **The default view is TODAY, and that is delicate.** The feed answers "what has keel been doing",
 and the honest default answer is "what it has done today" -- an operator opening the dashboard at
 lunchtime wants this morning, not a fortnight of scrollback. So `build_activity_feed` scopes to
-the local CALENDAR day by default (`scope_start_ts`, midnight-to-now in the same local clock
-`_stamp` renders timestamps in -- NOT a rolling 24 hours, which would put "yesterday 09:00" and
-"today 09:00" on the same screen every morning and neither on it every afternoon).
+the UTC CALENDAR day by default (`scope_start_ts`, 00:00 UTC-to-now in the same clock `_stamp`
+renders timestamps in -- NOT a rolling 24 hours, which would put "yesterday 01:20" and "today
+01:20" on the same screen every morning and neither on it every afternoon).
 
-The delicacy is that the real deployment runs ONCE A DAY, at 09:00. "Today" therefore holds at
-most one row, and before 09:00 it holds none -- and a blank panel is worse than the dead-looking
-dashboard this whole feature exists to fix. Two things follow, and both are load-bearing:
+The delicacy is that the real deployment runs ONCE A DAY, shortly after 01:00 UTC. "Today"
+therefore holds at most one row, and before 01:00 UTC it holds none -- and a blank panel is worse
+than the dead-looking dashboard this whole feature exists to fix. Two things follow, and both are
+load-bearing:
 
 * `apply_scope` retains the newest cycle that fell OUTSIDE the scope as
   `ActivityFeed.last_cycle_before_scope`, so the empty state can say *when keel last ran* and
@@ -159,7 +170,7 @@ ACTIVITY_SCOPES: tuple[str, ...] = ("today", "7d", "all")
 #: an operator asked once, not a new default for a dashboard they will next open tomorrow.
 DEFAULT_ACTIVITY_SCOPE = "today"
 
-#: How many local calendar days each bounded scope spans, counting the current one. `"7d"` is
+#: How many UTC calendar days each bounded scope spans, counting the current one. `"7d"` is
 #: therefore today plus the six days before it -- seven DAYS, not seven times 24 hours, for the
 #: same reason `"today"` is a calendar day: the deployment's unit of work is one daily cycle, so
 #: a boundary that fell mid-morning would split a day's single row off from its own date.
@@ -184,25 +195,23 @@ def next_activity_scope(scope: str) -> str:
 
 
 def scope_start_ts(scope: str, now_ts: float) -> float | None:
-    """The epoch second a scope begins at -- LOCAL midnight of the first calendar day it covers --
+    """The epoch second a scope begins at -- 00:00 **UTC** of the first calendar day it covers --
     or `None` for `"all"`, which has no lower bound.
 
     `now_ts` is a parameter, not a `time.time()` call buried in here, so the boundary is
     injectable and every test of it is deterministic on whatever day it happens to run.
 
-    **Local, and derived from the same clock the rows render in.** `datetime.fromtimestamp` with
-    no tzinfo yields naive LOCAL time and `.timestamp()` converts it back through the local zone,
-    so the boundary lands on the same civil midnight `_stamp`'s `time.localtime` would print --
-    which is the only way "today" can mean what the operator reading the timestamps thinks it
-    means.
+    **UTC, and derived from the same clock the rows render in.** That pairing is the requirement,
+    not the choice of zone: a boundary in one frame and timestamps in another is how a "today"
+    view comes to exclude a cycle whose printed date IS today's. UTC is the frame both are in
+    because it is the frame the work is defined in -- one cycle per UTC date, gated on `date -u`
+    by `keel-live-run.sh` at 01:00 UTC (see the module docstring). Under the previous local-day
+    boundary that cycle landed before local midnight anywhere behind UTC, so on this deployment
+    `"today"` was empty every day of the year.
 
-    **DST is handled, and handled in the safe direction.** Going through `date` -> naive midnight
-    -> `.timestamp()` uses the offset in force on THAT day, so a 23- or 25-hour day still starts
-    where the civil day starts (a fixed `now_ts - 86400` would drift an hour twice a year). In
-    the few zones whose transition happens AT midnight, so that 00:00 does not exist, the naive
-    conversion resolves to the instant an hour before the nominal wall reading -- i.e. slightly
-    EARLIER than the true day boundary. That direction is deliberate: a boundary that errs early
-    can only ever include a cycle that belongs to today, never exclude one.
+    **DST stops being a consideration.** UTC has no offset transitions, so a UTC day is 86400
+    seconds always and the boundary needs none of the care a civil-midnight one did -- the class
+    of bug where a 23- or 25-hour day shifts the boundary an hour simply does not arise.
 
     Never raises: a `now_ts` outside the platform's `time_t` returns `None`, which degrades to an
     unfiltered feed rather than an empty one."""
@@ -210,8 +219,10 @@ def scope_start_ts(scope: str, now_ts: float) -> float | None:
     if days is None:
         return None
     try:
-        day = datetime.datetime.fromtimestamp(now_ts).date() - datetime.timedelta(days=days - 1)
-        return datetime.datetime.combine(day, datetime.time.min).timestamp()
+        day = datetime.datetime.fromtimestamp(now_ts, datetime.UTC).date() - datetime.timedelta(
+            days=days - 1
+        )
+        return datetime.datetime.combine(day, datetime.time.min, datetime.UTC).timestamp()
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -324,7 +335,7 @@ class ActivityFeed:
     #: Which scope produced `cycles` -- one of `ACTIVITY_SCOPES`.
     scope: str = "all"
 
-    #: Local midnight the scope begins at, or `None` for `"all"` (and for a `now_ts` so broken
+    #: 00:00 UTC the scope begins at, or `None` for `"all"` (and for a `now_ts` so broken
     #: that no boundary could be computed, which degrades to showing everything).
     scope_start_ts: float | None = None
 
@@ -338,7 +349,7 @@ class ActivityFeed:
 
     #: The newest cycle before the scope boundary, kept for ONE purpose: so an empty "today" can
     #: name when keel last ran. That is a status line, not a history feed -- it is what turns a
-    #: blank panel into "keel has not run yet today; last cycle yesterday 09:00".
+    #: blank panel into "keel has not run yet today; last cycle yesterday 01:20".
     last_cycle_before_scope: ActivityCycle | None = None
 
     #: Whether the bounded read PROVED it reached back past the scope boundary. False means the
@@ -839,7 +850,7 @@ def apply_scope(
       scope, and an empty result there means "not seen", not "did not happen".
 
     Filtering is on `started_ts`, the timestamp the row itself renders, and the boundary is
-    INCLUSIVE (`>= start`) so a cycle at exactly local midnight belongs to the day beginning
+    INCLUSIVE (`>= start`) so a cycle at exactly 00:00 UTC belongs to the day beginning
     then -- the same convention every calendar uses, and the only one under which two adjacent
     days cannot both claim it or both disown it.
 
@@ -899,7 +910,7 @@ def build_activity_feed(
     `OSError` into a status; this catches whatever a config object shaped differently than
     expected could still throw, and turns it into the same kind of readable sentence.
 
-    `scope` defaults to TODAY -- the local calendar day -- because that is what "what has keel
+    `scope` defaults to TODAY -- the UTC calendar day -- because that is what "what has keel
     been doing" means to someone opening the dashboard now. `now_ts` is injectable so the day
     boundary is a parameter of this call rather than a hidden clock read, which is what makes the
     whole scoping layer deterministic under test. A non-ok window is scope-stamped too, so the
@@ -942,35 +953,85 @@ _UNRENDERABLE_TS = "??"
 
 
 def _safe_strftime(fmt: str, ts: float, width: int) -> str:
+    """UTC, not local -- see `_stamp`. `gmtime` raises on exactly the values `localtime` does,
+    so the guard is unchanged."""
     try:
-        return time.strftime(fmt, time.localtime(ts))
+        return time.strftime(fmt, time.gmtime(ts))
     except (OSError, OverflowError, ValueError):
         return _UNRENDERABLE_TS * (width // len(_UNRENDERABLE_TS))
 
 
 def _clock(ts: float) -> str:
-    """Local `HH:MM:SS` for an expanded event row -- the cycle's own row already carries the
-    date, and repeating it on every event line would cost a fifth of the width for nothing."""
+    """UTC `HH:MM:SS` for an expanded event row -- the cycle's own row already carries the date,
+    and repeating it on every event line would cost a fifth of the width for nothing. Same clock
+    as `_stamp`, necessarily: an expanded event reading 21:20 under a row reading 01:20 would be
+    a worse bug than the one this whole module's UTC choice exists to fix."""
     return _safe_strftime("%H:%M:%S", ts, 8)
 
 
 def _stamp(ts: float) -> str:
-    """Local `YYYY-MM-DD HH:MM:SS`, matching `keel/commands/tui.py`'s `_human_dt` so the feed's
-    timestamps and the dashboard's read identically. `ts` is a float epoch in the log;
-    `localtime` accepts it directly."""
+    """`YYYY-MM-DD HH:MM:SS` in **UTC**, and that is the load-bearing word.
+
+    This deliberately does NOT match `keel/commands/tui.py`'s `_human_dt`, which stays local. The
+    dashboard's other timestamps describe things whose natural frame is the operator's day (when
+    autonomy lapses, when a position was opened). A cycle's is not: the deployment's wrapper
+    (`keel-live-run.sh`) gates and stamps ONE cycle per **UTC** date, firing at the first trigger
+    at or after 01:00 UTC -- the instant `turtle_breakout._completed_days` stops withholding the
+    daily bar that closed at 00:00 UTC. Rendering that instant in a zone behind UTC printed a
+    date one day earlier than the date the run belongs to (01:20 UTC reads as 21:20 the previous
+    day at UTC-4), so a deployment that had run correctly that morning looked a full day stale,
+    and `"today"` -- when it too was a local day -- excluded its own only cycle. The column is
+    headed `when (UTC)` so the frame is stated rather than inferred."""
     return _safe_strftime("%Y-%m-%d %H:%M:%S", ts, 19)
+
+
+#: Widest an `age` cell may render, and the width the header reserves for it. `999d` is the
+#: ceiling `_age` clamps to; nothing in a `_MAX_CYCLES`-deep window of daily cycles comes near it.
+_AGE_WIDTH = 4
+
+
+def _age(then_ts: float, now_ts: float | None) -> str:
+    """How long ago a cycle started, in at most `_AGE_WIDTH` columns: `47m`, `22h`, `3d`.
+
+    The date alone cannot answer "is this feed fresh" at a glance -- reading a UTC stamp against
+    a local wall clock is exactly the arithmetic that made a same-morning run look stale -- so
+    the row states the answer instead of leaving it to be computed. Coarser than
+    `_elapsed_phrase` on purpose: this is a column beside four count columns, not a sentence.
+
+    Empty (not zero, not a guess) when `now_ts` is unknown, so a caller that has no clock renders
+    an aligned blank rather than a wrong number. Never negative and never raises: a row stamped
+    in the future (clock skew, a hand-edited line) reads `now`, and an unusable `ts` reads `--`,
+    because this runs in the live loop's repaint path."""
+    if now_ts is None:
+        return ""
+    try:
+        minutes = int(max(0.0, now_ts - then_ts) // 60)
+        if minutes < 1:
+            return "now"
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        if hours < 48:
+            return f"{hours}h"
+        return f"{min(hours // 24, 999)}d"
+    except (OverflowError, ValueError):
+        return "--"
 
 
 #: The column header for the collapsed rows, built with the SAME field widths
 #: `render_cycle_row` uses so the two cannot drift out of alignment when either is edited.
 ACTIVITY_HEADER = (
-    f"   {'when':<19}  {'mode':<7} {'sig':>3}  {'blk':>3}  {'ent':>3}  "
-    f"{'exi':>3}  {'err':>3}  what happened"
+    f"   {'when (UTC)':<19}  {'age':>{_AGE_WIDTH}}  {'mode':<7} {'sig':>3}  {'blk':>3}  "
+    f"{'ent':>3}  {'exi':>3}  {'err':>3}  what happened"
 )
 
 
 def render_cycle_row(
-    cycle: ActivityCycle, *, selected: bool = False, expanded: bool = False
+    cycle: ActivityCycle,
+    *,
+    now_ts: float | None = None,
+    selected: bool = False,
+    expanded: bool = False,
 ) -> str:
     """The collapsed one-line summary of a cycle, aligned under `ACTIVITY_HEADER`.
 
@@ -978,7 +1039,12 @@ def render_cycle_row(
     still visible, which is the trade this row exists to make: `signals=0 blocked=0 entered=0
     exited=0 errors=0` spelled out consumes 43 columns to say "nothing happened", and would push
     the one genuinely informative part of a notable row off the right edge (`_paint` clips). The
-    header spells them out once, above."""
+    header spells them out once, above.
+
+    `now_ts` is the clock the `age` column is measured against -- passed in, never read here, so
+    every row on one repaint reports its age against the SAME instant (`ActivityFeed.now_ts`,
+    which is also the instant the scope was computed against). Omitting it renders an aligned
+    blank age rather than a stale or invented one."""
     caret = "▾" if expanded else "▸"
     marker = ">" if selected else " "
     mode = (cycle.mode or ("--" if cycle.is_uncorrelated else "?"))[:7]
@@ -1000,7 +1066,8 @@ def render_cycle_row(
         tail_parts.append("quiet -- looked, nothing to do")
     tail = "  ".join(tail_parts)
     return (
-        f"{marker}{caret} {_stamp(cycle.started_ts)}  {mode:<7} "
+        f"{marker}{caret} {_stamp(cycle.started_ts)}  "
+        f"{_age(cycle.started_ts, now_ts):>{_AGE_WIDTH}}  {mode:<7} "
         f"{cycle.signals:>3}  {cycle.blocked:>3}  {cycle.entered:>3}  "
         f"{cycle.exited:>3}  {cycle.errors:>3}  {tail}"
     )
@@ -1162,7 +1229,7 @@ def render_event_detail(ev: ActivityEvent) -> str:
 
 
 def render_event_row(ev: ActivityEvent) -> str:
-    """One expanded event line: local clock, the stable event id (never an interpolated sentence
+    """One expanded event line: UTC clock, the stable event id (never an interpolated sentence
     -- the id is what an operator greps the raw log for), then the meaningful fields."""
     return f"      {_clock(ev.ts)}  {ev.event:<30}  {render_event_detail(ev)}"
 
@@ -1229,14 +1296,18 @@ _NO_CYCLES_AT_ALL = "No cycles in the window -- the log was read, but held no gr
 
 
 def scope_label(scope: str, start_ts: float | None) -> str:
-    """The scope named the way an operator would say it, with the date it actually begins at.
-    Naming the DATE matters: "today" is ambiguous next to a row stamped `2026-08-11 09:00`
-    unless the header says which day "today" is."""
+    """The scope named the way an operator would say it, with the UTC date it actually begins at.
+    Naming the DATE matters: "today" is ambiguous next to a row stamped `2026-08-11 01:20`
+    unless the header says which day "today" is. And naming the ZONE matters for the same reason
+    the rows do it -- an operator behind UTC whose local date is 08-17 needs to see that this
+    "today" is 08-18 UTC, not to read a bare date as the one on their own wall. The date is
+    unparenthesised because spelling `UTC` out costs four columns and `scope_headline` has to
+    stay inside 80 of them; dropping the brackets pays for the zone exactly."""
     if scope == "today":
-        return f"today ({_safe_strftime('%Y-%m-%d', start_ts, 10)})" if start_ts else "today"
+        return f"today {_safe_strftime('%Y-%m-%d', start_ts, 10)} UTC" if start_ts else "today"
     if scope == "7d":
         return (
-            f"last 7 days (from {_safe_strftime('%Y-%m-%d', start_ts, 10)})"
+            f"last 7 days from {_safe_strftime('%Y-%m-%d', start_ts, 10)} UTC"
             if start_ts
             else "last 7 days"
         )
@@ -1279,13 +1350,14 @@ def _elapsed_phrase(seconds: float) -> str:
 
 
 def _day_phrase(then_ts: float, now_ts: float) -> str:
-    """`yesterday` / `3 days ago` / `earlier today`, by LOCAL CALENDAR DAY rather than by elapsed
+    """`yesterday` / `3 days ago` / `earlier today`, by UTC CALENDAR DAY rather than by elapsed
     hours -- 23 hours ago can be yesterday or the day before, and the calendar answer is the one
-    that matches the date printed beside it."""
+    that matches the date printed beside it. UTC for exactly that reason: the date printed beside
+    it is UTC (`_stamp`), and the scope this phrase describes is a UTC day (`scope_start_ts`)."""
     try:
         delta = (
-            datetime.datetime.fromtimestamp(now_ts).date()
-            - datetime.datetime.fromtimestamp(then_ts).date()
+            datetime.datetime.fromtimestamp(now_ts, datetime.UTC).date()
+            - datetime.datetime.fromtimestamp(then_ts, datetime.UTC).date()
         ).days
     except (OSError, OverflowError, ValueError):
         return "at an unreadable time"
@@ -1307,18 +1379,18 @@ def _next_due_lines(last_ts: float, now_ts: float) -> list[str]:
     The two cases are genuinely different news, so they read differently: still to come is
     reassurance, already overdue is a prompt to go and look."""
     try:
-        last = datetime.datetime.fromtimestamp(last_ts)
-        today = datetime.datetime.fromtimestamp(now_ts).date()
+        last = datetime.datetime.fromtimestamp(last_ts, datetime.UTC)
+        today = datetime.datetime.fromtimestamp(now_ts, datetime.UTC).date()
         due = datetime.datetime.combine(
-            today, datetime.time(last.hour, last.minute)
+            today, datetime.time(last.hour, last.minute), datetime.UTC
         ).timestamp()
     except (OSError, OverflowError, ValueError):
         return []
     clock = f"{last.hour:02d}:{last.minute:02d}"
     if due > now_ts:
-        return [f"Next cycle due today around {clock} local -- in {_elapsed_phrase(due - now_ts)}."]
+        return [f"Next cycle due today around {clock} UTC -- in {_elapsed_phrase(due - now_ts)}."]
     return [
-        f"Its usual start time today ({clock} local) passed {_elapsed_phrase(now_ts - due)} ago.",
+        f"Its usual start time today ({clock} UTC) passed {_elapsed_phrase(now_ts - due)} ago.",
         "If no row appears here shortly, check that the agent's schedule is still running.",
     ]
 
@@ -1339,8 +1411,8 @@ def describe_empty_scope(feed: ActivityFeed) -> list[str]:
     """The lines shown when the log read fine but the SCOPE holds no cycle -- the single most
     important thing in the day-scoping change, and the reason it is safe at all.
 
-    On a deployment that runs one cycle a day at 09:00, a "today" view is empty every morning
-    before 09:00. A blank panel there would be strictly worse than the state dashboard this whole
+    On a deployment that runs one cycle a day just after 01:00 UTC, a "today" view is empty for
+    that first hour. A blank panel there would be strictly worse than the state dashboard this whole
     feature exists to fix, because a blank panel and a dead agent look identical. So this always
     answers "is keel alive" first, and it answers it with a FACT -- the timestamp of the last
     cycle the window saw -- rather than with reassurance.

@@ -993,13 +993,68 @@ def test_header_and_row_columns_line_up() -> None:
     assert ACTIVITY_HEADER.index("when") == row.index("2")  # the timestamp's leading digit
 
 
-def test_cycle_row_renders_local_time_not_an_epoch_float() -> None:
+def test_header_and_row_columns_line_up_with_an_age_too() -> None:
+    """The `age` cell is variable-width text in a fixed-width column, so it gets its own alignment
+    check -- a one-character age must not slide `mode` and the counts left."""
+    (cycle,) = feed_from_lines(_quiet_cycle_lines("cycle-a", T0)).cycles
+
+    for now_ts in (T0 + 60, T0 + 22 * 3600, T0 + 300 * 86400, None):
+        row = render_cycle_row(cycle, now_ts=now_ts)
+        assert ACTIVITY_HEADER.index("mode") == row.index("paper"), now_ts
+        assert ACTIVITY_HEADER.index("sig") == row.index(f"{cycle.signals:>3}"), now_ts
+
+
+def test_cycle_row_renders_utc_time_not_an_epoch_float_and_not_local_time() -> None:
+    """UTC is the load-bearing half. The engine's day is a UTC day (`keel-live-run.sh` gates on
+    `date -u`), so a row rendered in the operator's zone printed a date the run did not belong
+    to -- one day early anywhere behind UTC, which is where this deployment runs."""
     (cycle,) = feed_from_lines(_quiet_cycle_lines("cycle-a", T0)).cycles
 
     row = render_cycle_row(cycle)
 
-    assert time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(T0)) in row
+    assert time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(T0)) in row
     assert "1786194006" not in row
+    local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(T0))
+    if local != time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(T0)):
+        assert local not in row  # a no-op only when the suite itself runs in UTC
+
+
+def test_the_when_column_is_labelled_utc_so_the_frame_is_stated_not_inferred() -> None:
+    """The header is the only place the zone can be stated once. Without it the column is a bare
+    date an operator reads against their own wall clock, which is precisely the misreading that
+    made a fresh feed look a day stale."""
+    assert "when (UTC)" in ACTIVITY_HEADER
+    assert "age" in ACTIVITY_HEADER
+
+
+def test_the_age_column_answers_freshness_without_timezone_arithmetic() -> None:
+    """The point of `age`: a UTC stamp cannot be compared to a local wall clock at a glance, so
+    the row states the answer rather than leaving it to be computed."""
+    (cycle,) = feed_from_lines(_quiet_cycle_lines("cycle-a", T0)).cycles
+
+    assert " 47m " in render_cycle_row(cycle, now_ts=T0 + 47 * 60)
+    assert " 22h " in render_cycle_row(cycle, now_ts=T0 + 22 * 3600)
+    assert "  3d " in render_cycle_row(cycle, now_ts=T0 + 3 * 86400)
+
+
+def test_age_is_blank_not_invented_when_the_caller_has_no_clock() -> None:
+    """A renderer with no `now_ts` must not guess one -- and must not lose the column either, or
+    every field to its right would shift out from under the header."""
+    (cycle,) = feed_from_lines(_quiet_cycle_lines("cycle-a", T0)).cycles
+
+    without = render_cycle_row(cycle)
+    with_clock = render_cycle_row(cycle, now_ts=T0 + 22 * 3600)
+
+    assert "22h" not in without
+    assert without.index("paper") == with_clock.index("paper")
+
+
+def test_age_of_a_row_stamped_in_the_future_reads_now_not_a_negative_duration() -> None:
+    """Clock skew between the writer and this reader is a real possibility (two processes, and a
+    log this one does not own). It renders as `now`, never as `-3h`."""
+    (cycle,) = feed_from_lines(_quiet_cycle_lines("cycle-a", T0)).cycles
+
+    assert " now " in render_cycle_row(cycle, now_ts=T0 - 3 * 3600)
 
 
 def test_cycle_row_caret_and_marker_reflect_selection_and_expansion() -> None:
@@ -1386,30 +1441,40 @@ def test_a_read_window_holding_no_whole_record_is_not_reported_as_empty(tmp_path
 # blank.
 #
 # Every test below pins its own "now" and derives every fixture timestamp from it through
-# `_local_midnight`, so the whole section is deterministic in any timezone and on any day it
+# `_utc_midnight`, so the whole section is deterministic in any timezone and on any day it
 # happens to run -- which is the entire reason `scope_start_ts`/`apply_scope`/`build_activity_feed`
 # take `now_ts` as a parameter instead of reading a clock internally.
 # ==================================================================================================
 
 
-def _local_midnight(now_ts: float, days_ago: int = 0) -> float:
-    """Local midnight `days_ago` calendar days before the local day containing `now_ts`.
+def _utc_midnight(now_ts: float, days_ago: int = 0) -> float:
+    """00:00 UTC, `days_ago` calendar days before the UTC day containing `now_ts`.
 
-    Calendar arithmetic, not `- days * 86400`: that is what makes these fixtures land on the
-    intended civil day across a DST transition, which is exactly the property the production
-    boundary claims and these tests would otherwise be unable to hold it to."""
-    day = datetime.datetime.fromtimestamp(now_ts).date() - datetime.timedelta(days=days_ago)
-    return datetime.datetime.combine(day, datetime.time.min).timestamp()
+    Calendar arithmetic rather than `- days * 86400` even though the two agree in UTC: these
+    fixtures exist to mirror the production boundary, and mirroring it with a different
+    computation is how a fixture comes to pass while the code it stands in for is wrong.
+
+    UTC, not local, because that is the frame the module now scopes and stamps in -- and the
+    reason it does is a bug these fixtures previously could not express: a deployment whose one
+    daily cycle fires at 01:20 UTC sits BEFORE local midnight everywhere behind UTC, so a
+    local-day "today" hid the very cycle it was meant to show."""
+    day = datetime.datetime.fromtimestamp(now_ts, datetime.UTC).date() - datetime.timedelta(
+        days=days_ago
+    )
+    return datetime.datetime.combine(day, datetime.time.min, datetime.UTC).timestamp()
 
 
-#: The instant the scope tests measure from: 14:00 LOCAL on the local day containing a fixed UTC
-#: epoch. Anchoring through `_local_midnight` rather than to the raw epoch keeps "today" the same
-#: civil day whether the suite runs in UTC, New York or Tokyo.
-_SCOPE_NOW = _local_midnight(1_786_212_000.0) + 14 * 3600
+#: The instant the scope tests measure from: 14:00 UTC on the UTC day containing a fixed epoch.
+#: Anchoring through `_utc_midnight` rather than to the raw epoch keeps "today" the same UTC day
+#: no matter which zone the suite happens to run in -- these tests must pass in UTC, New York and
+#: Tokyo alike, and the whole point of the change is that the answer no longer depends on that.
+_SCOPE_NOW = _utc_midnight(1_786_212_000.0) + 14 * 3600
 
-#: The same day, but 07:00 -- BEFORE the deployment's 09:00 daily cycle. This is the case the
-#: whole empty-state design exists for: "today" is legitimately empty every single morning.
-_SCOPE_NOW_EARLY = _local_midnight(_SCOPE_NOW) + 7 * 3600
+#: The same UTC day, but 07:00 -- BEFORE the 09:00 cycle these fixtures place. (The real
+#: deployment's daily cycle is just after 01:00 UTC; 09:00 is kept here only because it makes the
+#: two-hours-early / five-hours-late arithmetic below readable.) This is the case the whole
+#: empty-state design exists for: "today" is legitimately empty until the day's cycle runs.
+_SCOPE_NOW_EARLY = _utc_midnight(_SCOPE_NOW) + 7 * 3600
 
 
 def _cycle_at(ts: float, cycle_id: str) -> list[str]:
@@ -1426,31 +1491,49 @@ def _scoped(lines: list[str], scope: str, now_ts: float, **kwargs: Any) -> Activ
 # -- the boundary itself ---------------------------------------------------------------------------
 
 
-def test_scope_start_ts_for_today_is_local_midnight_of_the_current_calendar_day() -> None:
+def test_scope_start_ts_for_today_is_utc_midnight_of_the_current_calendar_day() -> None:
     start = scope_start_ts("today", _SCOPE_NOW)
 
-    assert start == _local_midnight(_SCOPE_NOW)
-    # ...and it renders as 00:00:00 in the SAME local clock the rows are stamped in, which is the
+    assert start == _utc_midnight(_SCOPE_NOW)
+    # ...and it renders as 00:00:00 in the SAME UTC clock the rows are stamped in, which is the
     # property that makes "today" mean what the operator reading those stamps thinks it means.
     assert start is not None
-    assert time.strftime("%H:%M:%S", time.localtime(start)) == "00:00:00"
+    assert time.strftime("%H:%M:%S", time.gmtime(start)) == "00:00:00"
 
 
 def test_scope_start_ts_for_today_is_not_a_rolling_24_hours() -> None:
-    """The distinction the requirement turns on. At 14:00 the boundary is 14 hours back, not 24 --
-    a rolling window would put yesterday's 09:00 cycle on screen every morning and drop it every
+    """The distinction the requirement turns on. At 14:00 UTC the boundary is 14 hours back, not
+    24 -- a rolling window would put yesterday's cycle on screen every morning and drop it every
     afternoon, so the same day's feed would change shape depending on when it was opened."""
     start = scope_start_ts("today", _SCOPE_NOW)
 
     assert start is not None
-    assert _SCOPE_NOW - start == pytest.approx(14 * 3600, abs=3600)
+    assert _SCOPE_NOW - start == 14 * 3600
     assert start != _SCOPE_NOW - 86400
 
 
 def test_scope_start_ts_for_7d_covers_today_plus_the_six_days_before_it() -> None:
     start = scope_start_ts("7d", _SCOPE_NOW)
 
-    assert start == _local_midnight(_SCOPE_NOW, days_ago=6)
+    assert start == _utc_midnight(_SCOPE_NOW, days_ago=6)
+
+
+def test_a_cycle_early_on_the_utc_day_stays_in_today_all_day_in_a_zone_behind_utc() -> None:
+    """The regression this whole change exists for, written as the deployment actually behaves.
+
+    `keel-live-run.sh` gates on `date -u` and fires just after 01:00 UTC, so the day's only cycle
+    lands at ~01:20 UTC. Read late on the same UTC date -- 23:28 UTC, which is 19:28 the PREVIOUS
+    evening at UTC-4 -- the cycle must still be "today", because it is: same UTC date, the date
+    the wrapper stamped. Under the old local-day boundary it was not, and `"today"` came back
+    empty on a deployment that had run correctly twenty-two hours earlier."""
+    day = _utc_midnight(1_786_212_000.0)
+    lines = _cycle_at(day + 1 * 3600 + 20 * 60, "the-days-cycle")
+
+    feed = _scoped(lines, "today", day + 23 * 3600 + 28 * 60)
+
+    assert [c.cycle_id for c in feed.cycles] == ["the-days-cycle"]
+    assert feed.cycles_out_of_scope == 0
+    assert feed.last_cycle_before_scope is None
 
 
 def test_scope_start_ts_for_all_has_no_lower_bound() -> None:
@@ -1493,11 +1576,11 @@ def test_the_default_scope_is_today() -> None:
 
 def test_today_shows_several_cycles_from_today_and_hides_every_earlier_day() -> None:
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "old-3"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "old-1"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 11 * 3600, "today-b"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-c"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "old-3"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "old-1"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 11 * 3600, "today-b"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 13 * 3600, "today-c"),
     ]
 
     feed = _scoped(lines, "today", _SCOPE_NOW)
@@ -1505,7 +1588,7 @@ def test_today_shows_several_cycles_from_today_and_hides_every_earlier_day() -> 
     assert [c.cycle_id for c in feed.cycles] == ["today-c", "today-b", "today-a"]
     assert feed.cycles_out_of_scope == 2
     assert feed.scope == "today"
-    assert feed.scope_start_ts == _local_midnight(_SCOPE_NOW)
+    assert feed.scope_start_ts == _utc_midnight(_SCOPE_NOW)
     # The newest thing OUTSIDE the scope is kept -- and it is the newest, not the oldest.
     assert feed.last_cycle_before_scope is not None
     assert feed.last_cycle_before_scope.cycle_id == "old-1"
@@ -1515,8 +1598,8 @@ def test_today_shows_exactly_one_cycle_when_the_day_holds_exactly_one() -> None:
     """The real deployment's normal afternoon: one cycle a day, at 09:00. One row is the correct,
     complete answer -- and the header must say "1 cycle", not look like a truncated log."""
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
     ]
 
     feed = _scoped(lines, "today", _SCOPE_NOW)
@@ -1530,7 +1613,7 @@ def test_today_shows_exactly_one_cycle_when_the_day_holds_exactly_one() -> None:
 def test_a_quiet_cycle_that_ran_today_is_still_a_row_not_an_empty_state() -> None:
     """A quiet cycle is the positive observation "it looked and there was nothing to do". Scoping
     to today must not turn that into a blank day."""
-    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "today", _SCOPE_NOW)
+    feed = _scoped(_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "today", _SCOPE_NOW)
 
     (cycle,) = feed.cycles
     assert cycle.is_quiet
@@ -1540,8 +1623,8 @@ def test_a_quiet_cycle_that_ran_today_is_still_a_row_not_an_empty_state() -> Non
 def test_today_holds_nothing_before_the_daily_run_but_the_last_run_is_remembered() -> None:
     """07:00 on a deployment that runs at 09:00 -- the case that would otherwise render blank."""
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=2) + 9 * 3600, "old"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW_EARLY, days_ago=2) + 9 * 3600, "old"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday"),
     ]
 
     feed = _scoped(lines, "today", _SCOPE_NOW_EARLY)
@@ -1565,13 +1648,13 @@ def test_every_scope_returns_the_cycles_it_promises(scope: str, expected_ids: li
     """One fixture, three scopes, exact counts -- `7d` must include the sixth day back and exclude
     the ninth, and `all` must reach the 40-day-old one."""
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=40) + 9 * 3600, "d40"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=9) + 9 * 3600, "d9"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=6) + 9 * 3600, "d6"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "d3"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=40) + 9 * 3600, "d40"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=9) + 9 * 3600, "d9"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=6) + 9 * 3600, "d6"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=3) + 9 * 3600, "d3"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today-a"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
     ]
 
     feed = _scoped(lines, scope, _SCOPE_NOW)
@@ -1580,11 +1663,11 @@ def test_every_scope_returns_the_cycles_it_promises(scope: str, expected_ids: li
     assert feed.cycles_out_of_scope == 7 - len(expected_ids)
 
 
-def test_a_cycle_at_exactly_local_midnight_belongs_to_the_day_that_begins_then() -> None:
+def test_a_cycle_at_exactly_utc_midnight_belongs_to_the_day_that_begins_then() -> None:
     """The boundary is inclusive on the lower side, so midnight belongs to the day it starts --
     the calendar's own convention, and the only one under which two adjacent days can neither
     both claim a cycle nor both disown it."""
-    midnight = _local_midnight(_SCOPE_NOW)
+    midnight = _utc_midnight(_SCOPE_NOW)
     lines = [
         *_cycle_at(midnight - 1, "one-second-before"),
         *_cycle_at(midnight, "exactly-midnight"),
@@ -1607,8 +1690,8 @@ def test_a_cycle_at_exactly_local_midnight_belongs_to_the_day_that_begins_then()
 
 def test_apply_scope_leaves_a_feed_alone_under_all() -> None:
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
     ]
     unscoped = feed_from_lines(lines, source="/tmp/keel.log")
 
@@ -1630,13 +1713,13 @@ def test_apply_scope_does_not_read_the_clock_when_now_is_given(
 
     monkeypatch.setattr(time, "time", _boom)
 
-    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "today", _SCOPE_NOW)
+    feed = _scoped(_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "today", _SCOPE_NOW)
 
     assert len(feed.cycles) == 1
 
 
 def test_apply_scope_on_an_unrecognised_scope_shows_today_rather_than_nothing() -> None:
-    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "since tuesday",
+    feed = _scoped(_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "since tuesday",
                    _SCOPE_NOW)
 
     assert feed.scope == "today"
@@ -1650,7 +1733,7 @@ def test_empty_today_names_the_last_run_and_when_the_next_one_is_due() -> None:
     """The most important wording in this change. Before 09:00 the panel is legitimately empty,
     and a blank panel is indistinguishable from a dead agent -- so it must say, in plain words,
     that keel has not run YET, when it last ran, and when the next run is expected."""
-    lines = _cycle_at(_local_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday")
+    lines = _cycle_at(_utc_midnight(_SCOPE_NOW_EARLY, days_ago=1) + 9 * 3600, "yesterday")
 
     feed = _scoped(lines, "today", _SCOPE_NOW_EARLY)
     said = describe_empty_scope(feed)
@@ -1664,7 +1747,7 @@ def test_empty_today_names_the_last_run_and_when_the_next_one_is_due() -> None:
     assert feed.last_cycle_before_scope is not None
     assert _stamp(feed.last_cycle_before_scope.started_ts) in text
     # ...and the forward-looking half: 09:00 is still two hours away at 07:00.
-    assert "Next cycle due today around 09:00 local" in text
+    assert "Next cycle due today around 09:00 UTC" in text
     assert "in 2h 00m" in text
     assert "Press t to widen the scope" in text
 
@@ -1672,12 +1755,12 @@ def test_empty_today_names_the_last_run_and_when_the_next_one_is_due() -> None:
 def test_empty_today_after_the_usual_time_says_the_run_is_overdue() -> None:
     """Different news, so it reads differently: at 14:00 with nothing since yesterday 09:00, the
     schedule has been missed and the operator should be told to go and look."""
-    lines = _cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday")
+    lines = _cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday")
 
     text = " ".join(describe_empty_scope(_scoped(lines, "today", _SCOPE_NOW)))
 
     assert "keel has not run yet today." in text
-    assert "Its usual start time today (09:00 local) passed 5h 00m ago." in text
+    assert "Its usual start time today (09:00 UTC) passed 5h 00m ago." in text
     assert "check that the agent's schedule is still running" in text
 
 
@@ -1688,7 +1771,7 @@ def test_empty_today_with_no_history_at_all_still_explains_itself() -> None:
         status="ok",
         source="/tmp/keel.log",
         scope="today",
-        scope_start_ts=_local_midnight(_SCOPE_NOW),
+        scope_start_ts=_utc_midnight(_SCOPE_NOW),
         now_ts=_SCOPE_NOW,
     )
 
@@ -1736,7 +1819,7 @@ def test_describe_empty_scope_under_all_keeps_the_original_no_cycles_wording() -
 
 def test_empty_7d_does_not_claim_to_know_when_the_next_run_is_due() -> None:
     """The next-run estimate is inferred from a DAILY cadence and only makes sense for today."""
-    lines = _cycle_at(_local_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient")
+    lines = _cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=30) + 9 * 3600, "ancient")
 
     text = " ".join(describe_empty_scope(_scoped(lines, "7d", _SCOPE_NOW)))
 
@@ -1752,8 +1835,8 @@ def test_coverage_is_proven_when_the_window_reaches_past_the_boundary() -> None:
     """A window that contains a cycle from BEFORE midnight has demonstrably seen the whole day,
     truncated or not."""
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
     ]
 
     feed = _scoped(lines, "today", _SCOPE_NOW, truncated=True)
@@ -1763,7 +1846,7 @@ def test_coverage_is_proven_when_the_window_reaches_past_the_boundary() -> None:
 
 
 def test_coverage_is_proven_when_the_whole_file_was_read() -> None:
-    lines = _cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today")
+    lines = _cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today")
 
     feed = _scoped(lines, "today", _SCOPE_NOW, truncated=False)
 
@@ -1774,8 +1857,8 @@ def test_coverage_is_unproven_when_the_bounded_window_begins_inside_today() -> N
     """The interaction the read bounds create: a truncated window whose OLDEST record is already
     today cannot show that nothing happened earlier today -- only that it did not see it."""
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 11 * 3600, "today-a"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 11 * 3600, "today-a"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 13 * 3600, "today-b"),
     ]
 
     feed = _scoped(lines, "today", _SCOPE_NOW, truncated=True)
@@ -1794,7 +1877,7 @@ def test_an_empty_today_in_an_unproven_window_says_so_instead_of_implying_a_quie
         status="ok",
         source="/tmp/keel.log",
         scope="today",
-        scope_start_ts=_local_midnight(_SCOPE_NOW),
+        scope_start_ts=_utc_midnight(_SCOPE_NOW),
         now_ts=_SCOPE_NOW,
         window_truncated=True,
         scope_fully_covered=False,
@@ -1809,7 +1892,7 @@ def test_an_empty_today_in_an_unproven_window_says_so_instead_of_implying_a_quie
 def test_all_scope_never_reports_coverage_doubt() -> None:
     """There is no boundary to fall short of, so the caveat would be meaningless noise."""
     feed = _scoped(
-        _cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "all", _SCOPE_NOW,
+        _cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "all", _SCOPE_NOW,
         truncated=True,
     )
 
@@ -1818,9 +1901,9 @@ def test_all_scope_never_reports_coverage_doubt() -> None:
 
 def test_footer_reports_how_much_the_scope_hid() -> None:
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=2) + 9 * 3600, "d2"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=2) + 9 * 3600, "d2"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
     ]
 
     notes = " ".join(footer_notes(_scoped(lines, "today", _SCOPE_NOW)))
@@ -1834,27 +1917,35 @@ def test_footer_reports_how_much_the_scope_hid() -> None:
 
 def test_scope_headline_names_the_day_the_count_the_hidden_and_the_key() -> None:
     lines = [
-        *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
-        *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "d1"),
+        *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
     ]
 
     headline = scope_headline(_scoped(lines, "today", _SCOPE_NOW))
 
-    assert "scope: today (" in headline
-    assert time.strftime("%Y-%m-%d", time.localtime(_SCOPE_NOW)) in headline
+    assert "scope: today " in headline
+    assert time.strftime("%Y-%m-%d", time.gmtime(_SCOPE_NOW)) in headline
+    # The zone is named here as well as over the column: an operator behind UTC has to be able to
+    # see that this "today" is not the date on their own wall.
+    assert "UTC" in headline
     assert "1 cycle" in headline
     assert "1 older hidden" in headline
     assert "press t to widen" in headline
-    # It has to survive an 80-column terminal to be worth writing.
+    # It has to survive an 80-column terminal to be worth writing. Naming the zone costs four
+    # columns, which is why `scope_label` leaves the date unbracketed.
     assert len(headline) <= 80
 
 
 @pytest.mark.parametrize(
     ("scope", "fragment"),
-    [("today", "today ("), ("7d", "last 7 days (from "), ("all", "all history in the window")],
+    [
+        ("today", "today "),
+        ("7d", "last 7 days from "),
+        ("all", "all history in the window"),
+    ],
 )
 def test_scope_headline_names_every_scope(scope: str, fragment: str) -> None:
-    feed = _scoped(_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "t"), scope, _SCOPE_NOW)
+    feed = _scoped(_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "t"), scope, _SCOPE_NOW)
 
     assert fragment in scope_headline(feed)
 
@@ -1869,8 +1960,8 @@ def test_build_activity_feed_defaults_to_today(tmp_path: Any) -> None:
     path.write_text(
         "\n".join(
             [
-                *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
-                *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+                *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+                *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
             ]
         )
         + "\n"
@@ -1890,8 +1981,8 @@ def test_build_activity_feed_widens_on_request(tmp_path: Any) -> None:
     path.write_text(
         "\n".join(
             [
-                *_cycle_at(_local_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
-                *_cycle_at(_local_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+                *_cycle_at(_utc_midnight(_SCOPE_NOW, days_ago=1) + 9 * 3600, "yesterday"),
+                *_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
             ]
         )
         + "\n"
@@ -1917,7 +2008,7 @@ def test_today_has_no_upper_bound_so_a_clock_skewed_row_is_shown_not_hidden() ->
     This module shows it -- with its odd timestamp visible -- rather than shrinking the panel and
     giving the operator nothing to go on. Pinned as a test because it is a decision, not an
     accident: "today" is the calendar day, and `now` is only ever its lower-bound anchor."""
-    lines = _cycle_at(_local_midnight(_SCOPE_NOW) + 20 * 3600, "later-today")  # 20:00 vs now 14:00
+    lines = _cycle_at(_utc_midnight(_SCOPE_NOW) + 20 * 3600, "later-today")  # 20:00 vs now 14:00
 
     feed = _scoped(lines, "today", _SCOPE_NOW)
 
