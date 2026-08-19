@@ -293,20 +293,30 @@ def test_the_menu_is_the_prd_tree_in_order() -> None:
     ]
 
 
-def test_only_dashboard_profile_and_help_do_anything_in_this_slice() -> None:
-    """C2 ships the SHELL: every other entry is a placeholder owned by a later slice, and
-    must say so rather than dead-click."""
+def test_only_dashboard_profile_compliance_and_help_do_anything() -> None:
+    """C2 shipped the SHELL; C3 (issue #389) landed the Compliance entry -- everything
+    else is still a placeholder owned by a later slice, and must say so rather than
+    dead-click."""
     available = [e.label for e in console.CONSOLE_MENU if e.lands_in is None]
-    assert available == ["Dashboard", "Profile", "Help"]
+    assert available == ["Dashboard", "Profile", "Compliance", "Help"]
     owners = {e.label: e.lands_in for e in console.CONSOLE_MENU if e.lands_in is not None}
     assert owners == {
         "Trading": "C5",
         "Rules": "C4",
-        "Compliance": "C3",
         "Data": "C5",
         "Research": "C4",
         "Account": "C5",
     }
+
+
+def test_the_compliance_entry_opens_the_compliance_menu() -> None:
+    """C3's dispatch: the tree's Compliance entry is no longer a placeholder -- selecting
+    it opens the Compliance sub-menu (`keel.commands.compliance_console`)."""
+    compliance = console.menu_entry(5)
+    assert compliance is not None
+    assert compliance.label == "Compliance"
+    assert compliance.action == "compliance"
+    assert compliance.available
 
 
 def test_the_menu_is_reachable_by_its_displayed_ordinals() -> None:
@@ -334,7 +344,6 @@ def test_the_menu_screen_renders_every_entry_and_the_lands_in_notices(tmp_path: 
     joined = "\n".join(texts)
     assert "lands in C5" in joined
     assert "lands in C4" in joined
-    assert "lands in C3" in joined
     # The cursor marks exactly one row (Trading, index 2 of the entries).
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "Trading" in marked[0]

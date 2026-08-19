@@ -287,6 +287,78 @@ def render_screened_asset(screened: ScreenedAsset) -> list[str]:
     return lines
 
 
+# -- attestations in force (the "Shariah in force" read, issue #389 C3 / PRD O10) -----------------
+
+
+@dataclass(frozen=True)
+class AttestationsInForce:
+    """What the ACTIVE deployment's compliance posture actually rests on right now: the
+    human-recorded attestations behind the active allowlist, the exemptions in effect,
+    and -- named as such -- the allowlisted assets with NO attestation (fail-closed is a
+    fact an operator auditing "what is enforced" needs to SEE, not infer from absence).
+
+    Rows are the repository's own dicts (`get_asset_attestation`'s shape), carried
+    verbatim so a front-end cannot accidentally re-derive or re-format a ruling on the
+    way to the screen. See `gather_attestations_in_force`.
+    """
+
+    quote: str
+    allowlist: tuple[str, ...]
+    #: `get_asset_attestation` rows, in allowlist order (only allowlisted assets).
+    asset_rows: tuple[dict, ...]
+    #: `get_instrument_attestation` rows for each allowlisted asset's `(VENUE, product)`.
+    instrument_rows: tuple[dict, ...]
+    #: `list_screen_exceptions` rows for allowlisted assets, in the repository's order.
+    exceptions: tuple[dict, ...]
+    #: Allowlisted assets with NO asset attestation on file -- the fail-closed gap.
+    unattested: tuple[str, ...]
+
+
+def gather_attestations_in_force(repo: Repository, config: Config) -> AttestationsInForce:
+    """The `assets list` data, SCOPED to the active allowlist -- the service read the
+    console's "Shariah in force" browser (PRD O10) renders.
+
+    `keel assets list` shows every recorded attestation; O10 asks what is in force for
+    THE ACTIVE PROFILE, so this joins the same three repository reads
+    (`get_asset_attestation`/`get_instrument_attestation`/`list_screen_exceptions`) to
+    `config.allowlist`, deriving each asset's product the ONE way everything else in
+    this module derives it (`_history_product`) and looking the instrument statement up
+    under the SAME `(VENUE, product_id)` key `screen_product` looks it up under -- the
+    browser then cannot disagree with the gate about which statement is in force.
+
+    READ-ONLY: no writes, no broker, no network. An allowlisted asset with no rows lands
+    in `unattested` -- shown, never papered over.
+    """
+    quote = config.quote_currency
+    allowlist = tuple(config.allowlist)
+    asset_rows: list[dict] = []
+    instrument_rows: list[dict] = []
+    unattested: list[str] = []
+    for asset in allowlist:
+        row = repo.get_asset_attestation(asset)
+        if row is None:
+            unattested.append(asset)
+            continue
+        asset_rows.append(row)
+        instrument = repo.get_instrument_attestation(
+            VENUE, _history_product(asset, quote)
+        )
+        if instrument is not None:
+            instrument_rows.append(instrument)
+    allow_set = {asset.upper() for asset in allowlist}
+    exceptions = tuple(
+        row for row in repo.list_screen_exceptions() if row["asset"].upper() in allow_set
+    )
+    return AttestationsInForce(
+        quote=quote,
+        allowlist=allowlist,
+        asset_rows=tuple(asset_rows),
+        instrument_rows=tuple(instrument_rows),
+        exceptions=exceptions,
+        unattested=tuple(unattested),
+    )
+
+
 # -- holdings ----------------------------------------------------------------------------
 
 

@@ -94,6 +94,14 @@ __all__ = [
 SHORTLIST_GLOB = "*shortlist.json"
 
 
+#: The most bytes of one shortlist this module will ever read (1 MiB -- the activity
+#: feed's own bound, `_MAX_BYTES` in `keel/commands/activity.py`, for the same reason: a
+#: screen that re-reads per poll must never have its cost grow with whatever a runaway
+#: writer put in the file). A shortlist over the bound is a calm `oversize` view, never a
+#: multi-megabyte read-and-parse.
+MAX_SHORTLIST_BYTES = 1024 * 1024
+
+
 def latest_shortlist(directory: Path) -> Path | None:
     """The newest `*shortlist.json` file under `directory` by mtime, or `None`.
 
@@ -118,6 +126,53 @@ def latest_shortlist(directory: Path) -> Path | None:
         return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
     except OSError:
         return None
+
+
+@dataclass(frozen=True)
+class ScoutFile:
+    """One shortlist file a scout run produced, with the display facts the console's Scout
+    results browser (issue #389 C3, PRD O6) renders beside the name: WHEN it was written
+    (mtime) and how big it is. Carried rather than re-`stat`-ed per render, because the
+    browser builds its list once per entry and repaints from the value."""
+
+    path: Path
+    mtime_ts: float
+    size_bytes: int
+
+
+def list_shortlists(directory: Path) -> tuple[ScoutFile, ...]:
+    """EVERY `*shortlist.json` under `directory`, newest first -- the service read behind
+    the Scout results browser (O6). The browser is a LIST-and-choose surface: unlike
+    `latest_shortlist` (which answers "the one newest file" for the propose overlay), it
+    must show the operator every scout run their directory holds, so an older shortlist
+    stays reachable instead of being shadowed by whichever sibling wrote last.
+
+    Same contract as `latest_shortlist` otherwise: the SAME `SHORTLIST_GLOB` convention
+    (never a bare `*.json` -- the scout writes sibling outputs beside its shortlists, and
+    a bare glob would list `*-param-proposals.json` as a malformed shortlist), the same
+    `(mtime, name)` tiebreak (descending -- `latest_shortlist`'s own ordering, reversed
+    for a list), never creates the directory, and `()` rather than an exception for every
+    absent/strangled path -- a browser must render a calm empty state, not a traceback.
+    """
+    try:
+        if not directory.is_dir():
+            return ()
+    except OSError:
+        return ()
+    found: list[ScoutFile] = []
+    for candidate in directory.glob(SHORTLIST_GLOB):
+        # Per-file, not per-directory: one file vanishing between the glob and the stat
+        # (another process mid-write, a rotation) must cost THAT row, not the whole list.
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        found.append(
+            ScoutFile(path=candidate, mtime_ts=stat.st_mtime, size_bytes=stat.st_size)
+        )
+    found.sort(key=lambda f: (f.mtime_ts, f.path.name), reverse=True)
+    return tuple(found)
+
 
 
 # -- 2b. screen report (offline, DB reads only) --------------------------------------------------
@@ -220,7 +275,7 @@ _PROPOSAL_SCHEMA_SUMMARY = (
 @dataclass(frozen=True)
 class ProposeView:
     source: Path | None
-    status: str  # "ok" | "no-directory" | "no-shortlist" | "unreadable" | "malformed"
+    status: str  # "ok" | "no-directory" | "no-shortlist" | "unreadable" | "oversize" | "malformed"
     detail: str | None  # the human reason when status != "ok"
     report: ProposalReport | None
 
@@ -293,15 +348,41 @@ def build_propose_view(
             )
 
     try:
-        raw_text = source.read_text()
-    except (OSError, UnicodeDecodeError) as exc:
-        # `UnicodeDecodeError` subclasses **ValueError, not OSError** -- so `except OSError` alone
-        # let a non-UTF-8 shortlist escape this function entirely, breaking the "Never raises"
-        # contract above. It is not a hypothetical: a scout run on Windows writes UTF-16LE+BOM,
-        # which is perfectly valid JSON and unreadable here. Uncaught, the TUI's propose overlay
-        # repainted `'utf-8' codec can't decode byte 0xff...` every poll forever, naming neither
-        # the file nor a next step, and `keel assets propose --from` exited on a raw traceback.
-        # Both now get the same calm, file-naming `unreadable` report a permissions error gets.
+        # BOUNDED, and bounded by the READ itself rather than a stat check: a file that
+        # grows between the stat and the read (another process mid-write) can still hand
+        # `read_text()` gigabytes, so at most MAX_SHORTLIST_BYTES+1 bytes come off the
+        # disk and anything over the bound is the calm `oversize` view below -- the same
+        # discipline the activity feed's tail read keeps.
+        with source.open("rb") as handle:
+            raw_bytes = handle.read(MAX_SHORTLIST_BYTES + 1)
+    except OSError as exc:
+        # A permissions problem, the file vanishing mid-read, a directory named `*.json`
+        # (an `IsADirectoryError`) -- every way the READ itself can fail becomes the same
+        # calm, file-naming `unreadable` report. The DECODE failure (below) is separate
+        # and deliberately named so: `UnicodeDecodeError` subclasses **ValueError, not
+        # OSError**, so folding it into this branch is how it once escaped a function
+        # whose docstring promises it never raises -- a scout run on Windows writes
+        # UTF-16LE+BOM, perfectly valid JSON and unreadable here.
+        return ProposeView(
+            source=source,
+            status="unreadable",
+            detail=f"could not read {source}: {exc}",
+            report=None,
+        )
+    if len(raw_bytes) > MAX_SHORTLIST_BYTES:
+        return ProposeView(
+            source=source,
+            status="oversize",
+            detail=(
+                f"{source} is over this screen's {MAX_SHORTLIST_BYTES}-byte read bound -- "
+                "split the shortlist into smaller runs"
+            ),
+            report=None,
+        )
+
+    try:
+        raw_text = raw_bytes.decode()
+    except UnicodeDecodeError as exc:
         return ProposeView(
             source=source,
             status="unreadable",
@@ -339,6 +420,7 @@ _PROPOSE_STATUS_HEADERS = {
     "no-directory": "no proposals directory found",
     "no-shortlist": "no shortlist file found",
     "unreadable": "could not read the shortlist file",
+    "oversize": "the shortlist file is too large to read",
     "malformed": "the shortlist file is malformed",
 }
 

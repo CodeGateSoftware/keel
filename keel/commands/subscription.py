@@ -66,6 +66,143 @@ def _resolve_pacing(
     return existing.pacing if existing is not None else config.subscription.pacing
 
 
+# -- the service layer (issue #389 C3: one implementation, two front-ends) ------------------------
+#
+# The three bodies below (attest, set, show) were CLI command bodies until C3 needed them
+# from the console's Compliance menu: the TUI dispatches to the SAME functions the CLI
+# commands call (PRD O2), so tier resolution, pacing carry-over, the record's shape and
+# every echoed line live here ONCE. Errors raise `ValueError`; each front-end renders it
+# its own way (the CLI keeps its byte-compatible stderr + exit-1 shape, the console
+# returns the message as the form's result line).
+
+
+def apply_subscription_attest(
+    repo: Repository,
+    config: Config,
+    *,
+    venue: str | None,
+    tier_name: str,
+    pacing: str | None,
+    now_ts: int,
+) -> str:
+    """`subscription attest`'s write: resolve the venue and the tier, upsert the record,
+    return the confirmation line. Raises `ValueError` for an unknown tier."""
+    resolved_venue = _bound_venue_or_default(venue)
+
+    tier = next((t for t in config.tiers if t.name == tier_name), None)
+    if tier is None:
+        valid = ", ".join(t.name for t in config.tiers)
+        raise ValueError(f"unknown tier {tier_name!r}. Configured tiers: {valid}")
+
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue=resolved_venue,
+            tier_name=tier.name,
+            free_volume_usd=tier.free_volume_usd,
+            pacing=_resolve_pacing(repo, config, resolved_venue, pacing),
+            subscription_usd_month=tier.subscription_usd_month,
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=now_ts,
+            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
+        )
+    )
+    volume = "unlimited" if tier.free_volume_usd is None else str(tier.free_volume_usd)
+    return (
+        f"attested {resolved_venue}: tier={tier.name} free_volume_usd={volume} "
+        f"status=active due in 365 days"
+    )
+
+
+def apply_subscription_set(
+    repo: Repository,
+    config: Config,
+    *,
+    venue: str | None,
+    free_volume_raw: str,
+    pacing: str | None,
+    now_ts: int,
+) -> str:
+    """`subscription set`'s write: a raw allowance with no tier named. Raises `ValueError`
+    for a non-numeric, non-finite or negative allowance (see the CLI body's own note for
+    why `inf` in particular must never become a spend cap)."""
+    resolved_venue = _bound_venue_or_default(venue)
+
+    try:
+        free_volume_usd = Decimal(free_volume_raw)
+    except InvalidOperation:
+        raise ValueError(
+            f"--free-volume-usd must be a number, got {free_volume_raw!r}"
+        ) from None
+    # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
+    # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
+    # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
+    # "unlimited" has no representation via this command; it is expressed elsewhere in this
+    # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
+    if not free_volume_usd.is_finite():
+        raise ValueError(
+            f"--free-volume-usd must be a finite number, got {free_volume_raw!r}"
+        )
+    if free_volume_usd < 0:
+        raise ValueError("--free-volume-usd must be non-negative")
+
+    repo.upsert_broker_subscription(
+        BrokerSubscription(
+            venue=resolved_venue,
+            tier_name="unknown",
+            free_volume_usd=free_volume_usd,
+            pacing=_resolve_pacing(repo, config, resolved_venue, pacing),
+            # Placeholder: `set` names no tier, so there is no real subscription price to
+            # record here. Must not be read as an actual (free) subscription cost.
+            subscription_usd_month=Decimal("0"),
+            # ACTIVE (full spend authority), even though `tier_name='unknown'` -- the same shape
+            # the v2 migration backfill deliberately marks `suspect` instead. Not a contradiction:
+            # the migration distrusts a *stale* hand-tuned number of unknown provenance, whereas
+            # this is a *fresh, explicit* user assertion made right now, by name, via this
+            # command. Provenance differs even though the resulting record looks identical.
+            status=SubscriptionStatus.ACTIVE,
+            attested_at=now_ts,
+            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
+        )
+    )
+    return (
+        f"set {resolved_venue}: free_volume_usd={free_volume_usd} tier=unknown "
+        f"(not an attestation -- prefer `subscription attest`)"
+    )
+
+
+def subscription_show_lines(repo: Repository, config: Config, now_ts: int) -> list[str]:
+    """`subscription show`'s exact lines, as a function of the repo/config/now it reads --
+    the console's Compliance menu renders the same report the CLI echoes."""
+    records = repo.list_broker_subscriptions()
+
+    if not records:
+        # The advice names the BOUND venue -- the one rail 14 actually gates on for this
+        # deployment -- so the operator's copy-paste writes the record that will be read.
+        venue = _bound_venue_or_default(None)
+        return [
+            "no subscription attested for any venue -- rail 14 caps live BUYs at the "
+            f"unsubscribed allowance {config.subscription.unsubscribed_allowance_usd}. "
+            f"Run `keel subscription attest --venue {venue} --tier <tier>`."
+        ]
+
+    unsubscribed = config.subscription.unsubscribed_allowance_usd
+    lines: list[str] = []
+    for record in records:
+        allowance = record.allowance_usd(now_ts, unsubscribed)
+        cap = "unlimited" if allowance is None else str(allowance)
+        volume = (
+            "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
+        )
+        lines.append(
+            f"{record.venue}: tier={record.tier_name} free_volume_usd={volume} "
+            f"pacing={record.pacing} stored_status={record.status.value} "
+            f"effective_status={record.effective_status(now_ts).value} "
+            f"effective_cap={cap} attested_at={record.attested_at} "
+            f"attest_due_ts={record.attest_due_ts}"
+        )
+    return lines
+
+
 @subscription_group.command("attest")
 @click.option(
     "--venue",
@@ -89,35 +226,16 @@ def subscription_attest(
     tier (`subscription set` also clears it, but names no tier)."""
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    venue = _bound_venue_or_default(venue)
 
-    tier = next((t for t in config.tiers if t.name == tier_name), None)
-    if tier is None:
-        valid = ", ".join(t.name for t in config.tiers)
-        click.echo(
-            f"Error: unknown tier {tier_name!r}. Configured tiers: {valid}",
-            err=True,
+    try:
+        line = apply_subscription_attest(
+            repo, config, venue=venue, tier_name=tier_name, pacing=pacing,
+            now_ts=int(time.time()),
         )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
         ctx.exit(1)
-
-    now_ts = int(time.time())
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue=venue,
-            tier_name=tier.name,
-            free_volume_usd=tier.free_volume_usd,
-            pacing=_resolve_pacing(repo, config, venue, pacing),
-            subscription_usd_month=tier.subscription_usd_month,
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=now_ts,
-            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
-        )
-    )
-    volume = "unlimited" if tier.free_volume_usd is None else str(tier.free_volume_usd)
-    click.echo(
-        f"attested {venue}: tier={tier.name} free_volume_usd={volume} "
-        f"status=active due in 365 days"
-    )
+    click.echo(line)
 
 
 @subscription_group.command("set")
@@ -151,54 +269,16 @@ def subscription_set(
     """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    venue = _bound_venue_or_default(venue)
 
     try:
-        free_volume_usd = Decimal(free_volume_raw)
-    except InvalidOperation:
-        click.echo(
-            f"Error: --free-volume-usd must be a number, got {free_volume_raw!r}", err=True
+        line = apply_subscription_set(
+            repo, config, venue=venue, free_volume_raw=free_volume_raw, pacing=pacing,
+            now_ts=int(time.time()),
         )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
         ctx.exit(1)
-    # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
-    # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
-    # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
-    # "unlimited" has no representation via this command; it is expressed elsewhere in this
-    # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
-    if not free_volume_usd.is_finite():
-        click.echo(
-            f"Error: --free-volume-usd must be a finite number, got {free_volume_raw!r}",
-            err=True,
-        )
-        ctx.exit(1)
-    if free_volume_usd < 0:
-        click.echo("Error: --free-volume-usd must be non-negative", err=True)
-        ctx.exit(1)
-
-    now_ts = int(time.time())
-    repo.upsert_broker_subscription(
-        BrokerSubscription(
-            venue=venue,
-            tier_name="unknown",
-            free_volume_usd=free_volume_usd,
-            pacing=_resolve_pacing(repo, config, venue, pacing),
-            # Placeholder: `set` names no tier, so there is no real subscription price to
-            # record here. Must not be read as an actual (free) subscription cost.
-            subscription_usd_month=Decimal("0"),
-            # ACTIVE (full spend authority), even though `tier_name='unknown'` -- the same shape
-            # the v2 migration backfill deliberately marks `suspect` instead. Not a contradiction:
-            # the migration distrusts a *stale* hand-tuned number of unknown provenance, whereas
-            # this is a *fresh, explicit* user assertion made right now, by name, via this
-            # command. Provenance differs even though the resulting record looks identical.
-            status=SubscriptionStatus.ACTIVE,
-            attested_at=now_ts,
-            attest_due_ts=now_ts + ATTESTATION_PERIOD_SEC,
-        )
-    )
-    click.echo(
-        f"set {venue}: free_volume_usd={free_volume_usd} tier=unknown "
-        f"(not an attestation -- prefer `subscription attest`)"
-    )
+    click.echo(line)
 
 
 @subscription_group.command("show")
@@ -208,31 +288,5 @@ def subscription_show(ctx: click.Context) -> None:
     """Show every venue's subscription, with the status and cap actually in force."""
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    records = repo.list_broker_subscriptions()
-
-    if not records:
-        # The advice names the BOUND venue -- the one rail 14 actually gates on for this
-        # deployment -- so the operator's copy-paste writes the record that will be read.
-        venue = _bound_venue_or_default(None)
-        click.echo(
-            "no subscription attested for any venue -- rail 14 caps live BUYs at the "
-            f"unsubscribed allowance {config.subscription.unsubscribed_allowance_usd}. "
-            f"Run `keel subscription attest --venue {venue} --tier <tier>`."
-        )
-        return
-
-    now_ts = int(time.time())
-    unsubscribed = config.subscription.unsubscribed_allowance_usd
-    for record in records:
-        allowance = record.allowance_usd(now_ts, unsubscribed)
-        cap = "unlimited" if allowance is None else str(allowance)
-        volume = (
-            "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
-        )
-        click.echo(
-            f"{record.venue}: tier={record.tier_name} free_volume_usd={volume} "
-            f"pacing={record.pacing} stored_status={record.status.value} "
-            f"effective_status={record.effective_status(now_ts).value} "
-            f"effective_cap={cap} attested_at={record.attested_at} "
-            f"attest_due_ts={record.attest_due_ts}"
-        )
+    for line in subscription_show_lines(repo, config, int(time.time())):
+        click.echo(line)
