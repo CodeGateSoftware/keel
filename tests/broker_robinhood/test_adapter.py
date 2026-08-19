@@ -1671,3 +1671,35 @@ def test_place_order_does_not_consult_the_sizing_bounds() -> None:
 
     assert result.success
     assert "get_trading_pairs" not in transport.calls
+
+
+def test_an_idempotency_key_pins_the_client_order_id_across_attempts() -> None:
+    """#409. Robinhood requires a `client_order_id` on every order and will deduplicate on it,
+    so this is the parameter that makes a placement retry safe: two attempts under one key reach
+    the venue as one id, and the retry is collapsed instead of becoming a second live order."""
+    transport = FakeTransport(placed=load_fixture("rh_order_open.json"))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+    first = transport.calls["create_order"]["body"]["client_order_id"]
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+
+    assert transport.calls["create_order"]["body"]["client_order_id"] == first
+    # A UUID, because that is what this venue's field is -- see `resolve_client_order_id` for why
+    # the caller's key is hashed rather than passed through.
+    assert uuid.UUID(first).version == 5
+
+
+def test_without_a_key_robinhood_still_mints_one_id_per_attempt() -> None:
+    """The default is unchanged, and deliberately so: two orders a strategy genuinely meant to
+    place twice must not collapse into one."""
+    transport = FakeTransport(placed=load_fixture("rh_order_open.json"))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    adapter.place_order(spec)
+    first = transport.calls["create_order"]["body"]["client_order_id"]
+    adapter.place_order(spec)
+
+    assert transport.calls["create_order"]["body"]["client_order_id"] != first

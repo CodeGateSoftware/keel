@@ -254,14 +254,16 @@ stands** would degrade a safety property keel already has. Phase B must trip ove
    at from a different direction. Run `scripts/robinhood_smoke.py` against an account with order
    history before trusting the number, and confirm the `orders` probe actually returned a row.
 
-2. **A fresh `client_order_id` per `place_order` call means no retry is ever deduplicated.**
-   The uuid is minted per ATTEMPT, so a caller that retries after a timeout -- exactly when the
-   first request may already have reached the venue -- places a **second live order**. Robinhood
-   has nothing to match the retry against, because the id differs. The current behaviour is the
-   right default for the opposite hazard (an id minted per spec would silently collapse two
-   orders a strategy genuinely meant to place twice), and the port has no "retry of" concept to
-   disambiguate the two. So this is a documented tradeoff, not a solved problem: whatever calls
-   `place_order` in Phase B must not retry placement blindly.
+2. **A placement retry is only safe when the caller passes an `idempotency_key`.** (#409,
+   resolved at the port.) Without one the `client_order_id` is minted per ATTEMPT, so a caller
+   that retries after a timeout -- exactly when the first request may already have reached the
+   venue -- places a **second live order**, because Robinhood has nothing to match the retry
+   against. That remains the DEFAULT, and deliberately: an id derived from the spec would
+   silently collapse two orders a strategy genuinely meant to place twice. What changed is that
+   the port now carries the distinction, so the caller can state which it means:
+   `place_order(spec, idempotency_key=...)` resolves every attempt under that key to one venue
+   id via `keel_broker_api.port.resolve_client_order_id`. Whatever calls `place_order` in
+   Phase B must pass a key before it retries placement.
 
 3. **`Preview.synthetic` is invisible at the confirm gate on today's CLI path.**
    `keel/cli.py`'s `_interactive_confirm` takes a raw `dict` and renders it by iterating

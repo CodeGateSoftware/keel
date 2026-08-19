@@ -889,3 +889,29 @@ class TestSession:
             )
         )
         assert transport.calls["create_order"]["body"]["extended_hours"] is False
+
+
+def test_an_idempotency_key_pins_the_client_order_id_across_attempts() -> None:
+    """#409. Alpaca accepts a string of up to 128 characters here, but the port hashes every
+    caller key to a UUID so one key means one order at whichever venue the order is routed to."""
+    transport = _full_transport()
+    adapter = AlpacaAdapter(transport)
+    spec = MarketIOCByBase(product_id=_PRODUCT, side=Side.SELL, base_size=Decimal("0.5"))
+
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+    first = transport.calls["create_order"]["body"]["client_order_id"]
+    adapter.place_order(spec, idempotency_key="cycle-7:pos-3:exit")
+
+    assert transport.calls["create_order"]["body"]["client_order_id"] == first
+
+
+def test_without_a_key_alpaca_still_mints_one_id_per_attempt() -> None:
+    transport = _full_transport()
+    adapter = AlpacaAdapter(transport)
+    spec = MarketIOCByBase(product_id=_PRODUCT, side=Side.SELL, base_size=Decimal("0.5"))
+
+    adapter.place_order(spec)
+    first = transport.calls["create_order"]["body"]["client_order_id"]
+    adapter.place_order(spec)
+
+    assert transport.calls["create_order"]["body"]["client_order_id"] != first
