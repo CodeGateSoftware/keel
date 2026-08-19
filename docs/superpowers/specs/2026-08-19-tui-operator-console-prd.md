@@ -120,6 +120,25 @@ dashboard (rails/positions/freshness/activity), `versions`.
   *maysir*, attestation, exemption, purification — from the same single-source glossary, with
   the fiqh terms' definitions anchored to `docs/fiqh-basis.md` so they cannot drift from the
   document that actually states them.
+- **O11 — The strategy console:** the Rules area grows from lifecycle buttons into the full
+  try/evaluate/retry loop, all through the C1 services:
+  * **Run simulations from the console and display their results** — invoke `run_simulation`
+    with the active profile's config/db, show the GO-LIVE/TRAIN-MORE verdict, the gates and
+    their numbers, the DCA benchmark comparison, and the tier matrix; the written report is
+    linked/openable from the Research readers (O5).
+  * **The tried-vs-used ledger** — one view answering "which strategies are in use, which were
+    tried, and WHY are the tried ones not used": every rule row rendered with its lifecycle
+    status AND the machine's recorded reason it sits there — the promotion gate's specific
+    failing floor (min_trades / edge / PBO) from the latest backtest, the `insights`
+    promotion-gate distance, disabled rules with their recorded context, and demotions.
+    Sourced from the rules table, backtest results, and the insights service — the engine's
+    own verdicts, never a TUI-authored narrative.
+  * **Add a new strategy to try** — the `rules add` flow in-console (kind, product, params
+    with the O8 parameter help at each field), dispatching to the rules service; lands as
+    `candidate` exactly as the CLI does.
+  * **Retry a strategy** — re-run the backtest and re-attempt promotion through the services
+    (`rules backtest` + `rules promote`, confirmations per O3; `--force` stays typed), and
+    re-enable a disabled rule (`rules enable`) as the documented restore path.
 
 ## Menu tree (v1 shape — final naming in implementation)
 
@@ -130,8 +149,11 @@ Profile              switch paper-forward | paper-hourly | paper-equities | live
   └─ Venues          installed adapters + capabilities (O7); selected one highlighted
 Trading              agent cycle (confirm) · monitor poll · autonomy · record-flow ·
                      reset-hwm · resume-entries (typed) · kill · resume (typed)
-Rules                list/select · backtest · promote (confirm/--force typed) ·
-                     disable · enable · demote · add · insights
+Rules                [Strategy console (O11)] list/select · tried-vs-used ledger (with the
+                     recorded reasons) · backtest · promote (confirm/--force typed) ·
+                     simulate + results (verdict, gates, benchmark, tiers) · add (param
+                     help at each field) · retry (backtest + promote) · disable · enable ·
+                     demote · insights
 Compliance           screen · propose · attest (typed) · attest-instrument · exempt/unexempt ·
                      holdings · discover · [Scout results…] · [Shariah in force…] (O10) ·
                      subscription (show/attest) · withdrawals attest (typed) · purification
@@ -166,6 +188,9 @@ service layer and both front-ends get it.
   allowlist, the fiqh-derived rails with their fiqh-basis citations, the standing honesty
   states; help vocabulary anchored to `docs/fiqh-basis.md`.
 - **C4 — Rules + Research menus.** Rule lifecycle actions; the evidence readers (O5).
+  **Owns the strategy console (O11)**: simulate-from-console with results display, the
+  tried-vs-used ledger with the engine's recorded reasons, add-with-param-help, and retry
+  (backtest + promote, `--force` typed).
 - **C5 — Trading + Data menus.** Cycle/poll invocations with their confirmations; fetch/repair
   surfaces; every typed action contract preserved (O3).
 - **C6 — Safety & polish pass.** Keybinding/help consistency; an adversarial review dedicated to
