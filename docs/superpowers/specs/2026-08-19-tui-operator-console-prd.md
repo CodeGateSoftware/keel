@@ -83,6 +83,17 @@ dashboard (rails/positions/freshness/activity), `versions`.
   the kill switch does, what paper mode means). Definitions live in ONE source (a glossary the
   TUI help renders and the docs link to — not a second, drifting copy), and the typed actions'
   help text says explicitly that the prompt cannot be pre-filled.
+  **Parameter-level help, single-sourced from the code that defines them:** every parameter of
+  every rule kind — e.g. `turtle_breakout`'s `entry_lookback`, `exit_lookback`, `adx_period`,
+  `adx_threshold`, `atr_period`, `atr_stop_mult`, `use_macd_confirm`, `s1_filter`,
+  `min_volume_filter`, `volume_ma_period`, `volume_mult`, `target_rr`, `granularity`, and the
+  other kinds' equivalents — is explainable in-console: plain-English meaning, what changing
+  it does (looser/tighter/faster/slower, and which gate it feeds), type, default, and the
+  shipped range. The source of truth is the rule classes themselves (`RULE_REGISTRY` /
+  their constructors): where per-parameter docstrings are missing they are ADDED AT THE
+  CLASS, and the help system renders them by introspection — never a hand-maintained
+  duplicate table. Contextually invokable wherever params render (`rules list` detail,
+  `rules add` forms, backtest views).
 - **O9 — The session banner on every screen (live and paper alike):** the console header
   permanently shows, for the ACTIVE profile: the market session state (OPEN / CLOSED /
   CLOCK UNAVAILABLE — the B1 `SessionState` vocabulary), the venue's market clock (current
