@@ -192,6 +192,39 @@ class _VenueEstimate:
     errors: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PairRules:
+    """The venue's per-pair sizing bounds, from `/trading_pairs/`.
+
+    ⚠️ **The three fields are NOT in the same denomination**, and reading them as if they were is
+    the mistake this dataclass exists to prevent. Established live on 2026-08-19 across all 89
+    pairs (#410):
+
+    * `min_order_amount` is in **QUOTE** currency -- USD. Every one of the 63 pairs that carries
+      it reports the same `0.1`, from BTC at ~$68,000 to DOGE at ~$0.07. A constant cannot be a
+      base-denominated minimum across six orders of magnitude of unit price; it is a venue-wide
+      $0.10 floor. Read as base it would mean a $6,836 minimum on BTC and a one-cent minimum on
+      DOGE, which is why a check written as `base_size >= min_order_amount` would reject nearly
+      every real BTC order -- including on the exit path.
+    * `max_order_size` is in **BASE**. It varies per asset (20 for BTC, 6,500,000 for DOGE) and
+      only lands on a comparable notional ceiling ($1.37M, $474k) when read that way.
+    * `asset_increment` is in **BASE** -- BTC's is `0.00000001`, one satoshi.
+
+    The names carry the distinction once it is pointed out: *amount* is quote, *size* is base.
+
+    Every field is optional because the endpoint is not uniform: `min_order_amount` is absent from
+    26 of the 89 pairs (#230), and a row this adapter cannot parse must degrade to "no bound
+    known" rather than to a bound of zero.
+    """
+
+    #: QUOTE currency (USD). `None` when the pair does not carry one, or the row was unreadable.
+    min_order_amount: Decimal | None
+    #: BASE units. The rounding unit an order size must be a multiple of.
+    asset_increment: Decimal | None
+    #: BASE units. The ceiling a single order may not exceed.
+    max_order_size: Decimal | None
+
+
 class RobinhoodAdapter:
     """Implements the `Broker` port against the Robinhood Crypto Trading API v2.
 
@@ -299,6 +332,40 @@ class RobinhoodAdapter:
         """
         accounts = _results(self._require_transport().get_accounts())
         return accounts[0] if accounts else {}
+
+    def _pair_rules(self, product_id: str) -> _PairRules | None:
+        """This pair's sizing bounds, or `None` when the venue did not usably state them.
+
+        **Not cached, deliberately.** This adapter holds no state but its transport, and a cached
+        bound is a bound that can go stale -- the venue can retune `min_order_amount` or delist a
+        pair between one preview and the next, and a preview that approved a spend against a
+        remembered ceiling would be asserting something it had not checked. The cost is one
+        request per `preview_order` call, which is a confirm-gate call made once per human
+        decision, not a loop. `get_fee_summary`'s docstring makes the same request-count argument
+        in the other direction, where the call IS in a sweep.
+
+        **`symbol=` is passed so the venue filters, not this method.** The unfiltered endpoint
+        returns all 89 pairs, and #230 is the standing lesson about picking a row out of that
+        list: the probe that read `results[0]` got BILL-USD and concluded the venue publishes no
+        minimum at all. Asking for one symbol makes `results[0]` the right row by construction.
+
+        `None` on any failure rather than a raise. This runs inside `preview_order`, which the
+        executor calls while unwinding a position, and `BrokerCapabilities`' docstring already
+        settles that a raise on the way out can trap a position. A missing bound means one fewer
+        check, reported in `Preview.errors`; it must never mean no preview.
+        """
+        try:
+            rows = _results(self._require_transport().get_trading_pairs(to_symbol(product_id)))
+        except Exception:
+            return None
+        if not rows:
+            return None
+        row = rows[0]
+        return _PairRules(
+            min_order_amount=_positive_or_none(_decimal_or_none(_field(row, "min_order_amount"))),
+            asset_increment=_positive_or_none(_decimal_or_none(_field(row, "asset_increment"))),
+            max_order_size=_positive_or_none(_decimal_or_none(_field(row, "max_order_size"))),
+        )
 
     def _fee_ratio(self, account: object) -> Decimal | None:
         """The account's fee ratio, or `None` when the venue did not report one.
@@ -439,6 +506,9 @@ class RobinhoodAdapter:
             else:
                 fee = quote_size * ratio
 
+        rules = self._pair_rules(spec.product_id)
+        errors.extend(self._sizing_notes(rules, base_size, quote_size))
+
         return Preview(
             product_id=spec.product_id,
             side=spec.side,
@@ -454,9 +524,75 @@ class RobinhoodAdapter:
                 "cost_basis": cost_basis,
                 "fee_basis": fee_basis,
                 "fee_ratio": str(ratio) if ratio is not None else "unknown",
+                # The bounds themselves, beside the notes derived from them, so a human reading
+                # a rejected-looking preview can see the number it was measured against rather
+                # than taking the sentence on trust. `min_order_amount` is labelled with its
+                # denomination because that is the field's whole hazard -- see `_PairRules`.
+                "min_order_amount_quote": _render_or_unknown(
+                    rules.min_order_amount if rules else None
+                ),
+                "asset_increment_base": _render_or_unknown(
+                    rules.asset_increment if rules else None
+                ),
+                "max_order_size_base": _render_or_unknown(rules.max_order_size if rules else None),
             },
             errors=tuple(errors),
         )
+
+    def _sizing_notes(
+        self, rules: _PairRules | None, base_size: Decimal, quote_size: Decimal
+    ) -> list[str]:
+        """What the venue's own bounds say about this order, as `Preview.errors` lines.
+
+        **Reported, never enforced, and that boundary is the whole design.** These are notes on a
+        preview a human is about to approve; nothing here refuses an order, and `place_order` does
+        not call this. Two reasons, and the second is the one that decides it:
+
+        1. Every order this adapter can place is an exit or a protective leg -- entries are
+           `MarketIOCByQuote`, which this venue cannot express at all (see the module docstring).
+           A check that refuses on those paths can strand a position or leave one running without
+           its stop, which is strictly worse than the venue rejecting the order itself.
+        2. **We do not know what this venue does with an off-increment or under-minimum order**,
+           because no order has ever been placed against it (#412). Refusing locally would be a
+           guess, and a guess that refuses an order the venue would have ACCEPTED is a new failure
+           this package invented. Reporting is right exactly while the venue's behaviour is
+           unobserved; #410 can revisit enforcement once #412 has watched a real rejection.
+
+        `quote_size <= 0` means the market path could not price this order, and the caller has
+        already said so in its own error line. A minimum stated in quote currency cannot be
+        checked without a price, and asserting "below the minimum" against an unpriced zero would
+        be the module's own cardinal sin -- treating an absent number as a real one.
+        """
+        if rules is None:
+            return [
+                "robinhood did not state this pair's sizing bounds; min/increment/max were NOT "
+                "checked -- this preview cannot say whether the venue will accept the size"
+            ]
+        notes: list[str] = []
+        if rules.max_order_size is not None and base_size > rules.max_order_size:
+            notes.append(
+                f"base_size {_render(base_size)} exceeds the venue's max_order_size "
+                f"{_render(rules.max_order_size)} for this pair (both in base units)"
+            )
+        if rules.min_order_amount is not None and quote_size > 0:
+            if quote_size < rules.min_order_amount:
+                notes.append(
+                    f"est_quote_size {_render(quote_size)} is below the venue's "
+                    f"min_order_amount {_render(rules.min_order_amount)}, which is quoted in "
+                    f"QUOTE currency (USD) -- not in base units"
+                )
+        elif rules.min_order_amount is None:
+            notes.append(
+                "this pair carries no min_order_amount (26 of the venue's 89 pairs do not), so "
+                "no minimum was checked"
+            )
+        if rules.asset_increment is not None and base_size % rules.asset_increment != 0:
+            notes.append(
+                f"base_size {_render(base_size)} is not a multiple of asset_increment "
+                f"{_render(rules.asset_increment)}; whether this venue rounds or rejects has "
+                f"never been observed (#412)"
+            )
+        return notes
 
     def _base_size(self, spec: OrderSpec) -> Decimal:
         """The spec's base size. Reachable only for the three base-sized kinds.
@@ -871,6 +1007,16 @@ _REJECTED_PLACEMENT_STATES: frozenset[str] = frozenset({"failed", "canceled"})
 #: only in `translate.STATE_TO_PORT_STATUS`, and reading the port's spelling here would silently
 #: never match, turning every confirmed cancel into a `False`.
 _CANCELED = "canceled"
+
+
+def _render_or_unknown(value: Decimal | None) -> str:
+    """`_render` for a bound the venue stated, the word `unknown` for one it did not.
+
+    Not `"0"`, and not an empty string. `Preview.detail` is read by a human deciding whether to
+    spend money, and a zero there would read as a bound of zero -- a claim the venue never made.
+    Same principle `_decimal_or_none` applies one layer down.
+    """
+    return _render(value) if value is not None else "unknown"
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
