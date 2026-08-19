@@ -9,8 +9,10 @@ from any third-party Alpaca adapter. "Alpaca" appears here solely to identify wh
 package talks to.
 
 US equities, cash account, long-only, regular session. Paper and live are separate
-hosts selected by an explicit `endpoint` choice — there is no configuration path from a
-paper credential to `https://api.alpaca.markets`, by construction.
+hosts selected by an explicit `endpoint` choice — `transport.TRADING_HOSTS` is the only
+construction path to a trading host (no constructor parameter accepts a host URL), so
+there is no configuration path from a paper credential to
+`https://api.alpaca.markets`, by construction.
 
 ## What works
 
@@ -30,11 +32,12 @@ paper credential to `https://api.alpaca.markets`, by construction.
 Commission is $0. Sells carry regulatory pass-throughs, modelled in `fees.py` with the
 rates as provenance-commented constants:
 
-- **SEC Section 31**: $22.90 per $1,000,000 of sale proceeds — Alpaca's own
-  regulatory-fees page ($27.80 previously; the SEC adjusts the rate periodically, and
-  its advisory 2026-2 moves it to $20.60 per $1M as of 2026-04-04 — a documented
-  re-measurement point, encoded as the venue's published figure until Alpaca's page
-  moves).
+- **SEC Section 31**: $22.90 per $1,000,000 of sale proceeds — the figure Alpaca's own
+  regulatory-fees page still publishes. The SEC's advisory 2026-2 rate ($20.60 per $1M)
+  has been in force since 2026-04-04, so the venue's page is the stale side; the model
+  deliberately tracks what the venue itself charges, which over-states the statutory
+  rate by ~$0.02 per $10k (conservative for a sell preview's proceeds), and that delta
+  is the re-measurement trigger for when Alpaca's page updates.
 - **FINRA TAF**: $0.000166 per share, capped at $8.30 per trade — the cap is on
   Alpaca's page; the per-share rate is FINRA Schedule A §4(b)(7), in force since
   2021-01-01.

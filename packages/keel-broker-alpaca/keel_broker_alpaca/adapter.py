@@ -482,13 +482,25 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     transport already parses unquoted numbers as `Decimal`, and `Decimal(str(value))`
     here lands both shapes on the same exact number. `None` rather than zero: an absent
     number and a zero number must never be the same value at a preview gate.
+
+    Non-finite values are `None` too, and the check is explicit because the `except`
+    below never fires for them: JSON's `NaN`/`Infinity` tokens arrive via
+    `parse_constant` (not `parse_float`) as `float("nan")`/`float("inf")`, and
+    `Decimal(str(...))` parses BOTH without raising -- `Decimal("NaN")` then crashes any
+    ordering comparison (`bid > 0`, `min(buying_power, cash)`) and `Decimal("Infinity")`
+    compares as a real price. A non-finite number is not a money value; refusing it here
+    is what keeps the preview's "every path that could not price the order populates
+    `errors`" invariant true for these rows too.
     """
     if value is None or isinstance(value, bool):
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+    if not parsed.is_finite():
+        return None
+    return parsed
 
 
 def _terminal_unknown(order_id: str) -> OrderStatus:
