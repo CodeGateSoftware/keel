@@ -174,6 +174,25 @@ def test_the_self_update_section_states_the_typed_gate_and_never_automatic() -> 
     assert "never" in section and ("automatic" in section or "auto-update" in section)
 
 
+def test_the_self_update_section_is_honest_about_what_the_gate_guarantees() -> None:
+    """The typed-gate claim names what keel SHIPS (both front-ends hand it the same
+    gate; the gate fails closed off a TTY, so a scheduled job cannot confirm) without
+    the old absolutism -- the service API is callable by an operator's own code, and
+    the CLI can be driven with scripted input on a real TTY; the section says so."""
+    section = _self_update_section().lower()
+    assert "front-ends" in section
+    assert "fails closed" in section
+    assert "operator's own code" in section
+    assert "can ever" not in section  # "no script can ever ..." absolutism removed
+
+
+def test_the_self_update_section_counts_the_per_db_migrate_the_four_commands_skip() -> None:
+    """The four commands do not migrate; the updater does -- the section must say so
+    instead of claiming the four commands are the whole of it."""
+    section = _self_update_section()
+    assert "plus the per-database" in section
+
+
 def test_the_self_update_section_states_uv_is_a_deployment_dependency() -> None:
     section = _self_update_section().lower()
     assert "uv" in section

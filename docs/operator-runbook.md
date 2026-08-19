@@ -181,10 +181,13 @@ exception: a `keel tui` left open keeps the build it started with until you quit
 
 ### Self-update: `keel update` and the console's update view
 
-The four commands above are what `keel update` runs for you (issue #415) — same order, same
-tools, one service (`keel/commands/update.py`) behind two front-ends: the `keel update` CLI
-command and the Account menu's `update` entry in the TUI console (see "The TUI console" for the
-ceremony). `keel update --check` mutates nothing: it prints current vs latest and the whole plan.
+The four commands above — plus the per-database `keel migrate --db` step the updater also
+runs (the four commands don't include it; it runs for every `keel*.db` with the new build,
+between install and verify) — are what `keel update` runs for you (issue #415) — same order,
+same tools, one service (`keel/commands/update.py`) behind two front-ends: the `keel update`
+CLI command and the Account menu's `update` entry in the TUI console (see "The TUI console"
+for the ceremony). `keel update --check` mutates nothing: it prints current vs latest and the
+whole plan.
 
 **What it does, in the manual procedure's own order.** It reads the latest release from the
 public GitHub API (no auth, no tokens — an unauthenticated read is rate-limited to 60/hour per
@@ -192,37 +195,61 @@ IP, which a human-gated check never approaches; a rate-limit or network failure 
 error, not a guessed "up to date"). It downloads exactly the **four production wheels** —
 `keel_core`, `keel_broker_api`, `keel_broker_coinbase`, `keel_trader`, by exact name, never
 `Release/*.whl`, so the fake and Robinhood wheels can never ride along — into `Release/` in the
-launch folder, verifying each file landed non-empty. **Backups first**: every `keel*.db` in the
-launch folder is copied to `<db>.bak-before-<version>-<timestamp>` before anything is installed,
-and the backups are **never deleted** — not on success, not on failure. It installs the four
+launch folder, verifying each file landed non-empty (and bounding the read at 200 MiB, far above
+the ~1 MiB wheels — a mis-pointed URL is refused, not streamed to disk; a failed download or
+install removes the partial files so a torn wheel cannot poison a later rollback).
+**Backups first**: every `keel*.db` in the
+launch folder is copied to `<db>.bak-before-<version>-<timestamp>` before anything is installed
+— through SQLite's own backup API, a consistent snapshot even with a writer mid-transaction,
+where a plain file copy can be torn — and the backups are **never deleted** — not on success,
+not on failure. It installs the four
 wheels by path into the RUNNING
-venv with `uv pip install --python <venv> <the four paths>` — uv is a **deployment dependency**
+venv with `uv pip install --python <venv> --find-links Release <the four paths>` — the manual
+command exactly, `--find-links Release` and all — uv is a **deployment dependency**
 of self-update for exactly the reason the manual procedure uses it; an absent uv is an honest
 error naming this section. It runs `keel migrate --db` for each database **with the new build**,
 then **verifies** with the new build's `keel versions` — every keel distribution must report the
 new version, the check that can actually fail. Only a verified success removes the **superseded
 wheels** (the old version's four) from `Release/`; the new four stay for the next update.
 
-**Never automatic — always typed.** The full run demands a typed `yes` at a terminal (the CLI's
-own confirmation gate, inside the service: there is no ungated code path to the writes), and the
-gate fails closed off a TTY, so no cron job or script can ever update a deployment. The wording
+**Never automatic from what keel ships — always typed.** The full run demands a typed `yes` at
+a terminal (the CLI's own confirmation gate, called inside the service before any mutation;
+both shipped front-ends — the CLI and the console's update view — hand it exactly that gate),
+and that gate fails closed off a TTY, so a scheduled job, which has no terminal, cannot confirm.
+The service underneath is a Python API, and an operator's own code could call it with its own
+gate — just as the CLI itself can be driven with scripted input on a real TTY; the guarantee is
+about what keel ships, not about what is physically expressible. The wording
 names the version pair, the launch folder, and that the running binary is replaced.
 
-**A failed verify is loud, never papered over.** pip replaces the packages at install time, so
-there is no cheap rollback; the updater says exactly that state, re-installs the **previous**
-wheels best-effort when they are still in `Release/` (they are — cleanup only happens on
-success), and names this section as the manual recovery. The backups are untouched either way.
+**A failure is loud and phase-true, never papered over.** pip replaces the packages at install
+time, so there is no cheap rollback. When the failure IS the install (uv absent, a timeout, a
+corrupt wheel), the updater says the venv was **not updated — or is half-updated** (`keel
+versions` shows exactly what is installed), removes the downloaded files, and attempts no
+reinstall. When the failure is AFTER a finished install (migrate, verify), the updater says the
+new wheels **are** installed, re-installs the **previous** wheels best-effort when they are
+still in `Release/` (they are — cleanup only happens on success), and names this section as the
+manual recovery — pointing at the `.bak-before-*` backups as the data recovery (the old build
+opening the migrated databases is the migrations-are-additive assumption, not a guarantee). The
+backups are untouched either way.
 
-**It refuses dev/source checkouts.** The plan refuses when the running build is not a release
-install, when no keel distributions are installed (an `uv run keel` checkout), or when the
-running `keel` package resolves from the launch folder itself — deploying wheels into a source
-tree would shadow it, not update it. From a checkout, this section's four commands by hand
+**It refuses everything that is not the deployment.** The plan refuses when the running build
+is not a release install, when no keel distributions are installed (an `uv run keel` checkout),
+and when the running `keel` package does not resolve from the launch folder's own `.venv`
+site-packages — a source `keel/` directory under the launch folder (deploying wheels would
+shadow the tree, not update it), a package resolving from outside the launch folder (a repo
+run: the wheels would land in a venv that is not this deployment's), or an install whose origin
+is not the wheels. From a checkout, this section's four commands by hand
 remain the procedure.
 
 **The relaunch split.** On a verified success the **TUI relaunches itself** — it replaces its
 own process with the new build's `keel` entry (`os.execv`, the terminal restored first, the
-original TUI arguments carried over), because a console left running would keep the replaced
-binary it started with. The **CLI prints the command instead** and does NOT relaunch anything:
+original invocation's arguments carried over VERBATIM after argv[0] — wrappers that exec
+`keel --config X --db Y tui` relaunch with exactly those flags in that order; only a wrapper
+invoked with no arguments at all relaunches as plain `keel tui`), because a console left
+running would keep the replaced
+binary it started with. A relaunch that cannot exec at all renders the manual `keel tui` start
+and holds it for an Enter retry that re-installs nothing. The **CLI prints the command instead**
+and does NOT relaunch anything:
 `keel update` ends by telling you to run `keel tui` (or your deployment wrapper). A wrapper
 invoked directly (`./keel-live tui`) relaunches through the venv's `keel` entry with the same
 flags.

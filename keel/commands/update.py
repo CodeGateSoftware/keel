@@ -17,26 +17,34 @@ human runs it, and it refuses to run anywhere that procedure would be wrong:
   registers a `fake` entry point) and `keel_broker_robinhood` (an optional venue that
   drags in an Ed25519 stack); a deployment must have neither, so they are never
   selected, by prefix, never by `*.whl`.
-* **Backups FIRST** -- every `keel*.db` in the launch folder is copied to
-  `<db>.bak-before-<version>-<ts>` (the runbook convention) before anything mutates
-  the deployment, and the updater NEVER deletes a backup.
+* **Backups FIRST, as consistent SQLite snapshots** -- every `keel*.db` in the launch
+  folder is copied to `<db>.bak-before-<version>-<ts>` (the runbook convention) through
+  SQLite's own online-backup API (a plain file copy of a database with a live rollback
+  journal -- launchd writers -- can be torn and restore as corrupt), before anything
+  mutates the deployment, and the updater NEVER deletes a backup.
 * **Verify before cleanup** -- after install and migrate, the NEW venv's
   `keel versions` must report every keel distribution at the target version (the same
   check a deploy script ends with, the one that can actually fail). Only a verified
   success removes the superseded wheels from `Release/`.
 * **A failed verify is loud, never pretended away** -- pip replaces the packages at
   install time, so there is no cheap rollback; the honest contract is: say exactly
-  what state the venv is in, re-install the PREVIOUS wheels best-effort when they are
-  still in `Release/` (they are -- cleanup only happens on success), and name the
-  manual recovery (the runbook).
-* **Never automatic** -- `run_update` takes a `confirm_gate` and calls it before ANY
-  mutation: there is no ungated path to the writes. Both front-ends hand it
-  `typed_update_gate` (the CLI's own `_require_interactive_confirmation` over this
-  module's shared wording), which fails closed off a TTY.
-* **Refuses dev/source checkouts** -- `plan_update` refuses when the build is not a
-  release install, when nothing is installed, or when the running `keel` package
-  resolves from the launch folder itself (the `uv run keel` case): deploying wheels
-  there would shadow a working tree the updater cannot put back.
+  what state the venv is in (phase-true: an install that never finished is NOT claimed
+  installed), re-install the PREVIOUS wheels best-effort when the install had
+  succeeded and they are still in `Release/` (they are -- cleanup only happens on
+  success), and name the manual recovery (the runbook).
+* **Gated at the shipped front-ends** -- `run_update` takes a `confirm_gate` and calls
+  it before ANY mutation; both front-ends hand it `typed_update_gate` (the CLI's own
+  `_require_interactive_confirmation` over this module's shared wording), which fails
+  closed off a TTY. The service function underneath is a Python API an operator's own
+  code could call with its own gate -- the guarantee is about what keel ships, not
+  about what is physically expressible.
+* **Refuses everything that is not the deployment layout** -- `plan_update` refuses
+  when the build is not a release install, when nothing is installed, and when the
+  running `keel` package does not resolve from the launch folder's OWN `.venv`
+  site-packages (`<launch>/.venv/lib/python3.x/site-packages/keel/`): a source `keel/`
+  directory under the launch folder would be shadowed by the wheels, a package
+  resolving from outside the launch folder belongs to some other venv (a repo run),
+  and an install whose origin is not one of the wheels is not a deployment to update.
 
 No secrets, no auth: the GitHub releases API is read unauthenticated (60 requests/hour
 per IP is plenty for a human-gated check), and the wheels' download URLs are public.
@@ -50,11 +58,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -255,23 +264,95 @@ def _running_python() -> Path:
     return Path(sys.executable)
 
 
-def _package_file(launch_dir: Path) -> Path | None:
-    """The running `keel` package's file when it resolves from INSIDE the launch
-    folder, else `None`. That is the concrete signal that this "deployment" is the
-    source checkout itself (`uv run keel` from the repo resolves `keel` to
-    `./keel/__init__.py`): installing wheels there would shadow the working tree. A
-    seam so tests can drive the detection without a checkout."""
+def _running_package_file() -> Path | None:
+    """The running `keel` package's own file (`keel/__init__.py`), resolved -- the
+    concrete answer to "where is this code running FROM", which the deployment-layout
+    detection below classifies. `None` when it cannot be located. A seam for tests."""
     try:
         import keel as _keel
 
         file = _keel.__file__
         if not file:
             return None
-        resolved = Path(file).resolve()
-        resolved.relative_to(Path(launch_dir).resolve())
-    except (ImportError, OSError, ValueError):
+        return Path(file).resolve()
+    except (ImportError, OSError):
         return None
-    return resolved
+
+
+def deployment_layout_refusal(launch_dir: Path, package_file: Path | None) -> str | None:
+    """Classify where the running `keel` package resolves from, relative to the launch
+    folder. PURE. `None` -- an update may be offered -- ONLY for the deployment
+    layout: the package resolving from the launch folder's OWN `.venv` site-packages,
+    i.e. a `.venv` path component somewhere between the launch folder and a
+    `site-packages` component (`<launch>/.venv/lib/python3.x/site-packages/keel/...`,
+    the runbook layout -- those wheels live in exactly the venv the updater installs
+    into, so updating that venv IS updating the deployment). Everything else refuses,
+    naming the layout it saw:
+
+    * a NON-venv path under the launch folder -- the source checkout itself (the
+      `uv run keel` case, `<launch>/keel/__init__.py`): installing wheels would shadow
+      the working tree, not update it;
+    * a path OUTSIDE the launch folder -- a repo run from another directory or a
+      system python: the venv the wheels would land in is not this launch folder's
+      own, so there is no deployment here to update;
+    * no package file at all -- refusing rather than guessing.
+    """
+    if package_file is None:
+        return (
+            "cannot locate the running keel package -- refusing rather than guessing "
+            "where the wheels would land"
+        )
+    try:
+        rel = package_file.resolve().relative_to(Path(launch_dir).resolve())
+    except ValueError:
+        return (
+            f"the running keel package resolves from OUTSIDE the launch folder "
+            f"({package_file}) -- a repo run or a system python, not this launch "
+            "folder's deployment: the wheels would install into a venv that is not "
+            "the one this launch folder runs on."
+        )
+    parts = rel.parts
+    if ".venv" in parts and "site-packages" in parts[parts.index(".venv") + 1 :]:
+        return None  # the deployment layout: the launch folder's own venv
+    return (
+        f"the running keel package resolves from a non-venv path inside the launch "
+        f"folder ({package_file}) -- this IS the source checkout, not a deployment: "
+        "installing wheels into the venv would shadow the working tree, not update it."
+    )
+
+
+def _wheel_origin_refusal(package_file: Path) -> str | None:
+    """`None` when the `keel-trader` distribution beside the running package (the
+    site-packages dir two levels up from `keel/__init__.py`) was installed as a wheel;
+    a refusal reason otherwise. A deployment is the four release WHEELS: an editable
+    install or a `pip install <source-dir>` has a `direct_url.json` whose `url` names a
+    directory rather than a `.whl` -- updating that in place is not the runbook's
+    procedure, so it is refused. No `direct_url.json` at all is an index install
+    (shipped as a wheel) and passes. Reads only the dist-info's own metadata."""
+    site_packages = package_file.parent.parent
+    dist_infos = sorted(site_packages.glob("keel_trader-*.dist-info"))
+    if not dist_infos:
+        return (
+            f"no keel_trader-*.dist-info beside the running package ({site_packages}) "
+            "-- cannot confirm the distribution was installed as a wheel; refusing "
+            "rather than guessing"
+        )
+    direct = dist_infos[0] / "direct_url.json"
+    if not direct.is_file():
+        return None  # an index install: no direct URL, and indexes ship wheels
+    try:
+        doc = json.loads(direct.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"cannot read {direct} -- refusing rather than guessing the install origin"
+    url = doc.get("url") if isinstance(doc, dict) else None
+    if isinstance(url, str) and url.endswith(".whl"):
+        return None
+    return (
+        f"the running keel-trader distribution was not installed from a wheel "
+        f"(its direct_url origin is {url!r}, a source directory or an editable "
+        "install) -- a deployment is the four release wheels; re-deploy from the "
+        "release (docs/operator-runbook.md, 'Deploying a new version')."
+    )
 
 
 def select_production_wheels(
@@ -284,18 +365,25 @@ def select_production_wheels(
     selected: list[ReleaseAsset] = []
     missing: list[str] = []
     for prefix in PRODUCTION_WHEEL_PREFIXES:
-        found = next(
-            (
-                asset
-                for asset in release.assets
-                if asset.name.startswith(f"{prefix}-{version}-") and asset.name.endswith(".whl")
-            ),
-            None,
-        )
-        if found is None:
+        matches = [
+            asset
+            for asset in release.assets
+            if asset.name.startswith(f"{prefix}-{version}-") and asset.name.endswith(".whl")
+        ]
+        if not matches:
             missing.append(prefix)
+        elif len(matches) > 1:
+            # A prefix that matches twice (a stray re-upload with an extra platform tag)
+            # is a refusal naming BOTH -- a silent first-match could install the wrong
+            # artifact into a deployment.
+            both = " and ".join(asset.name for asset in matches)
+            raise UpdateError(
+                f"release {release.tag} carries MORE THAN ONE asset matching "
+                f"{prefix}-{version}-: {both}. Which one is the wheel is not the "
+                "updater's to guess -- see docs/RELEASING.md, 'Release assets'."
+            )
         else:
-            selected.append(found)
+            selected.append(matches[0])
     if missing:
         names = ", ".join(asset.name for asset in release.assets) or "no assets at all"
         raise UpdateError(
@@ -313,6 +401,7 @@ def plan_update(
     installed: dict[str, str] | None = None,
     launch_dir: Path | None = None,
     venv_python: Path | None = None,
+    package_file: Path | None = None,
 ) -> UpdatePlan:
     """Build the plan for updating to `release`. PURE aside from the glob/stat reads
     of the launch folder; every input is injectable so the offer/refusal semantics
@@ -326,6 +415,7 @@ def plan_update(
     dists = installed if installed is not None else installed_distributions()
     launch = launch_dir if launch_dir is not None else _launch_dir()
     venv = venv_python if venv_python is not None else _running_python()
+    pkg_file = package_file if package_file is not None else _running_package_file()
 
     reasons: list[str] = []
     wheels: tuple[ReleaseAsset, ...] = ()
@@ -347,12 +437,15 @@ def plan_update(
             "checkout run from the repo (e.g. `uv run keel`). There is no install "
             "here to update; a deployment is a venv installed from the four wheels."
         )
-    package_file = _package_file(launch)
-    if package_file is not None:
-        reasons.append(
-            f"the running keel package resolves from inside the launch folder "
-            f"({package_file}) -- this IS the source checkout, not a deployment."
-        )
+    layout_refusal = deployment_layout_refusal(launch, pkg_file)
+    if layout_refusal is not None:
+        reasons.append(layout_refusal)
+    elif pkg_file is not None:
+        # only meaningful for the deployment layout (the venv the package resolves
+        # from): is the distribution in it one of the wheels?
+        origin_refusal = _wheel_origin_refusal(pkg_file)
+        if origin_refusal is not None:
+            reasons.append(origin_refusal)
 
     newer = is_newer_version(release.version, info.version)
     if newer is None:
@@ -397,34 +490,84 @@ def console_entry(venv_python: Path) -> Path:
     return venv_python.parent / ("keel.exe" if os.name == "nt" else "keel")
 
 
-def backup_path(db_path: Path, target_version: str, now_ts: float) -> Path:
+def backup_path(
+    db_path: Path, target_version: str, now_ts: float, occupied: Collection[str] = ()
+) -> Path:
     """The runbook's backup name: `<db>.bak-before-<version>-<timestamp>` -- what the
     manual procedure would write, so a self-updated deployment's backups are
-    indistinguishable from a hand-upgraded one's. PURE."""
+    indistinguishable from a hand-upgraded one's. The timestamp has second granularity,
+    so `occupied` (the backup names that already exist on disk or were written this
+    run) guards the collision: a same-second name gets a `-2`, `-3`, ... counter
+    suffix -- a backup is NEVER overwritten. PURE."""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ts))
-    return db_path.with_name(f"{db_path.name}.bak-before-{target_version}-{stamp}")
+    base = f"{db_path.name}.bak-before-{target_version}-{stamp}"
+    if base not in occupied:
+        return db_path.with_name(base)
+    counter = 2
+    while f"{base}-{counter}" in occupied:
+        counter += 1
+    return db_path.with_name(f"{base}-{counter}")
+
+
+#: The download guard: 200 MiB, three orders of magnitude above the ~1 MiB wheels -- a
+#: mis-pointed URL (a release PAGE, a video) is refused instead of streamed to disk.
+_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 
 
 def _download_file(url: str, dest: Path) -> None:
-    """Download a public asset URL to `dest`. The production seam; tests inject."""
+    """Download a public asset URL to `dest`, with the read BOUNDED at
+    `_MAX_DOWNLOAD_BYTES`. The production seam; tests inject."""
     try:
         with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT_SEC) as response:
-            dest.write_bytes(response.read())
+            payload = response.read(_MAX_DOWNLOAD_BYTES + 1)
     except OSError as exc:
         raise UpdateError(f"could not download {url}: {exc}") from exc
+    if len(payload) > _MAX_DOWNLOAD_BYTES:
+        raise UpdateError(
+            f"refused to download {url}: larger than the 200 MiB guard (the wheels are "
+            "~1 MiB) -- the URL does not point at a wheel. Nothing was written."
+        )
+    dest.write_bytes(payload)
+
+
+def _backup_file(src: Path, dest: Path) -> None:
+    """Back up `src` to `dest`. The GUARANTEE for a database: a CONSISTENT snapshot via
+    SQLite's own online-backup API (`src_conn.backup(dest_conn)`), correct even while
+    another process is mid-transaction under a rollback journal (launchd writers) --
+    where a plain file copy can be torn (half old pages, half new) and restore as
+    corrupt. Anything that is not a `.db` (there is none in the plan's `keel*.db` glob,
+    but the guard is cheap) falls back to `shutil.copy2`. The production seam."""
+    if src.suffix == ".db":
+        src_conn = sqlite3.connect(src)
+        try:
+            dest_conn = sqlite3.connect(dest)
+            try:
+                src_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        finally:
+            src_conn.close()
+    else:
+        shutil.copy2(src, dest)
 
 
 def _uv_install(venv_python: Path, wheels: Sequence[Path]) -> None:
     """Install the wheels BY PATH into the RUNNING venv with uv -- exactly the
-    runbook's own command, `uv pip install --python <venv> <the four paths>`. uv is a
-    deployment dependency (the runbook says so); an absent uv is an honest error
-    naming the manual procedure, never a fallback to some other installer."""
+    runbook's own command, `uv pip install --python <venv> --find-links <Release> <the
+    four paths>`. uv is a deployment dependency (the runbook says so); an absent uv is
+    an honest error naming the manual procedure, never a fallback to some other
+    installer."""
+    # `--find-links` points at the wheels' own directory, exactly as the runbook's
+    # command does, so the wheels' ==-pinned siblings resolve from Release/ rather
+    # than from PyPI -- where they do not exist.
     argv = [
         "uv",
         "pip",
         "install",
         "--python",
         str(venv_python),
+        "--find-links",
+        str(wheels[0].parent),
         *(str(wheel) for wheel in wheels),
     ]
     try:
@@ -523,19 +666,27 @@ def run_update(
     install: Callable[[Path, Sequence[Path]], None] | None = None,
     migrate: Callable[[Path, Path], None] | None = None,
     verify: Callable[[Path, str], None] | None = None,
+    backup: Callable[[Path, Path], None] | None = None,
     now_ts: float | None = None,
 ) -> UpdateResult:
     """Run the update, in the runbook's order, streaming every step through `echo`.
 
-    **Fail-safe by construction:** the `confirm_gate` runs INSIDE this function,
-    before any mutation -- an ungated call is not expressible. The order is:
-    gate -> backups of every `keel*.db` -> download the four wheels (verified
-    non-empty) -> install into the RUNNING venv -> migrate each database with the new
-    build -> verify with the new build's `keel versions` -> only then delete the
-    superseded wheels. Backups are never deleted. A failure after install is LOUD
-    about the real state (pip has already replaced the packages) and re-installs the
-    previous wheels best-effort when they are still in `Release/` (they are, until a
-    verified success cleans them).
+    **Fail-safe by construction:** the `confirm_gate` runs INSIDE this function, before
+    any mutation -- both shipped front-ends gate the run with the same typed gate (the
+    service function itself could be called by an operator's own code with their own
+    gate; nothing keel ships calls it ungated). The order is: gate -> consistent
+    SQLite-snapshot backups of every `keel*.db` (never overwriting an existing backup)
+    -> download the four wheels (verified non-empty, read bounded at 200 MiB) ->
+    install into the RUNNING venv -> migrate each database with the new build -> verify
+    with the new build's `keel versions` -> only then delete the superseded wheels.
+    Backups are never deleted. A failure is PHASE-TRUE about the venv's state: a
+    failure OF the install says the venv was NOT updated (or is half-updated) and
+    removes the downloaded wheel files from `Release/` (a torn file must not poison a
+    later rollback's superseded set); a failure AFTER a finished install says the new
+    wheels ARE installed (pip replaces the packages at install time, so the old build
+    does not come back on its own), re-installs the previous wheels best-effort when
+    they are still in `Release/` (they are, until a verified success cleans them), and
+    points at the `.bak-before-*` backups as the data recovery.
 
     Every subprocess/HTTP seam is injectable; the defaults are the real thing. Never
     raises `UpdateError` -- a failure is the returned result, with the steps that
@@ -567,6 +718,7 @@ def run_update(
     install_wheels = install if install is not None else _uv_install
     migrate_db = migrate if migrate is not None else _migrate_db
     verify_install = verify if verify is not None else _verify_versions
+    backup_file = backup if backup is not None else _backup_file
     ts = time.time() if now_ts is None else now_ts
 
     say(f"updating {plan.launch_dir}: {plan.current_version} -> {plan.target_version}")
@@ -587,11 +739,14 @@ def run_update(
         )
 
     # BACKUPS FIRST -- before any download, before any install: if anything after
-    # this point half-happens, the databases' pre-update state exists on disk.
+    # this point half-happens, the databases' pre-update state exists on disk. Each
+    # is a consistent SQLite snapshot, and a same-second name never overwrites one.
+    occupied = {p.name for p in plan.launch_dir.glob("*.bak-before-*")}
     backups: list[Path] = []
     for db_path in plan.db_paths:
-        dest = backup_path(db_path, plan.target_version, ts)
-        shutil.copy2(db_path, dest)
+        dest = backup_path(db_path, plan.target_version, ts, occupied=occupied)
+        backup_file(db_path, dest)
+        occupied.add(dest.name)
         backups.append(dest)
         say(f"backed up {db_path.name} -> {dest.name}")
     if not plan.db_paths:
@@ -602,26 +757,35 @@ def run_update(
     try:
         for name, url in zip(plan.wheel_names, plan.wheel_urls):
             dest = plan.release_dir / name
+            wheel_paths.append(dest)
             say(f"downloading {name}")
             fetch_file(url, dest)
             if not dest.is_file() or dest.stat().st_size == 0:
                 raise UpdateError(
                     f"the downloaded wheel {name} is missing or empty -- nothing was "
-                    "installed; the running binary is unchanged. Delete the partial "
-                    "file and retry, or follow the manual procedure (the runbook, "
-                    "'Deploying a new version')."
+                    "installed; the running binary is unchanged. The partial file was "
+                    "removed from Release/ (a torn file must not stay behind to "
+                    "poison a later rollback); retry, or follow the manual procedure "
+                    "(the runbook, 'Deploying a new version')."
                 )
-            wheel_paths.append(dest)
     except UpdateError as exc:
+        for partial in wheel_paths:
+            partial.unlink(missing_ok=True)
+        say(
+            "removed the partial wheel file(s) from Release/ -- a torn download must "
+            "not poison a later rollback"
+        )
         return UpdateResult(
             ok=False, steps=tuple(steps), error=str(exc), rolled_back=False,
             backups=tuple(backups),
         )
 
     new_keel = console_entry(plan.venv_python)
+    installed = False  # whether the four wheels FINISHED installing (uv returned success)
     try:
         say(f"installing the four wheels into the RUNNING venv ({plan.venv_python})")
         install_wheels(plan.venv_python, wheel_paths)
+        installed = True
         for db_path in plan.db_paths:
             say(f"migrating {db_path.name} with the new build")
             migrate_db(new_keel, db_path)
@@ -632,22 +796,55 @@ def run_update(
         verify_install(new_keel, plan.target_version)
     except UpdateError as exc:
         say(f"FAILED: {exc}")
+        if not installed:
+            # The failure IS the install (uv absent, a timeout, a corrupt wheel that
+            # passed the non-empty check): the venv was NOT updated, or is
+            # half-updated -- and a reinstall of the previous wheels is NOT attempted
+            # (uv just refused this venv; the previous wheels are untouched in
+            # Release/ for the manual recovery). The downloaded files are removed so
+            # a torn one cannot ride into a later rollback's superseded set.
+            for path in wheel_paths:
+                path.unlink(missing_ok=True)
+            say(
+                "removed the downloaded wheel files from Release/ -- a torn file must "
+                "not poison a later rollback's superseded set"
+            )
+            error = (
+                f"update FAILED while installing the wheels: {exc}\n"
+                f"STATE: the venv was NOT updated (or is half-updated -- run `keel "
+                f"versions` to see exactly what is installed); the previous wheels "
+                f"are still in {plan.release_dir}, and the downloaded files were "
+                f"removed from it.\n"
+                f"{_MANUAL_RECOVERY}"
+            )
+            return UpdateResult(
+                ok=False, steps=tuple(steps), error=error, rolled_back=False,
+                backups=tuple(backups),
+            )
         rolled_back = False
         if superseded:
             say("best-effort recovery: re-installing the PREVIOUS wheels from Release/")
             try:
                 install_wheels(plan.venv_python, superseded)
                 rolled_back = True
-                say("re-installed the previous wheels -- the venv is back on the old")
-                say("build. (The databases were already migrated; migrate is "
-                    "idempotent and schema-only, so they need nothing.)")
+                say("re-installed the previous wheels -- the venv is back on the old build.")
+                say(
+                    "The databases were already migrated; the old build is ASSUMED to "
+                    "still open them (this release's migrations are written to be "
+                    "additive -- an assumption, not a guarantee). The real data "
+                    "recovery is the backups: <db>.bak-before-<version>-<ts> beside "
+                    "each database, never deleted by the updater."
+                )
             except UpdateError as reinstall_exc:
                 say(f"best-effort re-install FAILED: {reinstall_exc}")
         recovery = (
             "rolled back: the previous wheels were re-installed from Release/ "
-            "(best-effort); confirm with `keel versions`."
+            "(best-effort); confirm with `keel versions` -- and if the old build "
+            "cannot open the migrated databases, restore from the .bak-before-* "
+            "backups beside them."
             if rolled_back
-            else "no previous wheels remained in Release/ to re-install."
+            else "no previous wheels remained in Release/ to re-install -- the "
+            ".bak-before-* backups beside the databases are the data recovery."
         )
         error = (
             f"update FAILED after the wheels were installed: {exc}\n"
@@ -678,16 +875,20 @@ def build_relaunch_argv(venv_python: Path, original_argv: Sequence[str]) -> list
     """The argv a relaunch execv's: the NEW venv's `keel` console entry carrying the
     original invocation's arguments. PURE.
 
-    `original_argv` is the running process's `sys.argv` (`[console-script, 'tui',
-    ...flags]`): argv[0] -- the OLD binary's path, possibly a wrapper -- is REPLACED
-    by the new entry, and every argument after it is kept verbatim. When the
-    remaining arguments do not lead with `tui` (a wrapper that exec'd something
-    else), the argv falls back to `[keel, 'tui', ...same flags...]` -- the relaunch
-    always opens the operator console, never a bare interpreter."""
+    `original_argv` is the running process's `sys.argv`. argv[0] -- the OLD binary's
+    path, possibly a wrapper -- is REPLACED by the new entry, and EVERY argument after
+    it is kept VERBATIM: no reordering, no prepending, ever. Deployment wrappers exec
+    `keel --config X --db Y tui`, so argv[0] is the wrapper and the subcommand sits
+    AFTER the flags -- click parses that identically on the relaunched process, and
+    any reconstruction of our own (the old fallback prepended `tui`, producing a
+    duplicate subcommand and a usage error) breaks exactly those wrappers. Only when
+    the original argv is genuinely unavailable -- the bare-wrapper case, an argv with
+    NO arguments at all -- is `[keel, 'tui']` constructed, so a relaunch always opens
+    the operator console, never a bare interpreter."""
     new_keel = console_entry(venv_python)
     args = [str(arg) for arg in original_argv[1:]]
-    if not args or args[0] != "tui":
-        args = ["tui", *args]
+    if not args:
+        return [str(new_keel), "tui"]
     return [str(new_keel), *args]
 
 
@@ -703,16 +904,24 @@ def relaunch_tui(
 
     The CALLER must have restored the terminal first -- the TUI runs the closure from
     inside its curses suspend dance, after `endwin`. `execv` replaces the process, so
-    the closure does not return; if it ever does (a faked execv), it raises rather
-    than fall through into the OLD code."""
+    the closure does not return; an `OSError` from it (permissions, a missing
+    interpreter) is wrapped into the same honest `UpdateError` as a returning execv --
+    naming the manual `keel tui` start -- so no front-end ever crashes on a bare
+    OSError, and a failed relaunch can be rendered instead of losing the run's state."""
     new_keel = console_entry(venv_python)
     argv = build_relaunch_argv(venv_python, original_argv)
 
     def _relaunch() -> NoReturn:
-        if execv is not None:
-            execv(str(new_keel), argv)
-        else:
-            os.execv(str(new_keel), argv)
+        try:
+            if execv is not None:
+                execv(str(new_keel), argv)
+            else:
+                os.execv(str(new_keel), argv)
+        except OSError as exc:
+            raise UpdateError(
+                f"relaunch failed ({exc}): execv could not start the new build -- "
+                f"start the console by hand: `{new_keel} tui`"
+            ) from exc
         raise UpdateError(
             f"relaunch failed: execv returned -- start the console by hand: "
             f"`{new_keel} tui`"
@@ -747,9 +956,11 @@ def gate_detail(plan: UpdatePlan) -> str:
 def typed_update_gate(plan: UpdatePlan) -> bool:
     """The CLI's own `_require_interactive_confirmation` over the shared wording --
     the one gate both front-ends hand to `run_update`'s `confirm_gate`. Demands the
-    typed word `yes` at a terminal, fails closed off a TTY (no cron job can ever
-    update a deployment), and returns False on any refusal instead of raising, so it
-    can be passed straight through the service's confirm seam."""
+    typed word `yes` at a terminal, fails closed off a TTY (a scheduled job has no
+    terminal to type into; the CLI driven with scripted input on a real TTY is an
+    operator's own choice, not a hole in the gate), and returns False on any refusal
+    instead of raising, so it can be passed straight through the service's confirm
+    seam."""
     from keel.commands._common import _require_interactive_confirmation
 
     try:

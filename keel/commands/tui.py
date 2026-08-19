@@ -2202,12 +2202,16 @@ def run_live(
         account_versions_offset = 0
         # the update view's HELD state (the versions view's contract): the plan (or
         # the check's error), the streamed step lines, and the finished result --
-        # read/computed ONCE, never per poll.
+        # read/computed ONCE, never per poll. `account_update_relaunch` is the view's
+        # ONE extra state: a verified update whose execv FAILED, its relaunch closure
+        # held so Enter retries ONLY the execv (the update is installed and verified;
+        # re-running it would re-download and re-install for nothing).
         account_update_plan: Any = None
         account_update_error: str | None = None
         account_update_progress: list[str] = []
         account_update_result: Any = None
         account_update_offset = 0
+        account_update_relaunch: Any = None
         # -- the Venues browser (issue #394 C7 / PRD O7): the O7 payload, read ONCE per
         # entry (an importlib-metadata scan plus one credential-less adapter
         # construction per adapter -- the same walk `venue_session_bound` makes, never
@@ -2544,6 +2548,7 @@ def run_live(
             nonlocal account_versions_rows, account_versions_offset
             nonlocal account_update_plan, account_update_error
             nonlocal account_update_progress, account_update_result, account_update_offset
+            nonlocal account_update_relaunch
             if entry.target == "versions":
                 try:
                     account_versions_rows = account_console.versions_rows()
@@ -2564,6 +2569,7 @@ def run_live(
                 account_update_progress = []
                 account_update_result = None
                 account_update_offset = 0
+                account_update_relaunch = None
                 mode = "account-update"
             else:  # "pnl"
                 account_pnl_offset = 0
@@ -2574,6 +2580,7 @@ def run_live(
             failed check): one more public read, held again -- never per poll."""
             nonlocal account_update_plan, account_update_error
             nonlocal account_update_progress, account_update_result, account_update_offset
+            nonlocal account_update_relaunch
             try:
                 account_update_plan = account_console.update_check()
             except Exception as exc:
@@ -2584,6 +2591,7 @@ def run_live(
             account_update_progress = []
             account_update_result = None
             account_update_offset = 0
+            account_update_relaunch = None
 
         def _run_account_update_at_terminal() -> str:
             """THE update run, dispatched at the terminal through the shared
@@ -2591,8 +2599,12 @@ def run_live(
             streamed lines collect into the held progress list, the RESULT is held
             for the view, and a verified success execv's the new build's keel entry
             with the ORIGINAL TUI argv (the terminal is already restored -- the run
-            happens after endwin, so the replacement starts on a clean terminal)."""
+            happens after endwin, so the replacement starts on a clean terminal). A
+            relaunch that RAISES is held (not lost to a crash): the failure and the
+            manual `keel tui` start land in the held progress, and the closure is
+            kept for an Enter retry that re-installs nothing."""
             nonlocal account_update_progress, account_update_result
+            nonlocal account_update_relaunch
             import sys as _sys
 
             relaunch = None
@@ -2600,13 +2612,35 @@ def run_live(
                 relaunch = update.relaunch_tui(
                     account_update_plan.venv_python, list(_sys.argv)
                 )
+
+            def _hold_failed_relaunch(_exc: BaseException) -> None:
+                nonlocal account_update_relaunch
+                account_update_relaunch = relaunch
+
             assert account_update_plan is not None
             account_update_result = account_console.run_update_at_terminal(
                 account_update_plan,
                 progress=account_update_progress,
                 relaunch_fn=relaunch,
+                on_relaunch_failure=_hold_failed_relaunch,
             )
             return "update run finished -- the results are held on screen"
+
+        def _retry_account_update_relaunch() -> str:
+            """Enter on a relaunch-FAILED result: the execv again and NOTHING else --
+            no re-check, no re-download, no re-install. A success replaces the process
+            (and never returns here); a second failure renders the manual `keel tui`
+            start into the held progress."""
+            closure = account_update_relaunch
+            assert closure is not None
+            try:
+                closure()
+            except Exception as exc:
+                account_update_progress.append(
+                    f"RELAUNCH FAILED again: {exc} -- run `keel tui` by hand (or your "
+                    "deployment wrapper)."
+                )
+            return "relaunch retried -- the results are held on screen"
 
         def _enter_help_entry(entry: Any) -> None:
             """Where a Help sub-menu selection goes -- the same closed-mapping rule
@@ -4182,7 +4216,9 @@ def run_live(
                     )
                 elif account_update_result is not None:
                     update_lines = account_console.build_update_result_lines(
-                        account_update_result, list(account_update_progress)
+                        account_update_result,
+                        list(account_update_progress),
+                        relaunch_pending=account_update_relaunch is not None,
                     )
                 else:
                     assert account_update_plan is not None
@@ -4206,6 +4242,7 @@ def run_live(
                     account_update_progress = []
                     account_update_result = None
                     account_update_offset = 0
+                    account_update_relaunch = None
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     plan_offered = (
                         account_update_plan is not None and account_update_plan.offered
@@ -4216,6 +4253,10 @@ def run_live(
                         # stream, and a verified success execv's the new build with
                         # the terminal already restored -- the process is replaced.
                         _run_terminal_form(stdscr, _run_account_update_at_terminal)
+                    elif account_update_relaunch is not None:
+                        # a relaunch-FAILED result: Enter retries ONLY the execv --
+                        # the update is installed and verified, so nothing re-runs
+                        _run_terminal_form(stdscr, _retry_account_update_relaunch)
                     else:
                         # A refusal, an up-to-date plan, a failed check, or a
                         # finished run: Enter re-checks the release (one public

@@ -21,6 +21,7 @@ Three surfaces, pinned here:
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,30 @@ _INSTALLED = {
 }
 
 
+#: The runbook's deployment layout: the launch folder's OWN `.venv`, its site-packages
+#: holding the running `keel` package and the `keel_trader` dist-info.
+_VENV_SITE = ".venv/lib/python3.12/site-packages"
+
+
+def _fake_venv_package(
+    launch_dir: Path, *, direct_url: str = "file:///Release/keel_trader-0.6.0-py3-none-any.whl"
+) -> Path:
+    """Create the fake deployment install under `launch_dir` -- the package resolving
+    from the launch folder's OWN `.venv` site-packages, plus a `keel_trader` dist-info
+    whose `direct_url.json` names the wheel it was installed from -- and return the
+    package file `plan_update` is pointed at."""
+    import json
+
+    site = launch_dir / _VENV_SITE
+    keel_pkg = site / "keel"
+    keel_pkg.mkdir(parents=True, exist_ok=True)
+    (keel_pkg / "__init__.py").write_text("")
+    dist_info = site / "keel_trader-0.6.0.dist-info"
+    dist_info.mkdir(exist_ok=True)
+    (dist_info / "direct_url.json").write_text(json.dumps({"url": direct_url}))
+    return keel_pkg / "__init__.py"
+
+
 def _plan(
     launch_dir: Path,
     *,
@@ -74,21 +99,50 @@ def _plan(
     installed: dict[str, str] | None = None,
     venv_python: Path | None = None,
     extra_assets: tuple[str, ...] = (),
+    package_file: Path | None = None,
+    direct_url: str = "file:///Release/keel_trader-0.6.0-py3-none-any.whl",
 ) -> up.UpdatePlan:
+    if package_file is None:
+        package_file = _fake_venv_package(launch_dir, direct_url=direct_url)
     return up.plan_update(
         up.parse_release(_release_json(version, extra_assets)),
         build=BuildInfo(version=current, commit="deadbeef", dirty=False, source=source),
         installed=dict(_INSTALLED if installed is None else installed),
         launch_dir=launch_dir,
         venv_python=venv_python or launch_dir / ".venv/bin/python",
+        package_file=package_file,
     )
 
 
+def _write_db(path: Path, marker: str) -> None:
+    """A REAL SQLite database with one marker row -- the backup pins prove the .bak
+    holds the pre-update CONTENT as a consistent snapshot, which only a real database
+    (not a byte blob) can show."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES (?)", (marker,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_marker(path: Path) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        return str(conn.execute("SELECT value FROM marker").fetchone()[0])
+    finally:
+        conn.close()
+
+
 def _deployment(tmp_path: Path) -> Path:
-    """A fake launch folder: two keel databases, an unrelated db, and a Release/ dir
-    holding the PREVIOUS release's four wheels (the superseded set)."""
-    (tmp_path / "keel.db").write_bytes(b"original-keel-db")
-    (tmp_path / "keel-live.db").write_bytes(b"original-live-db")
+    """A fake launch folder in the runbook's DEPLOYMENT layout: the own `.venv` the
+    running package resolves from, two keel databases, an unrelated db, and a Release/
+    dir holding the PREVIOUS release's four wheels (the superseded set)."""
+    _fake_venv_package(tmp_path)
+    _write_db(tmp_path / "keel.db", "original-keel-db")
+    _write_db(tmp_path / "keel-live.db", "original-live-db")
     (tmp_path / "unrelated.db").write_bytes(b"not-a-keel-db")
     release = tmp_path / "Release"
     release.mkdir()
@@ -107,6 +161,9 @@ class _FakeOps:
         self.events: list[tuple[str, Any]] = []
         self.fail_verify = False
         self.fail_verify_with = "verify exploded"
+        self.fail_install_with: str | None = None
+        self.fail_migrate_with: str | None = None
+        self.installs = 0
 
     def download(self, url: str, dest: Path) -> None:
         baks = sorted(p.name for p in self.launch_dir.glob("*.bak-before-0.7.0-*"))
@@ -114,18 +171,26 @@ class _FakeOps:
         dest.write_bytes(b"new-wheel-bytes")
 
     def install(self, venv_python: Path, wheels: Any) -> None:
+        # counted FIRST so a spying test can tell the backups' own connections from
+        # this pin's reads
+        self.installs += 1
         # THE ORDERING PIN, asserted from inside the mutation: by the time anything is
-        # installed, every database backup must already exist and hold the pre-update
-        # content. If run_update is ever reordered, THIS raises and the test fails.
+        # installed, every database backup must already exist and OPEN CLEANLY as a
+        # consistent SQLite snapshot. If run_update is ever reordered -- or the backup
+        # ever stops being a real snapshot -- THIS raises and the test fails.
         baks = sorted(self.launch_dir.glob("*.bak-before-0.7.0-*"))
-        assert len(baks) == 2, f"backups before install: {[b.name for b in baks]}"
-        assert baks[0].read_bytes() in (b"original-keel-db", b"original-live-db")
-        assert baks[1].read_bytes() in (b"original-keel-db", b"original-live-db")
+        assert len(baks) >= 2, f"backups before install: {[b.name for b in baks]}"
+        for bak in baks:
+            _read_marker(bak)
+        if self.fail_install_with is not None and self.installs == 1:
+            raise up.UpdateError(self.fail_install_with)
         self.events.append(("install", [Path(w).name for w in wheels]))
 
     def migrate(self, new_keel: Path, db_path: Path) -> None:
         self.events.append(("migrate", str(new_keel), db_path.name))
-        db_path.write_bytes(b"migrated-by-the-new-build")
+        if self.fail_migrate_with is not None:
+            raise up.UpdateError(self.fail_migrate_with)
+        _write_db(db_path, "migrated-by-the-new-build")
 
     def verify(self, new_keel: Path, target: str) -> None:
         self.events.append(("verify", str(new_keel), target))
@@ -226,6 +291,34 @@ def test_the_production_wheels_are_exactly_four_and_never_fake_or_robinhood() ->
     assert "fake" not in joined and "robinhood" not in joined
 
 
+def test_an_ambiguous_wheel_match_is_refused_naming_both() -> None:
+    """Two assets matching one prefix (a stray re-upload with an extra platform tag,
+    say) is a REFUSAL that names both -- never a silent first-match, which could pick
+    the wrong artifact and install it into a deployment."""
+    import json
+
+    payload = json.dumps(
+        {
+            "tag_name": "v0.7.0",
+            "assets": [
+                _asset(name)
+                for name in (
+                    "keel_core-0.7.0-py3-none-any.whl",
+                    "keel_core-0.7.0-cp312-cp312-macosx_11_0.whl",
+                    "keel_broker_api-0.7.0-py3-none-any.whl",
+                    "keel_broker_coinbase-0.7.0-py3-none-any.whl",
+                    "keel_trader-0.7.0-py3-none-any.whl",
+                )
+            ],
+        }
+    ).encode()
+    with pytest.raises(up.UpdateError) as excinfo:
+        up.select_production_wheels(up.parse_release(payload), "0.7.0")
+    message = str(excinfo.value)
+    assert "keel_core-0.7.0-py3-none-any.whl" in message
+    assert "keel_core-0.7.0-cp312-cp312-macosx_11_0.whl" in message
+
+
 def test_a_missing_production_wheel_is_named_honestly() -> None:
     import json
 
@@ -279,18 +372,50 @@ def test_the_plan_refuses_when_nothing_is_installed(tmp_path: Path) -> None:
     assert any("installed" in reason.lower() for reason in plan.refusal_reasons)
 
 
-def test_the_plan_refuses_when_the_package_resolves_from_the_launch_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A checkout run via `uv run keel` resolves the `keel` package from the repo
-    itself: the launch folder IS the source tree, and deploying wheels there would
-    shadow the working tree. Detected independently of the build stamp."""
+def test_the_plan_offers_the_runbooks_real_deployment_layout(tmp_path: Path) -> None:
+    """The runbook's own layout: the running `keel` package resolves from the launch
+    folder's OWN `.venv` site-packages (`<launch>/.venv/lib/python3.x/site-packages/
+    keel/`), installed from a wheel -- that IS the deployment, and the update is
+    OFFERED. The previous detection refused ANY package under the launch folder, which
+    refused every real deployment on the box."""
+    plan = _plan(tmp_path)
+    assert plan.offered is True
+    assert plan.refusal_reasons == ()
+
+
+def test_the_plan_refuses_a_source_keel_dir_under_the_launch_folder(tmp_path: Path) -> None:
+    """A checkout run via `uv run keel` resolves `keel` to `<launch>/keel/__init__.py`
+    -- a NON-venv path under the launch folder. Deploying wheels would shadow the
+    working tree, so it is refused -- detected by LAYOUT, not by the build stamp."""
     (tmp_path / "keel").mkdir()
     (tmp_path / "keel" / "__init__.py").write_text("")
-    monkeypatch.setattr(up, "_package_file", lambda launch: launch / "keel" / "__init__.py")
-    plan = _plan(tmp_path)
+    plan = _plan(tmp_path, package_file=tmp_path / "keel" / "__init__.py")
     assert plan.offered is False
-    assert any("source" in reason.lower() for reason in plan.refusal_reasons)
+    assert any("source checkout" in reason for reason in plan.refusal_reasons)
+
+
+def test_the_plan_refuses_a_repo_run_from_outside_the_launch_folder(tmp_path: Path) -> None:
+    """`keel` running from a repo checkout (or a system python) while the launch folder
+    is elsewhere: the venv the wheels would land in is NOT this launch folder's own --
+    refused, naming the outside resolution."""
+    elsewhere = tmp_path.parent / "elsewhere-repo"
+    plan = _plan(tmp_path, package_file=elsewhere / "keel" / "__init__.py")
+    assert plan.offered is False
+    assert any("outside the launch folder" in reason.lower() for reason in plan.refusal_reasons)
+
+
+def test_the_plan_refuses_an_install_that_is_not_a_wheel(tmp_path: Path) -> None:
+    """The deployment layout but a non-wheel origin: the `keel_trader` distribution's
+    own `direct_url.json` names a source directory (an editable or `pip install .`
+    install), not a `.whl` -- a deployment is the four release wheels, so this is
+    refused rather than updated in place."""
+    plan = _plan(tmp_path, direct_url="file:///Users/op/keel-repo")
+    assert plan.offered is False
+    assert any("wheel" in reason.lower() for reason in plan.refusal_reasons)
+
+
+def test_the_layout_classifier_refuses_an_unknown_package_file(tmp_path: Path) -> None:
+    assert up.deployment_layout_refusal(tmp_path, None) is not None
 
 
 def test_the_plan_refuses_a_release_missing_a_production_wheel(tmp_path: Path) -> None:
@@ -325,6 +450,33 @@ def test_the_plan_names_the_release_dir_and_the_running_venv(tmp_path: Path) -> 
     assert plan.launch_dir == tmp_path
     venv = tmp_path / ".venv/bin/python"
     assert plan.venv_python == venv
+
+
+# -- backups: the runbook's name, never an overwrite -----------------------------------------------
+
+
+def test_backup_path_appends_a_counter_when_a_same_second_name_exists() -> None:
+    db = Path("/launch/keel.db")
+    base = up.backup_path(db, "0.7.0", NOW_TS)
+    second = up.backup_path(db, "0.7.0", NOW_TS, occupied={base.name})
+    assert second != base
+    assert second.name == f"{base.name}-2"
+    third = up.backup_path(db, "0.7.0", NOW_TS, occupied={base.name, second.name})
+    assert third.name == f"{base.name}-3"
+
+
+def test_run_update_twice_in_one_second_writes_two_backups_not_one(tmp_path: Path) -> None:
+    """Second granularity is not operator granularity: two runs inside one second (a
+    failed run retried immediately) must not overwrite the first backup -- a counter
+    suffix is appended, and BOTH exist afterwards."""
+    launch = _deployment(tmp_path)
+    ops = _FakeOps(launch)
+    first, _steps = _run(_plan(launch), ops)
+    assert first.ok is True
+    second, _steps = _run(_plan(launch), ops)
+    assert second.ok is True
+    for name in ("keel.db.bak-before-0.7.0-*", "keel-live.db.bak-before-0.7.0-*"):
+        assert len(list(launch.glob(name))) == 2, name
 
 
 # -- run_update against the fake environment -------------------------------------------------------
@@ -396,9 +548,10 @@ def test_run_update_backs_up_before_installing_and_finishes_the_whole_procedure(
     baks = sorted(p.name for p in launch.glob("keel*.db.bak-before-0.7.0-*"))
     assert len(baks) == 2
     assert all(".bak-before-0.7.0-" in name for name in baks)
-    # the backups hold the PRE-update content even though migrate rewrote the dbs
+    # the backups hold the PRE-update content (as clean, openable snapshots) even though
+    # migrate rewrote the dbs
     assert baks[0].startswith("keel-live.db.bak-before-")
-    assert (launch / baks[0]).read_bytes() == b"original-live-db"
+    assert _read_marker(launch / baks[0]) == "original-live-db"
     # every step was streamed
     assert any("download" in step.lower() for step in steps)
     assert any("back" in step.lower() for step in steps)
@@ -438,6 +591,39 @@ def test_run_update_refuses_a_zero_byte_download(tmp_path: Path) -> None:
     # nothing was installed: the running binary is unchanged
     assert not any(event[0] == "install" for event in ops.events)
     assert "nothing was installed" in (result.error or "").lower()
+    # the torn file was REMOVED, and the failure says so -- a partial wheel left in
+    # Release/ must not poison a later rollback's superseded set
+    assert "removed" in (result.error or "").lower() or any(
+        "removed" in step.lower() for step in steps
+    )
+    assert not list((launch / "Release").glob("*0.7.0*.whl"))
+    # the previous wheels (the recovery path) stay
+    assert len(list((launch / "Release").glob("*.whl"))) == 4
+
+
+def test_a_download_larger_than_the_guard_is_refused_not_streamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read is BOUNDED (200 MiB, generous vs the ~1 MiB wheels): a mis-pointed URL
+    (a release page, someone's screen recording) must be refused, never streamed to
+    disk -- and nothing lands in Release/ when it is."""
+
+    class _HugeResponse:
+        def __enter__(self) -> _HugeResponse:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self, n: int = -1) -> bytes:
+            return b"x" * (n + 1)  # always one byte MORE than the bound allows
+
+    monkeypatch.setattr(
+        up.urllib.request, "urlopen", lambda url, timeout=None: _HugeResponse()
+    )
+    with pytest.raises(up.UpdateError, match="200 MiB"):
+        up._download_file("https://example/huge", tmp_path / "w.whl")
+    assert not (tmp_path / "w.whl").exists()
 
 
 def test_run_update_verify_failure_is_loud_reinstalls_the_previous_wheels_best_effort(
@@ -468,6 +654,107 @@ def test_run_update_verify_failure_is_loud_reinstalls_the_previous_wheels_best_e
     assert "installed" in error  # the new wheels ARE in the venv -- pip already replaced
     assert "runbook" in error or "manual" in error
     assert any("best-effort" in step.lower() or "reinstall" in step.lower() for step in steps)
+    # the rollback text points at the BACKUPS as the real data recovery, and states the
+    # additive-migration belief as an ASSUMPTION, never a guarantee
+    assert any("assumption" in step.lower() for step in steps)
+    assert any(".bak-before" in step for step in steps)
+
+
+def test_run_update_install_failure_says_the_venv_was_not_updated_and_never_rolls_back(
+    tmp_path: Path,
+) -> None:
+    """Phase-true failure text: when the failure IS the install (uv absent, a timeout,
+    a torn wheel that passed the non-empty check), the wheels are NOT claimed
+    installed -- the venv was not updated, or is half-updated, and `keel versions` is
+    the honest next step. No reinstall of the previous wheels is attempted (uv already
+    refused this venv once; the previous wheels are still in Release/ untouched)."""
+    launch = _deployment(tmp_path)
+    plan = _plan(launch)
+    ops = _FakeOps(launch)
+    ops.fail_install_with = "uv pip install failed (exit 2): wheel is corrupted"
+    result, steps = _run(plan, ops)
+
+    assert result.ok is False
+    assert result.rolled_back is False
+    assert [event[0] for event in ops.events].count("install") == 0  # no reinstall attempted
+    error = (result.error or "").lower()
+    assert "not updated" in error
+    assert "half-updated" in error
+    assert "keel versions" in error
+    # the downloaded (possibly torn) wheels were removed from Release/ so they cannot
+    # poison a later rollback's superseded set; the previous four stay
+    wheels = sorted(p.name for p in (launch / "Release").glob("*.whl"))
+    assert wheels == sorted(
+        f"{prefix}-0.6.0-py3-none-any.whl" for prefix in up.PRODUCTION_WHEEL_PREFIXES
+    )
+    assert any("removed" in step.lower() for step in steps)
+    assert "runbook" in error or "manual" in error
+
+
+def test_run_update_migrate_failure_states_the_wheels_are_installed(tmp_path: Path) -> None:
+    """Phase-true failure text for a POST-install failure (the migrate step): the
+    wheels ARE installed -- pip replaced the packages -- and the best-effort reinstall
+    of the previous wheels runs exactly as for a verify failure."""
+    launch = _deployment(tmp_path)
+    plan = _plan(launch)
+    ops = _FakeOps(launch)
+    ops.fail_migrate_with = "`keel migrate --db keel.db` failed (exit 1): locked"
+    result, _steps = _run(plan, ops)
+
+    assert result.ok is False
+    assert result.rolled_back is True
+    error = (result.error or "").lower()
+    assert "after the wheels were installed" in error
+    assert "are installed" in error
+    assert [event[0] for event in ops.events].count("install") == 2  # the rollback ran
+
+
+def test_the_default_backup_uses_the_sqlite_backup_api_not_a_file_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live database is snapshotted through SQLite's own online-backup API (a
+    connection pair per database): a plain `copy2` of a database with a live rollback
+    journal (launchd writers) can be torn -- half old pages, half new -- and restore as
+    corrupt. The spy proves the sqlite route, the functional test below the guarantee."""
+    launch = _deployment(tmp_path)
+    plan = _plan(launch)
+    ops = _FakeOps(launch)
+    real_connect = sqlite3.connect
+    connected: list[tuple[object, bool]] = []
+
+    def _spy_connect(*args: object, **kwargs: object) -> object:
+        # tag each connection with whether it happened BEFORE anything installed -- the
+        # backups' own connections, not the ordering pin's reads
+        before_install = ops.installs == 0
+        connected.append((args[0] if args else kwargs.get("database"), before_install))
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(up.sqlite3, "connect", _spy_connect)
+    result, _steps = _run(plan, ops)
+    assert result.ok is True
+    # the sqlite route: a source+destination connection pair per database, all made
+    # before anything installed -- a plain copy2 would connect zero times
+    backup_connects = [c for c, before_install in connected if before_install]
+    assert len(backup_connects) == 4
+    assert len([c for c in backup_connects if ".bak-before-" in str(c)]) == 2
+
+
+def test_a_backup_of_a_midtransaction_database_opens_cleanly(tmp_path: Path) -> None:
+    """The functional guarantee: with a writer holding an OPEN transaction (the
+    launchd-writer pattern), the backup opens cleanly, passes integrity_check, and
+    carries the last COMMITTED state -- never a torn page mix."""
+    db = tmp_path / "keel.db"
+    _write_db(db, "committed")
+    dest = tmp_path / "keel.db.bak-before-0.7.0-x"
+    writer = sqlite3.connect(db)
+    try:
+        writer.execute("BEGIN")
+        writer.execute("INSERT INTO marker VALUES ('not-committed')")
+        up._backup_file(db, dest)
+    finally:
+        writer.rollback()
+        writer.close()
+    assert _read_marker(dest) == "committed"  # integrity_ok + the committed row only
 
 
 def test_run_update_verify_failure_without_previous_wheels_says_manual_recovery(
@@ -512,6 +799,10 @@ def test_the_default_install_runs_uv_with_the_venv_and_the_four_paths(
             "install",
             "--python",
             str(venv),
+            # the runbook's own command carries --find-links Release so the wheels'
+            # ==-pinned siblings resolve from Release/ (they are not on PyPI)
+            "--find-links",
+            str(launch / "Release"),
             *[str(launch / "Release" / f"{p}-0.7.0-py3-none-any.whl")
               for p in up.PRODUCTION_WHEEL_PREFIXES],
         ]
@@ -593,6 +884,42 @@ def test_build_relaunch_argv_replaces_the_entry_and_keeps_the_tui_args() -> None
     ]
 
 
+def test_build_relaunch_argv_preserves_flags_before_the_subcommand_verbatim() -> None:
+    """A deployment wrapper execs `keel --config X --db Y tui`: argv[0] is the WRAPPER,
+    not the subcommand -- the arguments after argv[0] must be carried VERBATIM, byte
+    for byte, no reordering and no prepending. (The old fallback prepended `tui` here,
+    producing `keel tui --config X --db Y tui` and a click usage error on every
+    relaunch of a wrapped deployment.)"""
+    venv = Path("/deployment/.venv/bin/python")
+    original = [
+        "/deployment/keel-live",
+        "--config",
+        "config.live-sandbox.yaml",
+        "--db",
+        "keel-live.db",
+        "tui",
+    ]
+    assert up.build_relaunch_argv(venv, original) == [
+        "/deployment/.venv/bin/keel",
+        "--config",
+        "config.live-sandbox.yaml",
+        "--db",
+        "keel-live.db",
+        "tui",
+    ]
+
+
+def test_build_relaunch_argv_preserves_a_leading_subcommand_verbatim() -> None:
+    venv = Path("/deployment/.venv/bin/python")
+    original = ["/deployment/.venv/bin/keel", "tui", "--interval", "5"]
+    assert up.build_relaunch_argv(venv, original) == [
+        "/deployment/.venv/bin/keel",
+        "tui",
+        "--interval",
+        "5",
+    ]
+
+
 def test_build_relaunch_argv_falls_back_to_the_tui_command_when_the_argv_does_not_name_it(
 ) -> None:
     venv = Path("/deployment/.venv/bin/python")
@@ -612,6 +939,24 @@ def test_relaunch_tui_execvs_the_new_console_entry(tmp_path: Path) -> None:
     with pytest.raises(up.UpdateError, match="relaunch"):
         relaunch()  # a real execv never returns; the fake does, and the closure says so
     assert recorded == [(str(venv.parent / "keel"), [str(venv.parent / "keel"), "tui"])]
+
+
+def test_relaunch_tui_maps_an_execv_oserror_to_the_manual_instruction(tmp_path: Path) -> None:
+    """An execv that RAISES (permissions, a missing interpreter) surfaces as the
+    service's honest UpdateError naming the manual `keel tui` -- never a bare OSError
+    for a front-end to crash on."""
+
+    def _raising_execv(path: str, argv: list[str]) -> None:
+        raise OSError(13, "permission denied")
+
+    relaunch = up.relaunch_tui(
+        tmp_path / ".venv/bin/python",
+        ["/old/keel", "tui"],
+        execv=_raising_execv,
+    )
+    with pytest.raises(up.UpdateError, match="keel tui") as excinfo:
+        relaunch()
+    assert "permission denied" in str(excinfo.value)
 
 
 # -- the gate: ONE wording, both front-ends --------------------------------------------------------
@@ -710,6 +1055,9 @@ def _cli_plan_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(up, "installed_distributions", lambda: dict(_INSTALLED))
     monkeypatch.setattr(
         up, "_running_python", lambda: tmp_path / ".venv/bin/python"
+    )
+    monkeypatch.setattr(
+        up, "_running_package_file", lambda: _fake_venv_package(tmp_path)
     )
 
 

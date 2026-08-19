@@ -320,6 +320,7 @@ def update_check(
     fetch: Callable[[str], bytes] | None = None,
     launch_dir: Any = None,
     venv_python: Any = None,
+    package_file: Any = None,
 ) -> update.UpdatePlan:
     """The entry-time read: ONE public-API release check plus the plan -- the versions
     view's contract (read once, hold), never per poll. A network/API failure raises
@@ -329,6 +330,7 @@ def update_check(
         update.latest_release(fetch=fetch),
         launch_dir=launch_dir,
         venv_python=venv_python,
+        package_file=package_file,
     )
 
 
@@ -404,11 +406,16 @@ def build_update_error_lines(error: str) -> list[ScreenLine]:
 
 
 def build_update_result_lines(
-    result: update.UpdateResult, progress: list[str] | tuple[str, ...]
+    result: update.UpdateResult,
+    progress: list[str] | tuple[str, ...],
+    *,
+    relaunch_pending: bool = False,
 ) -> list[ScreenLine]:
     """The held run result: the streamed step lines VERBATIM above (wrapped, never
     clipped -- how far it got is the detail), then the shared summary/recovery
-    renderer's lines, failure text loud. PURE over the held values."""
+    renderer's lines, failure text loud. `relaunch_pending` -- a verified success
+    whose execv failed, held for an Enter retry -- switches the footer from re-run to
+    retry-the-relaunch. PURE over the held values."""
     lines: list[ScreenLine] = [
         ScreenLine("keel console -- account / update results", "heading"),
         _blank(),
@@ -428,9 +435,12 @@ def build_update_result_lines(
     lines.append(_blank())
     for wrapped in _wrap(CTRL_C_DISCLOSURE, indent=""):
         lines.append(ScreenLine(wrapped, "muted"))
-    lines.append(
-        ScreenLine("Enter re-runs · q/Esc/m back to the Account menu", "muted")
+    footer = (
+        "Enter retries the relaunch (re-installs nothing) · q/Esc/m back to the menu"
+        if relaunch_pending
+        else "Enter re-runs · q/Esc/m back to the Account menu"
     )
+    lines.append(ScreenLine(footer, "muted"))
     return lines
 
 
@@ -441,14 +451,17 @@ def run_update_at_terminal(
     gate_fn: Callable[[update.UpdatePlan], bool] | None = None,
     relaunch_fn: Callable[[], object] | None = None,
     run_fn: Callable[..., update.UpdateResult] | None = None,
+    on_relaunch_failure: Callable[[BaseException], object] | None = None,
 ) -> update.UpdateResult:
     """THE update run, at the terminal: the CLI's OWN typed gate rides the service's
-    `confirm_gate` seam (there is no ungated path to the mutations), the service's
-    streamed lines collect into `progress`, and -- only on a verified success -- the
-    relaunch closure runs (execv, terminal already restored by the suspend dance; a
-    faked execv returns and the progress says so). Returns the service's
-    `UpdateResult` so the live loop can hold and render it. `gate_fn`/`run_fn` are
-    injectable so the loop's tests can drive the contract without any of it."""
+    `confirm_gate` seam (both shipped front-ends gate the run; nothing keel ships calls
+    the service ungated), the service's streamed lines collect into `progress`, and --
+    only on a verified success -- the relaunch closure runs (execv, terminal already
+    restored by the suspend dance). A relaunch that RAISES (execv refused) is rendered
+    into `progress` with the manual `keel tui` start and reported through
+    `on_relaunch_failure` -- the update itself is done and verified, so its result is
+    returned held-ok, never lost to the exception. `gate_fn`/`run_fn` are injectable
+    so the loop's tests can drive the contract without any of it."""
     gate = gate_fn if gate_fn is not None else update.typed_update_gate
     service = run_fn if run_fn is not None else update.run_update
     result = service(plan, echo=progress.append, confirm_gate=lambda: gate(plan))
@@ -458,6 +471,17 @@ def run_update_at_terminal(
             "on the new build."
         )
         if relaunch_fn is not None:
-            relaunch_fn()
+            try:
+                relaunch_fn()
+            except Exception as exc:  # execv refused: the update itself is DONE and verified
+                progress.append(f"RELAUNCH FAILED: {exc}")
+                progress.append(
+                    "the new build IS installed and verified -- run `keel tui` by hand "
+                    "(or your deployment wrapper). Enter retries the relaunch; it "
+                    "re-installs nothing."
+                )
+                if on_relaunch_failure is not None:
+                    on_relaunch_failure(exc)
+                return result
             progress.append("relaunch did not replace the process -- run `keel tui` by hand.")
     return result

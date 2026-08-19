@@ -473,12 +473,25 @@ def test_the_console_tree_has_no_placeholders_left() -> None:
 
 
 def _fake_plan(tmp_path: Any, *, offered: bool = True) -> Any:
+    import json
+    from pathlib import Path
+
     from keel.commands import update as up
 
     current = "0.6.0"
     latest = "0.7.0" if offered else "0.6.0"
     (tmp_path / "keel.db").write_bytes(b"paper db")
     (tmp_path / "keel-live.db").write_bytes(b"live db")
+    # the runbook's deployment layout: the running package resolves from the launch
+    # folder's OWN .venv site-packages, installed from a wheel -- so the plan is OFFERED
+    site = tmp_path / ".venv/lib/python3.12/site-packages"
+    (site / "keel").mkdir(parents=True, exist_ok=True)
+    (site / "keel" / "__init__.py").write_text("")
+    dist_info = site / "keel_trader-0.6.0.dist-info"
+    dist_info.mkdir(exist_ok=True)
+    (dist_info / "direct_url.json").write_text(
+        json.dumps({"url": "file:///Release/keel_trader-0.6.0-py3-none-any.whl"})
+    )
     return up.plan_update(
         up.parse_release(
             b'{"tag_name": "v%s", "assets": [%s]}'
@@ -500,6 +513,7 @@ def _fake_plan(tmp_path: Any, *, offered: bool = True) -> Any:
         },
         launch_dir=tmp_path,
         venv_python=tmp_path / ".venv/bin/python",
+        package_file=Path(site / "keel" / "__init__.py"),
     )
 
 
@@ -683,6 +697,69 @@ def test_run_update_at_terminal_gates_then_runs_then_relaunches(
     assert relaunched == []
 
 
+def test_run_update_at_terminal_a_failed_relaunch_is_rendered_not_lost(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An execv that RAISES (the relaunch closure wraps the OSError into an
+    `UpdateError` naming the manual `keel tui`) must not escape the runner: the update
+    itself SUCCEEDED and is verified, so the held result stays ok, the failure and the
+    manual start render into the held progress, and the `on_relaunch_failure` seam
+    fires so the live loop can hold the retry."""
+    from keel.commands import update as up
+
+    plan = _fake_plan(tmp_path)
+    result = up.UpdateResult(ok=True, steps=("verified",), error=None,
+                             rolled_back=False, backups=())
+
+    def _fake_run(a_plan: Any, *, echo: Any, confirm_gate: Any) -> up.UpdateResult:
+        echo("the service streamed a line")
+        return result
+
+    monkeypatch.setattr(up, "run_update", _fake_run)
+
+    def _raising_relaunch() -> None:
+        raise up.UpdateError(
+            "relaunch failed ([Errno 13] permission denied): execv could not start the "
+            "new build -- start the console by hand: `/x/.venv/bin/keel tui`"
+        )
+
+    failures: list[BaseException] = []
+    progress: list[str] = []
+    held = ac.run_update_at_terminal(
+        plan,
+        progress=progress,
+        gate_fn=lambda _plan: True,
+        relaunch_fn=_raising_relaunch,
+        on_relaunch_failure=failures.append,
+    )
+    assert held.ok is True  # the update completed and verified; only the execv failed
+    joined = "\n".join(progress)
+    assert "RELAUNCH FAILED" in joined
+    assert "keel tui" in joined  # the manual start, named
+    assert len(failures) == 1
+
+
+def test_build_update_result_lines_footer_distinguishes_a_pending_relaunch(
+    tmp_path: Any,
+) -> None:
+    """The result footer says what Enter DOES: re-run the check normally, but retry
+    ONLY the relaunch when one is pending -- the state that distinguishes them."""
+    from keel.commands import update as up
+
+    result = up.UpdateResult(ok=True, steps=("verified",), error=None,
+                             rolled_back=False, backups=())
+    normal = "\n".join(
+        line.text for line in ac.build_update_result_lines(result, progress=[])
+    )
+    assert "Enter re-runs" in normal
+    pending = "\n".join(
+        line.text
+        for line in ac.build_update_result_lines(result, progress=[], relaunch_pending=True)
+    )
+    assert "Enter retries the relaunch" in pending
+    assert "re-installs nothing" in pending
+
+
 def _drive_update(
     keys: list[int],
     monkeypatch: pytest.MonkeyPatch,
@@ -839,3 +916,48 @@ def test_run_live_update_success_relaunches_the_console_on_the_new_build(
     assert relaunched and relaunched[0][0] == tmp_path / ".venv/bin/python"
     assert relaunched[0][1] and relaunched[0][1][0]  # the original argv is carried
     assert any("updated" in t.lower() or "0.7.0" in t for t in painted)
+
+
+def test_run_live_a_failed_relaunch_is_held_and_enter_retries_only_the_relaunch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A verified update whose execv RAISES: the result is HELD (never a silent re-ARM
+    of the whole update), the manual `keel tui` start is on screen, and a second Enter
+    retries ONLY the relaunch -- the service is not re-entered, nothing re-installs."""
+    plan = _fake_plan(tmp_path)
+    from keel.commands import update as up
+
+    result = up.UpdateResult(ok=True, steps=("verified",), error=None,
+                             rolled_back=False, backups=())
+    service_runs: list[int] = []
+
+    def _fake_run(a_plan: Any, *, echo: Any, confirm_gate: Any) -> up.UpdateResult:
+        service_runs.append(1)
+        echo("the service streamed a line")
+        return result
+
+    monkeypatch.setattr(up, "run_update", _fake_run)
+    monkeypatch.setattr(ac, "update_check", lambda **_kwargs: plan)
+    relaunch_attempts: list[int] = []
+
+    def _failing_relaunch(venv_python: Any, original_argv: Any) -> Any:
+        def _closure() -> None:
+            relaunch_attempts.append(1)
+            raise up.UpdateError(
+                "relaunch failed ([Errno 13] permission denied): execv could not start "
+                "the new build -- start the console by hand: `keel tui`"
+            )
+
+        return _closure
+
+    monkeypatch.setattr(up, "relaunch_tui", _failing_relaunch)
+    # m -> menu; '8' -> account; '3' -> update; poll; Enter -> the run (relaunch
+    # FAILS, result held); poll; Enter -> the relaunch RETRY (fails again, held)
+    keys = [ord("m"), ord("8"), -1, ord("3"), -1, ord("\r"), -1, ord("\r"), -1]
+    stdscr = _drive(_repo(), _config(), keys, monkeypatch, tmp_path)
+    painted = [call[2] for call in stdscr.calls]
+    assert len(service_runs) == 1  # the update ran ONCE -- Enter did not re-run it
+    assert len(relaunch_attempts) == 2  # failed once, retried once by the second Enter
+    assert any("RELAUNCH FAILED" in t for t in painted)
+    assert any("keel tui" in t for t in painted)
+    assert any("re-installs nothing" in t for t in painted)
