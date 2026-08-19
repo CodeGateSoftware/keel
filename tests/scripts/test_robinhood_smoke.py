@@ -7,11 +7,13 @@ worth pinning. Everything here runs offline with a stub transport.
 
 from __future__ import annotations
 
+import base64
 import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import nacl.signing
 import pytest
 
 from scripts.robinhood_smoke import (
@@ -27,7 +29,23 @@ from scripts.robinhood_smoke import (
     shape_of,
 )
 
-_VALID_SEED_B64 = "A" * 44  # a base64 32-byte Ed25519 seed is 44 characters
+#: Raw bytes behind the test seed. Any 32 bytes is a valid Ed25519 seed.
+_SEED_RAW = bytes(range(32))
+
+#: A REAL base64 Ed25519 seed, not 44 arbitrary characters. It has to be real now: the guard
+#: derives a public key from it, and `"A" * 44` is not valid base64 for 32 bytes at all -- it
+#: decodes to 33, which is the sort of thing a constant named `_VALID_SEED_B64` should not be.
+_VALID_SEED_B64 = base64.b64encode(bytes(_SEED_RAW)).decode()
+
+#: The public key that seed derives to -- the exact value an operator pastes into Robinhood's
+#: credential page, and the exact value that must never appear in `ROBINHOOD_API_KEY`.
+_ITS_PUBLIC_KEY_B64 = base64.b64encode(
+    bytes(nacl.signing.SigningKey(bytes(_SEED_RAW)).verify_key)
+).decode()
+
+#: Stands in for a real `rh-api-<uuid>`: the shape observed on the one credential known to
+#: authenticate. Not base64, which is the property the guard keys off.
+_VALID_API_KEY = "rh-api-1e2d3c4b-5a69-4788-9f01-23456789abcd"
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -303,19 +321,72 @@ def test_a_missing_api_key_is_named(tmp_path: Path) -> None:
         load_credentials(env)
 
 
-def test_a_public_key_pasted_as_the_private_key_is_caught_before_a_request(
-    tmp_path: Path,
-) -> None:
-    """Wrong-length seeds must fail here, not as a 401 that reads like a signing bug."""
-    env = _write_env(tmp_path, "ROBINHOOD_API_KEY=abc\nROBINHOOD_PRIVATE_KEY=tooshort\n")
+def test_a_misshapen_private_key_is_caught_before_a_request(tmp_path: Path) -> None:
+    """A PEM, a hex string or a truncated paste must fail here, not as a 401 that reads like a
+    signing bug."""
+    env = _write_env(
+        tmp_path, f"ROBINHOOD_API_KEY={_VALID_API_KEY}\nROBINHOOD_PRIVATE_KEY=tooshort\n"
+    )
     with pytest.raises(SystemExit) as excinfo:
         load_credentials(env)
-    assert "PUBLIC key" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "8 characters" in message
+    # ...and it no longer CLAIMS to have caught a public key, which it cannot do by length.
+    assert "does NOT mean the public key" in message
+
+
+def test_the_public_key_pasted_as_the_api_key_is_named_exactly(tmp_path: Path) -> None:
+    """The real 2026-08-19 incident, and the whole reason this guard was rewritten.
+
+    A seed and a public key are both 32 bytes and both 44 base64 characters, so no length check
+    can separate them -- the old guard's comment claimed it did, and the operator got a bare 401
+    instead. Deriving the public key from the seed is the only test that actually distinguishes
+    them, and it turns an afternoon of "is it the key, the clock, or the signature?" into one
+    line naming the file, the variable and the fix.
+    """
+    env = _write_env(
+        tmp_path,
+        f"ROBINHOOD_API_KEY={_ITS_PUBLIC_KEY_B64}\nROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n",
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        load_credentials(env)
+    message = str(excinfo.value)
+    assert "PUBLIC key of ROBINHOOD_PRIVATE_KEY" in message
+    # The fix has to be actionable without a round trip to figure out what to do.
+    assert "robinhood.com/account/crypto" in message
+    assert "Add key" in message
+    assert "ROBINHOOD_PRIVATE_KEY stays as it is" in message
+
+
+def test_an_unrelated_ed25519_key_in_the_api_key_slot_is_still_refused(tmp_path: Path) -> None:
+    """The same mistake made with a DIFFERENT credential's public key. It cannot be named as
+    precisely -- the guard has nothing to match it against -- but a 32-byte base64 value is never
+    an API key identifier whatever the identifier format turns out to be, so it must not pass."""
+    other = base64.b64encode(bytes(range(100, 132))).decode()  # not _SEED_RAW, not its public key
+    env = _write_env(
+        tmp_path, f"ROBINHOOD_API_KEY={other}\nROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n"
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        load_credentials(env)
+    assert "Ed25519 KEY" in str(excinfo.value)
+
+
+def test_a_real_api_key_is_not_mistaken_for_base64(tmp_path: Path) -> None:
+    """`rh-api-<uuid>` contains `-`, which is outside the base64 alphabet. Without
+    `validate=True`, `b64decode` DISCARDS such characters instead of refusing, and a genuine API
+    key could decode to 32 bytes by accident and be rejected as a pasted key. This is the test
+    that pins the strict decode."""
+    env = _write_env(
+        tmp_path, f"ROBINHOOD_API_KEY={_VALID_API_KEY}\nROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n"
+    )
+    assert load_credentials(env) == (_VALID_API_KEY, _VALID_SEED_B64)
 
 
 def test_a_wellformed_credential_is_returned(tmp_path: Path) -> None:
-    env = _write_env(tmp_path, f"ROBINHOOD_API_KEY=abc\nROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n")
-    assert load_credentials(env) == ("abc", _VALID_SEED_B64)
+    env = _write_env(
+        tmp_path, f"ROBINHOOD_API_KEY={_VALID_API_KEY}\nROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n"
+    )
+    assert load_credentials(env) == (_VALID_API_KEY, _VALID_SEED_B64)
 
 
 # --- probes and fixtures agree ---------------------------------------------------------------
