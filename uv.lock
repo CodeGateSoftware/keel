@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "keel-broker-alpaca",
     "keel-broker-api",
     "keel-broker-coinbase",
     "keel-broker-fake",
@@ -478,6 +479,23 @@ wheels = [
 ]
 
 [[package]]
+name = "keel-broker-alpaca"
+version = "0.9.3"
+source = { editable = "packages/keel-broker-alpaca" }
+dependencies = [
+    { name = "keel-broker-api" },
+    { name = "keel-core" },
+    { name = "requests" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
+    { name = "keel-core", editable = "packages/keel-core" },
+    { name = "requests", specifier = ">=2.32.0" },
+]
+
+[[package]]
 name = "keel-broker-api"
 version = "0.9.3"
 source = { editable = "packages/keel-broker-api" }
@@ -576,6 +594,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "keel-broker-alpaca" },
     { name = "keel-broker-fake" },
     { name = "keel-broker-robinhood" },
     { name = "mypy" },
@@ -595,6 +614,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "keel-broker-alpaca", editable = "packages/keel-broker-alpaca" },
     { name = "keel-broker-fake", editable = "packages/keel-broker-fake" },
     { name = "keel-broker-robinhood", editable = "packages/keel-broker-robinhood" },
     { name = "mypy", specifier = ">=1.18.0" },

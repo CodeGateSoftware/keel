@@ -1,0 +1,26 @@
+[project]
+name = "keel-broker-alpaca"
+version = "0.9.3"
+description = "Alpaca Trading API adapter for keel (US equities, cash account)"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+# Siblings pinned `==` (see the root `pyproject.toml`); `requests` matches the
+# `keel-broker-robinhood` transport convention -- raw REST over an injected transport,
+# deliberately NO `alpaca-py` SDK: Alpaca's Trading + Market Data APIs are plain
+# JSON-over-HTTPS with two header credentials, so the SDK would add a version-churning
+# dependency for nothing the port needs.
+dependencies = ["keel-core==0.9.3", "keel-broker-api==0.9.3", "requests>=2.32.0"]
+
+[project.entry-points."keel.brokers"]
+alpaca = "keel_broker_alpaca:AlpacaAdapter"
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv.sources]
+keel-core = { workspace = true }
+keel-broker-api = { workspace = true }
