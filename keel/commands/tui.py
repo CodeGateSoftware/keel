@@ -1377,22 +1377,21 @@ def _do_fetch(open_state: OpenState, now_fn: NowFn) -> str:
 def _do_screen_report(open_state: OpenState) -> ScreenReport:
     """Build a fresh `ScreenReport` for the current allowlist -- OFFLINE, DB reads only, rebuilt
     every poll while the screen overlay is open, exactly like insights' per-poll rebuild.
-    `_screen_product` (THE single admission gate every candidate source must route through) lives
-    in `keel.cli`, which itself imports THIS module to wire up `tui_cmd`/`run_live` -- importing
-    it at module load time here would cycle, so it is lazy-imported inside this function, exactly
-    like `_do_fetch` lazy-imports the fetch primitives for the same reason.
+    `screen_product` (THE single admission gate every candidate source must route through) lives
+    in `keel.commands.assets` (issue #387 C1) -- the shared service layer, importable here with
+    no `keel.cli` cycle and no lazy-import dodge: one gate, two front-ends.
     Thin I/O -- not unit-tested directly, only smoke-tested via `run_live`."""
-    from keel.cli import _screen_product
+    from keel.commands.assets import screen_product
 
     repo, config = open_state()
-    return build_screen_report(repo, config, _screen_product)
+    return build_screen_report(repo, config, screen_product)
 
 
 def _do_propose_view(open_state: OpenState) -> ProposeView:
     """Build a fresh `ProposeView` over the newest shortlist in `config.proposals_dir` -- OFFLINE
     (DB + local filesystem reads only), rebuilt every poll while the propose overlay is open.
-    `_screen_product` is lazy-imported for the identical reason `_do_screen_report` lazy-imports
-    it.
+    `screen_product` comes from `keel.commands.assets` for the identical reason
+    `_do_screen_report` names: the shared gate, not a `keel.cli` import.
 
     `build_propose_view` is fail-soft about the shortlist FILE -- a missing directory, a
     permissions error, a non-UTF-8 file, invalid JSON, a malformed top-level shape all come back
@@ -1401,12 +1400,12 @@ def _do_propose_view(open_state: OpenState) -> ProposeView:
     it once let a `UnicodeDecodeError` from the read itself through (that specific hole is now
     closed -- see `build_propose_view`'s own `except (OSError, UnicodeDecodeError)`), and
     `build_propose_view` still SCREENS every parsed candidate afterwards, which means real DB
-    reads through `_screen_product`. A locked DB, mid-screen, surfaces here exactly like one from
+    reads through `screen_product`. A locked DB, mid-screen, surfaces here exactly like one from
     `open_state()` does. The caller's `try/except` is load-bearing for both."""
-    from keel.cli import _screen_product
+    from keel.commands.assets import screen_product
 
     repo, config = open_state()
-    return build_propose_view(repo, config, _screen_product)
+    return build_propose_view(repo, config, screen_product)
 
 
 def _do_discover_report(open_state: OpenState) -> DiscoverReport:

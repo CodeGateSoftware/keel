@@ -288,7 +288,8 @@ def screen_asset(
         facts.product_id,
     ):
         # A mismatch is treated as ABSENCE, not as a mismatch worth reporting in its own right.
-        # `_screen_product` looks the row up BY this pair, so the two can only diverge via a
+        # `keel.commands.assets.screen_product` looks the row up BY this pair, so the two can
+        # only diverge via a
         # direct caller passing a statement about some other listing -- and a claim about a
         # different product is not weaker evidence about this one, it is no evidence at all.
         failures.append(
@@ -498,8 +499,9 @@ def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
     by its own close. That makes the number comparable across assets and comparable to the
     venue's reported quote volume.
 
-    **Both callers must use this.** `cli._market_facts` feeds it to `screen_asset`'s liquidity
-    criterion; `assets discover --probe-liquidity` uses it to pre-filter on the SAME statistic
+    **Both callers must use this.** `keel.commands.assets.market_facts` feeds it to
+    `screen_asset`'s liquidity criterion; `assets discover --probe-liquidity` uses it to
+    pre-filter on the SAME statistic
     the gate will later apply. A second copy next to whichever caller needed it would drift, and
     the symptom of that drift is the one this function exists to prevent: a sweep that proposes
     an asset the screen then rejects on liquidity, or quietly drops one it would have admitted.

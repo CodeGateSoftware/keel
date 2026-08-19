@@ -67,25 +67,34 @@ in `keel/commands/*` and are registered here via `cli.add_command(...)`: `db`, `
 `keel.commands._common` and are re-imported here; `_is_interactive` is reached as
 `_common._is_interactive()` so a single patch point in `keel.commands._common` drives every gate
 wherever its command is defined.
+
+**Thin by construction (issue #387 C1, the TUI PRD's O2).** Every command body here that used
+to carry logic now delegates to a service in `keel/commands/*`, so the CLI and the TUI are two
+front-ends over ONE implementation: `fetch` -> `commands.fetch.run_fetch`, `monitor` ->
+`commands.monitor.run_monitor`, `simulate` -> `commands.simulate.run_simulation`, the `assets`
+decision layer -> `commands.assets` (`screen_product` is THE admission gate), the order-preview
+confirm gate -> `commands.confirm._interactive_confirm`, `kill`/`resume`/`resume-entries`/
+`record-flow`/`reset-hwm` -> `commands.trading`, `pnl` -> `commands.pnl`,
+`purification`'s rendering -> `commands.purification`. A command body here parses click
+options, builds the broker at the `_build_broker` seam (LAZILY, where the old body did), calls
+the service, and prints/raises -- nothing else. The names the tests pin through THIS module
+(`_screen_product`, `_assess_products`, `_SIM_SLIPPAGE_PCT`, `_interactive_confirm`, the
+preview markers, `history_mod`/`repair_mod`) are re-imports of those same service objects, not
+copies: `tests/commands/test_service_parity.py` pins the identity, and
+`tests/commands/test_service_isolation.py` pins that the service layer never imports this file.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import click
-from keel_broker_api.results import Preview, SessionState
-from keel_core.products import quote_currency_of
 
 from keel import agent
-from keel.analysis import pnl as pnl_analysis
-from keel.commands import _common
 from keel.commands._common import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_DB_PATH,
@@ -98,15 +107,69 @@ from keel.commands._common import (
 )
 from keel.commands._products import (
     _default_sim_products,
-    _history_product,
+    # No longer used in this file (holdings derives products inside the service layer now), but
+    # imported on purpose: `tests/compliance/test_assets_cli.py` pins the product-id derivation
+    # THROUGH `keel.cli` as the surface an operator's config meets.
+    _history_product,  # noqa: F401 -- pinned by tests
     parse_products_option,
 )
+from keel.commands.assets import VENUE as _VENUE
+from keel.commands.assets import (
+    broker_auth_hint,
+    gather_holdings,
+    render_discover,
+    render_holdings,
+    render_screened_asset,
+    run_discovery,
+    screen_products,
+)
+from keel.commands.assets import screen_product as _screen_product
 from keel.commands.autonomy import autonomy_group
+
+# The order-preview confirmation gate lives in `keel.commands.confirm` (issue #387 C1: the CLI
+# and the TUI must hand the executor ONE confirm function, never a front-end copy). Re-imported
+# here so the tests' `cli_module.*` pins -- the marker strings, and `_interactive_confirm`'s
+# identity as the very object `agent` receives -- keep resolving to these exact objects.
+from keel.commands.confirm import (  # noqa: F401 -- deliberate re-export, pinned by tests
+    DEGRADED_PREVIEW_PHRASE,
+    NATIVE_PREVIEW_MARKER,
+    SYNTHETIC_PREVIEW_MARKER,
+    UNPRICED_PREVIEW_MARKER,
+    UNREADABLE_PREVIEW_MARKER,
+    _interactive_confirm,
+)
 from keel.commands.db import db_group
+from keel.commands.fetch import assess_products as _assess_products  # noqa: F401 -- pinned by tests
+
+# The fetch flow (freshness sweep, --check verdict, ensure/repair pass) lives in
+# `keel.commands.fetch` (issue #387 C1) so the TUI's Data menu dispatches to exactly what the
+# CLI calls. `_assess_products` is re-imported because the fetch tests pin the sweep's
+# window-bounded invariant THROUGH this module's name.
+from keel.commands.fetch import run_fetch
 from keel.commands.insights import insights_group
+from keel.commands.monitor import run_monitor
+from keel.commands.pnl import build_pnl_report, render_pnl_report
+from keel.commands.purification import render_purification_report
 from keel.commands.rules import rules_group, rules_seed
+from keel.commands.simulate import (
+    SIM_SLIPPAGE_PCT as _SIM_SLIPPAGE_PCT,  # noqa: F401 -- pinned by tests
+)
+
+# The whole simulate assembly (constants, candle loading, slippage pass, account metrics, tier
+# matrix, report write) lives in `keel.commands.simulate` (issue #387 C1). `_SIM_SLIPPAGE_PCT`
+# is re-imported because the simulate tests pin, through THIS module's name, that the flat rate
+# is structurally the engine's floor.
+from keel.commands.simulate import run_simulation
 from keel.commands.status import status_cmd
 from keel.commands.subscription import subscription_group
+from keel.commands.trading import (
+    clear_consecutive_loss_halt,
+    disengage_kill_switch,
+    engage_kill_switch,
+    render_loop_result,
+    reset_high_water_mark,
+)
+from keel.commands.trading import record_flow as record_declared_flow
 from keel.commands.trials import trials_group
 from keel.commands.tui import tui_cmd
 from keel.commands.versions import versions_cmd
@@ -115,22 +178,10 @@ from keel.compliance import purification as purification_mod
 from keel.compliance import screen as screen_mod
 from keel.config import Config
 from keel.data import freshness as freshness_mod
-from keel.data import history as history_mod
-from keel.data import market_feed
-from keel.data import repair as repair_mod
+from keel.data import history as history_mod  # noqa: F401 -- fetch/simulate tests patch this alias
+from keel.data import repair as repair_mod  # noqa: F401 -- fetch tests patch cli_module.repair_mod
 from keel.data.db import connect, migrate
-from keel.data.repository import Repository
-from keel.execution import equity as equity_mod
 from keel.research import ledger as trials_ledger
-from keel.sim import artifact as artifact_mod
-from keel.sim import benchmark as benchmark_mod
-from keel.sim import metrics as metrics_mod
-from keel.sim import portfolio_sim
-from keel.sim import report as report_mod
-from keel.sim import tiers as tiers_mod
-from keel.strategy import backtest as backtest_mod
-from keel.strategy import promotion as promotion_mod
-from keel.types import Candle, Granularity
 from keel.version import build_info, check_install
 
 # -- root group ---------------------------------------------------------------------------------
@@ -328,96 +379,6 @@ cli.add_command(db_group)
 # -- fetch ----------------------------------------------------------------------------------
 
 
-def _assess_products(
-    repo: Repository,
-    products: list[str],
-    granularities: list[Granularity],
-    now_ts: int,
-    start_ts: int,
-    tolerance_bars: int,
-    market_closed: bool = False,
-) -> list[tuple[freshness_mod.Freshness, int]]:
-    """Read-only sweep over every (product, granularity). No network.
-
-    `granularities` is whatever the caller is keeping current -- `fetch` passes
-    `config.market_data.granularities`, so the sweep judges exactly the series the warm step
-    fetches and the agent polls.
-
-    `market_closed` (FR-9) is the recorded venue-clock answer (`agent.recorded_market_closed`)
-    threaded into every verdict, so a session-bound venue's weekend reads CLOSED rather than
-    STALE. Defaulted False: a 24/7 venue never records a session and keeps yesterday's verdicts.
-
-    Returns `(freshness, unexplained_gaps)`, BOTH bounded to the same window starting at
-    `start_ts`. That shared window is the point: `_print_freshness` subtracts the second from
-    `freshness.gaps`, and `coverage()` counts those gaps over `get_candles(.., start_ts, None)`
-    -- so an unexplained count taken over the WHOLE series goes negative the moment bars are
-    missing older than `start_ts`. The field saw exactly that on 2026-08-17 (`keel fetch`
-    printed `-2 proven absent at venue`: an impossible claim that made still-unexplained gaps
-    look reconciled). `--fail-on-gaps` does NOT judge this count -- it keeps whole-series
-    scope, see the `check` branch of `fetch`.
-    """
-    out: list[tuple[freshness_mod.Freshness, int]] = []
-    for product in products:
-        for granularity in granularities:
-            info = history_mod.coverage(repo, product, granularity, start_ts)
-            unexplained = repair_mod.unexplained_gap_count(
-                repo, product, granularity, start_ts
-            )
-            out.append(
-                (
-                    freshness_mod.assess(
-                        info, now_ts, tolerance_bars, market_closed=market_closed
-                    ),
-                    unexplained,
-                )
-            )
-    return out
-
-
-def _print_freshness(rows: list[tuple[freshness_mod.Freshness, int]]) -> None:
-    for row, unexplained in rows:
-        # A series can be BOTH stale and gapped. The state label reports the most urgent
-        # condition, but the detail always carries BOTH numbers -- an earlier version showed
-        # only the label and silently hid gaps behind staleness.
-        #
-        # A stale verdict under a closed market (FR-9) is its own state, ahead of plain
-        # STALE: the bars ARE behind, but the venue's clock explains why, and the label must
-        # say so rather than teach an operator to ignore STALE every weekend. MISSING stays
-        # MISSING even when closed -- a closed venue still serves history, so a cold cache
-        # remains the fetch pipeline's problem, not the calendar's.
-        if row.missing:
-            state = "MISSING"
-        elif row.stale and row.market_closed:
-            state = "CLOSED"
-        elif row.stale:
-            state = "STALE"
-        elif row.gaps:
-            state = "GAPS"
-        else:
-            state = "ok"
-        if row.missing:
-            detail = "nothing cached"
-        elif row.stale and row.market_closed:
-            proven = row.gaps - unexplained
-            suffix = f" ({proven} proven absent at venue)" if proven else ""
-            detail = (
-                f"{row.bars_behind} bars behind, market closed -- not alerting, "
-                f"{row.gaps} internal gaps{suffix}"
-            )
-        else:
-            # No max(0, ...) clamp: `unexplained` comes from the same window-bounded read as
-            # `row.gaps` (see `_assess_products`), so the subtraction is consistent by
-            # construction. A clamp would only re-hide the mismatch that once printed
-            # "-2 proven absent at venue" for a series with real unexplained gaps.
-            proven = row.gaps - unexplained
-            suffix = f" ({proven} proven absent at venue)" if proven else ""
-            detail = f"{row.bars_behind} bars behind, {row.gaps} internal gaps{suffix}"
-        click.echo(
-            f"  {state:<8} {row.product:<12} {row.granularity.value:<9} "
-            f"n={row.n_candles:<7} {detail}"
-        )
-
-
 @cli.command("fetch")
 @click.option("--products", default=None, help="Comma-separated product ids (default: allowlist).")
 @click.option("--years", default=5, show_default=True, help="Years of history to ensure.")
@@ -479,143 +440,35 @@ def fetch(
 
     `--check` is the dry-run a scheduler should alert on: it never opens a network connection
     and exits non-zero when anything is missing, stale or gapped.
+
+    The flow itself lives in `keel.commands.fetch.run_fetch` (issue #387 C1); this wrapper
+    parses the options, hands the service a lazy `_build_broker` factory (so `--check` and the
+    all-current skip still never construct a broker), and turns the service's `error` into the
+    command's exit code.
     """
-    now_ts = int(time.time())
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-
     product_list = _parse_products_option(products, config)
-    start_ts = now_ts - years * _DAYS_PER_YEAR * 86400
 
-    # fetch is the data pipeline: it warms exactly what this deployment polls, i.e.
-    # `config.market_data.granularities` -- the same list `agent` and `monitor` use -- so the
-    # runbook's `keel fetch` warm step honestly covers the FIFTEEN_MINUTE confirmation series
-    # every shipped config lists. `simulate` deliberately keeps `_SIM_GRANULARITIES`
-    # ([ONE_HOUR, ONE_DAY]) instead: that pair is the backtest ENGINE's supported timeframes,
-    # an engine limit rather than a data choice (Issue #349).
-    granularities = list(config.market_data.granularities)
-
-    # FR-9: the venue's session answer, as recorded by the last cycle of whatever loop is
-    # running (the agent, or `keel monitor --loop`). A closed session-bound venue defuses
-    # STALE (nothing can fetch bars a shut venue is not minting, and a weekend must not page
-    # an operator); see `agent.recorded_market_closed` for the trust window -- derived from
-    # the interval the recording deployment actually cycles at, config only as the fallback
-    # -- and the deliberate clock_unavailable/missing carve-outs. A 24/7 venue never records
-    # a session, so this is False and every verdict stays byte-identical.
-    market_closed = agent.recorded_market_closed(repo, config, now_ts)
-
-    before = _assess_products(
-        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
-    )
-    click.echo(f"data cached in: {ctx.obj['db_path']}")
-    _print_freshness(before)
-
-    if check:
-        actionable = [r for r, _ in before if r.needs_fetch]
-        if actionable:
-            raise click.ClickException(f"{len(actionable)} series missing or stale")
-        # `--fail-on-gaps` judges the WHOLE series, not the window the display above is bounded
-        # to: a hole older than `start_ts` is invisible to those counts, yet `repair_series`
-        # probes holes wherever they sit, so it is still fixable, still unproven, and still
-        # this flag's business. That is also why `unexplained_gap_count`'s default stays
-        # whole-series -- the two calls differ on purpose, and this is the one place that
-        # wants the unbounded number.
-        unexplained = sum(
-            repair_mod.unexplained_gap_count(repo, product, granularity) > 0
-            for product in product_list
-            for granularity in granularities
-        )
-        if unexplained and fail_on_gaps:
-            raise click.ClickException(
-                f"{unexplained} series have unexplained gaps -- run `keel fetch --repair-gaps`"
-            )
-        # Truthful, not reassuring: series that ARE behind must not be called "current".
-        # When the closed record explains the staleness, the summary says so -- the quiet
-        # has to be legible, which is the whole point of a closing line (and the older
-        # "all series actionable" wording said the opposite of what it meant).
-        closed_explained = market_closed and any(r.stale for r, _ in before)
-        summary = (
-            "all series current or closed-explained"
-            if closed_explained
-            else "all series current"
-        )
-        if unexplained:
-            click.echo(
-                f"\n{summary}. {unexplained} have UNEXPLAINED gaps -- run "
-                "`keel fetch --repair-gaps` to probe them."
-            )
-        elif closed_explained:
-            click.echo(f"\n{summary} (market closed -- staleness does not alert)")
-        else:
-            click.echo(f"\n{summary}")
-        return
-
-    if not refresh and not repair_gaps and not freshness_mod.any_needs_fetch(
-        [r for r, _ in before]
-    ):
-        # The no-network skip is deliberate (nothing a fetch does can produce bars a closed
-        # venue is not minting) -- but a behind series must not be called "current" to
-        # justify it. Name the closure instead.
-        if market_closed and any(r.stale for r, _ in before):
-            click.echo(
-                "\nmarket closed -- staleness does not alert; behind series are "
-                "expected, nothing to fetch"
-            )
-        else:
-            click.echo("\nall series current -- nothing to fetch")
-        return
-
-    click.echo("\nfetching...")
-    client = _build_broker(config)
-    history_mod.ensure_history(
-        client,
+    result = run_fetch(
         repo,
-        product_list,
-        granularities,
-        years,
-        now_ts,
-        sleep_fn=time.sleep,
+        config,
+        lambda: _build_broker(config),
+        db_path=ctx.obj["db_path"],
+        products=product_list,
+        years=years,
+        now_ts=int(time.time()),
+        tolerance_bars=tolerance_bars,
+        check=check,
+        fail_on_gaps=fail_on_gaps,
         refresh=refresh,
+        repair_gaps=repair_gaps,
+        reprobe_absent=reprobe_absent,
+        echo=click.echo,
+        echo_err=lambda message: click.echo(message, err=True),
     )
-
-    if repair_gaps:
-        click.echo("\nrepairing interior gaps...")
-        for product in product_list:
-            for granularity in granularities:
-                outcome = repair_mod.repair_series(
-                    client,
-                    repo,
-                    product,
-                    granularity,
-                    now_ts=now_ts,
-                    reprobe_known_absent=reprobe_absent,
-                    sleep_fn=time.sleep,
-                )
-                if not outcome.windows_found:
-                    continue
-                click.echo(
-                    f"  {product:<12} {granularity.value:<9} "
-                    f"windows={outcome.windows_found} probed={outcome.windows_probed} "
-                    f"skipped={outcome.windows_skipped_known_absent} "
-                    f"recovered={outcome.bars_recovered} "
-                    f"absent_at_source={outcome.windows_absent_at_source}"
-                )
-                for error in outcome.errors:
-                    click.echo(f"    error: {error}", err=True)
-
-    after = _assess_products(
-        repo, product_list, granularities, now_ts, start_ts, tolerance_bars, market_closed
-    )
-    click.echo("\nafter fetch:")
-    _print_freshness(after)
-    if freshness_mod.any_needs_fetch([r for r, _ in after]):
-        # Not an error: an asset younger than the window, or a venue simply not serving the
-        # most recent bar yet, both land here legitimately. Say so rather than failing a
-        # scheduled run that did everything it could.
-        click.echo(
-            "\nsome series are still short. Common and usually benign: an asset younger than "
-            "the requested window (PAXG-USD), or a bar the venue has not published yet."
-        )
+    if result.error is not None:
+        raise click.ClickException(result.error)
 
 
 # -- assets (allowlist admission screening) -------------------------------------------------
@@ -624,119 +477,6 @@ def fetch(
 @cli.group("assets")
 def assets_group() -> None:
     """Allowlist admission screening (KB §28.4/§65.5) -- a CURATION gate, not a per-trade rail."""
-
-
-#: Days of recent daily candles `--probe-liquidity` samples per candidate. Deliberately a RECENT
-#: window rather than the full history the screen medians over: the probe's job is to be one cheap
-#: request that tracks the criterion, not to reproduce it exactly. Recent is also the conservative
-#: direction for a *pre-filter* — it reflects the liquidity a new position would actually meet.
-_LIQUIDITY_PROBE_DAYS = 180
-
-
-#: The venue every product screened here is listed on.
-#:
-#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The live path constructs
-#: `keel/data/cb_client.py`'s `CoinbaseClient` directly, so there is exactly one venue these
-#: product ids can mean, and an `InstrumentAttestation` is keyed on `(venue, product_id)` --
-#: which means the screen needs a venue id to look one up, and inventing a per-call parameter
-#: for a value with one possible answer would be a knob whose only safe setting is its default.
-#:
-#: The broker-port migration replaces this with the adapter's own `BrokerCapabilities.venue`
-#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`), at which point the wrapper
-#: statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD` somewhere
-#: else -- which is issue #202's entire point and the reason the key is a pair. Until an adapter
-#: handle actually reaches this function, reading a venue id off one would be reading it off
-#: nothing: the same dead-gate pattern `capabilities.py` warns about, where a lookup that cannot
-#: fail reads as a defence.
-_VENUE = "coinbase"
-
-
-def _market_facts(repo: Repository, product: str, quote: str) -> screen_mod.MarketFacts:
-    """Everything the screen can compute for itself from data we already hold."""
-    asset = product.split("-")[0]
-    candles = repo.get_candles(product, Granularity.ONE_DAY)
-    return screen_mod.MarketFacts(
-        asset=asset,
-        daily_bars=len(candles),
-        # `screen_mod.median_daily_quote_volume` is the ONE definition of this statistic --
-        # `assets discover --probe-liquidity` pre-filters on the same call, so the sweep and the
-        # gate cannot disagree about what "liquid enough" means.
-        median_daily_volume=screen_mod.median_daily_quote_volume(candles),
-        # A REAL check: does this product settle in the currency this deployment trades in?
-        # The former `or bool(candles)` fallback made it vacuous -- every screened product is
-        # `-USD`, so it always fell through to "do we have bars", which the history criterion
-        # already covers. One of four admission criteria was doing nothing.
-        quotable_in_settlement_currency=quote_currency_of(product) == quote.upper(),
-        # Carried, not reduced: `screen_asset` applies rail 19's grammar to it, so the screen's
-        # shape verdict and the rail's cannot disagree, and the verdict can name the id.
-        product_id=product,
-        # The other half of the key the instrument statement is recorded under. See `_VENUE`.
-        venue=_VENUE,
-    )
-
-
-def _screen_product(
-    repo: Repository, product: str, quote: str
-) -> tuple[screen_mod.MarketFacts, screen_mod.ScreenResult]:
-    """THE admission decision, for every candidate source.
-
-    `assets screen`, `assets holdings --screen` and any future proposer (an LLM shortlist, say)
-    all route through here, so none of them can drift onto a laxer path -- which is what makes
-    "the same vetting process" a property of the code rather than an intention. Returns the facts
-    alongside the verdict so a caller can explain WHY without recomputing them.
-
-    The instrument statement is looked up HERE, next to the asset attestation, rather than being
-    threaded in by each caller -- that is what makes the wrapper criterion inherit the same
-    single-decision-point property as everything else on this path. Three callers get the new
-    check with no per-caller wiring, and none of them can be the one that forgot it.
-    """
-    asset = product.split("-")[0]
-    facts = _market_facts(repo, product, quote)
-    raw = repo.get_asset_attestation(asset)
-    attestation = (
-        screen_mod.AssetAttestation(
-            asset=raw["asset"],
-            sector=raw["sector"],
-            backing=raw["backing"],
-            pays_yield=bool(raw["pays_yield"]),
-            source=raw["source"],
-            attested_by=raw["attested_by"],
-            attested_at=raw["attested_at"],
-        )
-        if raw is not None
-        else None
-    )
-    raw_instrument = repo.get_instrument_attestation(_VENUE, product)
-    instrument = (
-        screen_mod.InstrumentAttestation(
-            venue=raw_instrument["venue"],
-            product_id=raw_instrument["product_id"],
-            wrapper=raw_instrument["wrapper"],
-            source=raw_instrument["source"],
-            attested_by=raw_instrument["attested_by"],
-            attested_at=raw_instrument["attested_at"],
-        )
-        if raw_instrument is not None
-        else None
-    )
-    waived = repo.get_screen_exceptions(asset)
-    return facts, screen_mod.screen_asset(
-        facts, attestation, waived=waived, instrument=instrument
-    )
-
-
-# Never candidates: you cannot trade the currency you settle in, and fiat is funding rather than
-# a position. Coinbase quotes many fiats, so the list is deliberately broad -- a missing one is
-# only cosmetic (an extra row), never an admission.
-_FIAT_CURRENCIES = frozenset(
-    {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "SGD", "BRL", "MXN", "TRY", "INR", "KRW"}
-)
-
-# Stablecoins are cash EQUIVALENTS -- funding you hold between positions, not positions. They are
-# excluded for the same reason fiat is: proposing the money as something to buy with the money is
-# noise. (They would be REJECTED anyway -- unattested, and a yield-bearing one fails §28.4 -- so
-# this only removes a redundant row, never an admission.)
-_CASH_EQUIVALENTS = frozenset({"USDC", "USDT", "DAI", "PYUSD", "TUSD", "USDP", "GUSD"})
 
 
 @assets_group.command("holdings")
@@ -765,7 +505,6 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    quote = config.quote_currency
     try:
         floor = Decimal(min_balance)
     except InvalidOperation as exc:
@@ -780,94 +519,16 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     except Exception as exc:  # noqa: BLE001 -- an unreachable venue is an error, not "nothing held"
         # Includes broker CONSTRUCTION, so a missing/invalid `.env` credential surfaces here
         # rather than as a raw traceback. Reporting an empty list instead would read as
-        # "you hold nothing", which is not what we learned. The auth hint names the keys the
-        # CONFIG'S venue actually reads: telling an alpaca operator to check CDP keys sends
-        # them hunting a credential this deployment never uses. Coinbase (the default, and
-        # any venue without dedicated credential wiring) keeps the historical CDP advice.
-        auth_hint = (
-            "ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY in .env (or the environment)"
-            if config.broker.name == "alpaca"
-            else "CDP_API_KEY/CDP_API_SECRET in .env"
-        )
+        # "you hold nothing", which is not what we learned. The auth hint (`broker_auth_hint`,
+        # shared with the TUI) names the keys the CONFIG'S venue actually reads.
         raise click.ClickException(
             f"could not read balances from the broker: {exc}\n"
-            f"  If this is an authentication error, check {auth_hint}."
+            f"  If this is an authentication error, check {broker_auth_hint(config)}."
         ) from exc
 
-    excluded = _FIAT_CURRENCIES | _CASH_EQUIVALENTS | {quote.upper()}
-    # Currency codes are compared UPPERCASED: a `usdc` balance is still the settlement currency,
-    # and must not be presented as something tradable on a casing accident.
-    holdings = sorted(
-        (
-            a
-            for a in accounts
-            if (a.get("currency") or "").upper() not in excluded
-            and a["available_balance"] > floor
-        ),
-        key=lambda a: (a.get("currency") or "").upper(),
-    )
-
-    if not holdings:
-        click.echo(f"no holdings above {floor} (excluding {quote} and fiat).")
-        return
-
-    allowlist = {asset.upper() for asset in config.allowlist}
-    click.echo(f"{len(holdings)} holding(s) above {floor}, excluding {quote} and fiat:\n")
-
-    for account in holdings:
-        # Uppercase here too, not just for the exclusion set: screening the raw code would look
-        # up `btc` (UNATTESTED) while the allowlist check matched `BTC`, and would hand the
-        # operator `keel fetch --products btc-USD`, a product id that never resolves.
-        asset = (account.get("currency") or "").upper()
-        on_allowlist = "on-allowlist" if asset.upper() in allowlist else "not-on-allowlist"
-        attested = "attested" if repo.get_asset_attestation(asset) else "UNATTESTED"
-        click.echo(f"  {asset:<8} balance={account['available_balance']:<18} "
-                   f"{on_allowlist:<16} {attested}")
-
-        if not run_screen:
-            continue
-
-        product = _history_product(asset, quote)
-        facts, result = _screen_product(repo, product, quote)
-        click.echo(f"      {result.summary}  ({facts.daily_bars} daily bars cached)")
-
-        # The likeliest misreading of this whole feature. With no cached bars, `history` and
-        # `liquidity` cannot say anything about the ASSET -- `0 daily bars, need 1460` measures
-        # the depth of OUR CACHE, and median volume is 0 *because* there are no bars -- so
-        # printing either as a finding would assert exactly what this message exists to deny: a
-        # candidate never fetched would read as indistinguishable from one genuinely too young.
-        # They are shown as derived-from-an-empty-cache, not as verdicts.
-        #
-        # The split and the explanation both live in `keel.compliance.screen` (`split_failures` /
-        # `missing_history_lines`), not here -- it owns `DATA_DERIVED_FAILURES`, the tag set that
-        # decides the split, so the decision and the tags cannot silently drift apart the way two
-        # independent per-caller copies could (and had, before `keel/proposer.py` and this
-        # function were unified onto the same two functions).
-        #
-        # NOTE: `settlement` is deliberately NOT suppressed. It compares the product's quote leg
-        # to the settlement currency and never reads candles, so it stays assessable at zero
-        # bars. Do not add it to `DATA_DERIVED_FAILURES` -- no test would catch that here (a
-        # derived product can never fail settlement), and it would hide a real verdict on any
-        # externally supplied product.
-        failures, not_assessable = screen_mod.split_failures(facts, result)
-        if facts.daily_bars == 0:
-            explanation = screen_mod.missing_history_lines(product, not_assessable)
-            click.echo(f"      ! {explanation[0]}")
-            for extra_line in explanation[1:]:
-                click.echo(f"        {extra_line}")
-        for failure in failures:
-            click.echo(f"      ✗ {failure}")
-        # Warnings carry compliance constraints that apply even to an ADMITted asset (§65.5's
-        # bay' al-sarf regime for gold/silver backing, say). Dropping them would make this
-        # command quietly less informative than `assets screen` for the same asset.
-        for warning in result.warnings:
-            click.echo(f"      ! {warning}")
-
-    click.echo(
-        "\n⚠️  Holdings are CANDIDATES, not admissions. Nothing here has been admitted to "
-        "trading:\nthat needs `keel assets attest` with a source, a passing screen, and a "
-        "deliberate edit to\n`allowlist` in config.yaml."
-    )
+    report = gather_holdings(repo, config, accounts, floor, run_screen=run_screen)
+    for line in render_holdings(report):
+        click.echo(line)
 
 
 @assets_group.command("discover")
@@ -934,86 +595,18 @@ def assets_discover(
     client = _build_broker(config)
     products = client.list_products()
 
-    policy = screen_mod.DiscoveryPolicy(
-        quote_currency=quote or config.quote_currency,
-        min_quote_24h_volume=Decimal(min_volume_24h),
+    sweep = run_discovery(
+        client,
+        products,
+        config,
+        quote=quote,
+        min_volume_24h=Decimal(min_volume_24h),
+        limit=limit,
+        probe_history=probe_history,
+        probe_liquidity=probe_liquidity,
     )
-    result = screen_mod.discover_candidates(
-        products, policy, exclude_assets=frozenset(config.allowlist)
-    )
-
-    click.echo(
-        f"{len(products)} venue products -> {len(result.candidates)} candidates "
-        f"(quote={policy.quote_currency}, 24h volume >= {policy.min_quote_24h_volume:,.0f}, "
-        f"excluding the current allowlist)"
-    )
-    click.echo(result.excluded.summary_line())
-    # Never truncate silently: `result.candidates` above is the FULL survivor list (only the
-    # table loop below is cut to `limit`), so if there are more survivors than `limit` allows,
-    # say so explicitly -- how many exist, how many are about to be shown, and that --limit is
-    # the knob. A silent cap here would be exactly the defect class this command's own fix
-    # (the --min-volume-24h floor) exists to eliminate, just moved one step later in the pipeline.
-    if len(result.candidates) > limit:
-        click.echo(
-            f"showing {limit} of {len(result.candidates)} candidates -- raise --limit to see "
-            "the rest."
-        )
-    click.echo("")
-    screen_policy = screen_mod.ScreenPolicy()
-    header = f"{'#':>3}  {'product':<14} {'asset':<8} {'24h quote volume':>18}"
-    if probe_history:
-        header += "  4yr?"
-    if probe_liquidity:
-        header += f"  {'median daily (probe)':>21}"
-    click.echo(header + "  name")
-
-    now_ts = int(time.time())
-    four_years_ago = now_ts - 4 * _DAYS_PER_YEAR * 86400
-    liquidity_window_start = now_ts - _LIQUIDITY_PROBE_DAYS * 86400
-    for index, candidate in enumerate(result.candidates[:limit], start=1):
-        line = (
-            f"{index:>3}  {candidate.product_id:<14} {candidate.asset:<8} "
-            f"{candidate.quote_24h_volume:>18,.0f}"
-        )
-        if probe_history:
-            try:
-                probed = client.get_candles(
-                    candidate.product_id,
-                    Granularity.ONE_DAY,
-                    four_years_ago,
-                    four_years_ago + 30 * 86400,
-                )
-                marker = "yes " if probed else "NO  "
-            except Exception:  # noqa: BLE001 -- a probe failure is unknown, not a verdict
-                marker = "?   "
-            line += f"  {marker}"
-        if probe_liquidity:
-            try:
-                sampled = client.get_candles(
-                    candidate.product_id, Granularity.ONE_DAY, liquidity_window_start, now_ts
-                )
-                median = screen_mod.median_daily_quote_volume(sampled)
-                # Same comparison `screen_asset` will make, against the same floor -- that is the
-                # entire point. A candidate marked LOW here is one the gate would reject.
-                verdict = "LOW" if median < screen_policy.min_median_daily_volume else "ok "
-                line += f"  {median:>17,.0f} {verdict}"
-            except Exception:  # noqa: BLE001 -- same rule as the history probe: unknown, not a no
-                line += f"  {'?':>17} ?  "
-        click.echo(line + f"  {candidate.base_name}")
-
-    click.echo(
-        "\n⚠️  These are PROPOSALS, not admissions. Nothing above has been screened for sector "
-        "or backing -- those cannot be derived from market data. Each one needs "
-        "`keel assets attest` with a source before `keel assets screen` can admit it."
-    )
-    if probe_liquidity:
-        click.echo(
-            f"\n'median daily (probe)' is the SAME statistic the screen applies (median of "
-            f"volume x close), floor {screen_policy.min_median_daily_volume:,.0f} -- but sampled "
-            f"over the last {_LIQUIDITY_PROBE_DAYS} days, where the screen medians over all "
-            "cached history. Treat LOW as 'the gate will reject this' and ok as 'worth pulling "
-            "candles for', never as the verdict itself. Run `keel assets screen` for that."
-        )
+    for line in render_discover(sweep):
+        click.echo(line)
 
 
 @assets_group.command("screen")
@@ -1041,39 +634,11 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
     # criterion this command ADMITted the one product shape rail 19 exists to veto.
     product_list, _ = parse_products_option(products, config, validate=False)
 
-    admitted = 0
-    for product in product_list:
-        asset = product.split("-")[0]
-        facts, result = _screen_product(repo, product, config.quote_currency)
-        admitted += int(result.admitted)
-
-        click.echo(
-            f"\n{result.summary:<7} {asset:<8} bars={facts.daily_bars} "
-            f"median_daily_volume={facts.median_daily_volume:.0f}"
-        )
-        # Same zero-bars split `assets holdings --screen` and `assets propose` use, via the same
-        # two helpers in `screen.py`. This command is the SIBLING of the TUI's `s` screen overlay
-        # -- both screen `_default_sim_products(config)` through `_screen_product` -- so leaving
-        # only one of them able to explain an empty cache would hand an operator two different
-        # stories about the same allowlist depending on which surface they looked at. That is the
-        # drift `_screen_product` exists to prevent, applied to the REPORTING rather than to the
-        # verdict. At zero bars `history`/`liquidity` measure OUR CACHE, not the asset, so
-        # printing them as verdicts would say "too young" about something we simply never
-        # fetched. `settlement`/`spot_instrument` read the product id alone and never touch
-        # candles, so they stay real verdicts here -- which is exactly why this command may still
-        # be asked about an unvalidated `--products` id (see the note above).
-        failures, not_assessable = screen_mod.split_failures(facts, result)
-        if facts.daily_bars == 0:
-            explanation = screen_mod.missing_history_lines(product, not_assessable)
-            click.echo(f"    ! {explanation[0]}")
-            for extra_line in explanation[1:]:
-                click.echo(f"      {extra_line}")
-        for failure in failures:
-            click.echo(f"    ✗ {failure}")
-        for warning in result.warnings:
-            click.echo(f"    ! {warning}")
-
-    click.echo(f"\n{admitted}/{len(product_list)} admitted")
+    screened = screen_products(repo, config, product_list)
+    for entry in screened:
+        for line in render_screened_asset(entry):
+            click.echo(line)
+    click.echo(f"\n{sum(1 for s in screened if s.admitted)}/{len(screened)} admitted")
 
 
 @assets_group.command("propose")
@@ -1362,32 +927,8 @@ def purification(ctx: click.Context) -> None:
     """
     repo = _open_repo(ctx)
     report = purification_mod.build_report(repo.get_transactions())
-
-    if not report.entries and not report.needs_review:
-        click.echo("no non-compliant credits found")
-        return
-
-    if report.entries:
-        click.echo(f"non-compliant credits: {len(report.entries)}")
-        click.echo(f"\n{'asset':<8} {'units received':>20} {'owed (USD)':>14}")
-        qty_by_asset = report.qty_by_asset
-        for asset, owed in report.owed_by_asset.items():
-            click.echo(f"{asset:<8} {qty_by_asset.get(asset, Decimal(0)):>20} {owed:>14.2f}")
-        click.echo(f"\nTOTAL OWED TO CHARITY: ${report.total_owed_usd:.2f}")
-        click.echo(
-            "\nThis is excluded from realised P&L and from the equity base sizing computes "
-            "from -- otherwise riba would compound into position size (§65.9). Zakat, if "
-            "estimated, is on purified wealth, so this runs first."
-        )
-
-    if report.needs_review:
-        click.echo(f"\n⚠️  {len(report.needs_review)} credit(s) of UNRECOGNISED type need review:")
-        for entry in report.needs_review[:20]:
-            click.echo(f"    {entry.tx_type!r} {entry.asset} qty={entry.qty} ${entry.amount_usd}")
-        click.echo(
-            "    Classified neither way on purpose: calling them clean would let riba into "
-            "P&L, calling them non-compliant would state an obligation as fact."
-        )
+    for line in render_purification_report(report):
+        click.echo(line)
 
 
 # -- trials ledger --------------------------------------------------------------------------
@@ -1420,7 +961,11 @@ cli.add_command(trials_group)
 def monitor(
     ctx: click.Context, loop: bool, interval_sec: float | None, max_cycles: int | None
 ) -> None:
-    """Poll fresh candles for every allowlisted product (read-only)."""
+    """Poll fresh candles for every allowlisted product (read-only).
+
+    The loop itself lives in `keel.commands.monitor.run_monitor` (issue #387 C1); this wrapper
+    parses the options and echoes.
+    """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
     broker = _build_broker(config)
@@ -1428,284 +973,27 @@ def monitor(
     granularities = list(config.market_data.granularities)
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
 
-    cycles = 0
-    # FR-9 at the polling surface: while a session-bound venue reports closed, there is
-    # nothing to poll (a shut venue mints no bars), so the cycle skips -- but the session
-    # is still recorded, so `fetch --check` stays quiet over the weekend even when monitor
-    # is the only loop cycling. The skip line is emitted ONCE PER STATE CHANGE (a weekend
-    # is ~60 hourly ticks of the same fact, and repeating it would train an operator to
-    # stop reading monitor output), which is what `last_session` tracks. Crypto venues
-    # (no session surface) poll exactly as before -- `record_market_session` records
-    # nothing for them.
-    last_session: SessionState | None = None
-    while True:
-        now_ts = int(time.time())
-        session, session_bound = agent.record_market_session(
-            broker, repo, config, now_ts, interval_sec=interval
-        )
-        if session_bound and session is not SessionState.OPEN:
-            if session is not last_session:
-                reason = (
-                    "market closed -- skipping poll"
-                    if session is SessionState.CLOSED
-                    else "market clock unreadable (fail-closed) -- skipping poll"
-                )
-                click.echo(f"[{now_ts}] {reason}")
-                last_session = session
-        else:
-            last_session = session if session_bound else None
-            written = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
-            click.echo(f"[{now_ts}] polled {written} new candle row(s) across {products}")
-        cycles += 1
-        if not loop or (max_cycles is not None and cycles >= max_cycles):
-            break
-        time.sleep(interval)
+    run_monitor(
+        broker,
+        repo,
+        config,
+        products,
+        granularities,
+        interval,
+        loop=loop,
+        max_cycles=max_cycles,
+        echo=click.echo,
+        sleep_fn=time.sleep,
+        now_fn=lambda: int(time.time()),
+    )
 
 
 # -- agent ------------------------------------------------------------------------------
 
 
-#: The banner a venue-priced preview carries. Exported (no underscore) because the tests assert
-#: on the exact text a human sees -- the failure this gate defends against is a *misread screen*,
-#: so the rendered string is the contract, not an implementation detail.
-NATIVE_PREVIEW_MARKER = "BROKER QUOTE -- the venue priced this order itself."
-SYNTHETIC_PREVIEW_MARKER = "SYNTHETIC ESTIMATE -- NOT A BROKER QUOTE."
-UNPRICED_PREVIEW_MARKER = "UNPRICED -- this preview carries no usable size."
-UNREADABLE_PREVIEW_MARKER = "PREVIEW UNREADABLE -- this gate cannot interpret what came back."
-#: What a human must type to place a degraded (unpriced / error-carrying / unreadable) preview.
-#: Compared case-insensitively after stripping: see `_ask_to_place`.
-DEGRADED_PREVIEW_PHRASE = "place anyway"
-
-_RULE_NATIVE = "  " + "=" * 72
-_RULE_ALARM = "  " + "!" * 72
-
-
-def _preview_decimal(value: Any) -> Decimal | None:
-    """Best-effort `Decimal` for a money field that may be a `Decimal`, a string or junk."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-
-def _read_preview(preview: Any) -> tuple[bool, dict[str, Any], tuple[str, ...], bool, bool]:
-    """Normalize either accepted preview shape into `(synthetic, fields, errors, unpriced, ok)`.
-
-    **Why two shapes.** The port's `Preview` is where this is going; the raw dict is where the
-    live path still is. `executor.py` calls `broker.preview_order(product_id, side,
-    order_configuration)` and `keel/commands/_common.py` builds a `CoinbaseClient`, so every
-    preview a human sees TODAY is `cb_client.preview_order`'s dict. Phase B has not landed.
-    Accepting only `Preview` would break the one venue that actually trades; accepting only
-    `dict` is the bug this exists to fix. So the gate accepts both and this function is the seam
-    -- deliberately transitional, and deletable the day `preview_order` returns `Preview`.
-
-    **Why a dict is read as native.** The dict shape *is* the Coinbase native-preview response
-    (`supports_native_preview=True`), so treating it as a broker quote is accurate rather than
-    optimistic. But "accurate today" is not "safe forever": if some future adapter returns a dict
-    while synthesizing, silently labelling it a broker quote is exactly the failure this issue is
-    about. So a dict that carries a truthy `synthetic` key is believed over the default. Any new
-    adapter should return `Preview` and not rely on that.
-
-    `ok=False` means neither shape was recognized -- which is itself a warning, not a blank.
-    """
-    if isinstance(preview, Preview):
-        fields: dict[str, Any] = {
-            "product_id": preview.product_id,
-            "side": getattr(preview.side, "value", preview.side),
-            "est_base_size": preview.est_base_size,
-            "est_quote_size": preview.est_quote_size,
-            "est_fee": preview.est_fee,
-        }
-        # NOT `fields.update(...)`: `detail` is free-form text an adapter chose, and a key
-        # collision would let it silently overwrite a money field with something that merely
-        # looks like one. A shadowed `est_fee` is a wrong number on a spending screen with
-        # nothing to indicate it was substituted, so a colliding key is namespaced instead.
-        for key, value in preview.detail.items():
-            fields[key if key not in fields else f"detail.{key}"] = value
-        # Either leg at zero means the adapter could not size this order. That is NOT a cheap
-        # order; it is an unknown one, and the two must never render alike.
-        unpriced = preview.est_quote_size <= 0 or preview.est_base_size <= 0
-        return preview.synthetic, fields, tuple(preview.errors), unpriced, True
-
-    if isinstance(preview, Mapping) and preview:
-        errors = preview.get("errs") or preview.get("errors") or ()
-        sized = next(
-            (
-                _preview_decimal(preview[key])
-                for key in ("order_total", "quote_size", "est_quote_size")
-                if key in preview
-            ),
-            None,
-        )
-        # `== 0`, NOT `<= 0`, and the difference is deliberate. A zero size is unambiguous: the
-        # order has no size and its cost is unknown. A NEGATIVE one is not -- it could just as
-        # easily be Coinbase reporting a SELL's `order_total` as signed proceeds, and that
-        # convention has not been verified against a real sell preview. Guessing wrong in the
-        # `<= 0` direction would demand a typed phrase on EVERY live sell, which trains the
-        # operator to type it by reflex and destroys the signal on the previews that need it.
-        # Sign-agnostic here until a live probe settles it; the `Preview` branch above owns its
-        # own types and can afford to be stricter.
-        return (
-            bool(preview.get("synthetic", False)),
-            dict(preview),
-            tuple(str(error) for error in errors),
-            sized is None or sized == 0,
-            True,
-        )
-
-    return False, {}, (), True, False
-
-
-def _preview_lines(preview: Any) -> tuple[list[str], bool]:
-    """Render `preview` for a human; return `(lines, degraded)`.
-
-    `degraded` is true when the preview is unpriced, carries errors, or could not be read at all
-    -- the three cases where the numbers on screen do not mean what they appear to mean.
-
-    Provenance is rendered ABOVE the numbers, not below them, because a footnote under a tidy
-    key/value block is read after the decision has already been made.
-    """
-    synthetic, fields, errors, unpriced, readable = _read_preview(preview)
-
-    lines: list[str] = []
-    if not readable:
-        lines += [
-            _RULE_ALARM,
-            f"  !! {UNREADABLE_PREVIEW_MARKER}",
-            "  !! Nothing below has been checked. Do not read it as a quote.",
-            _RULE_ALARM,
-            f"    {preview!r}",
-        ]
-        return lines, True
-
-    if synthetic:
-        lines += [
-            _RULE_ALARM,
-            f"  !! {SYNTHETIC_PREVIEW_MARKER}",
-            "  !! keel's adapter computed these figures from a price lookup. The",
-            "  !! venue has NOT priced, validated or reserved anything, and is bound",
-            "  !! by none of the numbers below. The fill can differ.",
-            _RULE_ALARM,
-        ]
-    else:
-        lines += [_RULE_NATIVE, f"  {NATIVE_PREVIEW_MARKER}", _RULE_NATIVE]
-
-    lines += [f"    {key}: {value}" for key, value in fields.items()]
-
-    # One block below the numbers, not one per problem: two rules butted together read as a
-    # rendering glitch, and a glitch is the last thing a money screen should look like.
-    alarms: list[str] = []
-    if unpriced:
-        alarms += [
-            f"  !! {UNPRICED_PREVIEW_MARKER}",
-            "  !! This is NOT a zero-cost order -- it is an order whose cost could",
-            "  !! not be determined. Approving it sends an order to the venue with",
-            "  !! no idea what it will spend.",
-        ]
-    if errors:
-        alarms += [f"  !! PREVIEW ERRORS ({len(errors)}) -- reported against this order:"]
-        alarms += [f"  !!   - {error}" for error in errors]
-    if alarms:
-        lines += [_RULE_ALARM, *alarms, _RULE_ALARM]
-
-    return lines, bool(unpriced or errors)
-
-
-def _ask_to_place(degraded: bool) -> bool:
-    """The question itself. A clean preview takes an ordinary y/n; a degraded one does not.
-
-    **Why extra friction, and why not a block.** A `y` at a `[y/N]` prompt is muscle memory after
-    the tenth order of the day, and the whole point of the banners above is that this particular
-    screen is not like the last ten. Demanding a typed phrase forces the operator to have read
-    *something*. It is deliberately NOT a refusal: the exit path is the one that must never be
-    walled off, and an unpriced preview is exactly what a human would see when a venue's pricing
-    endpoint is down and they are trying to close a position. Refusing outright would trap a
-    position behind a broken preview endpoint -- a worse money outcome than a warned-and-approved
-    order. So: harder to do, never impossible.
-
-    An abort (Ctrl-C, EOF) at either prompt is a decline, not a traceback out of the gate.
-    """
-    try:
-        if not degraded:
-            return bool(click.confirm("Place this order?", default=False))
-        click.echo(
-            "This preview is NOT a reliable quote. To place it anyway you must type the "
-            f'phrase "{DEGRADED_PREVIEW_PHRASE}" -- anything else declines.'
-        )
-        typed = click.prompt(
-            f'Type "{DEGRADED_PREVIEW_PHRASE}" to place, or press Enter to decline',
-            default="",
-            show_default=False,
-        )
-    except (click.Abort, EOFError):
-        click.echo("aborted -- declining.", err=True)
-        return False
-    return str(typed).strip().lower() == DEGRADED_PREVIEW_PHRASE
-
-
-def _interactive_confirm(preview: Preview | Mapping[str, Any] | None) -> bool:
-    """Human-in-the-loop order confirmation for `mode="confirm"`.
-
-    Called by the executor ONLY after the intent has already passed every hard rail -- this is
-    an additional human gate, never a replacement for the rails.
-
-    **What this renders, and why it shouts.** `Preview`'s own docstring sets the requirement:
-    "approving an estimate must never look identical to approving a broker's own quote." A
-    venue that has a preview endpoint returns numbers it is willing to stand behind; a venue
-    without one gets an estimate keel computed from a price lookup that validated nothing and
-    reserved nothing. Those two screens used to be byte-identical, because this function took a
-    raw dict and had nowhere to put `Preview.synthetic`. They are now visually unmistakable, and
-    the distinction sits ABOVE the numbers rather than under them.
-
-    Three further states get their own alarm block: `Preview.errors` (the adapter or the venue
-    said something went wrong), an unpriced preview (a zero size renders as a harmless "$0.00
-    order" unless something says otherwise), and a preview shape this gate cannot read at all.
-    Each of those also upgrades the question from `[y/N]` to a typed phrase -- see `_ask_to_place`
-    for why that is friction and not a refusal.
-
-    Accepts both the port's `Preview` and the legacy Coinbase dict; `_read_preview` documents why
-    both, and which one the live path actually sends today.
-
-    Fails closed: a non-TTY invocation (a script, a cron job, a headless run) declines rather
-    than blocking on stdin, so `mode="confirm"` never trades unattended.
-    """
-    lines, degraded = _preview_lines(preview)
-    # The legacy header names Coinbase because the dict shape IS the Coinbase client's response.
-    # A `Preview` can come from any venue, so it gets the venue-neutral header.
-    # An unreadable preview is not "Coinbase's" either -- naming a venue over a shape this gate
-    # could not parse asserts a provenance it does not have.
-    legacy_coinbase_dict = (
-        isinstance(preview, Mapping) and bool(preview) and not preview.get("synthetic", False)
-    )
-    header = "Coinbase order preview" if legacy_coinbase_dict else "Order preview"
-    click.echo(f"\nRails PASSED. {header}:")
-    for line in lines:
-        click.echo(line)
-    if not _common._is_interactive():
-        click.echo("no TTY -- declining (confirm mode fails closed).", err=True)
-        return False
-    return _ask_to_place(degraded)
-
-
 def _print_loop_result(result: agent.LoopResult) -> None:
-    if result.skipped:
-        click.echo(f"[{result.ts}] skipped: {result.skip_reason}")
-        return
-    entered = sum(1 for r in result.enter_results if r.placed)
-    exited = sum(1 for r in result.exit_results if r.placed)
-    click.echo(
-        f"[{result.ts}] mode={result.mode} polled={result.polled} "
-        f"products={result.products} stale={result.stale_products} "
-        f"signals={len(result.enter_signals)} blocked={len(result.blocked_entries)} "
-        f"entered={entered} exited={exited}"
-    )
-    if result.paper_equity is not None:
-        click.echo(
-            f"paper equity ${result.paper_equity} | drawdown "
-            f"{result.drawdown_total_pct} total / {result.drawdown_weekly_pct} weekly"
-        )
+    for line in render_loop_result(result):
+        click.echo(line)
 
 
 @cli.command()
@@ -1828,127 +1116,12 @@ def _parse_marks(raw_marks: tuple[str, ...]) -> dict[str, Decimal]:
 def pnl(ctx: click.Context, asset: str | None, raw_marks: tuple[str, ...]) -> None:
     """Realized + unrealized FIFO P&L report from imported transactions (read-only)."""
     repo = _open_repo(ctx)
-    transactions = repo.get_transactions(asset)
-    marks = _parse_marks(raw_marks)
-
-    if asset is not None:
-        realized = pnl_analysis.realized_pnl(transactions, asset)
-        pos = pnl_analysis.position(transactions, asset)
-        click.echo(f"{asset}: realized={realized} open_qty={pos.qty} avg_cost={pos.avg_cost}")
-        if asset in marks:
-            unrealized = (marks[asset] - pos.avg_cost) * pos.qty
-            click.echo(f"{asset}: mark={marks[asset]} unrealized={unrealized}")
-        return
-
-    total_realized = pnl_analysis.realized_pnl(transactions)
-    click.echo(f"total realized P&L: {total_realized}")
-    unrealized_by_asset = pnl_analysis.unrealized_pnl(transactions, marks) if marks else {}
-    for a in sorted({tx["asset"] for tx in transactions}):
-        pos = pnl_analysis.position(transactions, a)
-        if not pos.qty:
-            continue
-        line = f"  {a}: open_qty={pos.qty} avg_cost={pos.avg_cost}"
-        if a in unrealized_by_asset:
-            line += f" unrealized={unrealized_by_asset[a]}"
+    report = build_pnl_report(repo.get_transactions(asset), asset, _parse_marks(raw_marks))
+    for line in render_pnl_report(report):
         click.echo(line)
 
 
 # -- simulate (Sim Task 8) -------------------------------------------------------------------
-
-# Fallback execution friction for the simulate pass, used only when a rate cannot be read from
-# config. `simulate` sources the fee from `config.fees.taker_pct` instead (see `_sim_fee_pct`),
-# so the edge table, the account pass, the tier matrix and the benchmarks still price fills
-# identically -- the property this constant used to provide, now at a rate the deployment
-# controls.
-#
-# It was `Decimal("0.006")` until #247, deliberately matching `strategy/backtest.backtest`'s and
-# `sim/portfolio_sim.run`'s own defaults. Those defaults were the MAKER rate under a taker fill
-# model, so the consistency was real and the number was wrong -- every simulate report, edge
-# table and benchmark comparison was priced at half the cost of trading
-# (`docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md` §5).
-_SIM_FEE_PCT = backtest_mod.TAKER_FEE_PCT
-# Aliased to the engine's floor (#259's cleanup), not repeated: the simulate report asserts
-# its flat-priced dollar sections cost "the flat SLIPPAGE_FLOOR_PCT per leg", and that claim
-# must be structurally true, not true by numeric coincidence that a retune would silently
-# break. (`portfolio_sim` and `paper` still carry their own literals -- see #335.)
-_SIM_SLIPPAGE_PCT = backtest_mod.SLIPPAGE_FLOOR_PCT
-
-
-def _sim_fee_pct(config: Config) -> Decimal:
-    """The rate `simulate` prices every fill at: the deployment's own `fees.taker_pct`.
-
-    Taker because every simulated fill in this project is market-style (`backtest` fills at a
-    touched level, `SimAccount` at next-bar open); a deployment on a different volume tier or
-    venue moves the rate by editing config, not code.
-    """
-    return config.fees.taker_pct
-_SIM_GRANULARITIES = [Granularity.ONE_HOUR, Granularity.ONE_DAY]
-_DAYS_PER_YEAR = 365
-
-
-def _slippage_assumptions(
-    candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
-    products: list[str],
-    rule_products: list[str],
-    fallback_pct: Decimal,
-) -> tuple[list[backtest_mod.SlippageAssumption], Callable[[str], Decimal]]:
-    """Per-product slippage for the edge pass (#259), from candles the run already loaded.
-
-    Scales each product's rate from its OWN liquidity via `backtest.slippage_for_quote_volume`
-    (the mapping's parameters and their rationale live there), with the statistic computed by
-    the ONE definition (`screen_mod.median_daily_quote_volume`) over the product's cached
-    ONE_DAY bars in the sim window -- no new data source, no network. A product with no daily
-    bars falls back to the flat rate and is flagged as such, so the report says "fallback (no
-    liquidity statistic)" rather than passing the flat 5bp off as a measured verdict.
-
-    Returns the rows to print/report and the resolver `edge_table` prices fills with. The
-    resolver is total: any product id it is not holding (a rule bound outside `--products`)
-    answers `fallback_pct`, never `KeyError` -- absent data is the fallback case, not a crash.
-    """
-    by_product: dict[str, Decimal] = {}
-    rows: list[backtest_mod.SlippageAssumption] = []
-    for product in sorted(set(products) | set(rule_products)):
-        asset = _sim_asset(product)
-        daily = candles_by_asset.get(asset, {}).get(Granularity.ONE_DAY, [])
-        if daily:
-            median = screen_mod.median_daily_quote_volume(daily)
-            pct = backtest_mod.slippage_for_quote_volume(median)
-            rows.append(backtest_mod.SlippageAssumption(product, median, pct))
-        else:
-            pct = fallback_pct
-            rows.append(backtest_mod.SlippageAssumption(product, None, pct))
-        by_product[product] = pct
-
-    def _resolve(product_id: str) -> Decimal:
-        return by_product.get(product_id, fallback_pct)
-
-    return rows, _resolve
-
-
-def _print_slippage_assumptions(rows: list[backtest_mod.SlippageAssumption]) -> None:
-    """Echo the per-product slippage the edge pass is about to price at (#259).
-
-    Terminal twin of the report's table: the numbers are assumptions, so they are stated
-    loudly enough that an operator comparing two runs cannot miss that they were priced
-    differently.
-    """
-    click.echo(
-        "assumed slippage per leg (scaled from median daily quote volume; "
-        f"floor {backtest_mod.SLIPPAGE_FLOOR_PCT * 10000:.1f}bp, "
-        f"cap {backtest_mod.SLIPPAGE_CAP_PCT * 10000:.1f}bp, anchor "
-        f"${backtest_mod.SLIPPAGE_REFERENCE_QUOTE_VOLUME:,.0f}/day -- "
-        "an assumption, not a measurement):"
-    )
-    for row in rows:
-        if row.fallback:
-            click.echo(f"  {row.product_id}: {row.slippage_pct * 10000:.1f}bp "
-                       "(fallback: no liquidity statistic)")
-        else:
-            note = " (capped)" if row.capped else ""
-            click.echo(
-                f"  {row.product_id}: median volume {row.median_daily_quote_volume:,.0f} "
-                f"-> {row.slippage_pct * 10000:.1f}bp{note}"
-            )
 
 
 def _parse_products_option(products: str | None, config: Config) -> list[str]:
@@ -1977,194 +1150,6 @@ def _parse_products_option(products: str | None, config: Config) -> list[str]:
         # but no ORDER for such a product ever will be under the current config.
         click.echo(f"⚠️  {warning}\n    Fetching/simulating it is fine; trading it is not.")
     return product_list
-
-
-def _sim_asset(product_id: str) -> str:
-    return product_id.split("-")[0]
-
-
-def _load_sim_candles(
-    repo: Repository, products: list[str], start_ts: int, end_ts: int
-) -> tuple[dict[str, dict[Granularity, list[Candle]]], dict[str, list[tuple[int, Decimal]]]]:
-    """Load cached candles for `products` into `(candles_by_asset, prices_by_asset)`.
-
-    `candles_by_asset`/`prices_by_asset` are keyed by bare asset code (`"BTC"`, not
-    `"BTC-USD"`) to match `sim.portfolio_sim`/`sim.benchmark`'s convention (rules bind to an
-    asset via `Rule.product_id`, `Config.target_weights` is asset-keyed).
-    """
-    candles_by_asset: dict[str, dict[Granularity, list[Candle]]] = {}
-    prices_by_asset: dict[str, list[tuple[int, Decimal]]] = {}
-    for product in products:
-        asset = _sim_asset(product)
-        per_tf = {
-            gran: repo.get_candles(product, gran, start_ts, end_ts) for gran in _SIM_GRANULARITIES
-        }
-        candles_by_asset[asset] = per_tf
-        prices_by_asset[asset] = [(c.ts, c.close) for c in per_tf[Granularity.ONE_DAY]]
-    return candles_by_asset, prices_by_asset
-
-
-def _sim_coverage(
-    repo: Repository, products: list[str], start_ts: int
-) -> dict[tuple[str, Granularity], history_mod.CoverageInfo]:
-    """Per-asset cached-candle coverage (no network -- reads whatever's already in the DB)."""
-    coverage: dict[tuple[str, Granularity], history_mod.CoverageInfo] = {}
-    for product in products:
-        asset = _sim_asset(product)
-        for gran in _SIM_GRANULARITIES:
-            coverage[(asset, gran)] = history_mod.coverage(repo, product, gran, start_ts)
-    return coverage
-
-
-def _print_sim_coverage(
-    db_path: str, coverage: dict[tuple[str, Granularity], history_mod.CoverageInfo]
-) -> None:
-    click.echo(f"data cached in: {db_path}")
-    for (asset, granularity), info in sorted(
-        coverage.items(), key=lambda kv: (kv[0][0], kv[0][1].value)
-    ):
-        click.echo(
-            f"  coverage {asset} {granularity.value}: n_candles={info.n_candles} "
-            f"first_ts={info.first_ts} last_ts={info.last_ts} gaps={info.gaps}"
-        )
-
-
-def _build_account_metrics(
-    sim: portfolio_sim.SimResult, start_ts: int, end_ts: int
-) -> dict[str, Any]:
-    """Reduce `sim.equity_curve`/`sim.contributions`/`sim.trades` into the account-metrics
-    dict `report.build_verdict`/`report.render_markdown` consume (see their docstrings for the
-    keys each reads)."""
-    equity_curve = sim.equity_curve
-    contributed = sum((amount for _, amount in sim.contributions), Decimal("0"))
-    ending_value = equity_curve[-1][1] if equity_curve else Decimal("0")
-    total_return_pct = (
-        (ending_value - contributed) / contributed if contributed > 0 else Decimal("0")
-    )
-    max_dd = metrics_mod.max_drawdown_pct(equity_curve)
-    returns = metrics_mod.daily_returns(equity_curve)
-    # Money-weighted IRR/CAGR treat contributions as outflows (negative) and the ending
-    # portfolio value as the single inflow -- see `sim.metrics.irr`/`cagr_money_weighted`.
-    cashflows = [(ts, -amount) for ts, amount in sim.contributions]
-
-    closed_trades = [t for t in sim.trades if t.outcome != "open"]
-    per_asset_pnl: dict[str, Decimal] = {}
-    for trade in closed_trades:
-        per_asset_pnl[trade.asset] = per_asset_pnl.get(trade.asset, Decimal("0")) + (
-            trade.pnl or Decimal("0")
-        )
-    # `exit_ts` is optional on the trade type because an OPEN trade has none; `closed_trades`
-    # has already excluded those, so every entry here carries one. Written as a filter rather
-    # than left implicit so the average is taken over exactly the trades that can contribute a
-    # duration -- matching the defensive `trade.pnl or Decimal("0")` two lines up, and keeping
-    # a stray `None` from reaching `Decimal(None - entry_ts)`.
-    hold_spans = [
-        Decimal(t.exit_ts - t.entry_ts) / Decimal(3600)
-        for t in closed_trades
-        if t.exit_ts is not None
-    ]
-    avg_hold_hours = (
-        sum(hold_spans, Decimal("0")) / len(hold_spans) if hold_spans else Decimal("0")
-    )
-
-    return {
-        "contributed": contributed,
-        "ending_value": ending_value,
-        "net_pnl_usd": ending_value - contributed,
-        "total_return_pct": total_return_pct,
-        "irr": metrics_mod.irr(cashflows, ending_value),
-        "cagr": metrics_mod.cagr_money_weighted(cashflows, ending_value, start_ts, end_ts),
-        "max_drawdown_pct": max_dd,
-        "return_per_drawdown": metrics_mod.return_per_drawdown(total_return_pct, max_dd),
-        "sharpe": metrics_mod.sharpe(returns),
-        "sortino": metrics_mod.sortino(returns),
-        "trade_count": len(closed_trades),
-        "avg_hold_hours": avg_hold_hours,
-        "per_asset_pnl": per_asset_pnl,
-    }
-
-
-def _build_tier_results(
-    config: Config,
-    rules: list[Any],
-    candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
-    sim_natural: portfolio_sim.SimResult,
-    natural_metrics: dict[str, Any],
-    start_ts: int,
-    now_ts: int,
-    monthly_contribution: Decimal,
-    skip_within_cap: bool,
-) -> list[tiers_mod.TierFeeResult]:
-    """Assemble the Coinbase One tier/fee analysis matrix (Issue #86) -- one `OVER_CAP` row per
-    `config.tiers` entry (always, from `sim_natural`, the already-computed natural/unthrottled
-    run) plus one `WITHIN_CAP` row per tier: an unlimited tier (`free_volume_usd is None`, e.g.
-    Premium) reuses `sim_natural` (nothing to throttle); a finite-free-volume tier gets its own
-    separate throttled `portfolio_sim.run(..., monthly_volume_cap=tier.free_volume_usd)` pass
-    UNLESS `skip_within_cap`, in which case that tier's within-cap row is simply omitted (only
-    the cheap over-cap overlay, reusing `sim_natural`, is computed).
-    """
-    natural_n_months = len(sim_natural.contributions)
-    natural_gross_pnl = natural_metrics.get("net_pnl_usd", Decimal("0"))
-
-    results: list[tiers_mod.TierFeeResult] = []
-    for tier in config.tiers:
-        results.append(
-            tiers_mod.compute_tier_fee_result(
-                monthly_volume=sim_natural.monthly_volume,
-                n_months=natural_n_months,
-                tier=tier,
-                mode=tiers_mod.OVER_CAP,
-                taker_pct=config.fees.taker_pct,
-                gross_pnl_usd=natural_gross_pnl,
-            )
-        )
-
-        if tier.free_volume_usd is None:
-            # Unlimited allowance -- nothing to throttle; within-cap == over-cap (Premium).
-            results.append(
-                tiers_mod.compute_tier_fee_result(
-                    monthly_volume=sim_natural.monthly_volume,
-                    n_months=natural_n_months,
-                    tier=tier,
-                    mode=tiers_mod.WITHIN_CAP,
-                    taker_pct=config.fees.taker_pct,
-                    gross_pnl_usd=natural_gross_pnl,
-                )
-            )
-            continue
-
-        if skip_within_cap:
-            continue
-
-        within_sim = portfolio_sim.run(
-            rules,
-            candles_by_asset,
-            config,
-            start_ts=start_ts,
-            end_ts=now_ts,
-            monthly_contribution=monthly_contribution,
-            fee_pct=_sim_fee_pct(config),
-            slippage_pct=_SIM_SLIPPAGE_PCT,
-            monthly_volume_cap=tier.free_volume_usd,
-        )
-        within_metrics = _build_account_metrics(within_sim, start_ts, now_ts)
-        results.append(
-            tiers_mod.compute_tier_fee_result(
-                monthly_volume=within_sim.monthly_volume,
-                n_months=len(within_sim.contributions),
-                tier=tier,
-                mode=tiers_mod.WITHIN_CAP,
-                taker_pct=config.fees.taker_pct,
-                gross_pnl_usd=within_metrics.get("net_pnl_usd", Decimal("0")),
-            )
-        )
-
-    return results
-
-
-def _default_report_path(now_ts: int) -> Path:
-    date_str = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y-%m-%d")
-    return Path("docs/superpowers/reports") / f"{date_str}-engine-validation.md"
 
 
 @cli.command()
@@ -2258,175 +1243,32 @@ def simulate(
     taker fee on volume EXCEEDING it ("over cap") nets out ahead. This means up to 3 total sim
     passes (natural + one throttled run per finite-free-volume tier) unless `--skip-within-cap`.
     """
-    now_ts = int(time.time())
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-
     product_list = _parse_products_option(products, config)
-    months = years * 12
     monthly_contribution = Decimal(contribution)
-    start_ts = now_ts - years * _DAYS_PER_YEAR * 86400
 
-    if not no_fetch:
-        client = _build_broker(config)
-        history_mod.ensure_history(
-            client,
-            repo,
-            product_list,
-            _SIM_GRANULARITIES,
-            years,
-            now_ts,
-            sleep_fn=time.sleep,
-            refresh=refresh,
-        )
-
-    coverage = _sim_coverage(repo, product_list, start_ts)
-    _print_sim_coverage(ctx.obj["db_path"], coverage)
-
-    candles_by_asset, prices_by_asset = _load_sim_candles(repo, product_list, start_ts, now_ts)
-    rules = [agent._build_rule(row) for row in repo.get_rules()]
-
-    # One rate for the whole pass -- edge table, account sim, and both benchmarks -- so the
-    # report's comparisons stay like-for-like. Sourced from config, and reported in the header
-    # below rather than left for the reader to assume.
-    sim_fee_pct = _sim_fee_pct(config)
-
-    # #259: the EDGE pass prices each product's fills from its own liquidity (the flat
-    # `_SIM_SLIPPAGE_PCT` remains the fallback for products without a statistic). The account
-    # pass and benchmarks below stay flat -- `SimAccount`'s cost model is unchanged by #259 --
-    # and the report says so beside the numbers (see `report._render_slippage_rows`).
-    slippage_rows, slippage_by_product = _slippage_assumptions(
-        candles_by_asset, product_list, [rule.product_id for rule in rules], _SIM_SLIPPAGE_PCT
-    )
-    _print_slippage_assumptions(slippage_rows)
-
-    edge = report_mod.edge_table(
-        rules,
-        candles_by_asset,
-        fee_pct=sim_fee_pct,
-        slippage_pct=_SIM_SLIPPAGE_PCT,
-        slippage_by_product=slippage_by_product,
-    )
-
-    sim = portfolio_sim.run(
-        rules,
-        candles_by_asset,
+    # `build_client=None` IS `--no-fetch`: the service never constructs a broker then, which is
+    # the no-network contract the tests pin. Otherwise it builds exactly where the old body
+    # did -- after option parsing, before the coverage read.
+    run_simulation(
+        repo,
         config,
-        start_ts=start_ts,
-        end_ts=now_ts,
+        None if no_fetch else (lambda: _build_broker(config)),
+        db_path=ctx.obj["db_path"],
+        products=product_list,
+        years=years,
         monthly_contribution=monthly_contribution,
-        fee_pct=sim_fee_pct,
-        slippage_pct=_SIM_SLIPPAGE_PCT,
+        now_ts=int(time.time()),
+        out_path=Path(out_path) if out_path is not None else None,
+        artifact=artifact,
+        refresh=refresh,
+        trial_decision=trial_decision,
+        trial_provenance=trial_provenance,
+        no_trial_record=no_trial_record,
+        skip_within_cap=skip_within_cap,
+        echo=click.echo,
     )
-    sim.coverage = coverage
-
-    account_metrics = _build_account_metrics(sim, start_ts, now_ts)
-
-    benchmark = benchmark_mod.dca_into_allowlist(
-        prices_by_asset,
-        config.target_weights,
-        monthly_contribution,
-        months,
-        sim_fee_pct,
-        _SIM_SLIPPAGE_PCT,
-    )
-    # Secondary benchmark (spec: DCA-into-BTC); not fed into the verdict gate, but computed so
-    # a future report revision can surface it without another sim pass.
-    benchmark_mod.dca_into_btc(
-        prices_by_asset, monthly_contribution, months, sim_fee_pct, _SIM_SLIPPAGE_PCT
-    )
-
-    promo_cfg = promotion_mod.PromotionConfig(
-        min_trades=config.promotion.min_trades,
-        min_expectancy=config.promotion.min_expectancy,
-        min_rr=config.promotion.min_rr,
-        min_win_rate=float(config.promotion.min_win_rate),
-    )
-    # G2 is checked per rule class (KB §25.5): each class's pooled edge sample is judged
-    # against its own floor, so a low-win/high-R:R trend-follower isn't rejected by the global
-    # 55%-win floor `promo_cfg` carries. Classes without a fixed floor fall back to `promo_cfg`.
-    pooled_by_class = report_mod.group_trades_by_class(edge, rules)
-    floors = {
-        cls: promotion_mod.floor_for_class(cls, promo_cfg) for cls in pooled_by_class
-    }
-    verdict = report_mod.build_verdict(
-        edge[report_mod.POOLED_KEY],
-        account_metrics,
-        benchmark,
-        sim.coverage,
-        promo_cfg,
-        pooled_by_class=pooled_by_class,
-        floors=floors,
-    )
-    gaps = report_mod.analyze_gaps(
-        sim.telemetry, sim.coverage, move_threshold_pct=portfolio_sim.MOVE_THRESHOLD_PCT
-    )
-
-    tier_results = _build_tier_results(
-        config,
-        rules,
-        candles_by_asset,
-        sim,
-        account_metrics,
-        start_ts,
-        now_ts,
-        monthly_contribution,
-        skip_within_cap,
-    )
-
-    if not no_trial_record:
-        # One ledger row per simulate run: the run IS one configuration of the whole rule set,
-        # and its account equity curve is that configuration's per-bar P&L column. Deposits are
-        # stripped by `bar_pnl` -- new capital is not profit (spec §4.5).
-        series = metrics_mod.bar_pnl(sim.equity_curve, sim.contributions)
-        trials_ledger.append_trial(
-            trials_ledger.DEFAULT_LEDGER_PATH,
-            trial_id=f"simulate-{now_ts}",
-            session="keel simulate",
-            rule=",".join(sorted({rule.name for rule in rules})) or "none",
-            params={
-                "products": product_list,
-                "years": years,
-                "monthly_contribution": str(monthly_contribution),
-                "rules": [rule.describe() for rule in rules],
-            },
-            provenance=trial_provenance,
-            kind="sweep_node",
-            decision=trial_decision,
-            per_bar_pnl=series,
-            series_missing=not series,
-            summary={"trade_count": len(sim.trades)},
-        )
-
-    md = report_mod.render_markdown(
-        sim,
-        edge,
-        account_metrics,
-        benchmark,
-        verdict,
-        gaps,
-        in_sample=True,
-        tier_results=tier_results,
-        fee_pct=sim_fee_pct,
-        slippage_rows=slippage_rows,
-    )
-
-    out = Path(out_path) if out_path is not None else _default_report_path(now_ts)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(md)
-
-    click.echo(f"verdict: {verdict.status}")
-    click.echo(f"report written to {out}")
-    if verdict.reasons:
-        click.echo("failing gates: " + "; ".join(verdict.reasons))
-
-    if artifact:
-        html = artifact_mod.render_html(
-            sim, benchmark, verdict, gaps, account_metrics, in_sample=True
-        )
-        html_path = out.with_suffix(".html")
-        html_path.write_text(html)
-        click.echo(f"artifact written to {html_path}")
 
 
 # -- subscription (rail 14, per-venue attested allowance) ----------------------------------------
@@ -2472,8 +1314,7 @@ cli.add_command(versions_cmd)
 @with_disclaimer
 def kill(ctx: click.Context) -> None:
     """Engage the kill-switch, halting all trading immediately. Always allowed (safe action)."""
-    repo = _open_repo(ctx)
-    repo.set_state("kill_switch", True)
+    engage_kill_switch(_open_repo(ctx))
     click.echo("kill-switch ENGAGED: all trading halted.")
 
 
@@ -2486,8 +1327,7 @@ def resume(ctx: click.Context) -> None:
         "disengage the kill-switch",
         "Trading resumes immediately: the agent may place orders on its next cycle.",
     )
-    repo = _open_repo(ctx)
-    repo.set_state("kill_switch", False)
+    disengage_kill_switch(_open_repo(ctx))
     click.echo("kill-switch disengaged: trading resumed.")
 
 
@@ -2509,9 +1349,7 @@ def resume_entries(ctx: click.Context) -> None:
         "clear the consecutive-loss halt (rail 16)",
         "New entries are re-permitted; the loss counter is reset with it.",
     )
-    repo = _open_repo(ctx)
-    repo.set_state("streak_halt_until", 0)
-    repo.set_state("consecutive_losses", 0)
+    clear_consecutive_loss_halt(_open_repo(ctx))
     click.echo("consecutive-loss breaker cleared: new entries permitted.")
 
 
@@ -2558,9 +1396,7 @@ def record_flow(ctx: click.Context, amount: str) -> None:
     if not parsed.is_finite():
         raise click.BadParameter(f"--amount must be a finite number, got {amount!r}")
 
-    repo = _open_repo(ctx)
-    equity_mod.record_external_flow(repo, amount=parsed)
-    hwm = repo.get_state("equity_high_water_mark")
+    hwm = record_declared_flow(_open_repo(ctx), parsed)
     if hwm is None:
         click.echo(
             f"flow of {parsed} recorded. No high-water mark yet -- the next cycle will seed it "
@@ -2589,11 +1425,7 @@ def reset_hwm(ctx: click.Context) -> None:
         "reset rail 11's high-water mark",
         "Any real, unrecovered drawdown stops being visible to the rail.",
     )
-    repo = _open_repo(ctx)
-    repo.set_state("equity_high_water_mark", None)
-    repo.set_state("drawdown_total_pct", Decimal("0"))
-    repo.set_state("drawdown_weekly_pct", Decimal("0"))
-    repo.set_state("equity_history", [])
+    reset_high_water_mark(_open_repo(ctx))
     click.echo("equity high-water mark reset: it will re-seed from the next cycle's equity.")
 
 
