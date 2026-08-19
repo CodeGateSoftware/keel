@@ -767,6 +767,61 @@ def test_freshness_style(granularity: str | None, age_sec: int | None, expected:
     assert _freshness_style(granularity, age_sec) == expected
 
 
+def test_freshness_style_mutes_the_staleness_colour_under_a_closed_market() -> None:
+    """`market_closed` mutes only the AGE-based warn: a behind series during a (still
+    trusted) closure is the expected weekend shape. Fresh stays ok, and the no-data /
+    unknown-granularity cells keep their warn -- a closed venue still serves history, so a
+    cold cache is a pipeline problem, not a session artifact (the `fetch --check` rule)."""
+    assert _freshness_style("ONE_HOUR", 3600 * 3, market_closed=True) == "muted"
+    assert _freshness_style("ONE_HOUR", 60, market_closed=True) == "ok"
+    assert _freshness_style(None, None, market_closed=True) == "warn"
+    assert _freshness_style("NOT_A_GRANULARITY", 60, market_closed=True) == "warn"
+
+
+def test_freshness_cells_render_muted_not_warn_while_the_market_is_closed() -> None:
+    """Finding: `_freshness_style` painted warn for age > 2x period even while the
+    dashboard's own session line said CLOSED -- two parts of one screen disagreeing about
+    the same weekend. The session record is the source of truth: closed AND inside its
+    trust window -> the behind series' cell is muted, like the session line itself."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=True
+        ),
+        data_freshness=[ProductFreshness("BTC-USD", "ONE_HOUR", NOW_TS - 4 * 3600, 4 * 3600)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  BTC-USD"))
+    assert freshness_line.style == "muted"
+
+
+def test_freshness_cells_still_warn_once_the_closed_record_is_stale() -> None:
+    """`defused=False` (record outside its trust window) means the closure no longer
+    vouches for the quiet -- the staleness colour comes back with the alert."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=False
+        ),
+        data_freshness=[ProductFreshness("BTC-USD", "ONE_HOUR", NOW_TS - 4 * 3600, 4 * 3600)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  BTC-USD"))
+    assert freshness_line.style == "warn"
+
+
+def test_no_data_freshness_cells_still_warn_while_the_market_is_closed() -> None:
+    """The `fetch --check` rule, carried into colour: MISSING stays actionable when closed
+    because a closed venue still serves history -- so 'no data' keeps the warning."""
+    report = _base_report(
+        market_session=MarketSessionStatus(
+            state="closed", recorded_ts=NOW_TS - 60, defused=True
+        ),
+        data_freshness=[ProductFreshness("ETH-USD", None, None, None)],
+    )
+    lines = build_screen(report, NOW_TS)
+    freshness_line = next(line for line in lines if line.text.startswith("  ETH-USD"))
+    assert freshness_line.style == "warn"
+
+
 # -- render_plain -----------------------------------------------------------------------------
 
 

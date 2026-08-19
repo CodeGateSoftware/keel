@@ -771,6 +771,42 @@ class TestSession:
         # No transport injected at all: the same fail-closed answer, not a RuntimeError.
         assert AlpacaAdapter().market_clock() is SessionState.CLOCK_UNAVAILABLE
 
+    @pytest.mark.parametrize(
+        "clock_body",
+        [
+            {"timestamp": "2026-08-14T20:00:00Z", "next_open": "2026-08-17T13:30:00Z"},
+            {"is_open": None},
+            {"is_open": "true"},
+            {"is_open": 1},
+        ],
+        ids=["is_open-absent", "is_open-null", "is_open-string", "is_open-number"],
+    )
+    def test_a_body_without_a_usable_is_open_is_clock_unavailable_not_closed(
+        self, clock_body: dict[str, Any]
+    ) -> None:
+        """A 2xx body that says nothing USABLE about the session is an unreadable clock, not
+        a closed one: CLOSED defuses staleness alerting forever (re-recorded fresh each
+        cycle), which is exactly what a malformed body must never be allowed to do. Only an
+        actual boolean answers OPEN/CLOSED -- fail-loud for alerting, fail-closed for
+        trading, the PR's own stated rule."""
+        assert AlpacaAdapter(FakeTransport(clock=clock_body)).market_clock() is (
+            SessionState.CLOCK_UNAVAILABLE
+        )
+        # Phase A's boolean form reads the same posture: not open.
+        assert AlpacaAdapter(FakeTransport(clock=clock_body)).is_market_open() is False
+
+    def test_only_an_actual_boolean_answers_open_or_closed(self) -> None:
+        """The positive half of the rule: `is_open: true`/`false` are the only shapes that
+        answer OPEN/CLOSED at all."""
+        assert (
+            AlpacaAdapter(FakeTransport(clock={"is_open": True})).market_clock()
+            is SessionState.OPEN
+        )
+        assert (
+            AlpacaAdapter(FakeTransport(clock={"is_open": False})).market_clock()
+            is SessionState.CLOSED
+        )
+
     def test_no_order_body_ever_asks_for_extended_hours(self) -> None:
         """Overnight/extended sessions are OFF by posture (FR-9): thinner liquidity would
         hold the #350 spread gate permanently. Every body pins `extended_hours: False`."""

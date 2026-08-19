@@ -184,16 +184,21 @@ class AlpacaAdapter:
         decides what to do; this method's answer is the venue's, or an honest "could not
         read".
 
-        A response that IS a clock but carries no `is_open` field reads CLOSED, matching
-        `is_market_open`'s Phase A reading of the same endpoint: a venue that answered with
-        a body and said nothing about the session is not an error, it is a closed-or-silent
-        clock, and the `False` default is the conservative of the two.
+        **Only an actual boolean `is_open` answers OPEN/CLOSED.** A 2xx body whose
+        `is_open` is absent, null, or not a bool is `CLOCK_UNAVAILABLE` too, not CLOSED:
+        CLOSED defuses staleness alerting (re-recorded fresh each cycle, so effectively
+        forever), and a malformed body must never buy that silence. Unreadable clocks are
+        fail-loud for alerting and fail-closed for trading -- the same split the engine's
+        session gate applies to `clock_unavailable`.
         """
         try:
             clock = self._require_transport().get_clock()
             if clock is None:
                 return SessionState.CLOCK_UNAVAILABLE
-            return SessionState.OPEN if _field(clock, "is_open", False) else SessionState.CLOSED
+            is_open = _field(clock, "is_open")
+            if not isinstance(is_open, bool):
+                return SessionState.CLOCK_UNAVAILABLE
+            return SessionState.OPEN if is_open else SessionState.CLOSED
         except Exception:
             return SessionState.CLOCK_UNAVAILABLE
 

@@ -113,14 +113,22 @@ class MarketSessionStatus:
     rail-17 pattern applied to the market clock: name the state that gates the cycle, on its
     own line, before an operator has to wonder why nothing trades.
 
-    Read from `agent_state` (`agent.MARKET_SESSION_KEY`), never from a broker call: this
+    Read from `agent_state` (`agent.market_session_key`), never from a broker call: this
     dashboard's whole design is "local DB + config only". `state is None` means no session-
     bound venue has recorded anything -- a 24/7 deployment, or one whose agent has not run --
     and renders NO line, so crypto dashboards stay byte-identical.
+
+    `defused` says whether that recorded CLOSED still vouches for the quiet: closed AND
+    inside its trust window (`agent.recorded_market_closed`) is the state under which
+    staleness does not alert, and the TUI's freshness styling keys off it so the cells and
+    the session line can never disagree about the same weekend.
     """
 
     state: str | None  # "open" | "closed" | "clock_unavailable" | None (not session-bound)
     recorded_ts: int | None
+    #: Defaulted so every existing `MarketSessionStatus(...)` construction (the TUI tests)
+    #: stays valid -- the same pattern `StatusReport` itself uses for this very field.
+    defused: bool = False
 
 
 @dataclass(frozen=True)
@@ -254,16 +262,33 @@ def _subscription_rows(
     ]
 
 
-def _market_session(repo: Repository) -> MarketSessionStatus:
+def _market_session(repo: Repository, config: Config, now_ts: int) -> MarketSessionStatus:
     """The venue's recorded session answer, read through `agent`'s own state keys -- the same
     discipline `_withdrawal_attestation` keeps toward the executor: this display reads what
-    the engine wrote, never a re-derivation that could disagree with the cycle's decision."""
-    state = repo.get_state(agent.MARKET_SESSION_KEY)
-    if state is None:
+    the engine wrote, never a re-derivation that could disagree with the cycle's decision.
+
+    The records are venue-namespaced (`market_session:{venue}`), and this dashboard holds no
+    broker to ask which venue it serves, so `agent.recorded_session_venues` discovers the
+    recorded slots and the most recently stamped one is displayed -- a deployment has one
+    venue, so there is exactly one slot in every supported topology. `defused` comes from
+    `agent.recorded_market_closed` (closed AND inside the trust window), which is the same
+    read `fetch --check` defuses on -- one source of truth for every rendering of the quiet.
+    """
+    best: tuple[int, str, int | None] | None = None
+    for venue in agent.recorded_session_venues(repo):
+        state = repo.get_state(agent.market_session_key(venue))
+        if state is None:
+            continue
+        recorded_ts = repo.get_state(agent.market_session_ts_key(venue))
+        stamped = recorded_ts if isinstance(recorded_ts, int) else -1
+        if best is None or stamped > best[0]:
+            best = (stamped, str(state), stamped if stamped > 0 else None)
+    if best is None:
         return MarketSessionStatus(state=None, recorded_ts=None)
-    recorded_ts = repo.get_state(agent.MARKET_SESSION_TS_KEY)
     return MarketSessionStatus(
-        state=str(state), recorded_ts=recorded_ts if isinstance(recorded_ts, int) else None
+        state=best[1],
+        recorded_ts=best[2],
+        defused=agent.recorded_market_closed(repo, config, now_ts),
     )
 
 
@@ -347,7 +372,7 @@ def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport
         live_rules=live_rules,
         data_freshness=_data_freshness(repo, config, now_ts),
         subscriptions=_subscription_rows(repo, config, now_ts),
-        market_session=_market_session(repo),
+        market_session=_market_session(repo, config, now_ts),
     )
 
 

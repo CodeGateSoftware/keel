@@ -15,9 +15,11 @@ from __future__ import annotations
 import time
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from click.testing import CliRunner
+from keel_broker_api.results import SessionState
 
 import keel.cli as cli_module
 from keel import agent
@@ -374,6 +376,109 @@ def test_monitor_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeyp
 
     assert result.exit_code == 0, result.output
     assert result.output.count("polled") == 2
+
+
+# -- monitor: session awareness (FR-9; review finding on #385) ---------------------------------
+#
+# `keel monitor --loop` is often the only thing cycling over a weekend on a session-bound
+# venue. While the venue reports closed it must skip polling (a shut venue mints no bars),
+# log the skip ONCE PER STATE CHANGE (not every tick -- a weekend is ~60 hourly ticks of
+# the same fact), and record the session so `fetch --check` stays quiet. Crypto venues
+# (no `capabilities()`) poll exactly as before.
+
+
+class _SessionClockFakeBroker(FakeBroker):
+    """`FakeBroker` plus the broker port's session surface: a venue-declaring,
+    session-bound clock whose answer list is consumed one cycle at a time (clamping to the
+    last answer once exhausted)."""
+
+    def __init__(self, answers: list[Any]) -> None:
+        super().__init__()
+        self._answers = list(answers)
+        self.clock_calls = 0
+
+    def capabilities(self) -> Any:
+        return SimpleNamespace(session_bound=True, venue="alpaca")
+
+    def market_clock(self) -> Any:
+        answer = self._answers[min(self.clock_calls, len(self._answers) - 1)]
+        self.clock_calls += 1
+        return answer
+
+
+def test_monitor_skips_polling_while_the_venue_reports_closed(
+    tmp_path, valid_config_path, monkeypatch
+):
+    broker = _SessionClockFakeBroker([SessionState.CLOSED])
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "monitor", "--loop", "--max-cycles", "3", "--interval", "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert broker.get_candles_calls == []  # a shut venue is never polled
+    assert result.output.count("market closed") == 1  # logged once per state change, not per tick
+    repo = _repo_at(db_path)
+    assert repo.get_state("market_session:alpaca") == "closed"
+    assert isinstance(repo.get_state("market_session_ts:alpaca"), int)
+    assert repo.get_state("market_session_interval_sec:alpaca") == 900  # the effective interval
+
+
+def test_monitor_resumes_polling_when_the_venue_reopens(tmp_path, valid_config_path, monkeypatch):
+    """Closed, closed, then open: two skipped cycles produce ONE skip line, and the open
+    cycle polls exactly as it always did."""
+    broker = _SessionClockFakeBroker(
+        [SessionState.CLOSED, SessionState.CLOSED, SessionState.OPEN]
+    )
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "monitor", "--loop", "--max-cycles", "3", "--interval", "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("market closed") == 1
+    assert result.output.count("polled") == 1
+    assert broker.get_candles_calls  # the open cycle polled
+    repo = _repo_at(db_path)
+    assert repo.get_state("market_session:alpaca") == "open"
+
+
+def test_monitor_polls_as_today_when_the_venue_is_open(tmp_path, valid_config_path, monkeypatch):
+    broker = _SessionClockFakeBroker([SessionState.OPEN])
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    db_path = tmp_path / "test.db"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--db", str(db_path),
+            "--config", str(valid_config_path),
+            "monitor", "--loop", "--max-cycles", "2", "--interval", "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("polled") == 2
+    assert broker.get_candles_calls
+    repo = _repo_at(db_path)
+    assert repo.get_state("market_session:alpaca") == "open"
 
 
 # -- rules ------------------------------------------------------------------------------------

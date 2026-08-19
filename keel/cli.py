@@ -77,7 +77,7 @@ from pathlib import Path
 from typing import Any
 
 import click
-from keel_broker_api.results import Preview
+from keel_broker_api.results import Preview, SessionState
 from keel_core.products import quote_currency_of
 
 from keel import agent
@@ -492,11 +492,13 @@ def fetch(
     # an engine limit rather than a data choice (Issue #349).
     granularities = list(config.market_data.granularities)
 
-    # FR-9: the venue's session answer, as recorded by the last agent cycle. A closed
-    # session-bound venue defuses STALE (nothing can fetch bars a shut venue is not minting,
-    # and a weekend must not page an operator); see `agent.recorded_market_closed` for the
-    # trust window and the deliberate clock_unavailable/missing carve-outs. A 24/7 venue
-    # never records a session, so this is False and every verdict stays byte-identical.
+    # FR-9: the venue's session answer, as recorded by the last cycle of whatever loop is
+    # running (the agent, or `keel monitor --loop`). A closed session-bound venue defuses
+    # STALE (nothing can fetch bars a shut venue is not minting, and a weekend must not page
+    # an operator); see `agent.recorded_market_closed` for the trust window -- derived from
+    # the interval the recording deployment actually cycles at, config only as the fallback
+    # -- and the deliberate clock_unavailable/missing carve-outs. A 24/7 venue never records
+    # a session, so this is False and every verdict stays byte-identical.
     market_closed = agent.recorded_market_closed(repo, config, now_ts)
 
     before = _assess_products(
@@ -524,21 +526,40 @@ def fetch(
             raise click.ClickException(
                 f"{unexplained} series have unexplained gaps -- run `keel fetch --repair-gaps`"
             )
+        # Truthful, not reassuring: series that ARE behind must not be called "current".
+        # When the closed record explains the staleness, the summary says so -- the quiet
+        # has to be legible, which is the whole point of a closing line (and the older
+        # "all series actionable" wording said the opposite of what it meant).
+        closed_explained = market_closed and any(r.stale for r, _ in before)
+        summary = (
+            "all series current or closed-explained"
+            if closed_explained
+            else "all series current"
+        )
         if unexplained:
             click.echo(
-                f"\nall series current. {unexplained} have UNEXPLAINED gaps -- run "
+                f"\n{summary}. {unexplained} have UNEXPLAINED gaps -- run "
                 "`keel fetch --repair-gaps` to probe them."
             )
-        elif market_closed:
-            click.echo("\nall series actionable -- market closed, staleness not alerting")
+        elif closed_explained:
+            click.echo(f"\n{summary} (market closed -- staleness does not alert)")
         else:
-            click.echo("\nall series current")
+            click.echo(f"\n{summary}")
         return
 
     if not refresh and not repair_gaps and not freshness_mod.any_needs_fetch(
         [r for r, _ in before]
     ):
-        click.echo("\nall series current -- nothing to fetch")
+        # The no-network skip is deliberate (nothing a fetch does can produce bars a closed
+        # venue is not minting) -- but a behind series must not be called "current" to
+        # justify it. Name the closure instead.
+        if market_closed and any(r.stale for r, _ in before):
+            click.echo(
+                "\nmarket closed -- staleness does not alert; behind series are "
+                "expected, nothing to fetch"
+            )
+        else:
+            click.echo("\nall series current -- nothing to fetch")
         return
 
     click.echo("\nfetching...")
@@ -1397,10 +1418,33 @@ def monitor(
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
 
     cycles = 0
+    # FR-9 at the polling surface: while a session-bound venue reports closed, there is
+    # nothing to poll (a shut venue mints no bars), so the cycle skips -- but the session
+    # is still recorded, so `fetch --check` stays quiet over the weekend even when monitor
+    # is the only loop cycling. The skip line is emitted ONCE PER STATE CHANGE (a weekend
+    # is ~60 hourly ticks of the same fact, and repeating it would train an operator to
+    # stop reading monitor output), which is what `last_session` tracks. Crypto venues
+    # (no session surface) poll exactly as before -- `record_market_session` records
+    # nothing for them.
+    last_session: SessionState | None = None
     while True:
         now_ts = int(time.time())
-        written = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
-        click.echo(f"[{now_ts}] polled {written} new candle row(s) across {products}")
+        session, session_bound = agent.record_market_session(
+            broker, repo, config, now_ts, interval_sec=interval
+        )
+        if session_bound and session is not SessionState.OPEN:
+            if session is not last_session:
+                reason = (
+                    "market closed -- skipping poll"
+                    if session is SessionState.CLOSED
+                    else "market clock unreadable (fail-closed) -- skipping poll"
+                )
+                click.echo(f"[{now_ts}] {reason}")
+                last_session = session
+        else:
+            last_session = session if session_bound else None
+            written = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
+            click.echo(f"[{now_ts}] polled {written} new candle row(s) across {products}")
         cycles += 1
         if not loop or (max_cycles is not None and cycles >= max_cycles):
             break

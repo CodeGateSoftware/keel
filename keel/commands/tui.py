@@ -173,16 +173,28 @@ _GRANULARITY_PERIOD_SEC: dict[str, int] = {
 }
 
 
-def _freshness_style(granularity: str | None, age_sec: int | None) -> str:
+def _freshness_style(
+    granularity: str | None, age_sec: int | None, *, market_closed: bool = False
+) -> str:
     """`"ok"` when a product's newest candle is within 2x its own granularity's period, `"warn"`
     when it is staler than that -- or when there is no local data / unknown granularity to begin
-    with (a daily series a couple of days old is fine; a couple of *periods* old is stale)."""
+    with (a daily series a couple of days old is fine; a couple of *periods* old is stale).
+
+    `market_closed` (the report's own session answer, closed AND inside its trust window --
+    `MarketSessionStatus.defused`) downgrades the AGE-based warn to `"muted"`: a behind
+    series during a closure is the expected weekend shape, and painting it warn while the
+    session line two rows up says CLOSED muted would be one screen disagreeing with itself.
+    The no-data/unknown-granularity warn is deliberately NOT downgraded -- a closed venue
+    still serves history, so a cold cache is a pipeline problem, not a session artifact (the
+    `fetch --check` rule, carried into colour)."""
     if granularity is None or age_sec is None:
         return "warn"
     period = _GRANULARITY_PERIOD_SEC.get(granularity)
     if period is None:
         return "warn"
-    return "warn" if age_sec > 2 * period else "ok"
+    if age_sec > 2 * period:
+        return "muted" if market_closed else "warn"
+    return "ok"
 
 
 def _blank() -> ScreenLine:
@@ -414,9 +426,17 @@ def _rule_lines(report: StatusReport) -> list[ScreenLine]:
 
 
 def _freshness_lines(report: StatusReport) -> list[ScreenLine]:
+    # The session answer the dashboard's own session line renders (`_market_session_lines`
+    # reads the same `report.market_session`): closed AND still inside its trust window
+    # (`defused`) mutes the staleness colour, so the cells and the line cannot disagree
+    # about the same weekend. Anything else -- open, unreadable clock, an expired record --
+    # keeps the ordinary warn.
+    market_closed = (
+        report.market_session.state == "closed" and report.market_session.defused
+    )
     lines: list[ScreenLine] = [ScreenLine("data freshness:", "normal")]
     for f in report.data_freshness:
-        style = _freshness_style(f.granularity, f.age_sec)
+        style = _freshness_style(f.granularity, f.age_sec, market_closed=market_closed)
         if f.last_ts is None:
             lines.append(ScreenLine(f"  {f.product_id}: no data", style))
         else:

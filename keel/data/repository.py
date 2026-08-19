@@ -381,6 +381,23 @@ class Repository:
         )
         self._conn.commit()
 
+    def get_state_keys(self, prefix: str) -> list[str]:
+        """Every `agent_state` key starting with `prefix`, sorted -- a prefix DISCOVERY read
+        for surfaces that hold no broker to ask which venue they serve: the venue-namespaced
+        market-session records (`agent.market_session_key`) are found this way by `fetch
+        --check`/`status`, which must stay offline and therefore cannot read a venue id off
+        an adapter's `capabilities()`.
+
+        `substr(key, 1, len(prefix)) = prefix` rather than `LIKE prefix || '%'` so a prefix
+        containing `_` or `%` matches literally -- venue ids are slugs, but this read should
+        not become a wildcard hazard the day one isn't.
+        """
+        rows = self._conn.execute(
+            "SELECT key FROM agent_state WHERE substr(key, 1, ?) = ? ORDER BY key",
+            (len(prefix), prefix),
+        ).fetchall()
+        return [row["key"] for row in rows]
+
     # -- broker subscriptions (per-venue, rail 14) -------------------------
 
     def get_broker_subscription(self, venue: str) -> BrokerSubscription | None:
