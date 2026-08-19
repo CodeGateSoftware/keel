@@ -23,14 +23,19 @@ Each entry is a `## term` heading, a definition, and a `Source:` line.
 ## rail
 
 One of keel's numbered hard guards that every order passes through -- spend caps, drawdown
-breakers, the allowlist, settlement-currency and spot-shape checks. Nineteen exist (1-14,
+breakers, the allowlist, settlement-currency and spot-shape checks. Eighteen exist (1-14,
 16, 17, 18, 19 -- there is no rail 15); each is un-overridable and audit-logged.
 
-Source: keel's own vocabulary -- docs/fiqh-basis.md's rails table enumerates all nineteen
+Source: keel's own vocabulary -- docs/fiqh-basis.md's rails table (the prudential rails 2-14, 16) plus its prose sections for rails 1, 17, 18 and 19
 
 ## attestation
 
-A human records them, with a source and a name, via `keel assets attest`.
+market facts are computed, Shariah classifications are **ATTESTED, never inferred**.
+Whether a token's core purpose is a haram sector (§28.4), whether it is asset-backed
+`'ayn` or a claim `dayn` (§65.5/§67.2), and whether it pays a riba-like yield are
+questions of fact-plus-scholarship about the world. No module in this repository derives
+them from candles, and none pretends to. A human records them, with a source and a name,
+via `keel assets attest`.
 
 Source: docs/fiqh-basis.md -- "## What is attested versus what is computed"
 
@@ -58,10 +63,15 @@ Source: docs/fiqh-basis.md -- "## What is attested versus what is computed"
 ## promotion gate
 
 The thresholds a candidate rule must clear on out-of-sample evidence before `rules
-promote` moves it toward live: a minimum number of trades, a minimum edge over the DCA
-benchmark, and a PBO (probability of backtest overfitting) bound. The pooled gate
-aggregates a kind's evidence across products; `keel insights` renders how far a rule
-sits from it.
+promote` moves it toward live: the four performance floors -- min_trades (a minimum
+number of trades), min_expectancy, min_rr (a minimum realised reward:risk ratio) and
+min_win_rate -- AND the overfitting gate (G4): a probability of backtest overfitting
+(PBO) above its bound TOGETHER WITH a steeply negative degradation slope, a
+conjunction, not a bare PBO bound. Pooling is per parameter SET and covers only the
+sample-size axis -- the same parameter set's paper evidence may count toward min_trades
+across products -- and the G4/overfitting gate is NOT pooled. The DCA benchmark is not
+a floor of this gate; a simulate report is where a rule is measured against it.
+`keel insights` renders how far a rule sits from the gate.
 
 Source: keel's own vocabulary -- keel/strategy/promotion.py and keel/research/cscv.py
 
@@ -90,8 +100,8 @@ Source: keel's own vocabulary -- keel/commands/trading.py
 
 ## autonomy
 
-The armed state in which the agent places orders unattended. Arming asks an explicit
-confirmation; disarming only ever reduces capability and never does.
+The armed state in which the agent places orders unattended. Arming demands a typed yes
+at the terminal; disarming only ever reduces capability and stays ungated.
 
 Source: keel's own vocabulary -- keel/commands/autonomy.py
 

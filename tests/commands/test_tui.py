@@ -1630,6 +1630,54 @@ def test_run_live_discover_enter_raising_paints_readable_failure_and_keeps_polli
     assert any(i > failed_idx and "paper mode" in t for i, t in enumerate(painted_texts))
 
 
+def test_run_live_discover_question_opens_the_discover_context_help(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[review #406] `?` was dead in the discover overlay -- the one dispatched mode
+    without it. From discover (armed, no network call made), `?` must open the context
+    overlay rendering DISCOVER's own CONTEXT_HELP rows, and Esc must return to the
+    discover overlay (still armed -- `?` is not Enter, it reads nothing and runs
+    nothing), then close back to the dashboard."""
+    config = _config()
+
+    class _FakeBroker:
+        def get_accounts(self) -> list[Any]:
+            return []
+
+        def list_products(self) -> list[dict]:
+            raise AssertionError("? must never run the fetch -- only Enter does")
+
+    def _fake_build_broker(cfg: Any, timeout: int | None = None) -> _FakeBroker:
+        return _FakeBroker()
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _fake_build_broker)
+
+    # poll1: normal -> 'd' opens discover, ARMED. poll2: discover -> '?' opens the
+    # context overlay. poll3: overlay, no key -- the discover rows repaint. poll4: Esc
+    # returns to discover. poll5: Esc closes discover. poll6: normal -> 'q' (default).
+    keys = [ord("d"), ord("?"), -1, 27, 27]
+    stdscr = _KeySequenceStdscr(height=24, width=80, keys=keys)
+
+    fake_curses = _fake_curses()
+    fake_curses.wrapper = lambda fn: fn(stdscr)
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+
+    def open_state() -> tuple[Repository, Any]:
+        return repo, config
+
+    run_live(open_state, lambda: NOW_TS, interval=0.01)
+
+    painted_texts = [call[2] for call in stdscr.calls]
+    overlay_idx = next(i for i, t in enumerate(painted_texts) if "help: discover" in t)
+    # the overlay renders DISCOVER's own rows, not the generic catalogue
+    assert any(
+        "discover (d) -- ARMED" in t for t in painted_texts[overlay_idx : overlay_idx + 8]
+    )
+    # opened from the armed overlay, closed back to it, then to the dashboard
+    assert any("ARMED" in t for t in painted_texts[overlay_idx + 1 :])
+    assert any("paper mode" in t for t in painted_texts[overlay_idx + 1 :])
+
+
 def test_run_live_discover_reopening_after_a_run_is_armed_not_stale(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:

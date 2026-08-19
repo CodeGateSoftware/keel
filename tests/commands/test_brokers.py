@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from click.testing import CliRunner
@@ -20,6 +22,7 @@ from click.testing import CliRunner
 from keel.cli import cli
 from keel.commands import brokers
 from keel.commands import console as console_mod
+from keel.config import load_config
 
 #: Every field the payload may carry -- the closed capability vocabulary. A field outside
 #: this set (an env read, a key-presence probe, a config content) is a scope violation,
@@ -37,6 +40,7 @@ PAYLOAD_FIELDS = {
     "declared_endpoints",
     "supported_data_feeds",
     "package_version",
+    "error",
 }
 
 _INSTALLED = {"alpaca", "coinbase", "fake", "robinhood"}
@@ -175,6 +179,115 @@ def test_render_human_lines_name_every_adapter_and_both_deployments() -> None:
     assert "wired-for-deployment" in text
     assert "optional-dev-venue" in text
     assert "24/7" in text and "session-bound" in text
+
+
+# -- one poisoned registry entry must not kill the listing (#406 review) ---------------------------
+
+
+class _BrokenAdapter:
+    """An adapter whose construction explodes -- the review's poisoned registry entry."""
+
+    def __init__(self) -> None:
+        raise RuntimeError("adapter metadata unreadable")
+
+
+def _capabilities() -> SimpleNamespace:
+    return SimpleNamespace(
+        venue="ok-venue",
+        session_bound=False,
+        quote_currencies=("USD",),
+        asset_classes=("spot",),
+        supported_orders=("market",),
+        supports_native_preview=True,
+        synthesizes_preview=False,
+        supports_fee_summary=True,
+    )
+
+
+class _HealthyAdapter:
+    def capabilities(self) -> SimpleNamespace:
+        return _capabilities()
+
+
+def _poison_the_registry(monkeypatch: Any) -> None:
+    """The registry walk the service makes, with one healthy and one broken entry."""
+    monkeypatch.setattr(
+        "keel_broker_api.registry.discover_brokers",
+        lambda: {"broken": _BrokenAdapter, "healthy": _HealthyAdapter},
+    )
+
+
+def test_a_poisoned_registry_entry_renders_an_error_row_and_keeps_the_rest(
+    monkeypatch: Any,
+) -> None:
+    """[review #406] One raising adapter must not kill `list_installed_brokers` (and with
+    it `keel brokers list` AND the console's Venues browser, which ride the same service
+    -- the TUI's Profile->Venues entry calls it outside every try in the loop). The
+    service stays total: the broken entry becomes an honest error row (its name plus the
+    error), and every healthy adapter still renders."""
+    _poison_the_registry(monkeypatch)
+    rows = brokers.list_installed_brokers()
+    by_name = {row.name: row for row in rows}
+    assert set(by_name) == {"broken", "healthy"}
+    broken = by_name["broken"]
+    assert broken.error is not None
+    assert "adapter metadata unreadable" in broken.error
+    assert by_name["healthy"].error is None
+    # the honest block carries name + error, wrapped to the console's budget
+    block = brokers.adapter_error_block(broken)
+    assert any("broken" in line for line in block)
+    assert any("adapter metadata unreadable" in line for line in block)
+    assert all(len(line) <= 78 for line in block)
+    # and the human rendering shows the error row AND the healthy adapter
+    text = "\n".join(brokers.render_brokers_lines(rows))
+    assert "broken" in text and "adapter metadata unreadable" in text
+    assert "healthy" in text and "ok-venue" in text
+
+
+def test_a_poisoned_registry_entry_does_not_crash_the_cli_nor_the_venues_browser(
+    monkeypatch: Any,
+) -> None:
+    """Both front-ends render the SAME resilient payload: the CLI exits 0 with the error
+    row and the healthy row, and the console's Venues browser (the TUI's rendering of
+    the service) renders both within the 80-column clip -- a broken adapter is a row on
+    a screen, never a dead console."""
+    _poison_the_registry(monkeypatch)
+    result = CliRunner().invoke(cli, ["brokers", "list"])
+    assert result.exit_code == 0, result.output
+    assert "broken" in result.output and "adapter metadata unreadable" in result.output
+    assert "healthy" in result.output
+
+    infos = brokers.list_installed_brokers()
+    lines = console_mod.build_venues_lines(
+        infos,
+        selected_venue="healthy",
+        profile=None,
+        binding_pair=None,
+    )
+    texts = [line.text for line in lines]
+    joined = "\n".join(texts)
+    assert "broken" in joined and "adapter metadata unreadable" in joined
+    assert "healthy" in joined and "ok-venue" in joined
+    assert all(len(text) <= 80 for text in texts)
+
+
+# -- the wired/optional classification is pinned to the tracked configs ----------------------------
+
+
+def test_the_wired_set_is_what_the_tracked_configs_actually_select() -> None:
+    """[review #406] Drift guard: `WIRED_FOR_DEPLOYMENT` is a hand-maintained constant,
+    so it is derived HERE from the tracked config files' own `broker.name` selections --
+    loaded the way the profile convention loads them (`load_config`, whose absent
+    `broker:` section means coinbase) and unioned. A newly wired adapter with a tracked
+    config fails this test until the constant (and its reasoning comment) is updated."""
+    root = Path(__file__).resolve().parents[2]
+    configs = sorted(root.glob("config*.yaml"))
+    found = {path.name for path in configs}
+    assert found >= {
+        profile.config_path for profile in console_mod.KNOWN_PROFILES
+    } | {"config.yaml"}, found
+    selected = {load_config(path).broker.name for path in configs}
+    assert brokers.WIRED_FOR_DEPLOYMENT == frozenset(selected)
 
 
 # -- the CLI (O7): `keel brokers list` --------------------------------------------------------
