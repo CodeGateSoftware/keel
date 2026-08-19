@@ -9,12 +9,15 @@ versioned and re-measured, not assumed".
 
 Provenance (all read 2026-08-17):
 
-* **SEC Section 31 fee** -- charged on SELLS, per $1,000,000 of principal. Alpaca's own
-  regulatory-fees page (https://alpaca.markets/support/regulatory-fees) states the
-  current rate as $22.90 per $1M ($27.80 previously). The SEC adjusts this rate
-  periodically by fee-rate advisory (advisory 2026-2 moves it to $20.60 per $1M as of
-  2026-04-04); the venue's published figure is the one encoded, and the drift is a
-  documented re-measurement point, not a silent correction.
+* **SEC Section 31 fee** -- charged on SELLS, per $1,000,000 of principal. The SEC's
+  advisory 2026-2 rate ($20.60 per $1M) took effect 2026-04-04 and IS the rate in force;
+  Alpaca's own regulatory-fees page (https://alpaca.markets/support/regulatory-fees)
+  still publishes $22.90 ($27.80 previously) -- the venue's page is the stale side of
+  the two. The encoded $22.90 deliberately tracks what the venue itself charges, which
+  over-states the statutory rate by ~$0.02 per $10k -- the conservative direction for a
+  sell preview's proceeds -- and that delta is the documented re-measurement trigger:
+  when Alpaca's page moves to the advisory figure, the constant and this provenance
+  move with it.
 * **FINRA Trading Activity Fee (TAF)** -- charged on SELLS, per share, capped per trade.
   The cap ($8.30 for equities) is on Alpaca's page above; the per-share rate ($0.000166)
   is FINRA's, Schedule A to the FINRA By-Laws §4(b)(7) (SR-FINRA-2020-032, in force since

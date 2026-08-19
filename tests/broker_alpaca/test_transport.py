@@ -244,6 +244,42 @@ def test_get_positions_and_get_clock_use_their_documented_paths(http: Any) -> No
 
 
 # ---------------------------------------------------------------------------------------------
+# Path-segment encoding: a symbol or order id is always ONE segment
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_symbol_containing_a_path_separator_stays_one_segment(http: Any) -> None:
+    """A malformed product id (`A/B-USD`) survives `to_symbol` as `A/B`, and an unquoted
+    `/` would reshape `/v2/stocks/A/B/bars` into a DIFFERENT resource. Path segments are
+    percent-encoded with `safe=""` exactly like the query string, so the symbol rides as
+    `A%2FB` -- one segment, whatever it contains."""
+    recorder = http([_FakeResponse(payload={"bars": []}), _FakeResponse(payload={"quote": {}})])
+    transport = _transport()
+
+    transport.get_bars("A/B", "1Day", "2026-08-01T00:00:00Z", "2026-08-14T00:00:00Z", "iex")
+    transport.get_latest_quote("A/B", "iex")
+
+    assert urlsplit(recorder.calls[0]["url"]).path == "/v2/stocks/A%2FB/bars"
+    assert urlsplit(recorder.calls[1]["url"]).path == "/v2/stocks/A%2FB/quotes/latest"
+
+
+def test_an_order_id_with_query_or_traversal_characters_stays_one_segment(http: Any) -> None:
+    """A `?` in an order id would open a query string and `../` would walk out of
+    `/v2/orders/`; both are data in an opaque id, so both ride percent-encoded (`%3F`,
+    `%2F`) and the request is never reshaped -- there is no query part at all."""
+    recorder = http([_FakeResponse(payload={"id": "o1"}), _FakeResponse(204)])
+    transport = _transport()
+
+    transport.get_order("o1?x=../evil")
+    transport.cancel_order("o1?x=../evil")
+
+    expected = f"{PAPER_TRADING_HOST}/v2/orders/o1%3Fx%3D..%2Fevil"
+    assert recorder.calls[0]["url"] == expected
+    assert recorder.calls[1]["url"] == expected
+    assert all(urlsplit(call["url"]).query == "" for call in recorder.calls)
+
+
+# ---------------------------------------------------------------------------------------------
 # Response handling: money as Decimal, the 404 sentinel, cancel statuses
 # ---------------------------------------------------------------------------------------------
 

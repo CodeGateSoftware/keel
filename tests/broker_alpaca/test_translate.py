@@ -208,3 +208,13 @@ def test_rfc3339_and_epoch_round_trip() -> None:
     assert to_unix_seconds("2026-08-14T14:30:00.999Z") == ts
     # ...and an explicit offset must parse too, not only a trailing Z.
     assert to_unix_seconds("2026-08-14T10:30:00-04:00") == ts
+
+
+def test_an_offset_less_timestamp_is_refused_never_read_as_local_time() -> None:
+    """`fromisoformat` without an offset yields a NAIVE datetime, and `.timestamp()`
+    silently assumes the host's local zone -- the same bar would timestamp differently
+    per machine. The fail-closed rule (the venue contract sends `Z` or an explicit
+    offset, so anything else is garbage): refuse with `ValueError`, this module's
+    refusal signal (`to_timeframe`'s), rather than guess the zone."""
+    with pytest.raises(ValueError, match="offset"):
+        to_unix_seconds("2026-08-14T14:30:00")

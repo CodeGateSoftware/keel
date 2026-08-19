@@ -133,11 +133,11 @@ class Transport(Protocol):
 class AlpacaTransport:
     """The live, network-backed `Transport`: header-authed JSON over HTTPS.
 
-    The trading host is derived from `endpoint` and cannot be overridden -- a paper
-    configuration must be structurally unable to reach the live venue. The `trading_host`
-    and `data_host` constructor parameters exist for tests pointing at a local recorder;
-    they are explicit escapes, not a configuration surface, and nothing in this workspace
-    passes them in production code.
+    The trading host is derived from `endpoint` and NOTHING else: the constructor accepts
+    no host URL of any kind (there were `trading_host`/`data_host` keyword escapes here
+    once -- zero callers, dead surface, removed), so `TRADING_HOSTS` is the only map from
+    an environment choice to a host and a paper credential cannot be pointed at the live
+    venue by any configuration path.
     """
 
     def __init__(
@@ -150,8 +150,6 @@ class AlpacaTransport:
         timeout: float = 10.0,
         max_attempts: int = 3,
         sleep: Callable[[float], None] = time.sleep,
-        trading_host: str | None = None,
-        data_host: str | None = None,
     ) -> None:
         if endpoint not in TRADING_HOSTS:
             raise ValueError(
@@ -171,8 +169,8 @@ class AlpacaTransport:
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._sleep = sleep
-        self._trading_host = trading_host if trading_host is not None else TRADING_HOSTS[endpoint]
-        self._data_host = data_host if data_host is not None else DATA_HOST
+        self._trading_host = TRADING_HOSTS[endpoint]
+        self._data_host = DATA_HOST
 
     @property
     def endpoint(self) -> str:
@@ -273,6 +271,9 @@ class AlpacaTransport:
         URL per request, so a recorded call is exactly what the venue received. Like the
         Robinhood transport, `quote_via=quote` (not `quote_plus`) so a `+` in a value is
         never decoded server-side as a space, and `safe=""` so nothing rides unencoded.
+        The same discipline covers PATH segments: callers percent-encode every
+        interpolated id/symbol with `quote(..., safe="")`, so a `/` or `?` inside one can
+        never reshape the request into a different resource.
 
         `parse_float=Decimal`, never `response.json()`: this venue mixes quoted and
         unquoted money fields (see the module docstring), and the parser is the only
@@ -313,7 +314,7 @@ class AlpacaTransport:
         rather than launder a network blip into "this order does not exist".
         """
         try:
-            return self._request_json("GET", f"/v2/orders/{order_id}")
+            return self._request_json("GET", f"/v2/orders/{quote(order_id, safe='')}")
         except AlpacaAPIError as exc:
             if exc.status_code == 404:
                 return None
@@ -328,7 +329,8 @@ class AlpacaTransport:
         filled) are returned as statuses rather than raised because both are ordinary
         answers the adapter maps to `False`; every other failure raises.
         """
-        response = self._send("DELETE", f"{self._trading_host}/v2/orders/{order_id}")
+        path = f"/v2/orders/{quote(order_id, safe='')}"
+        response = self._send("DELETE", f"{self._trading_host}{path}")
         status = int(getattr(response, "status_code", 0))
         if status < 400 or status in (404, 422):
             return status
@@ -355,7 +357,10 @@ class AlpacaTransport:
         if page_token is not None:
             params["page_token"] = page_token
         return self._request_json(
-            "GET", f"/v2/stocks/{symbol}/bars", host=self._data_host, params=params
+            "GET",
+            f"/v2/stocks/{quote(symbol, safe='')}/bars",
+            host=self._data_host,
+            params=params,
         )
 
     def get_latest_quote(self, symbol: str, feed: str) -> Any:
@@ -365,7 +370,10 @@ class AlpacaTransport:
         signal the adapter treats as "no book on that side", not a price of zero.
         """
         return self._request_json(
-            "GET", f"/v2/stocks/{symbol}/quotes/latest", host=self._data_host, params={"feed": feed}
+            "GET",
+            f"/v2/stocks/{quote(symbol, safe='')}/quotes/latest",
+            host=self._data_host,
+            params={"feed": feed},
         )
 
 

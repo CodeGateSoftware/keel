@@ -224,8 +224,21 @@ def to_unix_seconds(value: str) -> int:
     Venue timestamps can carry fractional seconds and (per the schema) explicit offsets;
     fractional seconds truncate because `Candle.ts` is whole seconds and a bar's open
     time is second-aligned anyway.
+
+    An offset-less timestamp is REFUSED, never read as local time: without an offset
+    `fromisoformat` yields a naive datetime whose `.timestamp()` silently assumes the
+    host's zone, so the same bar would timestamp differently per machine. `ValueError`
+    is this module's refusal signal (`to_timeframe`'s), and refusing is the fail-closed
+    direction -- the venue's contract sends `Z` or an explicit offset, so anything else
+    is garbage, not a zone to guess.
     """
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"alpaca timestamp {value!r} carries no UTC offset; refusing to read a naive "
+            "datetime as local time"
+        )
+    return int(parsed.timestamp())
 
 
 __all__ = [
