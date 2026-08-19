@@ -69,12 +69,27 @@ dashboard (rails/positions/freshness/activity), `versions`.
   EXISTING admission flow — `assets propose` → `screen` → human-typed `attest` → allowlist —
   reusing `keel/commands/admission.py` end to end (operator example #3). It never auto-attests
   and never writes outside supported service paths.
+- **O7 — Venues/brokers visibility (service-first):** a small `brokers` service (over the
+  existing entry-point registry, `discover_brokers()`, and `BrokerCapabilities`) listing every
+  installed adapter — name, venue id, wired-for-deployment vs optional-dev-venue, session-bound
+  or 24/7, quote currency, asset classes, paper/live endpoints where declared, preview
+  synthesis, supported data feeds — plus a `keel brokers list` CLI surface; the TUI's Profile
+  area renders it as a Venues browser with the SELECTED adapter highlighted and the active
+  deployment's binding shown. Capability display, not key-presence inference (#233-aligned);
+  no secret values ever shown.
+- **O8 — Newbie-friendly help & glossary:** every screen carries "what am I looking at" help
+  and every invokable action a plain-English "what will this do" description — written for a
+  newcomer (what a rail IS, what an attestation records, what the promotion gate demands, what
+  the kill switch does, what paper mode means). Definitions live in ONE source (a glossary the
+  TUI help renders and the docs link to — not a second, drifting copy), and the typed actions'
+  help text says explicitly that the prompt cannot be pre-filled.
 
 ## Menu tree (v1 shape — final naming in implementation)
 
 ```
 Dashboard            the current live view (rails, session, positions, freshness, activity)
 Profile              switch paper-forward | paper-hourly | paper-equities | live (guarded)
+  └─ Venues          installed adapters + capabilities (O7); selected one highlighted
 Trading              agent cycle (confirm) · monitor poll · autonomy · record-flow ·
                      reset-hwm · resume-entries (typed) · kill · resume (typed)
 Rules                list/select · backtest · promote (confirm/--force typed) ·
@@ -85,6 +100,8 @@ Compliance           screen · propose · attest (typed) · attest-instrument ·
 Data                 fetch · fetch --check · repair gaps · freshness overview · db import
 Research             experiments · research docs · promotion reports · trials (list/verify) ·
 Account              pnl · versions
+Help                 glossary · per-screen "what am I looking at" · per-action "what will
+                     this do" (O8) — also reachable contextually from every screen
 ```
 
 ## 4. Non-objectives
@@ -110,6 +127,10 @@ service layer and both front-ends get it.
   surfaces; every typed action contract preserved (O3).
 - **C6 — Safety & polish pass.** Keybinding/help consistency; an adversarial review dedicated to
   the typed-confirmation contract and live-profile guards; docs (runbook TUI section).
+- **C7 — Venues/brokers visibility + the help & glossary system.** The `brokers` service +
+  `keel brokers list` CLI (O7) with the TUI Venues browser under Profile; the single-source
+  glossary and the contextual help framework (O8), whose per-screen/per-action strings land
+  with each menu slice (C2–C5) and are consolidated + audited here.
 
 ## 6. Success criteria
 
@@ -119,6 +140,10 @@ service layer and both front-ends get it.
 3. Typed actions behave identically to CLI (same prompts, same logs, same audit events).
 4. The scout handler drives propose→screen→attest for a real proposal file end-to-end in paper.
 5. Profile switching visibly rebinds config/db everywhere in one action.
+6. `keel brokers list` and the TUI Venues browser show identical information from one service,
+   including capabilities and the selected adapter — with no secret material.
+7. Every screen and action has help text a newcomer can understand; glossary definitions have
+   exactly one source and no drifted duplicates.
 
 ## 7. Risks
 
