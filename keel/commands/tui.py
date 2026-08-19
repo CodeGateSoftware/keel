@@ -2985,10 +2985,10 @@ def run_live(
                 elif ch in (10, 13, curses.KEY_ENTER):
                     _paint(
                         stdscr,
-                        [ScreenLine(
+                        _run_notice_lines(
                             "simulating... please wait (this can take minutes; the "
-                            "screen is frozen exactly like the CLI)", "normal"
-                        )],
+                            "screen is frozen exactly like the CLI)"
+                        ),
                     )
                     progress: list[str] = []
                     try:

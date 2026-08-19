@@ -979,7 +979,15 @@ def test_the_loop_painted_run_notices_wrap_inside_the_80_column_clip() -> None:
     one line, the tail -- the part that says what happens to orders -- is exactly what
     a 80-column terminal loses. The notice helper wraps every body to the builders'
     78-column budget, tail included, and carries the Ctrl-C line."""
-    bodies = (_CYCLE_RUN_NOTICE, _MONITOR_RUN_NOTICE, _FETCH_RUN_NOTICE)
+    bodies = (
+        _CYCLE_RUN_NOTICE,
+        _MONITOR_RUN_NOTICE,
+        _FETCH_RUN_NOTICE,
+        # the C4-era simulate notice rides the same helper since the C5 review
+        # flagged its identical clipping (91 chars, tail lost),
+        "simulating... please wait (this can take minutes; the "
+        "screen is frozen exactly like the CLI)",
+    )
     # the raw bodies genuinely need the wrapping this test exists to force
     assert len(_CYCLE_RUN_NOTICE) > 80
     assert len(_FETCH_RUN_NOTICE) > 80
