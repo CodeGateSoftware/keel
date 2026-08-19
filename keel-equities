@@ -1,0 +1,27 @@
+#!/bin/bash
+# keel-equities -- run ANY keel command against the EQUITIES paper profile (issue #370 B2),
+# with the config and database pinned together, symmetric with `keel-live`/`keel-paper`/
+# `keel-paperhourly`.
+#
+# Same footgun those wrappers exist to remove: `--db` defaults to keel.db (the daily CRYPTO
+# paper account), so
+#   keel --config config.paper-equities.yaml agent
+# without `--db keel-equities.db` would drive the equity rules against the wrong ledger.
+# Config and db must always travel as a pair; here they do.
+#
+# Paper mode places NOTHING real. The rows this profile loads are `paper`-status daily
+# turtle rules with params.granularity="ONE_DAY" on US equities via Alpaca's PAPER API
+# (see docs/operator-runbook.md, "The equities paper profile", for the bootstrap).
+#
+#   ./keel-equities status
+#   ./keel-equities agent          # one daily cycle (same as paper-equities-run.sh)
+#   ./keel-equities rules list
+#
+# Authored in the dev repo. DEPLOY (copy) to ~/keel.
+set -euo pipefail
+
+# Resolve the deployment dir from this script's own location, so it works from any cwd.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+exec ./.venv/bin/keel --config config.paper-equities.yaml --db keel-equities.db "$@"

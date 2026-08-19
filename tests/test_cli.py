@@ -288,6 +288,76 @@ def test_agent_loop_does_not_exit_the_process_when_a_cycle_is_blocked(
     assert "blocked=1" in result.output
 
 
+# -- agent: the market-clock skip exits must distinguish unavailable from closed (#386 review) ---
+
+
+class _SessionClockCLIBroker(FakeBroker):
+    """The CLI-side sibling of `test_agent.py::_SessionClockBroker`: a fake that also answers
+    the broker port's session surface, so the single-cycle exit code can be driven through the
+    real `keel agent` entrypoint."""
+
+    def __init__(self, clock_answer: Any) -> None:
+        super().__init__()
+        self._clock_answer = clock_answer
+
+    def capabilities(self) -> Any:
+        return SimpleNamespace(session_bound=True, venue="alpaca")
+
+    def market_clock(self) -> Any:
+        if isinstance(self._clock_answer, Exception):
+            raise self._clock_answer
+        return self._clock_answer
+
+
+def test_agent_exits_clock_unavailable_when_the_session_clock_cannot_be_read(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """A single-cycle `keel agent` that skipped because the venue clock could not be READ
+    (a transient outage: no network on wake, the clock endpoint erroring) must not exit `0`:
+    a green exit is exactly what lets `paper-equities-run.sh` stamp the UTC day as done, which
+    silently loses the trading day to a skip that carried no information. Mirrors
+    `DATA_NOT_READY_EXIT`'s contract; see `agent.MARKET_CLOCK_UNAVAILABLE_EXIT`."""
+    monkeypatch.setattr(
+        cli_module, "_build_broker", lambda config: _SessionClockCLIBroker(
+            SessionState.CLOCK_UNAVAILABLE
+        )
+    )
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
+    )
+
+    assert result.exit_code == agent.MARKET_CLOCK_UNAVAILABLE_EXIT, result.output
+    assert "skipped: market_clock_unavailable" in result.output
+
+
+def test_agent_still_exits_zero_on_a_market_closed_skip(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The other skip kind, and the reason the two need distinct treatment: a CLOSED venue
+    (weekend, holiday) is a fact about the calendar, the skip is correct cadence bookkeeping
+    -- nothing more can happen that day -- and stamping it is right. Only the degraded
+    clock read must decline to stamp."""
+    monkeypatch.setattr(
+        cli_module, "_build_broker", lambda config: _SessionClockCLIBroker(
+            SessionState.CLOSED
+        )
+    )
+    db_path = tmp_path / "test.db"
+    _repo_at(db_path).set_state("kill_switch", False)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "skipped: market_closed" in result.output
+
+
 
 
 

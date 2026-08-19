@@ -9,6 +9,11 @@
     "interval_sec": 1800,
     "mode": "confirm"
   },
+  "broker": {
+    "data_feed": "sip",
+    "endpoint": "live",
+    "name": "alpaca"
+  },
   "caps": {
     "max_exposure_usd": "4444.44",
     "max_per_asset_pct": "0.55",

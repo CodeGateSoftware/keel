@@ -51,9 +51,12 @@ religious-advice disclaimer footer via the `with_disclaimer` decorator on their 
 always, even when the command errors out or is refused at a confirmation prompt. (Pure-reporting
 commands such as `trials *`, `withdrawals show` and `assets list` deliberately omit it.)
 
-**No live network in tests.** `_build_broker` is the one seam that would construct a real
-`CoinbaseClient` (from `.env` secrets via `coinbase.rest.RESTClient`); tests monkeypatch it
-to inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker`.
+**No live network in tests.** `_build_broker` is the one seam that would construct a real,
+network-talking broker (a `CoinbaseClient` for the default/absent `broker:` section, or the
+configured venue's adapter otherwise — venue selection, #370 B2); tests monkeypatch it to
+inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker` (the
+venue-selection branches themselves are driven against fakes and network-free construction
+in `tests/test_paper_equities_profile.py`).
 
 **Module layout.** This file is the composition root: it defines the root `cli` group, the
 broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
@@ -775,12 +778,20 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     try:
         accounts = _build_broker(config).get_accounts()
     except Exception as exc:  # noqa: BLE001 -- an unreachable venue is an error, not "nothing held"
-        # Includes broker CONSTRUCTION, so a missing/!invalid `.env` credential surfaces here
+        # Includes broker CONSTRUCTION, so a missing/invalid `.env` credential surfaces here
         # rather than as a raw traceback. Reporting an empty list instead would read as
-        # "you hold nothing", which is not what we learned.
+        # "you hold nothing", which is not what we learned. The auth hint names the keys the
+        # CONFIG'S venue actually reads: telling an alpaca operator to check CDP keys sends
+        # them hunting a credential this deployment never uses. Coinbase (the default, and
+        # any venue without dedicated credential wiring) keeps the historical CDP advice.
+        auth_hint = (
+            "ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY in .env (or the environment)"
+            if config.broker.name == "alpaca"
+            else "CDP_API_KEY/CDP_API_SECRET in .env"
+        )
         raise click.ClickException(
             f"could not read balances from the broker: {exc}\n"
-            "  If this is an authentication error, check CDP_API_KEY/CDP_API_SECRET in .env."
+            f"  If this is an authentication error, check {auth_hint}."
         ) from exc
 
     excluded = _FIAT_CURRENCIES | _CASH_EQUIVALENTS | {quote.upper()}
@@ -1738,6 +1749,13 @@ def agent_cmd(
             broker, repo, config, now_ts=int(time.time()), confirm_fn=confirm_fn
         )
         _print_loop_result(result)
+        if result.skipped and result.skip_reason == "market_clock_unavailable":
+            # A clock that could not be READ is a transient outage, not the day's work: exit
+            # nonzero so a day-stamping wrapper (paper-equities-run.sh) declines to stamp and
+            # the next trigger retries -- see `agent.MARKET_CLOCK_UNAVAILABLE_EXIT`'s
+            # docstring. The market_closed skip deliberately falls through to exit 0: stamping
+            # a closed day is correct cadence bookkeeping.
+            ctx.exit(agent.MARKET_CLOCK_UNAVAILABLE_EXIT)
         if result.blocked_entries:
             # Finding 1 (HIGH): a green exit here is exactly what lets a cron/LaunchAgent
             # wrapper stamp the day as done and never retry -- see `agent.DATA_NOT_READY_EXIT`'s

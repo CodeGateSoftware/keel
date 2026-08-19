@@ -8,6 +8,7 @@ Phase-1-safe defaults — unused fields are fine per the plan.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -305,6 +306,32 @@ class ExecutionConfig:
 
 
 @dataclass(frozen=True)
+class BrokerConfig:
+    """Which broker adapter this deployment talks to (issue #370 Phase B2, venue selection).
+
+    The section is OPTIONAL, and its absence means Coinbase -- not as a fallback the engine
+    guesses at, but as the statement of how keel has always been built: `_build_broker`'s
+    Coinbase construction predates the section and stays byte-identical when `name` is
+    `"coinbase"`, so every shipped config and test that omits `broker:` behaves exactly as
+    before. A config that NAMES a venue routes through the `keel.brokers` entry points
+    (`keel_broker_api.registry.load_broker`), so installing an adapter is a package install,
+    not a core change.
+
+    `endpoint` ("paper" | "live") and `data_feed` ("iex" | "sip") are validated HERE even
+    though only the Alpaca wiring consumes them today, because they are declared properties
+    of the ADAPTER (FR-11's paper/live host posture, FR-5's data tier), not request-time
+    details: a typo in either should fail at config load, not at the first network call --
+    the same load-time posture the Alpaca adapter itself enforces on its constructor
+    arguments. They are Alpaca's vocabulary; a config that sets them alongside a venue whose
+    wiring has no such knob (Coinbase) is refused rather than silently ignored.
+    """
+
+    name: str = "coinbase"
+    endpoint: str = "paper"
+    data_feed: str = "iex"
+
+
+@dataclass(frozen=True)
 class Config:
     allowlist: list[str]
     target_weights: dict[str, Decimal]
@@ -343,6 +370,10 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Which broker adapter this deployment talks to. Defaulted (not required) so the
+    # pre-existing configs that omit the section parse to the same Coinbase deployment they
+    # always were -- see `BrokerConfig` for why the default is a statement, not a guess.
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
 
 
 # Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
@@ -651,6 +682,75 @@ def _parse_research(raw: dict[str, Any]) -> ResearchConfig:
 _MAX_ENTRY_SPREAD_PCT_CEILING = Decimal("0.10")
 
 
+#: The two Alpaca trading environments an `endpoint:` may name. The vocabulary is exactly
+#: two words because the ADAPTER derives the trading host from it (paper-api vs api) and
+#: accepts no URL of any kind -- so no configuration can point a paper credential at the live
+#: venue (FR-11). Anything else here is a typo that must fail at load.
+_VALID_BROKER_ENDPOINTS = ("paper", "live")
+
+#: The two Alpaca market-data tiers a `data_feed:` may name (FR-5): IEX is the free tier,
+#: SIP the subscribed one. The choice is a DECLARED capability, never an assumption -- the
+#: venue's server-side default is SIP, which silently fails for keys without the
+#: subscription, so the adapter names its feed explicitly and the config names it first.
+_VALID_BROKER_DATA_FEEDS = ("iex", "sip")
+
+
+def _parse_broker(raw: dict[str, Any]) -> BrokerConfig:
+    """Parse `broker:` (issue #370 B2) -- optional; an ABSENT section selects Coinbase
+    unchanged, which is the byte-compatibility contract every pre-existing config and test
+    relies on (see `BrokerConfig`).
+
+    `name` is validated only for shape, not against a venue list: adapters are plugins
+    discovered through the `keel.brokers` entry points, and keel-core cannot know which are
+    installed. A name no adapter answers to fails at broker construction with the registry's
+    own list of what IS installed -- the honest error, from the component that actually
+    knows.
+
+    `endpoint`/`data_feed` are Alpaca wiring keys, and setting them alongside any other
+    venue is refused: the Coinbase construction has no such knob, so a config that sets one
+    there would be silently ignoring an operator's deliberate edit -- the exact
+    dead-knob-in-waiting failure `_parse_settlement_currencies` and friends exist to catch.
+    """
+    broker_raw = raw.get("broker") or {}
+    if not isinstance(broker_raw, dict):
+        raise ConfigError(
+            f"broker: must be a mapping of {{name, endpoint, data_feed}}, got {broker_raw!r}"
+        )
+
+    name = broker_raw.get("name", "coinbase")
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError(
+            f"broker.name: must be a non-empty venue name (resolved through the keel.brokers "
+            f"entry points), got {name!r}"
+        )
+    name = name.strip()
+
+    endpoint = broker_raw.get("endpoint", "paper")
+    if endpoint not in _VALID_BROKER_ENDPOINTS:
+        raise ConfigError(
+            f"broker.endpoint: invalid value {endpoint!r}; must be one of "
+            f"{_VALID_BROKER_ENDPOINTS!r} -- the trading host is derived from this choice and "
+            f"is never a URL, so a paper credential cannot be pointed at the live venue"
+        )
+
+    data_feed = broker_raw.get("data_feed", "iex")
+    if data_feed not in _VALID_BROKER_DATA_FEEDS:
+        raise ConfigError(
+            f"broker.data_feed: invalid value {data_feed!r}; must be one of "
+            f"{_VALID_BROKER_DATA_FEEDS!r} -- the data tier is a declared capability, not a "
+            f"server-side default to fall back on"
+        )
+
+    if name == "coinbase" and ("endpoint" in broker_raw or "data_feed" in broker_raw):
+        raise ConfigError(
+            f"broker.name: {name!r} has no endpoint/data_feed wiring -- those keys select the "
+            "Alpaca trading host and market-data tier and are silently ignored by every other "
+            "venue. Remove them, or set broker.name: alpaca."
+        )
+
+    return BrokerConfig(name=name, endpoint=endpoint, data_feed=data_feed)
+
+
 def _parse_execution(raw: dict[str, Any]) -> ExecutionConfig:
     """Parse `execution:` -- optional, falls back to `ExecutionConfig`'s defaults.
 
@@ -849,6 +949,7 @@ def load_config(path: str | Path) -> Config:
         logging=_parse_logging(raw),
         research=_parse_research(raw),
         execution=_parse_execution(raw),
+        broker=_parse_broker(raw),
     )
 
 
@@ -870,6 +971,34 @@ def load_secrets(env_path: str | Path = ".env") -> dict:
     return {"api_key": api_key, "api_secret": api_secret}
 
 
+def load_alpaca_secrets(env_path: str | Path = ".env") -> dict:
+    """Load Alpaca API credentials from the environment or a git-ignored `.env` file.
+
+    Follows `load_secrets`' shape contract exactly -- `{"key_id": ..., "secret_key": ...}`
+    when both are present, `{}` when neither is, so the caller (venue selection in
+    `_build_broker`) owns the venue-specific "how to fix this" message rather than this
+    loader guessing at one. Two deliberate divergences from `load_secrets`, both stated:
+
+    * The REAL environment is read as well as the file (environment first), so a deployment
+      can inject the paper keys without a `.env` at all. `load_secrets` predates multi-venue
+      support and stays file-only for byte-compatibility; a new loader gets the honest
+      both-sources semantics.
+    * The names are the venue's own (`ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`, the two
+      headers Alpaca's API documents), namespaced by venue so one deployment's `.env` can
+      hold credentials for several adapters without collisions.
+    """
+    values = dotenv_values(Path(env_path)) if Path(env_path).exists() else {}
+
+    def _read(name: str) -> str | None:
+        return os.environ.get(name) or values.get(name)
+
+    key_id = _read("ALPACA_API_KEY_ID")
+    secret_key = _read("ALPACA_API_SECRET_KEY")
+    if not key_id and not secret_key:
+        return {}
+    return {"key_id": key_id, "secret_key": secret_key}
+
+
 __all__ = [
     "ConfigError",
     "NON_BINDING_CAP_USD",
@@ -887,7 +1016,9 @@ __all__ = [
     "ResearchConfig",
     "ExecutionConfig",
     "FeesConfig",
+    "BrokerConfig",
     "Config",
     "load_config",
     "load_secrets",
+    "load_alpaca_secrets",
 ]

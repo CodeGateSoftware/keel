@@ -187,20 +187,20 @@ histories. **A figure from one says nothing about the other.** Checking a paper 
 against live account equity — or a live cap against paper cash — yields a confident wrong answer,
 and has already produced one. Establish which account a number came from before reasoning about it.
 
-| | paper | live | paper-hourly |
-| --- | --- | --- | --- |
-| config | `config.paperforward.yaml` | `config.live-sandbox.yaml` | `config.paper-hourly.yaml` |
-| database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) | `keel-paperhourly.db` (must be passed) |
-| `auto_trade.mode` | `paper` | `confirm` | `paper` |
-| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | paper's 8 + 11 Tier-2 = 19 (#351) |
-| `caps.max_exposure_usd` | 5000 | 200 | 5000 |
-| money spent | synthetic `paper_cash_usdc` | the real broker balance | synthetic `paper_cash_usdc` |
-| sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy | the hourly account's own equity |
-| rail 14 allowance | $500/month (Basic tier) | $200/month | $500/month |
-| `equity_state_mode` | `paper` | `live` | `paper` |
-| launchd job | `com.keel.paperforward` | `com.keel.live` | `com.keel.paper-hourly` |
-| cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) |
-| rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` |
+| | paper | live | paper-hourly | paper-equities |
+| --- | --- | --- | --- | --- |
+| config | `config.paperforward.yaml` | `config.live-sandbox.yaml` | `config.paper-hourly.yaml` | `config.paper-equities.yaml` |
+| database | `keel.db` (the `--db` default) | `keel-live.db` (must be passed) | `keel-paperhourly.db` (must be passed) | `keel-equities.db` (must be passed) |
+| `auto_trade.mode` | `paper` | `confirm` | `paper` | `paper` |
+| allowlist | BTC, ETH, PAXG, SOL, XLM, LTC, ADA, LINK (8) | BTC, ETH, PAXG, ADA, XLM (5) | paper's 8 + 11 Tier-2 = 19 (#351) | 5 US large caps, **unattested paper candidates** |
+| `caps.max_exposure_usd` | 5000 | 200 | 5000 | 5000 |
+| money spent | synthetic `paper_cash_usdc` | the real broker balance | synthetic `paper_cash_usdc` | synthetic `paper_cash_usdc` |
+| sizing basis | the paper account's own equity | `caps.max_exposure_usd`, as a proxy | the hourly account's own equity | the equity account's own equity |
+| rail 14 allowance | $500/month (Basic tier) | $200/month | $500/month | $500/month (simulator assumption; Alpaca has no tiers) |
+| `equity_state_mode` | `paper` | `live` | `paper` | `paper` |
+| launchd job | `com.keel.paperforward` | `com.keel.live` | `com.keel.paper-hourly` | `com.keel.paper-equities` |
+| cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) | daily, in the US session (UTC day-stamp) |
+| rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
 
 **Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures
@@ -221,7 +221,9 @@ place. Autonomy changes who is asked, never what is allowed; check the flag befo
 live cycle is supervised, rather than inferring it from `confirm`.
 
 **Both fire hourly; both run once a day** (the third job, `com.keel.paper-hourly`, is the
-exception that runs once per UTC *hour* — see "The hourly evidence profile" below). Each
+exception that runs once per UTC *hour* — see "The hourly evidence profile" below — and the
+fourth, `com.keel.paper-equities`, runs once per day *inside the US regular session*; see
+"The equities paper profile"). Each
 launchd job has a list of hourly triggers plus
 `RunAtLoad`, and each runner is day-stamped: the first eligible trigger that finds no stamp for
 today runs the cycle and writes the stamp, and every later trigger that day is a no-op. The
@@ -338,6 +340,201 @@ it is on live: the paper path already refuses a second entry while a product is 
 against the then-newest bar. An hour lost to the machine being powered off is lost — the runner
 cannot replay bars that closed while it was down; that is an hour of evidence, not an hour of
 money, and it is why the profile's duty cycle matters more than its exact schedule.
+
+## The equities paper profile (paper-equities)
+
+A fourth deployment, `config.paper-equities.yaml` + `keel-equities.db`, running the **same**
+daily turtle rules on a different asset class: US equities through Alpaca's **paper** API
+(`broker: {name: alpaca, endpoint: paper, data_feed: iex}` — the config's `broker:` section is
+the whole venue-selection surface; omitting it keeps Coinbase, byte-compatibly). One paper
+cycle per day, fired *inside* the US regular session by `com.keel.paper-equities.plist`
+(10:00–15:00 local/ET) and stamped on the UTC day by `paper-equities-run.sh`. Use
+`./keel-equities <command>` so the config and database always travel as a pair.
+
+**Why it exists: evidence on a session-bound venue, nothing more.** Every profile so far
+exercises the engine on one venue and one asset class. This one accrues the same admissible
+evidence — rail vetoes, outcomes, pending lifespans, intent divergence — where the venue has
+a *clock*: weekends and holidays are read "market closed," never "feed stale" (#370 B1), and
+the rails meet a second asset class for the first time. **The honest caveat, which changes
+nothing: there is NO PROVEN EDGE on any asset class.** The crypto configurations are measured
+net-negative on their own clocks, and these rules have never been measured on equities at all.
+Do not promote from this profile on a positive stretch; a new asset class is a new
+measurement, not a fresh start for unproven rules (Phase C's cost-fidelity work comes before
+any strategy evaluation is believed).
+
+**The allowlist is PAPER CANDIDATES, and asserts nothing religiously.** MSFT, AAPL, GOOGL,
+NVDA and COST are liquid US large caps, chosen so a screen *could* be run on them — not
+because any has been screened (leverage and the other screening ratios are the operator's
+attestation to make, not a fact this file asserts). Trading them here is paper evidence
+collection, full stop; see the attestation semantics below for what live consideration would
+additionally demand.
+
+### Bootstrap
+
+Deployment to the operator's machine is **out of scope here** (it needs the operator's own
+Alpaca paper credentials); the steps, once you have them:
+
+1. **Alpaca paper account.** Create a paper trading key pair in the Alpaca dashboard's paper
+   account, and put the values in `.env` (or the environment):
+
+   ```bash
+   ALPACA_API_KEY_ID=...
+   ALPACA_API_SECRET_KEY=...
+   ```
+
+   Paper keys suffice — `endpoint: paper` selects `paper-api.alpaca.markets`, and the adapter
+   derives the host from that word and accepts no URL, so these cannot be pointed at the live
+   venue by any configuration.
+
+2. **Install the adapter wheel.** The deployment must have `keel-broker-alpaca` installed —
+   venue selection resolves `name: alpaca` through the `keel.brokers` entry points, and the
+   error names what is installed when it is missing. The equities deployment's wheel list is
+   the usual four plus this one.
+
+3. **Migrate + seed + warm:**
+
+   ```bash
+   keel migrate --db keel-equities.db        # schema only; never seeds
+   for s in MSFT AAPL GOOGL NVDA COST; do
+     keel --config config.paper-equities.yaml --db keel-equities.db rules add \
+       --kind turtle_breakout --product "${s}-USD" --params '{"granularity": "ONE_DAY"}'
+   done
+   keel --config config.paper-equities.yaml --db keel-equities.db rules promote --force <id>
+   keel --config config.paper-equities.yaml --db keel-equities.db fetch
+   ```
+
+   The `rules add` form (explicit per-symbol rows, granularity stated even though ONE_DAY is
+   the constructor default) mirrors the hourly bootstrap so the clock each row trades is
+   visible in the row itself. `--force` is the documented bypass for a rule whose backtest
+   cannot clear the gate; for equity turtle the gate has not been evaluated on this asset
+   class at all — the bypass is deliberate and the warning it prints is the caveat above
+   restated. `fetch` warms ONE_DAY × 365d for the five symbols; run it on a weekend and it is
+   quiet — B1's session awareness records the closed clock and `--check` does not alert on
+   closed-explained staleness.
+
+**Scheduling, in one paragraph.** The plist triggers at 10:00–15:00 local (ET), on the hour —
+*inside* the 09:30–16:00 regular session, deliberately not shortly after the close: B1's
+session gate skips the whole cycle whenever the venue clock answers closed, so an
+after-close trigger would log `market_closed` and never evaluate a bar. The daily bar that
+closes at 16:00 ET is evaluated at the *next* session's open — the conventional
+daily-system semantics (signal on close, execute next open) — and the 10:00 anchor gives the
+open thirty minutes to settle. The runner stamps the **UTC day** (Alpaca keys a session's
+ONE_DAY bar to that UTC date, and the UTC rollover at 19:00/20:00 local is always after the
+window), refuses to run outside its window — 10:00 inclusive to 16:00 exclusive, local (the
+15:00 trigger runs; a closed-market skip exits 0 and must never be stamped as the day's
+work) — and writes the stamp only after a successful cycle (a cycle that skipped because the
+venue clock could not be *read* exits nonzero, so a transient clock outage is retried by the
+next trigger rather than recorded as the day's work).
+
+**Where that schedule is actually correct.** On an ET-anchored host — or one within ±4h of
+ET, where the trigger hours still land inside the 09:30–16:00 ET session. The deployment
+host's local zone is America/New_York, so the fixed local triggers keep their Eastern
+meaning across both US DST transitions: what moves is the UTC instant, never the distance
+from the open. Anywhere else, re-anchor the trigger hours so they land 10:00–15:00 **ET**
+(on a host far enough ahead of ET, all six triggers can fire pre-open, and the runner's
+local-hours guard will still endorse them — it reads the host's clock, not ET — so each day
+would be stamped by a closed-market skip: permanently zero evidence). The guard is a
+backstop against off-schedule boots, not a drift absorber for a mis-anchored schedule.
+
+### Attestation semantics for equities
+
+Equity screening criteria (business-activity screens, leverage ratios, purification) are
+**operator-supplied classifications from attributed sources** — the engine computes market
+facts and never classifies, exactly as on crypto. Attestations are keyed per
+`(alpaca, SYMBOL)`: an equity instrument attests under its own venue namespace and is never
+reused from a Coinbase row. The sources to watch are the ones the fiqh source review (#367)
+already names for this territory: **AAOIFI**'s screening standards and **IFSB**'s
+pronouncements (plus any scholar the operator trusts) — an attestation without a source is
+not evidence. Two honest limits, stated rather than papered over:
+
+- `keel assets attest-instrument --venue alpaca --product MSFT-USD --wrapper spot` records
+  the *instrument* half (what contract the listing is) and works today.
+- The *asset*-level screen (`keel assets screen`) is Coinbase-shaped by construction — its
+  venue constant is deliberately hardcoded to `coinbase` (open item below) — so until the
+  screen generalizes (#233 live-path work), equity classifications live in the operator's
+  records, and this profile trades as **unattested paper candidates**. That is precisely why
+  the config's allowlist carries its disclaimer and why nothing here is live.
+
+**Dividend purification is fenced to Phase B3 — planned, not forgotten.** Purification
+appears above only as a classification input (the ratio the operator attests). The walk the
+fiqh source review implies — corporate actions (dividends, splits) recorded per event as
+they occur (FR-10's recording duty), the purification amount computed against the attested
+ratio under the operator's stated policy, and the disposition (how much, and where it went)
+recorded — is the **B3 slice of this phase** (corporate actions + purification recording).
+Until B3 lands, nothing here computes or records that walk, and a holder of dividend-paying
+candidates carries the purification obligation in their own records.
+
+### Rail 17 (withdrawal capability) for equities
+
+"Can this asset leave this venue?" maps to **transfer-out capability** — for a US brokerage,
+an ACATS transfer to another broker. It is attested like any venue:
+
+```bash
+keel --config config.paper-equities.yaml --db keel-equities.db withdrawals attest --enabled
+```
+
+Rail 17 is a live-state rail (skipped in paper), so this is recorded for the day live is ever
+considered, and it lapses weekly like every deployment's attestation.
+
+### T+1 settlement × daily cadence
+
+US equities settle T+1: sale proceeds become spendable the next business day. On a **daily**
+cadence this is immaterial for entries — the next entry attempt is at least a day after the
+previous buy, by which time it has settled (a weekend makes it longer, never shorter).
+**Exits are never T+1-blocked**: a SELL produces cash rather than spending it, and the engine
+never needs to spend sale proceeds within a cycle. The documented cash-crunch case: on a cash
+account you cannot spend *unsettled* proceeds, so an operator manually redeploying same-day
+sale proceeds (outside the engine, which cycles daily) is the one way to meet the constraint
+— and it is an operator act, not an engine one. The paper profile's synthetic cash does not
+model settlement at all; that honesty is on record for any future live consideration.
+
+### Account posture: cash only — never margin — and the PDT rule
+
+The equities profile runs against a **cash account, never a margin account**. Margin
+borrowing is a loan that charges interest — *riba* — so the posture is categorical, not a
+preference; a cash account also sidesteps the pattern day trader (PDT) rule's $25,000
+minimum-equity requirement, which applies to **margin** accounts only. The PDT rule: FINRA
+flags a **margin** account as a pattern day trader when it executes four or more day trades
+within five business days, and such an account then needs $25,000 of equity to keep day
+trading. A cash account running keel's daily cadence is not that pattern — the rule does not
+bind cash accounts, and in any case keel evaluates a session's bar once and holds overnight
+by construction, so it does not day-trade in the first place; settled-cash funding is what
+makes entries wait for settlement, and that interplay is the T+1 section above (not repeated
+here).
+
+Enforcement in code — the config refusing a margin posture where the venue reports one — is
+issue **#372**'s scope; this runbook carries the operator-facing half now: **create and keep
+the Alpaca account a cash account** (the paper account is one by default), and treat any
+offer to "upgrade" to margin as a posture violation to decline, not a capability to use.
+
+### Operator-verified opt-outs (Alpaca account level)
+
+Two account settings the venue offers conflict with the posture the engine enforces, and
+neither is visible to any rail (no order is placed). **Verify both are OFF in the Alpaca
+dashboard** — under the account's settings, the stock-lending (fully-paid securities lending)
+enrollment and the cash sweep / interest program enrollment:
+
+- **Stock lending is OFF** — lending out held shares conflicts with *qabd* (possession; the
+  engine's own possession rail assumes held means held) and the income is interest-like.
+- **The high-yield cash sweep is OFF** — interest on idle USD is *riba*.
+
+These are operator-verified obligations in the same class as the pre-live checklist's USDC
+Rewards item: account settings no rail can see, re-checked after any account change.
+
+### What is deliberately NOT here
+
+- **`keel/assets` screening venue semantics** stay hardcoded to `coinbase` (`_VENUE` in
+  `keel/cli.py`) — that hardcoding is deliberate pending #233's capability-declaration work
+  on the live path; the paper profile does not need it, and the attestation section above
+  records the consequence.
+- **Deployment to the operator's machine** — needs the operator's Alpaca paper credentials;
+  this section is the bootstrap, and the plist/runner/wrapper are authored for the
+  America/New_York host like every sibling.
+- **Cost fidelity and the DCA benchmark** — Phase C (PRD §6.3): Alpaca's real cost structure
+  (regulatory fees on sells, spread, IEX-vs-SIP data fidelity) is measured and documented
+  before any strategy evaluation on this asset class is believed.
+- **Trademark posture** — unchanged and stated where it lives: the README's standing
+  disclaimer covers Alpaca alongside every other venue, and nothing here duplicates it.
 
 ## How much money moves
 

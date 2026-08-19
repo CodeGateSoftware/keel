@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.keel.paper-equities</string>
+
+    <!-- NOTE ON COMMENT STYLE, same as every sibling plist: the rest of this repo separates
+         asides with a double hyphen. XML forbids a double hyphen inside a comment, and while
+         Apple's CoreFoundation parser is lenient enough to accept one (plutil -lint says OK),
+         a strict parser such as expat does not, which makes the file unreadable to ordinary
+         XML tooling and to the tests that assert on the schedule below. Do not "fix" it back.
+
+         EQUITIES PAPER profile (issue #370 Phase B2): one paper cycle per day against
+         config.paper-equities.yaml and its OWN database keel-equities.db (pinned by
+         paper-equities-run.sh), trading the daily turtle rules on US equities through
+         Alpaca's PAPER API. It places NOTHING real. It exists because every profile so far
+         exercises the engine on one venue and one asset class: this one accrues evidence
+         (rail vetoes, outcomes, pending lifespans, intent divergence) on a SESSION-BOUND
+         venue and a second asset class. NO PROVEN EDGE ON ANY ASSET CLASS: the crypto
+         configurations are measured net-negative and these rules have never been measured
+         on equities at all. Evidence, not profit.
+
+         WHY INSIDE THE SESSION AND NOT SHORTLY AFTER THE CLOSE. The US regular session runs
+         09:30 to 16:00 ET, and the engine's session gate (#370 B1, PR #385) skips the WHOLE
+         cycle whenever the venue clock answers closed, so a trigger at, say, 16:40 would log
+         market_closed and never evaluate a bar: zero evidence, forever. The daily bar that
+         closes at 16:00 ET is therefore evaluated at the NEXT session's open, which is also
+         how daily breakout systems are conventionally run: signal on the close, execute at
+         the next open. The 10:00 anchor gives the 09:30 open thirty minutes to settle, and
+         every trigger at 10:00-15:00 local falls inside the session.
+
+         THE SIX TRIGGERS ARE CATCH-UP BREADTH, NOT EXTRA CYCLES. launchd re-runs a missed
+         StartCalendarInterval on wake from SLEEP but NOT when the trigger passed while the
+         machine was powered OFF, so a machine down at 10:00 would otherwise lose the day.
+         The runner is day-stamped: the first trigger that finds no stamp for the UTC day
+         runs the cycle, every later one is a no-op, and a FAILED cycle leaves the day
+         unstamped so the next hour retries. The runner's own window guard (the window is
+         10:00 inclusive to 16:00 exclusive, LOCAL: the 15:00 trigger runs, the 16:00 one
+         does not) keeps a RunAtLoad boot outside the session from stamping a closed-market
+         skip as the day's work and suppressing the real evaluation.
+
+         ET ANCHORING AND THE DST CAVEAT, STATED HONESTLY. The deployment machine's local
+         zone is America/New_York, so a fixed local trigger time keeps its Eastern meaning
+         across BOTH US DST transitions: the zone shifts with ET, and what moves is the UTC
+         instant (10:00 ET is 14:00 UTC in summer, 15:00 UTC in winter), never the distance
+         from the 09:30 open. That makes this schedule correct on an ET-anchored host, or
+         on one within about four hours of ET where the trigger hours still land inside the
+         09:30-16:00 ET session. On any other host it is not "slightly drifted", it is
+         WRONG: a machine far enough ahead of ET can fire every trigger pre-open, and the
+         runner's local-hours guard will endorse those triggers (the guard reads the HOST's
+         clock, so it cannot see that they sit outside the ET session), stamping each day
+         with a closed-market skip: permanently zero evidence. If this profile moves to
+         another host, re-anchor the trigger hours so they land 10:00-15:00 ET; the
+         local-hours guard is a backstop against off-schedule boots, not a drift absorber.
+
+         WEEKENDS AND HOLIDAYS ARE QUIET BY DESIGN: the venue clock answers closed, the
+         agent skips with reason market_closed (recording the session, which keeps the
+         fetch command's staleness check non-alerting through the closure), and the day is
+         stamped. A clock that cannot be READ is the other skip kind, stamped differently:
+         the agent exits MARKET_CLOCK_UNAVAILABLE_EXIT (nonzero) for it, so the runner
+         leaves the day unstamped and the next trigger retries once the clock answers
+         again. A trading day lost to the
+         machine being powered off is lost: the runner cannot replay bars that closed while
+         it was down. That is a day of evidence, not a day of money. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elmehdiaitbrahim/keel/paper-equities-run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <!-- Run on load, so a boot inside the window runs the day's cycle immediately instead of
+         waiting for the next trigger. A boot OUTSIDE the window is refused by the runner's
+         guard (an early-morning closed-market skip exits 0 and must not stamp the day). The
+         day-stamp makes a repeated load harmless. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elmehdiaitbrahim/keel</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paper-equities.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/paper-equities.err.log</string>
+</dict>
+</plist>

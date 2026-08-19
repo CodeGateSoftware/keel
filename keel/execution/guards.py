@@ -54,9 +54,11 @@ Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
   produces USDC, it doesn't consume it).
 - Rail 14 (monthly subscription-allowance) caps this calendar month's live BUY notional (own
   spend, from the orders audit log, `_monthly_buy_spend_usd`) plus this order's notional against
-  the allowance derived from the venue's **attested subscription record**
-  (`repo.get_broker_subscription`, `data/repository.py`) -- read fresh on every `check()` call,
-  never cached, so `keel subscription attest` takes effect on the very next order. The cap is
+  the allowance derived from the deployment's bound venue's **attested subscription record**
+  (`repo.get_broker_subscription`, `data/repository.py`; the venue is the one `_load_cfg` binds
+  for telemetry, `coinbase` when nothing is -- see `DEFAULT_VENUE`) -- read fresh on every
+  `check()` call, never cached, so `keel subscription attest` takes effect on the very next
+  order. The cap is
   `free_volume_usd` from that record, so upgrading a tier changes exactly one place; it is NOT
   typed into config. **Fails closed** like rails 12/13: an unattested venue, a `suspect` or
   `lapsed` record, or one whose `attest_due_ts` has passed all fall back to
@@ -109,7 +111,7 @@ from typing import Any
 
 from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.subscription import SubscriptionStatus
-from keel_core.telemetry import log_event
+from keel_core.telemetry import current_venue, log_event
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -124,10 +126,14 @@ CORRELATED_SIZE_SCALE = Decimal("0.5")  # rail 5: half-size when correlated expo
 UNCORRELATED_ASSETS = frozenset({"PAXG"})  # gold-backed; not "long crypto beta" (§4.1)
 FEED_STALENESS_CYCLES = 3  # rail 12: 3 missed polling cycles = stale feed
 
-# Rail 14: the engine is single-venue until the broker port lands. `OrderIntent` carries no
-# venue to key on, and inventing one before then would be a guess -- but `broker_subscriptions`
-# is venue-keyed from birth because that costs nothing and is the right shape. This constant is
-# the one line the multi-venue migration deletes (monorepo design spec §8).
+# Rail 14's venue when nothing is bound. The bound venue arrives through the SAME
+# ContextVar binding the CLI makes for telemetry (`_load_cfg` -> `bind_venue(config.broker.name)`,
+# read here via `current_venue()`): one binding at process entry serves both the stamped events
+# and the rail, so they can never disagree about which venue this process is trading -- and
+# guards stays broker-less and config-shape-agnostic (the venue is binding state, not broker
+# state). Unbound (every in-process caller, every pre-existing test) keeps coinbase, the
+# engine's single-venue answer since the rail was born; this constant is that fallback, not
+# the rail's key.
 DEFAULT_VENUE = "coinbase"
 
 _ACTIVE_ORDER_STATUSES = ("pending", "filled")
@@ -564,11 +570,17 @@ def check(
     # 14. Monthly subscription-allowance — month-to-date live BUY spend + this order must not
     #     exceed the allowance derived from the venue's *attested* subscription record
     #     (`repo.get_broker_subscription`), read fresh on every call so an attestation takes
-    #     effect on the very next order. Fails closed: unattested, suspect, lapsed, or overdue
-    #     all fall back to `unsubscribed_allowance_usd` (default 0). DCA is NOT exempt -- it is
-    #     exactly the recurring spend this rail exists to cap (Issue #59).
+    #     effect on the very next order. The venue is the DEPLOYMENT'S: the binding `_load_cfg`
+    #     makes at process entry (`bind_venue(config.broker.name)` -- the same one telemetry
+    #     reads), with coinbase when nothing is bound (see `DEFAULT_VENUE`). Keying on anything
+    #     else would gate an alpaca deployment on a coinbase record nothing writes and veto
+    #     with advice that sends the operator to attest the wrong venue. Fails closed:
+    #     unattested, suspect, lapsed, or overdue all fall back to `unsubscribed_allowance_usd`
+    #     (default 0). DCA is NOT exempt -- it is exactly the recurring spend this rail exists
+    #     to cap (Issue #59).
     if is_buy:
-        record = repo.get_broker_subscription(DEFAULT_VENUE)
+        venue = current_venue() or DEFAULT_VENUE
+        record = repo.get_broker_subscription(venue)
         unsubscribed = config.subscription.unsubscribed_allowance_usd
 
         if record is None:
@@ -589,7 +601,7 @@ def check(
                     logger,
                     logging.WARNING,
                     "subscription.attestation_overdue",
-                    venue=DEFAULT_VENUE,
+                    venue=venue,
                     attested_at=record.attested_at,
                     attest_due_ts=record.attest_due_ts,
                 )
@@ -629,12 +641,14 @@ def check(
             if projected_monthly > effective_cap:
                 if degraded_reason:
                     # A user in this state is not over budget -- they have no budget. Telling
-                    # them "0 exceeds 0" would be true and useless.
+                    # them "0 exceeds 0" would be true and useless. The advice names the BOUND
+                    # venue: on an alpaca deployment, pointing at coinbase writes a row
+                    # nothing reads and leaves every BUY vetoed.
                     violations.append(
-                        f"subscription_unattested: {DEFAULT_VENUE} cannot spend because "
+                        f"subscription_unattested: {venue} cannot spend because "
                         f"{degraded_reason}, so its allowance is the unsubscribed default "
                         f"{unsubscribed}{pacing_note}. Run `keel subscription attest --venue "
-                        f"{DEFAULT_VENUE} --tier <tier>` to restore it."
+                        f"{venue} --tier <tier>` to restore it."
                     )
                 else:
                     remaining = max(effective_cap - monthly_spend, Decimal("0"))

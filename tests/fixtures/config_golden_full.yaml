@@ -106,3 +106,11 @@ research:
 # Non-default on purpose (the default is 0.005 = 50bp) -- see the `research` note above.
 execution:
   max_entry_spread_pct: 0.0075
+
+# Venue selection (issue #370 B2). Non-default on purpose (the default name is coinbase,
+# paper, iex) so `test_the_two_goldens_actually_differ` proves this section really parses
+# rather than falling through to its defaults.
+broker:
+  name: alpaca
+  endpoint: live
+  data_feed: sip

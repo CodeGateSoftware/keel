@@ -34,7 +34,6 @@ from keel_core.telemetry import bind_venue
 from keel.config import Config, load_config
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 
 DISCLAIMER = (
@@ -126,31 +125,92 @@ def _load_cfg(ctx: click.Context) -> Config:
         config = replace(config, logging=replace(config.logging, verbose=True))
     configure_logging(config.logging)
     # Spec §10.2 names `venue` a stable field on every event. Bound once here, at the one
-    # process entry point, rather than passed into ~26 `log_event` call sites -- the engine is
-    # single-venue today, so threading a constant through every payload would mean revisiting
-    # all of them again the moment it stops being one. A process driving several venues rebinds
-    # per cycle instead; nothing else changes.
-    bind_venue(DEFAULT_VENUE)
+    # process entry point, rather than passed into ~26 `log_event` call sites -- the engine
+    # was single-venue until #370 B2, and threading a constant through every payload would
+    # have meant revisiting all of them again the moment it stopped being one. The venue now
+    # comes from the config's own `broker:` selection (Coinbase for every config that omits
+    # the section, so the bound string is byte-identical to the old `DEFAULT_VENUE`
+    # constant); a process driving several venues rebinds per cycle instead; nothing else
+    # changes.
+    bind_venue(config.broker.name)
     return config
 
 
-def _build_broker(  # pragma: no cover -- exercised only against fakes
+def _build_broker(
     config: Config, *, timeout: int | None = None
 ) -> Any:
-    """Construct the real, network-talking `CoinbaseClient`. Tests monkeypatch this function.
+    """Construct the real, network-talking broker for the venue `config.broker` selects.
 
-    `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no timeout),
-    matching every existing caller (the agent/executor broker path) exactly. Callers that cannot
-    tolerate a hung network call (e.g. `keel tui`'s live balance refresh, which must never freeze
-    the dashboard) pass an explicit bound.
+    **Venue selection (issue #370 B2).** The `broker:` config section is the one surface:
+    absent (or `name: coinbase`), this builds exactly what it always built -- a
+    `CoinbaseClient` over a `coinbase.rest.RESTClient` fed by `load_secrets()` -- so every
+    pre-existing config, deployment and test is byte-identical. A named venue resolves
+    through the `keel.brokers` entry points (`keel_broker_api.registry.load_broker`), so
+    installing an adapter is a package install, not a core change; today the CLI knows how
+    to construct CREDENTIALS for one non-Coinbase venue (alpaca: paper/live endpoint, iex/
+    sip feed, `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`), and an adapter that resolves but
+    has no wiring is refused by name rather than constructed credential-less.
+
+    Tests monkeypatch this function; the branches are additionally driven against fakes and
+    the real (network-free at construction) Alpaca classes by
+    `tests/test_paper_equities_profile.py`.
+
+    `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no
+    timeout), matching every existing caller (the agent/executor broker path) exactly.
+    Callers that cannot tolerate a hung network call (e.g. `keel tui`'s live balance
+    refresh, which must never freeze the dashboard) pass an explicit bound.
     """
-    from coinbase.rest import RESTClient
+    venue = config.broker.name
 
-    from keel.config import load_secrets
-    from keel.data.cb_client import CoinbaseClient
+    if venue == "coinbase":
+        from coinbase.rest import RESTClient
 
-    secrets = load_secrets()
-    transport = RESTClient(
-        api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"), timeout=timeout
+        from keel.config import load_secrets
+        from keel.data.cb_client import CoinbaseClient
+
+        secrets = load_secrets()
+        transport = RESTClient(
+            api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"), timeout=timeout
+        )
+        return CoinbaseClient(transport)
+
+    # Every other name resolves through the entry points -- the registry is the authority on
+    # which adapters exist, and its LookupError already names what is installed.
+    from keel_broker_api.registry import load_broker
+
+    adapter_cls = load_broker(venue)
+
+    if adapter_cls.__module__.split(".")[0] != "keel_broker_alpaca":
+        raise RuntimeError(
+            f"broker.name {venue!r} resolved to an installed adapter, but the CLI does not "
+            "yet know how to give it credentials -- venue wiring exists for 'coinbase' and "
+            "'alpaca' only. Constructing it anyway would hand the engine a broker that "
+            "cannot reach its venue."
+        )
+
+    from keel.config import load_alpaca_secrets
+
+    secrets = load_alpaca_secrets()
+    if not secrets.get("key_id") or not secrets.get("secret_key"):
+        raise RuntimeError(
+            f"broker {venue!r} needs Alpaca credentials: set ALPACA_API_KEY_ID and "
+            "ALPACA_API_SECRET_KEY in the environment or in .env. Paper keys suffice for the "
+            "paper profile -- generate them from the Alpaca dashboard's paper trading "
+            "account; broker.endpoint selects paper-api.alpaca.markets, and there is no URL "
+            "knob anywhere that could point these at the live venue."
+        )
+
+    from keel_broker_alpaca.transport import AlpacaTransport
+
+    transport = AlpacaTransport(
+        secrets["key_id"] or "",
+        secrets["secret_key"] or "",
+        endpoint=config.broker.endpoint,
+        data_feed=config.broker.data_feed,
+        timeout=10.0 if timeout is None else float(timeout),
     )
-    return CoinbaseClient(transport)
+    # `adapter_cls` IS the class the entry point registered -- constructed through discovery
+    # (not a direct import) so the installed adapter, not a hard dependency, is what runs.
+    return adapter_cls(
+        transport, endpoint=config.broker.endpoint, data_feed=config.broker.data_feed
+    )

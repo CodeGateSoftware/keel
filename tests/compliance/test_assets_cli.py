@@ -15,6 +15,7 @@ from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.types import Candle, Granularity
+from tests.conftest import VALID_CONFIG_YAML
 
 _DAY = 86400
 
@@ -728,6 +729,43 @@ def test_a_broker_failure_is_an_ERROR_not_an_empty_clean_result(
 
     assert result.exit_code != 0
     assert "unreachable" in result.output.lower() or "error" in result.output.lower()
+
+
+def test_holdings_auth_advice_names_the_coinbase_env_vars(
+    tmp_path, valid_config_path, monkeypatch
+):
+    """The auth hint is actionable only if it names the keys THIS deployment reads: on the
+    default (coinbase) config that is the CDP pair -- the historical advice, unchanged."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    _with_broker(monkeypatch, _FakeBroker([], fail=True))
+
+    result = _holdings(db_path, valid_config_path)
+
+    assert result.exit_code != 0
+    assert "CDP_API_KEY" in result.output
+    assert "CDP_API_SECRET" in result.output
+    assert "ALPACA_API_KEY_ID" not in result.output
+
+
+def test_holdings_auth_advice_names_the_alpaca_env_vars(tmp_path, write_config, monkeypatch):
+    """The alpaca mirror: an operator whose `broker:` section selects alpaca never reads a
+    CDP credential, so the advice must point at the Alpaca pair instead (#386 review: advice
+    that names the wrong venue's keys sends the operator hunting a credential this
+    deployment never uses)."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    config_path = write_config(
+        VALID_CONFIG_YAML + "\nbroker:\n  name: alpaca\n  endpoint: paper\n  data_feed: iex\n"
+    )
+    _with_broker(monkeypatch, _FakeBroker([], fail=True))
+
+    result = _holdings(db_path, config_path)
+
+    assert result.exit_code != 0
+    assert "ALPACA_API_KEY_ID" in result.output
+    assert "ALPACA_API_SECRET_KEY" in result.output
+    assert "CDP_API_KEY" not in result.output
 
 
 def test_holdings_marks_assets_already_on_the_allowlist(

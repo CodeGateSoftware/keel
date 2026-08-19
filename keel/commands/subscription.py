@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 
 import click
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.telemetry import current_venue
 
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
 from keel.config import Config
@@ -22,13 +23,30 @@ from keel.execution.guards import DEFAULT_VENUE
 ATTESTATION_PERIOD_SEC = 365 * 24 * 3600
 
 
+def _bound_venue_or_default(venue: str | None) -> str:
+    """An explicit `--venue` wins; otherwise the venue THIS deployment trades.
+
+    That is the same binding rail 14 gates every BUY on -- the one `_load_cfg` makes at
+    process entry for telemetry (`bind_venue(config.broker.name)`) -- with coinbase when
+    nothing is bound. A `--venue` default frozen at coinbase would make an alpaca operator
+    type `--venue alpaca` on every invocation or silently write a record nothing reads.
+
+    Must be called AFTER `_load_cfg(ctx)` has run, or there is nothing bound to read.
+    """
+    if venue is not None:
+        return venue
+    return current_venue() or DEFAULT_VENUE
+
+
 @click.group("subscription")
 def subscription_group() -> None:
     """View or attest a venue's subscription (the allowance execution.guards rail 14 enforces).
 
     Coinbase exposes no subscription endpoint, so a subscription is *asserted* by the user, not
     fetched. `attest` is that assertion. Rail 14 reads the resulting record fresh on every order,
-    so an attestation takes effect on the very next one, with no restart.
+    so an attestation takes effect on the very next one, with no restart. An omitted `--venue`
+    means this deployment's bound venue (its `broker:` selection; coinbase when unbound) -- the
+    same key rail 14 gates on, so the default writes the record that will actually be read.
 
     Until a venue is attested, rail 14 caps it at `subscription.unsubscribed_allowance_usd`
     (default 0) -- keel ships unable to place a live BUY, deliberately.
@@ -49,7 +67,12 @@ def _resolve_pacing(
 
 
 @subscription_group.command("attest")
-@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to attest.")
+@click.option(
+    "--venue",
+    default=None,
+    help="Venue to attest (default: this config's bound venue -- its `broker:` selection; "
+    "coinbase when unbound).",
+)
 @click.option("--tier", "tier_name", required=True, help="Tier name from config.yaml's `tiers`.")
 @click.option(
     "--pacing",
@@ -60,12 +83,13 @@ def _resolve_pacing(
 @click.pass_context
 @with_disclaimer
 def subscription_attest(
-    ctx: click.Context, venue: str, tier_name: str, pacing: str | None
+    ctx: click.Context, venue: str | None, tier_name: str, pacing: str | None
 ) -> None:
     """Assert which subscription tier this venue is on -- clears `suspect` by asserting a named
     tier (`subscription set` also clears it, but names no tier)."""
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
+    venue = _bound_venue_or_default(venue)
 
     tier = next((t for t in config.tiers if t.name == tier_name), None)
     if tier is None:
@@ -97,7 +121,12 @@ def subscription_attest(
 
 
 @subscription_group.command("set")
-@click.option("--venue", default=DEFAULT_VENUE, show_default=True, help="Venue to update.")
+@click.option(
+    "--venue",
+    default=None,
+    help="Venue to update (default: this config's bound venue -- its `broker:` selection; "
+    "coinbase when unbound).",
+)
 @click.option(
     "--free-volume-usd",
     "free_volume_raw",
@@ -113,7 +142,7 @@ def subscription_attest(
 @click.pass_context
 @with_disclaimer
 def subscription_set(
-    ctx: click.Context, venue: str, free_volume_raw: str, pacing: str | None
+    ctx: click.Context, venue: str | None, free_volume_raw: str, pacing: str | None
 ) -> None:
     """Set a raw allowance without naming a tier -- an escape hatch, not an attestation.
 
@@ -122,6 +151,7 @@ def subscription_set(
     """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
+    venue = _bound_venue_or_default(venue)
 
     try:
         free_volume_usd = Decimal(free_volume_raw)
@@ -181,10 +211,13 @@ def subscription_show(ctx: click.Context) -> None:
     records = repo.list_broker_subscriptions()
 
     if not records:
+        # The advice names the BOUND venue -- the one rail 14 actually gates on for this
+        # deployment -- so the operator's copy-paste writes the record that will be read.
+        venue = _bound_venue_or_default(None)
         click.echo(
             "no subscription attested for any venue -- rail 14 caps live BUYs at the "
             f"unsubscribed allowance {config.subscription.unsubscribed_allowance_usd}. "
-            "Run `keel subscription attest --venue coinbase --tier <tier>`."
+            f"Run `keel subscription attest --venue {venue} --tier <tier>`."
         )
         return
 

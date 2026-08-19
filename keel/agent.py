@@ -98,6 +98,19 @@ logger = logging.getLogger(__name__)
 #: healthy long-running loop over what is usually a transient publication lag.
 DATA_NOT_READY_EXIT = 4
 
+#: `keel agent` (single-cycle, non-`--loop`) exits with this status when the cycle skipped on
+#: `market_clock_unavailable` -- the venue's clock could not be READ (a transient outage: no
+#: network on wake, the clock endpoint erroring), which is a different fact from the venue
+#: ANSWERING closed. It mirrors `DATA_NOT_READY_EXIT`'s contract with a day-stamping wrapper:
+#: `paper-equities-run.sh` stamps the UTC day as done only on a ZERO exit, and stamping a
+#: clock-unavailable skip would record the day as done while nothing was evaluated --
+#: silently losing the trading day to an outage the next trigger would have retried. The
+#: `market_closed` skip deliberately still exits 0: a closed venue is a fact about the
+#: calendar (weekend, holiday), the skip is correct cadence bookkeeping, and nothing more can
+#: happen that day. The `--loop` path never uses this either, for `DATA_NOT_READY_EXIT`'s
+#: reason: a long-running loop just retries next interval.
+MARKET_CLOCK_UNAVAILABLE_EXIT = 5
+
 # -- rule reconstruction: DB row (kind, JSON-plain params) -> a real Rule instance -------------
 
 RULE_REGISTRY: dict[str, type[Rule]] = {

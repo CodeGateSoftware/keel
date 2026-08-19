@@ -1,0 +1,167 @@
+# keel runtime configuration — the EQUITIES paper profile (issue #370, Phase B2).
+#
+# The fourth deployment profile, and the first on a SECOND ASSET CLASS: keel's daily turtle
+# rules running on US equities through Alpaca's PAPER trading API (`broker:` below selects
+# the alpaca adapter, its paper endpoint and the IEX data feed). It runs on its OWN database,
+# keel-equities.db, pinned to this config by the keel-equities wrapper — never in keel.db
+# (the daily crypto paper account) or keel-live.db. Bootstrap commands are in
+# docs/operator-runbook.md, "The equities paper profile".
+#
+# THE ALLOWLIST IS PAPER CANDIDATES, NOTHING MORE. MSFT, AAPL, GOOGL, NVDA and COST are
+# chosen for LIQUIDITY (deep daily books, long split-adjusted history, IEX data quality on
+# mega-caps) and for being the kind of liquid large cap an equity screen can be RUN on —
+# not because any of them has been screened, and not because any of them is expected to be
+# profitable. Classification is OPERATOR-ATTESTED per (alpaca, SYMBOL), from attributed
+# sources, before any live consideration (see the runbook's attestation semantics: AAOIFI /
+# IFSB-class standards are the watch); the engine never classifies, and this file
+# asserts nothing religiously. Trading these names here is paper evidence collection, full
+# stop.
+#
+# HONEST CAVEAT, STATED UP FRONT: there is NO PROVEN EDGE on any asset class. The crypto
+# configurations are measured net-negative on their own clocks, and these rules have never
+# been measured on equities at all — nothing in this file changes either fact. This profile
+# exists to accrue ADMISSIBLE EVIDENCE — rail vetoes, outcomes, pending lifespans, intent
+# divergence, this time on a session-bound venue and a second asset class — not profit. Do
+# not read a positive stretch as anything but noise.
+#
+# A DAILY CLOCK. market_data.granularities is ONE_DAY ONLY: the daily turtle rules trade
+# ONE_DAY bars, and hourly bars exist only within sessions (Alpaca mints them 09:30–16:00 ET
+# on trading days), so they are not needed by daily rules and polling them would add rate-
+# limit surface for nothing. interval_sec: 86400 is the matching cadence — and it scales the
+# feed-staleness window, which B1's session awareness (#385) reads closed-explained through:
+# a weekend is "market closed", never "feed stale".
+#
+# `allowlist` and `caps` are required and validated by keel.config.load_config; missing or
+# invalid values raise ConfigError naming the offending key rather than silently defaulting.
+
+allowlist:
+  - MSFT
+  - AAPL
+  - GOOGL
+  - NVDA
+  - COST
+
+# Flat 20% each, summing to exactly 1.000. Flatness states NO view: nobody has earned a
+# conviction weighting on an asset class nothing has been measured on, and every name's
+# shariah classification is unrecorded (that is the operator's attestation, not this file).
+# It is the sizing half of the same guardrail logic as the hourly profile's flat Tier-2
+# caps — a candidate can only ever be a 20% position while it is still a candidate.
+target_weights:
+  MSFT: 0.200
+  AAPL: 0.200
+  GOOGL: 0.200
+  NVDA: 0.200
+  COST: 0.200
+
+risk_pct: 0.01
+
+# The venue this deployment talks to — the whole of the venue-selection surface. `name`
+# resolves through the keel.brokers entry points (the deployment must have keel-broker-alpaca
+# installed); `endpoint: paper` selects Alpaca's PAPER host (paper-api.alpaca.markets — the
+# adapter derives the host from this word and accepts no URL, so a paper credential cannot
+# be pointed at the live venue); `data_feed: iex` declares the free data tier (sip is the
+# subscribed tier — the choice is declared, never assumed, because the venue's server-side
+# default silently fails for keys without the subscription). Omitting the section entirely
+# selects Coinbase, byte-compatibly with every other profile.
+broker:
+  name: alpaca
+  endpoint: paper
+  data_feed: iex
+
+caps:
+  # Same non-binding internal limits as the crypto paper profiles — deliberately NOT tighter,
+  # for the same reason: this profile's evidence is partly ABOUT rail behaviour (rail vetoes
+  # are admissible evidence), so silently clamping sizing here would bias exactly the thing
+  # being measured.
+  max_exposure_usd: 5000
+  max_per_asset_pct: 0.50
+
+market_data:
+  # See the header: ONE_DAY ONLY — a daily-clock equities profile. history_days mirrors the
+  # crypto paper profiles so a year of warm cache backs the daily lookbacks.
+  granularities:
+    - ONE_DAY
+  history_days: 365
+
+auto_trade:
+  mode: paper
+  # NOTE: currently UNUSED by any code path -- it is NOT a kill-switch and setting it
+  # true or false changes nothing. Use `keel kill` to halt trading.
+  enabled: false
+  # One cycle per UTC day. The LaunchAgent (com.keel.paper-equities.plist) triggers daily
+  # at 10:00-15:00 local, inside the US regular session (the runner's window is 10:00
+  # inclusive to 16:00 exclusive, so the 15:00 trigger runs), because B1's session gate
+  # skips any cycle the venue clock answers closed — see that plist's comment for the full
+  # reasoning. That schedule is correct on an ET-anchored host (or one within ±4h of ET);
+  # on any other host, re-anchor the trigger hours to land 10:00-15:00 ET — the runner's
+  # local-hours guard is a backstop against off-schedule boots, not a drift absorber. This
+  # value also scales the staleness window (86400 x FEED_STALENESS_CYCLES), which is what
+  # keeps weekends and holidays reading market-closed instead of stale.
+  interval_sec: 86400
+
+promotion:
+  min_trades: 100
+  min_expectancy: 0.0
+  min_rr: 1.5
+  min_win_rate: 0.55
+
+money_mgmt:
+  profit_trigger_pct: 0.10
+  acceleration_pct: 0.05
+  max_total_dd_pct: 0.20
+  max_weekly_dd_pct: 0.08
+  # Rail 16 (consecutive-loss breaker) — DISABLED by default (0 = off), same as the siblings.
+  max_consecutive_losses: 0
+  streak_cooloff_days: 0
+
+dca:
+  budget_usd: 50
+  cadence_days: 7
+
+paper:
+  # Same seed/contribution as the crypto paper profiles, deliberately: a like-for-like
+  # comparison of rail behaviour across venues wants the same sizing basis, and changing it
+  # here would confound exactly that. At $10k+ synthetic equity, rail 14's $500/month
+  # allowance can veto large sized setups — those vetoes are themselves evidence.
+  starting_equity_usd: 10000
+  monthly_contribution_usd: 500
+
+# Equities settle in USD; Alpaca only trades USD-quoted symbols (the adapter refuses any
+# other quote leg), so this is not a choice so much as a restatement of the venue.
+quote_currency: USD
+
+subscription:
+  # Rail 14's simulator assumptions. Alpaca has no subscription tiers — commission-free
+  # trading with regulatory fees on sells — so the tier CATALOGUE below stays at its
+  # Coinbase defaults (rail 14 reads the ATTESTED record, not this catalogue, and a live
+  # equities path would restate all of this before it mattered; see the runbook).
+  assumed_free_volume_usd: 500
+  unsubscribed_allowance_usd: 0
+  pacing: opportunistic
+
+# Alpaca equities are commission-free: $0 per trade, so paper fills price at a 0% commission
+# here — the honest statement about commission on this venue. What this does NOT model is
+# the sell-side regulatory fees (SEC Section 31 + FINRA TAF, passed through on sells) and
+# the spread; the adapter's preview estimates the former from the venue's own published
+# formulas, and Phase C's cost-fidelity work re-measures all of it before any strategy
+# evaluation on this asset class is believed (PRD §6.3).
+fees:
+  taker_pct: 0.0
+  maker_pct: 0.0
+
+# Daily cadence means one cycle per trading day, but rail vetoes and no-signal reasons still
+# arrive every cycle and verbose=false would make "why no order today?" a manual database
+# replay. Rotation bounds the volume. (Weekends and holidays are quiet by design — B1.)
+logging:
+  verbose: true
+  file: logs/keel-equities.log
+  max_file_mb: 25
+  file_count: 5
+
+# G4 overfitting gate (KB §78). NEVER tune these to obtain a desired verdict. Same floors as
+# every other profile; this profile's rows are EXPECTED to fail them — an unmeasured asset
+# class is the definition of no edge, and that failure is the finding, not a configuration
+# problem.
+research:
+  pbo_max: 0.05
+  slope_floor: -0.5
