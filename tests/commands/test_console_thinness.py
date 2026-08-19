@@ -34,6 +34,13 @@ from the services the CLI calls. The pin is an AST scan enforcing four rules:
   and the offline capability display). Combined with Rule 2 (the executor allowlist
   admits only the two READ helpers), there is no TUI-originated order path: the sole
   order-capable dispatch is `agent.run_once`, which is not a compute-module call.
+* **Rule 5 -- no process/network orchestration in the console layer** (issue #415): no
+  console module may import `subprocess`/`urllib` or call `execv`/`urlopen`/`os.system`
+  itself. The self-update slice's shells-out work (uv, `keel migrate`, `keel versions`
+  verification, the GitHub release fetch, the execv relaunch) lives in the SERVICE
+  (`keel.commands.update`), which this pin does not scan -- so the rule needs no
+  allowance at all, and a console module that inlines any of that orchestration fails
+  here rather than shipping a second, unpinned place that replaces the running binary.
 
 The allowlists are deliberately entry-scoped (module + enclosing function + callee), so
 an allowance cannot leak to a new call site: the same callee at a different place, or a
@@ -358,6 +365,43 @@ def findings() -> dict[str, list[str]]:
                 f"{stem}:{owners.get(node, '<module>')}: constructs a broker ({short}, "
                 f"line {node.lineno}) outside the build_broker/build_client service seam",
             )
+
+        # Rule 5: no subprocess/HTTP/exec orchestration in the console layer (issue
+        # #415) -- that is the update service's, never a console module's.
+        for node in ast.walk(tree):
+            banned_imports = ("subprocess", "urllib.request", "urllib")
+            if isinstance(node, ast.ImportFrom) and isinstance(node.module, str):
+                root = node.module.split(".")[0]
+                if node.module in banned_imports or root in banned_imports:
+                    found.add(
+                        "rule5_orchestration",
+                        f"{stem}: imports {node.module} -- process/network orchestration "
+                        "belongs to the service layer (keel.commands.update)",
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    if alias.name in banned_imports or root in banned_imports:
+                        found.add(
+                            "rule5_orchestration",
+                            f"{stem}: imports {alias.name} -- process/network "
+                            "orchestration belongs to the service layer "
+                            "(keel.commands.update)",
+                        )
+            if isinstance(node, ast.Call):
+                name = _dotted_call_name(node.func, aliases)
+                if name is None:
+                    continue
+                if name in ("subprocess.run", "subprocess.check_output",
+                            "urllib.request.urlopen", "os.execv", "os.system") or name.endswith(
+                                ".execv"
+                            ):
+                    found.add(
+                        "rule5_orchestration",
+                        f"{stem}:{owners.get(node, '<module>')}: calls {name} -- the "
+                        "console layer never shells out, opens a socket or replaces "
+                        "its own process; that is keel.commands.update's job",
+                    )
     return found
 
 
@@ -390,6 +434,36 @@ def test_rule_4_no_broker_construction_outside_the_seams(
     bounded read sites -- there is no other construction, so no TUI-originated order
     path (the sole order-capable dispatch is `agent.run_once`, not a compute call)."""
     assert not findings.get("rule4_broker_construction"), findings["rule4_broker_construction"]
+
+
+def test_rule_5_no_process_or_network_orchestration_in_the_console_layer(
+    findings: dict[str, list[str]],
+) -> None:
+    """Issue #415's rule: the console layer never shells out, opens a socket, or
+    replaces its own process. All of that orchestration (uv, the `keel migrate`/`keel
+    versions` subprocesses, the GitHub release fetch, the execv relaunch) lives in the
+    update SERVICE (`keel.commands.update`), outside this pin's file set -- which is
+    why the rule needs no allowance: there is nothing to allow, and inlining any of it
+    into a console module fails here."""
+    assert not findings.get("rule5_orchestration"), findings["rule5_orchestration"]
+
+
+def test_rule_5_is_proven_false_capable() -> None:
+    """The detector's own positive control: a synthetic module that shells out and
+    execv's is flagged (an AST scan that silently matched nothing would make Rule 5
+    vacuously green)."""
+    snippet = "import subprocess\nimport os\nsubprocess.run(['uv'])\nos.execv('/k', ['/k'])\n"
+    tree = ast.parse(snippet)
+    aliases = _collect_aliases(tree)
+    flagged = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            flagged += 1
+        elif isinstance(node, ast.Call):
+            name = _dotted_call_name(node.func, aliases)
+            if name in ("subprocess.run", "os.execv"):
+                flagged += 1
+    assert flagged == 4, flagged
 
 
 def test_the_scan_actually_scanned_the_console_layer() -> None:

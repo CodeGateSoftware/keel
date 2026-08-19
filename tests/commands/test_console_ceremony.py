@@ -498,6 +498,35 @@ CEREMONY: dict[tuple[str, str], tuple[Cell, ...]] = {
             ),
         ),
     ),
+    # -- the Account menu (C6 read-only; #415 adds its ONE gated write) ---------------------------
+    ("ACCOUNT_MENU", "update"): (
+        Cell(
+            T,
+            "the update view opens ARMED with the whole plan (current vs latest, the "
+            "four production wheels, the Release/ dir, the .bak-before-* database "
+            "backups, the RUNNING venv); Enter is NOT enough -- the run demands the "
+            "CLI's OWN typed gate (`keel update`'s exact wording, which names the "
+            "version, the launch folder and that the running binary is replaced), "
+            "rendered at the terminal through the suspend/restore dance. The gate "
+            "runs INSIDE the service's confirm seam, so there is no ungated path to "
+            "the mutations; a wrong phrase, a no-TTY run or a decline writes "
+            "not one file and never relaunches",
+            (
+                (
+                    "test_account_console",
+                    "test_run_live_update_entry_opens_the_armed_view_and_never_runs_the_service",
+                ),
+                (
+                    "test_account_console",
+                    "test_run_live_update_enter_runs_the_gate_at_the_terminal_and_a_refusal_writes_nothing",
+                ),
+                (
+                    "test_account_console",
+                    "test_run_update_at_terminal_gates_then_runs_then_relaunches",
+                ),
+            ),
+        ),
+    ),
     # -- the Data menu (C5) ------------------------------------------------------------------------
     ("DATA_MENU", "fetch"): (
         Cell(
@@ -1043,9 +1072,16 @@ def test_every_blocking_run_that_can_prompt_suspends_curses() -> None:
         assert call in seam_source, call
 
 
-def test_the_account_menu_contributes_no_mutating_actions() -> None:
-    """The one branch with nothing to audit: every Account entry is a view -- the
-    coverage derivation gives it zero keys, and that is stated as its own pin (a future
-    write path added there WILL surface in the teeth test, not slip through here)."""
-    assert all(entry.kind == "view" for entry in account_console.ACCOUNT_MENU)
-    assert not {key for key in _mutating_keys() if key[0] == "ACCOUNT_MENU"}
+def test_the_account_menu_contributes_exactly_one_mutating_action_the_typed_update() -> None:
+    """Through C6 the Account branch was read-only top to bottom (its own pin said
+    so). #415 adds its ONE write path: the update entry, kind "armed", whose run is
+    TYPED (the row above). pnl and versions stay views, and no OTHER mutating action
+    may appear in the branch without a ceremony row -- the teeth test surfaces it."""
+    assert [(e.target, e.kind) for e in account_console.ACCOUNT_MENU] == [
+        ("pnl", "view"),
+        ("versions", "view"),
+        ("update", "armed"),
+    ]
+    assert {key for key in _mutating_keys() if key[0] == "ACCOUNT_MENU"} == {
+        ("ACCOUNT_MENU", "update")
+    }
