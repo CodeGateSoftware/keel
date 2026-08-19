@@ -14,11 +14,89 @@ prints per cycle -- kept beside the state services so both front-ends show a cyc
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from keel import agent
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
+
+# -- the typed gates' wording, and the output lines (their ONE home) ------------------------------
+#
+# These strings used to live inline in `keel/cli.py`'s command bodies. The TUI's Trading
+# menu (issue #391 C5) renders the SAME typed prompts and the SAME confirmation lines, and
+# two front-ends printing one ceremony out of two copies is exactly the drift O3 forbids --
+# so the wording moved here, the same way `withdrawals.py` owns its gate's wording. The CLI
+# imports and prints these; the console imports and renders these; neither re-words them.
+
+#: `keel resume`'s typed-confirmation phrase pair.
+RESUME_ACTION = "disengage the kill-switch"
+RESUME_DETAIL = "Trading resumes immediately: the agent may place orders on its next cycle."
+#: `keel resume-entries`'s typed-confirmation phrase pair (rail 16's early release).
+RESUME_ENTRIES_ACTION = "clear the consecutive-loss halt (rail 16)"
+RESUME_ENTRIES_DETAIL = "New entries are re-permitted; the loss counter is reset with it."
+#: `keel reset-hwm`'s typed-confirmation phrase pair.
+RESET_HWM_ACTION = "reset rail 11's high-water mark"
+RESET_HWM_DETAIL = "Any real, unrecovered drawdown stops being visible to the rail."
+#: `keel record-flow`'s typed-confirmation detail; the ACTION carries the amount (see
+#: `record_flow_action`) because the operator must confirm the exact number, sign included.
+RECORD_FLOW_DETAIL = (
+    "A wrong amount or sign here silently mis-states drawdown from now on "
+    "(positive = deposit, negative = withdrawal)."
+)
+
+
+def record_flow_action(amount: str) -> str:
+    """`keel record-flow`'s typed-confirmation action phrase, naming the RAW amount the
+    operator typed (sign included) -- the thing being confirmed is that exact rebase."""
+    return f"rebase rail 11's high-water mark by {amount}"
+
+
+def parse_flow_amount(raw: str) -> Decimal:
+    """The `--amount` validation `keel record-flow` performs, ONE implementation: raises
+    `ValueError` with the CLI's exact message text (the CLI wraps it in a
+    `click.BadParameter`; the console renders it verbatim). `Decimal("nan")`/`("inf")`
+    parse without raising, so the finite check is load-bearing -- NaN written into the
+    high-water mark poisons it permanently (every later `equity > hwm` is False)."""
+    try:
+        parsed = Decimal(raw)
+    except InvalidOperation:
+        raise ValueError(f"--amount must be a number, got {raw!r}") from None
+    if not parsed.is_finite():
+        raise ValueError(f"--amount must be a finite number, got {raw!r}")
+    return parsed
+
+
+#: The line `keel kill` prints -- one key, no ceremony, by that command's own contract.
+KILL_ENGAGED_LINE = "kill-switch ENGAGED: all trading halted."
+#: The line `keel resume` prints once the typed `yes` released the halt.
+RESUME_DISENGAGED_LINE = "kill-switch disengaged: trading resumed."
+#: The line `keel resume-entries` prints once rail 16's halt is cleared.
+RESUME_ENTRIES_CLEARED_LINE = "consecutive-loss breaker cleared: new entries permitted."
+#: The line `keel reset-hwm` prints once the mark is cleared.
+RESET_HWM_DONE_LINE = "equity high-water mark reset: it will re-seed from the next cycle's equity."
+
+
+def render_flow_recorded(amount: Decimal, hwm: Decimal | None) -> list[str]:
+    """The lines `keel record-flow` prints after the write -- the shared twin every
+    front-end shows, so a declared flow reads identically wherever it renders."""
+    if hwm is None:
+        return [
+            f"flow of {amount} recorded. No high-water mark yet -- the next cycle will seed it "
+            "from observed equity, which already includes this flow."
+        ]
+    return [f"flow of {amount} recorded. High-water mark rebased to {hwm}."]
+
+
+def render_blocked_entries(result: agent.LoopResult) -> list[str]:
+    """The blocked-entry lines `keel agent` prints (to stderr) when a cycle withheld a
+    rule's entry because its gating bar was not confirmed ready -- the same facts both
+    front-ends must be able to state, from `LoopResult`'s own recorded reasons."""
+    return [
+        f"blocked: {blocked.rule_name} on {blocked.product} needs a confirmed "
+        f"{blocked.granularity.value} bar at {blocked.expected_ts} "
+        f"(have {blocked.stored_ts}, reason={blocked.reason})"
+        for blocked in result.blocked_entries
+    ]
 
 
 def engage_kill_switch(repo: Repository) -> None:

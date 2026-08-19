@@ -1757,6 +1757,24 @@ def run_live(
     `menu`/`profile` modes move a selected row the same way `activity` does, and `placeholder`
     does not scroll (a notice is one screen).
 
+    C5 (issue #391) adds the Trading and Data menus, all console-bound only: `trading`
+    (the sub-menu over `trading_console.TRADING_MENU`; forms -- autonomy, record-flow,
+    reset-hwm, resume-entries, resume -- run at the TERMINAL like Compliance's, so O3's
+    typed gates render in-console through the suspend/restore dance; kill dispatches
+    IMMEDIATELY, per its own one-key CLI contract), `trading-cycle` (the agent-cycle
+    ARMED view -- Enter is the confirm step: the screen names the profile, the mode's
+    paper/confirm semantics and the autonomy state, plus the SESSION HONESTY line from
+    the recorded B1 state; the run itself is `agent.run_once` with the CLI's own
+    `_interactive_confirm`, so there is no TUI-originated order path, and its result
+    lines -- a skip's logged reason verbatim -- are held), `trading-monitor` (one poll,
+    the same ARMED story over `monitor_cycle`), `data` (the sub-menu over
+    `data_console.DATA_MENU`), `data-fetch` (the fetch / fetch --check / repair-gaps
+    ARMED views: the plan -- products x granularities x window from the ACTIVE profile --
+    shows first, Enter runs `run_fetch` itself, blocking, with the streamed lines held
+    and a check run's verdict pinned under the scroll), and `data-freshness` (the
+    offline freshness overview, rebuilt per poll, a check sweep that never constructs a
+    broker).
+
     Normal-mode keys: `q`/`Q` quit; `h`/`?` open help; `i` open insights; `s` open screen; `p`
     open propose; `d` open discover; `v` open activity; `m` open the console menu (when a
     console binding was supplied); `r` refresh now; `a` toggle autonomy
@@ -1808,8 +1826,16 @@ def run_live(
     # Lazy import, the established cycle-dodge for this module (see `insights`): console
     # imports THIS module at load time (its builders speak `ScreenLine`), so importing it
     # here keeps the two modules loadable in either order. The strategy/research consoles
-    # follow the same rule (both speak `ScreenLine` and dispatch to the service layer).
-    from keel.commands import compliance_console, console, research_console, strategy_console
+    # follow the same rule (both speak `ScreenLine` and dispatch to the service layer),
+    # and so do the C5 trading/data consoles.
+    from keel.commands import (
+        compliance_console,
+        console,
+        data_console,
+        research_console,
+        strategy_console,
+        trading_console,
+    )
 
     def _balance_fn(cfg: Config) -> Decimal | None:
         # Lazy imports -- `keel.commands._common` and `keel.execution.executor` both import
@@ -1865,6 +1891,10 @@ def run_live(
                 return "strategy", 0, 0, None
             if action == "research":
                 return "research", 0, 0, None
+            if action == "trading":
+                return "trading", 0, 0, None
+            if action == "data":
+                return "data", 0, 0, None
             return "placeholder", 0, 0, entry
 
         mode = "normal"
@@ -1945,6 +1975,33 @@ def run_live(
         research_doc_cache: dict[tuple[str, int], list[str]] = {}
         research_doc_offset = 0
         research_trials_offset = 0
+        # -- the Trading menu (issue #391 C5): the sub-menu's cursor, and the two ARMED
+        # views' plan/held-result state (the agent cycle and the monitor poll -- Enter
+        # is the confirm step, the discover overlay's gating story; the run blocks the
+        # loop exactly like simulate/fetch and its rendered result is held until close
+        # re-arms the view).
+        trading_cursor = 0
+        trading_menu_offset = 0
+        trading_cycle_plan: Any = None
+        trading_cycle_result: Any = None
+        trading_cycle_error: str | None = None
+        trading_cycle_offset = 0
+        trading_monitor_plan: Any = None
+        trading_monitor_result: Any = None
+        trading_monitor_error: str | None = None
+        trading_monitor_offset = 0
+        # -- the Data menu (issue #391 C5): the sub-menu's cursor, the fetch variants'
+        # ARMED plan/held state (fetch / fetch --check / repair gaps, one mode branch),
+        # and the freshness overview's scroll offset (the view itself is offline and
+        # rebuilt per poll, the offline views' contract).
+        data_cursor = 0
+        data_menu_offset = 0
+        data_fetch_plan: Any = None
+        data_fetch_progress: list[str] = []
+        data_fetch_result: Any = None
+        data_fetch_error: str | None = None
+        data_fetch_offset = 0
+        data_freshness_offset = 0
         # Where the insights overlay closes back to: the dashboard by default, the Rules
         # menu when the strategy console opened it (the shell is a hierarchy).
         insights_back = "normal"
@@ -2107,6 +2164,142 @@ def run_live(
                 research_list_cursor = 0
                 research_list_offset = 0
                 mode = "research-list"
+
+        def _run_trading_form_at_terminal(form_target: str) -> None:
+            """A Trading-menu form entry: open the state through the console's own
+            loaders and run the form through `trading_console.run_*` inside the
+            suspend/restore dance -- the same seam the Compliance/strategy forms use, so
+            O3's typed gates (resume's, resume-entries', record-flow's, reset-hwm's,
+            autonomy's) render in-console, never piped, never pre-filled."""
+            nonlocal message, message_ts
+
+            form_repo, form_config = open_state()
+
+            def _run() -> str:
+                if form_target == "autonomy":
+                    return trading_console.run_autonomy_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                if form_target == "record-flow":
+                    return trading_console.run_record_flow_form(
+                        form_repo, _form_prompt, now_fn()
+                    )
+                if form_target == "reset-hwm":
+                    return trading_console.run_reset_hwm_form(form_repo)
+                if form_target == "resume-entries":
+                    return trading_console.run_resume_entries_form(form_repo)
+                if form_target == "resume":
+                    return trading_console.run_resume_form(form_repo)
+                raise ValueError(f"unknown trading form: {form_target}")
+
+            message = _run_terminal_form(stdscr, _run)
+            message_ts = now_fn()
+
+        def _enter_trading_entry(entry: Any) -> None:
+            """Where a Trading selection goes -- the closed-mapping rule again: the two
+            ARMED views (the cycle/poll confirm steps; their plans read the RECORDED
+            session for the honesty line, never a TUI-side calendar), a form at the
+            terminal (the typed gates), or kill -- dispatched IMMEDIATELY, per its own
+            CLI contract (one key, no ceremony), with the CLI's own line as the toast."""
+            nonlocal mode, trading_cycle_plan, trading_cycle_result, trading_cycle_error
+            nonlocal trading_cycle_offset, trading_monitor_plan, trading_monitor_result
+            nonlocal trading_monitor_error, trading_monitor_offset
+            nonlocal message, message_ts
+            # The B1 recording read the honesty line renders -- the same broker-free
+            # seam the session banner reads (`latest_recorded_session`), never a
+            # TUI-side calendar.
+            from keel import agent as agent_mod
+
+            if entry.kind == "armed" and entry.target == "cycle":
+                cycle_repo, cycle_config = open_state()
+                profile = console.active_profile(
+                    console_binding.config_path if console_binding else "",
+                    console_binding.db_path if console_binding else "",
+                )
+                trading_cycle_plan = trading_console.cycle_plan(
+                    cycle_repo,
+                    cycle_config,
+                    console_binding.db_path if console_binding else "?",
+                    now_fn(),
+                    profile_label=profile.label if profile else None,
+                    session_bound=(
+                        console_binding.session_bound(cycle_config)
+                        if console_binding
+                        else False
+                    ),
+                    recorded=agent_mod.latest_recorded_session(
+                        cycle_repo, cycle_config, now_fn()
+                    ),
+                )
+                trading_cycle_result = None
+                trading_cycle_error = None
+                trading_cycle_offset = 0
+                mode = "trading-cycle"
+            elif entry.kind == "armed":  # the monitor poll
+                monitor_repo, monitor_config = open_state()
+                trading_monitor_plan = trading_console.monitor_plan(
+                    monitor_config,
+                    console_binding.db_path if console_binding else "?",
+                    session_bound=(
+                        console_binding.session_bound(monitor_config)
+                        if console_binding
+                        else False
+                    ),
+                    recorded=agent_mod.latest_recorded_session(
+                        monitor_repo, monitor_config, now_fn()
+                    ),
+                )
+                trading_monitor_result = None
+                trading_monitor_error = None
+                trading_monitor_offset = 0
+                mode = "trading-monitor"
+            elif entry.kind == "action":  # kill: one key, no ceremony, per its contract
+                kill_repo, _kill_config = open_state()
+                message = _guarded("kill", lambda: trading_console.run_kill(kill_repo))
+                message_ts = now_fn()
+            else:
+                _run_trading_form_at_terminal(entry.target)
+
+        def _run_data_form_at_terminal(form_target: str) -> None:
+            """A Data-menu form entry: the db-import path form, run at the terminal
+            through the same suspend/restore seam (the CLI's own validation messages
+            render verbatim)."""
+            nonlocal message, message_ts
+
+            form_repo, _form_config = open_state()
+
+            def _run() -> str:
+                if form_target == "db-import":
+                    return data_console.run_db_import_form(form_repo, _form_prompt)
+                raise ValueError(f"unknown data form: {form_target}")
+
+            message = _run_terminal_form(stdscr, _run)
+            message_ts = now_fn()
+
+        def _enter_data_entry(entry: Any) -> None:
+            """Where a Data selection goes: an ARMED fetch variant (the plan is built on
+            entry so the confirm screen shows what the ACTIVE profile resolves to), the
+            offline freshness view, or the import form at the terminal."""
+            nonlocal mode, data_fetch_plan, data_fetch_progress
+            nonlocal data_fetch_result, data_fetch_error, data_fetch_offset
+            nonlocal data_freshness_offset
+            if entry.kind == "armed":
+                fetch_repo, fetch_config = open_state()
+                data_fetch_plan = data_console.fetch_plan(
+                    fetch_config,
+                    console_binding.db_path if console_binding else "?",
+                    entry.target,
+                )
+                data_fetch_progress = []
+                data_fetch_result = None
+                data_fetch_error = None
+                data_fetch_offset = 0
+                mode = "data-fetch"
+            elif entry.kind == "view":  # the freshness overview: offline, per poll
+                data_freshness_offset = 0
+                mode = "data-freshness"
+            else:
+                _run_data_form_at_terminal(entry.target)
 
         while True:
             if mode == "menu":
@@ -2920,6 +3113,368 @@ def run_live(
                         research_trials_offset,
                         height,
                         len(banner) + len(trials_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "trading":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Trading sub-menu (issue #391 C5): PRD §3's Trading branch, one
+                # cursor-marked row, the typed entries marked. A FORM entry runs at the
+                # terminal right here (curses suspended -- O3's typed gates render
+                # in-console) and its confirmation line toasts on this screen; kill
+                # dispatches IMMEDIATELY (its own CLI contract: one key, no ceremony);
+                # the cycle and the poll are ARMED modes that close back HERE. SCROLLED
+                # with the cursor-follow rule: eight entries with wrapped descriptions
+                # outgrow a small window.
+                trading_lines = trading_console.build_trading_menu_lines(
+                    cursor=trading_cursor, message=_toast_ttl()
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(trading_lines)
+                trading_menu_offset = _follow_cursor(trading_menu_offset, cursor_row, height)
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *trading_lines], trading_menu_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    trading_cursor = max(0, trading_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    trading_cursor = min(
+                        len(trading_console.TRADING_MENU) - 1, trading_cursor + 1
+                    )
+                elif ord("1") <= ch <= ord("9"):
+                    trading_selected = trading_console.trading_entry(ch - ord("0"))
+                    if trading_selected is not None:
+                        _enter_trading_entry(trading_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_trading_entry(trading_console.TRADING_MENU[trading_cursor])
+                else:
+                    # Banner-aware total, for the same reason as help's branch above.
+                    trading_menu_offset = _scroll_offset(
+                        ch,
+                        trading_menu_offset,
+                        height,
+                        len(banner) + len(trading_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "trading-cycle" and trading_cycle_plan is not None:
+                # The agent cycle view (issue #391 C5): ARMED until an explicit Enter --
+                # the CONFIRM step (the screen names the profile, the mode's semantics
+                # and the session honesty). Enter runs `agent.run_once` through
+                # `trading_console.run_agent_cycle` (the CLI's own confirm gate), which
+                # CAN PLACE ORDERS on the active profile -- the one entry in this
+                # console with that power, which is exactly why nothing fires before
+                # the Enter. The run blocks the loop like simulate/fetch; the cycle's
+                # own result lines are held and repainted until Enter re-runs or close
+                # re-arms.
+                if trading_cycle_result is not None:
+                    cycle_view = trading_console.build_cycle_result_lines(
+                        trading_cycle_result
+                    )
+                elif trading_cycle_error is not None:
+                    cycle_view = [
+                        ScreenLine(f"agent cycle failed: {trading_cycle_error}", "alert"),
+                        _blank(),
+                        ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"),
+                    ]
+                else:
+                    cycle_view = trading_console.build_cycle_armed_lines(
+                        trading_cycle_plan
+                    )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *cycle_view], trading_cycle_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "trading"
+                    # Closing discards the held result -- reopening is ARMED again.
+                    trading_cycle_result = None
+                    trading_cycle_error = None
+                    trading_cycle_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine(
+                            "running one agent cycle... please wait (the screen is "
+                            "frozen exactly like the CLI; orders, if any, follow this "
+                            "profile's mode and confirm gates)",
+                            "normal",
+                        )],
+                    )
+                    try:
+                        cycle_repo, cycle_config = open_state()
+                        from keel.commands._common import _build_broker
+
+                        trading_cycle_result = trading_console.run_agent_cycle(
+                            cycle_repo,
+                            cycle_config,
+                            now_ts=now_fn(),
+                            build_broker=lambda: _build_broker(cycle_config),
+                        )
+                        trading_cycle_error = None
+                    except Exception as exc:
+                        trading_cycle_result = None
+                        trading_cycle_error = str(exc)[:200]
+                    trading_cycle_offset = 0
+                else:
+                    trading_cycle_offset = _scroll_offset(
+                        ch,
+                        trading_cycle_offset,
+                        height,
+                        len(banner) + len(cycle_view),
+                        curses,
+                    )
+                continue
+
+            if mode == "trading-monitor" and trading_monitor_plan is not None:
+                # The monitor poll view: the same ARMED story for ONE poll -- Enter
+                # runs `monitor_cycle` (record the session, skip while closed, else
+                # fetch fresh candles), blocking; the cycle's own line is held.
+                if trading_monitor_result is not None:
+                    monitor_view = trading_console.build_monitor_result_lines(
+                        trading_monitor_result
+                    )
+                elif trading_monitor_error is not None:
+                    monitor_view = [
+                        ScreenLine(
+                            f"monitor poll failed: {trading_monitor_error}", "alert"
+                        ),
+                        _blank(),
+                        ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"),
+                    ]
+                else:
+                    monitor_view = trading_console.build_monitor_armed_lines(
+                        trading_monitor_plan
+                    )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *monitor_view], trading_monitor_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "trading"
+                    trading_monitor_result = None
+                    trading_monitor_error = None
+                    trading_monitor_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine("polling... please wait (one poll; the screen is "
+                                    "frozen exactly like the CLI)", "normal")],
+                    )
+                    try:
+                        poll_repo, poll_config = open_state()
+                        from keel.commands._common import _build_broker
+
+                        trading_monitor_result = trading_console.run_monitor_poll(
+                            poll_repo,
+                            poll_config,
+                            now_ts=now_fn(),
+                            build_broker=lambda: _build_broker(poll_config),
+                        )
+                        trading_monitor_error = None
+                    except Exception as exc:
+                        trading_monitor_result = None
+                        trading_monitor_error = str(exc)[:200]
+                    trading_monitor_offset = 0
+                else:
+                    trading_monitor_offset = _scroll_offset(
+                        ch,
+                        trading_monitor_offset,
+                        height,
+                        len(banner) + len(monitor_view),
+                        curses,
+                    )
+                continue
+
+            if mode == "data":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Data sub-menu (issue #391 C5): PRD §3's Data branch. The fetch
+                # variants open ARMED modes that close back HERE; the freshness
+                # overview is an offline view; db import runs its path form at the
+                # terminal. SCROLLED with the cursor-follow rule like the other
+                # sub-menus.
+                data_lines = data_console.build_data_menu_lines(
+                    cursor=data_cursor, message=_toast_ttl()
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(data_lines)
+                data_menu_offset = _follow_cursor(data_menu_offset, cursor_row, height)
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *data_lines], data_menu_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    data_cursor = max(0, data_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    data_cursor = min(len(data_console.DATA_MENU) - 1, data_cursor + 1)
+                elif ord("1") <= ch <= ord("9"):
+                    data_selected = data_console.data_entry(ch - ord("0"))
+                    if data_selected is not None:
+                        _enter_data_entry(data_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_data_entry(data_console.DATA_MENU[data_cursor])
+                else:
+                    data_menu_offset = _scroll_offset(
+                        ch,
+                        data_menu_offset,
+                        height,
+                        len(banner) + len(data_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "data-fetch" and data_fetch_plan is not None:
+                # A fetch variant (fetch / fetch --check / repair gaps): ARMED until an
+                # explicit Enter -- the confirm step, the plan on screen first. Enter
+                # runs `run_fetch` (the SAME flow `keel fetch` runs) through
+                # `data_console.run_console_fetch`, blocking the loop exactly like `f`
+                # fetch; the lines the CLI would have streamed are collected and HELD,
+                # with a `--check` run's verdict PINNED under the body so no scroll
+                # offset can hide what the dry-run concluded.
+                if data_fetch_result is not None or data_fetch_error is not None:
+                    fetch_view = data_console.build_fetch_result_lines(
+                        data_fetch_plan.target,
+                        tuple(data_fetch_progress),
+                        error=data_fetch_error,
+                        verdict=(
+                            data_fetch_result.error
+                            if data_fetch_result is not None
+                            else None
+                        ),
+                    )
+                else:
+                    fetch_view = data_console.build_fetch_armed_lines(data_fetch_plan)
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                pinned = (
+                    data_console.check_verdict_footer(
+                        data_fetch_result.error
+                        if data_fetch_plan.check and data_fetch_result is not None
+                        else None
+                    )
+                )
+                _paint(
+                    stdscr,
+                    compliance_console.pinned_frame(
+                        [*banner, *fetch_view], pinned,
+                        offset=data_fetch_offset, height=height,
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "data"
+                    # Closing discards the held run -- reopening is ARMED again.
+                    data_fetch_result = None
+                    data_fetch_error = None
+                    data_fetch_progress = []
+                    data_fetch_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine(
+                            "fetching... please wait (this can take minutes; the screen "
+                            "is frozen exactly like the CLI)", "normal"
+                        )],
+                    )
+                    fetch_progress: list[str] = []
+                    try:
+                        fetch_repo, fetch_config = open_state()
+                        from keel.commands._common import _build_broker
+
+                        data_fetch_result = data_console.run_console_fetch(
+                            fetch_repo,
+                            fetch_config,
+                            data_fetch_plan,
+                            now_ts=now_fn(),
+                            # The lazy factory the CLI's own wrapper hands the service:
+                            # `--check` and the all-current skip never construct one.
+                            build_client=lambda: _build_broker(fetch_config),
+                            progress=fetch_progress,
+                        )
+                        data_fetch_error = None
+                    except Exception as exc:
+                        data_fetch_result = None
+                        data_fetch_error = str(exc)[:200]
+                    data_fetch_progress = fetch_progress
+                    data_fetch_offset = 0
+                else:
+                    data_fetch_offset = _scroll_offset(
+                        ch,
+                        data_fetch_offset,
+                        max(height - len(pinned), 0),
+                        len(banner) + len(fetch_view),
+                        curses,
+                    )
+                continue
+
+            if mode == "data-freshness":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The freshness overview: OFFLINE and rebuilt per poll, fail-soft --
+                # `run_fetch(check=True)`'s own sweep, the same lines `keel fetch
+                # --check` prints (a check run never opens a network connection, so no
+                # broker is ever constructed from this screen).
+                try:
+                    freshness_repo, freshness_config = open_state()
+                    rows = data_console.freshness_lines(
+                        freshness_repo,
+                        freshness_config,
+                        console_binding.db_path,
+                        now_fn(),
+                    )
+                    freshness_view = data_console.build_freshness_lines(rows)
+                except Exception as exc:
+                    freshness_view = [
+                        ScreenLine(f"freshness read failed: {exc} -- retrying...", "alert")
+                    ]
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *freshness_view], data_freshness_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "data"
+                    data_freshness_offset = 0
+                else:
+                    data_freshness_offset = _scroll_offset(
+                        ch,
+                        data_freshness_offset,
+                        height,
+                        len(banner) + len(freshness_view),
                         curses,
                     )
                 continue

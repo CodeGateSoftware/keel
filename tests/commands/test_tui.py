@@ -3551,13 +3551,14 @@ def test_run_live_m_opens_the_menu_and_esc_returns_to_the_dashboard(
 def test_run_live_a_placeholder_entry_lands_in_its_slice_notice(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Selecting a future slice's entry (3 = Trading, C5) renders the notice, not a dead
-    click and not a feature -- the shell is navigation only."""
+    """Selecting a future slice's entry (8 = Account, C6 -- Trading and Data went live
+    with C5, issue #391) renders the notice, not a dead click and not a feature -- the
+    shell is navigation only."""
     painted, _binding = _console_run(
-        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("3"), -1, 27, 27]
+        _deployment_dir(tmp_path), monkeypatch, [ord("m"), ord("8"), -1, 27, 27]
     )
 
-    assert any("lands in C5" in t for t in painted)
+    assert any("lands in C6" in t for t in painted)
     assert any("navigation" in t.lower() for t in painted)
 
 

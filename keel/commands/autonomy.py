@@ -18,6 +18,7 @@ from keel.commands._common import (
     _require_interactive_confirmation,
     with_disclaimer,
 )
+from keel.config import Config
 
 #: Upper bound on `keel autonomy on --for-hours` (1 year). Guards against inf/nan/overflow
 #: and against a "window" so long it is indistinguishable from no expiry at all.
@@ -25,6 +26,45 @@ _MAX_AUTONOMY_HOURS = 8760.0
 #: One second. Below this the window rounds to zero and we would write an already-lapsed row
 #: while printing "autonomy ON until ..." -- fails safe, but the message would be a lie.
 _MIN_AUTONOMY_HOURS = 1.0 / 3600.0
+
+#: The line `keel autonomy off` prints -- de-risking is done, say so the same way twice.
+AUTONOMY_OFF_LINE = "autonomy off: every order will ask for confirmation."
+
+
+def autonomy_expiry(for_hours: float | None, now_ts: int) -> int | None:
+    """The expiry stamp `--for-hours` resolves to (`None` = never lapses), shared by the
+    CLI command and any front-end that arms autonomy with the same semantics."""
+    return None if for_hours is None else now_ts + int(for_hours * 3600)
+
+
+def autonomy_on_gate(config: Config, for_hours: float | None, now_ts: int) -> None:
+    """The typed gate `keel autonomy on` demands -- its ONE home, extracted from the CLI
+    body (issue #391 C5) so the TUI's Trading menu runs the CLI's own ceremony: the same
+    action wording, the same decisive facts (the window, the mode, the allowlist), the
+    same typed `yes` from a human at a terminal. Byte-identical to what the CLI prints;
+    the CLI command calls this."""
+    expires_ts = autonomy_expiry(for_hours, now_ts)
+    window = (
+        "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"
+    )
+    _require_interactive_confirmation(
+        "turn autonomy ON",
+        f"Orders will be placed with NO further prompt, {window} "
+        f"(mode={config.auto_trade.mode}, allowlist={config.allowlist}).",
+    )
+
+
+def render_autonomy_on(expires_ts: int | None) -> list[str]:
+    """The lines `keel autonomy on` prints after arming -- the no-expiry warning included
+    (`--for-hours`'s whole point), kept beside the gate so both front-ends show the same
+    aftermath."""
+    if expires_ts is None:
+        return [
+            "autonomy ON, with NO expiry -- it stays on until you run `keel autonomy off`.",
+            "  Consider `--for-hours N` for a supervised session, so a forgotten `on` cannot "
+            "grant unattended trading indefinitely.",
+        ]
+    return [f"autonomy ON until {expires_ts}. It lapses on its own after that."]
 
 
 @click.group("autonomy")
@@ -93,24 +133,11 @@ def autonomy_on(ctx: click.Context, for_hours: float | None) -> None:
             f"--for-hours must be at least {_MIN_AUTONOMY_HOURS} (one second) and at most "
             f"{_MAX_AUTONOMY_HOURS} ({int(_MAX_AUTONOMY_HOURS) // 24} days); got {for_hours!r}."
         )
-    expires_ts = None if for_hours is None else now_ts + int(for_hours * 3600)
-    window = (
-        "until you turn it off" if expires_ts is None else f"for {for_hours}h (until {expires_ts})"
-    )
-    _require_interactive_confirmation(
-        "turn autonomy ON",
-        f"Orders will be placed with NO further prompt, {window} "
-        f"(mode={config.auto_trade.mode}, allowlist={config.allowlist}).",
-    )
+    expires_ts = autonomy_expiry(for_hours, now_ts)
+    autonomy_on_gate(config, for_hours, now_ts)
     repo.set_autonomous(True, now_ts, expires_ts=expires_ts)
-    if expires_ts is None:
-        click.echo(
-            "autonomy ON, with NO expiry -- it stays on until you run `keel autonomy off`.\n"
-            "  Consider `--for-hours N` for a supervised session, so a forgotten `on` cannot "
-            "grant unattended trading indefinitely."
-        )
-    else:
-        click.echo(f"autonomy ON until {expires_ts}. It lapses on its own after that.")
+    for line in render_autonomy_on(expires_ts):
+        click.echo(line)
 
 
 @autonomy_group.command("off")
@@ -123,4 +150,4 @@ def autonomy_off(ctx: click.Context) -> None:
     so this works from a script, a cron job or a pipe. Arming is what needs a human.
     """
     _open_repo(ctx).set_autonomous(False, int(time.time()))
-    click.echo("autonomy off: every order will ask for confirmation.")
+    click.echo(AUTONOMY_OFF_LINE)

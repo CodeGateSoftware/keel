@@ -240,15 +240,17 @@ def switch_profile(
 @dataclass(frozen=True)
 class MenuEntry:
     """One top-level entry of the PRD §3 tree. `lands_in` names the console slice that owns
-    the entry's behavior: `None` means the entry works TODAY (Dashboard, Profile, Help --
-    this slice); anything else is a placeholder that renders a 'lands in Cx' notice, so no
-    menu item is ever a dead click and no future slice has to restructure the tree.
+    the entry's behavior: `None` means the entry works TODAY; anything else is a
+    placeholder that renders a 'lands in Cx' notice, so no menu item is ever a dead click
+    and no future slice has to restructure the tree.
 
     `action` is what selecting the entry does in the shell: `"dashboard"`/`"profile"`/
     `"help"` are this slice's three live destinations, `"compliance"` is C3's (issue #389)
-    -- the Compliance sub-menu, `keel.commands.compliance_console` -- and `"placeholder"`
-    everything else: a closed vocabulary the live loop dispatches on, rather than
-    string-matching labels."""
+    -- the Compliance sub-menu, `keel.commands.compliance_console` -- `"strategy"` and
+    `"research"` are C4's (issue #390), `"trading"` and `"data"` are C5's (issue #391) --
+    `keel.commands.trading_console` and `keel.commands.data_console` -- and
+    `"placeholder"` everything else: a closed vocabulary the live loop dispatches on,
+    rather than string-matching labels."""
 
     ordinal: int
     label: str
@@ -262,12 +264,13 @@ class MenuEntry:
 
 
 #: The PRD §3 tree's top level, in tree order. The placeholder owners are the PRD §5
-#: phasing's own assignments: Trading/Data -> C5. Compliance landed with C3 (issue #389);
-#: Rules and Research with C4 (issue #390) -- the strategy console
-#: (`keel.commands.strategy_console`) and the evidence readers
-#: (`keel.commands.research_console`). Account is unassigned by the PRD's phasing, rides
-#: with C5 (the last menu slice), and the description says so plainly rather than
-#: inventing precision.
+#: phasing's own assignments: Compliance landed with C3 (issue #389); Rules and Research
+#: with C4 (issue #390) -- the strategy console (`keel.commands.strategy_console`) and
+#: the evidence readers (`keel.commands.research_console`); Trading and Data with C5
+#: (issue #391) -- `keel.commands.trading_console` and `keel.commands.data_console`.
+#: Account is unassigned by the PRD's phasing and rides with the next slice (C6, the
+#: safety & polish pass), and the description says so plainly rather than inventing
+#: precision.
 CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=1,
@@ -284,8 +287,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=3,
         label="Trading",
-        lands_in="C5",
         description="agent cycle, monitor, autonomy, record-flow, reset-hwm, kill/resume",
+        action="trading",
     ),
     MenuEntry(
         ordinal=4,
@@ -302,8 +305,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=6,
         label="Data",
-        lands_in="C5",
         description="fetch, fetch --check, repair gaps, freshness, db import",
+        action="data",
     ),
     MenuEntry(
         ordinal=7,
@@ -314,7 +317,7 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=8,
         label="Account",
-        lands_in="C5",
+        lands_in="C6",
         description="pnl, versions",
     ),
     MenuEntry(
