@@ -350,6 +350,31 @@ class PullbackContinuation(Rule):
     evaluation engine's job, spec §8 Task 7 — out of scope here).
     """
 
+    # Per-parameter docstrings, AT THE CLASS (issue #390 C4 / PRD O8): the single source
+    # `keel.commands.rules.describe_params` renders by introspection -- the tunable knobs
+    # the module docstring names, each with its plain-English meaning and direction.
+    PARAM_DOCS: dict[str, str] = {
+        "granularity": "the candle series the rule decides on (ONE_HOUR default).",
+        "ema_periods": (
+            "the EMA fan that defines the trend (default 8/20/50). A wider fan = "
+            "fewer, better-established trends."
+        ),
+        "entry_zone": (
+            "where the pullback must land: 'ema_touch' (touch of the fastest EMA) or "
+            "'ema_band' (dip into the band between the two slower EMAs)."
+        ),
+        "signal_patterns": (
+            "candle patterns that confirm the pullback has ended (default pin_bar) -- "
+            "names the rule can actually match."
+        ),
+        "buffer_ticks": "price buffer around the entry zone, in quote units.",
+        "stop_method": "'fixed' (below the zone) or 'atr' (a multiple of ATR).",
+        "target_method": (
+            "'measured_1to1', 'swing' (the previous swing high) or 'fib_ext' (the Fib "
+            "1.272 extension)."
+        ),
+    }
+
     def __init__(
         self,
         product_id: str,

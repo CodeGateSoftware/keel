@@ -30,15 +30,24 @@ class Dca(Rule):
     assumed to already be for that product, matching how the Task 7 evaluation engine will
     evaluate rules per-product.
 
-    Params:
-      - `cadence_days`: days between buys (e.g. 7 = weekly).
-      - `budget_usd`: base $ spent on a non-dip cadence hit.
-      - `dip_bonus_pct`: linear scale-up -- extra % of `budget_usd` added per 1 percentage point
-        the price is below its recent high. E.g. `dip_bonus_pct=2` at a 10% drawdown adds a 20%
-        bonus (`size_usd = budget_usd * 1.20`). `0` (default) disables dip-scaling entirely.
-      - `lookback_days`: window (in daily candles) used to find the "recent high" that dip%
-        is measured against.
+    Params: documented per-parameter in `PARAM_DOCS` below (issue #390 C4 / PRD O8) -- the
+    single source `keel.commands.rules.describe_params` renders by introspection, so the
+    class docstring and the help system cannot drift apart.
     """
+
+    PARAM_DOCS: dict[str, str] = {
+        "cadence_days": "days between buys (e.g. 7 = weekly).",
+        "budget_usd": "base $ spent on a non-dip cadence hit.",
+        "dip_bonus_pct": (
+            "linear scale-up -- extra % of budget_usd added per 1 percentage point the "
+            "price is below its recent high. E.g. 2 at a 10% drawdown adds a 20% bonus. "
+            "0 (default) disables dip-scaling entirely."
+        ),
+        "lookback_days": (
+            "window (in daily candles) used to find the 'recent high' that dip% is "
+            "measured against."
+        ),
+    }
 
     def __init__(
         self,

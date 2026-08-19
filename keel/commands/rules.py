@@ -10,6 +10,14 @@ and `add` (one from operator-supplied params). Both write at `candidate` by defa
 validate `--product(s)` against rails 18/19 before writing anything; only `seed` can be told to
 write another status, and only for the supervised live-order test. `add` cannot, deliberately --
 see its docstring.
+
+Two layers, the house split since issue #390 C4 (the TUI-operator-console PRD, O2): the
+validation/write logic lives in SERVICE functions (`add_rule_row`, `run_rule_backtest`,
+`attempt_promotion`, `apply_rule_enable`/`disable`/`demote`, `describe_params`) that take a
+repo, a config and values and echo their operator-facing lines through injected sinks; the
+click commands above them parse options and dispatch. The strategy console
+(`keel.commands.strategy_console`) is the second front-end over the same services -- one
+implementation, never a TUI re-derivation.
 """
 
 from __future__ import annotations
@@ -19,6 +27,8 @@ import json
 import logging
 import math
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, get_args, get_origin, get_type_hints
 
@@ -49,6 +59,66 @@ logger = logging.getLogger(__name__)
 _DEMOTE_PREV: dict[str, str] = {"live": "paper", "paper": "candidate"}
 
 
+# -- the service layer (issue #390 C4 / PRD O2) ---------------------------------------------------
+#
+# The rule lifecycle's VALIDATION and WRITE logic, callable with a repo, a config and
+# values -- the same seam the CLI commands dispatch through since this slice and the
+# strategy console (`keel.commands.strategy_console`) dispatches to as its second
+# front-end. Every function echoes its operator-facing lines through an injected `echo`
+# (stdout) / `echo_err` (stderr) pair so the CLI passes `click.echo`/`click.echo(err=True)`
+# and the console passes collectors -- one implementation, two renderings, byte-identical
+# order. Two refusal shapes, matching the two the CLI always had:
+#
+# * `RulesUsageError` -- a usage error the CLI renders as `click.BadParameter` with the
+#   same message and `param_hint` (exit 2, click's usage banner);
+# * `RulesRefused` -- a refusal whose `Error: ...` lines have ALREADY been echoed to
+#   `echo_err` when it raises; the CLI renders `ctx.exit(1)`, the console renders the
+#   collected lines as its result.
+
+
+class RulesUsageError(ValueError):
+    """A `rules` usage error (a malformed product id, a params/product disagreement): the
+    CLI turns this into `click.BadParameter(str(exc), param_hint=exc.param_hint)`, so the
+    message and hint are exactly the ones the command always printed."""
+
+    def __init__(self, message: str, param_hint: str | None = None) -> None:
+        super().__init__(message)
+        self.param_hint = param_hint
+
+
+class RulesRefused(RuntimeError):
+    """A command refusal: the `Error: ...` lines were already echoed through `echo_err`
+    before this raised, and nothing was written. The front-end exits non-zero / renders
+    the refusal -- it never re-prints the message itself."""
+
+
+@dataclass(frozen=True)
+class RulesOutcome:
+    """What a rules-service call did, minus the printing: the stdout lines it echoed (in
+    order), the rule row it wrote (if any), and the status that row now holds."""
+
+    lines: tuple[str, ...] = ()
+    rule_id: int | None = None
+    new_status: str | None = None
+
+
+def _noop(message: str) -> None:
+    """The default echo: silent (a caller that wants the lines passes its own)."""
+    del message
+
+
+def _line_sink(echo: Callable[[str], None]) -> tuple[Callable[[str], None], list[str]]:
+    """An echo wrapper that RECORDS every line it echoes -- how a service builds the
+    `RulesOutcome.lines` it returns without printing anywhere its caller did not ask for."""
+    recorded: list[str] = []
+
+    def sink(line: str) -> None:
+        recorded.append(line)
+        echo(line)
+
+    return sink, recorded
+
+
 @click.group("rules")
 def rules_group() -> None:
     """Rule lifecycle commands (candidate -> paper -> live -> disabled)."""
@@ -69,13 +139,15 @@ def rules_list(ctx: click.Context, status: str | None) -> None:
         click.echo(f"[{row['id']}] {row['kind']} status={row['status']} params={row['params']}")
 
 
-def _require_rule_row(ctx: click.Context, repo: Repository, rule_id: int) -> dict[str, Any]:
+def _rule_row_or_refuse(
+    repo: Repository, rule_id: int, echo_err: Callable[[str], None]
+) -> dict[str, Any]:
+    """The `rules` row for `rule_id`, or a refusal naming it (nothing written)."""
     rows = {row["id"]: row for row in repo.get_rules()}
     row = rows.get(rule_id)
     if row is None:
-        click.echo(f"Error: no rule with id {rule_id}", err=True)
-        ctx.exit(1)
-    assert row is not None  # narrows for type-checkers; ctx.exit() above raises SystemExit
+        echo_err(f"Error: no rule with id {rule_id}")
+        raise RulesRefused(f"no rule with id {rule_id}")
     return row
 
 
@@ -128,28 +200,52 @@ def _describe_fee(fee_pct: Decimal, source: str) -> str:
     return f"fee_pct={fee_pct * 100:.4f}% ({source})"
 
 
-def _run_backtest(
-    ctx: click.Context,
+def _backtest_rule(
     repo: Repository,
     rule: Any,
     granularity_opt: str | None,
     fee_pct: Decimal,
+    echo_err: Callable[[str], None],
 ) -> backtest_mod.BacktestResult:
+    """Backtest `rule` against its own cached candles at `fee_pct` -- the one backtest path
+    `rules backtest`/`rules promote` (and the strategy console's ledger/retry) all share.
+    A rule with no product or no resolvable granularity is a refusal, not a crash."""
     product_id = getattr(rule, "product_id", None)
     if product_id is None:
-        click.echo("Error: rule has no product_id to backtest against", err=True)
-        ctx.exit(1)
+        echo_err("Error: rule has no product_id to backtest against")
+        raise RulesRefused("rule has no product_id")
     granularity = _resolve_granularity(rule, granularity_opt)
     if granularity is None:
-        click.echo("Error: could not determine a granularity; pass --granularity", err=True)
-        ctx.exit(1)
+        echo_err("Error: could not determine a granularity; pass --granularity")
+        raise RulesRefused("no granularity")
     candles = repo.get_candles(product_id, granularity)
     return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
 
 
-def _load_pbo(
-    ctx: click.Context, session: str | None, blocks: int
+def _load_pbo_for(
+    session: str | None,
+    blocks: int,
+    echo_err: Callable[[str], None],
 ) -> cscv_mod.PBOResult | None:
+    """The CSCV result for `session`, or `None` when no session was named -- the
+    ctx-free service half of `_load_pbo` (see its docstring for the reasoning)."""
+    if session is None:
+        return None
+    trials = trials_ledger.read_trials(trials_ledger.DEFAULT_LEDGER_PATH)
+    build = matrix_mod.build_matrix(trials, session=session)
+    if not build.columns:
+        echo_err(
+            f"Error: no usable trial columns for session {session!r} -- every trial is "
+            "`series_missing` or the session has no trials. CSCV cannot run, so the rule "
+            "cannot be promoted through the gate."
+        )
+        raise RulesRefused(f"no usable trial columns for session {session!r}")
+    for warning in build.warnings:
+        echo_err(f"warning: {warning}")
+    return cscv_mod.pbo(build.columns, s=blocks)
+
+
+def _load_pbo(ctx: click.Context, session: str | None, blocks: int) -> cscv_mod.PBOResult | None:
     """The CSCV result for `session`, or `None` when no session was named.
 
     Reuses the exact pipeline behind `keel trials pbo` -- ledger -> `build_matrix` ->
@@ -160,22 +256,17 @@ def _load_pbo(
     `None` as NOT RUN and refuses to promote on it. A genuinely empty/unusable matrix is a hard
     error instead: the operator asked for the check, so silently downgrading to "not run" would
     hide a broken ledger behind the same message as not having asked.
+
+    The CLI-shaped wrapper over `_load_pbo_for` (its `ctx.exit(1)` turning the service's
+    `RulesRefused` into the exit the command always had); tests patch THIS name to pin the
+    gate's verdict, so the service takes the loader as an injection rather than calling
+    either half directly.
     """
-    if session is None:
-        return None
-    trials = trials_ledger.read_trials(trials_ledger.DEFAULT_LEDGER_PATH)
-    build = matrix_mod.build_matrix(trials, session=session)
-    if not build.columns:
-        click.echo(
-            f"Error: no usable trial columns for session {session!r} -- every trial is "
-            "`series_missing` or the session has no trials. CSCV cannot run, so the rule "
-            "cannot be promoted through the gate.",
-            err=True,
-        )
+    try:
+        return _load_pbo_for(session, blocks, lambda message: click.echo(message, err=True))
+    except RulesRefused:
         ctx.exit(1)
-    for warning in build.warnings:
-        click.echo(f"warning: {warning}", err=True)
-    return cscv_mod.pbo(build.columns, s=blocks)
+        raise  # unreachable: ctx.exit raises SystemExit
 
 
 @rules_group.command("backtest")
@@ -193,17 +284,46 @@ def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) ->
     the dominant term, not a rounding detail -- prior numbers printed without it turned out to
     be maker-priced against a taker fill model (#247).
     """
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
+    try:
+        run_rule_backtest(
+            _open_repo(ctx),
+            _optional_cfg(ctx),
+            rule_id,
+            granularity_opt=granularity,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+
+
+def run_rule_backtest(
+    repo: Repository,
+    config: Any | None,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> tuple[RulesOutcome, backtest_mod.BacktestResult]:
+    """THE `rules backtest` service: the row, the backtest, the fee-honest summary line.
+
+    Returns the outcome (its single echoed line) beside the raw `BacktestResult` -- the
+    strategy console's retry flow and ledger render both, and a caller that only wants the
+    CLI's line reads `outcome.lines`. Refusals (unknown id, no granularity) are the
+    service's two `RulesRefused` shapes, already echoed to `echo_err`."""
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
     rule = agent._build_rule(row)
-    fee_pct, fee_source = _backtest_fee(_optional_cfg(ctx))
-    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
-    click.echo(
+    fee_pct, fee_source = _backtest_fee(config)
+    stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
+    sink, recorded = _line_sink(echo)
+    sink(
         f"rule {rule_id} ({row['kind']}): n_trades={stats.n_trades} "
         f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
         f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown} "
         f"{_describe_fee(fee_pct, fee_source)}"
     )
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"]), stats
 
 
 @rules_group.command("promote")
@@ -264,19 +384,76 @@ def rules_promote(
     reach `paper` status, yet the whole point of a paper-forward is to accrue the out-of-sample
     trades the backtest can't. Use deliberately and audit the (loud) warning this prints.
     """
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
+    try:
+        attempt_promotion(
+            _open_repo(ctx),
+            # Loaded ONLY on the gated path, exactly as the old body did -- there, AFTER
+            # the row refusal: `--force` never needed a config, an unreadable one must
+            # not newly refuse it, and NEITHER may mask the unknown-id refusal
+            # (`--config missing.yaml rules promote 999` prints the id error, exit 1).
+            # Passed LAZY (a zero-arg loader) so the service resolves it at that point.
+            lambda: None if force else _load_cfg(ctx),
+            rule_id,
+            granularity_opt=granularity,
+            force=force,
+            pbo_session=pbo_session,
+            pbo_blocks=pbo_blocks,
+            # The CLI's own loader seam (tests patch `rules_cmd._load_pbo` to pin the G4
+            # verdict); the console uses the service's default. Called at the exact point
+            # the old command body called it, so stdout/stderr interleaving is unchanged.
+            load_pbo=lambda session, blocks: _load_pbo(ctx, session, blocks),
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+
+
+def attempt_promotion(
+    repo: Repository,
+    config: Any,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    force: bool = False,
+    pbo_session: str | None = None,
+    pbo_blocks: int = 16,
+    load_pbo: Callable[[str | None, int], cscv_mod.PBOResult | None] | None = None,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules promote` service: re-backtest, both gate readings, the transition.
+
+    The exact body the CLI command ran, echoed through the injected sinks in the exact
+    order it printed them -- the CLI passes `click.echo`, the strategy console collects the
+    same lines to render in-console. `load_pbo` defaults to the service's own ctx-free
+    loader (`_load_pbo_for`); the CLI passes its `ctx`-carrying `_load_pbo` seam so the
+    tests that pin the G4 verdict keep working unchanged.
+
+    `config` may be a loaded `Config`, `None`, or a zero-arg CALLABLE producing either --
+    resolved only on the gated path, after the row refusal, at the exact point the old
+    command body loaded it: the CLI passes a lazy loader so an unreadable config cannot
+    mask `Error: no rule with id N` (origin loaded config only after the row check).
+
+    FORCE carries no gate HERE (the CLI's `--force` is a flag the operator already typed at
+    a terminal); the strategy console's retry flow runs its own TYPED gate before calling
+    with `force=True` -- the O3 contract is the front-end's to keep, never the service's to
+    assume."""
+    if load_pbo is None:
+        load_pbo = lambda session, blocks: _load_pbo_for(session, blocks, echo_err)  # noqa: E731
+    sink, recorded = _line_sink(echo)
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
 
     if force:
         target = promotion_mod.next_status(row["status"])
         if target is None:
-            click.echo(
+            sink(
                 f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; "
                 "nothing to promote"
             )
-            return
+            return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"])
         repo.update_rule_status(rule_id, target)
-        click.echo(
+        sink(
             f"⚠️  FORCE-PROMOTING rule {rule_id} ({row['kind']}): {row['status']} -> {target}, "
             "BYPASSING the backtest/promotion gate. This is for a deliberate, un-gated "
             "paper-forward start (e.g. a low-frequency trend-follower whose backtest can never "
@@ -291,14 +468,17 @@ def rules_promote(
             from_status=row["status"],
             to_status=target,
         )
-        click.echo(f"rule {rule_id} ({row['kind']}): status -> {target}")
-        return
+        sink(f"rule {rule_id} ({row['kind']}): status -> {target}")
+        return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=target)
 
-    config = _load_cfg(ctx)
+    # The lazy config resolves HERE -- after the row refusal, exactly where the old
+    # command body loaded it (`config = _load_cfg(ctx)` sat below the force return).
+    if callable(config):
+        config = config()
     rule = agent._build_rule(row)
     fee_pct, fee_source = _backtest_fee(config)
-    stats = _run_backtest(ctx, repo, rule, granularity, fee_pct)
-    click.echo(
+    stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
+    sink(
         f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}"
     )
 
@@ -320,14 +500,13 @@ def rules_promote(
         for sib in sibling_rows:
             sib_product = (sib["params"] or {}).get("product_id")
             sib_rule = agent._build_rule(sib)
-            if _resolve_granularity(sib_rule, granularity) is None:
-                click.echo(
+            if _resolve_granularity(sib_rule, granularity_opt) is None:
+                echo_err(
                     f"warning: pooled sibling rule {sib['id']} ({sib_product}) has no "
-                    "granularity to backtest against; excluded from the pool",
-                    err=True,
+                    "granularity to backtest against; excluded from the pool"
                 )
                 continue
-            sib_stats = _run_backtest(ctx, repo, sib_rule, granularity, fee_pct)
+            sib_stats = _backtest_rule(repo, sib_rule, granularity_opt, fee_pct, echo_err)
             samples.append(promotion_mod.ProductSample(str(sib_product), sib_stats))
         # A pool of one (every sibling skipped) is no pool: judge the rule alone rather
         # than printing a "diversity 1 < 5" failure the operator cannot act on.
@@ -340,7 +519,7 @@ def rules_promote(
         min_rr=config.promotion.min_rr,
         min_win_rate=float(config.promotion.min_win_rate),
     )
-    pbo_result = _load_pbo(ctx, pbo_session, pbo_blocks)
+    pbo_result = load_pbo(pbo_session, pbo_blocks)
     gate = promotion_mod.pbo_gate_from_config(config.research)
 
     decision = promotion_mod.can_promote(stats, promo_cfg, pbo_result, gate, pooled_samples)
@@ -350,12 +529,12 @@ def rules_promote(
     if decision.pooled is not None:
         reading = decision.pooled
         census = ", ".join(f"{product}={n}" for product, n in reading.per_product)
-        click.echo(
+        sink(
             f"rule {rule_id} ({row['kind']}): sample readings -- per-rule "
             f"n_trades={stats.n_trades}, pooled n_trades={reading.n_pooled} across "
             f"{len(reading.per_product)} products"
         )
-        click.echo(
+        sink(
             f"  pooled census (diversity floor {promotion_mod.MIN_POOLED_PRODUCTS} "
             f"products x >= {promotion_mod.MIN_TRADES_PER_PRODUCT_POOLED} trades): "
             f"{census} -- {reading.products_contributing} products contribute, "
@@ -364,19 +543,20 @@ def rules_promote(
         # Say in WORDS when the pooled path carried the promotion: a log auditor should
         # not have to infer it from n_trades being below the floor on the line above.
         if decision.promotable and stats.n_trades < promo_cfg.min_trades:
-            click.echo(
+            sink(
                 "  promotion carried by the POOLED reading "
                 "(the rule's own sample is below min_trades)"
             )
 
-    click.echo(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
+    sink(f"rule {rule_id} ({row['kind']}): overfitting check = {decision.overfitting}")
     for reason in decision.reasons:
-        click.echo(f"  - {reason}")
+        sink(f"  - {reason}")
 
     new_status = promotion_mod.transition(
         repo, row["kind"], stats, promo_cfg, pbo_result, gate, pooled_samples, rule_id
     )
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
+    sink(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=new_status)
 
 
 @rules_group.command("demote")
@@ -385,16 +565,37 @@ def rules_promote(
 @with_disclaimer
 def rules_demote(ctx: click.Context, rule_id: int) -> None:
     """Manually step a rule's lifecycle status back one stage (live->paper->candidate)."""
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
+    try:
+        apply_rule_demote(
+            _open_repo(ctx),
+            rule_id,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+
+
+def apply_rule_demote(
+    repo: Repository,
+    rule_id: int,
+    *,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules demote` service: one lifecycle step back, through the same
+    `update_rule_status` write the CLI makes."""
+    sink, recorded = _line_sink(echo)
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
     prev = _DEMOTE_PREV.get(row["status"])
     if prev is None:
-        click.echo(
+        sink(
             f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; nothing to demote"
         )
-        return
+        return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"])
     repo.update_rule_status(rule_id, prev)
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> {prev}")
+    sink(f"rule {rule_id} ({row['kind']}): status -> {prev}")
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=prev)
 
 
 @rules_group.command("disable")
@@ -404,10 +605,31 @@ def rules_demote(ctx: click.Context, rule_id: int) -> None:
 def rules_disable(ctx: click.Context, rule_id: int) -> None:
     """Disable a rule (nothing promotes from here; `keel rules enable` can restore it, at
     `candidate` -- never at the status it held when disabled)."""
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
+    try:
+        apply_rule_disable(
+            _open_repo(ctx),
+            rule_id,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+
+
+def apply_rule_disable(
+    repo: Repository,
+    rule_id: int,
+    *,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules disable` service: `disabled` is terminal, and the write stamps
+    `demoted_at` -- the recorded context the ledger renders for a disabled row."""
+    sink, recorded = _line_sink(echo)
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
     repo.update_rule_status(rule_id, "disabled")
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> disabled")
+    sink(f"rule {rule_id} ({row['kind']}): status -> disabled")
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status="disabled")
 
 
 @rules_group.command("enable")
@@ -428,26 +650,45 @@ def rules_enable(ctx: click.Context, rule_id: int) -> None:
     floor -- a DCA rule produces no backtest trades at all, so force is the only way it can
     reach `paper` (see `promote`'s own docstring).
     """
-    repo = _open_repo(ctx)
-    row = _require_rule_row(ctx, repo, rule_id)
+    try:
+        apply_rule_enable(
+            _open_repo(ctx),
+            rule_id,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+
+
+def apply_rule_enable(
+    repo: Repository,
+    rule_id: int,
+    *,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules enable` service -- the documented RESTORE path for a disabled rule: back
+    at `candidate`, the lifecycle floor, never at the status it held when disabled."""
+    sink, recorded = _line_sink(echo)
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
     if row["status"] != "disabled":
-        click.echo(
+        echo_err(
             f"Error: rule {rule_id} ({row['kind']}) is {row['status']!r}, not disabled -- "
             "`enable` only restores a disabled rule. To advance this one, use "
-            "`keel rules promote`.",
-            err=True,
+            "`keel rules promote`."
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"rule {rule_id} is {row['status']!r}, not disabled")
     repo.update_rule_status(rule_id, "candidate")
-    click.echo(f"rule {rule_id} ({row['kind']}): status -> candidate")
-    click.echo(
+    sink(f"rule {rule_id} ({row['kind']}): status -> candidate")
+    sink(
         f"rule {rule_id} ({row['kind']}): re-enabled at CANDIDATE, the lifecycle floor -- "
         "a rule disabled from `live` lands here too (disable records no prior status to "
         f"restore). Advance with `keel rules promote {rule_id}`; `--force` is the documented "
         "bypass for a paper-forward whose backtest can never reach the min_trades floor "
         "(e.g. DCA)."
     )
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status="candidate")
 
 
 def _json_plain(value: Any) -> Any:
@@ -629,14 +870,7 @@ def _declared_choices(rule_cls: type) -> dict[str, tuple[Any, ...]]:
     one. A rule whose annotations cannot be resolved at all yields no choices rather than an
     exception: an un-checkable param is the status quo, a crashing `rules add` is not.
     """
-    try:
-        # `type: ignore[misc]`: mypy rejects reading `__init__` off a value because a subclass
-        # could carry an incompatible one -- which is precisely what is being introspected here.
-        # Reaching for the constructor of whatever concrete rule class was passed IS the job of
-        # this function (see the docstring), so the unsoundness it warns about is the intent.
-        hints = get_type_hints(rule_cls.__init__)  # type: ignore[misc]
-    except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
-        return {}
+    hints = _init_hints(rule_cls)
 
     choices: dict[str, tuple[Any, ...]] = {}
     for name, hint in hints.items():
@@ -959,21 +1193,55 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     Read-only w.r.t. the exchange: no network call, no broker, no confirmation gate -- it only
     writes one local `rules` row, exactly like `rules seed`.
     """
-    repo = _open_repo(ctx)
+    try:
+        add_rule_row(
+            _open_repo(ctx),
+            _load_cfg(ctx),
+            kind=kind,
+            product=product,
+            params_json=params_json,
+            now_ts=int(time.time()),
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesUsageError as exc:
+        raise click.BadParameter(str(exc), param_hint=exc.param_hint) from exc
+    except RulesRefused:
+        ctx.exit(1)
 
+
+def add_rule_row(
+    repo: Repository,
+    config: Any,
+    *,
+    kind: str,
+    product: str,
+    params_json: str | None,
+    now_ts: int,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules add` service: every validation the CLI command performs, the single
+    `insert_rule`, and the confirmation lines -- the exact body the command ran, echoed
+    through the injected sinks in the exact order it printed them, so the CLI is
+    byte-compatible and the strategy console's add form renders the SAME messages.
+
+    The usage-error shapes raise `RulesUsageError` (message + param_hint: the CLI renders
+    `click.BadParameter`, the form renders `Error: ...`); the refusal shapes echo their
+    `Error: ...` lines to `echo_err` and raise `RulesRefused`. Nothing is ever written
+    before every check has passed."""
     # Everything below this line VALIDATES; the single `insert_rule` is the last statement that
     # can run. A refusal after a partial write would leave a row the operator was told did not
     # exist -- and rows are what the agent polls.
-    config = _load_cfg(ctx)
     try:
-        # `settlement_is_fatal` stays at its default, as in `rules seed` and for the same
+        # `settlement_is_fatal` stays at the default, as in `rules seed` and for the same
         # reason: this command WRITES a row the agent then polls every cycle, so a product the
         # rails veto forever is not a lesser problem than a typo, only a quieter one.
         product_list, _ = parse_products_option(product, config)
     except ValueError as exc:
-        raise click.BadParameter(str(exc), param_hint="--product") from exc
+        raise RulesUsageError(str(exc), param_hint="--product") from exc
     if len(product_list) != 1:
-        raise click.BadParameter(
+        raise RulesUsageError(
             f"expects exactly ONE product id, got {len(product_list)} ({product!r}) -- one "
             f"invocation inserts one rule, and the `rules backtest <id>` it prints names one id",
             param_hint="--product",
@@ -982,12 +1250,10 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
 
     rule_cls = agent.RULE_REGISTRY.get(kind)
     if rule_cls is None:
-        click.echo(
-            f"Error: unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}",
-            err=True,
+        echo_err(
+            f"Error: unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}"
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"unknown rule kind {kind!r}")
 
     # "flag absent" and "flag given but empty" are different intentions, and only `is None`
     # tells them apart. An empty string is what a shell hands over when the proposal plumbing
@@ -996,7 +1262,7 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     # available outcome: an id is printed, the operator backtests it, and the numbers they read
     # belong to the stock rule rather than to the proposal they believe they measured.
     if params_json is not None and not params_json.strip():
-        raise click.BadParameter(
+        raise RulesUsageError(
             "was given as an EMPTY string, which is not the same as omitting the flag. This is "
             "almost always a shell accident (`--params \"$(jq -c .params proposal.json)\"` "
             "yields an empty string when the key is missing or jq fails), and taking it as "
@@ -1009,9 +1275,9 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     try:
         supplied: Any = json.loads(params_json) if params_json is not None else {}
     except json.JSONDecodeError as exc:
-        raise click.BadParameter(f"not valid JSON ({exc})", param_hint="--params") from exc
+        raise RulesUsageError(f"not valid JSON ({exc})", param_hint="--params") from exc
     if not isinstance(supplied, dict):
-        raise click.BadParameter(
+        raise RulesUsageError(
             f"must be a JSON object of constructor kwargs, got {type(supplied).__name__}",
             param_hint="--params",
         )
@@ -1019,7 +1285,7 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     # One source of truth for the product. Silently letting `--params` win would print one id
     # and store another, and the stored one is the one that trades.
     if "product_id" in supplied and supplied["product_id"] != product_id:
-        raise click.BadParameter(
+        raise RulesUsageError(
             f"names product_id {supplied['product_id']!r}, which disagrees with --product "
             f"{product_id!r}; pass the product once, via --product",
             param_hint="--params",
@@ -1028,44 +1294,37 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     mismatches = _param_type_mismatches(kind, rule_cls, supplied)
     if mismatches:
         quotable = sorted(agent.coerced_param_keys(kind))
-        click.echo(
+        echo_err(
             f"Error: {kind} cannot use these params:\n"
             + "\n".join(f"       - {problem}" for problem in mismatches)
             + f"\n       (a quoted value is right only for {quotable!r} -- keel converts "
-            f"those on the way in)",
-            err=True,
+            f"those on the way in)"
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"{kind} cannot use these params")
 
     try:
         rule = agent.build_rule_from_params(kind, {**supplied, "product_id": product_id})
     except TypeError as exc:
         # An unknown/misspelled kwarg: the constructor names it, we name the alternatives.
-        click.echo(
+        echo_err(
             f"Error: {kind} does not accept these params: {exc}\n"
-            f"       accepted params: {_accepted_params(rule_cls)!r}",
-            err=True,
+            f"       accepted params: {_accepted_params(rule_cls)!r}"
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"{kind} does not accept these params") from exc
     except (ValueError, ArithmeticError) as exc:
         # The rule's OWN validation (e.g. `Dca`: "cadence_days must be positive"), or a value
         # that is not the type the coercion boundary expects (`Decimal("x")` -> InvalidOperation,
         # an `ArithmeticError`). Either way the params cannot make a rule, so no row.
-        click.echo(f"Error: {kind} rejected these params: {exc}", err=True)
-        ctx.exit(1)
-        return
+        echo_err(f"Error: {kind} rejected these params: {exc}")
+        raise RulesRefused(f"{kind} rejected these params") from exc
 
     nonfinite = _nonfinite_params(rule.describe()["params"])
     if nonfinite:
-        click.echo(
+        echo_err(
             f"Error: {kind} was given a value that is not a finite number, which no backtest "
-            f"can report on:\n" + "\n".join(f"       - {problem}" for problem in nonfinite),
-            err=True,
+            f"can report on:\n" + "\n".join(f"       - {problem}" for problem in nonfinite)
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"{kind} was given a non-finite value")
 
     # `.describe()`'s params, JSON-plain -- the same thing `rules seed` stores, so the row is
     # exactly what `agent._build_rule` reconstructs. `product_id` is re-applied because not
@@ -1082,15 +1341,13 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
     # starts persisting a field needs no change here.
     dropped = sorted(set(supplied) - set(params))
     if dropped:
-        click.echo(
+        echo_err(
             f"Error: {kind} accepts {dropped!r} but does not persist "
             f"{'them' if len(dropped) > 1 else 'it'} in the rule row, so the value would be "
             f"silently lost when the rule is rebuilt for a backtest or a cycle. Refusing rather "
-            f"than storing a rule that is not the one you asked for.",
-            err=True,
+            f"than storing a rule that is not the one you asked for."
         )
-        ctx.exit(1)
-        return
+        raise RulesRefused(f"{kind} does not persist {dropped!r}")
 
     existing = [
         row
@@ -1098,24 +1355,126 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
         if row["kind"] == kind and (row["params"] or {}).get("product_id") == product_id
     ]
 
-    rule_id = repo.insert_rule(kind, params, status="candidate", now_ts=int(time.time()))
+    rule_id = repo.insert_rule(kind, params, status="candidate", now_ts=now_ts)
 
-    click.echo(f"added rule {rule_id}: {kind} {product_id} status=candidate")
-    click.echo(f"  params: {json.dumps(params, sort_keys=True)}")
+    sink, recorded = _line_sink(echo)
+    sink(f"added rule {rule_id}: {kind} {product_id} status=candidate")
+    sink(f"  params: {json.dumps(params, sort_keys=True)}")
     if _asset_of(product_id) not in config.allowlist:
-        click.echo(
+        sink(
             f"  note: {_asset_of(product_id)} is not in this deployment's allowlist "
             f"{sorted(config.allowlist)!r}. The rule is added and can be backtested; rail 1 "
             f"would veto any ORDER for it until the asset is admitted."
         )
     if existing:
-        click.echo(
+        sink(
             f"  note: {len(existing)} other rule(s) already exist for {kind}/{product_id} -- "
             f"this is allowed (comparing parameter sets is the point), but backtest the right "
             f"one:"
         )
         for row in existing:
-            click.echo(
+            sink(
                 f"    [{row['id']}] status={row['status']} {_params_delta(row['params'], params)}"
             )
-    click.echo(f"next: keel rules backtest {rule_id}")
+    sink(f"next: keel rules backtest {rule_id}")
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status="candidate")
+
+
+# -- parameter help, single-sourced from the classes (issue #390 C4 / PRD O8) ---------------------
+
+
+@dataclass(frozen=True)
+class ParamHelp:
+    """One rule parameter's help, DERIVED from the class that defines it: the
+    per-parameter docstring the class carries (`PARAM_DOCS`, added AT THE CLASS per O8 --
+    never a second, drifting table), the constructor's own default, the type its annotation
+    declares, the choices its own `Literal` states, and whether a QUOTED value is the right
+    shape (the coercion boundary's own answer, `agent.coerced_param_keys`)."""
+
+    name: str
+    doc: str
+    default: Any
+    type_name: str
+    choices: tuple[str, ...] | None
+    quotable: bool
+
+
+def _init_hints(rule_cls: type) -> dict[str, Any]:
+    """The resolved type hints of `rule_cls.__init__`, or `{}` when they cannot be resolved
+    -- the same resolution (and for the same reasons) `_declared_choices` documents."""
+    try:
+        # `type: ignore[misc]`: mypy rejects reading `__init__` off a value because a subclass
+        # could carry an incompatible one -- which is precisely what is being introspected here.
+        return get_type_hints(rule_cls.__init__)  # type: ignore[misc]
+    except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
+        return {}
+
+
+def _param_type(hint: Any, default: Any) -> tuple[str, tuple[str, ...] | None]:
+    """(type_name, declared choices) for one param, from its annotation when it resolves and
+    from its own default otherwise. PURE."""
+    if get_origin(hint) is Literal:
+        return "choice", tuple(str(value) for value in get_args(hint))
+    if get_origin(hint) is tuple:
+        element = next((arg for arg in get_args(hint) if arg is not Ellipsis), None)
+        if element is not None and get_origin(element) is Literal:
+            return "list", tuple(str(value) for value in get_args(element))
+        return "list", None
+    if hint is Granularity or isinstance(default, Granularity):
+        return "granularity", None
+    return type(default).__name__, None
+
+
+def describe_params(kind: str) -> dict[str, ParamHelp]:
+    """{param: help} for every operator-facing parameter of rule `kind`, by introspection.
+
+    THE O8 parameter-level source: the doc comes from the class's own `PARAM_DOCS`, the
+    default and the type from its constructor's signature/annotations, the choices from the
+    `Literal` it declares (`_declared_choices`' own read), and `quotable` from
+    `agent.coerced_param_keys` -- the coercion tables themselves -- so the help can never
+    disagree with what `rules add` accepts. `product_id` (supplied by `--product`, one
+    source of truth) and `name` (the kind's identity, not a knob) are excluded, and so is
+    any constructor kwarg the kind does not PERSIST: the same `describe()["params"]` the
+    add service's dropped-param refusal reads is the one source here, so the help can never
+    offer a param the add flow would refuse as silently lost (pullback_continuation's
+    `granularity` -- accepted by the constructor, never stored in the row). A kind's
+    `PARAM_DOCS` entry for such a param stays where it is, documenting the class; the FORM
+    simply does not offer it.
+
+    Raises `ValueError` for a kind not in `RULE_REGISTRY`, naming the known kinds -- the
+    same refusal `add_rule_row` makes."""
+    rule_cls = agent.RULE_REGISTRY.get(kind)
+    if rule_cls is None:
+        raise ValueError(
+            f"unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}"
+        )
+    # ONE source for "does the row persist this param?": the constructed rule's own
+    # `describe()["params"]` -- exactly the dict `add_rule_row` stores and
+    # `agent._build_rule` rebuilds from. A kind whose defaults cannot even construct
+    # offers everything it accepts (the honest fallback; no registered kind hits it).
+    try:
+        persisted = set(
+            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
+            .describe()["params"]
+        )
+    except (TypeError, ValueError, ArithmeticError):
+        persisted = None
+    docs = getattr(rule_cls, "PARAM_DOCS", {})
+    hints = _init_hints(rule_cls)
+    quotable = agent.coerced_param_keys(kind)
+    params: dict[str, ParamHelp] = {}
+    for name, param in inspect.signature(rule_cls).parameters.items():
+        if name in ("self", "product_id", "name"):
+            continue
+        if persisted is not None and name not in persisted:
+            continue
+        type_name, choices = _param_type(hints.get(name), param.default)
+        params[name] = ParamHelp(
+            name=name,
+            doc=docs.get(name, ""),
+            default=param.default,
+            type_name=type_name,
+            choices=choices,
+            quotable=name in quotable,
+        )
+    return params

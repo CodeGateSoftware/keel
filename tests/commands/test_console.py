@@ -293,18 +293,16 @@ def test_the_menu_is_the_prd_tree_in_order() -> None:
     ]
 
 
-def test_only_dashboard_profile_compliance_and_help_do_anything() -> None:
-    """C2 shipped the SHELL; C3 (issue #389) landed the Compliance entry -- everything
-    else is still a placeholder owned by a later slice, and must say so rather than
-    dead-click."""
+def test_only_the_landed_slices_do_anything() -> None:
+    """C2 shipped the SHELL; C3 (issue #389) landed Compliance; C4 (issue #390) lands Rules
+    and Research -- everything else is still a placeholder owned by a later slice, and must
+    say so rather than dead-click."""
     available = [e.label for e in console.CONSOLE_MENU if e.lands_in is None]
-    assert available == ["Dashboard", "Profile", "Compliance", "Help"]
+    assert available == ["Dashboard", "Profile", "Rules", "Compliance", "Research", "Help"]
     owners = {e.label: e.lands_in for e in console.CONSOLE_MENU if e.lands_in is not None}
     assert owners == {
         "Trading": "C5",
-        "Rules": "C4",
         "Data": "C5",
-        "Research": "C4",
         "Account": "C5",
     }
 
@@ -317,6 +315,26 @@ def test_the_compliance_entry_opens_the_compliance_menu() -> None:
     assert compliance.label == "Compliance"
     assert compliance.action == "compliance"
     assert compliance.available
+
+
+def test_the_rules_entry_opens_the_strategy_console() -> None:
+    """C4's dispatch: the tree's Rules entry opens the strategy console
+    (`keel.commands.strategy_console`) -- the ledger, simulate, add and retry of O11."""
+    rules = console.menu_entry(4)
+    assert rules is not None
+    assert rules.label == "Rules"
+    assert rules.action == "strategy"
+    assert rules.available
+
+
+def test_the_research_entry_opens_the_research_readers() -> None:
+    """C4's dispatch: the tree's Research entry opens the O5 evidence readers
+    (`keel.commands.research_console`)."""
+    research = console.menu_entry(7)
+    assert research is not None
+    assert research.label == "Research"
+    assert research.action == "research"
+    assert research.available
 
 
 def test_the_menu_is_reachable_by_its_displayed_ordinals() -> None:
@@ -343,7 +361,9 @@ def test_the_menu_screen_renders_every_entry_and_the_lands_in_notices(tmp_path: 
         assert any(entry.label in t for t in texts), entry.label
     joined = "\n".join(texts)
     assert "lands in C5" in joined
-    assert "lands in C4" in joined
+    # C4 landed (issue #390): Rules and Research are live entries now, so no "lands in C4"
+    # notice remains anywhere in the tree.
+    assert "lands in C4" not in joined
     # The cursor marks exactly one row (Trading, index 2 of the entries).
     marked = [t for t in texts if t.lstrip().startswith(">")]
     assert len(marked) == 1 and "Trading" in marked[0]

@@ -117,6 +117,7 @@ below are still the only three.
 from __future__ import annotations
 
 import sys
+import textwrap
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1720,6 +1721,25 @@ def run_live(
     proposals directory, screen the chosen shortlist through the admission services, and
     offer -- never auto-run -- the TYPED attest step for a selected candidate).
 
+    C4 (issue #390) adds the strategy console and the research readers, all
+    console-bound only: `strategy` (the Rules sub-menu over
+    `strategy_console.STRATEGY_MENU`; forms run at the terminal like Compliance's),
+    `strategy-ledger` (the tried-vs-used ledger -- every rule row with its RECORDED
+    context, read CHEAPLY once on entry: zero backtests run there, because the
+    entry-time re-backtest this view shipped with cost minutes per rule on long
+    series), `strategy-rule` (one rule's detail: params rendered through
+    `describe_params`, the O8 per-field help, and the rule's backtest verdict -- ARMED
+    until an explicit Enter, the ONE place the strategy console runs a rule backtest:
+    warned first, honestly blocking while it runs like simulate/fetch, held in
+    `strategy_verdicts` and rendered under its row once computed),
+    `strategy-simulate` (the O11.1 ARMED view -- Enter is the confirm
+    step; the run fetches/writes exactly as `keel simulate` does, blocks the loop exactly
+    like `f` fetch, and its verdict+report render under a pinned footer), and the four
+    `research*` modes (the O5 evidence readers over `research_console`: a corpus list, a
+    bounded mtime-cached document view, and the trials ledger with its chain verdict --
+    all read-only). The strategy menu's `insights` entry opens the pre-existing insights
+    overlay with a BACK-POINTER so it closes onto the Rules menu, not the dashboard.
+
     Seven modes: `normal` (the dashboard, plus a transient one-line `message` toast from the last
     action), `help` (a scrolled window of `build_help_screen()`), `insights` (a scrolled window of
     `build_insights_screen()` -- a READ-ONLY overlay over `build_insights_report`/
@@ -1787,8 +1807,9 @@ def run_live(
 
     # Lazy import, the established cycle-dodge for this module (see `insights`): console
     # imports THIS module at load time (its builders speak `ScreenLine`), so importing it
-    # here keeps the two modules loadable in either order.
-    from keel.commands import compliance_console, console
+    # here keeps the two modules loadable in either order. The strategy/research consoles
+    # follow the same rule (both speak `ScreenLine` and dispatch to the service layer).
+    from keel.commands import compliance_console, console, research_console, strategy_console
 
     def _balance_fn(cfg: Config) -> Decimal | None:
         # Lazy imports -- `keel.commands._common` and `keel.execution.executor` both import
@@ -1840,6 +1861,10 @@ def run_live(
                 return "help", 0, 0, None
             if action == "compliance":
                 return "compliance", 0, 0, None
+            if action == "strategy":
+                return "strategy", 0, 0, None
+            if action == "research":
+                return "research", 0, 0, None
             return "placeholder", 0, 0, entry
 
         mode = "normal"
@@ -1886,6 +1911,43 @@ def run_live(
         compliance_menu_offset = 0
         scout_list_offset = 0
         scout_view_cache: dict[tuple[str, int], ProposeView] = {}
+        # -- the strategy console (issue #390 C4 / PRD O11): the Rules sub-menu's cursor,
+        # the ledger's HELD rows (built CHEAPLY once per entry -- recorded state only,
+        # ZERO backtests; the entry-time re-backtest this view shipped with cost minutes
+        # per rule on long series), the per-rule verdicts the operator EXPLICITLY
+        # re-computes (Enter-gated in the rule's detail; held here and dropped with the
+        # rows when the ledger is re-entered -- the rules-table-write invalidation), the
+        # simulate view's ARMED/held state (Enter is the confirm step, the discover
+        # overlay's gating story), and the research readers' list/selection state.
+        strategy_cursor = 0
+        strategy_menu_offset = 0
+        strategy_ledger: list[Any] = []
+        strategy_ledger_built = False
+        strategy_ledger_cursor = 0
+        strategy_ledger_offset = 0
+        strategy_rule_detail: Any = None
+        strategy_rule_offset = 0
+        strategy_verdicts: dict[int, Any] = {}
+        strategy_simulate_plan: Any = None
+        strategy_simulate_result: Any = None
+        strategy_simulate_error: str | None = None
+        strategy_simulate_progress: list[str] = []
+        strategy_simulate_offset = 0
+        # -- the research readers (issue #390 C4 / PRD O5)
+        research_cursor = 0
+        research_menu_offset = 0
+        research_files: tuple[Any, ...] = ()
+        research_dir: Any = None
+        research_title = ""
+        research_list_cursor = 0
+        research_list_offset = 0
+        research_doc_path: Any = None
+        research_doc_cache: dict[tuple[str, int], list[str]] = {}
+        research_doc_offset = 0
+        research_trials_offset = 0
+        # Where the insights overlay closes back to: the dashboard by default, the Rules
+        # menu when the strategy console opened it (the shell is a hierarchy).
+        insights_back = "normal"
         message: str | None = None
         message_ts = 0
         available: AvailableBalance | None = None
@@ -1943,6 +2005,108 @@ def run_live(
                 mode = "scout-list"
             else:
                 _run_form_at_terminal(entry.target)
+
+        def _run_strategy_form_at_terminal(form_target: str) -> None:
+            """A strategy-console form entry: open the state through the console's own
+            loaders and run the form through `strategy_console.run_*` inside the
+            suspend/restore dance -- the same seam the Compliance forms use, so the O3
+            typed gates (the retry `--force` phrase) render in-console."""
+            nonlocal message, message_ts
+
+            form_repo, form_config = open_state()
+
+            def _run() -> str:
+                if form_target == "add":
+                    return strategy_console.run_add_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                if form_target == "retry":
+                    return strategy_console.run_retry_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                if form_target == "enable":
+                    return strategy_console.run_enable_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                if form_target == "disable":
+                    return strategy_console.run_disable_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                if form_target == "demote":
+                    return strategy_console.run_demote_form(
+                        form_repo, form_config, _form_prompt, now_fn()
+                    )
+                raise ValueError(f"unknown strategy form: {form_target}")
+
+            message = _run_terminal_form(stdscr, _run)
+            message_ts = now_fn()
+
+        def _enter_strategy_entry(entry: Any) -> None:
+            """Where a Rules selection goes -- the closed-mapping rule again: the ledger
+            (a CHEAP recorded-state read -- no backtest runs on entry; the per-rule
+            verdict is the detail view's explicit Enter-gated re-compute), the ARMED
+            simulate view, a form at the terminal, or the insights overlay with a
+            back-pointer to this menu."""
+            nonlocal mode, strategy_ledger, strategy_ledger_built, strategy_ledger_cursor
+            nonlocal strategy_ledger_offset, strategy_rule_detail, strategy_rule_offset
+            nonlocal strategy_verdicts
+            nonlocal strategy_simulate_plan, strategy_simulate_result
+            nonlocal strategy_simulate_error, strategy_simulate_progress
+            nonlocal strategy_simulate_offset, insights_back
+            nonlocal message, message_ts, insights_offset
+            if entry.kind == "view":  # the tried-vs-used ledger
+                try:
+                    ledger_repo, ledger_config = open_state()
+                    strategy_ledger = strategy_console.build_strategy_ledger(
+                        ledger_repo, ledger_config, now_fn()
+                    )
+                except Exception as exc:
+                    strategy_ledger = []
+                    message = f"ledger read failed: {str(exc)[:160]}"
+                    message_ts = now_fn()
+                    return
+                # Re-entering rebuilds the rows from the rules table AND drops every held
+                # verdict -- a rules-table write between visits can never keep a stale
+                # verdict on a changed row.
+                strategy_verdicts = {}
+                strategy_ledger_built = True
+                strategy_ledger_cursor = 0
+                strategy_ledger_offset = 0
+                strategy_rule_detail = None
+                mode = "strategy-ledger"
+            elif entry.kind == "armed":  # simulate: opens ARMED, Enter confirms and runs
+                sim_repo, sim_config = open_state()
+                strategy_simulate_plan = strategy_console.simulate_plan(
+                    sim_config, console_binding.db_path if console_binding else "?",
+                    now_ts=now_fn(),
+                )
+                strategy_simulate_result = None
+                strategy_simulate_error = None
+                strategy_simulate_progress = []
+                strategy_simulate_offset = 0
+                mode = "strategy-simulate"
+            elif entry.kind == "insights":
+                insights_back = "strategy"
+                mode = "insights"
+                insights_offset = 0
+            else:
+                _run_strategy_form_at_terminal(entry.target)
+
+        def _enter_research_entry(entry: Any) -> None:
+            """Where a Research selection goes: a corpus list (read on entry, the scout
+            browser's contract) or the trials-ledger view."""
+            nonlocal mode, research_files, research_dir, research_title
+            nonlocal research_list_cursor, research_list_offset, research_trials_offset
+            if entry.kind == "trials":
+                research_trials_offset = 0
+                mode = "research-trials"
+            else:
+                research_title = entry.target
+                research_dir = research_console.corpus_path(entry.target)
+                research_files = research_console.list_documents(research_dir)
+                research_list_cursor = 0
+                research_list_offset = 0
+                mode = "research-list"
 
         while True:
             if mode == "menu":
@@ -2337,6 +2501,429 @@ def run_live(
                     )
                 continue
 
+            if mode == "strategy":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Rules sub-menu (issue #390 C4): the strategy console. A FORM entry
+                # runs at the terminal right here (curses suspended -- the retry flow's
+                # TYPED --force gate renders in-console) and its confirmation lines toast
+                # on this screen; the ledger, simulate and insights are separate modes
+                # that close back HERE. SCROLLED with the cursor-follow rule: eight
+                # entries with wrapped descriptions outgrow a small window.
+                strategy_lines = strategy_console.build_strategy_menu_lines(
+                    cursor=strategy_cursor, message=_toast_ttl()
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(strategy_lines)
+                strategy_menu_offset = _follow_cursor(
+                    strategy_menu_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *strategy_lines], strategy_menu_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    strategy_cursor = max(0, strategy_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    strategy_cursor = min(
+                        len(strategy_console.STRATEGY_MENU) - 1, strategy_cursor + 1
+                    )
+                elif ord("1") <= ch <= ord("9"):
+                    strategy_selected = strategy_console.strategy_entry(ch - ord("0"))
+                    if strategy_selected is not None:
+                        _enter_strategy_entry(strategy_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_strategy_entry(
+                        strategy_console.STRATEGY_MENU[strategy_cursor]
+                    )
+                else:
+                    strategy_menu_offset = _scroll_offset(
+                        ch,
+                        strategy_menu_offset,
+                        height,
+                        len(banner) + len(strategy_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "strategy-ledger":
+                if console_binding is None or not strategy_ledger_built:
+                    mode = "strategy"
+                    continue
+                # The tried-vs-used ledger (O11.2): every rule row with its RECORDED
+                # context, HELD from the entry-time read (a poll repaint must never
+                # re-read, and never backtests -- entry runs zero of them). Any verdicts
+                # the operator re-computed in the detail view render under their rows.
+                # A cursor over the rule rows; Enter opens the detail (whose own Enter
+                # is the explicit, warned re-compute).
+                ledger_lines = strategy_console.build_ledger_lines(
+                    strategy_ledger,
+                    cursor=strategy_ledger_cursor,
+                    verdicts=strategy_verdicts,
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(ledger_lines)
+                strategy_ledger_offset = _follow_cursor(
+                    strategy_ledger_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *ledger_lines], strategy_ledger_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "strategy"
+                    strategy_ledger_built = False
+                elif ch in (curses.KEY_UP, ord("k")):
+                    strategy_ledger_cursor = max(0, strategy_ledger_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    strategy_ledger_cursor = min(
+                        max(0, len(strategy_ledger) - 1), strategy_ledger_cursor + 1
+                    )
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and strategy_ledger:
+                    strategy_rule_detail = strategy_ledger[strategy_ledger_cursor]
+                    strategy_rule_offset = 0
+                    mode = "strategy-rule"
+                else:
+                    strategy_ledger_offset = _scroll_offset(
+                        ch,
+                        strategy_ledger_offset,
+                        height,
+                        len(banner) + len(ledger_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "strategy-rule" and strategy_rule_detail is not None:
+                # One rule's detail: the params rendered through `describe_params` (the
+                # O8 per-field help), the recorded paper-gate distance, and the rule's
+                # backtest verdict -- ARMED until an explicit Enter. That Enter is the
+                # ONE place the strategy console runs a rule backtest: warned first (the
+                # detail screen says what it costs), honestly blocking while it runs
+                # (exactly like simulate/fetch), and held in `strategy_verdicts` when it
+                # ends -- repaints render the held verdict, they never recompute.
+                detail = strategy_rule_detail
+                rule_lines = strategy_console.build_ledger_detail_lines(
+                    detail, verdict=strategy_verdicts.get(detail.rule_id)
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *rule_lines], strategy_rule_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "strategy-ledger"
+                    strategy_rule_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine(
+                            f"re-computing rule {detail.rule_id}'s verdict (the "
+                            "full-window backtest)... please wait -- this can take "
+                            "minutes on long series; the screen is frozen like "
+                            "simulate/fetch",
+                            "normal",
+                        )],
+                    )
+                    try:
+                        verdict_repo, verdict_config = open_state()
+                        strategy_verdicts[detail.rule_id] = (
+                            strategy_console.compute_rule_verdict(
+                                verdict_repo, verdict_config, detail
+                            )
+                        )
+                    except Exception as exc:
+                        strategy_verdicts[detail.rule_id] = (
+                            strategy_console.RuleVerdict(
+                                stats_line=None,
+                                reason_lines=(
+                                    f"the re-compute failed before the backtest could "
+                                    f"run: {str(exc)[:160]}",
+                                ),
+                            )
+                        )
+                    strategy_rule_offset = 0
+                else:
+                    strategy_rule_offset = _scroll_offset(
+                        ch,
+                        strategy_rule_offset,
+                        height,
+                        len(banner) + len(rule_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "strategy-simulate" and strategy_simulate_plan is not None:
+                # The simulate view (O11.1): ARMED until an explicit Enter -- the confirm
+                # step; opening the screen and polling make NO call and touch NO file.
+                # Enter runs `run_simulation` (which fetches history when the cache does
+                # not cover the window and WRITES the report), blocking the loop exactly
+                # like `f` fetch does -- the CLI's own UX, mirrored honestly -- then the
+                # result is HELD and every poll repaints it until Enter re-runs or the
+                # view closes (which re-arms it).
+                if strategy_simulate_result is not None:
+                    sim_lines = strategy_console.build_simulate_result_lines(
+                        strategy_simulate_result, tuple(strategy_simulate_progress)
+                    )
+                elif strategy_simulate_error is not None:
+                    # A failed run keeps the progress it streamed BEFORE failing, above
+                    # the error (they head the results on success; dropping them here
+                    # would hide exactly the lines that say how far it got).
+                    sim_lines = []
+                    if strategy_simulate_progress:
+                        sim_lines.append(
+                            ScreenLine("run progress (what the CLI streamed):", "muted")
+                        )
+                        for line in strategy_simulate_progress:
+                            for wrapped in textwrap.wrap(line, width=78) or [""]:
+                                sim_lines.append(ScreenLine(wrapped, "muted"))
+                        sim_lines.append(_blank())
+                    sim_lines.extend(
+                        [
+                            ScreenLine(f"simulate failed: {strategy_simulate_error}", "alert"),
+                            _blank(),
+                            ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"),
+                        ]
+                    )
+                else:
+                    sim_lines = strategy_console.build_simulate_armed_lines(
+                        strategy_simulate_plan
+                    )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                pinned = (
+                    strategy_console.simulate_verdict_footer(strategy_simulate_result)
+                    if strategy_simulate_result is not None
+                    else []
+                )
+                _paint(
+                    stdscr,
+                    compliance_console.pinned_frame(
+                        [*banner, *sim_lines], pinned,
+                        offset=strategy_simulate_offset, height=height,
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "strategy"
+                    # Closing discards the held result -- reopening is ARMED again.
+                    strategy_simulate_result = None
+                    strategy_simulate_error = None
+                    strategy_simulate_progress = []
+                    strategy_simulate_offset = 0
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    _paint(
+                        stdscr,
+                        [ScreenLine(
+                            "simulating... please wait (this can take minutes; the "
+                            "screen is frozen exactly like the CLI)", "normal"
+                        )],
+                    )
+                    progress: list[str] = []
+                    try:
+                        sim_repo, sim_config = open_state()
+                        from keel.commands._common import _build_broker
+
+                        strategy_simulate_result = strategy_console.run_simulate(
+                            sim_repo,
+                            sim_config,
+                            strategy_simulate_plan,
+                            now_ts=now_fn(),
+                            # The CLI's own default: fetch history when the cache does
+                            # not cover the window (a broker is constructed for it).
+                            build_client=lambda: _build_broker(sim_config),
+                            progress=progress,
+                        )
+                        strategy_simulate_error = None
+                    except Exception as exc:
+                        strategy_simulate_result = None
+                        strategy_simulate_error = str(exc)[:200]
+                    strategy_simulate_progress = progress
+                    strategy_simulate_offset = 0
+                else:
+                    strategy_simulate_offset = _scroll_offset(
+                        ch,
+                        strategy_simulate_offset,
+                        max(height - len(pinned), 0),
+                        len(banner) + len(sim_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "research":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # The Research sub-menu (issue #390 C4 / O5): the evidence corpora and
+                # the trials ledger, all read-only.
+                research_lines = research_console.build_research_menu_lines(
+                    cursor=research_cursor, message=_toast_ttl()
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(research_lines)
+                research_menu_offset = _follow_cursor(
+                    research_menu_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *research_lines], research_menu_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "menu"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    research_cursor = max(0, research_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    research_cursor = min(
+                        len(research_console.RESEARCH_MENU) - 1, research_cursor + 1
+                    )
+                elif ord("1") <= ch <= ord("9"):
+                    research_selected = research_console.research_entry(ch - ord("0"))
+                    if research_selected is not None:
+                        _enter_research_entry(research_selected)
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
+                    _enter_research_entry(
+                        research_console.RESEARCH_MENU[research_cursor]
+                    )
+                else:
+                    research_menu_offset = _scroll_offset(
+                        ch,
+                        research_menu_offset,
+                        height,
+                        len(banner) + len(research_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "research-list":
+                if console_binding is None:  # unreachable via the menu; kept total anyway
+                    mode = "normal"
+                    continue
+                # A corpus's file list, read on ENTRY (documents do not change under a
+                # held screen the way a DB does) -- the scout browser's contract.
+                doc_list_lines = research_console.build_doc_list_lines(
+                    research_title, research_files, research_dir,
+                    cursor=research_list_cursor,
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                cursor_row = len(banner) + _cursor_line_index(doc_list_lines)
+                research_list_offset = _follow_cursor(
+                    research_list_offset, cursor_row, height
+                )
+                _paint(
+                    stdscr,
+                    _visible_slice(
+                        [*banner, *doc_list_lines], research_list_offset, height
+                    ),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "research"
+                elif ch in (curses.KEY_UP, ord("k")):
+                    research_list_cursor = max(0, research_list_cursor - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    research_list_cursor = min(
+                        max(0, len(research_files) - 1), research_list_cursor + 1
+                    )
+                elif ch in (10, 13, ord(" "), curses.KEY_ENTER) and research_files:
+                    research_doc_path = research_files[research_list_cursor].path
+                    research_doc_cache = {}  # a fresh selection starts uncached
+                    research_doc_offset = 0
+                    mode = "research-doc"
+                else:
+                    research_list_offset = _scroll_offset(
+                        ch,
+                        research_list_offset,
+                        height,
+                        len(banner) + len(doc_list_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "research-doc" and research_doc_path is not None:
+                # The chosen document, read through the BOUNDED, mtime-cached reader --
+                # repaints do not re-read an unchanged file (the scout-view lesson).
+                doc_lines = research_console.build_doc_lines(
+                    research_title,
+                    research_doc_path,
+                    research_console.cached_document_lines(
+                        research_doc_path, research_doc_cache
+                    ),
+                )
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *doc_lines], research_doc_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "research-list"
+                    research_doc_offset = 0
+                else:
+                    research_doc_offset = _scroll_offset(
+                        ch,
+                        research_doc_offset,
+                        height,
+                        len(banner) + len(doc_lines),
+                        curses,
+                    )
+                continue
+
+            if mode == "research-trials":
+                # The trials ledger (O5): rebuilt per poll, fail-soft -- it is a small
+                # read-only file read, and a mid-view append (a simulate run in another
+                # terminal) then shows up on the next repaint.
+                try:
+                    trials_lines = research_console.build_trials_lines()
+                except Exception as exc:
+                    trials_lines = [
+                        ScreenLine(f"trials read failed: {exc} -- retrying...", "alert")
+                    ]
+                height, _width = stdscr.getmaxyx()
+                banner = _console_banner()
+                _paint(
+                    stdscr,
+                    _visible_slice([*banner, *trials_lines], research_trials_offset, height),
+                )
+                stdscr.timeout(int(interval * 1000))
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27, ord("m")):
+                    mode = "research"
+                    research_trials_offset = 0
+                else:
+                    research_trials_offset = _scroll_offset(
+                        ch,
+                        research_trials_offset,
+                        height,
+                        len(banner) + len(trials_lines),
+                        curses,
+                    )
+                continue
+
             if mode == "help":
                 help_lines = build_help_screen()
                 height, _width = stdscr.getmaxyx()
@@ -2397,7 +2984,11 @@ def run_live(
                 stdscr.timeout(int(interval * 1000))
                 ch = stdscr.getch()
                 if ch in (ord("q"), 27, ord("i")):
-                    mode = "normal"
+                    # `insights_back`: the dashboard by default, the Rules menu when the
+                    # strategy console's insights entry opened it (the shell is a
+                    # hierarchy).
+                    mode = insights_back
+                    insights_back = "normal"
                     insights_offset = 0
                 else:
                     # Banner-aware total, for the same reason as help's branch above: the
@@ -2635,6 +3226,7 @@ def run_live(
                 continue
             if ch == ord("i"):
                 mode = "insights"
+                insights_back = "normal"
                 insights_offset = 0
                 continue
             if ch == ord("s"):
@@ -2782,7 +3374,19 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     console shell. Profile switches the deployment (the config+db pair -- paper-forward,
     paper-hourly, paper-equities, live) in one action, rebinding everything the console
     reads; selecting LIVE asks an explicit y/N at the terminal first and is marked
-    unmistakably in the header once active. Compliance (issue #389 C3) opens the
+    unmistakably in the header once active. Rules (issue #390 C4) opens the STRATEGY
+    CONSOLE: the tried-vs-used ledger (every rule with its recorded lifecycle context --
+    status, stamps, and the insights gate distance for paper rules; NO backtest runs on
+    entry: each rule's verdict is an explicit, warned, per-rule re-compute on Enter),
+    simulate + results (ARMED; Enter confirms a run that fetches and writes the report
+    exactly as the CLI
+    does, then holds the verdict and the report verbatim), add-a-strategy (per-field
+    parameter help from the rule classes themselves, landing as candidate), retry
+    (re-backtest + re-attempt promote with its y/N confirm and the TYPED `--force`
+    phrase), enable/disable/demote, and insights. Research (C4) opens the evidence
+    READERS: the experiments and research-docs corpora, the promotion reports (including
+    a just-run simulation's, newest first), and the trials ledger with its chain verdict
+    -- all read-only, all bounded reads. Compliance (issue #389 C3) opens the
     Compliance sub-menu: screen/propose/holdings/discover/subscription-show/purification
     as browsable service reports (holdings and discover ARMED -- one live venue read each,
     only on Enter), the record-writes (attest [typed: type the asset code back],
@@ -2792,8 +3396,8 @@ def tui_cmd(ctx: click.Context, interval: float, once: bool) -> None:
     config, screened through the admission services, attest offered but never auto-run),
     and the read-only "Shariah in force" browser (the attestations, exemptions and
     fiqh-derived rails in force for the active profile, quoted and cited from
-    docs/fiqh-basis.md, honesty lines always visible). Trading/Rules/Data/Research/Account
-    are placeholders for later console slices and say which one they land in. Every screen
+    docs/fiqh-basis.md, honesty lines always visible). Trading/Data/Account are
+    placeholders for later console slices and say which one they land in. Every screen
     carries the session banner: the active deployment, then the venue's market session and
     clock (24/7, or OPEN/CLOSED with the next open/close, or CLOCK UNAVAILABLE fail-loud)
     -- rendered from the agent cycle's own recorded session state, never a clock call of

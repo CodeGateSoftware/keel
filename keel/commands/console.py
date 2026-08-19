@@ -262,9 +262,12 @@ class MenuEntry:
 
 
 #: The PRD §3 tree's top level, in tree order. The placeholder owners are the PRD §5
-#: phasing's own assignments: Rules/Research -> C4, Trading/Data -> C5. Compliance landed
-#: with C3 (issue #389); Account is unassigned by the PRD's phasing, rides with C5 (the
-#: last menu slice), and the description says so plainly rather than inventing precision.
+#: phasing's own assignments: Trading/Data -> C5. Compliance landed with C3 (issue #389);
+#: Rules and Research with C4 (issue #390) -- the strategy console
+#: (`keel.commands.strategy_console`) and the evidence readers
+#: (`keel.commands.research_console`). Account is unassigned by the PRD's phasing, rides
+#: with C5 (the last menu slice), and the description says so plainly rather than
+#: inventing precision.
 CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=1,
@@ -287,8 +290,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=4,
         label="Rules",
-        lands_in="C4",
-        description="the strategy console -- list, backtest, promote, simulate, retry",
+        description="the strategy console -- ledger, simulate, add, retry",
+        action="strategy",
     ),
     MenuEntry(
         ordinal=5,
@@ -305,8 +308,8 @@ CONSOLE_MENU: tuple[MenuEntry, ...] = (
     MenuEntry(
         ordinal=7,
         label="Research",
-        lands_in="C4",
         description="experiments, research docs, promotion reports, the trials ledger",
+        action="research",
     ),
     MenuEntry(
         ordinal=8,
