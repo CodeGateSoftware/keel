@@ -42,8 +42,10 @@ The surfaces, all pure (or injected-I/O) and unit-testable without curses:
   single source, offering only the params the kind PERSISTS; lands as `candidate` exactly
   as the CLI does, with the SERVICE's own validation messages rendered), retry (re-backtest
   always; promote only on an explicit y/N; `--force` behind
-  `clis_typed_promote_force_gate` -- the CLI's OWN typed gate, exact phrase, never
-  pre-filled, failing closed), and enable as the documented restore path.
+  `clis_typed_promote_force_gate` -- console-ADDED ceremony over the CLI's bare `--force`
+  flag, built on the shared typed-confirmation gate and quoting the CLI's own force
+  warning; exact phrase, never pre-filled, failing closed), and enable as the documented
+  restore path.
 """
 
 from __future__ import annotations
@@ -66,7 +68,9 @@ from keel.commands.rules import (
     apply_rule_disable,
     apply_rule_enable,
     attempt_promotion,
+    backtest_resolved,
     describe_params,
+    resolve_rule_backtest,
     run_rule_backtest,
 )
 from keel.commands.simulate import (
@@ -417,26 +421,20 @@ def compute_rule_verdict(
     repo: Repository, config: Config, entry: LedgerRule
 ) -> RuleVerdict:
     """THE explicit per-rule re-compute (Enter-gated in the console): the full-window
-    backtest over the repo's cached candles, judged by the promotion gate exactly as
-    `rules promote` judges it (`can_promote`, no PBO session -- so the G4 axis renders as
-    its own honest NOT RUN reason). This is REAL WORK -- minutes on long series -- which is
-    precisely why nothing calls it from a render path. A backtest that raises (stale
-    params, e.g. a quoted float a pre-guard row still carries) is an honest per-row error
-    line, following `build_rule_track_record`'s graceful-degradation precedent."""
-    from keel.commands.rules import _backtest_fee, _describe_fee
+    backtest over the repo's cached candles -- DELEGATED to the `rules` service's compute
+    core (`resolve_rule_backtest` + `backtest_resolved`, the same read/build/backtest
+    `keel rules backtest` runs; this view once re-derived the granularity loop and the
+    input assembly here, a drifting twin of the service's) -- judged by the promotion gate
+    exactly as `rules promote` judges it (`can_promote`, no PBO session -- so the G4 axis
+    renders as its own honest NOT RUN reason). This is REAL WORK -- minutes on long series
+    -- which is precisely why nothing calls it from a render path. A backtest that raises
+    (stale params, e.g. a quoted float a pre-guard row still carries) is an honest per-row
+    error line, following `build_rule_track_record`'s graceful-degradation precedent."""
+    from keel.commands.rules import _describe_fee
     from keel.strategy import promotion as promotion_mod
-    from keel.strategy.backtest import backtest as backtest_fn
-
-    row = {
-        "id": entry.rule_id,
-        "kind": entry.kind,
-        "params": entry.params,
-        "status": entry.status,
-    }
-    reasons: list[str] = []
 
     try:
-        rule = agent._build_rule(row)
+        resolved = resolve_rule_backtest(repo, config, entry.rule_id)
     except ValueError:
         return RuleVerdict(
             stats_line=None,
@@ -445,26 +443,24 @@ def compute_rule_verdict(
                 "the engine cannot rebuild (see `keel rules list`)",
             ),
         )
-
-    granularity = None
-    for attr in ("granularity", "timeframe"):
-        value = getattr(rule, attr, None)
-        if value is not None:
-            granularity = value
-            break
-
-    candles = (
-        repo.get_candles(entry.product_id, granularity)
-        if entry.product_id and granularity
-        else []
-    )
-    if not candles:
-        gran_name = granularity.value if granularity is not None else "its own"
-        reasons.append(
-            f"no backtest on record -- the repo holds no cached {gran_name} candles for "
-            f"{entry.product_id or 'this product'} to backtest against"
+    except RulesRefused as exc:
+        return RuleVerdict(
+            stats_line=None,
+            reason_lines=(
+                f"no backtest on record -- the backtest service refused this row: {exc} "
+                f"(see `keel rules backtest {entry.rule_id}` for the CLI's own refusal)",
+            ),
         )
-        return RuleVerdict(stats_line=None, reason_lines=tuple(reasons))
+
+    if not resolved.candles:
+        return RuleVerdict(
+            stats_line=None,
+            reason_lines=(
+                f"no backtest on record -- the repo holds no cached "
+                f"{resolved.granularity.value} candles for "
+                f"{entry.product_id or 'this product'} to backtest against",
+            ),
+        )
 
     promo_cfg = promotion_mod.PromotionConfig(
         min_trades=config.promotion.min_trades,
@@ -473,9 +469,8 @@ def compute_rule_verdict(
         min_win_rate=float(config.promotion.min_win_rate),
     )
     gate = promotion_mod.pbo_gate_from_config(config.research)
-    fee_pct, fee_source = _backtest_fee(config)
     try:
-        stats = backtest_fn(rule, candles, fee_pct=fee_pct)
+        stats = backtest_resolved(resolved)
     except Exception as exc:  # noqa: BLE001 -- the row's own error, never the view's
         return RuleVerdict(
             stats_line=None,
@@ -489,10 +484,9 @@ def compute_rule_verdict(
     stats_line = (
         f"backtest: n_trades={stats.n_trades} win_rate={stats.win_rate:.2%} "
         f"expectancy={stats.expectancy} profit_factor={stats.profit_factor} "
-        f"{_describe_fee(fee_pct, fee_source)}"
+        f"{_describe_fee(resolved.fee_pct, resolved.fee_source)}"
     )
-    reasons.extend(decision.reasons)
-    return RuleVerdict(stats_line=stats_line, reason_lines=tuple(reasons))
+    return RuleVerdict(stats_line=stats_line, reason_lines=tuple(decision.reasons))
 
 
 def build_strategy_ledger(
@@ -1014,9 +1008,11 @@ def run_retry_form(
     first content), then re-attempt the promotion through `attempt_promotion` -- only on
     an explicit y/N (the O3 promote confirmation), with the PBO session named or honestly
     absent (the gate's own NOT RUN reason renders when it is). `--force` is offered after
-    a declined-or-refused promote and runs ONLY behind `typed_force_fn` -- the CLI's own
-    typed gate (`clis_typed_promote_force_gate`, the default), never pre-filled, failing
-    closed: a wrong phrase writes nothing."""
+    a declined-or-refused promote and runs ONLY behind `typed_force_fn` -- the console's
+    typed gate (`clis_typed_promote_force_gate`, the default: console-added ceremony over
+    the CLI's bare `--force` flag, quoting its warning over the shared
+    typed-confirmation gate), never pre-filled, failing closed: a wrong phrase writes
+    nothing."""
     if typed_force_fn is None:
         typed_force_fn = clis_typed_promote_force_gate
     del now_ts  # the services stamp their own times

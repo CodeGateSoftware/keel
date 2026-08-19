@@ -26,7 +26,48 @@ from __future__ import annotations
 
 import click
 
-from keel.version import build_info, check_install
+from keel.version import BuildInfo, InstallReport, build_info, check_install
+
+
+def render_versions_lines(
+    info: BuildInfo, report: InstallReport
+) -> list[tuple[str, bool]]:
+    """The EXACT `keel versions` lines as `(text, to_stderr)` pairs, in issuance order --
+    ONE renderer for both front-ends (issue #392 C6, the C1 rule): the CLI echoes them
+    (`err=` carrying the flag, byte-identical to the pre-extraction output) and the
+    console's Account menu renders the same pairs, styling the stderr half (the
+    not-reproducible warning, the disagreement errors) loud. PURE -- a function of the
+    build identity and the install report, nothing else."""
+    lines: list[tuple[str, bool]] = [(info.describe(), False)]
+    if not info.is_reproducible:
+        lines.append(
+            (
+                "warning: this build is NOT reproducible -- it does not correspond to a "
+                "commit. Do not run it against live funds.",
+                True,
+            )
+        )
+
+    if not report.distributions:
+        # Nothing installed: a source checkout run via `uv run` with the workspace on the path.
+        # There is no install to disagree with itself, so there is nothing to fail on.
+        lines.append(("no keel distributions installed -- nothing to compare.", False))
+        return lines
+
+    width = max(len(name) for name in report.distributions) + 2
+    lines.append(("", False))
+    for name, version in sorted(report.distributions.items()):
+        lines.append((f"{name.ljust(width)}{version}", False))
+    lines.append(("", False))
+
+    if not report.problems:
+        n = len(report.distributions)
+        lines.append((f"ok: {n} keel distributions, all at {report.versions[0]}.", False))
+        return lines
+
+    for problem in report.problems:
+        lines.append((f"error: {problem}", True))
+    return lines
 
 
 @click.command("versions")
@@ -36,31 +77,7 @@ def versions_cmd(ctx: click.Context) -> None:
     info = build_info()
     report = check_install(source=info.source)
 
-    click.echo(info.describe())
-    if not info.is_reproducible:
-        click.echo(
-            "warning: this build is NOT reproducible -- it does not correspond to a commit. "
-            "Do not run it against live funds.",
-            err=True,
-        )
-
-    if not report.distributions:
-        # Nothing installed: a source checkout run via `uv run` with the workspace on the path.
-        # There is no install to disagree with itself, so there is nothing to fail on.
-        click.echo("no keel distributions installed -- nothing to compare.")
-        return
-
-    width = max(len(name) for name in report.distributions) + 2
-    click.echo("")
-    for name, version in sorted(report.distributions.items()):
-        click.echo(f"{name.ljust(width)}{version}")
-    click.echo("")
-
-    if not report.problems:
-        n = len(report.distributions)
-        click.echo(f"ok: {n} keel distributions, all at {report.versions[0]}.")
-        return
-
-    for problem in report.problems:
-        click.echo(f"error: {problem}", err=True)
-    ctx.exit(1)
+    for text, to_stderr in render_versions_lines(info, report):
+        click.echo(text, err=to_stderr)
+    if report.problems:
+        ctx.exit(1)
