@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from keel.commands.fetch import FetchResult, run_fetch
-from keel.commands.tui import ScreenLine, _blank, _message_style
+from keel.commands.tui import CTRL_C_DISCLOSURE, ScreenLine, _blank, _message_style
 from keel.types import Granularity
 
 if TYPE_CHECKING:
@@ -274,8 +274,10 @@ def build_fetch_armed_lines(plan: FetchPlan) -> list[ScreenLine]:
         indent="      ",
     ):
         lines.append(ScreenLine(wrapped, "muted"))
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent="      "):
+        lines.append(ScreenLine(wrapped, "muted"))
     lines.append(_blank())
-    lines.append(ScreenLine("Press q or Esc to return to the Data menu.", "muted"))
+    lines.append(ScreenLine("Press q/Esc/m to return to the Data menu.", "muted"))
     return lines
 
 
@@ -352,6 +354,8 @@ def build_fetch_result_lines(
         # -- loud, because a scheduler would exit non-zero on it.
         lines.append(ScreenLine(f"--check verdict: FAIL -- {verdict}", "alert"))
         lines.append(_blank())
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
     if error is not None:
         lines.append(ScreenLine("Press Enter to retry, or q/Esc to close.", "muted"))
     else:

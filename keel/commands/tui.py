@@ -1348,6 +1348,31 @@ _BALANCE_TIMEOUT_SEC = 10
 #: only exit is Ctrl-C (which kills the whole TUI, not just the request).
 _DISCOVER_TIMEOUT_SEC = 20
 
+#: What Ctrl-C does on a blocking console screen -- ONE sentence, rendered on every blocking
+#: surface (the ARMED and result screens the builders paint, and the frozen notices the loop
+#: paints mid-run): a frozen screen is exactly where an operator reaches for it, and it must
+#: say BEFORE the press that it leaves the WHOLE console (gracefully -- `run_live` catches the
+#: KeyboardInterrupt and restores the terminal) and that whatever the run was holding is gone.
+CTRL_C_DISCLOSURE = (
+    "during the run, Ctrl-C exits the whole console (gracefully) and discards held results"
+)
+
+#: The frozen-run notices the loop paints while a blocking run holds it (the agent cycle, the
+#: monitor poll, the fetch variants): each says the screen is frozen exactly like the CLI's --
+#: and the CYCLE one adds what happens to orders, which is the tail a one-line paint loses.
+#: Module constants (not builder output) because the loop paints them directly, mid-run.
+_CYCLE_RUN_NOTICE = (
+    "running one agent cycle... please wait (the screen is frozen exactly like the "
+    "CLI; orders, if any, follow this profile's mode and confirm gates)"
+)
+_MONITOR_RUN_NOTICE = (
+    "polling... please wait (one poll; the screen is frozen exactly like the CLI)"
+)
+_FETCH_RUN_NOTICE = (
+    "fetching... please wait (this can take minutes; the screen is frozen exactly "
+    "like the CLI)"
+)
+
 
 def _refresh_balance(
     open_state: OpenState, now_fn: NowFn, balance_fn: Callable[[Config], Decimal | None]
@@ -1593,13 +1618,14 @@ def _do_compliance_network(open_state: OpenState, kind: str) -> Any:
 
 
 def _run_terminal_form(stdscr: Any, fn: Callable[[], str]) -> str:
-    """Run one Compliance form at the TERMINAL, inside the console session: suspend
-    curses (the same `def_prog_mode` -> `endwin` -> `reset_prog_mode` dance
-    `_confirm_arm_autonomy`/`_confirm_live_profile` keep), let the form's prompts and
-    O3's typed gates render in-console, restore the screen, and return the form's result
-    line (the confirmation of what was written). A form that cannot run at all (an
-    exception outside its own fail-soft handling) becomes a readable toast, never a
-    crash of the loop."""
+    """Run one terminal interaction inside the console session: suspend curses (the
+    `def_prog_mode` -> `endwin` -> `reset_prog_mode` dance
+    `_confirm_arm_autonomy`/`_confirm_live_profile` keep -- this is its one shared
+    generic copy, the seam every console's forms AND the agent-cycle dispatch ride),
+    let the form's prompts and O3's typed gates render in-console, restore the screen,
+    and return the form's result line (the confirmation of what was written). A form
+    that cannot run at all (an exception outside its own fail-soft handling) becomes a
+    readable toast, never a crash of the loop."""
     import curses
 
     try:
@@ -1612,6 +1638,24 @@ def _run_terminal_form(stdscr: Any, fn: Callable[[], str]) -> str:
             stdscr.refresh()
     except Exception as exc:
         return f"form failed: {exc}"[:200]
+
+
+def _run_notice_lines(notice: str) -> list[ScreenLine]:
+    """One frozen-run notice, WRAPPED to the 78-column budget the console builders keep:
+    `_paint` CLIPS at the window width, and the loop-painted notices are long (the
+    cycle's is 144 chars) -- painted as one line, the tail (the part that says what
+    happens to orders) is exactly what an 80-column terminal loses. The Ctrl-C
+    disclosure rides every frozen notice (a blocked screen is where an operator
+    reaches for it). PURE."""
+    lines = [
+        ScreenLine(wrapped, "normal") for wrapped in textwrap.wrap(notice, width=78) or [""]
+    ]
+    lines.append(_blank())
+    lines.extend(
+        ScreenLine(wrapped, "muted")
+        for wrapped in textwrap.wrap(CTRL_C_DISCLOSURE, width=78) or [""]
+    )
+    return lines
 
 
 def _do_propose_view(open_state: OpenState) -> ProposeView:
@@ -1872,30 +1916,6 @@ def run_live(
                 )
             except Exception as exc:
                 return [ScreenLine(f"console header read failed: {exc}", "warn")]
-
-        def _enter_menu_entry(
-            action: str, entry: console.MenuEntry
-        ) -> tuple[str, int, int, console.MenuEntry | None]:
-            """Where a menu selection goes: a closed mapping in one place, so the rendered
-            tree, the ordinals and the dispatch can never disagree about what an entry
-            does. Every destination opens at the top (cursor 0, offset 0)."""
-            if action == "dashboard":
-                return "normal", 0, 0, None
-            if action == "profile":
-                return "profile", 0, 0, None
-            if action == "help":
-                return "help", 0, 0, None
-            if action == "compliance":
-                return "compliance", 0, 0, None
-            if action == "strategy":
-                return "strategy", 0, 0, None
-            if action == "research":
-                return "research", 0, 0, None
-            if action == "trading":
-                return "trading", 0, 0, None
-            if action == "data":
-                return "data", 0, 0, None
-            return "placeholder", 0, 0, entry
 
         mode = "normal"
         help_offset = 0
@@ -2181,9 +2201,7 @@ def run_live(
                         form_repo, form_config, _form_prompt, now_fn()
                     )
                 if form_target == "record-flow":
-                    return trading_console.run_record_flow_form(
-                        form_repo, _form_prompt, now_fn()
-                    )
+                    return trading_console.run_record_flow_form(form_repo, _form_prompt)
                 if form_target == "reset-hwm":
                     return trading_console.run_reset_hwm_form(form_repo)
                 if form_target == "resume-entries":
@@ -2301,6 +2319,55 @@ def run_live(
             else:
                 _run_data_form_at_terminal(entry.target)
 
+        def _enter_menu_entry(
+            action: str, entry: console.MenuEntry
+        ) -> tuple[str, int, int, console.MenuEntry | None]:
+            """Where a menu selection goes: a closed mapping in one place, so the rendered
+            tree, the ordinals and the dispatch can never disagree about what an entry
+            does. Every destination opens at the top (cursor 0, offset 0) -- and that
+            includes every sub-menu's OWN cursor and scroll offset, reset HERE on every
+            (re)entry: a remembered row is a loaded one (leave Trading with the row on
+            kill, re-enter, and a replayed Enter would engage the halt with no
+            ceremony), so this is the ONE shared reset point every console sub-menu
+            passes through."""
+            nonlocal compliance_cursor, compliance_menu_offset
+            nonlocal strategy_cursor, strategy_menu_offset
+            nonlocal research_cursor, research_menu_offset
+            nonlocal trading_cursor, trading_menu_offset
+            nonlocal data_cursor, data_menu_offset
+            if action == "compliance":
+                compliance_cursor = 0
+                compliance_menu_offset = 0
+            elif action == "strategy":
+                strategy_cursor = 0
+                strategy_menu_offset = 0
+            elif action == "research":
+                research_cursor = 0
+                research_menu_offset = 0
+            elif action == "trading":
+                trading_cursor = 0
+                trading_menu_offset = 0
+            elif action == "data":
+                data_cursor = 0
+                data_menu_offset = 0
+            if action == "dashboard":
+                return "normal", 0, 0, None
+            if action == "profile":
+                return "profile", 0, 0, None
+            if action == "help":
+                return "help", 0, 0, None
+            if action == "compliance":
+                return "compliance", 0, 0, None
+            if action == "strategy":
+                return "strategy", 0, 0, None
+            if action == "research":
+                return "research", 0, 0, None
+            if action == "trading":
+                return "trading", 0, 0, None
+            if action == "data":
+                return "data", 0, 0, None
+            return "placeholder", 0, 0, entry
+
         while True:
             if mode == "menu":
                 if console_binding is None:  # unreachable via 'm'; kept total anyway
@@ -2333,16 +2400,11 @@ def run_live(
                         mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
                             selected.action, selected
                         )
-                        if selected.action == "compliance":
-                            # Enter the sub-menu at the top, like every other destination.
-                            compliance_menu_offset = 0
                 elif ch in (10, 13, ord(" "), curses.KEY_ENTER):
                     selected = console.CONSOLE_MENU[menu_cursor]
                     mode, menu_cursor, help_offset, placeholder_entry = _enter_menu_entry(
                         selected.action, selected
                     )
-                    if selected.action == "compliance":
-                        compliance_menu_offset = 0
                 continue
 
             if mode == "placeholder":
@@ -3206,29 +3268,39 @@ def run_live(
                     trading_cycle_error = None
                     trading_cycle_offset = 0
                 elif ch in (10, 13, curses.KEY_ENTER):
-                    _paint(
-                        stdscr,
-                        [ScreenLine(
-                            "running one agent cycle... please wait (the screen is "
-                            "frozen exactly like the CLI; orders, if any, follow this "
-                            "profile's mode and confirm gates)",
-                            "normal",
-                        )],
-                    )
-                    try:
-                        cycle_repo, cycle_config = open_state()
-                        from keel.commands._common import _build_broker
+                    _paint(stdscr, _run_notice_lines(_CYCLE_RUN_NOTICE))
 
-                        trading_cycle_result = trading_console.run_agent_cycle(
-                            cycle_repo,
-                            cycle_config,
-                            now_ts=now_fn(),
-                            build_broker=lambda: _build_broker(cycle_config),
-                        )
-                        trading_cycle_error = None
-                    except Exception as exc:
-                        trading_cycle_result = None
-                        trading_cycle_error = str(exc)[:200]
+                    def _run_cycle() -> str:
+                        # Runs with curses SUSPENDED, through `_run_terminal_form` --
+                        # the ONE shared copy of the dance -- because on a
+                        # confirm-mode profile the CLI's own `_interactive_confirm`
+                        # gate asks MID-CYCLE: it echo's the order preview and reads
+                        # the y at the terminal, and under curses that prompt garbles
+                        # the screen while the answer is typed BLIND under noecho.
+                        # The view's held result/error state is captured here (the
+                        # seam's toast-string return has nothing to say on this
+                        # screen, which renders the state itself); a Ctrl-C
+                        # propagates THROUGH the dance's finally -- screen restored --
+                        # and exits the whole console gracefully, exactly as the
+                        # frozen notice says.
+                        nonlocal trading_cycle_result, trading_cycle_error
+                        try:
+                            cycle_repo, cycle_config = open_state()
+                            from keel.commands._common import _build_broker
+
+                            trading_cycle_result = trading_console.run_agent_cycle(
+                                cycle_repo,
+                                cycle_config,
+                                now_ts=now_fn(),
+                                build_broker=lambda: _build_broker(cycle_config),
+                            )
+                            trading_cycle_error = None
+                        except Exception as exc:
+                            trading_cycle_result = None
+                            trading_cycle_error = str(exc)[:200]
+                        return ""
+
+                    _run_terminal_form(stdscr, _run_cycle)
                     trading_cycle_offset = 0
                 else:
                     trading_cycle_offset = _scroll_offset(
@@ -3276,11 +3348,7 @@ def run_live(
                     trading_monitor_error = None
                     trading_monitor_offset = 0
                 elif ch in (10, 13, curses.KEY_ENTER):
-                    _paint(
-                        stdscr,
-                        [ScreenLine("polling... please wait (one poll; the screen is "
-                                    "frozen exactly like the CLI)", "normal")],
-                    )
+                    _paint(stdscr, _run_notice_lines(_MONITOR_RUN_NOTICE))
                     try:
                         poll_repo, poll_config = open_state()
                         from keel.commands._common import _build_broker
@@ -3397,13 +3465,7 @@ def run_live(
                     data_fetch_progress = []
                     data_fetch_offset = 0
                 elif ch in (10, 13, curses.KEY_ENTER):
-                    _paint(
-                        stdscr,
-                        [ScreenLine(
-                            "fetching... please wait (this can take minutes; the screen "
-                            "is frozen exactly like the CLI)", "normal"
-                        )],
-                    )
+                    _paint(stdscr, _run_notice_lines(_FETCH_RUN_NOTICE))
                     fetch_progress: list[str] = []
                     try:
                         fetch_repo, fetch_config = open_state()

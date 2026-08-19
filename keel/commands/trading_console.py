@@ -63,7 +63,7 @@ from keel.commands.trading import (
     render_loop_result,
     reset_high_water_mark,
 )
-from keel.commands.tui import ScreenLine, _blank, _message_style
+from keel.commands.tui import CTRL_C_DISCLOSURE, ScreenLine, _blank, _message_style
 from keel.types import Granularity
 
 if TYPE_CHECKING:
@@ -354,8 +354,10 @@ def build_cycle_armed_lines(plan: CyclePlan) -> list[ScreenLine]:
         indent="      ",
     ):
         lines.append(ScreenLine(wrapped, "muted"))
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent="      "):
+        lines.append(ScreenLine(wrapped, "muted"))
     lines.append(_blank())
-    lines.append(ScreenLine("Press q or Esc to return to the Trading menu.", "muted"))
+    lines.append(ScreenLine("Press q/Esc/m to return to the Trading menu.", "muted"))
     return lines
 
 
@@ -400,6 +402,8 @@ def build_cycle_result_lines(result: agent.LoopResult) -> list[ScreenLine]:
         for wrapped in _wrap(blocked, indent=""):
             lines.append(ScreenLine(wrapped, "warn"))
     lines.append(_blank())
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
     lines.append(
         ScreenLine("Enter re-runs the cycle · q/Esc/m back to the Trading menu", "muted")
     )
@@ -461,6 +465,13 @@ def build_monitor_armed_lines(plan: MonitorPlan) -> list[ScreenLine]:
     granularities = ", ".join(g.value for g in plan.granularities)
     for wrapped in _wrap(f"granularities {granularities}", indent="      "):
         lines.append(ScreenLine(wrapped, "normal"))
+    # The interval the session record trusts -- operationally relevant (it is what
+    # `keel monitor`'s own loop would sleep between polls), so the plan renders it.
+    for wrapped in _wrap(
+        f"interval {plan.interval_sec:g}s -- the cadence the session record trusts",
+        indent="      ",
+    ):
+        lines.append(ScreenLine(wrapped, "normal"))
     for wrapped in _wrap(
         "the poll records the venue session, then either skips (a shut venue mints no "
         "bars) or fetches fresh candles -- read-only w.r.t. money, exactly `keel "
@@ -477,8 +488,10 @@ def build_monitor_armed_lines(plan: MonitorPlan) -> list[ScreenLine]:
         indent="      ",
     ):
         lines.append(ScreenLine(wrapped, "muted"))
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent="      "):
+        lines.append(ScreenLine(wrapped, "muted"))
     lines.append(_blank())
-    lines.append(ScreenLine("Press q or Esc to return to the Trading menu.", "muted"))
+    lines.append(ScreenLine("Press q/Esc/m to return to the Trading menu.", "muted"))
     return lines
 
 
@@ -515,6 +528,8 @@ def build_monitor_result_lines(cycle: MonitorCycle) -> list[ScreenLine]:
     for wrapped in _wrap(cycle.line, indent=""):
         lines.append(ScreenLine(wrapped, "normal"))
     lines.append(_blank())
+    for wrapped in _wrap(CTRL_C_DISCLOSURE, indent=""):
+        lines.append(ScreenLine(wrapped, "muted"))
     lines.append(
         ScreenLine("Enter re-polls · q/Esc/m back to the Trading menu", "muted")
     )
@@ -631,7 +646,6 @@ def run_reset_hwm_form(repo: Repository, *, gate_fn: Callable[[], bool] | None =
 def run_record_flow_form(
     repo: Repository,
     prompt_fn: PromptFn,
-    now_ts: int,
     *,
     gate_fn: Callable[[str], bool] | None = None,
 ) -> str:

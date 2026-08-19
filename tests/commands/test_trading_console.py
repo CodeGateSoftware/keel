@@ -219,6 +219,68 @@ def test_the_trading_screens_fit_the_80_column_clip() -> None:
             assert len(line.text) <= 80, line.text
 
 
+def test_every_blocking_screen_discloses_what_ctrl_c_does() -> None:
+    """[review #405] A frozen screen is exactly where an operator reaches for Ctrl-C,
+    so every blocking surface -- ARMED and held-result, cycle and poll -- must state
+    plainly, BEFORE the run, what it does: the whole console exits (gracefully) and
+    any held results are discarded."""
+    plan = tc.CyclePlan(
+        db_path="keel.db",
+        profile_label="paper-forward",
+        mode="paper",
+        autonomous=False,
+        session_line=None,
+    )
+    monitor_plan = tc.MonitorPlan(
+        db_path="keel.db",
+        products=("BTC-USD",),
+        granularities=(Granularity.ONE_HOUR,),
+        interval_sec=900.0,
+        session_line=None,
+    )
+    result = agent.LoopResult(
+        ts=NOW_TS, skipped=True, skip_reason="market_closed", mode=None, polled=0
+    )
+    screens = [
+        tc.build_cycle_armed_lines(plan),
+        tc.build_cycle_result_lines(result),
+        tc.build_monitor_armed_lines(monitor_plan),
+        tc.build_monitor_result_lines(_fake_monitor_cycle()),
+    ]
+    for screen in screens:
+        joined = "\n".join(line.text for line in screen)
+        assert "Ctrl-C" in joined
+        assert "exits the whole console" in joined
+        assert "discards" in joined
+
+
+def test_the_armed_footers_state_all_three_close_keys() -> None:
+    """[review #405] `m` is bound on every ARMED screen (the loop's close set is
+    q/Esc/m) -- the footer must say so, matching the result footers, or the binding is
+    under-documented on the one screen that waits on it."""
+    cycle_plan = tc.CyclePlan(
+        db_path="keel.db",
+        profile_label="paper-forward",
+        mode="paper",
+        autonomous=False,
+        session_line=None,
+    )
+    monitor_plan = tc.MonitorPlan(
+        db_path="keel.db",
+        products=("BTC-USD",),
+        granularities=(Granularity.ONE_HOUR,),
+        interval_sec=900.0,
+        session_line=None,
+    )
+    for screen in (
+        tc.build_cycle_armed_lines(cycle_plan),
+        tc.build_monitor_armed_lines(monitor_plan),
+    ):
+        joined = "\n".join(line.text for line in screen)
+        assert "q/Esc/m" in joined
+        assert "Press q or Esc" not in joined
+
+
 def _fake_monitor_cycle() -> Any:
     from keel.commands.monitor import MonitorCycle
 
@@ -455,6 +517,9 @@ def test_the_armed_monitor_screen_says_what_one_poll_does() -> None:
     assert "ARMED" in joined
     assert "BTC-USD" in joined
     assert "ONE_HOUR" in joined or "1h" in joined or "3600" in joined
+    # the poll's interval -- the cadence the session record trusts -- renders too
+    # (review #405: a computed-never-rendered plan field is dead display state)
+    assert "interval 900" in joined
 
 
 def test_run_monitor_poll_dispatches_to_monitor_cycle(repo: Repository) -> None:
@@ -690,7 +755,7 @@ def test_record_flow_form_gates_before_validating_and_writes_nothing_on_a_refusa
         gated.append(amount)
         return False
 
-    result = tc.run_record_flow_form(spy, _prompt(["nan"]), NOW_TS, gate_fn=decline)
+    result = tc.run_record_flow_form(spy, _prompt(["nan"]), gate_fn=decline)
     assert gated == ["nan"]
     assert spy.calls == []
     assert "not given" in result or "cancelled" in result.lower()
@@ -703,13 +768,13 @@ def test_record_flow_form_surfaces_the_clis_own_validation_errors_verbatim(
 
     spy = _RecordingRepo(repo)
     result = tc.run_record_flow_form(
-        spy, _prompt(["abc"]), NOW_TS, gate_fn=lambda _amount: True
+        spy, _prompt(["abc"]), gate_fn=lambda _amount: True
     )
     assert spy.calls == []
     assert "--amount must be a number, got 'abc'" in result
 
     result = tc.run_record_flow_form(
-        spy, _prompt(["nan"]), NOW_TS, gate_fn=lambda _amount: True
+        spy, _prompt(["nan"]), gate_fn=lambda _amount: True
     )
     assert spy.calls == []
     assert "--amount must be a finite number, got 'nan'" in result
@@ -725,7 +790,7 @@ def test_record_flow_form_records_the_flow_and_renders_the_clis_own_lines(
 ) -> None:
     repo.set_state("equity_high_water_mark", Decimal("10000"))
     result = tc.run_record_flow_form(
-        repo, _prompt(["500"]), NOW_TS, gate_fn=lambda _amount: True
+        repo, _prompt(["500"]), gate_fn=lambda _amount: True
     )
     assert "flow of 500 recorded" in result
     assert "High-water mark rebased to 10500" in result  # 10000 + the 500 deposit
@@ -736,7 +801,7 @@ def test_record_flow_on_a_repo_with_no_mark_yet_gets_the_clis_own_no_mark_line(
     repo: Repository,
 ) -> None:
     result = tc.run_record_flow_form(
-        repo, _prompt(["500"]), NOW_TS, gate_fn=lambda _amount: True
+        repo, _prompt(["500"]), gate_fn=lambda _amount: True
     )
     assert "flow of 500 recorded" in result
     assert "No high-water mark yet" in result
@@ -745,7 +810,7 @@ def test_record_flow_on_a_repo_with_no_mark_yet_gets_the_clis_own_no_mark_line(
 
 def test_record_flow_form_cancels_on_an_empty_amount(repo: Repository) -> None:
     spy = _RecordingRepo(repo)
-    result = tc.run_record_flow_form(spy, _prompt([""]), NOW_TS, gate_fn=lambda: True)
+    result = tc.run_record_flow_form(spy, _prompt([""]), gate_fn=lambda: True)
     assert spy.calls == []
     assert "cancelled" in result.lower()
 
@@ -1099,3 +1164,114 @@ def test_run_live_the_trading_menu_scrolls_banner_aware(
     painted = [call[2] for call in stdscr.calls]
     after = painted[painted.index(next(t for t in painted if "keel console -- trading" in t)) :]
     assert any("resume" in t for t in after)
+
+
+def test_run_live_the_cycle_dispatch_suspends_curses_around_the_mid_cycle_confirm_gate(
+    repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[review #405, major] On a confirm-mode profile the cycle itself asks at the
+    terminal MID-RUN: the CLI's own `_interactive_confirm` echo's the order preview and
+    reads a y (confirm.py: "the rendered string is the contract"). Dispatched inside
+    the curses loop that prompt garbles the screen and the y is typed BLIND under
+    noecho -- so the dispatch must ride the SAME suspend/restore dance the terminal
+    forms use, spy-proven BY ORDER on the fake curses' one timeline: the suspend pair
+    strictly before the gate asks, the restore strictly after it answers, and the held
+    result still renders cleanly through the loop."""
+    from keel.commands import confirm as confirm_mod
+
+    real_cycle = tc.run_agent_cycle
+
+    def scripted_run(*args: Any, confirm_fn: Any = None, **kwargs: Any) -> agent.LoopResult:
+        # The executor's own mid-cycle ask: the gate the CLI hands `agent.run_once`.
+        assert confirm_fn is not None
+        answered = confirm_fn({"order_total": "10.00"})
+        assert answered is True  # the y went through, cleanly
+        return agent.LoopResult(
+            ts=NOW_TS, skipped=False, skip_reason=None, mode="confirm", polled=1
+        )
+
+    monkeypatch.setattr(
+        tc, "run_agent_cycle", lambda *a, **k: real_cycle(*a, **k, run_fn=scripted_run)
+    )
+
+    answers = iter(["y"])
+
+    def stdout_gate(preview: Any) -> bool:
+        # The CLI gate's own shape: WRITES the preview, READS the y -- at the terminal,
+        # which is only sane while curses is suspended. Recorded on the fake curses'
+        # call timeline so the order vs. the dance is assertable.
+        print("Rails PASSED. Order preview:")
+        print(f"    order_total: {preview['order_total']}")
+        sys.modules["curses"].calls.append("gate:asked")
+        return next(answers).strip().lower() == "y"
+
+    monkeypatch.setattr(confirm_mod, "_interactive_confirm", stdout_gate)
+
+    # m; 3 -> Trading; 1 -> cycle (ARMED); Enter RUNS (the gate asks mid-run); poll;
+    # Esc; q.
+    stdscr = _drive(
+        repo, _config(), [ord("m"), ord("3"), ord("1"), 10, -1, 27], monkeypatch
+    )
+
+    timeline: list[str] = sys.modules["curses"].calls
+    gate_at = timeline.index("gate:asked")
+    # the suspend pair ran BEFORE the gate asked -- and nothing sits between the
+    # suspend and the ask (the screen was handed over before the first write)
+    assert timeline[:gate_at][-1] == "endwin"
+    assert "def_prog_mode" in timeline[:gate_at]
+    # ...and the restore ran only AFTER the gate answered
+    assert "reset_prog_mode" not in timeline[:gate_at]
+    assert "reset_prog_mode" in timeline[gate_at:]
+    # the gate's write reached a sane stdout, and the cycle's held result renders
+    assert "Order preview" in capsys.readouterr().out
+    painted = "\n".join(call[2] for call in stdscr.calls)
+    assert f"[{NOW_TS}] mode=confirm polled=1" in painted
+
+
+def test_run_live_re_entering_the_trading_menu_resets_the_cursor_to_the_top(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[review #405] A remembered cursor is a loaded one: `trading_cursor` used to
+    persist across sub-menu re-entries, so leaving Trading with the row on kill and
+    re-entering meant a replayed Enter engaged the halt with no ceremony. The shared
+    reset point puts every console sub-menu back on its TOP row on (re)entry -- so the
+    second Enter of a double-tap lands on the first entry (the ARMED cycle view), never
+    on kill. The one-key contract itself is unchanged (kill still engages immediately
+    when its row is chosen on purpose -- tested above)."""
+    from tests.commands.test_tui import _fake_curses
+
+    down = _fake_curses().KEY_DOWN
+    # m -> menu; 3 -> Trading; j x6 -> cursor on kill (row 7); q -> back to the menu;
+    # 3 -> RE-ENTER Trading (cursor must reset); poll; Enter -> the TOP entry's
+    # destination; poll; Esc -> back to Trading; then out and quit.
+    stdscr = _drive(
+        repo,
+        _config(),
+        [
+            ord("m"),
+            ord("3"),
+            *([down] * 6),
+            ord("q"),
+            ord("3"),
+            -1,
+            10,
+            -1,
+            27,
+        ],
+        monkeypatch,
+    )
+    painted = [call[2] for call in stdscr.calls]
+    marked = [(i, t) for i, t in enumerate(painted) if t.startswith(">")]
+    kill_marked = [i for i, t in marked if "kill" in t]
+    cycle_marked = [i for i, t in marked if "agent cycle" in t]
+    assert kill_marked  # the cursor really did reach kill before leaving
+    assert cycle_marked
+    # after re-entry the TOP row is the marked one again -- never kill
+    assert max(cycle_marked) > max(kill_marked)
+    # ...so the replayed Enter opened the cycle's ARMED view, not kill's halt
+    after_reentry = painted[max(kill_marked) :]
+    assert any("ARMED -- nothing has run yet." in t for t in after_reentry)
+    assert not any("kill-switch ENGAGED" in t for t in after_reentry)
+    assert repo.get_state("kill_switch") is False

@@ -153,6 +153,41 @@ def test_the_data_screens_fit_the_80_column_clip() -> None:
             assert len(line.text) <= 80, line.text
 
 
+def test_every_blocking_screen_discloses_what_ctrl_c_does() -> None:
+    """[review #405] A frozen screen is exactly where an operator reaches for Ctrl-C,
+    so every blocking surface -- the ARMED screens of all three variants and the held
+    results -- must state plainly, BEFORE the run, what it does: the whole console
+    exits (gracefully) and any held results are discarded."""
+    screens = [
+        dc.build_fetch_armed_lines(dc.fetch_plan(_config(), "keel.db", target))
+        for target in ("fetch", "fetch-check", "repair-gaps")
+    ]
+    screens.append(
+        dc.build_fetch_result_lines(
+            "fetch", ("data cached in: keel.db",), error=None, verdict=None
+        )
+    )
+    for screen in screens:
+        joined = "\n".join(line.text for line in screen)
+        assert "Ctrl-C" in joined
+        assert "exits the whole console" in joined
+        assert "discards" in joined
+
+
+def test_the_armed_footers_state_all_three_close_keys() -> None:
+    """[review #405] `m` is bound on every ARMED screen (the loop's close set is
+    q/Esc/m) -- the footer must say so, matching the result footers."""
+    for target in ("fetch", "fetch-check", "repair-gaps"):
+        joined = "\n".join(
+            line.text
+            for line in dc.build_fetch_armed_lines(
+                dc.fetch_plan(_config(), "keel.db", target)
+            )
+        )
+        assert "q/Esc/m" in joined
+        assert "Press q or Esc" not in joined
+
+
 # -- fetch: the ARMED plan and the run -------------------------------------------------------------
 
 
@@ -586,3 +621,32 @@ def test_run_live_the_data_menu_scrolls_banner_aware(
     painted = [call[2] for call in stdscr.calls]
     data_idx = next(i for i, t in enumerate(painted) if "keel console -- data" in t)
     assert any("db import" in t for t in painted[data_idx:])
+
+
+def test_run_live_re_entering_the_data_menu_resets_the_cursor_to_the_top(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[review #405] The same shared reset point the Trading menu keeps: a sub-menu
+    cursor must never survive a re-entry. Leave Data with the row on db import (the
+    terminal FORM), re-enter, and the top row is marked again -- the replayed Enter
+    opens the fetch ARMED view instead of running the form."""
+    from tests.commands.test_tui import _fake_curses
+
+    down = _fake_curses().KEY_DOWN
+    # m -> menu; 6 -> Data; j x4 -> cursor on db import (row 5); q -> menu; 6 ->
+    # RE-ENTER Data (cursor must reset); poll; Enter -> the TOP entry (fetch, ARMED);
+    # poll; Esc; then out and quit.
+    stdscr = _drive(
+        repo,
+        _config(),
+        [ord("m"), ord("6"), *([down] * 4), ord("q"), ord("6"), -1, 10, -1, 27],
+        monkeypatch,
+    )
+    painted = [call[2] for call in stdscr.calls]
+    marked = [(i, t) for i, t in enumerate(painted) if t.startswith(">")]
+    import_marked = [i for i, t in marked if "db import" in t]
+    fetch_marked = [i for i, t in marked if "fetch" in t]
+    assert import_marked  # the cursor really did reach db import before leaving
+    assert fetch_marked
+    assert max(fetch_marked) > max(import_marked)  # back on the TOP row after re-entry
+    assert any("ARMED -- nothing has run yet." in t for t in painted[max(import_marked) :])
