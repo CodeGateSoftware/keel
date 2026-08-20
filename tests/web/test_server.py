@@ -819,3 +819,100 @@ def test_a_field_the_action_did_not_declare_is_dropped(
         },
     )
     assert set(seen) == {"CDP_API_KEY", "CDP_API_SECRET"}
+
+
+# -- the background job, on the page -----------------------------------------------------------
+
+
+def test_the_setup_page_refreshes_only_while_a_job_runs(
+    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished page that kept reloading would fight a reader; a running one that did not
+    would be a progress display that never progresses. The zero-JS meta refresh is the only
+    mechanism available to a page that ships no scripts."""
+    from keel.commands import jobs
+
+    jobs.reset()
+    _status, _headers, idle = _request(empty_machine, "/setup", cookie=_session(empty_machine))
+    assert 'http-equiv="refresh"' not in idle
+
+    gate = threading.Event()
+    jobs.start("market_data", lambda echo: (echo("fetching BTC-USD"), gate.wait(5)))
+    try:
+        _status, _headers, running = _request(
+            empty_machine, "/setup", cookie=_session(empty_machine)
+        )
+        assert 'http-equiv="refresh"' in running
+        assert "fetching BTC-USD" in running
+        assert "running" in running
+    finally:
+        gate.set()
+        jobs.wait(5)
+
+    _status, _headers, finished = _request(empty_machine, "/setup", cookie=_session(empty_machine))
+    assert 'http-equiv="refresh"' not in finished
+    assert "done" in finished
+    jobs.reset()
+
+
+def test_a_failed_job_is_shown_on_the_page_and_stays(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """Nobody was watching when it broke. If the page did not still say so, nothing would."""
+    from keel.commands import jobs
+
+    jobs.reset()
+
+    def boom(_echo):
+        raise RuntimeError("the venue said no")
+
+    jobs.start("market_data", boom)
+    jobs.wait(5)
+    for _ in range(2):
+        _status, _headers, body = _request(empty_machine, "/setup", cookie=_session(empty_machine))
+        assert "failed" in body
+        assert "the venue said no" in body
+    jobs.reset()
+
+
+def test_starting_market_data_returns_immediately(
+    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property the whole module exists for: the POST must not wait for the fetch."""
+    from keel.commands import jobs
+    from keel.commands import setup as setup_mod
+
+    jobs.reset()
+    gate = threading.Event()
+    started = threading.Event()
+
+    def _slow_action(_config, _db, _values):
+        jobs.start("market_data", lambda echo: (started.set(), gate.wait(5)))
+        return setup_mod.ActionResult("market_data", True, "started")
+
+    monkeypatch.setattr(
+        setup_mod,
+        "ACTIONS",
+        tuple(
+            a
+            if a.key != "market_data"
+            else type(a)(a.key, a.title, a.detail, _slow_action, a.inputs)
+            for a in setup_mod.ACTIONS
+        ),
+    )
+    try:
+        status, headers, _body = _request(
+            empty_machine,
+            "/setup/market_data",
+            method="POST",
+            cookie=_session(empty_machine),
+            form={"csrf": _csrf(empty_machine)},
+        )
+        assert status == 303
+        assert headers["Location"] == "/setup?ran=market_data"
+        assert started.wait(5), "the job never started"
+        assert jobs.is_running(), "the request returned before the job finished, as intended"
+    finally:
+        gate.set()
+        jobs.wait(5)
+        jobs.reset()
