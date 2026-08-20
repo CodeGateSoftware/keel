@@ -12,6 +12,7 @@ import http.client
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 
@@ -79,13 +80,19 @@ def _request(
     method: str = "GET",
     cookie: str | None = None,
     host: str | None = None,
+    form: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], str]:
     conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
     headers = {"Host": host if host is not None else f"{cfg.host}:{cfg.port}"}
     if cookie:
         headers["Cookie"] = cookie
+    body = None
+    if form is not None:
+        body = urlencode(form)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        headers["Content-Length"] = str(len(body))
     try:
-        conn.request(method, path, headers=headers)
+        conn.request(method, path, body=body, headers=headers)
         response = conn.getresponse()
         body = response.read().decode("utf-8", "replace")
         return response.status, dict(response.getheaders()), body
@@ -97,29 +104,289 @@ def _session(cfg: web_server.ServeConfig) -> str:
     return f"{SESSION_COOKIE}={cfg.token}"
 
 
+def _csrf(cfg: web_server.ServeConfig) -> str:
+    from keel.web.security import csrf_token
+
+    return csrf_token(cfg.token)
+
+
 # -- the read-only guarantee ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
-def test_no_write_verb_is_answered(running: web_server.ServeConfig, method: str) -> None:
-    """The read-only property is STRUCTURAL, not a matter of routing discipline: the handler
-    implements `do_GET`/`do_HEAD` and nothing else, so the stdlib refuses everything else before
-    any keel code -- or any authentication -- runs. This is the test that would have to be
-    deleted, not merely edited, for a write surface to appear here by accident."""
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_no_verb_beyond_get_head_and_post_is_answered(
+    running: web_server.ServeConfig, method: str
+) -> None:
+    """Everything outside the three implemented verbs dies in the stdlib, before any keel code
+    or any authentication runs."""
     status, _headers, _body = _request(running, "/", method=method, cookie=_session(running))
     assert status == 501
 
 
-def test_the_handler_declares_only_get_and_head() -> None:
-    """The same guarantee read off the class, so that a `do_POST` added anywhere in the
-    hierarchy fails here even if a test forgot to exercise its verb."""
+def test_the_handler_declares_exactly_three_verbs() -> None:
+    """Read off the class, so a `do_DELETE` added anywhere in the hierarchy fails here even if
+    no test exercised it."""
     verbs = {
         name
         for klass in web_server.KeelHandler.__mro__
         for name in vars(klass)
         if name.startswith("do_")
     }
-    assert verbs == {"do_GET", "do_HEAD"}
+    assert verbs == {"do_GET", "do_HEAD", "do_POST"}
+
+
+def test_post_is_refused_everywhere_except_the_setup_actions(
+    running: web_server.ServeConfig,
+) -> None:
+    """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
+    is no write surface at that path at all."""
+    for path in ("/", "/insights", "/gates", "/setup"):
+        status, _headers, _body = _request(
+            running, path, method="POST", cookie=_session(running), form={"csrf": _csrf(running)}
+        )
+        assert status == 404, path
+
+
+# -- the guarantee that replaced "no POST at all" ---------------------------------------------
+
+
+def test_the_write_surface_is_exactly_the_mechanical_steps() -> None:
+    """`ACTIONS` is the whole write surface, and every member must be a step declared
+    MECHANICAL. A judgement step is the operator's -- a wizard may record one but must never
+    decide it -- and an off-venue step happens where keel cannot reach. This is what stops a
+    button for "attest this asset" from being added as markup."""
+    from keel.commands.setup import ACTIONS, STEPS, StepKind
+
+    mechanical = {step.key for step in STEPS if step.kind is StepKind.MECHANICAL}
+    declared = {action.key for action in ACTIONS}
+    assert declared <= mechanical, sorted(declared - mechanical)
+    assert declared, "an empty write surface would make every test below vacuous"
+
+    for step in STEPS:
+        if step.kind is not StepKind.MECHANICAL:
+            assert step.key not in declared, step.key
+
+
+def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> None:
+    """THE safety property, and the reason this is a better guarantee than "no POST at all".
+
+    "No POST" said the server could not write -- and was also satisfied by a server that could
+    not set anything up, which is the problem #437 exists to solve. This says the server cannot
+    ARM, RELEASE or SPEND anything: not one of the eleven capability-increasing actions in
+    `keel/capabilities.py` is named anywhere under `keel/web/`, nor is the TTY gate they all pass
+    through.
+
+    Only possible because #453 landed the inventory; before that this test would have been a
+    hand-written list going stale."""
+    import ast
+    import glob
+    import os
+
+    from keel.capabilities import CAPABILITIES
+
+    forbidden_functions = {cap.function for cap in CAPABILITIES} | {
+        "_require_interactive_confirmation"
+    }
+    forbidden_modules = {cap.module for cap in CAPABILITIES}
+
+    web_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "keel",
+        "web",
+    )
+    sources = sorted(glob.glob(os.path.join(web_dir, "*.py")))
+    assert sources, "the scan found no web modules, which would make this vacuous"
+
+    offences: list[str] = []
+    for path in sources:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in forbidden_modules:
+                for alias in node.names:
+                    if alias.name in forbidden_functions:
+                        offences.append(f"{os.path.basename(path)} imports {alias.name}")
+            name = None
+            if isinstance(node, ast.Call):
+                callee = node.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr
+                    if isinstance(callee, ast.Attribute)
+                    else None
+                )
+            if name in forbidden_functions:
+                offences.append(f"{os.path.basename(path)} calls {name}")
+    assert not offences, "the web layer can reach a capability-increasing action: " + "; ".join(
+        offences
+    )
+
+
+def test_the_scan_for_capability_increasing_actions_can_fail() -> None:
+    """An AST scan that silently matched nothing would make the test above vacuously green."""
+    import ast
+
+    from keel.capabilities import CAPABILITIES
+
+    victim = next(cap for cap in CAPABILITIES)
+    tree = ast.parse(f"def sneaky():\n    {victim.function}()\n")
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert victim.function in called
+
+
+# -- CSRF -------------------------------------------------------------------------------------
+
+
+def test_a_write_without_the_session_cookie_is_refused(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """Admission is shared with GET, deliberately: a write path with a laxer check than the read
+    path is exactly the shape of a bug nobody notices."""
+    status, _headers, _body = _request(
+        empty_machine, "/setup/config", method="POST", form={"csrf": _csrf(empty_machine)}
+    )
+    assert status == 403
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_a_write_without_the_csrf_token_is_refused(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """`SameSite=Strict` already stops a cross-site POST in any current browser. This is the
+    layer that does not depend on the browser being current."""
+    for form in ({}, {"csrf": ""}, {"csrf": "not-the-token"}):
+        status, _headers, _body = _request(
+            empty_machine,
+            "/setup/config",
+            method="POST",
+            cookie=_session(empty_machine),
+            form=form,
+        )
+        assert status == 403, form
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_a_write_from_a_rebound_hostname_is_refused(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        host=f"evil.example:{empty_machine.port}",
+    )
+    assert status == 403
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_the_csrf_token_is_not_the_session_token(
+    running: web_server.ServeConfig,
+) -> None:
+    """The session token is `HttpOnly` and must never be written into the page; the CSRF token
+    is. They must therefore be different values, and the derivation must not be reversible."""
+    from keel.web.security import csrf_token
+
+    assert csrf_token(running.token) != running.token
+    _status, _headers, body = _request(running, "/setup", cookie=_session(running))
+    assert running.token not in body
+    assert csrf_token(running.token) in body
+
+
+# -- the actions themselves, over the wire ------------------------------------------------------
+
+
+def test_a_first_run_user_can_build_a_paper_deployment_from_the_browser(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """#437's acceptance, as far as this PR takes it: config, database and rule library with no
+    command typed. Market data and every judgement step remain outstanding, by design."""
+    from keel.commands.setup import ACTIONS, inspect
+
+    for action in ACTIONS:
+        status, headers, _body = _request(
+            empty_machine,
+            f"/setup/{action.key}",
+            method="POST",
+            cookie=_session(empty_machine),
+            form={"csrf": _csrf(empty_machine)},
+        )
+        assert status == 303, action.key
+        assert headers["Location"] == f"/setup?ran={action.key}"
+
+    state = inspect(empty_machine.config_path, empty_machine.db_path)
+    done = {item.step.key: item.done for item in state.states}
+    assert done["config"] is True
+    assert done["database"] is True
+    assert done["rules"] is True
+    # Still nothing that can trade: candidates only, and every judgement step outstanding.
+    assert done["rule_promoted"] is False
+    assert done["assets_attested"] is False
+
+
+def test_running_every_action_twice_changes_nothing_the_second_time(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """A setup flow is something a nervous user clicks twice, and a browser reload re-submits.
+    The redirect stops the reload; idempotence stops everything else."""
+    from keel.commands.setup import ACTIONS
+
+    for _pass in range(2):
+        for action in ACTIONS:
+            status, _headers, _body = _request(
+                empty_machine,
+                f"/setup/{action.key}",
+                method="POST",
+                cookie=_session(empty_machine),
+                form={"csrf": _csrf(empty_machine)},
+            )
+            assert status == 303
+
+    config_text = Path(empty_machine.config_path).read_text()
+    assert "auto_trade" in config_text
+    from keel.commands.setup import inspect
+
+    item = next(
+        s
+        for s in inspect(empty_machine.config_path, empty_machine.db_path).states
+        if s.step.key == "rules"
+    )
+    assert item.done is True
+
+
+def test_an_undeclared_action_key_is_a_404_not_a_lookup_that_falls_through(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    for key in ("autonomy", "resume", "reset-hwm", "../../etc/passwd", ""):
+        status, _headers, _body = _request(
+            empty_machine,
+            f"/setup/{key}",
+            method="POST",
+            cookie=_session(empty_machine),
+            form={"csrf": _csrf(empty_machine)},
+        )
+        assert status == 404, key
+
+
+def test_an_oversized_form_body_is_refused_without_being_read(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """`rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion primitive, and there
+    is no proxy in front of this server to impose a limit."""
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine), "padding": "x" * 32_000},
+    )
+    assert status == 403  # the body was discarded, so the csrf field never arrived
+    assert not Path(empty_machine.config_path).exists()
 
 
 # -- the token -----------------------------------------------------------------------------

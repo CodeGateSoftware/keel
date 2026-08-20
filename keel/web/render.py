@@ -89,6 +89,11 @@ dl.terms dd.src { color: var(--muted); font-size: 0.82rem; }
 footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 0.8rem;
   padding: 1rem 1.25rem; }
 pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 0.85rem; }
+form { margin: 0.5rem 0 0; }
+button { font: inherit; font-weight: 550; padding: 0.35rem 0.9rem; border-radius: 7px;
+  border: 1px solid var(--accent); background: var(--accent); color: var(--card);
+  cursor: pointer; }
+button:hover { filter: brightness(1.08); }
 """
 
 
@@ -611,13 +616,37 @@ _STEP_KIND_NOTE: dict[str, str] = {
 }
 
 
-def render_setup(state: Any) -> str:
-    """The first-run checklist. Read-only, like everything else this server serves: it says what
-    is outstanding and names the command, and it performs nothing."""
+def render_setup(
+    state: Any,
+    *,
+    actions: Sequence[Any] = (),
+    not_automated: dict[str, str] | None = None,
+    csrf: str = "",
+    ran: str = "",
+) -> str:
+    """The first-run checklist, with a button for each MECHANICAL step and a command for every
+    other one.
+
+    A button appears ONLY where `actions` carries one, and `actions` is
+    `keel.commands.setup.ACTIONS` -- a closed set that cannot contain a judgement or off-venue
+    step without failing a test. So this function cannot grow a button for "attest this asset" by
+    someone adding markup here: it would have to be added to the registry first, where the test
+    is."""
+    by_key = {action.key: action for action in actions}
+    not_automated = not_automated or {}
     parts = [
         "<h1>Setup</h1>",
         f'<p class="sub">{esc(state.root)}</p>',
     ]
+    if ran:
+        item = next((s for s in state.states if s.step.key == ran), None)
+        if item is not None:
+            done = item.done is True
+            parts.append(
+                f'<div class="card"><strong class="{"good" if done else "warn"}">'
+                f"{esc(item.step.title)}</strong> "
+                f'<span class="muted">{esc(item.detail)}</span></div>'
+            )
     if state.is_new:
         parts.append(
             '<div class="card"><strong>There is no deployment here yet.</strong> '
@@ -659,12 +688,33 @@ def render_setup(state: Any) -> str:
                 f"<strong>{esc(item.step.title)}</strong>"
                 f'<div class="muted">{esc(item.detail)}</div>'
             )
-            if item.blocking:
+            action = by_key.get(item.step.key)
+            if item.blocking and action is not None and csrf:
+                body += _action_form(action, csrf)
+            elif item.blocking:
                 body += f"<div><code>{esc(item.step.how)}</code></div>"
+                if item.step.key in not_automated:
+                    body += (
+                        '<div class="muted">Not a button, deliberately: '
+                        f"{esc(not_automated[item.step.key])}</div>"
+                    )
             body += f'<div class="muted">{esc(item.step.why)} {esc(note)}</div>'
             rows.append((mark, f'<span class="pill">{esc(item.step.kind.value)}</span>', body))
         parts.append(table((("", False), ("kind", False), ("step", False)), rows))
     return "".join(parts)
+
+
+def _action_form(action: Any, csrf: str) -> str:
+    """One button, one action key, one write token. No hidden parameters: an action takes no
+    arguments at all, so there is nothing a crafted form could ask for that the registry does not
+    already fix."""
+    return (
+        f'<form method="post" action="/setup/{esc(action.key)}">'
+        f'<input type="hidden" name="csrf" value="{esc(csrf)}">'
+        f'<button type="submit">{esc(action.title)}</button>'
+        f'<div class="muted">{esc(action.detail)}</div>'
+        "</form>"
+    )
 
 
 def render_gates(gates: Sequence[Any], capabilities: Sequence[Any]) -> str:

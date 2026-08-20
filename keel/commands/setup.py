@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -558,3 +560,188 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
             for item in state.states
         ],
     }
+
+
+# -- the mechanical actions -------------------------------------------------------------------
+#
+# Everything below WRITES. Read the rules before adding to it:
+#
+# 1. Only steps declared `MECHANICAL` may appear here. `JUDGEMENT` steps are the operator's --
+#    a wizard may collect and record them but must never decide them -- and `OFF_VENUE` steps
+#    happen somewhere keel cannot reach. `tests/commands/test_setup_actions.py` enforces this
+#    against `STEPS`, so a new action for a judgement step fails rather than shipping.
+#
+# 2. Every action is IDEMPOTENT and NEVER destructive. A setup flow is something a nervous user
+#    clicks twice, and a browser reload re-submits. "The config already exists" is a successful
+#    outcome that changed nothing -- never an overwrite, and there is deliberately no `force`
+#    parameter for any web caller to pass.
+#
+# 3. Nothing here increases what keel can DO. Not one of the eleven capability-increasing actions
+#    in `keel/capabilities.py` is reachable from this module, and a test asserts the two sets are
+#    disjoint. Creating a config, a schema and a library of CANDIDATE rules leaves an engine that
+#    still places nothing: candidates trade nothing until a human promotes them, and promotion is
+#    a judgement step.
+
+
+def template_config_text(live: bool = False) -> str:
+    """A config.yaml template shipped inside the wheel (see pyproject `artifacts`).
+
+    `live=False` returns the dev template (`mode: paper` -- places nothing). `live=True` returns
+    the production template (`mode: confirm` -- previews every order and waits for approval),
+    which is also the `config.yaml` attached to a GitHub Release.
+
+    Lives here rather than in `keel/cli.py`, where it started: this service writes a config on a
+    first run and a service may not import the CLI. `keel.cli` re-exports the name, so
+    `init_config` and the tests that reach `keel.cli._template_config_text` are unaffected.
+    """
+    from importlib.resources import files
+
+    name = "config.live.yaml" if live else "config.yaml"
+    return (files("keel.templates") / name).read_text(encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class ActionResult:
+    step_key: str
+    #: False when the step was already done. Not a failure -- the distinction the UI needs to say
+    #: "created" rather than "already there", and the property that makes a double-click safe.
+    changed: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class Action:
+    key: str
+    title: str
+    #: What it will do, in the operator's words, shown before they choose it.
+    detail: str
+    run: Callable[[Path, Path], ActionResult]
+
+
+def create_config(config_path: Path, db_path: Path) -> ActionResult:
+    """Write the PAPER template if there is no config. Never overwrites.
+
+    Paper deliberately, and never the live template from here: paper places nothing at all, which
+    is the only state a first-run user can safely be dropped into. Hummingbot reached the same
+    conclusion -- its paper mode needs no exchange keys, which makes it the only thing a new user
+    *can* do first."""
+    if config_path.exists():
+        return ActionResult("config", False, f"{config_path} already exists -- left untouched")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(template_config_text(live=False), encoding="utf-8")
+    return ActionResult("config", True, f"wrote {config_path} (paper -- places no orders)")
+
+
+def create_database(config_path: Path, db_path: Path) -> ActionResult:
+    """Create the database if absent and apply outstanding migrations.
+
+    Migrations run every time, not only on first run, because that is what makes an upgrade
+    self-heal: they are idempotent, so applying them costs nothing when there is nothing to
+    apply."""
+    from keel.data.db import connect, migrate
+
+    existed = db_path.exists()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(str(db_path))
+    try:
+        migrate(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    if existed:
+        return ActionResult("database", False, f"{db_path} is at the current schema")
+    return ActionResult("database", True, f"created {db_path} at the current schema")
+
+
+def seed_rule_library(config_path: Path, db_path: Path) -> ActionResult:
+    """Seed one CANDIDATE rule per (kind, allowlisted product).
+
+    Candidates trade nothing. Promoting one is a separate, deliberate, human step -- which is why
+    seeding is mechanical and promotion is not.
+
+    Products come from the config's own allowlist through `parse_products_option`, the same
+    validation the CLI applies: an id keel could not trade is refused here, naming it, with
+    nothing written. Rails 18/19 would veto every order for such a rule anyway; the difference is
+    that the operator hears it now rather than reading it out of a log."""
+    from keel import agent
+    from keel.commands._products import parse_products_option
+    from keel.commands.rules import seed_rules_into
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    config = _config_or_none(config_path)
+    if config is None:
+        return ActionResult("rules", False, f"no usable config at {config_path}")
+
+    products, _warnings = parse_products_option(None, config)
+    conn = connect(str(db_path))
+    try:
+        outcome = seed_rules_into(
+            Repository(conn),
+            list(agent.RULE_REGISTRY),
+            products,
+            status="candidate",
+            force=False,
+            now_ts=int(time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if not outcome.seeded:
+        return ActionResult(
+            "rules", False, f"the library already covers all {len(outcome.skipped)} pair(s)"
+        )
+    return ActionResult(
+        "rules",
+        True,
+        f"seeded {len(outcome.seeded)} candidate rule(s); candidates trade nothing until "
+        "you promote one",
+    )
+
+
+#: THE closed set of steps a machine may perform on the operator's behalf.
+ACTIONS: tuple[Action, ...] = (
+    Action(
+        key="config",
+        title="Create a config file",
+        detail=(
+            "Writes the paper template. Paper places no orders at all, so nothing can be spent "
+            "by anything that follows. An existing config is never overwritten."
+        ),
+        run=create_config,
+    ),
+    Action(
+        key="database",
+        title="Create the database",
+        detail="Creates it if absent and applies outstanding migrations. Both are idempotent.",
+        run=create_database,
+    ),
+    Action(
+        key="rules",
+        title="Seed the rule library",
+        detail=(
+            "One candidate rule per strategy and allowlisted product. Candidates trade nothing "
+            "-- promoting one is your decision, and a separate step."
+        ),
+        run=seed_rule_library,
+    ),
+)
+
+#: Mechanical steps that are deliberately NOT offered as one-click actions, and why. Recorded as
+#: data rather than omitted silently, so the gap is visible to the next person rather than
+#: looking like an oversight.
+NOT_AUTOMATED_YET: dict[str, str] = {
+    "market_data": (
+        "The first fetch is a network call that can run for minutes across the allowlist. A "
+        "request that blocks that long is not a button, it is a background job with progress "
+        "and cancellation -- so it stays `keel fetch` until there is somewhere for such a job "
+        "to live."
+    ),
+}
+
+
+def action_for(key: str) -> Action | None:
+    for action in ACTIONS:
+        if action.key == key:
+            return action
+    return None

@@ -10,10 +10,21 @@ routing for six paths and a templating engine used zero times. `http.server` is 
 more honest answer here, and it is genuinely the wrong answer the moment this serves more than
 one local user -- at which point the framework, not this module, is the thing to reach for.
 
-**The read-only property is structural.** This handler implements `do_GET` and `do_HEAD`. Every
-other verb is refused by `BaseHTTPRequestHandler` before any keel code runs, so there is no code
-path here that a later change could accidentally extend into a write. D3 (#436) adds the human
-gate; write actions arrive with it, behind it, and not before.
+**The write surface is a closed set, and that is a better guarantee than the one it replaced.**
+This handler used to implement `do_GET`/`do_HEAD` and nothing else, so a POST died in the stdlib.
+That was a clean property and it was also satisfied by a server that could not set anything up --
+which is the whole problem #437 exists to solve, because a first-run user on a machine with no
+terminal has to be able to create a deployment somehow.
+
+So `do_POST` exists, and it routes ONLY through `keel.commands.setup.ACTIONS`: three idempotent,
+non-destructive steps, every one of them declared `MECHANICAL` in the same module's step list.
+The guarantee is now that **not one of the eleven capability-increasing actions in
+`keel/capabilities.py` is reachable from this package**, asserted by a test that scans this
+source rather than by inspection. "No POST" said the server could not write; this says it cannot
+arm, release or spend -- which is the property anyone actually cares about.
+
+Attesting, promoting, releasing a halt and arming autonomy remain CLI-only, behind the TTY gate.
+D3 (#436) is where a browser gate for those would go, if it goes anywhere.
 
 **Each request opens its own SQLite connection.** A `ThreadingHTTPServer` hands requests to
 different threads, and a `sqlite3` connection belongs to the thread that made it. Per-request is
@@ -30,13 +41,15 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from keel.web import render
 from keel.web.security import (
     SESSION_COOKIE,
     HostPolicy,
+    csrf_token,
     parse_cookie_header,
     tokens_match,
 )
@@ -45,6 +58,11 @@ from keel.web.security import (
 #: "is it running" is answered without a keypress, slow enough that a page being read does not
 #: jump away every few seconds.
 _REFRESH_SEC = 15
+
+#: Cap on a form body. `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
+#: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
+#: an action key and a token.
+_MAX_FORM_BYTES = 8 * 1024
 
 #: Journal rows rendered on the insights page. A cap, not a paginator: the page answers "how has
 #: this been going", and the full history is what `keel insights journal` is for.
@@ -120,8 +138,20 @@ def _deployment_state(cfg: ServeConfig) -> Any:
     return inspect(cfg.config_path, cfg.db_path)
 
 
-def page_setup(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    return "Setup", render.render_setup(_deployment_state(cfg)), None
+def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
+    from keel.commands.setup import ACTIONS, NOT_AUTOMATED_YET
+
+    return (
+        "Setup",
+        render.render_setup(
+            _deployment_state(cfg),
+            actions=ACTIONS,
+            not_automated=NOT_AUTOMATED_YET,
+            csrf=csrf_token(cfg.token),
+            ran=(query.get("ran") or [""])[0],
+        ),
+        None,
+    )
 
 
 def needs_database(
@@ -141,9 +171,10 @@ def needs_database(
 
     @functools.wraps(page)
     def guarded(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-        state = _deployment_state(cfg)
-        if not state.has_usable_database:
-            return "Setup", render.render_setup(state), None
+        if not _deployment_state(cfg).has_usable_database:
+            # The full setup page, not a bare checklist: someone who lands here has nothing set
+            # up, and the actions are the reason they are being shown this instead of a 500.
+            return page_setup(cfg, query)
         return page(cfg, query)
 
     return guarded
@@ -253,6 +284,22 @@ ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, 
 }
 
 
+#: The write surface, in full. A path here maps to one `keel.commands.setup.Action`; there is no
+#: other way into this handler, and no other verb.
+SETUP_ACTION_PREFIX = "/setup/"
+
+
+def run_setup_action(cfg: ServeConfig, key: str) -> Any:
+    """Perform one declared mechanical action. Returns its `ActionResult`, or `None` for a key
+    that is not in the closed set -- never a lookup that falls through to something else."""
+    from keel.commands.setup import action_for
+
+    action = action_for(key)
+    if action is None:
+        return None
+    return action.run(Path(cfg.config_path), Path(cfg.db_path))
+
+
 def _close(repo: Any) -> None:
     conn = getattr(repo, "conn", None)
     if conn is not None:
@@ -274,8 +321,12 @@ def _close(repo: Any) -> None:
 _SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     (
         "Content-Security-Policy",
+        # `form-action 'self'`, not `'none'`: the setup form posts back here, and `'none'`
+        # would have the browser silently refuse it. `'self'` is still the tightest value that
+        # works -- a form on this page cannot be made to submit anywhere else, which is what the
+        # directive is for.
         "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; "
-        "form-action 'none'; base-uri 'none'",
+        "form-action 'self'; base-uri 'none'",
     ),
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
@@ -335,9 +386,96 @@ class KeelHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # -- shared admission --
+    def _admitted(self) -> bool:
+        """Host header, then session cookie. `False` means a refusal has already been sent.
+
+        Factored out so GET and POST cannot drift into two admission policies -- a write path
+        with a laxer check than the read path is exactly the shape of a bug nobody notices."""
+        if not self.cfg.host_policy.permits(self.headers.get("Host")):
+            # DNS rebinding lands exactly here: the packet arrived on loopback, so the bind check
+            # passed, and only the header tells the truth about who the browser thinks it is
+            # talking to.
+            self._refuse(
+                403,
+                "Refused",
+                "This request did not come from the address keel is serving on.",
+            )
+            return False
+        cookies = parse_cookie_header(self.headers.get("Cookie"))
+        if not tokens_match(cookies.get(SESSION_COOKIE), self.cfg.token):
+            self._refuse(
+                403,
+                "Not authorised",
+                "Open the address keel printed when it started -- it carries a one-time token "
+                "for this session. The token is new every run and is never written to disk.",
+            )
+            return False
+        return True
+
     # -- the request --
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib's naming, not ours
         self.do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib's naming, not ours
+        """The ENTIRE write surface (#437). Read `keel/web/__init__.py` before extending it.
+
+        Four refusals before anything is performed, and then a lookup in a closed set. There is
+        no dynamic dispatch here, no getattr on a user-supplied name, and no path that reaches
+        keel other than `keel.commands.setup.ACTIONS` -- which contains three idempotent,
+        non-destructive, `MECHANICAL` steps and cannot contain anything else without failing a
+        test."""
+        parsed = urlsplit(self.path)
+        if not self._admitted():
+            return
+
+        if not parsed.path.startswith(SETUP_ACTION_PREFIX):
+            # Not "method not allowed" -- there is no write surface at this path at all, and
+            # saying so is both true and less informative to someone probing.
+            self._refuse(404, "No such action", f"Nothing accepts a POST at {parsed.path}.")
+            return
+
+        body = self._read_form()
+        if not tokens_match(body.get("csrf"), csrf_token(self.cfg.token)):
+            # `SameSite=Strict` already stops a cross-site POST in any current browser. This is
+            # the layer that does not depend on the browser being current.
+            self._refuse(
+                403,
+                "Refused",
+                "That form did not carry this session's write token. Reload the page and try "
+                "again.",
+            )
+            return
+
+        key = parsed.path[len(SETUP_ACTION_PREFIX) :]
+        try:
+            result = run_setup_action(self.cfg, key)
+        except Exception as exc:
+            self._refuse(500, "That step could not be completed", f"{type(exc).__name__}: {exc}")
+            return
+        if result is None:
+            self._refuse(404, "No such action", f"{key!r} is not a setup step keel performs.")
+            return
+
+        # POST/redirect/GET: a browser reload must not re-submit. The actions are idempotent, so
+        # a re-submission would be harmless -- but "harmless" is not a reason to leave a
+        # re-submitting page in a setup flow someone is clicking nervously.
+        self._send(303, "", extra=(("Location", f"/setup?ran={quote(result.step_key)}"),))
+
+    def _read_form(self) -> dict[str, str]:
+        """The urlencoded body, bounded.
+
+        Bounded because `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
+        primitive, and this server has no proxy in front of it to impose a limit. A setup form
+        carries an action key and a token; anything past a few kilobytes is not one."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if length <= 0 or length > _MAX_FORM_BYTES:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        return {key: values[0] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib's naming, not ours
         parsed = urlsplit(self.path)
@@ -346,7 +484,8 @@ class KeelHandler(BaseHTTPRequestHandler):
         if not self.cfg.host_policy.permits(self.headers.get("Host")):
             # DNS rebinding lands exactly here: the packet arrived on loopback, so the bind check
             # passed, and only the header tells the truth about who the browser thinks it is
-            # talking to.
+            # talking to. Checked before the token exchange below, so a rebinding attempt cannot
+            # probe token validity by watching which refusal it gets.
             self._refuse(
                 403,
                 "Refused",
@@ -371,14 +510,7 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return
 
-        cookies = parse_cookie_header(self.headers.get("Cookie"))
-        if not tokens_match(cookies.get(SESSION_COOKIE), self.cfg.token):
-            self._refuse(
-                403,
-                "Not authorised",
-                "Open the address keel printed when it started -- it carries a one-time token "
-                "for this session. The token is new every run and is never written to disk.",
-            )
+        if not self._admitted():
             return
 
         handler = ROUTES.get(parsed.path)
