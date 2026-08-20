@@ -155,7 +155,7 @@ from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
 from keel.commands.rules import rules_group, rules_seed
 from keel.commands.serve import serve_cmd
-from keel.commands.setup import setup_cmd
+from keel.commands.setup import setup_cmd, template_config_text
 from keel.commands.simulate import (
     SIM_SLIPPAGE_PCT as _SIM_SLIPPAGE_PCT,  # noqa: F401 -- pinned by tests
 )
@@ -285,17 +285,11 @@ def cli(
 # -- init (scaffold a working directory) ----------------------------------------------------
 
 
-def _template_config_text(live: bool = False) -> str:
-    """A config.yaml template shipped inside the wheel (see pyproject `artifacts`).
-
-    `live=False` returns the dev template (`mode: paper` -- places nothing). `live=True` returns
-    the production template (`mode: confirm` -- previews every order and waits for approval),
-    which is also the `config.yaml` attached to a GitHub Release.
-    """
-    from importlib.resources import files
-
-    name = "config.live.yaml" if live else "config.yaml"
-    return (files("keel.templates") / name).read_text(encoding="utf-8")
+#: Re-exported from `keel.commands.setup`, its home since #437 -- the first-run setup service
+#: needs it, and a service may not import the CLI (`tests/commands/test_service_isolation.py`
+#: pins that, and caught this import pointing the wrong way). The name stays bound here because
+#: tests and `init_config` below reach it through this module.
+_template_config_text = template_config_text
 
 
 @cli.command("init-config")

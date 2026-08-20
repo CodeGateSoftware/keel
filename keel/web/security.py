@@ -23,8 +23,20 @@ Four independent layers, none of which is sufficient alone:
    `Lax` attaches the cookie to top-level navigations, so a link on a hostile page would arrive
    authenticated. Nothing is persisted -- close the server and the token is gone.
 
-4. **GET and HEAD only** removes the write surface, structurally: `keel/web/server.py` implements
-   those two handlers and no others, so a POST is refused by the stdlib before any keel code runs.
+4. **A closed set of setup actions** is the whole write surface. `POST` exists now (#437 -- a
+   first-run user on a machine with no terminal has to be able to create a deployment somehow),
+   but it routes ONLY through `keel.commands.setup.ACTIONS`, every member of which is a step
+   declared `MECHANICAL`, is idempotent and is never destructive. Not one of the eleven
+   capability-increasing actions in `keel/capabilities.py` is reachable, and a test asserts the
+   two sets are disjoint. That is a narrower guarantee than "no POST at all" was, and a more
+   useful one: "no POST" would have been satisfied by a server that could not set anything up,
+   while this is satisfied only by one that cannot arm, release or spend anything.
+
+5. **A CSRF token** on every write. The `SameSite=Strict` cookie already stops a cross-site POST
+   in any current browser; this is the layer that does not depend on the browser being current.
+   It is derived from the session token by HMAC rather than stored, so there is no server-side
+   session table to expire, and it is deliberately NOT the session token itself -- that one is
+   `HttpOnly` and must never be written into the page.
 
 The token comparison uses `secrets.compare_digest`; a `==` on a secret leaks its prefix through
 timing, and the fact that this is loopback traffic makes the measurement *easier*, not harder.
@@ -32,6 +44,8 @@ timing, and the fact that this is loopback traffic makes the measurement *easier
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import secrets
 from dataclasses import dataclass
 
@@ -54,6 +68,21 @@ def new_session_token() -> str:
     """A fresh token for one `keel serve` run. Never written to disk: a token that outlives the
     process it authorised is a credential, and this package deliberately does not manage any."""
     return secrets.token_urlsafe(_TOKEN_BYTES)
+
+
+#: Domain separation for the CSRF derivation: this label is what stops the derived value from
+#: being usable as, or confusable with, the session token itself.
+_CSRF_LABEL = b"keel/web/csrf/v1"
+
+
+def csrf_token(session_token: str) -> str:
+    """The write token for a session, derived rather than stored.
+
+    Derived, so there is no server-side session table to keep, expire or leak, and so it dies
+    with the session token it comes from. HMAC rather than a plain hash so that seeing the CSRF
+    value -- which is written into the page, unlike the `HttpOnly` cookie -- does not let anyone
+    work backwards to the session token."""
+    return hmac.new(session_token.encode("utf-8"), _CSRF_LABEL, hashlib.sha256).hexdigest()
 
 
 def tokens_match(presented: str | None, expected: str) -> bool:

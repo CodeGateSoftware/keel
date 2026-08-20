@@ -426,9 +426,7 @@ def run_rule_backtest(
     "REQUIRED for promotion: without it the check cannot run, and an un-run check is not a "
     "pass. Use `keel trials list` to find the session your parameter sweep recorded under.",
 )
-@click.option(
-    "--pbo-blocks", default=16, show_default=True, help="S: number of CSCV row blocks."
-)
+@click.option("--pbo-blocks", default=16, show_default=True, help="S: number of CSCV row blocks.")
 @click.pass_context
 @with_disclaimer
 def rules_promote(
@@ -527,8 +525,7 @@ def attempt_promotion(
         target = promotion_mod.next_status(row["status"])
         if target is None:
             sink(
-                f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; "
-                "nothing to promote"
+                f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; nothing to promote"
             )
             return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"])
         repo.update_rule_status(rule_id, target)
@@ -557,9 +554,7 @@ def attempt_promotion(
     rule = agent._build_rule(row)
     fee_pct, fee_source = _backtest_fee(config)
     stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
-    sink(
-        f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}"
-    )
+    sink(f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}")
 
     # #338: the sample-size axis also has a POOLED reading -- the same parameters'
     # evidence on other products. Siblings are `paper` rows with identical params
@@ -668,9 +663,7 @@ def apply_rule_demote(
     row = _rule_row_or_refuse(repo, rule_id, echo_err)
     prev = _DEMOTE_PREV.get(row["status"])
     if prev is None:
-        sink(
-            f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; nothing to demote"
-        )
+        sink(f"rule {rule_id} ({row['kind']}): already at {row['status']!r}; nothing to demote")
         return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"])
     repo.update_rule_status(rule_id, prev)
     sink(f"rule {rule_id} ({row['kind']}): status -> {prev}")
@@ -788,6 +781,62 @@ def _json_plain(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class SeedOutcome:
+    """What one seeding pass did. `seeded`/`skipped` are `kind:product` labels, in the order the
+    pass produced them."""
+
+    seeded: tuple[str, ...]
+    skipped: tuple[str, ...]
+    status: str
+
+
+def seed_rules_into(
+    repo: Any,
+    kinds: list[str],
+    products: list[str],
+    *,
+    status: str,
+    force: bool,
+    now_ts: int,
+) -> SeedOutcome:
+    """Insert one rule row per (kind, product) that has none. THE seeding pass -- extracted from
+    `rules_seed` so the CLI and the first-run setup path (#437) share one implementation rather
+    than two that drift.
+
+    Idempotent by (kind, product_id): a pair that already has a row of ANY status is skipped
+    unless `force`. That is what makes it safe to call from a setup flow a user may click twice.
+
+    Validation belongs to the CALLER. `rules_seed` refuses an untradeable product id through
+    `parse_products_option` before reaching here, naming it, with nothing written -- and any other
+    caller must do the same. This function trusts its arguments, which is why it is not public
+    API for arbitrary input.
+    """
+    existing_keys = {
+        (row["kind"], (row["params"] or {}).get("product_id")) for row in repo.get_rules()
+    }
+
+    seeded: list[str] = []
+    skipped: list[str] = []
+    for kind in kinds:
+        for product in products:
+            label = f"{kind}:{product}"
+            if not force and (kind, product) in existing_keys:
+                skipped.append(label)
+                continue
+            # Via `build_rule_from_params` rather than `RULE_REGISTRY[kind](product_id=...)`:
+            # that function is documented as THE `(kind, params)` -> `Rule` boundary, and this
+            # was the one caller reaching around it. With `product_id` as the only param none
+            # of its coercion tables apply, so it calls the very same constructor -- but a rule
+            # kind that later needs coercion for a seeded default gets it here for free.
+            rule = agent.build_rule_from_params(kind, {"product_id": product})
+            params = _json_plain(rule.describe()["params"])
+            params["product_id"] = product
+            repo.insert_rule(kind, params, status=status, now_ts=now_ts)
+            seeded.append(label)
+    return SeedOutcome(seeded=tuple(seeded), skipped=tuple(skipped), status=status)
+
+
 @rules_group.command("seed")
 @click.option(
     "--products",
@@ -883,30 +932,10 @@ def rules_seed(
         ctx.exit(1)
         return
 
-    existing_keys = {
-        (row["kind"], (row["params"] or {}).get("product_id")) for row in repo.get_rules()
-    }
-
-    seeded: list[str] = []
-    skipped: list[str] = []
-    for kind in kind_list:
-        for product in product_list:
-            label = f"{kind}:{product}"
-            if not force and (kind, product) in existing_keys:
-                skipped.append(label)
-                continue
-            # Via `build_rule_from_params` rather than `RULE_REGISTRY[kind](product_id=...)`:
-            # that function is documented as THE `(kind, params)` -> `Rule` boundary, and this
-            # was the one caller reaching around it. With `product_id` as the only param none
-            # of its coercion tables apply, so it calls the very same constructor -- but a rule
-            # kind that later needs coercion for a seeded default gets it here for free. Its
-            # unknown-kind `ValueError` cannot fire: `kind_list` is checked against the registry
-            # above and exits non-zero before this loop.
-            rule = agent.build_rule_from_params(kind, {"product_id": product})
-            params = _json_plain(rule.describe()["params"])
-            params["product_id"] = product
-            repo.insert_rule(kind, params, status=status, now_ts=now_ts)
-            seeded.append(label)
+    outcome = seed_rules_into(
+        repo, kind_list, product_list, status=status, force=force, now_ts=now_ts
+    )
+    seeded, skipped = outcome.seeded, outcome.skipped
 
     click.echo(f"seeded={len(seeded)} skipped={len(skipped)} status={status}")
     if status == "live":
@@ -1032,8 +1061,7 @@ def _param_type_mismatches(kind: str, rule_cls: type, supplied: dict[str, Any]) 
             problems.append(f"{name}={value!r} should be a quoted string (default {default!r})")
         elif isinstance(default, (bool, int, float)) and isinstance(value, str):
             problems.append(
-                f"{name}={value!r} is quoted, but {kind} wants a number here "
-                f"(default {default!r})"
+                f"{name}={value!r} is quoted, but {kind} wants a number here (default {default!r})"
             )
         elif (
             isinstance(default, int)
@@ -1329,9 +1357,7 @@ def add_rule_row(
 
     rule_cls = agent.RULE_REGISTRY.get(kind)
     if rule_cls is None:
-        echo_err(
-            f"Error: unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}"
-        )
+        echo_err(f"Error: unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}")
         raise RulesRefused(f"unknown rule kind {kind!r}")
 
     # "flag absent" and "flag given but empty" are different intentions, and only `is None`
@@ -1343,9 +1369,9 @@ def add_rule_row(
     if params_json is not None and not params_json.strip():
         raise RulesUsageError(
             "was given as an EMPTY string, which is not the same as omitting the flag. This is "
-            "almost always a shell accident (`--params \"$(jq -c .params proposal.json)\"` "
+            'almost always a shell accident (`--params "$(jq -c .params proposal.json)"` '
             "yields an empty string when the key is missing or jq fails), and taking it as "
-            "\"use the defaults\" would print a rule id for a row that is NOT the parameter set "
+            '"use the defaults" would print a rule id for a row that is NOT the parameter set '
             "you meant to measure. Pass '{}' to ask for the kind's defaults deliberately, or "
             "omit --params entirely.",
             param_hint="--params",
@@ -1452,9 +1478,7 @@ def add_rule_row(
             f"one:"
         )
         for row in existing:
-            sink(
-                f"    [{row['id']}] status={row['status']} {_params_delta(row['params'], params)}"
-            )
+            sink(f"    [{row['id']}] status={row['status']} {_params_delta(row['params'], params)}")
     sink(f"next: keel rules backtest {rule_id}")
     return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status="candidate")
 
@@ -1533,8 +1557,7 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
     # offers everything it accepts (the honest fallback; no registered kind hits it).
     try:
         persisted = set(
-            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
-            .describe()["params"]
+            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"}).describe()["params"]
         )
     except (TypeError, ValueError, ArithmeticError):
         persisted = None
