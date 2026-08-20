@@ -20,7 +20,7 @@ from keel.web import server as web_server
 from keel.web.security import SESSION_COOKIE, new_session_token
 from tests.conftest import VALID_CONFIG_YAML
 
-ROUTES = ("/", "/activity", "/insights", "/rules", "/venues", "/glossary")
+ROUTES = ("/", "/activity", "/insights", "/rules", "/venues", "/gates", "/glossary")
 
 
 @pytest.fixture
@@ -285,3 +285,28 @@ def test_the_printed_url_is_the_one_that_carries_the_token(
     url = running.url()
     assert url.startswith(f"http://{running.host}:{running.port}/?token=")
     assert running.token in url
+
+
+def test_the_nav_and_the_routing_table_agree() -> None:
+    """A page with no nav entry is unreachable; a nav entry with no page is a 404 the user is
+    invited to click. Neither is caught by testing either side alone."""
+    from keel.web import render
+
+    assert {href for href, _label in render.NAV} == set(web_server.ROUTES)
+    assert set(ROUTES) == set(web_server.ROUTES), "this test module's list drifted from the server"
+
+
+def test_the_gates_page_names_every_capability_and_claims_none_of_them(
+    running: web_server.ServeConfig,
+) -> None:
+    """The audit surface #436 asks for. It must list every gated action -- and say plainly that
+    this view cannot perform any of them, which is true because no write verb is served."""
+    from keel.capabilities import CAPABILITIES
+    from keel.web import render
+
+    _status, _headers, body = _request(running, "/gates", cookie=_session(running))
+    for cap in CAPABILITIES:
+        # Escaped, not raw: an invocation containing an apostrophe reaches the page as `&#x27;`,
+        # and asserting on the raw form would quietly stop checking those rows.
+        assert render.esc(cap.invocation) in body, cap.invocation
+    assert "cannot perform any of them" in body

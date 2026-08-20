@@ -127,6 +127,7 @@ from keel.commands.assets import (
 from keel.commands.assets import screen_product as _screen_product
 from keel.commands.autonomy import autonomy_group
 from keel.commands.brokers import brokers_group
+from keel.commands.capabilities import capabilities_cmd
 
 # The order-preview confirmation gate lives in `keel.commands.confirm` (issue #387 C1: the CLI
 # and the TUI must hand the executor ONE confirm function, never a front-end copy). Re-imported
@@ -1322,6 +1323,15 @@ cli.add_command(tui_cmd)
 # construction (GET and HEAD are the only verbs it implements), and pinned by the same thinness
 # test as the console layer. Defined in `keel.commands.serve` over `keel.web`.
 cli.add_command(serve_cmd)
+
+
+# -- capabilities (the audit surface for the TTY gate) -------------------------------------------
+
+# `keel/capabilities.py` declares every action that increases what keel can do without asking
+# again, and which gate covers it; `tests/test_capabilities.py` checks that declaration against
+# the source in both directions. This command prints it, so the question "what can a cron job
+# reach?" is answerable from the running binary rather than from a grep of the repository.
+cli.add_command(capabilities_cmd)
 
 
 # -- insights (read-only promotion-gate + journal reporting, no broker call) --------------------
