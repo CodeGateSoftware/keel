@@ -628,12 +628,19 @@ class RobinhoodTransport:
         partially-filled-then-cancelled order, whose fee was really charged. See
         `adapter._fees_paid` for why `updated_at` rather than `created_at`.
 
-        ⚠️ **Neither this endpoint nor any order object it returns has ever been observed live.**
-        `scripts/robinhood_smoke.py` can now probe it read-only, but until an operator with a real
-        credential runs that, the envelope shape, the page size, and every field name below the
-        `results` key are read from the documentation alone -- the same standing on which the
-        `rh_order_*.json` fixtures sit, and the same standing that #217 proved wrong four times
-        over on the endpoints that COULD be probed.
+        Both this endpoint and the order objects it returns were observed live on 2026-08-20
+        (#412), against an account carrying exactly one order. The envelope is
+        `{"next": ..., "previous": ..., "results": [...]}` as documented, and every field name in
+        `rh_orders.json`'s `results[]` is transcribed from that response -- including the four the
+        documentation-derived fixture had wrong: `filled_asset_quantity`,
+        `limit_order_config.asset_quantity` and `limit_order_config.limit_price` all arrive as
+        QUOTED strings padded to 18 decimal places, and `limit_order_config.time_in_force` is not
+        echoed back at all despite being accepted on the way in.
+
+        ⚠️ What that single row could NOT settle is what a MARKET order or a FILLED order looks
+        like: it was a limit buy priced 50% below the bid, so `market_order_config`,
+        `average_price` and the `executions[]` rows below it remain read from the documentation
+        alone -- the same standing that #217 proved wrong four times over.
 
         `limit` is not sent: the docs' pagination section says only "some of our endpoints support
         this query parameter" and directs the reader to each endpoint's own parameter list, and

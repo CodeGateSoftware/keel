@@ -4,8 +4,13 @@
 of this adapter that only exists once an order does: the placement response's `state` values, the
 per-order `fee_charged` that `get_fee_summary` sums, whether a cancel `200` actually confirms, and
 every field name in `tests/fixtures/rh_order_open.json`, `rh_order_filled.json`,
-`rh_order_canceled.json` and `rh_orders.json`. All four fixtures are transcribed from
-documentation and have never been corroborated by a live response.
+`rh_order_canceled.json` and `rh_orders.json`.
+
+This script has now been run once, on 2026-08-20, against a real credential. It placed one
+BTC-USD limit buy -- 0.0001 BTC at $36,352.78, 50% below the bid -- observed it, and cancelled
+it. `rh_order_open.json`, `rh_order_canceled.json` and `rh_orders.json`'s `results[]` shape are
+that order's own responses. `rh_order_filled.json` is still documentation-derived and cannot be
+anything else while this script works the way it does: an order that CAN fill is not a probe.
 
 Robinhood publishes no sandbox (`adapter.py`'s module docstring), and the conformance suite calls
 `place_order` and so must never see live credentials (`conformance/suite.py`). So one real order
@@ -63,6 +68,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -87,6 +93,12 @@ _DEFAULT_BASE_SIZE = Decimal("0.0001")
 
 _DEFAULT_SYMBOL = "BTC-USD"
 
+#: How many times, and how far apart, `run` re-reads a cancelled order waiting for it to leave
+#: `open`. The 2026-08-20 run (#412) saw the venue take ~1.1s; ~15s of patience is far more than
+#: that and still bounded, and unlike `adapter.cancel_order` nothing here is on an exit path.
+_CANCEL_SETTLE_POLLS = 10
+_CANCEL_SETTLE_INTERVAL = 1.5
+
 
 class OrderProbeRefused(RuntimeError):
     """A fence rejected the run. Never means the venue said no -- it means we did."""
@@ -107,6 +119,14 @@ class _OneOrderOnly:
     def __init__(self, transport: Any) -> None:
         self._transport = transport
         self.calls: list[tuple[str, str]] = []
+        #: Last raw decoded response per `(METHOD, path-shape)`, so `run` can record the bodies
+        #: that `adapter.place_order` and `adapter.cancel_order` consume and reduce to a
+        #: `PlacementResult` and a `bool`. The 2026-08-20 run (#412) lost both: the cancel `200`
+        #: turned out to be an acknowledgement rather than a confirmation, and the evidence for
+        #: that had to be reconstructed from the surrounding polls because the body itself was
+        #: never written down. A probe whose entire purpose is recording shapes must not discard
+        #: the two responses only it can reach.
+        self.responses: dict[str, Any] = {}
         self.orders_created = 0
         self._inner = transport._request
         transport._request = self._request
@@ -124,7 +144,12 @@ class _OneOrderOnly:
                 )
             self.orders_created += 1
         self.calls.append((method.upper(), path))
-        return self._inner(method, path, **kwargs)
+        response = self._inner(method, path, **kwargs)
+        if creating:
+            self.responses["placement"] = response
+        elif path.rstrip("/").endswith("/cancel"):
+            self.responses["cancel"] = response
+        return response
 
 
 #: Wraps a `Decimal`'s exact digits so `dumps_venue_json` can unquote them afterwards. Chosen to
@@ -351,11 +376,15 @@ def run(
         "client_order_id": resolve_client_order_id(idempotency_key),
         "placed": None,
         "placement_error": None,
+        "placement_response": None,
         "observed": None,
         "cancel_confirmed": None,
+        "cancel_response": None,
         "after_cancel": None,
+        "settled": None,
         "orders_list": None,
     }
+    tee: dict[str, Any] = getattr(transport, "responses", {})
 
     try:
         placed = adapter.place_order(spec, idempotency_key=idempotency_key)
@@ -368,6 +397,12 @@ def run(
         "broker_order_id": placed.broker_order_id,
         "reason": placed.reason,
     }
+    # The POST's own body, which `place_order` reduces to the three fields above. It is the only
+    # sighting of a placement response there will ever be, and it is the one that carries the
+    # venue's rejection vocabulary when `state` comes back already terminal.
+    if "placement" in tee:
+        report["placement_response"] = tee["placement"]
+        record(out_dir, "rh_order_placement_observed", tee["placement"])
     order_id = placed.broker_order_id
     if not placed.success or order_id is None:
         # Nothing is resting, so there is nothing to cancel and no `finally` to enter. A refusal
@@ -384,8 +419,26 @@ def run(
         # Unconditional. An exception above must not leave a live resting order behind, and this
         # is the only process that knows the id.
         report["cancel_confirmed"] = adapter.cancel_order(order_id)
+        if "cancel" in tee:
+            report["cancel_response"] = tee["cancel"]
+            record(out_dir, "rh_order_cancel_response_observed", tee["cancel"])
         report["after_cancel"] = transport.get_order(order_id)
-        record(out_dir, "rh_order_canceled_observed", report["after_cancel"])
+        record(out_dir, "rh_order_after_cancel_observed", report["after_cancel"])
+        # A SECOND read, after a bounded wait. On 2026-08-20 (#412) the cancel took ~1.1s to
+        # settle, so `after_cancel` above recorded the order still `open` and the run produced no
+        # observation of the terminal state at all -- the fixture named `rh_order_canceled.json`
+        # was filled in from a hand-written poll afterwards. Waiting here is safe in a way it is
+        # not inside `adapter.cancel_order`: this is a recording script, not the executor's exit
+        # path, so a few seconds costs nothing but a few seconds.
+        for attempt in range(_CANCEL_SETTLE_POLLS):
+            settled = transport.get_order(order_id)
+            report["settled"] = settled
+            if settled is not None and settled.get("state") != "open":
+                break
+            if attempt + 1 < _CANCEL_SETTLE_POLLS:
+                time.sleep(_CANCEL_SETTLE_INTERVAL)
+        if report["settled"] is not None:
+            record(out_dir, "rh_order_canceled_observed", report["settled"])
     return report
 
 

@@ -28,6 +28,7 @@ from keel_broker_api.results import (
     SessionState,
 )
 from keel_broker_robinhood import RobinhoodAdapter
+from keel_broker_robinhood.translate import STATE_TO_PORT_STATUS, TIME_IN_FORCE
 from keel_core.types import Granularity, Side
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -724,13 +725,16 @@ def test_get_order_maps_fill_quantity_average_price_and_fee() -> None:
 
 
 def test_get_order_reads_the_same_money_whether_the_venue_quotes_it_or_not() -> None:
-    """The order fixtures are the three this repository has never seen live, on a venue that is
-    demonstrably inconsistent about quoting (#217 F6).
+    """`rh_order_filled.json` is the one order fixture this repository has never seen live, on a
+    venue that is demonstrably inconsistent about quoting (#217 F6).
 
-    Observing an order object means placing a real order, which the probe refuses by construction,
-    so `average_price` / `filled_asset_quantity` / `fee_charged` could arrive either way and this
-    package has no basis to prefer one. Rather than commit to a guess in the fixture and leave the
-    other half untested, this drives BOTH forms through `get_order` and requires identical
+    Observing a FILLED order means placing an order that can fill, which the probe refuses by
+    construction -- it prices its order 50% below the bid for exactly that reason -- so
+    `average_price` and a non-zero `fee_charged` could still arrive either way and this package
+    has no basis to prefer one. The 2026-08-20 live run (#412) proved the concern is not
+    hypothetical: the same order object quotes `filled_asset_quantity` as a string while sending
+    `fee_charged` as an unquoted number. Rather than commit to a guess in the fixture and leave
+    the other half untested, this drives BOTH forms through `get_order` and requires identical
     `Decimal`s out. `Decimal(str(value))` is what makes that true -- exact for a `str`, a
     round-trip no-op for a `Decimal` -- and this is the test that fails if anyone "simplifies" it
     to `Decimal(value)`.
@@ -751,6 +755,92 @@ def test_get_order_reads_the_same_money_whether_the_venue_quotes_it_or_not() -> 
     assert orders[0] == orders[1]
     assert orders[0].average_filled_price == Decimal("65420.75")
     assert orders[0].total_fees == Decimal("1.6355")
+
+
+# --- what the venue actually sends (#412, observed 2026-08-20) -------------------------------
+# `rh_order_open.json` and `rh_order_canceled.json` are one real BTC-USD limit buy's own
+# responses -- placed 50% below the bid so it could not fill, polled, cancelled. Before that run
+# both were transcribed from Robinhood's documentation, and the documentation was wrong about
+# four fields. These pin the corrections, because the failure mode they guard is silent: an
+# adapter reading a field the venue does not send gets `None`, and `None` money reads as zero.
+
+_OBSERVED_ORDER_FIXTURES = ("rh_order_open.json", "rh_order_canceled.json")
+
+
+@pytest.mark.parametrize("name", _OBSERVED_ORDER_FIXTURES)
+def test_the_venue_quotes_order_sizes_and_prices_as_strings(name: str) -> None:
+    """Sizes and prices on an ORDER object arrive QUOTED, padded to 18 decimal places.
+
+    The doc-derived fixtures had all three of these as unquoted JSON numbers, which
+    `load_fixture`'s `parse_float=Decimal` would have turned into `Decimal`s. That is the wrong
+    half of #217 F6 for this endpoint, and it matters beyond tidiness: `_decimal_or_none` and
+    `Decimal(str(...))` are written to accept both forms precisely because this venue mixes them
+    within ONE object, and a fixture that carries only the unquoted form stops exercising the
+    branch that production actually takes.
+    """
+    order = load_fixture(name)
+
+    assert isinstance(order["filled_asset_quantity"], str)
+    assert isinstance(order["limit_order_config"]["asset_quantity"], str)
+    assert isinstance(order["limit_order_config"]["limit_price"], str)
+
+
+@pytest.mark.parametrize("name", _OBSERVED_ORDER_FIXTURES)
+def test_the_venue_does_not_echo_time_in_force_back_on_an_order(name: str) -> None:
+    """`time_in_force` is accepted on the way IN and absent on the way OUT.
+
+    `to_order_body` sends `"time_in_force": "gtc"` and the venue accepted it -- the observed order
+    was created. It simply does not appear in `limit_order_config` on any response. The
+    doc-derived fixtures invented it, and an invented field is the dangerous direction: it is how
+    a reader concludes the venue confirms a time-in-force it never states.
+    """
+    order = load_fixture(name)
+
+    assert "time_in_force" not in order["limit_order_config"]
+    assert TIME_IN_FORCE == "gtc", "still sent on the way in; only the echo is absent"
+
+
+@pytest.mark.parametrize("name", _OBSERVED_ORDER_FIXTURES)
+def test_fee_charged_is_spelled_that_way_and_arrives_unquoted(name: str) -> None:
+    """The single sharpest risk #412 names, closed by observation.
+
+    If the venue spelled this field anything else, every row would parse to `None`,
+    `_fees_paid` would skip every row, and `get_fee_summary().fees_usd` would be a confident
+    `Decimal("0")` -- an always-passing fee rail, indistinguishable from a correct zero and
+    therefore worse than no rail at all. It is spelled `fee_charged`, it is present on every order
+    object observed, and it is an unquoted JSON number, so `load_fixture` yields a `Decimal`.
+    """
+    order = load_fixture(name)
+
+    assert "fee_charged" in order
+    assert isinstance(order["fee_charged"], Decimal)
+    assert isinstance(order["estimated_fee_remaining"], Decimal)
+
+
+def test_the_observed_states_both_translate_and_neither_is_the_ports_spelling() -> None:
+    """`open` and `canceled` are the two states the live run actually produced.
+
+    Every other entry in `STATE_TO_PORT_STATUS` is still read from Robinhood's docs -- the probe
+    cannot produce a `filled` or a `failed` without placing an order that can fill or an order it
+    expects to be refused. Pinning the two that ARE observed keeps the American single-`l`
+    `canceled` from drifting toward the port's `CANCELLED`, which is the one rename that would
+    silently turn every confirmed cancel into a `False`.
+    """
+    assert load_fixture("rh_order_open.json")["state"] == "open"
+    assert load_fixture("rh_order_canceled.json")["state"] == "canceled"
+    assert STATE_TO_PORT_STATUS["open"] == "OPEN"
+    assert STATE_TO_PORT_STATUS["canceled"] == "CANCELLED"
+
+
+def test_the_observed_order_fixtures_carry_no_real_account_number() -> None:
+    """The observations are real responses from a real funded account, so the one field that
+    identifies it is replaced by the repository's existing placeholder before it is committed.
+    The order UUIDs are kept: they are random and identify nothing once the account does not."""
+    for name in (*_OBSERVED_ORDER_FIXTURES, "rh_orders.json"):
+        payload = load_fixture(name)
+        rows = payload.get("results", [payload])
+        for row in rows:
+            assert row["account_number"] == "AB1234567890"
 
 
 def test_get_order_maps_canceled_state_to_the_ports_doubled_l_spelling() -> None:

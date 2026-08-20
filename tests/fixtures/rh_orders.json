@@ -3,95 +3,113 @@
   "previous": null,
   "results": [
     {
-      "id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+      "symbol": "BTC-USD",
+      "client_order_id": "9c8ecd0f-6842-5d7c-a156-fb5db925cc6d",
+      "side": "buy",
+      "type": "limit",
+      "id": "6a8738ba-836d-4afd-abd8-483d7e4d01c9",
       "account_number": "AB1234567890",
+      "state": "canceled",
+      "filled_asset_quantity": "0.000000000000000000",
+      "executions": [],
+      "average_price": null,
+      "created_at": "2026-08-20T13:26:18.409035-04:00",
+      "updated_at": "2026-08-20T13:26:20.891890-04:00",
+      "fee_charged": 0.0,
+      "estimated_fee_remaining": 0.0,
+      "limit_order_config": {
+        "asset_quantity": "0.000100000000000000",
+        "limit_price": "36352.780000000000000000"
+      }
+    },
+    {
       "symbol": "BTC-USD",
       "client_order_id": "9f8e7d6c-5b4a-3c2d-1e0f-9a8b7c6d5e4f",
       "side": "sell",
       "type": "market",
+      "id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+      "account_number": "AB1234567890",
       "state": "filled",
-      "average_price": 65420.75,
-      "filled_asset_quantity": 0.1,
-      "created_at": "2026-08-09T11:55:00.000000Z",
-      "updated_at": "2026-08-09T11:55:01.000000Z",
-      "fee_charged": 1.6355,
-      "estimated_fee_remaining": 0,
+      "filled_asset_quantity": "0.100000000000000000",
       "executions": [
         {
-          "effective_price": 65420.75,
-          "quantity": 0.1,
-          "timestamp": "2026-08-09T11:55:01.000000Z"
+          "effective_price": "65420.750000000000000000",
+          "quantity": "0.100000000000000000",
+          "timestamp": "2026-08-20T11:55:01.000000-04:00"
         }
       ],
+      "average_price": 65420.75,
+      "created_at": "2026-08-20T11:55:00.000000-04:00",
+      "updated_at": "2026-08-20T11:55:01.000000-04:00",
+      "fee_charged": 1.6355,
+      "estimated_fee_remaining": 0.0,
       "market_order_config": {
-        "asset_quantity": 0.1
+        "asset_quantity": "0.100000000000000000"
       }
     },
     {
-      "id": "5c6d7e8f-9a0b-1c2d-3e4f-5a6b7c8d9e0f",
-      "account_number": "AB1234567890",
       "symbol": "BTC-USD",
       "client_order_id": "2b3c4d5e-6f7a-8b9c-0d1e-2f3a4b5c6d7e",
       "side": "buy",
       "type": "limit",
+      "id": "5c6d7e8f-9a0b-1c2d-3e4f-5a6b7c8d9e0f",
+      "account_number": "AB1234567890",
       "state": "canceled",
-      "average_price": 64000.0,
-      "filled_asset_quantity": 0.0262,
-      "created_at": "2026-08-09T11:40:00.000000Z",
-      "updated_at": "2026-08-09T11:45:00.000000Z",
-      "fee_charged": 0.42,
-      "estimated_fee_remaining": 0,
+      "filled_asset_quantity": "0.026200000000000000",
       "executions": [
         {
-          "effective_price": 64000.0,
-          "quantity": 0.0262,
-          "timestamp": "2026-08-09T11:42:00.000000Z"
+          "effective_price": "64000.000000000000000000",
+          "quantity": "0.026200000000000000",
+          "timestamp": "2026-08-20T11:42:00.000000-04:00"
         }
       ],
+      "average_price": 64000.0,
+      "created_at": "2026-08-20T11:40:00.000000-04:00",
+      "updated_at": "2026-08-20T11:45:00.000000-04:00",
+      "fee_charged": 0.42,
+      "estimated_fee_remaining": 0.0,
       "limit_order_config": {
-        "asset_quantity": 0.1,
-        "limit_price": 64000.0,
-        "time_in_force": "gtc"
+        "asset_quantity": "0.100000000000000000",
+        "limit_price": "64000.000000000000000000"
       }
     },
     {
-      "id": "8e5f9c2a-1b3d-4e6f-9a2b-7c1d3e5f9a2b",
-      "account_number": "AB1234567890",
       "symbol": "BTC-USD",
       "client_order_id": "3f2e1d4c-5b6a-7c8d-9e0f-1a2b3c4d5e6f",
       "side": "buy",
       "type": "limit",
+      "id": "8e5f9c2a-1b3d-4e6f-9a2b-7c1d3e5f9a2b",
+      "account_number": "AB1234567890",
       "state": "open",
-      "average_price": null,
-      "filled_asset_quantity": 0,
-      "created_at": "2026-08-09T12:00:00.000000Z",
-      "updated_at": "2026-08-09T12:00:00.000000Z",
-      "fee_charged": 0,
-      "estimated_fee_remaining": 0.16,
+      "filled_asset_quantity": "0.000000000000000000",
       "executions": [],
+      "average_price": null,
+      "created_at": "2026-08-20T12:00:00.000000-04:00",
+      "updated_at": "2026-08-20T12:00:00.000000-04:00",
+      "fee_charged": 0.0,
+      "estimated_fee_remaining": 0.16,
       "limit_order_config": {
-        "asset_quantity": 0.1,
-        "limit_price": 64000.0,
-        "time_in_force": "gtc"
+        "asset_quantity": "0.100000000000000000",
+        "limit_price": "64000.000000000000000000"
       }
     },
     {
-      "id": "7d4e2f1a-3b5c-6d8e-0f1a-2b3c4d5e6f7a",
-      "account_number": "AB1234567890",
       "symbol": "ETH-USD",
       "client_order_id": "6a5b4c3d-2e1f-0a9b-8c7d-6e5f4a3b2c1d",
       "side": "buy",
       "type": "market",
+      "id": "7d4e2f1a-3b5c-6d8e-0f1a-2b3c4d5e6f7a",
+      "account_number": "AB1234567890",
       "state": "failed",
-      "average_price": null,
-      "filled_asset_quantity": 0,
-      "created_at": "2026-08-09T10:15:00.000000Z",
-      "updated_at": "2026-08-09T10:15:00.000000Z",
-      "fee_charged": 0,
-      "estimated_fee_remaining": 0,
+      "filled_asset_quantity": "0.000000000000000000",
       "executions": [],
+      "average_price": null,
+      "created_at": "2026-08-20T10:15:00.000000-04:00",
+      "updated_at": "2026-08-20T10:15:00.000000-04:00",
+      "fee_charged": 0.0,
+      "estimated_fee_remaining": 0.0,
       "market_order_config": {
-        "asset_quantity": 0.5
+        "asset_quantity": "0.500000000000000000"
       }
     }
   ]

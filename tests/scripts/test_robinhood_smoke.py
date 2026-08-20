@@ -389,6 +389,49 @@ def test_a_wellformed_credential_is_returned(tmp_path: Path) -> None:
     assert load_credentials(env) == (_VALID_API_KEY, _VALID_SEED_B64)
 
 
+def test_the_credential_can_be_read_from_a_differently_named_variable(tmp_path: Path) -> None:
+    """#412's fix put the real identifier in a NEW variable rather than overwriting the evidence.
+
+    `ROBINHOOD_API_KEY` was found holding the base64 PUBLIC key -- which is why every request
+    401'd -- and the correct `rh-api-<uuid>` identifier went into
+    `ROBINHOOD_API_KEY_CREDENTIAL` beside it. Both slots are therefore populated and only one is
+    usable, so a read-only probe has to be pointed at a chosen pairing. Without this it could
+    only ever read the broken slot, and proving auth BEFORE placing a live order is the entire
+    reason the read-only script exists.
+    """
+    env = _write_env(
+        tmp_path,
+        f"ROBINHOOD_API_KEY={_ITS_PUBLIC_KEY_B64}\n"
+        f"ROBINHOOD_API_KEY_CREDENTIAL={_VALID_API_KEY}\n"
+        f"ROBINHOOD_PRIVATE_KEY={_VALID_SEED_B64}\n",
+    )
+
+    assert load_credentials(env, api_key_var="ROBINHOOD_API_KEY_CREDENTIAL") == (
+        _VALID_API_KEY,
+        _VALID_SEED_B64,
+    )
+    # ...and the default still reads the broken slot and still names the mistake.
+    with pytest.raises(SystemExit, match="PUBLIC key"):
+        load_credentials(env)
+
+
+def test_a_diagnostic_names_the_variable_it_actually_read(tmp_path: Path) -> None:
+    """A message naming `ROBINHOOD_API_KEY` while the operator pointed the script at a different
+    variable sends them to edit the wrong line. Every diagnostic interpolates the chosen name."""
+    env = _write_env(tmp_path, f"ROBINHOOD_PRIVATE_KEY_READ_ONLY={_VALID_SEED_B64}\n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        load_credentials(
+            env,
+            api_key_var="ROBINHOOD_API_KEY_READ_ONLY",
+            private_key_var="ROBINHOOD_PRIVATE_KEY_READ_ONLY",
+        )
+
+    message = str(excinfo.value)
+    assert "ROBINHOOD_API_KEY_READ_ONLY" in message
+    assert "ROBINHOOD_PRIVATE_KEY_READ_ONLY is the base64" in message
+
+
 # --- probes and fixtures agree ---------------------------------------------------------------
 
 
