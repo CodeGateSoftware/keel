@@ -150,33 +150,96 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 # -- the guarantee that replaced "no POST at all" ---------------------------------------------
 
 
-def test_the_write_surface_never_covers_a_judgement_or_an_off_venue_step() -> None:
-    """The line that matters, and it is not "mechanical only" any more.
+def test_the_write_surface_reaches_no_capability_increasing_action() -> None:
+    """THE invariant, and the one the step-kind rule kept being a poor proxy for.
 
-    A MECHANICAL step has no input: the machine does it. An OPERATOR_INPUT step is a FACT only the
-    operator has -- an API key -- which a wizard can record and could not possibly invent. Both
-    are safe to offer as a form.
+    `StepKind` was tried as the rule twice -- "MECHANICAL only", then "MECHANICAL or
+    OPERATOR_INPUT" -- and both were the wrong axis. Two JUDGEMENT steps (attesting an asset,
+    promoting a rule) live in the PAPER stage, so forbidding them bought no safety, because the
+    capability registry already protects the dangerous ones. It only made a terminal-free paper
+    deployment impossible, which is the entire point of the milestone.
 
-    A JUDGEMENT is a DECISION: a Shariah classification, a promotion. A form that recorded one
-    would be making a compliance ruling on the operator's behalf, and no amount of "but they
-    clicked it" makes that the same thing as their having decided it. An OFF_VENUE step happens
-    somewhere keel cannot reach at all. Neither may ever be an action.
-    """
+    What must never be reachable is the eleven. `withdrawals attest --enabled` is among them and
+    is therefore not an action, and this asserts that by IDENTITY rather than by taste."""
+    from keel.capabilities import CAPABILITIES
+    from keel.commands.setup import ACTIONS, STEPS
+
+    gated_invocations = {cap.invocation for cap in CAPABILITIES}
+    by_key = {step.key: step for step in STEPS}
+    for action in ACTIONS:
+        step = by_key[action.key]
+        for invocation in gated_invocations:
+            assert invocation not in step.how, (
+                f"the {action.key} action runs {invocation!r}, which is behind the TTY gate"
+            )
+
+    # The one judgement step that IS among the eleven must have no action.
+    assert "withdrawals_attested" in by_key
+    assert "withdrawals_attested" not in {action.key for action in ACTIONS}
+
+
+def test_no_off_venue_step_is_ever_an_action() -> None:
+    """There is nothing there to record that would be true. keel cannot see whether USDC Rewards
+    is off, and a form that recorded "I turned it off" would record what was asserted, not what
+    is -- which the operator runbook names as worse than an honest manual step."""
     from keel.commands.setup import ACTIONS, STEPS, StepKind
 
+    off_venue = {s.key for s in STEPS if s.kind is StepKind.OFF_VENUE}
+    assert off_venue, "no off-venue steps exist, so this proves nothing"
+    assert not (off_venue & {a.key for a in ACTIONS})
+
+
+def test_a_judgement_action_asks_for_everything_and_assumes_nothing() -> None:
+    """The secondary policy, and the one that makes exposing a judgement acceptable: a wizard may
+    RECORD what the operator supplies; it may never SUPPLY it.
+
+    So an action over a judgement step must declare inputs, and no field may open on a valid
+    answer. A `pays_yield` checkbox would open unticked, and unticked is `no` -- the permissive
+    answer, since a yield-bearing asset fails the screen. A form whose default is the compliant
+    one attests on the operator's behalf."""
+    from keel.commands.setup import ACTIONS, STEPS, StepKind
+    from keel.web import render
+
     by_key = {step.key: step for step in STEPS}
-    declared = {action.key for action in ACTIONS}
-    assert declared, "an empty write surface would make every test below vacuous"
+    judgements = [a for a in ACTIONS if by_key[a.key].kind is StepKind.JUDGEMENT]
+    assert judgements, "no judgement actions exist, so this proves nothing"
 
-    for key in declared:
-        assert key in by_key, f"{key} is an action over no declared step"
-        assert by_key[key].kind in (StepKind.MECHANICAL, StepKind.OPERATOR_INPUT), key
+    for action in judgements:
+        assert action.inputs, action.key
+        html = render._action_form(action, "tok")
+        assert html.count("required") == len(action.inputs), action.key
+        # Nothing pre-filled and nothing pre-chosen: every select opens on the disabled
+        # placeholder, and no input carries a value.
+        assert 'value="" disabled selected' in html or "<select" not in html
+        assert 'value="' not in html.replace('value="tok"', "").replace(
+            'value="" disabled selected', ""
+        ), action.key
 
-    forbidden = {
-        step.key for step in STEPS if step.kind in (StepKind.JUDGEMENT, StepKind.OFF_VENUE)
-    }
-    assert forbidden, "no judgement or off-venue steps exist, so this proves nothing"
-    assert not (declared & forbidden), sorted(declared & forbidden)
+
+def test_the_backing_choices_match_the_screens_own_vocabulary() -> None:
+    """The form lists them as literals to keep `keel.compliance.screen` off the CLI's import
+    path. That is a duplication, so it is pinned: a backing kind added to the screen and missing
+    from the form would be un-attestable from the browser, silently."""
+    from keel.commands.setup import _backing_choices, action_for
+
+    field = next(f for f in action_for("assets_attested").inputs if f.name == "backing")
+    assert tuple(sorted(field.choices)) == _backing_choices()
+
+
+def test_promotion_offers_no_force_field() -> None:
+    """`attempt_promotion`'s own docstring: force "carries no gate HERE ... the O3 contract is the
+    front-end's to keep, never the service's to assume". The console keeps it with a typed
+    terminal confirmation. A browser cannot keep it that way, so this front-end simply has no
+    force path -- and force-promote is itself one of the eleven."""
+    import inspect as inspect_mod
+
+    from keel.commands import setup as setup_mod
+
+    action = setup_mod.action_for("rule_promoted")
+    assert {f.name for f in action.inputs} == {"rule_id"}
+    source = inspect_mod.getsource(setup_mod.promote_rule)
+    assert "force=False" in source
+    assert "force=True" not in source
 
 
 def test_an_action_declares_inputs_exactly_when_its_step_needs_them() -> None:
@@ -187,7 +250,7 @@ def test_an_action_declares_inputs_exactly_when_its_step_needs_them() -> None:
 
     by_key = {step.key: step for step in STEPS}
     for action in ACTIONS:
-        needs = by_key[action.key].kind is StepKind.OPERATOR_INPUT
+        needs = by_key[action.key].kind in (StepKind.OPERATOR_INPUT, StepKind.JUDGEMENT)
         assert action.needs_input is needs, action.key
 
 
