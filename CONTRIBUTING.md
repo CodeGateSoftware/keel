@@ -8,6 +8,87 @@ one can only be resented. The standard is spelled out with a worked example unde
 [The documentation standard](#the-documentation-standard) — read that section before your
 first PR and reviews will feel fair instead of heavy.
 
+## The contribution workflow, step by step
+
+To maintain code quality and keep the deployment pipeline safe, every contribution — from a
+typo fix to a new broker adapter — follows the same path.
+
+### 1. Find or create an issue
+
+- Browse the **Issues** tab of the main repository.
+- Comment on the issue you want to work on, so others know it is taken.
+- Found a bug or want a feature that has no issue yet? **Open the issue first** and discuss
+  the approach before writing code. The [scope section](#scope-what-is-welcome-what-needs-discussion-first-what-is-out)
+  says which kinds of changes need that agreement *before* a PR exists.
+
+### 2. Fork the repository
+
+Use the **Fork** button at the top right of the main repository page. This creates a copy of
+the project under your personal GitHub account.
+
+### 3. Clone and set up locally
+
+Clone your fork and add the original repository as the `upstream` remote:
+
+```bash
+# Clone your fork (replace USERNAME with your GitHub username)
+git clone https://github.com/USERNAME/keel.git
+cd keel
+
+# Add the original repository as the 'upstream' remote
+git remote add upstream https://github.com/CodeGateSoftware/keel.git
+```
+
+Then run the development setup and the four gates exactly as written under
+[Development setup and the gates a PR must pass](#development-setup-and-the-gates-a-pr-must-pass)
+below — `uv sync --all-extras --dev`, then `ruff`, `mypy`, and the full `pytest` suite.
+
+### 4. Create a feature branch
+
+Never make changes directly on `main`. Pull the latest upstream state and branch from it:
+
+```bash
+git checkout main
+git pull upstream main
+
+# Create and switch to your new feature branch
+git checkout -b feature/your-feature-name
+# Or, for bug fixes:
+git checkout -b fix/your-bug-name
+```
+
+### 5. Commit and test your changes
+
+- Keep your commits atomic, focused, and small.
+- Write clear, descriptive commit messages in the present tense, with the Conventional
+  Commits prefix the releases are cut from (`fix(strategy): fill entries at the next bar's
+  open`) — see [Commit convention](#commit-convention).
+- Changes here land test-first ([Tests come first](#tests-come-first)), and **all four gates
+  must pass locally** before you ask for review. CI runs exactly those commands, so anything
+  red locally is red everywhere.
+
+### 6. Push and submit a pull request
+
+Push your feature branch to your fork:
+
+```bash
+git push origin feature/your-feature-name
+```
+
+GitHub will then show a **Compare & pull request** banner on your fork. Use it, and in the
+PR description explain your changes and link the issue it resolves with `Closes #42` (the
+issue then closes automatically on merge).
+
+### Code review & security guidelines
+
+- **No direct write access.** All contributions land through a reviewed pull request;
+  direct pushes to `main` are blocked by repository branch protection.
+- **Review process.** Expect questions, suggested edits, or requests for code adjustments
+  before a merge — that is the gates working, not pushback on you. First review arrives
+  within the window stated under [What to expect from a solo maintainer](#what-to-expect-from-a-solo-maintainer).
+- **Keep syncing.** If your PR waits for review, keep it updated with
+  `git pull upstream main` to avoid merge conflicts.
+
 ## Governance: rulings vs. machinery
 
 **keel is not a fatwa engine. It is an enforcement engine for a ruling you supply.**
