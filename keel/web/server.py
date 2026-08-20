@@ -187,6 +187,14 @@ def page_venues(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, s
     return "Venues", render.render_venues(list_installed_brokers()), None
 
 
+def page_gates(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
+    """Read from `keel.capabilities`, which is a pure declaration -- no config, no database, no
+    network. It describes the binary that is serving the page."""
+    from keel.capabilities import CAPABILITIES, GATES
+
+    return "Gates", render.render_gates(GATES, CAPABILITIES), None
+
+
 def page_glossary(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
     from keel.commands.help_console import load_glossary
 
@@ -199,6 +207,7 @@ ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, 
     "/insights": page_insights,
     "/rules": page_rules,
     "/venues": page_venues,
+    "/gates": page_gates,
     "/glossary": page_glossary,
 }
 

@@ -32,6 +32,7 @@ NAV: tuple[tuple[str, str], ...] = (
     ("/insights", "Insights"),
     ("/rules", "Rules"),
     ("/venues", "Venues"),
+    ("/gates", "Gates"),
     ("/glossary", "Glossary"),
 )
 
@@ -590,6 +591,52 @@ def render_venues(infos: Sequence[Any]) -> str:
         )
         or '<p class="empty">No adapters installed.</p>'
     )
+    return "".join(parts)
+
+
+def render_gates(gates: Sequence[Any], capabilities: Sequence[Any]) -> str:
+    """The capability inventory (#436), rendered from `keel/capabilities.py`.
+
+    This page is the reason a browser view can be honest about its own limits. The read surface
+    here cannot reach a single one of these actions -- the server implements no write verb at all
+    -- and the page says so, next to the list of what it cannot do and who can."""
+    parts = [
+        '<h1>Gates</h1><p class="sub">every action that increases what keel can do without '
+        "asking again</p>",
+        '<div class="card"><strong>This view cannot perform any of them.</strong> '
+        '<span class="muted">The server answers GET and HEAD and implements no other verb, so '
+        "there is no request it can accept that changes anything. Each action below needs a "
+        "human at a terminal.</span></div>",
+    ]
+    for gate in gates:
+        covered = [cap for cap in capabilities if cap.gate == gate.name]
+        parts.append(f"<h2>{esc(gate.name)} &middot; {esc(len(covered))} action(s)</h2>")
+        parts.append(
+            '<div class="card"><div class="kv"><span class="k">evidence required</span>'
+            f'<span class="v">{esc(gate.evidence)}</span></div>'
+            f'<p class="note">Fails closed against {esc(gate.fails_closed_against)}.</p>'
+            f'<p class="note">Implemented once, at <code>{esc(gate.implementation)}</code>.</p>'
+            "</div>"
+        )
+        rows = []
+        for cap in covered:
+            mirror = (
+                f'<span class="pill">mirrors {esc(cap.mirrors[1])}</span>' if cap.mirrors else ""
+            )
+            rows.append(
+                (
+                    f'<span class="pill">{esc(cap.surface)}</span>',
+                    f"<code>{esc(cap.invocation)}</code> {mirror}",
+                    esc(cap.increases),
+                    f"<code>{esc(cap.module)}.{esc(cap.function)}</code>",
+                )
+            )
+        parts.append(
+            table(
+                (("surface", False), ("action", False), ("grants", False), ("call site", False)),
+                rows,
+            )
+        )
     return "".join(parts)
 
 
