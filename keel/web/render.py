@@ -28,6 +28,7 @@ from typing import Any
 #: Nav order, and the labels. `/` first because the status page is the answer to "is it alive".
 NAV: tuple[tuple[str, str], ...] = (
     ("/", "Status"),
+    ("/setup", "Setup"),
     ("/activity", "Activity"),
     ("/insights", "Insights"),
     ("/rules", "Rules"),
@@ -591,6 +592,78 @@ def render_venues(infos: Sequence[Any]) -> str:
         )
         or '<p class="empty">No adapters installed.</p>'
     )
+    return "".join(parts)
+
+
+#: How each kind of setup step is introduced. The wording carries the whole argument of #437 --
+#: what a wizard may do for you, what it may only collect, and what it cannot touch at all.
+_STEP_KIND_NOTE: dict[str, str] = {
+    "mechanical": "keel can do this for you.",
+    "judgement": (
+        "Yours to decide. keel can record it; it must never choose it for you, and an "
+        "attestation without a cited source is refused exactly like a missing one."
+    ),
+    "off_venue": (
+        "Happens in the venue's own dashboard, and keel cannot verify it -- the venue's API "
+        "does not expose it. Never shown as done here, because a green check that verifies "
+        "nothing turns an open risk into a false assurance."
+    ),
+}
+
+
+def render_setup(state: Any) -> str:
+    """The first-run checklist. Read-only, like everything else this server serves: it says what
+    is outstanding and names the command, and it performs nothing."""
+    parts = [
+        "<h1>Setup</h1>",
+        f'<p class="sub">{esc(state.root)}</p>',
+    ]
+    if state.is_new:
+        parts.append(
+            '<div class="card"><strong>There is no deployment here yet.</strong> '
+            '<span class="muted">Nothing below has been done, which is exactly what a first '
+            "run looks like. Work down the list; the paper stage places no orders at all.</span>"
+            "</div>"
+        )
+    nxt = state.next_step
+    if nxt is not None:
+        parts.append(
+            '<div class="card"><div class="kv"><span class="k">next</span>'
+            f'<span class="v">{esc(nxt.step.title)}</span></div>'
+            f'<p class="note">{esc(nxt.step.how)}</p></div>'
+        )
+    else:
+        parts.append('<div class="card">Nothing outstanding.</div>')
+
+    for stage, heading, blurb in (
+        (
+            "paper",
+            "To run in paper",
+            "Evaluates rules against real market data and places nothing.",
+        ),
+        ("live", "To go live", "Everything the go-live runbook adds before real money moves."),
+    ):
+        items = [item for item in state.states if item.step.stage.value == stage]
+        parts.append(f"<h2>{esc(heading)}</h2>")
+        parts.append(f'<p class="note">{esc(blurb)}</p>')
+        rows = []
+        for item in items:
+            if item.done is True:
+                mark = '<span class="good">done</span>'
+            elif item.done is False:
+                mark = '<span class="muted">to do</span>'
+            else:
+                mark = '<span class="warn">not determined</span>'
+            note = _STEP_KIND_NOTE.get(item.step.kind.value, "")
+            body = (
+                f"<strong>{esc(item.step.title)}</strong>"
+                f'<div class="muted">{esc(item.detail)}</div>'
+            )
+            if item.blocking:
+                body += f"<div><code>{esc(item.step.how)}</code></div>"
+            body += f'<div class="muted">{esc(item.step.why)} {esc(note)}</div>'
+            rows.append((mark, f'<span class="pill">{esc(item.step.kind.value)}</span>', body))
+        parts.append(table((("", False), ("kind", False), ("step", False)), rows))
     return "".join(parts)
 
 

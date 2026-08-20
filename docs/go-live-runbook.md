@@ -10,6 +10,27 @@ exchange, correctly, and we have a record of it".
 
 ---
 
+## Where am I up to?
+
+```bash
+keel setup            # what this deployment still needs, and which parts only you can do
+```
+
+Read-only — it opens the database read-only and writes nothing, so it is safe on a deployment
+mid-cycle and safe when there is no deployment at all. It reports the same steps this runbook
+lists, observed rather than assumed, in three kinds:
+
+- **mechanical** — keel can do these for you.
+- **judgement** — yours to decide. keel records them; it must never choose them. Every Shariah
+  attestation is a human classification with a cited source, and an unsourced attestation is
+  refused exactly like a missing one.
+- **off-venue** — done in the venue's own dashboard, where keel can neither act nor look. These
+  are **never** reported as done, because a green check that verifies nothing turns an open risk
+  into a false assurance.
+
+The same checklist is the Setup page in `keel serve`, and it is what a brand-new machine's
+landing page shows instead of an empty dashboard.
+
 ## 0. Before you start
 
 | | check | why |
