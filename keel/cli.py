@@ -97,12 +97,13 @@ import click
 from keel import agent
 from keel.commands._common import (
     DEFAULT_CONFIG_PATH,
-    DEFAULT_DB_PATH,
     DISCLAIMER,
     _build_broker,
     _load_cfg,
     _open_repo,
     _require_interactive_confirmation,
+    default_config_path,
+    default_db_path,
     with_disclaimer,
 )
 from keel.commands._products import (
@@ -246,13 +247,17 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
     help="Show the running version, commit and working-tree state, then exit.",
 )
 @click.option(
-    "--db", "db_path", default=DEFAULT_DB_PATH, show_default=True, help="SQLite DB path."
+    "--db",
+    "db_path",
+    default=default_db_path,
+    show_default="the deployment folder, or the OS app-data directory",
+    help="SQLite DB path.",
 )
 @click.option(
     "--config",
     "config_path",
-    default=DEFAULT_CONFIG_PATH,
-    show_default=True,
+    default=default_config_path,
+    show_default="the deployment folder, or the OS app-data directory",
     help="config.yaml path.",
 )
 @click.option(
@@ -292,6 +297,11 @@ def _template_config_text(live: bool = False) -> str:
 
 @cli.command("init-config")
 @click.option(
+    # CWD, deliberately -- NOT the state-root resolver. `init-config` and `init` are the commands
+    # that CREATE a deployment folder, so "here" is what the operator means; resolving them through
+    # `keel_core.paths` would make `mkdir x && cd x && keel init` write somewhere else entirely,
+    # because an empty folder is not yet a deployment root. Once written, the folder IS one and
+    # every other command resolves against it (#434).
     "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
     help="Where to write the config file.",
 )
