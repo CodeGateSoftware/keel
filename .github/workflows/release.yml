@@ -214,9 +214,15 @@ jobs:
               echo "## Desktop app (macOS / Windows)"
               echo
               echo "⚠️ **These builds are not code-signed, so your computer will warn you.**"
-              echo "Apple's certificate costs \$99/yr and keel cannot currently afford it. There"
-              echo "is no cheaper tier and no free option, and a certificate we made ourselves"
-              echo "would do nothing — macOS trusts only certificates Apple issued."
+              echo "Apple's certificate is \$99/yr and Azure Trusted Signing is ~\$120/yr, and"
+              echo "keel cannot currently afford either. There is no cheaper tier and no free"
+              echo "open-source option on either platform. (Windows is worse value than it looks:"
+              echo "since 2024 even an EV certificate no longer grants an instant SmartScreen"
+              echo "pass — reputation is earned from download volume over time.)"
+              echo
+              echo "**Prefer no warning at all?** Install from the wheels above instead — nothing"
+              echo "is downloaded as an application, so nothing objects. Needs a terminal and"
+              echo "Python 3.11+."
               echo
               echo "Full explanation, including how to check what you downloaded:"
               echo "<https://github.com/${{ github.repository }}/blob/main/docs/desktop-install.md>"
@@ -261,10 +267,20 @@ jobs:
   #
   # THESE ARTIFACTS ARE NOT CODE-SIGNED, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT.
   #
-  # Apple notarisation requires a Developer ID certificate, which requires the $99/yr Developer
-  # Program. There is no free path: a free Apple account signs only for local development, and a
+  # NEITHER PLATFORM IS SIGNED, and both are decisions with the same cause.
+  #
+  # macOS: notarisation requires a Developer ID certificate, which requires the $99/yr Developer
+  # Program. There is no free path -- a free Apple account signs only for local development, and a
   # self-signed certificate buys nothing because Gatekeeper trusts Apple-issued Developer IDs and
-  # nothing else. keel is open source on a small budget and has chosen not to pay it.
+  # nothing else.
+  #
+  # Windows: Azure Trusted Signing is ~$120/yr, MORE than Apple's, and it does not even buy the
+  # same thing. Since 2024 an EV certificate no longer grants an instant SmartScreen pass;
+  # reputation accrues from download volume over time, so a new certificate on a young project
+  # leaves the warning in place for a while regardless. Paying more to still be warned about is
+  # the worst of the three options.
+  #
+  # keel is open source on a small budget and has chosen not to pay either.
   #
   # What that costs the user is real and is documented rather than hidden: a `.dmg` downloaded
   # from the internet carries a quarantine flag, so macOS refuses the first open until they go to
