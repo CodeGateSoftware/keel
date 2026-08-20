@@ -893,11 +893,15 @@ class RobinhoodAdapter:
         total = Decimal("0")
         for row in rows:
             # `_decimal_or_none` reads a quoted string and an unquoted number identically, which
-            # is required rather than merely tolerant here: this venue mixes the two (#217 F6) and
-            # `fee_charged`'s own quoting has never been observed, because observing an order
-            # object requires placing a real order and there is no sandbox. The v2 schema types it
-            # as an unquoted number and types the neighbouring `executions[].effective_price` as a
-            # quoted decimal string, so the documentation does not settle it either.
+            # is required rather than merely tolerant here: this venue mixes the two within a
+            # single order object (#217 F6). The live probe of 2026-08-20 (#412) settled
+            # `fee_charged` itself -- it is spelled exactly that, is present on every order
+            # object, and arrives UNQUOTED (`0.0`), which is what #412 feared might not be true:
+            # a different spelling would have made every row parse to `None` and turned
+            # `get_fee_summary` into an always-passing zero. The tolerance still earns its keep,
+            # because the SAME object quotes `filled_asset_quantity` and
+            # `limit_order_config.limit_price` as strings, and a partially-filled order's
+            # `average_price` has still never been seen non-null.
             fee = _decimal_or_none(_field(row, "fee_charged"))
             if fee is None or fee <= 0:
                 continue
@@ -953,6 +957,37 @@ class RobinhoodAdapter:
         from a still-pending cancel is the conservative outcome -- the engine keeps believing the
         order might be resting, which is the belief that keeps it watching. `True` on a cancel
         that had not landed is the outcome with no recovery.
+
+        ⚠️ **Observed 2026-08-20 (#412), and the finding is that this method returns `False` on a
+        cancel that succeeded.** One real BTC-USD limit buy was placed, cancelled, and then
+        polled. The venue's timeline:
+
+        | t | event | `state` |
+        | --- | --- | --- |
+        | `…18.409035` | order created | `open` |
+        | `…18.858613` | first `GET /orders/{id}/` | `open` |
+        | `…19.792632` | `GET` immediately after `POST …/cancel/` returned 200 | `open` |
+        | `…20.891890` | order settles cancelled | `canceled` |
+
+        So the `200` on the cancel endpoint is an ACKNOWLEDGEMENT, not a confirmation -- it hands
+        back the order as it stood when the request was accepted, exactly as this docstring
+        already predicted -- and the single zero-delay re-poll is ALSO too early, by roughly one
+        second. `adapter.cancel_order` returned `False` for a cancellation that had in fact
+        landed; a read one second later showed `canceled`, `filled_asset_quantity` `0`, and
+        `executions` empty.
+
+        That is contract-correct (the port requires `True` only on confirmation, and nothing had
+        confirmed yet) but it means the confirming branch is, on this evidence, unreachable in
+        production: `executor._cancel_at_exchange` will record every successful cancel as
+        unconfirmed and keep re-polling the order. Whether to spend a bounded wait here to make
+        the confirmation reachable is a live-money design decision, not a fixture correction, so
+        it is left to #412 rather than changed on the strength of one observation. The safe
+        direction is unchanged either way -- `False` keeps the engine watching an order that is
+        already gone, which costs a redundant poll, where a `True` on an unlanded cancel costs a
+        position.
+
+        ⚠️ The raw body of that cancel `200` was NOT captured: this method consumes it and
+        returns a `bool`. `_OneOrderOnly` now tees every response so a future run records it.
 
         An id the venue never issued returns `False` rather than raising, per the port docstring:
         absence of a refusal is not a confirmation, and neither is a 404.

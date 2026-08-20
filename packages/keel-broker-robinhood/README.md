@@ -213,11 +213,29 @@ stamped with a single `timestamp`. The fixture now carries an observed crossed B
 `rh_best_bid_ask_uncrossed.json` an observed XLM-USD one, because either alone would state a rule
 the endpoint does not follow. That old fixture also invented `"next": null, "previous": null`,
 which this endpoint does not send. Anything reading this endpoint must tolerate a non-positive
-spread -- see `transport.get_best_bid_ask` and #413. **The three order fixtures (`rh_order_open.json`, `rh_order_filled.json`,
-`rh_order_canceled.json`) remain unverified against the venue**, because observing an order
-object requires placing a real order, which that script refuses by construction. Their field
-names are still read from the documentation alone, and `place_order` / `get_order` /
-`cancel_order` all depend on them.
+spread -- see `transport.get_best_bid_ask` and #413. **Two of the three order fixtures are now observed.** `scripts/robinhood_order_probe.py`
+placed one real BTC-USD limit buy on 2026-08-20 (#412) -- 0.0001 BTC at $36,352.78, 50% below
+the bid so that it could not fill -- polled it, and cancelled it. `rh_order_open.json` and
+`rh_order_canceled.json` are that order's own responses, with `account_number` replaced by the
+repository's `AB1234567890` placeholder and nothing else altered. The run corrected four claims
+the documentation-derived fixtures had made:
+
+| field | fixtures claimed | venue actually sends |
+| --- | --- | --- |
+| `filled_asset_quantity` | unquoted number | QUOTED string, padded to 18dp |
+| `limit_order_config.asset_quantity` | unquoted number | QUOTED string, padded to 18dp |
+| `limit_order_config.limit_price` | unquoted number | QUOTED string, padded to 18dp |
+| `limit_order_config.time_in_force` | `"gtc"` | **absent** -- accepted on the way in, never echoed back |
+
+`fee_charged` and `estimated_fee_remaining` are UNQUOTED numbers, which is what the fixtures
+already said, so #197's fee sweep reads a real value rather than the silent `Decimal("0")` #412
+warned about.
+
+**`rh_order_filled.json` remains doc-derived** and is marked as such wherever it is used: the
+probe prices its order 50% below the bid precisely so it cannot fill, so `average_price`, the
+`executions[]` rows and a non-zero `fee_charged` have still never been observed. Its field
+quoting follows the conventions the open/cancelled observations established, which is an
+inference from the same venue rather than an observation of a filled order.
 
 The script gained a sixth probe with #197, against the orders LIST endpoint and
 `rh_orders.json`. It is a GET, so it stays inside the read-only guarantee, and it does verify the

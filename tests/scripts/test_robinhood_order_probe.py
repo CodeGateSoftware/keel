@@ -7,11 +7,13 @@ exercised at all -- a fence you can only test by placing an order is a fence nob
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
+from scripts import robinhood_order_probe as probe
 from scripts.robinhood_order_probe import (
     _MIN_DISCOUNT,
     OrderProbeRefused,
@@ -138,6 +140,35 @@ def test_cancels_and_reads_are_not_capped() -> None:
     assert guard.orders_created == 1
 
 
+def test_the_guard_tees_the_placement_and_cancel_bodies_nobody_else_keeps() -> None:
+    """The gap the 2026-08-20 live run (#412) fell into.
+
+    `adapter.place_order` reduces the POST's body to a `PlaceResult` and `adapter.cancel_order`
+    reduces the cancel's to a `bool`, so the two responses only this script can ever reach were
+    discarded by the one run that reached them. The cancel `200` turned out to be an
+    acknowledgement rather than a confirmation, and the evidence had to be reconstructed from the
+    surrounding polls. The guard already sees every request, so it tees the bodies on the way
+    back rather than adding a second interception point.
+    """
+    guard = _OneOrderOnly(_StubTransport())
+
+    guard._request("POST", "/api/v2/crypto/trading/orders/")
+    guard._request("POST", "/api/v2/crypto/trading/orders/o1/cancel/")
+
+    assert guard.responses["placement"] == {"id": "o1"}
+    assert guard.responses["cancel"] == {"id": "o1"}
+
+
+def test_an_ordinary_read_is_not_teed_as_a_placement_or_a_cancel() -> None:
+    """Only the two bodies that are otherwise unrecoverable. A GET's body is already written to
+    `--out-dir` by `record`, and teeing it here would let a later read overwrite the placement."""
+    guard = _OneOrderOnly(_StubTransport())
+
+    guard._request("GET", "/api/v2/crypto/trading/orders/")
+
+    assert guard.responses == {}
+
+
 def test_the_guard_is_installed_onto_the_transport_not_wrapped_around_it() -> None:
     """The trap `robinhood_smoke._ReadOnly` documents: a `__getattr__` wrapper is bypassed by the
     transport's own internal `self._request` calls, so the guarantee would cover the tests and
@@ -196,9 +227,12 @@ def test_a_connection_failure_with_no_response_is_also_UNKNOWN() -> None:
 class _SequenceTransport:
     """Answers the adapter's place/observe/cancel calls, recording the order of operations."""
 
-    def __init__(self, *, observe_raises: bool = False) -> None:
+    def __init__(self, *, observe_raises: bool = False, states: list[str] | None = None) -> None:
         self.ops: list[str] = []
         self._observe_raises = observe_raises
+        #: `state` for each successive `get_order`, last value repeating. Defaults to a venue that
+        #: has already settled, so the ordinary tests spend no time in the settle poll.
+        self._states = list(states or ["canceled"])
 
     def create_order(self, body: dict[str, Any]) -> Any:
         self.ops.append("create")
@@ -208,7 +242,8 @@ class _SequenceTransport:
         self.ops.append("get_order")
         if self._observe_raises and self.ops.count("get_order") == 1:
             raise RuntimeError("venue blipped while observing")
-        return {"id": order_id, "state": "canceled"}
+        index = min(self.ops.count("get_order") - 1, len(self._states) - 1)
+        return {"id": order_id, "state": self._states[index]}
 
     def get_orders(self, updated_at_start: str | None = None) -> Any:
         self.ops.append("get_orders")
@@ -234,6 +269,46 @@ def test_the_run_places_observes_and_cancels(tmp_path: Any) -> None:
     assert "cancel" in transport.ops
     assert report["placed"]["success"] is True
     assert (tmp_path / "rh_order_open_observed.json").exists()
+
+
+def test_the_run_keeps_polling_until_the_cancel_actually_settles(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The correction the live run forced. Robinhood's cancel is asynchronous: on 2026-08-20 the
+    order still read `open` on the poll immediately after the cancel `200` and only reached
+    `canceled` ~1.1s later. `after_cancel` therefore recorded an `open` order into the file named
+    for the CANCELLED fixture -- a probe whose whole purpose is recording shapes writing down the
+    wrong one. Waiting is safe here in a way it is not inside `adapter.cancel_order`: this is a
+    recording script, not the executor's exit path.
+    """
+    monkeypatch.setattr(probe, "_CANCEL_SETTLE_INTERVAL", 0)
+    transport = _SequenceTransport(states=["open", "open", "open", "canceled"])
+
+    report = run(
+        transport, symbol="BTC-USD", plan=_plan_for_run(), idempotency_key="t", out_dir=tmp_path
+    )
+
+    assert report["after_cancel"]["state"] == "open", "the immediate read is genuinely too early"
+    assert report["settled"]["state"] == "canceled"
+    assert json.loads((tmp_path / "rh_order_canceled_observed.json").read_text())["state"] == (
+        "canceled"
+    ), "the canceled fixture must not be written from a still-open read"
+
+
+def test_the_settle_poll_is_bounded_and_reports_what_it_last_saw(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """An order that never leaves `open` must not spin forever, and must not be reported as
+    cancelled either. The last observation stands, whatever it says."""
+    monkeypatch.setattr(probe, "_CANCEL_SETTLE_INTERVAL", 0)
+    transport = _SequenceTransport(states=["open"])
+
+    report = run(
+        transport, symbol="BTC-USD", plan=_plan_for_run(), idempotency_key="t", out_dir=tmp_path
+    )
+
+    assert report["settled"]["state"] == "open"
+    assert transport.ops.count("get_order") <= probe._CANCEL_SETTLE_POLLS + 3
 
 
 def test_the_cancel_runs_even_when_observation_raises(tmp_path: Any) -> None:

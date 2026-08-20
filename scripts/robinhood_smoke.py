@@ -47,10 +47,18 @@ Robinhood, `results` comes back empty, and `compare_shapes` skips comparing a li
 are `<empty>` -- so a bare account reports a shape match it has not actually earned, and an
 operator reading the report needs to know that a match there is not corroboration.
 `fee_charged`'s JSON quoting -- a quoted string vs an unquoted number, the exact ambiguity #197
-turns on -- is precisely what the probe would settle if a single order row came back. So
-`rh_order_open.json`, `rh_order_filled.json` and `rh_order_canceled.json` remain unverified
-whenever the account has no order history; placing an order is still the only way to guarantee
-an observation.
+turns on -- is precisely what the probe would settle if a single order row came back.
+
+That row now exists. `scripts/robinhood_order_probe.py` placed one real BTC-USD limit buy on
+2026-08-20 (#412) and cancelled it, so `rh_order_open.json`, `rh_order_canceled.json` and the
+`results[]` shape of `rh_orders.json` are transcribed from live responses. `fee_charged` is
+spelled exactly that, is present on every order object, and arrives as an UNQUOTED number.
+`rh_order_filled.json` is still doc-derived: the probe's order is priced 50% below the bid
+precisely so that it cannot fill, so no filled order has ever been observed here.
+
+The conditional-verification warning above still stands for anyone re-running this on a
+different account: on an account with no order history the `orders` line prints a match it has
+not earned.
 
 ## Why it cannot place an order
 
@@ -430,8 +438,21 @@ def _public_key_b64(seed_b64: str) -> str | None:
         return None
 
 
-def load_credentials(env_path: Path) -> tuple[str, str]:
+def load_credentials(
+    env_path: Path,
+    *,
+    api_key_var: str = "ROBINHOOD_API_KEY",
+    private_key_var: str = "ROBINHOOD_PRIVATE_KEY",
+) -> tuple[str, str]:
     """Read the credential from `.env`, failing with instructions rather than a stack trace.
+
+    `api_key_var` and `private_key_var` name which `.env` variables to read, mirroring
+    `robinhood_order_probe.py`'s flags of the same name. They exist because #412 found the
+    default `ROBINHOOD_API_KEY` slot holding an Ed25519 public key rather than the identifier
+    Robinhood issues, and the fix put the identifier in a NEW variable rather than overwriting
+    evidence. A read-only probe has to be able to point at the new pairing without the operator
+    editing their `.env` first -- and every diagnostic below still names the variable it read,
+    so the messages stay actionable whichever slot was chosen.
 
     Three checks, and the ORDER is the design: each one only runs when the more specific check
     above it did not fire, so the operator is told the most actionable thing true of their file
@@ -448,12 +469,12 @@ def load_credentials(env_path: Path) -> tuple[str, str]:
     and a 401 is the least informative failure this integration can hand back.
     """
     values = dotenv_values(env_path)
-    api_key = (values.get("ROBINHOOD_API_KEY") or "").strip()
-    private_key = (values.get("ROBINHOOD_PRIVATE_KEY") or "").strip()
+    api_key = (values.get(api_key_var) or "").strip()
+    private_key = (values.get(private_key_var) or "").strip()
 
     missing = [
         name
-        for name, val in (("ROBINHOOD_API_KEY", api_key), ("ROBINHOOD_PRIVATE_KEY", private_key))
+        for name, val in ((api_key_var, api_key), (private_key_var, private_key))
         if not val
     ]
     if missing:
@@ -461,13 +482,13 @@ def load_credentials(env_path: Path) -> tuple[str, str]:
             f"missing {' and '.join(missing)} in {env_path}.\n\n"
             "Robinhood signs EVERY request, including read-only ones, so an API key alone "
             "cannot make a single call.\n"
-            "ROBINHOOD_PRIVATE_KEY is the base64 of the raw 32-byte Ed25519 seed generated "
+            f"{private_key_var} is the base64 of the raw 32-byte Ed25519 seed generated "
             "locally -- not the base64 public key pasted into Robinhood's credential page.\n"
             "See packages/keel-broker-robinhood/README.md for the pynacl snippet."
         )
     if len(private_key) != _SEED_B64_LEN:
         raise SystemExit(
-            f"ROBINHOOD_PRIVATE_KEY is {len(private_key)} characters; a base64-encoded 32-byte "
+            f"{private_key_var} is {len(private_key)} characters; a base64-encoded 32-byte "
             f"Ed25519 seed is {_SEED_B64_LEN}.\n"
             "That usually means a PEM, a hex string, or a truncated paste. (It does NOT mean the "
             "public key -- a public key is also 32 bytes and passes this check; see below.) "
@@ -477,7 +498,7 @@ def load_credentials(env_path: Path) -> tuple[str, str]:
     if _raw_key_bytes(api_key) is not None:
         if api_key == _public_key_b64(private_key):
             raise SystemExit(
-                "ROBINHOOD_API_KEY holds the base64 PUBLIC key of ROBINHOOD_PRIVATE_KEY, not an "
+                f"{api_key_var} holds the base64 PUBLIC key of {private_key_var}, not an "
                 "API key.\n\n"
                 "The public key is what you paste INTO Robinhood's credential page. What belongs "
                 f"here is the identifier Robinhood issues back once the credential exists "
@@ -485,14 +506,14 @@ def load_credentials(env_path: Path) -> tuple[str, str]:
                 "Every request would sign correctly and be rejected 401, because the venue has no "
                 "record of this key.\n\n"
                 "Fix: sign in to web classic, open https://robinhood.com/account/crypto, choose "
-                "Add key, paste the value currently in ROBINHOOD_API_KEY as the public key, tick "
-                "the API actions this credential needs, and put the identifier it returns here. "
-                "ROBINHOOD_PRIVATE_KEY stays as it is -- the keypair is already correct."
+                f"Add key, paste the value currently in {api_key_var} as the public key, tick "
+                f"the API actions this credential needs, and put the identifier it returns here. "
+                f"{private_key_var} stays as it is -- the keypair is already correct."
             )
         raise SystemExit(
-            "ROBINHOOD_API_KEY decodes as a 32-byte base64 value, which is an Ed25519 KEY -- an "
+            f"{api_key_var} decodes as a 32-byte base64 value, which is an Ed25519 KEY -- an "
             f"API key is an identifier issued by Robinhood ({_API_KEY_HINT}).\n"
-            "It does not match ROBINHOOD_PRIVATE_KEY's public key either, so it is most likely a "
+            f"It does not match {private_key_var}'s public key either, so it is most likely a "
             "public key from a different credential.\n"
             "See packages/keel-broker-robinhood/README.md, 'Credentials'."
         )
@@ -568,9 +589,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--symbol", default=PROBE_SYMBOL, help=f"default {PROBE_SYMBOL}")
     parser.add_argument("--env", type=Path, default=REPO_ROOT / ".env")
+    parser.add_argument(
+        "--api-key-var",
+        default="ROBINHOOD_API_KEY",
+        help="which .env variable holds the API key identifier",
+    )
+    parser.add_argument("--private-key-var", default="ROBINHOOD_PRIVATE_KEY")
     args = parser.parse_args(argv)
 
-    api_key, private_key = load_credentials(args.env)
+    api_key, private_key = load_credentials(
+        args.env,
+        api_key_var=args.api_key_var,
+        private_key_var=args.private_key_var,
+    )
 
     # Imported here, not at module scope: `argparse --help` and the credential error above must
     # work in an environment where the optional adapter is not installed.

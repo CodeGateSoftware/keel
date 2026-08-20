@@ -1,25 +1,25 @@
 {
-  "id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
-  "account_number": "AB1234567890",
   "symbol": "BTC-USD",
   "client_order_id": "9f8e7d6c-5b4a-3c2d-1e0f-9a8b7c6d5e4f",
   "side": "sell",
   "type": "market",
+  "id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+  "account_number": "AB1234567890",
   "state": "filled",
-  "average_price": 65420.75,
-  "filled_asset_quantity": 0.1,
-  "created_at": "2026-08-09T11:55:00.000000Z",
-  "updated_at": "2026-08-09T11:55:01.000000Z",
-  "fee_charged": 1.6355,
-  "estimated_fee_remaining": 0,
+  "filled_asset_quantity": "0.100000000000000000",
   "executions": [
     {
-      "effective_price": 65420.75,
-      "quantity": 0.1,
-      "timestamp": "2026-08-09T11:55:01.000000Z"
+      "effective_price": "65420.750000000000000000",
+      "quantity": "0.100000000000000000",
+      "timestamp": "2026-08-20T11:55:01.000000-04:00"
     }
   ],
+  "average_price": 65420.75,
+  "created_at": "2026-08-20T11:55:00.000000-04:00",
+  "updated_at": "2026-08-20T11:55:01.000000-04:00",
+  "fee_charged": 1.6355,
+  "estimated_fee_remaining": 0.0,
   "market_order_config": {
-    "asset_quantity": 0.1
+    "asset_quantity": "0.100000000000000000"
   }
 }
