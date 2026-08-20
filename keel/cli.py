@@ -202,6 +202,7 @@ from keel.data import freshness as freshness_mod
 from keel.data import history as history_mod  # noqa: F401 -- fetch/simulate tests patch this alias
 from keel.data import repair as repair_mod  # noqa: F401 -- fetch tests patch cli_module.repair_mod
 from keel.data.db import connect, migrate
+from keel.install import install_plan_cmd
 from keel.research import ledger as trials_ledger
 from keel.version import build_info, check_install
 
@@ -272,9 +273,7 @@ def _print_version(ctx: click.Context, param: object, value: bool) -> None:
     "logging.verbose. Errors/exceptions are always logged regardless of this flag.",
 )
 @click.pass_context
-def cli(
-    ctx: click.Context, db_path: str, config_path: str, verbose: bool
-) -> None:
+def cli(ctx: click.Context, db_path: str, config_path: str, verbose: bool) -> None:
     """keel: an offline-first, halal, guard-railed Coinbase auto-trading agent."""
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
@@ -299,7 +298,10 @@ _template_config_text = template_config_text
     # `keel_core.paths` would make `mkdir x && cd x && keel init` write somewhere else entirely,
     # because an empty folder is not yet a deployment root. Once written, the folder IS one and
     # every other command resolves against it (#434).
-    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    "--config",
+    "config_path",
+    default=DEFAULT_CONFIG_PATH,
+    show_default=True,
     help="Where to write the config file.",
 )
 @click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
@@ -329,7 +331,10 @@ def init_config(config_path: str, force: bool, live: bool) -> None:
 
 @cli.command("init")
 @click.option(
-    "--config", "config_path", default=DEFAULT_CONFIG_PATH, show_default=True,
+    "--config",
+    "config_path",
+    default=DEFAULT_CONFIG_PATH,
+    show_default=True,
     help="Config file to write.",
 )
 @click.option("--force", is_flag=True, default=False, help="Overwrite an existing config.")
@@ -505,11 +510,16 @@ def assets_group() -> None:
 
 @assets_group.command("holdings")
 @click.option(
-    "--min-balance", default="0", show_default=True,
+    "--min-balance",
+    default="0",
+    show_default=True,
     help="Ignore balances at or below this (dust from airdrops, forks and rounding).",
 )
 @click.option(
-    "--screen", "run_screen", is_flag=True, default=False,
+    "--screen",
+    "run_screen",
+    is_flag=True,
+    default=False,
     help="Also run each holding through the admission screen.",
 )
 @click.pass_context
@@ -558,7 +568,9 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
 @assets_group.command("discover")
 @click.option("--quote", default=None, help="Settlement currency (default: config.quote_currency).")
 @click.option(
-    "--min-volume-24h", default="100000", show_default=True,
+    "--min-volume-24h",
+    default="100000",
+    show_default=True,
     help="Cheap pre-filter on the venue's reported 24h quote volume. Bounds the request count; it "
     "is NOT a liquidity criterion -- a 24h snapshot is a different statistic from the median the "
     "gate applies, so use --probe-liquidity for that. Deliberately set well BELOW the admission "
@@ -575,7 +587,9 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
     # typical sweep at no extra cost: with NEITHER probe flag, `discover` makes exactly ONE venue
     # request regardless of --limit -- filtering and sorting are local. --probe-history and
     # --probe-liquidity are the ones with a per-row cost, called out below.
-    "--limit", default=100, show_default=True,
+    "--limit",
+    default=100,
+    show_default=True,
     help="Show at most this many candidates. With neither --probe-history nor --probe-liquidity, "
     "raising this costs nothing extra -- discovery still makes exactly one venue request. Each "
     "probe flag adds one venue request PER CANDIDATE SHOWN (two requests per row if both are "
@@ -667,7 +681,9 @@ def assets_screen(ctx: click.Context, products: str | None) -> None:
 
 @assets_group.command("propose")
 @click.option(
-    "--from", "from_file", required=True,
+    "--from",
+    "from_file",
+    required=True,
     type=click.Path(exists=True, dir_okay=False),
     help="JSON shortlist file produced OUTSIDE keel (an LLM + web-search scout).",
 )
@@ -1021,9 +1037,7 @@ def _print_loop_result(result: agent.LoopResult) -> None:
 
 
 @cli.command()
-@click.option(
-    "--loop", is_flag=True, default=False, help="Run the scheduled loop, not one cycle."
-)
+@click.option("--loop", is_flag=True, default=False, help="Run the scheduled loop, not one cycle.")
 @click.option(
     "--interval",
     "interval_sec",
@@ -1159,9 +1173,7 @@ def _parse_products_option(products: str | None, config: Config) -> list[str]:
     `--products` option and polls `_default_sim_products` directly.
     """
     try:
-        product_list, warnings = parse_products_option(
-            products, config, settlement_is_fatal=False
-        )
+        product_list, warnings = parse_products_option(products, config, settlement_is_fatal=False)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--products") from exc
     for warning in warnings:
@@ -1336,6 +1348,15 @@ cli.add_command(capabilities_cmd)
 # off-venue -- read from the deployment rather than assumed, so the CLI, the browser view and any
 # later wizard cannot drift into three accounts of what a deployment needs (#437).
 cli.add_command(setup_cmd)
+
+
+# -- install-plan (the machine interface an installer script calls) ------------------------------
+
+# The desktop product has no self-update (#439), so the INSTALLER is the update path -- and "what
+# should happen when this build meets the one already on disk" has to be right every time. An
+# Inno Setup script and a `.pkg` postinstall are both places where that answer cannot be tested,
+# so it lives in `keel/install.py` and they shell out to this.
+cli.add_command(install_plan_cmd)
 
 
 # -- insights (read-only promotion-gate + journal reporting, no broker call) --------------------

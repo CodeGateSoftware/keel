@@ -226,3 +226,187 @@ def test_keel_update_refuses_a_packaged_install_and_says_why(
     # And it is the FIRST thing said: every other refusal talks about venv layouts and `uv`,
     # which is exactly the advice a desktop user cannot act on.
     assert RELEASES_URL in packaged.refusal_reasons[0]
+
+
+# -- the marker, and the command an installer script calls ------------------------------------
+
+
+def test_a_marker_round_trips(tmp_path: Path) -> None:
+    from keel.install import read_installed_version, write_install_marker
+
+    write_install_marker(tmp_path, "0.10.0", commit="abc123")
+    assert read_installed_version(tmp_path) == "0.10.0"
+
+
+def test_the_marker_goes_in_the_program_directory_and_is_ini(tmp_path: Path) -> None:
+    """INI rather than JSON because Inno Setup reads INI natively and would otherwise need a JSON
+    parser written in Pascal -- and a hand-rolled parser deciding whether to overwrite someone's
+    install is not a trade worth making."""
+    from keel.install import INSTALL_MARKER, write_install_marker
+
+    path = write_install_marker(tmp_path, "0.10.0")
+    assert path.name == INSTALL_MARKER
+    assert path.suffix == ".ini"
+    assert "[keel]" in path.read_text()
+
+
+@pytest.mark.parametrize(
+    "content", ["", "not ini at all", "[keel]\n", "[keel]\nversion=\n", "[other]\nversion=1\n"]
+)
+def test_an_unusable_marker_reads_as_unknown_and_never_raises(tmp_path: Path, content: str) -> None:
+    """Missing, unreadable, malformed and empty all mean "cannot establish what is installed",
+    which `plan_install` turns into a confirmation rather than a silent overwrite. An installer
+    that crashed while deciding whether to overwrite would be worse than one that asks."""
+    from keel.install import INSTALL_MARKER, plan_install_into, read_installed_version
+
+    (tmp_path / INSTALL_MARKER).write_text(content)
+    assert read_installed_version(tmp_path) is None
+    assert plan_install_into(tmp_path, "0.11.0").decision is InstallDecision.FRESH
+
+
+def test_a_directory_with_no_marker_reads_as_nothing_installed(tmp_path: Path) -> None:
+    from keel.install import read_installed_version
+
+    assert read_installed_version(tmp_path) is None
+    assert read_installed_version(tmp_path / "does-not-exist") is None
+
+
+@pytest.mark.parametrize(
+    ("installed", "incoming", "code"),
+    [
+        (None, "0.11.0", 0),
+        ("0.10.0", "0.11.0", 0),
+        ("0.10.0", "0.10.0", 2),
+        ("0.11.0", "0.10.0", 2),
+    ],
+)
+def test_install_plan_exits_zero_to_proceed_and_two_to_confirm(
+    tmp_path: Path, installed: str | None, incoming: str, code: int
+) -> None:
+    """The exit code carries the decision, so a script that reads nothing but the status still
+    fails safe: anything non-zero means stop and ask."""
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+    from keel.install import write_install_marker
+
+    if installed is not None:
+        write_install_marker(tmp_path, installed)
+    result = CliRunner().invoke(
+        cli, ["install-plan", "--target", str(tmp_path), "--incoming", incoming]
+    )
+    assert result.exit_code == code, result.output
+
+
+def test_install_plan_json_carries_the_warning(tmp_path: Path) -> None:
+    import json as json_mod
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+    from keel.install import write_install_marker
+
+    write_install_marker(tmp_path, "0.11.0")
+    result = CliRunner().invoke(
+        cli, ["install-plan", "--target", str(tmp_path), "--incoming", "0.10.0", "--json"]
+    )
+    payload = json_mod.loads(result.output)
+    assert payload["decision"] == "downgrade"
+    assert payload["needs_confirmation"] is True
+    assert "forward-only" in payload["warning"]
+
+
+# -- the stamp, and why a frozen build must not ask git ----------------------------------------
+
+
+def _stamped(monkeypatch: pytest.MonkeyPatch, commit: str) -> None:
+    import types
+
+    import keel.version as version_mod
+
+    stamp = types.SimpleNamespace(VERSION="0.10.0", COMMIT=commit, DIRTY=False)
+    monkeypatch.setattr(version_mod, "_embedded", lambda: stamp)
+
+
+def test_a_frozen_release_is_not_marked_dirty_by_an_unrelated_git_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_git` inherits the process CWD, so a packaged app launched from inside ANY git repository
+    reads that repository's HEAD, finds it disagrees with the stamp, and marks a legitimate
+    signed release DIRTY. The user then reads "this build is NOT reproducible -- do not run it
+    against live funds" about a build that is both.
+
+    A warning that fires on correct builds is one people learn to ignore, and this is the warning
+    that must never be ignored."""
+    import keel.version as version_mod
+
+    _stamped(monkeypatch, "aaaaaaaaaaaa")
+    monkeypatch.setattr(version_mod, "_git", lambda *args: "bbbbbbbbbbbb")
+    monkeypatch.setattr(version_mod, "is_packaged", lambda: True)
+
+    info = version_mod.build_info()
+    assert info.source == "release"
+    assert info.dirty is False
+    assert info.is_reproducible
+
+
+def test_a_VENV_release_is_still_marked_dirty_when_git_disagrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix must not weaken the case it was written for. A stale stamp in a working checkout
+    would otherwise claim `[release]` and hide a dirty tree -- the exact misreport
+    `keel/version.py` exists to prevent -- and that hazard is real for a venv install and
+    impossible for a bundle, which has no working tree to have edited."""
+    import keel.version as version_mod
+
+    _stamped(monkeypatch, "aaaaaaaaaaaa")
+    monkeypatch.setattr(version_mod, "_git", lambda *args: "bbbbbbbbbbbb")
+    monkeypatch.setattr(version_mod, "is_packaged", lambda: False)
+
+    info = version_mod.build_info()
+    assert info.source == "release"
+    assert info.dirty is True
+    assert not info.is_reproducible
+
+
+def test_an_unstamped_frozen_bundle_is_unknown_and_never_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It is not a checkout -- there is no working tree. `unknown` also keeps `plan_update`'s
+    `source != "release"` refusal correct for a bundle that was built without a stamp."""
+    import keel.version as version_mod
+
+    monkeypatch.setattr(version_mod, "_embedded", lambda: None)
+    monkeypatch.setattr(version_mod, "is_packaged", lambda: True)
+
+    info = version_mod.build_info()
+    assert info.source == "unknown"
+    assert not info.is_reproducible
+
+
+def test_a_frozen_build_never_shells_out_to_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not merely that the answer is right, but that git is not consulted at all: a subprocess
+    per `--version` on a desktop app is also a visible pause, and on a machine with no git it is
+    an exception handler doing nothing useful."""
+    import keel.version as version_mod
+
+    _stamped(monkeypatch, "aaaaaaaaaaaa")
+    monkeypatch.setattr(version_mod, "is_packaged", lambda: True)
+
+    calls: list[tuple[str, ...]] = []
+
+    def _record(*args: str) -> str | None:
+        calls.append(args)
+        return None
+
+    monkeypatch.setattr(version_mod, "_git", _record)
+    version_mod.build_info()
+    assert calls == []
+
+
+def test_there_is_one_packaged_detector_not_two() -> None:
+    """`keel.install.is_packaged` is `keel.version`'s, re-exported. Two detectors would
+    eventually disagree about the same process."""
+    from keel import install, version
+
+    assert install.is_packaged is version.is_packaged

@@ -25,26 +25,27 @@ separate at the point where a wizard would be most tempted to conflate them.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from configparser import ConfigParser
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+
+import click
+
+from keel.version import is_packaged as _is_packaged
 
 #: Where a release is downloaded from, named in every refusal that tells a desktop user to update
 #: by downloading rather than by running a command.
 RELEASES_URL = "https://github.com/CodeGateSoftware/keel/releases/latest"
 
 
-def is_packaged() -> bool:
-    """True when running inside a frozen bundle rather than from a venv.
-
-    Both markers are checked because PyInstaller sets `sys.frozen` for every build mode but only
-    sets `sys._MEIPASS` for `--onefile`, and other freezers set one or the other. A false positive
-    here costs a refusal an operator can work around; a false negative sends a desktop user to
-    install `uv`, which is the outcome #439 exists to stop.
-    """
-    return bool(getattr(sys, "frozen", False)) or hasattr(sys, "_MEIPASS")
+#: Re-exported from `keel.version`, its home: that module is a leaf, and "how is this running"
+#: is its subject. Re-exported rather than re-implemented so the two can never disagree about the
+#: same process -- `keel.version.build_info` reads it to decide whether to consult git at all.
+is_packaged = _is_packaged
 
 
 # -- where things go ---------------------------------------------------------------------------
@@ -245,3 +246,115 @@ def packaged_update_refusal() -> str:
         f"from the command line. Get it from {RELEASES_URL} and run it -- it will keep your "
         "config, database and credentials exactly as they are."
     )
+
+
+# -- the marker an installer reads -------------------------------------------------------------
+#
+# `plan_install` needs the installed version, and #438 requires it be read from the artifact's
+# METADATA rather than by executing the installed binary. A frozen bundle has no `.dist-info` an
+# installer script can parse, so the installer writes this instead: one small file, in the program
+# directory, in a format a `.iss` script or a shell one-liner can read without a Python
+# interpreter it does not yet have.
+
+#: Written into the PROGRAM directory (never the deployment). INI rather than JSON because Inno
+#: Setup reads INI natively (`GetIniString`) and would otherwise need a JSON parser in Pascal --
+#: and a hand-rolled parser deciding whether to overwrite someone's install is not a trade worth
+#: making.
+INSTALL_MARKER = "keel-install.ini"
+
+_MARKER_SECTION = "keel"
+
+
+def marker_path(program_dir: Path | str) -> Path:
+    return Path(program_dir) / INSTALL_MARKER
+
+
+def write_install_marker(program_dir: Path | str, version: str, *, commit: str = "") -> Path:
+    """Record what was installed, for the NEXT installer to read.
+
+    Deliberately tiny and deliberately not authoritative about anything else: it answers one
+    question, and a file that answered several would grow reasons to be trusted for things it
+    cannot know."""
+    path = marker_path(program_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = f"[{_MARKER_SECTION}]\nversion={version}\n"
+    if commit:
+        body += f"commit={commit}\n"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def read_installed_version(program_dir: Path | str) -> str | None:
+    """The version recorded in `program_dir`, or `None` if there is no keel there.
+
+    `None` for a missing file, an unreadable one, a malformed one and an empty version alike: all
+    four mean "cannot establish what is installed", and `plan_install` turns that into a
+    confirmation rather than a silent overwrite. Never raises -- an installer that crashes while
+    deciding whether to overwrite is worse than one that asks."""
+    path = marker_path(program_dir)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    parser = ConfigParser()
+    try:
+        parser.read_string(text)
+    except Exception:
+        return None
+    version = parser.get(_MARKER_SECTION, "version", fallback="").strip()
+    return version or None
+
+
+def plan_install_into(program_dir: Path | str, incoming_version: str) -> InstallPlan:
+    """`plan_install`, reading the installed version from the target directory itself."""
+    return plan_install(incoming_version, read_installed_version(program_dir))
+
+
+# -- the command an installer script calls -----------------------------------------------------
+
+
+@click.command("install-plan")
+@click.option(
+    "--target",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="The program directory the installer is about to write into.",
+)
+@click.option("--incoming", default=None, help="Version being installed (default: this build's).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Machine-readable output.")
+@click.pass_context
+def install_plan_cmd(ctx: click.Context, target: Path, incoming: str | None, as_json: bool) -> None:
+    """What installing into `--target` would do, and whether it needs the user to agree.
+
+    A machine interface, like `keel versions`: an installer script shells out to it and acts on
+    the answer, so the rule that a downgrade must warn lives in tested Python rather than in a
+    Pascal script or a shell fragment where it cannot be tested at all.
+
+    Exit code is 0 when the install may proceed without asking, and 2 when it must stop and
+    confirm -- so a script that reads nothing but the status still fails safe.
+    """
+    from keel.version import build_info
+
+    version = incoming or build_info().version
+    plan = plan_install_into(target, version)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "decision": plan.decision.value,
+                    "installed_version": plan.installed_version,
+                    "incoming_version": plan.incoming_version,
+                    "needs_confirmation": plan.needs_confirmation,
+                    "summary": plan.summary,
+                    "warning": plan.warning,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(plan.summary)
+        if plan.warning:
+            click.echo(plan.warning)
+    # `ctx.exit`, not `raise SystemExit`: click owns the exit path, and a bare SystemExit
+    # is swallowed into a generic failure that loses both the code and the output above it.
+    ctx.exit(2 if plan.needs_confirmation else 0)
