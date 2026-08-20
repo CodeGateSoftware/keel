@@ -82,8 +82,64 @@ chmod +x "$APP/Contents/MacOS/keel-launcher"
 
 echo "built $APP"
 
-# `hdiutil` with UDZO: compressed, read-only, and the format `notarytool` accepts for stapling.
+# The note goes INSIDE the disk image, beside the app. This is the one place a Mac user actually
+# looks at the moment the app refuses to open -- a page in the repository is no use to someone
+# staring at "keel cannot be opened because the developer cannot be verified".
+STAGE="$OUT_DIR/dmg-stage"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/keel.app"
+cat > "$STAGE/READ ME FIRST.txt" <<NOTE
+keel $VERSION
+
+IF MACOS REFUSES TO OPEN THIS APP, NOTHING IS BROKEN.
+
+keel is not code-signed. Code signing is a paid certificate from Apple that tells macOS
+who built a program. It costs \$99 per year, there is no cheaper tier and no free option
+for open-source projects, and a certificate we made ourselves would do nothing at all --
+macOS trusts only certificates Apple issued.
+
+keel is an open-source project with essentially no budget, and that yearly cost is not
+something it can commit to today. So macOS sees a program from a developer it cannot
+identify, and does the right thing: it stops and asks you.
+
+TO OPEN IT
+
+  1. Drag keel.app to your Applications folder.
+  2. Double-click it. macOS refuses.
+  3. Open System Settings -> Privacy & Security.
+  4. Scroll down to the message about keel and click "Open Anyway".
+
+You only do this once.
+
+BEFORE YOU DO, PLEASE CHECK WHAT YOU DOWNLOADED
+
+We would rather not just ask you to click past a security warning -- keel is a program you
+may give exchange API keys to. Every release carries proof of where its files came from,
+which answers the same question a certificate does: was this built from keel's own source,
+by keel's own release pipeline?
+
+  gh attestation verify <the .dmg you downloaded> --repo CodeGateSoftware/keel
+
+A SHA256SUMS.txt file is attached to the release too. If either check fails, do not open
+this app.
+
+WHAT THIS DOES NOT MEAN
+
+  - It does not mean the download is damaged.
+  - It does not mean macOS found something wrong. Nothing was scanned and nothing was
+    detected; macOS simply does not know who wrote it.
+  - It does not mean the app behaves differently. A signed and an unsigned build of the
+    same release are the same program.
+
+Full explanation: https://github.com/CodeGateSoftware/keel/blob/main/docs/desktop-install.md
+
+keel is a personal tool. It is not financial advice and not religious (Shariah) advice.
+NOTE
+
+# `hdiutil` with UDZO: compressed and read-only.
 DMG="$OUT_DIR/keel-$VERSION-$(uname -m).dmg"
 rm -f "$DMG"
-hdiutil create -quiet -srcfolder "$APP" -volname "keel $VERSION" -format UDZO "$DMG"
+hdiutil create -quiet -srcfolder "$STAGE" -volname "keel $VERSION" -format UDZO "$DMG"
+rm -rf "$STAGE"
 echo "built $DMG"

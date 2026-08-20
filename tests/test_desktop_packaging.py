@@ -195,3 +195,63 @@ def test_the_script_runs_no_signing_command() -> None:
     for command in ("codesign", "notarytool", "stapler", "productsign"):
         offenders = [line for line in code if command in line]
         assert not offenders, f"{command} is invoked: {offenders}"
+
+
+# -- what the person downloading it is told ----------------------------------------------------
+
+_INSTALL_DOC = _ROOT / "docs" / "desktop-install.md"
+
+
+def test_the_install_note_exists_and_states_the_actual_reason() -> None:
+    """The reason is a budget, and saying so is better than "not signed at this time".
+
+    A user who is told a build is unsigned with no reason assumes carelessness. A user who is
+    told the certificate costs $99/yr and the project cannot commit to it has been given a fact
+    they can weigh -- and it is the truth."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    assert "$99" in text
+    assert "cannot currently afford" in text
+    assert "no cheaper tier" in text or "no free option" in text
+    # A self-signed certificate is the obvious "why not just..." and must be answered.
+    assert "made ourselves" in text or "self-signed" in text
+
+
+def test_the_install_note_tells_the_user_how_to_verify_before_bypassing() -> None:
+    """We are asking someone to click past a security warning on a program they may give exchange
+    API keys to. Asking that without offering a check would be the wrong trade."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    assert "gh attestation verify" in text
+    assert "SHA256SUMS" in text
+    assert "do not open" in text.lower()
+
+
+def test_the_install_note_says_what_the_warning_does_not_mean() -> None:
+    """ "Damaged" is what macOS sometimes says, and it is not what happened. Leaving that
+    uncorrected is how a working download gets deleted."""
+    # Emphasis stripped: the doc bolds the "not", and a test that missed it because of two
+    # asterisks would be checking markdown rather than meaning.
+    text = _INSTALL_DOC.read_text(encoding="utf-8").lower().replace("*", "")
+    assert "does not mean the download is damaged" in text
+    assert "nothing was scanned" in text
+
+
+def test_the_readme_documentation_map_links_the_install_note() -> None:
+    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "docs/desktop-install.md" in text
+
+
+def test_the_dmg_carries_the_note_beside_the_app() -> None:
+    """A page in the repository is no use to someone staring at "keel cannot be opened because
+    the developer cannot be verified". The disk image is where they are actually looking."""
+    text = _MACOS_SCRIPT.read_text(encoding="utf-8")
+    assert "READ ME FIRST.txt" in text
+    assert "$99" in text
+    # The image is built from a staging directory, not from the .app alone -- otherwise the note
+    # is written and then not shipped.
+    assert '-srcfolder "$STAGE"' in text
+
+
+def test_the_release_notes_point_at_the_full_explanation() -> None:
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    assert "docs/desktop-install.md" in text
+    assert "cannot currently afford" in text

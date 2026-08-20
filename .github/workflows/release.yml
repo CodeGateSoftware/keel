@@ -213,10 +213,13 @@ jobs:
             if [ "${{ inputs.desktop }}" = "publish-unsigned" ]; then
               echo "## Desktop app (macOS / Windows)"
               echo
-              echo "⚠️ **These builds are not code-signed.** keel is open source on a small"
-              echo "budget, and Apple notarisation requires a paid Developer ID certificate."
-              echo "There is no free alternative: a self-signed certificate buys nothing, because"
-              echo "Gatekeeper trusts Apple-issued Developer IDs and nothing else."
+              echo "⚠️ **These builds are not code-signed, so your computer will warn you.**"
+              echo "Apple's certificate costs \$99/yr and keel cannot currently afford it. There"
+              echo "is no cheaper tier and no free option, and a certificate we made ourselves"
+              echo "would do nothing — macOS trusts only certificates Apple issued."
+              echo
+              echo "Full explanation, including how to check what you downloaded:"
+              echo "<https://github.com/${{ github.repository }}/blob/main/docs/desktop-install.md>"
               echo
               echo "**macOS** — the first open is refused. Open **System Settings → Privacy &"
               echo "Security**, scroll to the message about \`keel\`, and choose **Open Anyway**."
