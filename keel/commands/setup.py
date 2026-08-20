@@ -623,16 +623,26 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #
 # Everything below WRITES. Read the rules before adding to it:
 #
-# 1. Only `MECHANICAL` and `OPERATOR_INPUT` steps may appear here, and the line between them and
-#    the rest is the point. A MECHANICAL step has no input: the machine simply does it. An
-#    OPERATOR_INPUT step is a FACT only the operator has -- an API key -- which a wizard can
-#    record and could not possibly invent.
+# 1. THE INVARIANT IS THE CAPABILITY REGISTRY, not the step kind. Not one of the eleven actions
+#    in `keel/capabilities.py` may be reachable from `keel/web/`, and a test scans that package
+#    to prove it. That is what stops the browser arming autonomy, releasing a halt, rebasing the
+#    high-water mark or replacing the binary.
 #
-#    `JUDGEMENT` steps are DECISIONS: a Shariah classification, a promotion. A form that recorded
-#    one would be making a compliance ruling on the operator's behalf, and no amount of "but they
-#    clicked it" makes that the same thing as their having decided it. `OFF_VENUE` steps happen
-#    somewhere keel cannot reach at all. Neither may ever be an action here, and the tests
-#    enforce it against `STEPS` rather than against a list kept in this file.
+#    `StepKind` was tried as the rule ("MECHANICAL only", then "MECHANICAL or OPERATOR_INPUT")
+#    and it was the wrong axis. Two JUDGEMENT steps -- attesting an asset, promoting a rule --
+#    live in the PAPER stage, so forbidding them did not buy safety (the registry already
+#    protects the dangerous ones); it only made a terminal-free paper deployment impossible,
+#    which is the whole point of the milestone.
+#
+#    So the step-kind rule is now the SECONDARY policy it should always have been: **a wizard may
+#    record what the operator supplies; it may never supply it.** An action over a JUDGEMENT step
+#    must therefore declare inputs, every one of them required, with no defaults and nothing
+#    pre-selected -- and `OFF_VENUE` steps stay unreachable, because there is nothing there to
+#    record that would be true.
+#
+#    What remains CLI-only is decided by the registry, not by taste: `withdrawals attest
+#    --enabled` is one of the eleven and stays behind the TTY gate. `confirm_cycle` is not an
+#    action because it cannot be observed at all.
 #
 # 2. An action with `inputs` records ONLY what was submitted. It has no defaults, no fallbacks and
 #    no "sensible guess" -- an action that could fill in a field the operator left blank is one
@@ -687,6 +697,11 @@ class ActionInput:
     name: str
     label: str
     secret: bool = False
+    #: A closed set of answers. Rendered as a select with NOTHING pre-selected -- see
+    #: `keel/web/render.py`. Empty means free text.
+    choices: tuple[str, ...] = ()
+    #: Shown under the field. For a judgement, this is where the question actually gets asked.
+    hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -861,9 +876,9 @@ def fetch_market_data(config_path: Path, db_path: Path, _values: dict[str, str])
         from keel.commands._products import parse_products_option
         from keel.commands.fetch import run_fetch
         from keel.config import load_config
+        from keel.data import freshness as freshness_mod
         from keel.data.db import connect
         from keel.data.repository import Repository
-        from keel.data import freshness as freshness_mod
 
         config = load_config(str(config_path))
         products, _warnings = parse_products_option(None, config)
@@ -895,6 +910,106 @@ def fetch_market_data(config_path: Path, db_path: Path, _values: dict[str, str])
     return ActionResult(
         "market_data", True, "fetching in the background -- this page will show its progress"
     )
+
+
+#: The classifications `keel assets attest` accepts. Read from the screen's own vocabulary so a
+#: new backing kind cannot appear there and be missing here.
+def _backing_choices() -> tuple[str, ...]:
+    from keel.compliance import screen as screen_mod
+
+    return tuple(sorted(screen_mod.KNOWN_BACKINGS))
+
+
+def attest_asset(config_path: Path, db_path: Path, values: dict[str, str]) -> ActionResult:
+    """Record one asset's Shariah classification -- EXACTLY as supplied, or not at all.
+
+    Its CLI counterpart states the reason this is safe to expose: "an attestation cannot itself
+    place an order or raise a cap, and the screen it feeds only ever ADMITS to a list that
+    `guards.py` rail 1 still enforces per-trade". It is not one of the eleven, and the CLI imposes
+    no ceremony on it beyond the mandatory `source`.
+
+    Every field is required and NOTHING is defaulted. `pays_yield` in particular is a choice with
+    no pre-selection rather than a checkbox: an unticked box would default to `no`, which is the
+    PERMISSIVE answer (a yield-bearing asset fails KB §28.4), and a form whose default answer is
+    the compliant one is a form that attests on the operator's behalf.
+    """
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    required = ("asset", "sector", "backing", "pays_yield", "source", "attested_by")
+    missing = [name for name in required if not values.get(name, "").strip()]
+    if missing:
+        return ActionResult(
+            "assets_attested", False, f"nothing recorded -- {', '.join(missing)} was blank"
+        )
+
+    backing = values["backing"].strip()
+    if backing not in _backing_choices():
+        return ActionResult("assets_attested", False, f"unknown backing {backing!r}")
+    if values["pays_yield"].strip() not in ("yes", "no"):
+        return ActionResult("assets_attested", False, "answer the yield question")
+
+    asset = values["asset"].strip().upper()
+    conn = connect(str(db_path))
+    try:
+        Repository(conn).upsert_asset_attestation(
+            asset=asset,
+            sector=values["sector"].strip(),
+            backing=backing,
+            pays_yield=values["pays_yield"].strip() == "yes",
+            source=values["source"].strip(),
+            attested_by=values["attested_by"].strip(),
+            attested_at=int(time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return ActionResult("assets_attested", True, f"attested {asset}")
+
+
+def promote_rule(config_path: Path, db_path: Path, values: dict[str, str]) -> ActionResult:
+    """Re-run a rule's backtest and advance it IF it clears the gate -- in the background.
+
+    **`force` is hard-wired False and is not a field.** `attempt_promotion`'s own docstring is
+    explicit that force "carries no gate HERE ... the O3 contract is the front-end's to keep,
+    never the service's to assume" -- so a front-end that offered it would be the thing removing
+    the gate. The console's force path runs a typed terminal confirmation first; this one simply
+    does not have a force path, which is the only version of that contract a browser can keep.
+
+    A promotion re-runs a backtest, so it is a job for the same reason a fetch is.
+    """
+    from keel.commands import jobs
+
+    raw = values.get("rule_id", "").strip()
+    if not raw.isdigit():
+        return ActionResult("rule_promoted", False, "nothing done -- give a numeric rule id")
+    rule_id = int(raw)
+
+    if jobs.is_running():
+        return ActionResult("rule_promoted", False, "a job is already running")
+
+    def _run(echo: Callable[[str], None]) -> None:
+        from keel.commands.rules import attempt_promotion
+        from keel.config import load_config
+        from keel.data.db import connect
+        from keel.data.repository import Repository
+
+        conn = connect(str(db_path))
+        try:
+            attempt_promotion(
+                Repository(conn),
+                lambda: load_config(str(config_path)),
+                rule_id,
+                force=False,
+                echo=echo,
+                echo_err=echo,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    jobs.start("rule_promoted", _run)
+    return ActionResult("rule_promoted", True, "running the backtest and gate -- progress is above")
 
 
 #: THE closed set of steps a machine may perform on the operator's behalf.
@@ -936,6 +1051,48 @@ ACTIONS: tuple[Action, ...] = (
             ActionInput("CDP_API_KEY", "CDP API key"),
             ActionInput("CDP_API_SECRET", "CDP API secret", secret=True),
         ),
+    ),
+    Action(
+        key="assets_attested",
+        title="Record this attestation",
+        detail=(
+            "Your classification of one asset, recorded exactly as you give it. keel does not "
+            "check it and cannot: it is a statement about the world, and the source is what makes "
+            "it one. Nothing here is filled in for you."
+        ),
+        run=attest_asset,
+        inputs=(
+            ActionInput("asset", "Asset code", hint="e.g. BTC"),
+            ActionInput("sector", "Core business line or purpose", hint="what the token is for"),
+            ActionInput(
+                "backing",
+                "Backing",
+                choices=("ayn", "dayn", "native"),
+                hint=(
+                    "'ayn (an owned thing), dayn (a claim on an issuer), native (a base-layer coin)"
+                ),
+            ),
+            ActionInput(
+                "pays_yield",
+                "Does holding it earn a return?",
+                choices=("no", "yes"),
+                hint="a yield-bearing asset is refused by the screen (KB §28.4)",
+            ),
+            ActionInput(
+                "source", "Source", hint="URL, standard or ruling this was established from"
+            ),
+            ActionInput("attested_by", "Attested by", hint="who established it"),
+        ),
+    ),
+    Action(
+        key="rule_promoted",
+        title="Promote this rule",
+        detail=(
+            "Re-runs the rule's backtest and advances it only if it clears the gate. There is no "
+            "force option here: bypassing the gate needs a terminal."
+        ),
+        run=promote_rule,
+        inputs=(ActionInput("rule_id", "Rule id", hint="from the Rules page"),),
     ),
     Action(
         key="market_data",

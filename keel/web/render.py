@@ -93,8 +93,9 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 0.85r
 form { margin: 0.5rem 0 0; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.6rem 0; max-width: 26rem; }
 .field span { font-size: 0.8rem; color: var(--muted); }
-.field input { font: inherit; padding: 0.4rem 0.6rem; border-radius: 7px;
+.field input, .field select { font: inherit; padding: 0.4rem 0.6rem; border-radius: 7px;
   border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.field em { font-style: normal; font-size: 0.78rem; color: var(--muted); }
 button { font: inherit; font-weight: 550; padding: 0.35rem 0.9rem; border-radius: 7px;
   border: 1px solid var(--accent); background: var(--accent); color: var(--card);
   cursor: pointer; }
@@ -745,6 +746,30 @@ def render_setup(
     return "".join(parts)
 
 
+def _action_field(field: Any) -> str:
+    """One input. A `choices` field renders as a select whose FIRST option is an empty,
+    disabled, selected placeholder -- so the form opens with no valid answer chosen.
+
+    That placeholder is the whole point for a judgement. A checkbox for "does it pay yield?"
+    would open unticked, and unticked is `no`, which is the PERMISSIVE answer -- a form whose
+    default is the compliant one attests on the operator's behalf. A select that starts on
+    "choose…" and is `required` cannot be submitted without someone answering.
+    """
+    label = f"<span>{esc(field.label)}</span>"
+    hint = f"<em>{esc(field.hint)}</em>" if getattr(field, "hint", "") else ""
+    choices = getattr(field, "choices", ())
+    if choices:
+        options = '<option value="" disabled selected>choose…</option>' + "".join(
+            f"<option>{esc(choice)}</option>" for choice in choices
+        )
+        control = f'<select name="{esc(field.name)}" required>{options}</select>'
+    else:
+        kind = "password" if field.secret else "text"
+        extra = ' autocomplete="off" spellcheck="false"' if field.secret else ""
+        control = f'<input type="{kind}" name="{esc(field.name)}" required{extra}>'
+    return f'<label class="field">{label}{control}{hint}</label>'
+
+
 def _action_form(action: Any, csrf: str) -> str:
     """One action key, one write token, and only the fields the action itself declares.
 
@@ -753,18 +778,11 @@ def _action_form(action: Any, csrf: str) -> str:
     where it survives a screenshot, a "view source", and anything that saves the page. The cost is
     that a failed submission must be retyped; that is the correct cost.
 
-    `autocomplete="off"` on the secret fields keeps a browser password manager from offering to
-    store an exchange API key as though it were a website login."""
-    fields = ""
-    for field in getattr(action, "inputs", ()):
-        kind = "password" if field.secret else "text"
-        extra = ' autocomplete="off" spellcheck="false"' if field.secret else ""
-        fields += (
-            '<label class="field">'
-            f"<span>{esc(field.label)}</span>"
-            f'<input type="{kind}" name="{esc(field.name)}" required{extra}>'
-            "</label>"
-        )
+    NO field is ever given a `value`, secret or not, and no select opens on a valid option. An
+    action over a judgement step records what the operator supplied and nothing else, and a
+    pre-filled form is the shortest route to recording something they did not.
+    """
+    fields = "".join(_action_field(field) for field in getattr(action, "inputs", ()))
     return (
         f'<form method="post" action="/setup/{esc(action.key)}">'
         f'<input type="hidden" name="csrf" value="{esc(csrf)}">'
