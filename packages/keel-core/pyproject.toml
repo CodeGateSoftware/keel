@@ -4,7 +4,16 @@ version = "0.10.0"
 description = "Shared domain types, configuration, and logging for keel"
 license = "Apache-2.0"
 requires-python = ">=3.11"
-dependencies = ["pyyaml>=6.0.3", "python-dotenv>=1.2.2"]
+dependencies = [
+    "pyyaml>=6.0.3",
+    "python-dotenv>=1.2.2",
+    # The OS keychain (macOS Keychain, Windows Credential Manager, Secret Service). Needed by
+    # `keel_core.secrets` because the desktop product's user has no terminal and cannot create a
+    # `.env`; `.env` stays fully supported and still takes precedence over it. Verified to work
+    # inside a PyInstaller bundle -- keyring selects its backend dynamically, which is exactly
+    # the kind of thing freezing usually breaks, so it was checked rather than assumed.
+    "keyring>=25.6",
+]
 
 [build-system]
 requires = ["uv_build>=0.10.4,<0.13.0"]

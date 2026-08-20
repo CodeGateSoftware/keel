@@ -955,21 +955,28 @@ def load_config(path: str | Path) -> Config:
 
 
 def load_secrets(env_path: str | Path | None = None) -> dict:
-    """Load CDP API credentials from a git-ignored `.env` file.
+    """Load CDP API credentials from the environment, a git-ignored `.env`, or the OS keychain.
 
-    Returns `{"api_key": ..., "api_secret": ...}` when both are present, `{}` when the file is
-    absent or empty so offline commands keep working without secrets configured.
+    Returns `{"api_key": ..., "api_secret": ...}` when either is present, `{}` when neither is,
+    so offline commands keep working without secrets configured.
+
+    **The `.env` file still wins over the keychain**, and every pre-existing deployment therefore
+    behaves byte-identically: the keychain only answers where the file was silent. `keel_core.
+    secrets` states the full precedence and why -- in one line, a value the operator can see beats
+    one they cannot when the two disagree, and a stale keychain entry silently overriding an
+    edited `.env` is a debugging session nobody should have to have.
+
+    The keychain exists because the desktop product's user has no terminal and cannot create a
+    `.env` at all (#437). It is not a migration: nothing moves a credential out of a file.
     """
+    from keel_core.secrets import read_secret
+
     # `None` resolves against the state root -- the deployment folder when there is one, the
     # OS app-data directory otherwise (see `keel_core.paths`). An explicit path is honoured
     # unchanged, which is what every caller passing one already relies on.
-    env_path = Path(env_path) if env_path is not None else default_env_path()
-    if not env_path.exists():
-        return {}
-
-    values = dotenv_values(env_path)
-    api_key = values.get("CDP_API_KEY")
-    api_secret = values.get("CDP_API_SECRET")
+    resolved = Path(env_path) if env_path is not None else default_env_path()
+    api_key = read_secret("CDP_API_KEY", env_path=resolved).value
+    api_secret = read_secret("CDP_API_SECRET", env_path=resolved).value
     if not api_key and not api_secret:
         return {}
     return {"api_key": api_key, "api_secret": api_secret}

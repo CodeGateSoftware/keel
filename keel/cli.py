@@ -141,6 +141,7 @@ from keel.commands.confirm import (  # noqa: F401 -- deliberate re-export, pinne
     UNREADABLE_PREVIEW_MARKER,
     _interactive_confirm,
 )
+from keel.commands.credentials import credentials_group
 from keel.commands.db import db_group
 from keel.commands.fetch import assess_products as _assess_products  # noqa: F401 -- pinned by tests
 
@@ -1348,6 +1349,14 @@ cli.add_command(capabilities_cmd)
 # off-venue -- read from the deployment rather than assumed, so the CLI, the browser view and any
 # later wizard cannot drift into three accounts of what a deployment needs (#437).
 cli.add_command(setup_cmd)
+
+
+# -- credentials (the OS keychain, so a desktop user need never create a .env) --------------------
+
+# `.env` stays fully supported and still takes precedence; the keychain only answers where the
+# file is silent. It exists because the desktop product's user has no terminal and cannot create a
+# `.env` at all (#437). Defined in `keel.commands.credentials` over `keel_core.secrets`.
+cli.add_command(credentials_group)
 
 
 # -- install-plan (the machine interface an installer script calls) ------------------------------
