@@ -155,6 +155,7 @@ from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
 from keel.commands.rules import rules_group, rules_seed
 from keel.commands.serve import serve_cmd
+from keel.commands.setup import setup_cmd
 from keel.commands.simulate import (
     SIM_SLIPPAGE_PCT as _SIM_SLIPPAGE_PCT,  # noqa: F401 -- pinned by tests
 )
@@ -1332,6 +1333,15 @@ cli.add_command(serve_cmd)
 # the source in both directions. This command prints it, so the question "what can a cron job
 # reach?" is answerable from the running binary rather than from a grep of the repository.
 cli.add_command(capabilities_cmd)
+
+
+# -- setup (what this deployment still needs, and which parts only a human can do) ---------------
+
+# First run is ~10 invocations plus hand-edited YAML, and the go-live runbook is the only place
+# that says so. `keel/commands/setup.py` is that ceremony as data -- mechanical / judgement /
+# off-venue -- read from the deployment rather than assumed, so the CLI, the browser view and any
+# later wizard cannot drift into three accounts of what a deployment needs (#437).
+cli.add_command(setup_cmd)
 
 
 # -- insights (read-only promotion-gate + journal reporting, no broker call) --------------------

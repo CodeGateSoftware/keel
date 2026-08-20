@@ -20,7 +20,16 @@ from keel.web import server as web_server
 from keel.web.security import SESSION_COOKIE, new_session_token
 from tests.conftest import VALID_CONFIG_YAML
 
-ROUTES = ("/", "/activity", "/insights", "/rules", "/venues", "/gates", "/glossary")
+ROUTES = (
+    "/",
+    "/setup",
+    "/activity",
+    "/insights",
+    "/rules",
+    "/venues",
+    "/gates",
+    "/glossary",
+)
 
 
 @pytest.fixture
@@ -310,3 +319,94 @@ def test_the_gates_page_names_every_capability_and_claims_none_of_them(
         # and asserting on the raw form would quietly stop checking those rows.
         assert render.esc(cap.invocation) in body, cap.invocation
     assert "cannot perform any of them" in body
+
+
+# -- first run (#437) --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def empty_machine(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
+    """A server pointed at paths where nothing exists -- the state a first-run user is in, and
+    the one most likely to render as a stack trace."""
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=str(tmp_path / "keel.db"),
+        config_path=str(tmp_path / "config.yaml"),
+    )
+    server = web_server.build_server(cfg)
+    bound = web_server.ServeConfig(
+        host=cfg.host,
+        port=int(server.server_address[1]),
+        token=cfg.token,
+        db_path=cfg.db_path,
+        config_path=cfg.config_path,
+    )
+    server.RequestHandlerClass.cfg = bound  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield bound
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_the_landing_page_of_a_machine_with_nothing_on_it_is_the_checklist(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """`gather_status` reads tables, so against a database with no schema it raises. Without
+    first-run detection the very first thing a new user sees is a 500 whose real cause is that
+    they have not set anything up yet."""
+    status, _headers, body = _request(empty_machine, "/", cookie=_session(empty_machine))
+    assert status == 200
+    assert "There is no deployment here yet" in body
+    assert "Traceback" not in body
+
+
+@pytest.mark.parametrize("path", ROUTES)
+def test_no_page_is_a_stack_trace_on_a_machine_with_nothing_on_it(
+    empty_machine: web_server.ServeConfig, path: str
+) -> None:
+    """Every route, not just the landing page. Smoke-testing an empty directory found `/activity`,
+    `/insights` and `/rules` answering 500 while `/` was fine -- so a first-run user who clicked
+    anything in the nav got an error page."""
+    status, _headers, body = _request(empty_machine, path, cookie=_session(empty_machine))
+    assert status == 200, (path, body[:300])
+    assert "Traceback" not in body
+
+
+def test_looking_at_a_machine_with_nothing_on_it_creates_nothing(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """`sqlite3.connect` CREATES the file it cannot find, so a page that opens the database
+    before checking whether there is one leaves an empty `keel.db` behind -- a read-only view
+    bringing a deployment into existence by being looked at. Every route, because that is how
+    this was missed: the original test walked two of them."""
+    for path in ROUTES:
+        _request(empty_machine, path, cookie=_session(empty_machine))
+    assert not Path(empty_machine.db_path).exists()
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_the_checklist_never_shows_an_off_venue_step_as_done(
+    running: web_server.ServeConfig,
+) -> None:
+    """keel cannot see whether USDC Rewards is off. Rendering it as done would turn an open riba
+    exposure into a false assurance -- the operator runbook says so explicitly."""
+    from keel.commands.setup import STEPS, StepKind
+
+    _status, _headers, body = _request(running, "/setup", cookie=_session(running))
+    off_venue = [step for step in STEPS if step.kind is StepKind.OFF_VENUE]
+    assert off_venue
+    for step in off_venue:
+        assert render_esc(step.title) in body
+    assert "cannot verify it" in body
+
+
+def render_esc(value: str) -> str:
+    from keel.web import render
+
+    return render.esc(value)

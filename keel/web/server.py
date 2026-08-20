@@ -23,6 +23,7 @@ than a long-lived reader that could sit inside someone else's transaction.
 
 from __future__ import annotations
 
+import functools
 import socket
 import sys
 import time
@@ -111,6 +112,41 @@ def _load_config(config_path: str) -> Any:
     from keel.config import load_config
 
     return load_config(config_path)
+
+
+def _deployment_state(cfg: ServeConfig) -> Any:
+    from keel.commands.setup import inspect
+
+    return inspect(cfg.config_path, cfg.db_path)
+
+
+def page_setup(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
+    return "Setup", render.render_setup(_deployment_state(cfg)), None
+
+
+def needs_database(
+    page: Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]],
+) -> Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]]:
+    """Serve the checklist instead of building a page that has no database to build from.
+
+    Every page below this reads tables, and `sqlite3.connect` CREATES the file it cannot find --
+    so without this a first-run user clicking "Activity" would get a 500 *and* leave an empty
+    `keel.db` behind, brought into existence by a read-only view being looked at. Found by
+    smoke-testing an empty directory; the unit tests missed it because they only exercised the
+    landing page.
+
+    The guard is on the whole set rather than on the landing page alone for the same reason the
+    thinness pin globs a directory: a page added later gets the behaviour by construction, not by
+    its author remembering."""
+
+    @functools.wraps(page)
+    def guarded(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
+        state = _deployment_state(cfg)
+        if not state.has_usable_database:
+            return "Setup", render.render_setup(state), None
+        return page(cfg, query)
+
+    return guarded
 
 
 def page_status(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
@@ -202,10 +238,15 @@ def page_glossary(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str,
 
 
 ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]]] = {
-    "/": page_status,
-    "/activity": page_activity,
-    "/insights": page_insights,
-    "/rules": page_rules,
+    # First-run detection (#437): every page that reads the database serves the checklist when
+    # there is no database to read, rather than a 500 whose real cause is that the user has not
+    # set anything up yet. `/venues`, `/gates` and `/glossary` are not wrapped -- none of them
+    # touches the deployment, and all three are useful before one exists.
+    "/": needs_database(page_status),
+    "/setup": page_setup,
+    "/activity": needs_database(page_activity),
+    "/insights": needs_database(page_insights),
+    "/rules": needs_database(page_rules),
     "/venues": page_venues,
     "/gates": page_gates,
     "/glossary": page_glossary,
