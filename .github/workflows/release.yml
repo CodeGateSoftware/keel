@@ -13,11 +13,11 @@ on:
         required: true
         type: string
       desktop:
-        description: "Desktop artifacts. 'build' produces and smoke-tests them as workflow artifacts; 'publish' also attaches them to the release and REQUIRES signing to have succeeded; 'skip' does neither."
+        description: "Desktop artifacts. 'build' produces and smoke-tests them as workflow artifacts only. 'publish-unsigned' also attaches them to the release -- they are NOT code-signed, so macOS Gatekeeper and Windows SmartScreen will warn; the option is named for what it does so it cannot be chosen without reading it. 'skip' does neither."
         required: true
         default: build
         type: choice
-        options: [build, publish, skip]
+        options: [build, publish-unsigned, skip]
 
 permissions:
   contents: write # create the tag and the release
@@ -210,6 +210,34 @@ jobs:
             echo
             echo "Seeded rules start as \`candidate\` and trade nothing until you promote them."
             echo
+            if [ "${{ inputs.desktop }}" = "publish-unsigned" ]; then
+              echo "## Desktop app (macOS / Windows)"
+              echo
+              echo "⚠️ **These builds are not code-signed.** keel is open source on a small"
+              echo "budget, and Apple notarisation requires a paid Developer ID certificate."
+              echo "There is no free alternative: a self-signed certificate buys nothing, because"
+              echo "Gatekeeper trusts Apple-issued Developer IDs and nothing else."
+              echo
+              echo "**macOS** — the first open is refused. Open **System Settings → Privacy &"
+              echo "Security**, scroll to the message about \`keel\`, and choose **Open Anyway**."
+              echo "You will only do this once."
+              echo
+              echo "**Windows** — SmartScreen shows \"Windows protected your PC\". Choose **More"
+              echo "info → Run anyway**."
+              echo
+              echo "**Verify what you downloaded before you run it.** Every artifact carries a"
+              echo "GitHub build attestation binding it to this repository, this workflow and this"
+              echo "commit — which is the question a code-signing certificate answers too:"
+              echo
+              echo "    gh attestation verify <file> --repo ${{ github.repository }}"
+              echo
+              echo "\`SHA256SUMS.txt\` is attached as well. If either check fails, do not run it."
+              echo
+              echo "The app opens keel in your browser; there is no terminal involved. Your"
+              echo "config, database and credentials live in your user Application Support /"
+              echo "LocalAppData folder and are never touched by an update."
+              echo
+            fi
             echo "$GENERATED"
           } > /tmp/release-notes.md
           echo "composed $(wc -l < /tmp/release-notes.md) lines of notes"
@@ -228,17 +256,37 @@ jobs:
   #
   # Runs AFTER `release`, so the tag it checks out is the one that job created and published.
   #
-  # WHY IT DEFAULTS TO `build` AND NOT `publish`. An unsigned binary that then asks for exchange
-  # API keys is the shape of malware distribution -- section 1 of the desktop PRD opens on a live
-  # example found while surveying this space. For a project whose proposition is auditability,
-  # shipping that silhouette without OS-level verification would be worse than shipping no
-  # installer at all. So the pipeline is built so that publishing an unsigned artifact is not
-  # something you can do by forgetting a flag: `publish` FAILS when the signing secrets are
-  # absent, rather than quietly attaching an unsigned build to a release.
+  # THESE ARTIFACTS ARE NOT CODE-SIGNED, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT.
+  #
+  # Apple notarisation requires a Developer ID certificate, which requires the $99/yr Developer
+  # Program. There is no free path: a free Apple account signs only for local development, and a
+  # self-signed certificate buys nothing because Gatekeeper trusts Apple-issued Developer IDs and
+  # nothing else. keel is open source on a small budget and has chosen not to pay it.
+  #
+  # What that costs the user is real and is documented rather than hidden: a `.dmg` downloaded
+  # from the internet carries a quarantine flag, so macOS refuses the first open until they go to
+  # System Settings -> Privacy & Security -> Open Anyway. Windows SmartScreen warns similarly.
+  #
+  # What replaces OS-level trust here is PROVENANCE, which is free and is arguably the more
+  # honest answer for an auditable project anyway: every artifact carries a GitHub build
+  # attestation tying it to this workflow, this repository and this commit, verifiable with
+  #
+  #     gh attestation verify <file> --repo CodeGateSoftware/keel
+  #
+  # plus a SHA256SUMS file in the release. That does not stop Gatekeeper -- nothing free does --
+  # but it does answer "did this binary come from that source", which a signature from a $99
+  # certificate answers no better.
+  #
+  # The publish option is spelled `publish-unsigned` deliberately: it cannot be selected without
+  # reading the word, and the default is `build`, which attaches nothing to a release.
   desktop:
     needs: release
     if: ${{ inputs.desktop != 'skip' }}
     timeout-minutes: 45
+    permissions:
+      contents: write # attach the artifacts to the release
+      id-token: write # OIDC token for the build attestation
+      attestations: write # write the attestation itself
     strategy:
       fail-fast: false
       matrix:
@@ -345,19 +393,24 @@ jobs:
           7z a -tzip "out/keel-${{ inputs.version }}-windows-${{ matrix.arch }}.zip" ./dist/keel/* >/dev/null
           ls -l out
 
-      # SIGNING GOES HERE. Deliberately absent rather than stubbed: a step that silently does
-      # nothing when a secret is missing is how an unsigned artifact ends up looking signed. The
-      # gate below fails the job instead, so the missing half is impossible to overlook.
-      #   macOS  -- Developer ID cert in an ephemeral keychain, `codesign --options runtime`,
-      #             `notarytool submit --wait`, `stapler staple`.
-      #   Windows -- Azure Trusted Signing or an OV cert, via a protected environment.
-      - name: Refuse to publish an unsigned artifact
-        if: inputs.desktop == 'publish'
+      # Checksums travel WITH the artifacts, in the same release, so a user who was handed a
+      # download link somewhere else has something local to compare against.
+      - name: Checksums
+        shell: bash
         run: |
-          echo "::error::'publish' was requested but no signing is configured in this workflow yet."
-          echo "::error::An unsigned binary that then asks for exchange API keys is the shape of"
-          echo "::error::malware distribution. Re-run with desktop=build, or wire signing first."
-          exit 1
+          set -euo pipefail
+          cd out
+          if command -v sha256sum >/dev/null; then sha256sum ./* > SHA256SUMS.txt
+          else shasum -a 256 ./* > SHA256SUMS.txt; fi
+          cat SHA256SUMS.txt
+
+      # The substitute for a code-signing certificate, and free. Ties each artifact to this
+      # workflow, this repository and this commit; a user verifies with
+      #   gh attestation verify <file> --repo ${{ github.repository }}
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v4
@@ -365,3 +418,15 @@ jobs:
           name: keel-${{ inputs.version }}-${{ runner.os }}-${{ matrix.arch }}
           path: out/*
           if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.desktop == 'publish-unsigned'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--clobber` so a re-run of one matrix leg replaces its own asset rather than failing
+          # the whole publish on a name collision.
+          gh release upload "v${{ inputs.version }}" out/* --clobber
+          echo "attached $(ls out | wc -l) file(s) to v${{ inputs.version }}"

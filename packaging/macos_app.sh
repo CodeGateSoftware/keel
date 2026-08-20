@@ -14,10 +14,18 @@
 # `keel.app/Contents/Resources/keel/keel <command>` and get the full CLI. One artifact, both
 # audiences, no second build.
 #
-# SIGNING IS NOT DONE HERE. This script produces an UNSIGNED bundle on purpose: signing needs an
-# Apple Developer ID certificate in a keychain, which exists only in the release workflow's
-# protected environment. Gatekeeper will refuse this output on another machine, and that is the
-# correct outcome for an artifact nobody signed.
+# THIS OUTPUT IS UNSIGNED, AND STAYS UNSIGNED. Apple notarisation requires a Developer ID
+# certificate, which requires the $99/yr Developer Program; a free Apple account signs only for
+# local development, and a self-signed certificate buys nothing because Gatekeeper trusts
+# Apple-issued Developer IDs and nothing else. keel is open source on a small budget and has
+# chosen not to pay it.
+#
+# So Gatekeeper WILL refuse the first open of a downloaded copy, and the release notes say so and
+# say what to do about it (System Settings -> Privacy & Security -> Open Anyway). What replaces
+# OS-level trust is provenance: the release workflow attaches a GitHub build attestation and a
+# SHA256SUMS file, which answer "did this come from that repository, built by that workflow" --
+# the same question a certificate answers, and the one an auditable project should care about
+# most.
 set -euo pipefail
 
 BUNDLE_DIR="${1:?usage: macos_app.sh <dist/keel> <out-dir> <version>}"

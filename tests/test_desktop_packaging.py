@@ -37,38 +37,71 @@ def _steps_text(job: dict) -> str:
 # -- the thing that must not happen ------------------------------------------------------------
 
 
-def test_publishing_an_unsigned_artifact_fails_rather_than_succeeding_quietly(
-    desktop_job: dict,
-) -> None:
-    """An unsigned binary that then asks for exchange API keys is the shape of malware
-    distribution -- the desktop PRD opens on a live example found while surveying this space.
+def test_the_publish_option_is_named_for_what_it_does(workflow: dict) -> None:
+    """These artifacts are not code-signed, by decision: Apple notarisation needs a paid
+    Developer ID and there is no free substitute -- a self-signed certificate buys nothing,
+    because Gatekeeper trusts Apple-issued IDs and nothing else.
 
-    So `publish` must FAIL while signing is unconfigured. A step that silently did nothing when a
-    secret was missing is exactly how an unsigned artifact ends up attached to a release looking
-    like a signed one."""
-    guards = [
+    Given that, the protection is that nobody can publish unsigned binaries without reading the
+    word "unsigned". `publish` would have been a value you could pick without thinking; this one
+    is not."""
+    desktop = workflow[True]["workflow_dispatch"]["inputs"]["desktop"]
+    assert set(desktop["options"]) == {"build", "publish-unsigned", "skip"}
+    assert "publish" not in desktop["options"]
+    assert "unsigned" in desktop["description"].lower()
+
+
+def test_the_default_attaches_nothing_to_a_release(workflow: dict, desktop_job: dict) -> None:
+    """The safe value is the one you get by not thinking about it."""
+    assert workflow[True]["workflow_dispatch"]["inputs"]["desktop"]["default"] == "build"
+    attaching = [
         step
         for step in desktop_job["steps"]
-        if str(step.get("if", "")).strip() == "inputs.desktop == 'publish'"
+        if "gh release upload" in str(step.get("run", ""))
+        or "gh release create" in str(step.get("run", ""))
     ]
-    assert guards, "nothing guards the publish path"
-    assert any("exit 1" in str(step.get("run", "")) for step in guards)
+    assert attaching, "nothing attaches artifacts, so this test proves nothing"
+    for step in attaching:
+        assert str(step.get("if", "")).strip() == "inputs.desktop == 'publish-unsigned'"
 
 
-def test_the_default_is_build_not_publish(workflow: dict) -> None:
-    """Publishing is opt-in. The safe value is the one you get by not thinking about it."""
-    desktop = workflow[True]["workflow_dispatch"]["inputs"]["desktop"]
-    assert desktop["default"] == "build"
-    assert set(desktop["options"]) == {"build", "publish", "skip"}
+def test_every_artifact_carries_provenance_and_checksums(desktop_job: dict) -> None:
+    """What replaces OS-level trust, and it is free. An attestation ties each artifact to this
+    repository, this workflow and this commit -- which is the question a code-signing certificate
+    answers too, and the one an auditable project should care about most."""
+    steps = desktop_job["steps"]
+    attest = [s for s in steps if "attest-build-provenance" in str(s.get("uses", ""))]
+    assert attest, "no build provenance attestation"
+    assert attest[0]["with"]["subject-path"] == "out/*"
+    assert "SHA256SUMS" in _steps_text(desktop_job)
+
+    # The attestation needs OIDC, and the job must ask for it explicitly rather than relying on
+    # a workflow-wide grant that would also widen the release job.
+    assert desktop_job["permissions"]["id-token"] == "write"
+    assert desktop_job["permissions"]["attestations"] == "write"
 
 
-def test_no_step_attaches_a_desktop_artifact_to_the_github_release(desktop_job: dict) -> None:
-    """The only route to a release asset is `gh release upload`/`create`. While signing is
-    unconfigured there must be no such call in this job at all -- the guard above is the
-    intended stop, and this is the one that catches a second route added around it."""
-    text = _steps_text(desktop_job)
-    assert "gh release upload" not in text
-    assert "gh release create" not in text
+def test_provenance_is_produced_before_anything_is_attached(desktop_job: dict) -> None:
+    """Attaching first would publish an artifact that is briefly unverifiable, and a failed
+    attestation afterwards would leave it published anyway."""
+    steps = desktop_job["steps"]
+    attest_at = next(
+        i for i, s in enumerate(steps) if "attest-build-provenance" in str(s.get("uses", ""))
+    )
+    attach_at = next(i for i, s in enumerate(steps) if "gh release upload" in str(s.get("run", "")))
+    assert attest_at < attach_at
+
+
+def test_the_release_notes_say_the_builds_are_unsigned_and_how_to_verify_them() -> None:
+    """A download that trips Gatekeeper with no explanation is indistinguishable from a broken
+    one, and a user who is told to click past a security warning with no way to check what they
+    have is being taught a bad habit while holding exchange API keys."""
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    assert "not code-signed" in text
+    assert "Privacy & Security" in text
+    assert "Open Anyway" in text
+    assert "gh attestation verify" in text
+    assert "SHA256SUMS" in text
 
 
 def test_the_desktop_job_runs_after_the_release_and_builds_that_tag(desktop_job: dict) -> None:
