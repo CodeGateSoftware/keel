@@ -209,7 +209,14 @@ STEPS: tuple[Step, ...] = (
         title="At least one rule promoted to paper",
         kind=StepKind.JUDGEMENT,
         stage=Stage.PAPER,
-        why="Seeded rules are candidates and trade nothing. Which rule to run is your choice.",
+        why=(
+            "Seeded rules are candidates and trade nothing. Which rule to run is your choice -- "
+            "and on a fresh deployment the gate will very likely REFUSE it, naming too few "
+            "trades, a win rate under the floor, and an overfitting check that was never run. "
+            "That is the engine working, not a fault: a rule that has not earned paper status "
+            "does not get it, and this step can stay outstanding for a long time. Bypassing the "
+            "gate is `keel rules promote --force`, deliberately and on the record, at a terminal."
+        ),
         how="keel rules promote <id>",
     ),
     Step(
@@ -296,7 +303,12 @@ class DeploymentState:
         `OFF_VENUE` steps can never be observed, so a deployment is never `ready_for(LIVE)` by
         this function's reckoning. That is the honest answer and it is deliberate: the last word
         on going live belongs to the operator who checked the venue dashboard, not to a function
-        that cannot see it."""
+        that cannot see it.
+
+        `ready_for(PAPER)` is a real answer, but not one a fresh install reaches quickly:
+        `rule_promoted` waits on a promotion gate that a newly-seeded rule will very likely fail,
+        by design. "Set up" and "has a rule worth running" are different states, and this reports
+        the second."""
         wanted = (Stage.PAPER,) if stage is Stage.PAPER else (Stage.PAPER, Stage.LIVE)
         return all(state.done is True for state in self.states if state.step.stage in wanted)
 

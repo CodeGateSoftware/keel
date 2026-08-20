@@ -245,3 +245,28 @@ def test_the_rendered_checklist_names_every_step_and_the_next_action(
     for step in STEPS:
         assert step.title in text, step.key
     assert text.rstrip().splitlines()[-1].startswith("next: ")
+
+
+def test_the_promotion_step_says_a_refusal_is_the_engine_working() -> None:
+    """Measured on a real deployment: a freshly-seeded turtle_breakout promoted from the browser
+    was refused with `n_trades 12 < 100`, `win_rate 0.5 < 0.55`, and the overfitting check never
+    run. That is correct, and it is also the single most likely thing a first-run user will see
+    on this step.
+
+    Left unexplained it reads as a broken button on a checklist that has gone green everywhere
+    else. The step's own text has to say that a refusal is the gate doing its job, that this item
+    can stay outstanding for a long time, and where the deliberate bypass lives -- at a terminal,
+    on the record."""
+    step = next(s for s in STEPS if s.key == "rule_promoted")
+    lowered = step.why.lower()
+    assert "refuse" in lowered
+    assert "not a fault" in lowered or "engine working" in lowered
+    assert "--force" in step.why
+    assert "terminal" in lowered
+
+
+def test_ready_for_paper_does_not_claim_a_fresh_install_is_ready(fresh: tuple[Path, Path]) -> None:
+    """ "Set up" and "has a rule worth running" are different states, and a checklist that
+    conflated them would call a deployment ready on the strength of a rule the gate refused."""
+    config_path, db_path = fresh
+    assert inspect(config_path, db_path).ready_for(Stage.PAPER) is False
