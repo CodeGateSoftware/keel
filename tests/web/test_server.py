@@ -150,21 +150,61 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 # -- the guarantee that replaced "no POST at all" ---------------------------------------------
 
 
-def test_the_write_surface_is_exactly_the_mechanical_steps() -> None:
-    """`ACTIONS` is the whole write surface, and every member must be a step declared
-    MECHANICAL. A judgement step is the operator's -- a wizard may record one but must never
-    decide it -- and an off-venue step happens where keel cannot reach. This is what stops a
-    button for "attest this asset" from being added as markup."""
+def test_the_write_surface_never_covers_a_judgement_or_an_off_venue_step() -> None:
+    """The line that matters, and it is not "mechanical only" any more.
+
+    A MECHANICAL step has no input: the machine does it. An OPERATOR_INPUT step is a FACT only the
+    operator has -- an API key -- which a wizard can record and could not possibly invent. Both
+    are safe to offer as a form.
+
+    A JUDGEMENT is a DECISION: a Shariah classification, a promotion. A form that recorded one
+    would be making a compliance ruling on the operator's behalf, and no amount of "but they
+    clicked it" makes that the same thing as their having decided it. An OFF_VENUE step happens
+    somewhere keel cannot reach at all. Neither may ever be an action.
+    """
     from keel.commands.setup import ACTIONS, STEPS, StepKind
 
-    mechanical = {step.key for step in STEPS if step.kind is StepKind.MECHANICAL}
+    by_key = {step.key: step for step in STEPS}
     declared = {action.key for action in ACTIONS}
-    assert declared <= mechanical, sorted(declared - mechanical)
     assert declared, "an empty write surface would make every test below vacuous"
 
-    for step in STEPS:
-        if step.kind is not StepKind.MECHANICAL:
-            assert step.key not in declared, step.key
+    for key in declared:
+        assert key in by_key, f"{key} is an action over no declared step"
+        assert by_key[key].kind in (StepKind.MECHANICAL, StepKind.OPERATOR_INPUT), key
+
+    forbidden = {
+        step.key for step in STEPS if step.kind in (StepKind.JUDGEMENT, StepKind.OFF_VENUE)
+    }
+    assert forbidden, "no judgement or off-venue steps exist, so this proves nothing"
+    assert not (declared & forbidden), sorted(declared & forbidden)
+
+
+def test_an_action_declares_inputs_exactly_when_its_step_needs_them() -> None:
+    """So a mechanical action cannot quietly start accepting operator data, and an operator-input
+    action cannot quietly stop requiring it -- either drift would move a step across the line the
+    test above draws, without touching that test."""
+    from keel.commands.setup import ACTIONS, STEPS, StepKind
+
+    by_key = {step.key: step for step in STEPS}
+    for action in ACTIONS:
+        needs = by_key[action.key].kind is StepKind.OPERATOR_INPUT
+        assert action.needs_input is needs, action.key
+
+
+def test_the_credential_form_never_renders_a_value_back_into_the_page() -> None:
+    """Pre-filling a secret field puts the secret in the page source, where it survives a
+    screenshot, a "view source", and anything that saves the page. A failed submission must be
+    retyped; that is the correct cost."""
+    from keel.commands.setup import ACTIONS
+    from keel.web import render
+
+    secret_actions = [a for a in ACTIONS if any(f.secret for f in a.inputs)]
+    assert secret_actions, "no secret fields exist, so this proves nothing"
+    for action in secret_actions:
+        html = render._action_form(action, "csrf-token")
+        assert 'type="password"' in html
+        assert "value=" not in html.split('type="password"')[1].split(">")[0]
+        assert 'autocomplete="off"' in html
 
 
 def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> None:
@@ -677,3 +717,105 @@ def render_esc(value: str) -> str:
     from keel.web import render
 
     return render.esc(value)
+
+
+# -- the credential form, over the wire --------------------------------------------------------
+
+
+def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
+    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secret in a redirect URL is a secret in browser history, in the Referer header of
+    anything the page later loads, and in any proxy log in between -- which is the whole reason
+    the form is a POST. This drives the real wire and then re-reads every page."""
+    from keel.commands import setup as setup_mod
+
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(
+        "keel_core.secrets.store_secret", lambda name, value: stored.__setitem__(name, value)
+    )
+    monkeypatch.setattr("keel_core.secrets.keychain_available", lambda: True)
+    monkeypatch.setattr("keel_core.secrets._from_keychain", lambda name: stored.get(name))
+
+    secret = "cdp-secret-that-must-never-be-echoed"
+    status, headers, body = _request(
+        empty_machine,
+        "/setup/credentials",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={
+            "csrf": _csrf(empty_machine),
+            "CDP_API_KEY": "cdp-key-value",
+            "CDP_API_SECRET": secret,
+        },
+    )
+    assert status == 303
+    assert headers["Location"] == "/setup?ran=credentials"
+    assert secret not in headers["Location"]
+    assert secret not in body
+    assert stored["CDP_API_SECRET"] == secret
+
+    for path in ROUTES:
+        _status, _headers, page = _request(empty_machine, path, cookie=_session(empty_machine))
+        assert secret not in page, path
+        assert "cdp-key-value" not in page, path
+
+    assert setup_mod.MARKET_DATA_SECRETS == ("CDP_API_KEY", "CDP_API_SECRET")
+
+
+def test_a_blank_field_records_nothing(
+    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An action that could fill in a field the operator left blank is one that could record
+    something they never supplied."""
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(
+        "keel_core.secrets.store_secret", lambda name, value: stored.__setitem__(name, value)
+    )
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/credentials",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine), "CDP_API_KEY": "k", "CDP_API_SECRET": "   "},
+    )
+    assert status == 303
+    assert stored == {}
+
+
+def test_a_field_the_action_did_not_declare_is_dropped(
+    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The form is attacker-shaped input the moment anyone can craft a POST, so an action should
+    never receive a key it has no name for."""
+    seen: dict[str, str] = {}
+
+    def _capture(_config: object, _db: object, values: dict[str, str]) -> object:
+        seen.update(values)
+        from keel.commands.setup import ActionResult
+
+        return ActionResult("credentials", False, "captured")
+
+    from keel.commands import setup as setup_mod
+
+    monkeypatch.setattr(
+        setup_mod,
+        "ACTIONS",
+        tuple(
+            a if a.key != "credentials" else type(a)(a.key, a.title, a.detail, _capture, a.inputs)
+            for a in setup_mod.ACTIONS
+        ),
+    )
+    _request(
+        empty_machine,
+        "/setup/credentials",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={
+            "csrf": _csrf(empty_machine),
+            "CDP_API_KEY": "k",
+            "CDP_API_SECRET": "s",
+            "SOMETHING_ELSE": "should not arrive",
+        },
+    )
+    assert set(seen) == {"CDP_API_KEY", "CDP_API_SECRET"}

@@ -90,6 +90,10 @@ footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 0.8r
   padding: 1rem 1.25rem; }
 pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 0.85rem; }
 form { margin: 0.5rem 0 0; }
+.field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.6rem 0; max-width: 26rem; }
+.field span { font-size: 0.8rem; color: var(--muted); }
+.field input { font: inherit; padding: 0.4rem 0.6rem; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 button { font: inherit; font-weight: 550; padding: 0.35rem 0.9rem; border-radius: 7px;
   border: 1px solid var(--accent); background: var(--accent); color: var(--card);
   cursor: pointer; }
@@ -705,14 +709,31 @@ def render_setup(
 
 
 def _action_form(action: Any, csrf: str) -> str:
-    """One button, one action key, one write token. No hidden parameters: an action takes no
-    arguments at all, so there is nothing a crafted form could ask for that the registry does not
-    already fix."""
+    """One action key, one write token, and only the fields the action itself declares.
+
+    A field marked `secret` renders as `type="password"` and is NEVER given a `value` -- not even
+    on a re-render after a failure. Pre-filling a secret field puts the secret in the page source,
+    where it survives a screenshot, a "view source", and anything that saves the page. The cost is
+    that a failed submission must be retyped; that is the correct cost.
+
+    `autocomplete="off"` on the secret fields keeps a browser password manager from offering to
+    store an exchange API key as though it were a website login."""
+    fields = ""
+    for field in getattr(action, "inputs", ()):
+        kind = "password" if field.secret else "text"
+        extra = ' autocomplete="off" spellcheck="false"' if field.secret else ""
+        fields += (
+            '<label class="field">'
+            f"<span>{esc(field.label)}</span>"
+            f'<input type="{kind}" name="{esc(field.name)}" required{extra}>'
+            "</label>"
+        )
     return (
         f'<form method="post" action="/setup/{esc(action.key)}">'
         f'<input type="hidden" name="csrf" value="{esc(csrf)}">'
-        f'<button type="submit">{esc(action.title)}</button>'
         f'<div class="muted">{esc(action.detail)}</div>'
+        f"{fields}"
+        f'<button type="submit">{esc(action.title)}</button>'
         "</form>"
     )
 
