@@ -12,6 +12,12 @@ on:
         description: "Semver to release, without a leading v (e.g. 0.2.0). Must already match pyproject.toml."
         required: true
         type: string
+      desktop:
+        description: "Desktop artifacts. 'build' produces and smoke-tests them as workflow artifacts only. 'publish-unsigned' also attaches them to the release -- they are NOT code-signed, so macOS Gatekeeper and Windows SmartScreen will warn; the option is named for what it does so it cannot be chosen without reading it. 'skip' does neither."
+        required: true
+        default: build
+        type: choice
+        options: [build, publish-unsigned, skip]
 
 permissions:
   contents: write # create the tag and the release
@@ -204,6 +210,37 @@ jobs:
             echo
             echo "Seeded rules start as \`candidate\` and trade nothing until you promote them."
             echo
+            if [ "${{ inputs.desktop }}" = "publish-unsigned" ]; then
+              echo "## Desktop app (macOS / Windows)"
+              echo
+              echo "⚠️ **These builds are not code-signed, so your computer will warn you.**"
+              echo "Apple's certificate costs \$99/yr and keel cannot currently afford it. There"
+              echo "is no cheaper tier and no free option, and a certificate we made ourselves"
+              echo "would do nothing — macOS trusts only certificates Apple issued."
+              echo
+              echo "Full explanation, including how to check what you downloaded:"
+              echo "<https://github.com/${{ github.repository }}/blob/main/docs/desktop-install.md>"
+              echo
+              echo "**macOS** — the first open is refused. Open **System Settings → Privacy &"
+              echo "Security**, scroll to the message about \`keel\`, and choose **Open Anyway**."
+              echo "You will only do this once."
+              echo
+              echo "**Windows** — SmartScreen shows \"Windows protected your PC\". Choose **More"
+              echo "info → Run anyway**."
+              echo
+              echo "**Verify what you downloaded before you run it.** Every artifact carries a"
+              echo "GitHub build attestation binding it to this repository, this workflow and this"
+              echo "commit — which is the question a code-signing certificate answers too:"
+              echo
+              echo "    gh attestation verify <file> --repo ${{ github.repository }}"
+              echo
+              echo "\`SHA256SUMS.txt\` is attached as well. If either check fails, do not run it."
+              echo
+              echo "The app opens keel in your browser; there is no terminal involved. Your"
+              echo "config, database and credentials live in your user Application Support /"
+              echo "LocalAppData folder and are never touched by an update."
+              echo
+            fi
             echo "$GENERATED"
           } > /tmp/release-notes.md
           echo "composed $(wc -l < /tmp/release-notes.md) lines of notes"
@@ -218,3 +255,181 @@ jobs:
             --notes-file /tmp/release-notes.md
           echo "published v${{ inputs.version }}"
 
+  # -- desktop artifacts -------------------------------------------------------------------------
+  #
+  # Runs AFTER `release`, so the tag it checks out is the one that job created and published.
+  #
+  # THESE ARTIFACTS ARE NOT CODE-SIGNED, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT.
+  #
+  # Apple notarisation requires a Developer ID certificate, which requires the $99/yr Developer
+  # Program. There is no free path: a free Apple account signs only for local development, and a
+  # self-signed certificate buys nothing because Gatekeeper trusts Apple-issued Developer IDs and
+  # nothing else. keel is open source on a small budget and has chosen not to pay it.
+  #
+  # What that costs the user is real and is documented rather than hidden: a `.dmg` downloaded
+  # from the internet carries a quarantine flag, so macOS refuses the first open until they go to
+  # System Settings -> Privacy & Security -> Open Anyway. Windows SmartScreen warns similarly.
+  #
+  # What replaces OS-level trust here is PROVENANCE, which is free and is arguably the more
+  # honest answer for an auditable project anyway: every artifact carries a GitHub build
+  # attestation tying it to this workflow, this repository and this commit, verifiable with
+  #
+  #     gh attestation verify <file> --repo CodeGateSoftware/keel
+  #
+  # plus a SHA256SUMS file in the release. That does not stop Gatekeeper -- nothing free does --
+  # but it does answer "did this binary come from that source", which a signature from a $99
+  # certificate answers no better.
+  #
+  # The publish option is spelled `publish-unsigned` deliberately: it cannot be selected without
+  # reading the word, and the default is `build`, which attaches nothing to a release.
+  desktop:
+    needs: release
+    if: ${{ inputs.desktop != 'skip' }}
+    timeout-minutes: 45
+    permissions:
+      contents: write # attach the artifacts to the release
+      id-token: write # OIDC token for the build attestation
+      attestations: write # write the attestation itself
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          # Two DMGs rather than a universal2 build: `lipo`-merging a bundled-CPython-plus-
+          # native-extension tree is fragile in practice. Note this runner image is scheduled to
+          # sunset around Aug 2027.
+          - os: macos-15-intel
+            arch: x86_64
+          - os: windows-latest
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the workspace
+        run: uv sync --all-packages
+
+      # The SAME stamp the release job writes. Without it a bundle reports `[checkout]`, and
+      # `keel/version.py` will not call an unstamped bundle a release -- correctly, which is why
+      # the smoke below can assert on it.
+      - name: Stamp build info
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMMIT="$(git rev-parse --short=12 HEAD)"
+          cat > keel/_build_info.py <<EOF
+          """Generated by .github/workflows/release.yml. Do not edit or commit."""
+
+          VERSION = "${{ inputs.version }}"
+          COMMIT = "$COMMIT"
+          DIRTY = False
+          EOF
+          echo "stamped $COMMIT"
+
+      - name: Freeze
+        run: uv run --with pyinstaller pyinstaller packaging/keel.spec --noconfirm
+
+      # THE STEP THAT EARNS ITS KEEP. Three of the four ways a bundle breaks are SILENT: it
+      # starts cleanly, and it has no venues, or no version identity, or no templates. Every
+      # assertion here corresponds to one of those, found by building a bundle and running it.
+      - name: Smoke the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="dist/keel/keel"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="dist/keel/keel.exe"
+
+          OUT="$("$BIN" --version)"
+          echo "$OUT"
+          printf '%s' "$OUT" | grep -q "${{ inputs.version }}" || {
+            echo "::error::the bundle does not report the released version"; exit 1; }
+          printf '%s' "$OUT" | grep -q "release" || {
+            echo "::error::the bundle is not stamped as a release build"; exit 1; }
+          printf '%s' "$OUT" | grep -q "DIRTY" && {
+            echo "::error::the bundle reports a dirty tree"; exit 1; } || true
+
+          # Without collected metadata this answers "no keel distributions installed" -- the
+          # deploy check that exists to catch a partial upgrade, reporting success by having
+          # nothing to compare.
+          "$BIN" versions || { echo "::error::the bundle cannot see its own distributions"; exit 1; }
+
+          # Without the adapters as hidden imports this answers `0 adapter(s)`, and a packaged
+          # keel with no venues is not a trading tool at all.
+          ADAPTERS="$("$BIN" brokers list | head -1)"
+          echo "$ADAPTERS"
+          printf '%s' "$ADAPTERS" | grep -qE '^[1-9][0-9]* adapter' || {
+            echo "::error::the bundle discovered no broker adapters"; exit 1; }
+          # And the dev-only fake venue must never reach a shipped artifact: it would put a FAKE
+          # VENUE in the venue list of a signed install a real person downloaded.
+          "$BIN" brokers list | grep -qi 'fake' && {
+            echo "::error::the dev-only fake venue is in the bundle"; exit 1; } || true
+
+          # Without collected package data `init-config` cannot write a config, so a first run
+          # cannot start at all.
+          WORK="$(mktemp -d)"
+          (cd "$WORK" && "$OLDPWD/$BIN" init-config >/dev/null && test -s config.yaml) || {
+            echo "::error::the bundle cannot write a config from its templates"; exit 1; }
+          echo "smoke passed"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out
+          packaging/macos_app.sh dist/keel out "${{ inputs.version }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Inno Setup is the intended installer (per-user, no admin prompt, and the install-path
+          # and version-decision UX #438 specifies). Until that script is written and tested on a
+          # Windows runner, a zip is shipped rather than an untested installer -- an installer
+          # nobody has run is a worse artifact than an archive everyone understands.
+          mkdir -p out
+          7z a -tzip "out/keel-${{ inputs.version }}-windows-${{ matrix.arch }}.zip" ./dist/keel/* >/dev/null
+          ls -l out
+
+      # Checksums travel WITH the artifacts, in the same release, so a user who was handed a
+      # download link somewhere else has something local to compare against.
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          if command -v sha256sum >/dev/null; then sha256sum ./* > SHA256SUMS.txt
+          else shasum -a 256 ./* > SHA256SUMS.txt; fi
+          cat SHA256SUMS.txt
+
+      # The substitute for a code-signing certificate, and free. Ties each artifact to this
+      # workflow, this repository and this commit; a user verifies with
+      #   gh attestation verify <file> --repo ${{ github.repository }}
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keel-${{ inputs.version }}-${{ runner.os }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.desktop == 'publish-unsigned'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--clobber` so a re-run of one matrix leg replaces its own asset rather than failing
+          # the whole publish on a name collision.
+          gh release upload "v${{ inputs.version }}" out/* --clobber
+          echo "attached $(ls out | wc -l) file(s) to v${{ inputs.version }}"

@@ -167,6 +167,10 @@ adapter, deliberately divergent, that the conformance suite runs against.
 - [`docs/launch.md`](docs/launch.md) — the pre-launch gate and the announcement plan:
   what must be true before anything is announced, where, in what order, and what the
   post says (the honest result included).
+- [`docs/desktop-install.md`](docs/desktop-install.md) — installing the macOS/Windows app,
+  and why your computer warns you about it: the builds are not code-signed, because Apple's
+  certificate costs $99/yr and keel cannot currently afford it. Says what to do, and how to
+  verify what you downloaded instead.
 - [`docs/RELEASING.md`](docs/RELEASING.md) — how a release is cut.
 
 ## Asking questions, and contributing
