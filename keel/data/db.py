@@ -310,9 +310,7 @@ def _migrate_v2_broker_subscriptions(conn: sqlite3.Connection) -> None:
     if already_migrated is not None:
         return
 
-    row = conn.execute(
-        "SELECT value FROM agent_state WHERE key = 'subscription'"
-    ).fetchone()
+    row = conn.execute("SELECT value FROM agent_state WHERE key = 'subscription'").fetchone()
     if row is None:
         return
 
@@ -464,15 +462,50 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
 }
 
 
+#: How long a connection waits for a lock before giving up. SQLite's default is ZERO -- it raises
+#: immediately -- which is the wrong default for a process that now reads and writes this file at
+#: the same time. Five seconds is far longer than any contention here lasts and far shorter than
+#: a person's patience.
+BUSY_TIMEOUT_MS = 5_000
+
+
 def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
     """Open a `sqlite3.Connection` to `path` (or an in-memory DB for `":memory:"`).
 
-    Configures dict-like `Row` access and turns on foreign-key enforcement, which SQLite
-    otherwise leaves off per-connection by default.
+    Configures dict-like `Row` access, foreign-key enforcement (which SQLite otherwise leaves off
+    per-connection), a busy timeout, and WAL.
+
+    **WAL, and why it is not a tuning preference.** In the default rollback journal a writer takes
+    an EXCLUSIVE lock and readers take SHARED ones, so a reader and a writer cannot coexist. That
+    was survivable while one process used this file at a time. It stopped being survivable when
+    `keel serve` began polling the database every few seconds to render a page while a background
+    fetch wrote to it (#437): the fetch DIED, and it died on the path most likely to be taken,
+    because the page invites the operator to watch it. Measured, on the same fetch:
+
+        page polling every 5s, rollback  -> FAILED at 45s, 31,709 candles ("disk I/O error")
+        nobody polling,        rollback  -> ran 150s, 108,202 candles
+        polling every 0.2s,    WAL       -> ran 150s, 108,501 candles, 694 clean reads
+
+    In WAL, readers never block the writer and the writer never blocks readers. The agent writing
+    a cycle while a dashboard refreshes is the same shape and was the same hazard.
+
+    Journal mode is a property OF THE FILE, not of the connection: the first connection converts
+    it and every later one inherits it, so this is a no-op on an already-converted database.
+
+    Two consequences worth knowing. WAL adds `-wal` and `-shm` sidecar files beside the database
+    -- a deployment folder now has three files where it had one. And `keel update`'s backups are
+    unaffected: it uses SQLite's own online-backup API, precisely because "a plain file copy of a
+    database with a live rollback journal is not a snapshot", and that API reads committed WAL
+    content too.
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    # `:memory:` has no file to journal, and asking for WAL there is refused; a shared in-memory
+    # database is also single-connection by nature, so there is nothing to protect.
+    if str(path) != ":memory:":
+        conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
