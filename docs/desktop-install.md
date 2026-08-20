@@ -3,35 +3,80 @@
 If you downloaded keel for macOS or Windows and your computer refused to open it, nothing is
 broken. This page explains exactly what happened, why, and what to do about it.
 
+## Would you rather not deal with this at all?
+
+There is a path with no warning on any platform, because nothing is downloaded as an application:
+the install-from-source route in the README's **"Try it in five minutes"**. `pip` and `uv` fetch
+the published wheels directly, and no operating system objects to that.
+
+```
+pip install --find-links . ./keel_trader-<version>-py3-none-any.whl
+keel versions
+```
+
+It needs a terminal and Python 3.11 or later — which is exactly the friction the desktop app
+exists to remove, so this is not the recommendation for everyone. But if you already have both, it
+is the shorter road and the rest of this page does not apply to you.
+
 ## The short version
 
-**keel's desktop builds are not code-signed.** Code signing is a paid certificate from Apple or
-Microsoft that tells your operating system who built a program.
+**keel's desktop builds are not code-signed, on either platform.** Code signing is a paid
+certificate from Apple or Microsoft that tells your operating system who built a program.
 
-**We cannot currently afford it.** Apple's certificate costs **$99 per year**, every year, and it
-is the only way to remove the warning — there is no cheaper tier, no free option for open-source
-projects, and a certificate we made ourselves would do nothing at all, because macOS only trusts
-certificates Apple issued. keel is an open-source project with essentially no budget, and that
-$99/yr is not something it can commit to today.
+**We cannot currently afford either one.**
 
-So your computer sees a program from a developer it cannot identify, and it does the right thing:
-it stops and asks you.
+| | cost | what it would buy |
+|---|---|---|
+| Apple Developer Program | **$99/yr** | removes the macOS warning |
+| Azure Trusted Signing | **~$120/yr** | *does not* remove the Windows warning by itself |
 
-## What to do
+There is no cheaper tier and no free option for open-source projects on either platform, and a
+certificate we made ourselves would do nothing at all — macOS trusts only certificates Apple
+issued.
 
-**macOS**
+Windows is worth a sentence of its own: since 2024, even an expensive EV certificate no longer
+buys an instant SmartScreen pass. Reputation is earned from download volume over time, so a new
+certificate on a young project would leave the warning in place for a while anyway — for more
+money than Apple's.
 
-1. Double-click keel. macOS refuses, saying it cannot verify the developer.
-2. Open **System Settings → Privacy & Security**.
-3. Scroll down. There is a message about keel being blocked, with an **Open Anyway** button.
-4. Click it, and confirm.
+keel is an open-source project with essentially no budget. So your computer sees a program from a
+developer it cannot identify, and it does the right thing: it stops and asks you.
 
-You only do this once. keel opens normally afterwards.
+## macOS — step by step
 
-**Windows**
+1. Open the downloaded `.dmg`. A window appears with **keel.app** and a **READ ME FIRST** file.
+2. Drag **keel.app** into your **Applications** folder.
+3. Eject the disk image (drag it to the Trash, or press ⌘E).
+4. Open **Applications** and double-click **keel**. macOS refuses, saying it cannot be opened
+   because the developer cannot be verified. Click **Done**.
+5. Open **System Settings** → **Privacy & Security**.
+6. Scroll down to the **Security** section. There is a line saying *"keel was blocked to protect
+   your Mac"*, with an **Open Anyway** button beside it. Click it.
+7. Authenticate with Touch ID or your password, then click **Open Anyway** once more in the
+   dialog that follows.
 
-1. Run the installer. SmartScreen says "Windows protected your PC".
-2. Click **More info**, then **Run anyway**.
+keel opens, and your browser opens with it. **You only do this once** — every later launch is a
+normal double-click.
+
+> On macOS Sequoia (15) and later, right-clicking the app and choosing *Open* no longer works as a
+> shortcut for this. Apple removed that path deliberately. System Settings is the only way.
+
+## Windows — step by step
+
+The download is a `.zip`, and Windows marks files that came from the internet.
+
+1. **Before extracting**, right-click the downloaded `.zip` → **Properties**.
+2. At the bottom of the **General** tab, if there is an **Unblock** checkbox, tick it and click
+   **OK**. This saves you a warning on every file inside.
+3. Right-click the `.zip` → **Extract All…**, and choose a folder you own — for example
+   `C:\Users\<you>\keel`. Do not extract into `C:\Program Files`; keel does not need
+   administrator rights and should not be given them.
+4. Open the extracted folder and double-click **keel.exe**.
+5. If SmartScreen appears — *"Windows protected your PC"* — click **More info**, then
+   **Run anyway**.
+
+> If you skipped step 2, you may see the SmartScreen prompt again on a later launch. Doing the
+> Unblock on the `.zip` first is what avoids that.
 
 ## Please check what you downloaded first
 
@@ -62,21 +107,9 @@ built, and no amount of clicking "Open Anyway" makes that safe.
 - It does **not** mean the app behaves differently once open. A signed and an unsigned build of
   the same release are the same program.
 
-## Would you rather avoid this entirely?
-
-Install keel the way developers do, from the release wheels, and no warning appears at all:
-
-```
-pip install --find-links . ./keel_trader-<version>-py3-none-any.whl
-keel versions
-```
-
-That path needs a terminal and a working Python. The desktop app exists precisely so that it does
-not have to be the only option.
-
 ## If this changes
 
 If keel ever has the budget, signing is a small change on our side — the release pipeline is
-already built to accept it — and this page will be replaced by a sentence saying the builds are
-signed. Until then, we would rather tell you the truth about what you are downloading than say
-nothing and let your computer deliver the news.
+already built to accept it, on both platforms — and this page will be replaced by a sentence
+saying the builds are signed. Until then, we would rather tell you the truth about what you are
+downloading than say nothing and let your computer deliver the news.

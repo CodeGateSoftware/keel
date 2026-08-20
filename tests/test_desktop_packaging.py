@@ -202,6 +202,40 @@ def test_the_script_runs_no_signing_command() -> None:
 _INSTALL_DOC = _ROOT / "docs" / "desktop-install.md"
 
 
+def test_the_install_note_covers_both_platforms_and_both_prices() -> None:
+    """Windows was left as "a separate decision, still open" for one round. It is not: Azure
+    Trusted Signing is ~$120/yr, MORE than Apple's, and since 2024 an EV certificate no longer
+    grants an instant SmartScreen pass -- so it buys less for more. A page that named only the
+    Apple cost would leave a reader assuming Windows was simply forgotten."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    assert "$99" in text
+    assert "120" in text
+    assert "SmartScreen" in text
+    assert "either" in text
+
+
+def test_the_install_note_leads_with_the_path_that_has_no_warning() -> None:
+    """Someone on this page is deciding whether to proceed. The first thing they should read is
+    that there is a route with no warning at all -- not four paragraphs about certificates."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    body = text[text.index("\n## ") :]
+    first_heading = body.split("\n")[1]
+    assert "not deal with this at all" in first_heading, first_heading
+    assert body.index("Try it in five minutes") < body.index("The short version")
+
+
+def test_the_install_note_gives_real_per_os_steps() -> None:
+    """ "Open Anyway" alone is not instructions. Someone who has never done this needs to be told
+    where the setting is, that Sequoia removed the right-click shortcut, and -- on Windows -- to
+    Unblock the zip BEFORE extracting, which is what stops the prompt returning."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    assert "Privacy & Security" in text
+    assert "Sequoia" in text
+    assert "Unblock" in text
+    assert "Extract All" in text
+    assert "Program Files" in text  # and why not to use it
+
+
 def test_the_install_note_exists_and_states_the_actual_reason() -> None:
     """The reason is a budget, and saying so is better than "not signed at this time".
 
@@ -210,7 +244,7 @@ def test_the_install_note_exists_and_states_the_actual_reason() -> None:
     they can weigh -- and it is the truth."""
     text = _INSTALL_DOC.read_text(encoding="utf-8")
     assert "$99" in text
-    assert "cannot currently afford" in text
+    assert "cannot currently afford" in text.replace("either one", "")
     assert "no cheaper tier" in text or "no free option" in text
     # A self-signed certificate is the obvious "why not just..." and must be answered.
     assert "made ourselves" in text or "self-signed" in text

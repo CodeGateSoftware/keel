@@ -14,11 +14,12 @@
 # `keel.app/Contents/Resources/keel/keel <command>` and get the full CLI. One artifact, both
 # audiences, no second build.
 #
-# THIS OUTPUT IS UNSIGNED, AND STAYS UNSIGNED. Apple notarisation requires a Developer ID
-# certificate, which requires the $99/yr Developer Program; a free Apple account signs only for
-# local development, and a self-signed certificate buys nothing because Gatekeeper trusts
-# Apple-issued Developer IDs and nothing else. keel is open source on a small budget and has
-# chosen not to pay it.
+# THIS OUTPUT IS UNSIGNED, AND STAYS UNSIGNED -- as does the Windows artifact. Apple notarisation
+# requires a Developer ID certificate ($99/yr); Azure Trusted Signing is ~$120/yr and, since 2024,
+# does not even buy an instant SmartScreen pass. A free Apple account signs only for local
+# development, and a self-signed certificate buys nothing because Gatekeeper trusts Apple-issued
+# Developer IDs and nothing else. keel is open source on a small budget and has chosen not to pay
+# either.
 #
 # So Gatekeeper WILL refuse the first open of a downloaded copy, and the release notes say so and
 # say what to do about it (System Settings -> Privacy & Security -> Open Anyway). What replaces
@@ -97,7 +98,8 @@ IF MACOS REFUSES TO OPEN THIS APP, NOTHING IS BROKEN.
 keel is not code-signed. Code signing is a paid certificate from Apple that tells macOS
 who built a program. It costs \$99 per year, there is no cheaper tier and no free option
 for open-source projects, and a certificate we made ourselves would do nothing at all --
-macOS trusts only certificates Apple issued.
+macOS trusts only certificates Apple issued. (Windows is not signed either, for the same
+reason: that certificate costs even more.)
 
 keel is an open-source project with essentially no budget, and that yearly cost is not
 something it can commit to today. So macOS sees a program from a developer it cannot
@@ -106,11 +108,22 @@ identify, and does the right thing: it stops and asks you.
 TO OPEN IT
 
   1. Drag keel.app to your Applications folder.
-  2. Double-click it. macOS refuses.
-  3. Open System Settings -> Privacy & Security.
-  4. Scroll down to the message about keel and click "Open Anyway".
+  2. Eject this disk image.
+  3. Open Applications and double-click keel. macOS refuses; click Done.
+  4. Open System Settings -> Privacy & Security.
+  5. Scroll to the Security section. There is a line saying keel was blocked, with an
+     "Open Anyway" button beside it. Click it.
+  6. Authenticate, then click "Open Anyway" once more in the dialog that follows.
 
-You only do this once.
+You only do this once. Note that on macOS Sequoia (15) and later, right-clicking the app
+and choosing Open no longer works as a shortcut -- Apple removed that path deliberately.
+
+PREFER NO WARNING AT ALL?
+
+Install from the release wheels instead. Nothing is downloaded as an application, so
+nothing objects -- but it needs a terminal and Python 3.11 or later:
+
+  pip install --find-links . ./keel_trader-<version>-py3-none-any.whl
 
 BEFORE YOU DO, PLEASE CHECK WHAT YOU DOWNLOADED
 
