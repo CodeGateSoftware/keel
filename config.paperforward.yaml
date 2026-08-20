@@ -72,7 +72,17 @@ dca:
   cadence_days: 7
 
 paper:
-  starting_equity_usd: 10000   # FUNDED paper-forward: seed the synthetic account at $10k
+  # 0 = seed from REAL broker mark-to-market equity (keel/agent.py:499). Changed from a
+  # synthetic $10k (#426), for the same reason as the hourly profile and kept identical to it
+  # because `test_config_universe_is_a_deliberate_superset_of_paperforward` asserts the two
+  # paper blocks are equal -- the profiles are meant to differ in CADENCE and nothing else.
+  #
+  # A synthetic account larger than the real one makes a paper profile propose orders the real
+  # deployment could never fund. Rail 14 caps monthly buy notional at the venue's fee-free
+  # allowance ($500 at the attested Basic tier), and that allowance is inherited from the REAL
+  # account whatever the synthetic equity says. At $10k synthetic and the measured 13.86%
+  # median daily stop, f_N = 0.07 gives ~$722 per trade -- 1.4x the whole monthly allowance.
+  starting_equity_usd: 0
   monthly_contribution_usd: 500   # $500/mo contribution during the paper-forward
 
 # The settlement currency this deployment TRADES IN. It must match the quote leg of the

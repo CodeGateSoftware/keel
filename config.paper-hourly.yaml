@@ -83,6 +83,10 @@ caps:
   # Same non-binding internal limits as the daily paper profile — deliberately NOT tighter:
   # this profile's evidence is partly ABOUT rail behaviour (rail vetoes are admissible
   # evidence), so silently clamping sizing here would bias exactly the thing being measured.
+  # Deliberately NOT raised to admit this profile's proposals. Rail 14 caps MONTHLY buy
+  # notional at the fee-free allowance ($500 at Basic), so a single ~$4,212 proposal is 8.4x
+  # the entire month -- widening the exposure cap admits nothing and only hides the sizing
+  # mismatch that `starting_equity_usd` below actually fixes.
   max_exposure_usd: 5000
   max_per_asset_pct: 0.50
 
@@ -136,7 +140,24 @@ paper:
   # interplay (operator-runbook, "How much money moves"): at $10k+ synthetic equity, rail 14's
   # $500/month allowance can veto large sized setups — those vetoes are themselves evidence,
   # and are recorded as such.
-  starting_equity_usd: 10000
+  # 0 = seed from REAL broker mark-to-market equity (keel/agent.py:499), not a synthetic
+  # amount. Changed from 10000 (#426).
+  #
+  # The synthetic $10k made this profile unable to record anything. It inherits the REAL
+  # account's subscription allowance -- rail 14, attested Basic, $500/month of fee-free buy
+  # notional -- while sizing against an account 23x larger than the real one (~$450). At
+  # risk_pct 1% and the measured 2.40% median hourly stop, f_N = risk_pct/s = 0.42, so a
+  # typical proposal was ~$4,212: 8.4x the whole monthly allowance. Every entry was refused.
+  # Over 60 cycles the profile detected 15 setups and recorded 0 trades.
+  #
+  # Seeding from real equity keeps every proposal inside the fee-free regime, which is also
+  # the ONLY regime where these rules are not structurally losing: inside the allowance
+  # kappa = 0.04R and p_be(b=6) = 14.9%, against a reconstructed 14.9% win rate; outside it
+  # kappa = 1.04R and p_be = 29.2%. The taker fee is the entire result.
+  #
+  # Takes effect on a FRESH paper ledger only -- the seed happens on first paper run. An
+  # already-seeded ledger needs `keel equity record-flow` to bring it down.
+  starting_equity_usd: 0
   monthly_contribution_usd: 500
 
 # The settlement currency this deployment TRADES IN — USD, same as paperforward (see that
