@@ -21,6 +21,7 @@ from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, 
 from keel_broker_api.port import UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     OrderStatus,
     PlaceResult,
@@ -889,16 +890,16 @@ def test_get_order_on_an_unrecognised_venue_state_reports_pending_not_failed() -
     assert order.status == "PENDING"
 
 
-def test_cancel_order_returns_true_when_the_venue_confirms_immediately() -> None:
+def test_cancel_order_is_confirmed_when_the_venue_confirms_immediately() -> None:
     fixture = load_fixture("rh_order_open.json")
     transport = FakeTransport(order=fixture)
     transport._issued_order_ids.add(fixture["id"])
     adapter = RobinhoodAdapter(transport)
 
-    assert adapter.cancel_order(fixture["id"]) is True
+    assert adapter.cancel_order(fixture["id"]) is CancelOutcome.CONFIRMED
 
 
-def test_cancel_order_re_polls_once_and_true_comes_from_the_poll() -> None:
+def test_cancel_order_re_polls_once_and_confirmation_comes_from_the_poll() -> None:
     """Robinhood's cancel endpoint can hand back the order as it stood the instant cancellation
     was requested, before the cancellation itself has settled -- so a cancel response that is not
     yet `canceled` is not evidence of failure either. The adapter must re-poll `get_order` exactly
@@ -909,31 +910,42 @@ def test_cancel_order_re_polls_once_and_true_comes_from_the_poll() -> None:
     transport._issued_order_ids.add(fixture["id"])
     adapter = RobinhoodAdapter(transport)
 
-    assert adapter.cancel_order(fixture["id"]) is True
+    assert adapter.cancel_order(fixture["id"]) is CancelOutcome.CONFIRMED
     assert transport.call_counts.get("get_order", 0) == 1
 
 
-def test_cancel_order_re_polls_once_and_false_comes_from_the_poll() -> None:
-    """The mirror of the case above: if the single re-poll still shows the order resting `open`,
-    the cancel must be reported as failed rather than optimistically assumed -- a `True` the venue
-    never actually confirmed would let `executor._cancel_at_exchange` record a cancel that never
-    happened."""
+def test_a_still_open_order_after_the_re_poll_is_accepted_not_refused() -> None:
+    """THE case that motivated `CancelOutcome` (#412).
+
+    A real run on 2026-08-20 placed one BTC-USD limit buy, cancelled it, and watched the venue:
+    the cancel `200` handed back `open`, the immediate re-poll ALSO read `open`, and the order
+    settled `canceled` about 1.1 seconds later. So this is the NORMAL path at this venue, not an
+    anomaly -- and under the old boolean contract it was reported as a failed cancel, which told
+    an operator a position was at risk when it was not, and made an exit wait a whole cycle.
+
+    `ACCEPTED` says what happened. It is still not `settled`, so nothing may act on it -- the
+    order can consume inventory until the engine settles it -- but it is no longer a failure, and
+    the reconciliation poll establishes the terminal state."""
     fixture = load_fixture("rh_order_open.json")
     transport = _ReCancelTransport(order=fixture)
     transport._issued_order_ids.add(fixture["id"])
     adapter = RobinhoodAdapter(transport)
 
-    assert adapter.cancel_order(fixture["id"]) is False
+    outcome = adapter.cancel_order(fixture["id"])
+    assert outcome is CancelOutcome.ACCEPTED
+    assert not outcome.settled
     assert transport.call_counts.get("get_order", 0) == 1
 
 
-def test_cancel_order_on_an_unknown_id_returns_false_and_does_not_raise() -> None:
+def test_cancel_order_on_an_unknown_id_is_refused_and_does_not_raise() -> None:
     """Absence of a refusal is not a confirmation, and an id the venue never issued is not a
-    network failure either -- it must fail closed as an ordinary `False`, matching the same
-    contract Coinbase's adapter is held to."""
+    network failure either. The transport surfaces a 404 -- and only a 404 -- as `None`, which
+    makes this a statement ABOUT THE ID: `REFUSED`, not `UNKNOWN`."""
     adapter = RobinhoodAdapter(FakeTransport())
 
-    assert adapter.cancel_order("an-id-this-venue-never-issued") is False
+    outcome = adapter.cancel_order("an-id-this-venue-never-issued")
+    assert outcome is CancelOutcome.REFUSED
+    assert not outcome.settled
 
 
 def test_get_fee_summary_maps_fee_ratio_to_both_taker_and_maker() -> None:
@@ -1364,28 +1376,28 @@ def test_preview_order_refuses_a_non_usd_symbol_on_every_path(kind: str) -> None
         adapter.preview_order(spec)
 
 
-def test_cancel_order_returns_false_instead_of_raising_when_the_venue_errors() -> None:
-    """A 5xx during a cancel must fail safe to `False`, never propagate out of this method.
+def test_cancel_order_is_unknown_instead_of_raising_when_the_venue_errors() -> None:
+    """A 5xx during a cancel must fail safe, never propagate out of this method.
 
     This adapter already writes the rule down at `_account`: "a raise on the way out of a position
     can trap it". `cancel_order` is the method most exposed to it -- `executor._cancel_at_exchange`
     calls it while unwinding, and an exception there can abort the unwind partway through, leaving
     the position AND the resting orders it was trying to clear both live.
 
-    `False` is the honest answer regardless of what went wrong, because the port's contract is
-    already "`True` ONLY when the venue CONFIRMS" -- and an exception is definitionally not a
-    confirmation. Nothing is claimed here that was not observed; the caller keeps believing the
-    order may still be resting, which is the belief that keeps it watching.
+    `UNKNOWN` is the honest answer regardless of what went wrong: the venue said nothing about
+    this order, which is a different fact from the venue declining it (`REFUSED`). Neither is
+    `settled`, so the fail-closed behaviour is identical -- the caller keeps believing the order
+    may still be resting, which is the belief that keeps it watching.
     """
     fixture = load_fixture("rh_order_open.json")
     transport = _RaisingCancelTransport(order=fixture)
     transport._issued_order_ids.add(fixture["id"])
     adapter = RobinhoodAdapter(transport)
 
-    assert adapter.cancel_order(fixture["id"]) is False
+    assert adapter.cancel_order(fixture["id"]) is CancelOutcome.UNKNOWN
 
 
-def test_cancel_order_returns_false_when_the_mandatory_re_poll_raises() -> None:
+def test_cancel_order_is_unknown_when_the_mandatory_re_poll_raises() -> None:
     """Same rule, one layer deeper: the re-poll is on the exit path too and cannot be allowed to
     escape as an exception either."""
     fixture = load_fixture("rh_order_open.json")
@@ -1393,7 +1405,7 @@ def test_cancel_order_returns_false_when_the_mandatory_re_poll_raises() -> None:
     transport._issued_order_ids.add(fixture["id"])
     adapter = RobinhoodAdapter(transport)
 
-    assert adapter.cancel_order(fixture["id"]) is False
+    assert adapter.cancel_order(fixture["id"]) is CancelOutcome.UNKNOWN
 
 
 def test_place_order_returns_a_domain_type() -> None:

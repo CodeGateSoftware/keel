@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from keel_broker_api.results import CancelOutcome
 from keel_core import telemetry
 
 from keel.data.cb_client import CoinbaseClient
@@ -504,17 +505,17 @@ def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none():
     assert order["total_fees"] == Decimal("0")
 
 
-def test_cancel_order_returns_true_when_the_exchange_confirms():
+def test_cancel_order_is_confirmed_when_the_exchange_confirms():
     transport = FakeTransport(
         cancel={"results": [{"success": True, "order_id": "abc-123"}]}
     )
     client = CoinbaseClient(transport)
 
-    assert client.cancel_order("abc-123") is True
+    assert client.cancel_order("abc-123") is CancelOutcome.CONFIRMED
     assert transport.calls["cancel_orders"] == {"order_ids": ["abc-123"]}
 
 
-def test_cancel_order_returns_false_when_the_exchange_refuses():
+def test_cancel_order_is_refused_when_the_exchange_refuses():
     """Coinbase's batch_cancel reports per-order success -- a 200 response does NOT mean the
     order was cancelled. Reading only the HTTP status would let `_cancel_at_exchange` record a
     cancel that never happened, which is the exact failure it exists to prevent."""
@@ -527,15 +528,16 @@ def test_cancel_order_returns_false_when_the_exchange_refuses():
     )
     client = CoinbaseClient(transport)
 
-    assert client.cancel_order("abc") is False
+    assert client.cancel_order("abc") is CancelOutcome.REFUSED
 
 
-def test_cancel_order_returns_false_on_an_empty_result_set():
+def test_cancel_order_is_unknown_on_an_empty_result_set():
     """No result for the id we asked about means we have no confirmation. Absence of a refusal
-    is not a confirmation -- fail closed."""
+    is not a confirmation -- fail closed. `UNKNOWN` rather than `REFUSED` because the exchange
+    did not answer about this order at all (#412); neither is settled."""
     client = CoinbaseClient(FakeTransport(cancel={"results": []}))
 
-    assert client.cancel_order("abc") is False
+    assert client.cancel_order("abc") is CancelOutcome.UNKNOWN
 
 
 # --- get_accounts failure severity --------------------------------------------------------

@@ -51,6 +51,7 @@ from keel_broker_api.orders import (
 from keel_broker_api.port import UnsupportedOrder, resolve_client_order_id
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
@@ -158,9 +159,7 @@ class AlpacaAdapter:
         of one transport: a configuration mistake should fail at load, not first request.
         """
         if endpoint not in TRADING_HOSTS:
-            raise ValueError(
-                f"endpoint must be one of {sorted(TRADING_HOSTS)}, got {endpoint!r}"
-            )
+            raise ValueError(f"endpoint must be one of {sorted(TRADING_HOSTS)}, got {endpoint!r}")
         if data_feed not in SUPPORTED_DATA_FEEDS:
             raise ValueError(
                 f"data_feed must be one of {sorted(SUPPORTED_DATA_FEEDS)}, got {data_feed!r}"
@@ -466,9 +465,7 @@ class AlpacaAdapter:
             errors=tuple(errors),
         )
 
-    def place_order(
-        self, spec: OrderSpec, *, idempotency_key: str | None = None
-    ) -> PlaceResult:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """Place a live order, with the venue's explicit refusals mapped to a failed
         `PlaceResult`.
 
@@ -552,27 +549,35 @@ class AlpacaAdapter:
             total_fees=Decimal("0"),
         )
 
-    def cancel_order(self, order_id: str) -> bool:
-        """Cancel one resting order. `True` only if the venue CONFIRMS it.
+    def cancel_order(self, order_id: str) -> CancelOutcome:
+        """Cancel one resting order and report what the venue said.
 
-        Alpaca's DELETE /v2/orders/{id} answers 204 No Content on confirmation -- a
-        status about the order, not an acknowledgement of the request (the Robinhood v1
-        text-ack failure this port's boolean exists to prevent). 404 ("order not found")
-        and 422 ("order status is not cancelable", e.g. already filled) are not
-        confirmations, so they answer `False`.
+        Alpaca is the venue this is simplest at: DELETE /v2/orders/{id} answers 204 No Content
+        on confirmation -- a status about the ORDER, not an acknowledgement of the request (the
+        Robinhood v1 text-ack failure the port exists to prevent). So Alpaca never produces
+        `ACCEPTED`: its answer is always about the order itself.
 
-        **A transport failure also returns `False` rather than propagating.** This runs
-        on the executor's exit path while unwinding a position; an exception escaping
-        here can abort the unwind partway and leave the position and its resting orders
-        live, which is strictly worse than a `False` that keeps the engine believing the
-        order may still be resting -- the belief that keeps it watching. The next
-        reconciliation poll re-reads the order from the venue either way.
+        404 ("order not found") and 422 ("order status is not cancelable", e.g. already filled)
+        are the venue declining, which is `REFUSED` -- both come back as statuses rather than
+        raising, precisely so this method can tell them apart from a failure.
+
+        **A transport failure is `UNKNOWN`, not a raise.** This runs on the executor's exit path
+        while unwinding a position; an exception escaping here can abort the unwind partway and
+        leave the position and its resting orders live. `UNKNOWN` keeps the engine believing the
+        order may still be resting -- the belief that keeps it watching -- and the reconciliation
+        poll re-reads the order from the venue either way.
         """
         try:
             status = int(self._require_transport().cancel_order(order_id))
         except Exception:
-            return False
-        return status == 204
+            return CancelOutcome.UNKNOWN
+        if status == 204:
+            return CancelOutcome.CONFIRMED
+        if status in (404, 422):
+            return CancelOutcome.REFUSED
+        # The transport raises for every other 4xx/5xx, so this is a status it was told to pass
+        # through and we have no mapping for. Claiming nothing is the only honest answer.
+        return CancelOutcome.UNKNOWN
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

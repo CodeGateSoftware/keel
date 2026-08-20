@@ -58,6 +58,7 @@ from keel_broker_api.port import (
 )
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
@@ -709,9 +710,7 @@ class RobinhoodAdapter:
             errors=errors,
         )
 
-    def place_order(
-        self, spec: OrderSpec, *, idempotency_key: str | None = None
-    ) -> PlaceResult:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """Place a live order. The returned `state` is read, not just the id.
 
         **`idempotency_key` is what makes a placement retry safe here** (#409). Without one the
@@ -937,30 +936,24 @@ class RobinhoodAdapter:
             total_fees=Decimal(str(_field(response, "fee_charged", "0") or "0")),
         )
 
-    def cancel_order(self, order_id: str) -> bool:
-        """Cancel one resting order. `True` only if the venue CONFIRMS the cancellation.
+    def cancel_order(self, order_id: str) -> CancelOutcome:
+        """Cancel one resting order and report what the venue said about it.
 
         v2's cancel endpoint returns the full order object as JSON, which is the whole reason
         this adapter targets v2: v1 answers `text/plain` "Cancel request was submitted", an
         acknowledgement that the REQUEST arrived and not a statement about the order. Reading
-        that as success would let `executor._cancel_at_exchange` record a cancel that never
-        happened -- and the order it believes is gone is still resting, still able to fill.
+        that as success would let `executor._cancel_at_exchange` act as though an order it
+        believes is gone can no longer consume inventory, while it is still resting and still
+        able to fill.
 
-        So the confirmation is read from the returned object's own `state`, and only
-        `"canceled"` (Robinhood's spelling) counts. A cancel is asynchronous at this venue: the
-        response can legitimately still read `open` because the request is queued behind the
-        matching engine. That is not a failure and not a success -- it is an unanswered question,
-        so the order is re-polled ONCE via `GET /orders/{id}/` and the answer taken from there.
+        So confirmation is read from the returned object's own `state`, and only `"canceled"`
+        (Robinhood's American single-`l` spelling) counts as `CONFIRMED`. The order is re-polled
+        ONCE via `GET /orders/{id}/` if the first answer does not say so -- once, not in a loop,
+        and not with a sleep, because this runs on the executor's exit path and a retry loop here
+        would block an exit while an order it wants gone is still live.
 
-        Once, not in a loop, and not with a sleep: this runs on the executor's path and a
-        retry loop here would block an exit while an order it wants gone is still live. A `False`
-        from a still-pending cancel is the conservative outcome -- the engine keeps believing the
-        order might be resting, which is the belief that keeps it watching. `True` on a cancel
-        that had not landed is the outcome with no recovery.
-
-        ⚠️ **Observed 2026-08-20 (#412), and the finding is that this method returns `False` on a
-        cancel that succeeded.** One real BTC-USD limit buy was placed, cancelled, and then
-        polled. The venue's timeline:
+        **This method is why `CancelOutcome` exists (#412).** One real BTC-USD limit buy was
+        placed, cancelled and polled on 2026-08-20. The venue's timeline:
 
         | t | event | `state` |
         | --- | --- | --- |
@@ -969,64 +962,56 @@ class RobinhoodAdapter:
         | `…19.792632` | `GET` immediately after `POST …/cancel/` returned 200 | `open` |
         | `…20.891890` | order settles cancelled | `canceled` |
 
-        So the `200` on the cancel endpoint is an ACKNOWLEDGEMENT, not a confirmation -- it hands
-        back the order as it stood when the request was accepted, exactly as this docstring
-        already predicted -- and the single zero-delay re-poll is ALSO too early, by roughly one
-        second. `adapter.cancel_order` returned `False` for a cancellation that had in fact
-        landed; a read one second later showed `canceled`, `filled_asset_quantity` `0`, and
-        `executions` empty.
+        The `200` is an ACKNOWLEDGEMENT -- it hands back the order as it stood when the request
+        was accepted -- and the single zero-delay re-poll is ALSO too early, by roughly a second.
+        Under the old boolean contract this returned `False` for a cancellation that had in fact
+        landed, so a successful cancel was reported as `exchange did not confirm cancellation …
+        it may still be live`, and an exit waited a full cycle (a DAY, on a daily deployment) for
+        a cancel that was already done.
 
-        That is contract-correct (the port requires `True` only on confirmation, and nothing had
-        confirmed yet) but it means the confirming branch is, on this evidence, unreachable in
-        production: `executor._cancel_at_exchange` will record every successful cancel as
-        unconfirmed and keep re-polling the order. Whether to spend a bounded wait here to make
-        the confirmation reachable is a live-money design decision, not a fixture correction, so
-        it is left to #412 rather than changed on the strength of one observation. The safe
-        direction is unchanged either way -- `False` keeps the engine watching an order that is
-        already gone, which costs a redundant poll, where a `True` on an unlanded cancel costs a
-        position.
+        That is now `ACCEPTED`: the venue took the request and has not settled it. It is still
+        not safe to act on -- the order can consume inventory until the engine settles it, so a
+        caller must not place against the same inventory yet -- but it is no longer reported as a
+        failure, and the reconciliation poll at the top of the next cycle establishes the
+        terminal state. Which state that is, `reconcile_open_orders` reads from the venue.
 
-        ⚠️ The raw body of that cancel `200` was NOT captured: this method consumes it and
-        returns a `bool`. `_OneOrderOnly` now tees every response so a future run records it.
+        An id the venue never issued (a 404, surfaced by the transport as `None`) is `REFUSED`.
 
-        An id the venue never issued returns `False` rather than raising, per the port docstring:
-        absence of a refusal is not a confirmation, and neither is a 404.
-
-        **A venue error also returns `False` rather than propagating.** The transport raises for
-        every failure that is not a 404 -- a 5xx, a timeout, a dropped connection -- and this
-        method runs on the EXIT path, where `executor._cancel_at_exchange` calls it while
-        unwinding a position. This adapter already writes the rule down at `_account`: "a raise on
-        the way out of a position can trap it." An exception escaping here can abort an unwind
-        partway through and leave both the position and the resting orders it was clearing live,
-        which is strictly worse than a `False`.
-
-        Nothing is claimed by swallowing it. The port's contract is already "`True` ONLY when the
-        venue CONFIRMS", and an exception is definitionally not a confirmation -- so `False` is
-        the same answer this method would give for any other unconfirmed cancel, and it keeps the
-        caller believing the order may still be resting, which is the belief that keeps it
-        watching. The failure is not hidden either: the order stays in local state as
-        possibly-live and the next reconciliation poll re-reads it from the venue.
+        **A venue error is `UNKNOWN`, never a raise.** The transport raises for every failure
+        that is not a 404 -- a 5xx, a timeout, a dropped connection -- and this method runs on
+        the EXIT path, where `executor._cancel_at_exchange` calls it while unwinding a position.
+        This adapter already writes the rule down at `_account`: "a raise on the way out of a
+        position can trap it." An exception escaping here can abort an unwind partway through and
+        leave both the position and the resting orders it was clearing live. `UNKNOWN` claims
+        nothing, keeps the engine watching, and the next reconciliation poll re-reads the order.
         """
         transport = self._require_transport()
 
         try:
             response = transport.cancel_order(order_id)
             if response is None:
-                return False
+                # The transport surfaces a 404 -- and only a 404 -- as None: an id this venue
+                # has never issued. That is the venue declining, not a failure to reach it.
+                return CancelOutcome.REFUSED
             if _confirms_cancel(response, order_id):
-                return True
+                return CancelOutcome.CONFIRMED
 
             polled = transport.get_order(order_id)
         # Intentionally broad. The transport raises whatever the HTTP stack raises -- a
         # `requests` exception, a socket timeout, a JSON decode error -- and narrowing this to a
         # guessed list would let the one unguessed type escape onto the exit path, which is the
-        # exact failure this catch exists to prevent. See the docstring for why `False` claims
-        # nothing the port does not already treat as "unconfirmed".
+        # exact failure this catch exists to prevent.
         except Exception:
-            return False
+            return CancelOutcome.UNKNOWN
+
         if polled is None:
-            return False
-        return _confirms_cancel(polled, order_id)
+            return CancelOutcome.REFUSED
+        if _confirms_cancel(polled, order_id):
+            return CancelOutcome.CONFIRMED
+        # The cancel endpoint answered 200 and the order is still not terminal. On the evidence
+        # above that is the normal path, not an anomaly: the request is queued behind the
+        # matching engine and settles about a second later.
+        return CancelOutcome.ACCEPTED
 
 
 #: Robinhood order states that mean a just-placed order is NOT resting at the venue.

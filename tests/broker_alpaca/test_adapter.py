@@ -33,7 +33,14 @@ from keel_broker_api.orders import (
     StopLimitGTC,
 )
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview, SessionState
+from keel_broker_api.results import (
+    Balance,
+    CancelOutcome,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.types import Granularity, Side
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -687,19 +694,27 @@ class TestOrderStatus:
 
 
 class TestCancel:
+    """Alpaca is the venue where the answer is always ABOUT THE ORDER, never an acknowledgement
+    of the request -- so it is the one adapter that can never produce `ACCEPTED` (#412)."""
+
     def test_a_204_is_the_venue_confirmation(self) -> None:
         adapter = AlpacaAdapter(_full_transport())
         placed = adapter.place_order(
             MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
         )
-        assert adapter.cancel_order(placed.broker_order_id or "") is True
+        assert adapter.cancel_order(placed.broker_order_id or "") is CancelOutcome.CONFIRMED
 
-    def test_an_id_the_venue_never_issued_is_false_not_a_raise(self) -> None:
-        assert AlpacaAdapter(_full_transport()).cancel_order("never-issued") is False
+    def test_an_id_the_venue_never_issued_is_a_refusal_not_a_raise(self) -> None:
+        """404 is the venue declining -- a statement about the id, so `REFUSED` rather than
+        `UNKNOWN`. Not a raise: this runs while unwinding a position."""
+        outcome = AlpacaAdapter(_full_transport()).cancel_order("never-issued")
+        assert outcome is CancelOutcome.REFUSED
+        assert not outcome.settled
 
-    def test_an_order_that_is_no_longer_cancellable_is_not_a_confirmation(self) -> None:
+    def test_an_order_that_is_no_longer_cancellable_is_a_refusal(self) -> None:
         """Alpaca answers DELETE with 422 when an order can no longer be cancelled (e.g.
-        already filled); 404 when it never existed. Neither is a confirmed cancellation."""
+        already filled); 404 when it never existed. Both are the venue declining, and neither
+        is a confirmed cancellation."""
         transport = FakeTransport(
             placed=load_fixture("alpaca_order_placed.json"), cancel_status=422
         )
@@ -707,9 +722,12 @@ class TestCancel:
         placed = adapter.place_order(
             MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
         )
-        assert adapter.cancel_order(placed.broker_order_id or "") is False
+        assert adapter.cancel_order(placed.broker_order_id or "") is CancelOutcome.REFUSED
 
-    def test_a_transport_failure_on_the_exit_path_is_false_not_an_exception(self) -> None:
+    def test_a_transport_failure_on_the_exit_path_is_unknown_not_an_exception(self) -> None:
+        """`UNKNOWN`, not `REFUSED`: the venue said nothing at all, which is a different fact
+        from the venue saying no -- and only one of them is about the order."""
+
         class _Exploding(FakeTransport):
             def cancel_order(self, order_id: str) -> Any:
                 self._record("cancel_order", order_id=order_id)
@@ -720,7 +738,17 @@ class TestCancel:
         placed = adapter.place_order(
             MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
         )
-        assert adapter.cancel_order(placed.broker_order_id or "") is False
+        assert adapter.cancel_order(placed.broker_order_id or "") is CancelOutcome.UNKNOWN
+
+    def test_alpaca_never_reports_accepted(self) -> None:
+        """Its DELETE answers about the ORDER (204/404/422), never "request received" -- so an
+        `ACCEPTED` from this adapter would mean the mapping had drifted."""
+        adapter = AlpacaAdapter(_full_transport())
+        placed = adapter.place_order(
+            MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+        )
+        for order_id in (placed.broker_order_id or "", "never-issued"):
+            assert adapter.cancel_order(order_id) is not CancelOutcome.ACCEPTED
 
 
 # ---------------------------------------------------------------------------------------------
