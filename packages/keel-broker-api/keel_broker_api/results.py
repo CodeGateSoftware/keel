@@ -34,6 +34,72 @@ class SessionState(str, Enum):
     CLOCK_UNAVAILABLE = "clock_unavailable"
 
 
+class CancelOutcome(str, Enum):
+    """What a venue actually said when asked to cancel one resting order (#412).
+
+    This replaced a `bool`, and the reason is a real observation rather than a taste for enums.
+    Robinhood's cancel endpoint answers `200` with the order still reading `open`: the request
+    was accepted and the matching engine settles it about a second later. A boolean has one word
+    for that and for "already filled, refused" -- `False` -- so a cancel that had in fact landed
+    was reported as `exchange did not confirm cancellation ... it may still be live`. That is not
+    a wording problem. On a deployment that cycles once a day, an exit that waits for a cancel
+    it believes failed waits a DAY, and the log says the position is at risk when it is not.
+
+    Four members, because the venues genuinely say four different things and the caller genuinely
+    wants to log them differently:
+
+    * `CONFIRMED` -- the venue states THIS order is terminal-cancelled. Alpaca's `204`,
+      Robinhood's `state: canceled`, Coinbase's per-order `success: true`. Only this permits a
+      caller to act as though the order can no longer consume inventory.
+    * `ACCEPTED` -- the venue took the request and has not settled it yet. Robinhood's `open`
+      after a `200`. **Not a failure**, and specifically not the same fact as a refusal.
+    * `REFUSED` -- the venue declined: already filled, already terminal, or an id it never
+      issued. Coinbase's `success: false`, Alpaca's `404`/`422`.
+    * `UNKNOWN` -- nothing could be established. A 5xx, a timeout, a dropped connection, an
+      answer with no row for this id. Distinguished from `REFUSED` because "the venue said no"
+      and "the venue said nothing" are different facts, and only one of them is about the order.
+
+    **Only `CONFIRMED` is safe to act on**, and `settled` says so in one place so no caller has
+    to re-derive it. The other three all mean "this order may still be resting", which is the
+    belief that keeps the engine watching it -- and the reconciliation poll at the top of every
+    cycle (`keel.execution.reconcile.reconcile_open_orders`) is what establishes the terminal
+    state for all of them.
+    """
+
+    CONFIRMED = "confirmed"
+    ACCEPTED = "accepted"
+    REFUSED = "refused"
+    UNKNOWN = "unknown"
+
+    @property
+    def settled(self) -> bool:
+        """Whether the venue has stated this order can no longer consume inventory.
+
+        The one question a caller on the exit path is actually asking. It is deliberately NOT
+        "did the cancel succeed": an `ACCEPTED` cancel will almost certainly succeed, and acting
+        on that near-certainty is what places a second order against inventory the venue still
+        has committed."""
+        return self is CancelOutcome.CONFIRMED
+
+
+def coerce_cancel_outcome(value: object) -> CancelOutcome:
+    """Read an adapter's answer, tolerating the `bool` this used to be.
+
+    An out-of-tree adapter written against the old contract still returns `True`/`False`, and the
+    mapping is the conservative one: `True` meant "confirmed" and still does; `False` meant
+    "not confirmed, fail closed" and becomes `REFUSED`, which fails closed identically. Anything
+    else -- `None`, a string, a mistake -- is `UNKNOWN`, never a confirmation. There is no input
+    to this function that turns an unconfirmed cancel into a confirmed one.
+    """
+    if isinstance(value, CancelOutcome):
+        return value
+    if value is True:
+        return CancelOutcome.CONFIRMED
+    if value is False:
+        return CancelOutcome.REFUSED
+    return CancelOutcome.UNKNOWN
+
+
 @dataclass(frozen=True)
 class MarketSchedule:
     """The venue's market clock WITH its schedule: `market_clock()`'s session state plus the
@@ -138,10 +204,12 @@ class FeeSummary:
 
 __all__ = [
     "Balance",
+    "CancelOutcome",
     "FeeSummary",
     "MarketSchedule",
     "OrderStatus",
     "PlaceResult",
     "Preview",
     "SessionState",
+    "coerce_cancel_outcome",
 ]

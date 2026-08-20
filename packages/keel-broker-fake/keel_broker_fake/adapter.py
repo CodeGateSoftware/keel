@@ -32,6 +32,7 @@ from keel_broker_api.orders import OrderSpec, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder, default_market_schedule
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
@@ -149,9 +150,7 @@ class FakeAdapter:
         """
         raise NotImplementedError("fake venue offers no order preview")
 
-    def place_order(
-        self, spec: OrderSpec, *, idempotency_key: str | None = None
-    ) -> PlaceResult:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """`idempotency_key` is ACCEPTED and deliberately not acted on.
 
         This venue has no `client_order_id` to carry it into -- order ids are minted from a
@@ -214,8 +213,12 @@ class FakeAdapter:
             total_fees=Decimal("0"),
         )
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: str) -> CancelOutcome:
         """Remove a resting order and its trigger (if any); confirm only what was actually here.
+
+        This venue is synchronous and in-process, so it never produces `ACCEPTED`: removing the
+        order IS the settlement. An id it is not holding is `REFUSED` -- the same answer a real
+        venue gives for an order that already filled or was never issued.
 
         A stop is two objects at this venue (`_RestingOrder` + `_Trigger`), so cancelling the
         order without dropping its trigger would leave the trigger free to fire later and place
@@ -225,7 +228,9 @@ class FakeAdapter:
         before = len(self.resting)
         self.resting = [order for order in self.resting if order.order_id != order_id]
         self.triggers = [t for t in self.triggers if t.order_id != order_id]
-        return len(self.resting) < before
+        if len(self.resting) < before:
+            return CancelOutcome.CONFIRMED
+        return CancelOutcome.REFUSED
 
 
 __all__ = ["MAX_CANDLES_PER_CALL", "SUPPORTED_GRANULARITIES", "FakeAdapter"]

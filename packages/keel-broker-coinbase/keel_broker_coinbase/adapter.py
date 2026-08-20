@@ -24,6 +24,7 @@ from keel_broker_api.port import (
 )
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
@@ -158,9 +159,7 @@ class CoinbaseAdapter:
             errors=errs,
         )
 
-    def place_order(
-        self, spec: OrderSpec, *, idempotency_key: str | None = None
-    ) -> PlaceResult:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """Place a live order.
 
         ⚠️ The previous wording here -- "a fresh `client_order_id` per call gives Coinbase
@@ -231,25 +230,39 @@ class CoinbaseAdapter:
             total_fees=Decimal(_field(order, "total_fees", "0") or "0"),
         )
 
-    def cancel_order(self, order_id: str) -> bool:
-        """Cancel one resting order. `True` only if the exchange CONFIRMS the cancellation.
+    def cancel_order(self, order_id: str) -> CancelOutcome:
+        """Cancel one resting order and report what the exchange said about THIS id.
 
         Coinbase's `batch_cancel` reports success per order, so a 200 response does not mean the
         order is gone -- it can come back `{"success": false, "failure_reason": ...}` for an
         order that already filled or does not exist. Reading only the HTTP status would let
         `executor._cancel_at_exchange` record a cancel that never happened, which is precisely
-        the failure it was written to prevent. No confirmation, including an empty result set,
-        is treated as failure: absence of a refusal is not a confirmation.
+        the failure this mapping exists to prevent.
+
+        `success: true` is `CONFIRMED` and `success: false` is `REFUSED` -- the venue answering
+        about this order either way.
+
+        An answer with NO row for this id is `UNKNOWN` rather than `REFUSED`, and that is the one
+        behavioural change here. It was `False` before, which fails closed identically; the
+        difference is only what gets logged, and "the exchange did not answer about this order"
+        is a different operational fact from "the exchange refused". Neither permits acting on
+        the cancel.
         """
         response = self._require_transport().cancel_orders(order_ids=[order_id])
         results = list(_field(response, "results", []) or [])
         for result in results:
             if _field(result, "order_id") == order_id:
-                return bool(_field(result, "success", False))
+                return _cancel_outcome_from_success(_field(result, "success", False))
         # Some responses omit the echoed id; a single result for a single-id request is it.
         if len(results) == 1:
-            return bool(_field(results[0], "success", False))
-        return False
+            return _cancel_outcome_from_success(_field(results[0], "success", False))
+        return CancelOutcome.UNKNOWN
+
+
+def _cancel_outcome_from_success(success: object) -> CancelOutcome:
+    """Coinbase states the outcome per order, so its answer is never merely an acknowledgement:
+    `success` is about the order and maps straight onto confirmed/refused."""
+    return CancelOutcome.CONFIRMED if bool(success) else CancelOutcome.REFUSED
 
 
 __all__ = ["CoinbaseAdapter"]

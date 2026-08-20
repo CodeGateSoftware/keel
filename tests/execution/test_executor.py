@@ -31,6 +31,7 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution.executor import (
+    CancelPending,
     CancelUnavailable,
     ExecutionResult,
     execute,
@@ -1280,7 +1281,7 @@ def test_a_cancel_the_exchange_REFUSES_is_not_recorded_as_a_cancel(repo):
         rule_name="pullback_continuation", now_ts=NOW_TS,
     )
 
-    with pytest.raises(CancelUnavailable, match="did not confirm"):
+    with pytest.raises(CancelUnavailable, match="REFUSED"):
         roll_to_break_even(
             broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
             entry_price=Decimal("50000"), qty=Decimal("0.01"),
@@ -1288,6 +1289,59 @@ def test_a_cancel_the_exchange_REFUSES_is_not_recorded_as_a_cancel(repo):
         )
 
     assert repo.get_order(stop_id)["status"] == "pending"
+
+
+def test_a_legacy_boolean_adapter_still_fails_closed(repo) -> None:
+    """An adapter written against the OLD boolean contract must not become more permissive by
+    accident. `False` meant "not confirmed, fail closed", and `coerce_cancel_outcome` maps it to
+    `REFUSED`, which fails closed identically -- the broker above returns a bare `False` and this
+    is the test that says so (#412)."""
+    from keel_broker_api.results import CancelOutcome, coerce_cancel_outcome
+
+    assert coerce_cancel_outcome(False) is CancelOutcome.REFUSED
+    assert not coerce_cancel_outcome(False).settled
+    assert coerce_cancel_outcome(True).settled
+    # Anything that is not an outcome and not a bool claims nothing.
+    for value in (None, "yes", 1, object()):
+        assert not coerce_cancel_outcome(value).settled
+
+
+def test_a_cancel_the_venue_ACCEPTS_but_has_not_settled_still_stops_the_caller(repo) -> None:
+    """The #412 case. `ACCEPTED` is not a failure and must not be logged as one -- but it is also
+    not permission to proceed: the order can still consume inventory until the venue settles it,
+    and the very next thing both cancel sites do is place another order against that same
+    inventory. So the caller is still stopped, by a `CancelPending` that IS-A `CancelUnavailable`
+    so every existing handler keeps working unchanged."""
+    from keel_broker_api.results import CancelOutcome
+
+    class _AcceptingBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> CancelOutcome:
+            self.cancel_calls.append(order_id)
+            return CancelOutcome.ACCEPTED
+
+    broker = _AcceptingBroker()
+    stop_id = place_bracket(
+        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
+        stop=Decimal("49000"), target=Decimal("53000"),
+        rule_name="pullback_continuation", now_ts=NOW_TS,
+    )
+
+    with pytest.raises(CancelPending, match="accepted"):
+        roll_to_break_even(
+            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"), qty=Decimal("0.01"),
+            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        )
+
+    # Still pending, so the reconciliation poll at the top of the next cycle reads the terminal
+    # state from the venue -- which is where establishing it belongs.
+    assert repo.get_order(stop_id)["status"] == "pending"
+
+
+def test_cancel_pending_is_caught_by_every_existing_cancel_unavailable_handler() -> None:
+    """The subclassing is the whole reason this distinction is safe to introduce on the live
+    money path: control flow is provably unchanged, and only the reporting differs."""
+    assert issubclass(CancelPending, CancelUnavailable)
 
 
 

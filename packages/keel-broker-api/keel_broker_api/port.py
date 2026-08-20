@@ -11,6 +11,7 @@ from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
@@ -129,9 +130,7 @@ class Broker(Protocol):
 
     def preview_order(self, spec: OrderSpec) -> Preview: ...
 
-    def place_order(
-        self, spec: OrderSpec, *, idempotency_key: str | None = None
-    ) -> PlaceResult:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """Place one order.
 
         `idempotency_key` identifies the INTENT, not the order. Omit it and the adapter mints a
@@ -156,12 +155,31 @@ class Broker(Protocol):
 
     def get_order(self, order_id: str) -> OrderStatus: ...
 
-    def cancel_order(self, order_id: str) -> bool:
-        """Cancel one resting order. Return `True` ONLY when the venue CONFIRMS the
-        cancellation for THIS order id -- absence of a refusal is not a confirmation. A caller
-        (`executor._cancel_at_exchange`) records local state on the strength of this boolean, so
-        a `True` that the venue never actually confirmed would record a cancel that never
-        happened.
+    def cancel_order(self, order_id: str) -> CancelOutcome:
+        """Cancel one resting order and report WHAT THE VENUE SAID about THIS order id.
+
+        Return `CancelOutcome.CONFIRMED` only when the venue states this order is
+        terminal-cancelled -- absence of a refusal is still not a confirmation. A caller
+        (`executor._cancel_at_exchange`) acts on the strength of this, and the action it takes
+        next is placing another order against the same inventory, so a `CONFIRMED` the venue
+        never gave would commit that inventory twice.
+
+        The other three members exist because venues say more than two things, and collapsing
+        them lost a real distinction. Robinhood answers `200` with the order still `open`: the
+        request is accepted and settles about a second later. That is `ACCEPTED`, and reporting
+        it as a failure (which a `bool` had no choice but to do) told operators a successful
+        cancel had left a position at risk, and made an exit wait a whole cycle for a cancel that
+        had already landed. `REFUSED` is the venue declining -- already filled, unknown id --
+        and `UNKNOWN` is a 5xx, a timeout, or an answer with no row for this id. See
+        `CancelOutcome` for the full mapping.
+
+        **Do not raise on the exit path.** This is called while unwinding a position; an
+        exception escaping here can abort the unwind partway and leave both the position and the
+        orders it was clearing live. A transport failure is `UNKNOWN`, which claims nothing.
+
+        A `bool` is still accepted for compatibility with adapters written against the older
+        contract -- `coerce_cancel_outcome` maps `True` to `CONFIRMED` and `False` to `REFUSED`,
+        which fails closed exactly as before.
         """
         ...
 
@@ -169,6 +187,7 @@ class Broker(Protocol):
 __all__ = [
     "CLIENT_ORDER_ID_NAMESPACE",
     "Broker",
+    "CancelOutcome",
     "UnsupportedOrder",
     "default_market_schedule",
     "resolve_client_order_id",

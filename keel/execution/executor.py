@@ -83,7 +83,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from keel_broker_api.results import Preview
+from keel_broker_api.results import CancelOutcome, Preview, coerce_cancel_outcome
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
@@ -214,7 +214,6 @@ def execute(
 # -- intent construction ---------------------------------------------------------------------
 
 
-
 def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_ts: int) -> bool:
     """Cancel any resting exchange-side exit bracket for `product_id`. `False` if one could not
     be cleared, in which case the caller MUST NOT place its SELL.
@@ -236,6 +235,19 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
             continue
         try:
             _cancel_at_exchange(broker, repo, row)
+        except CancelPending:
+            # NOT a failure, and logged at INFO so it does not read as one: the venue took the
+            # cancel and settles it asynchronously. The exit still waits -- placing now would
+            # commit inventory the venue may still hold -- but an operator reading this line
+            # should see a cancel in flight, not a position at risk.
+            log_event(
+                logger,
+                logging.INFO,
+                "executor.bracket_cancel_pending",
+                product=product_id,
+                order_id=row["id"],
+            )
+            return False
         except CancelUnavailable:
             log_exception(
                 logger,
@@ -326,13 +338,17 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
         return None
 
     for account in accounts or []:
-        currency = account.get("currency") if isinstance(account, dict) else getattr(
-            account, "currency", None
+        currency = (
+            account.get("currency")
+            if isinstance(account, dict)
+            else getattr(account, "currency", None)
         )
         if (currency or "").upper() != quote_currency.upper():
             continue
-        balance = account.get("available_balance") if isinstance(account, dict) else getattr(
-            account, "available_balance", None
+        balance = (
+            account.get("available_balance")
+            if isinstance(account, dict)
+            else getattr(account, "available_balance", None)
         )
         if balance is None:
             return None
@@ -383,9 +399,7 @@ def _build_intent(
             stop = setup.stop
 
         # The PRODUCT's quote leg -- what this order actually spends.
-        available_quote = _fetch_available_quote(
-            broker, quote_currency_of(signal.product_id)
-        )
+        available_quote = _fetch_available_quote(broker, quote_currency_of(signal.product_id))
         withdrawals = _withdrawals_enabled(repo, now_ts)
 
         return OrderIntent(
@@ -427,9 +441,7 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     buy_cost = Decimal("0")
     sell_qty = Decimal("0")
     for order in repo.get_orders(mode="live", product_id=product_id, status="filled"):
-        price = order.get("actual_fill") or order.get("limit_price") or order.get(
-            "expected_fill"
-        )
+        price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
         qty = order["qty"] or Decimal("0")
         if order["side"] == Side.BUY.value:
             buy_qty += qty
@@ -618,7 +630,6 @@ def _run_order(
     return ExecutionResult(
         placed=True, order_id=order_id, vetoed_by=[], preview=preview, reason="placed"
     )
-
 
 
 def _upgrade_to_observed_economics(
@@ -1079,6 +1090,27 @@ class CancelUnavailable(RuntimeError):
     """
 
 
+class CancelPending(CancelUnavailable):
+    """The venue ACCEPTED the cancel and has not settled it yet (#412).
+
+    A SUBCLASS, deliberately, so every existing `except CancelUnavailable` keeps catching this
+    and the control flow is provably unchanged by this distinction. What changes is only what the
+    caller can say about it -- and that matters, because the two are not the same event and were
+    being reported as though they were.
+
+    Robinhood's cancel endpoint answers `200` with the order still `open`; the matching engine
+    settles it about a second later. Under the old boolean contract that arrived as "the exchange
+    did not confirm cancellation -- it may still be live", which told an operator a position was
+    at risk when the cancel had in fact landed.
+
+    It is still not safe to ACT on: until the venue settles it, the order can consume inventory,
+    and the next thing both cancel sites do is place another order against that same inventory.
+    So this still stops the caller. The reconciliation poll at the top of the next cycle
+    (`keel.execution.reconcile.reconcile_open_orders`) reads the terminal state from the venue,
+    which is where establishing it belongs -- not on an exit path that would have to sleep.
+    """
+
+
 def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]) -> None:
     """Cancel `order_row` at the exchange, or raise. Never marks local state on failure.
 
@@ -1104,13 +1136,30 @@ def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]
     # The RETURN VALUE is the confirmation, not the absence of an exception. Coinbase's
     # batch_cancel answers per order, so a refused cancel (already filled, unknown id) comes back
     # `success: false` on a 200. Discarding it recorded a cancel that never happened -- the exact
-    # failure this module exists to prevent. `is not True` so a fake/broker returning None (no
-    # confirmation) also fails closed.
-    if cancel(native_id) is not True:
-        raise CancelUnavailable(
-            f"exchange did not confirm cancellation of {native_id} -- refusing to record it as "
-            "canceled while it may still be live"
+    # failure this module exists to prevent.
+    #
+    # `coerce_cancel_outcome` also absorbs an adapter still written against the older boolean
+    # contract, mapping `True`/`False`/anything-else to CONFIRMED/REFUSED/UNKNOWN. Only CONFIRMED
+    # lets the caller proceed, which is the same bar `is not True` set -- so no adapter, old or
+    # new, can turn an unconfirmed cancel into a permitted one.
+    outcome = coerce_cancel_outcome(cancel(native_id))
+    if outcome.settled:
+        return
+    if outcome is CancelOutcome.ACCEPTED:
+        raise CancelPending(
+            f"exchange accepted the cancellation of {native_id} but has not settled it yet -- "
+            "waiting rather than placing against inventory it may still hold; the next "
+            "reconciliation poll will read the terminal state"
         )
+    if outcome is CancelOutcome.REFUSED:
+        raise CancelUnavailable(
+            f"exchange REFUSED to cancel {native_id} (already filled, already terminal, or an "
+            "id it never issued) -- refusing to record it as canceled while it may still be live"
+        )
+    raise CancelUnavailable(
+        f"exchange said nothing usable about cancelling {native_id} -- refusing to record it as "
+        "canceled while it may still be live"
+    )
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:

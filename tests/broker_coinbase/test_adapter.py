@@ -16,6 +16,7 @@ import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     OrderStatus,
     PlaceResult,
@@ -361,29 +362,35 @@ def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none() -> None:
     assert order.total_fees == Decimal("0")
 
 
-def test_cancel_order_returns_true_when_the_exchange_confirms() -> None:
+def test_cancel_order_is_confirmed_when_the_exchange_confirms() -> None:
     transport = FakeTransport()
     # Bypass the normal create_order plumbing: issue the id directly so the fake transport
     # treats it as one it has actually seen.
     transport._issued_order_ids.add("abc-123")
     adapter = CoinbaseAdapter(transport)
 
-    assert adapter.cancel_order("abc-123") is True
+    outcome = adapter.cancel_order("abc-123")
+    assert outcome is CancelOutcome.CONFIRMED
+    assert outcome.settled
     assert transport.calls["cancel_orders"] == {"order_ids": ["abc-123"]}
 
 
-def test_cancel_order_returns_false_when_the_exchange_refuses() -> None:
+def test_cancel_order_is_refused_when_the_exchange_refuses() -> None:
     """Coinbase's batch_cancel reports per-order success -- a 200 response does NOT mean the
     order was cancelled. Reading only the HTTP status would let `_cancel_at_exchange` record a
     cancel that never happened, which is the exact failure it exists to prevent."""
     adapter = CoinbaseAdapter(FakeTransport())
 
-    assert adapter.cancel_order("never-issued") is False
+    assert adapter.cancel_order("never-issued") is CancelOutcome.REFUSED
 
 
-def test_cancel_order_returns_false_on_an_empty_result_set() -> None:
+def test_cancel_order_is_unknown_on_an_empty_result_set() -> None:
     """No result for the id we asked about means we have no confirmation. Absence of a refusal
-    is not a confirmation -- fail closed."""
+    is not a confirmation -- fail closed.
+
+    `UNKNOWN` rather than `REFUSED` (#412): the exchange did not answer about this order at all,
+    which is a different operational fact from the exchange declining. Neither is settled, so the
+    fail-closed behaviour is identical -- only the log line changes."""
 
     class EmptyCancelTransport(FakeTransport):
         def cancel_orders(self, order_ids: list[str], **kwargs: Any) -> Any:
@@ -392,4 +399,6 @@ def test_cancel_order_returns_false_on_an_empty_result_set() -> None:
 
     adapter = CoinbaseAdapter(EmptyCancelTransport())
 
-    assert adapter.cancel_order("abc") is False
+    outcome = adapter.cancel_order("abc")
+    assert outcome is CancelOutcome.UNKNOWN
+    assert not outcome.settled

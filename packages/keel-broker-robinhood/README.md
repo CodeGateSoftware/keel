@@ -9,7 +9,7 @@ API v2.
 | ------------ | ---------------------------------------------------------------------------- |
 | Balances     | Per-holding `Balance` plus one for the account's `buying_power`.              |
 | Order status | `get_order` normalizes a Robinhood order object to `OrderStatus`.            |
-| Cancel       | `cancel_order` confirms from the venue's returned order, with one re-poll.    |
+| Cancel       | `cancel_order` reads the venue's returned order, with one re-poll, and answers a `CancelOutcome`. This venue settles cancels **asynchronously** (~1s observed), so `ACCEPTED` is its normal answer, not a failure — see #412. |
 | Fee summary  | Rates from `fee_tier_status.fee_ratio`, `volume_usd` from `thirty_day_volume`, `fees_usd` summed from 30 days of order history. |
 | Preview      | Synthetic only (`synthetic=True`) -- there is no native preview endpoint.     |
 

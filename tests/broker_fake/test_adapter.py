@@ -11,7 +11,7 @@ from decimal import Decimal
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
 from keel_broker_api.port import UnsupportedOrder
-from keel_broker_api.results import Balance, OrderStatus, PlaceResult, SessionState
+from keel_broker_api.results import Balance, CancelOutcome, OrderStatus, PlaceResult, SessionState
 from keel_broker_fake import FakeAdapter
 from keel_broker_fake.adapter import MAX_CANDLES_PER_CALL
 from keel_core.types import Granularity, Side
@@ -158,13 +158,27 @@ def test_cancel_order_removes_a_resting_order_and_confirms() -> None:
     placed = adapter.place_order(spec)
     assert placed.broker_order_id is not None
 
-    assert adapter.cancel_order(placed.broker_order_id) is True
+    assert adapter.cancel_order(placed.broker_order_id) is CancelOutcome.CONFIRMED
     assert adapter.resting == []
     assert adapter.get_order(placed.broker_order_id).status == "FAILED"
 
 
-def test_cancel_order_on_an_unknown_id_returns_false() -> None:
-    assert FakeAdapter().cancel_order("never-placed") is False
+def test_cancel_order_on_an_unknown_id_is_refused() -> None:
+    assert FakeAdapter().cancel_order("never-placed") is CancelOutcome.REFUSED
+
+
+def test_the_fake_venue_never_reports_accepted() -> None:
+    """This venue is synchronous and in-process: removing the order IS the settlement, so there
+    is no window in which a cancel is accepted-but-unsettled. An `ACCEPTED` here would mean the
+    fake had stopped modelling a venue faithfully (#412)."""
+    adapter = FakeAdapter()
+    spec = LimitGTC(
+        product_id="BTC-USD", side=Side.SELL, base_size=Decimal("1"), limit_price=Decimal("70000")
+    )
+    placed = adapter.place_order(spec)
+    assert placed.broker_order_id is not None
+    assert adapter.cancel_order(placed.broker_order_id) is not CancelOutcome.ACCEPTED
+    assert adapter.cancel_order("never-placed") is not CancelOutcome.ACCEPTED
 
 
 def test_cancel_order_drops_the_stops_trigger_too() -> None:
@@ -183,6 +197,6 @@ def test_cancel_order_drops_the_stops_trigger_too() -> None:
     assert placed.broker_order_id is not None
     assert len(adapter.triggers) == 1
 
-    assert adapter.cancel_order(placed.broker_order_id) is True
+    assert adapter.cancel_order(placed.broker_order_id) is CancelOutcome.CONFIRMED
 
     assert adapter.triggers == []

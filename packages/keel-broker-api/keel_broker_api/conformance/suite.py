@@ -40,12 +40,14 @@ from keel_broker_api.orders import (
 from keel_broker_api.port import UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
+    CancelOutcome,
     FeeSummary,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
     Preview,
     SessionState,
+    coerce_cancel_outcome,
 )
 
 _PRODUCT = "BTC-USD"
@@ -217,9 +219,7 @@ class BrokerConformanceTests:
         """
         broker = self.broker()
         for kind in sorted(broker.capabilities().supported_orders):
-            result = broker.place_order(
-                _SPEC_BY_KIND[kind], idempotency_key=f"conformance-{kind}"
-            )
+            result = broker.place_order(_SPEC_BY_KIND[kind], idempotency_key=f"conformance-{kind}")
             assert isinstance(result, PlaceResult), (
                 f"{kind} did not return a PlaceResult when given an idempotency_key"
             )
@@ -324,21 +324,38 @@ class BrokerConformanceTests:
         assert isinstance(order.average_filled_price, Decimal)
         assert isinstance(order.total_fees, Decimal)
 
-    def test_cancel_order_reports_per_order_confirmation(self) -> None:
+    def test_cancel_order_reports_what_the_venue_said(self) -> None:
         """Coinbase's `batch_cancel` answers per order, so a 200 is not a confirmation. The port
-        must surface the per-order boolean, not the HTTP result -- `executor._cancel_at_exchange`
-        records local state on the strength of it, so a cancel that never happened would be
-        recorded as one that did.
+        must surface the venue's answer about THIS order, not the HTTP result --
+        `executor._cancel_at_exchange` acts on the strength of it, and what it does next is place
+        another order against the same inventory.
 
-        The unknown id must come back `False`, not raise: absence of a refusal is not a
-        confirmation.
+        An unknown id must come back non-`CONFIRMED`, not raise: absence of a refusal is not a
+        confirmation, and a raise on the exit path can abort an unwind partway.
+
+        Only `CONFIRMED` is asserted positively. A conformant adapter MAY answer `ACCEPTED` for a
+        venue that settles cancels asynchronously (Robinhood does), so the suite pins the
+        property that matters -- an unknown id never reports as settled -- rather than a member
+        that would be wrong for such a venue.
         """
         broker = self.broker()
         placed = broker.place_order(self._any_supported_spec(broker.capabilities()))
         assert placed.broker_order_id is not None
 
-        assert broker.cancel_order(placed.broker_order_id) is True
-        assert broker.cancel_order("an-id-this-venue-never-issued") is False
+        outcome = coerce_cancel_outcome(broker.cancel_order(placed.broker_order_id))
+        assert outcome is CancelOutcome.CONFIRMED
+
+        unknown = coerce_cancel_outcome(broker.cancel_order("an-id-this-venue-never-issued"))
+        assert isinstance(unknown, CancelOutcome)
+        assert not unknown.settled
+
+    def test_cancel_order_never_raises_on_the_exit_path(self) -> None:
+        """`cancel_order` is called while unwinding a position. An exception escaping it can
+        abort the unwind partway and leave both the position and the orders it was clearing live
+        -- strictly worse than an answer that claims nothing and keeps the engine watching."""
+        broker = self.broker()
+        outcome = coerce_cancel_outcome(broker.cancel_order("an-id-this-venue-never-issued"))
+        assert not outcome.settled
 
     # --- candles ---------------------------------------------------------------------------
 
