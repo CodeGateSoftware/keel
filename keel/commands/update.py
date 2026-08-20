@@ -70,6 +70,7 @@ from typing import NoReturn
 
 import click
 
+from keel.install import is_packaged, packaged_update_refusal
 from keel.version import BuildInfo, build_info, installed_distributions
 
 #: The public, unauthenticated latest-release endpoint. NO auth, NO tokens: this
@@ -130,8 +131,10 @@ def parse_release(payload: bytes | str) -> ReleaseInfo:
         doc = json.loads(payload)
     except (TypeError, ValueError) as exc:
         raise UpdateError(f"the releases API returned a non-JSON payload: {exc}") from exc
-    if not isinstance(doc, dict) or not isinstance(doc.get("tag_name"), str) or not doc.get(
-        "tag_name"
+    if (
+        not isinstance(doc, dict)
+        or not isinstance(doc.get("tag_name"), str)
+        or not doc.get("tag_name")
     ):
         raise UpdateError(
             "unexpected release payload: no tag_name -- the API answered something "
@@ -142,8 +145,10 @@ def parse_release(payload: bytes | str) -> ReleaseInfo:
         raise UpdateError("unexpected release payload: assets is not a list")
     assets: list[ReleaseAsset] = []
     for item in raw_assets:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(
-            item.get("browser_download_url"), str
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("browser_download_url"), str)
         ):
             raise UpdateError(
                 "unexpected release payload: an asset without a name or a download url"
@@ -355,9 +360,7 @@ def _wheel_origin_refusal(package_file: Path) -> str | None:
     )
 
 
-def select_production_wheels(
-    release: ReleaseInfo, version: str
-) -> tuple[ReleaseAsset, ...]:
+def select_production_wheels(release: ReleaseInfo, version: str) -> tuple[ReleaseAsset, ...]:
     """The FOUR production wheel assets for `version`, in `PRODUCTION_WHEEL_PREFIXES`
     order, matched by exact `<prefix>-<version>-` name -- never `*.whl`, so the
     fake/robinhood wheels can never ride along. PURE; raises `UpdateError` naming any
@@ -424,6 +427,12 @@ def plan_update(
     except UpdateError as exc:
         reasons.append(str(exc))
 
+    if is_packaged():
+        # First, and on its own terms: every other refusal below talks about `site-packages`
+        # layouts and tells the reader to put `uv` on PATH. A packaged user has no venv and no
+        # `uv`, and never will -- so the message that reaches them has to name the real update
+        # path rather than an impossible one (#439).
+        reasons.append(packaged_update_refusal())
     if info.source != "release":
         reasons.append(
             f"this is a [{info.source}] build, not a release install -- the updater "
@@ -776,7 +785,10 @@ def run_update(
             "not poison a later rollback"
         )
         return UpdateResult(
-            ok=False, steps=tuple(steps), error=str(exc), rolled_back=False,
+            ok=False,
+            steps=tuple(steps),
+            error=str(exc),
+            rolled_back=False,
             backups=tuple(backups),
         )
 
@@ -818,7 +830,10 @@ def run_update(
                 f"{_MANUAL_RECOVERY}"
             )
             return UpdateResult(
-                ok=False, steps=tuple(steps), error=error, rolled_back=False,
+                ok=False,
+                steps=tuple(steps),
+                error=error,
+                rolled_back=False,
                 backups=tuple(backups),
             )
         rolled_back = False
@@ -854,7 +869,10 @@ def run_update(
             f"{_MANUAL_RECOVERY}"
         )
         return UpdateResult(
-            ok=False, steps=tuple(steps), error=error, rolled_back=rolled_back,
+            ok=False,
+            steps=tuple(steps),
+            error=error,
+            rolled_back=rolled_back,
             backups=tuple(backups),
         )
 
@@ -923,8 +941,7 @@ def relaunch_tui(
                 f"start the console by hand: `{new_keel} tui`"
             ) from exc
         raise UpdateError(
-            f"relaunch failed: execv returned -- start the console by hand: "
-            f"`{new_keel} tui`"
+            f"relaunch failed: execv returned -- start the console by hand: `{new_keel} tui`"
         )
 
     return _relaunch
@@ -978,17 +995,14 @@ def render_plan_lines(plan: UpdatePlan) -> list[str]:
     The exact lines the CLI prints and the console's update view renders -- ONE
     renderer, so the two front-ends cannot drift. PURE."""
     lines = [
-        f"current: {plan.current_version}   latest: {plan.latest_version} "
-        f"(tag {plan.latest_tag})"
+        f"current: {plan.current_version}   latest: {plan.latest_version} (tag {plan.latest_tag})"
     ]
     if not plan.offered:
         if plan.refusal_reasons:
             lines.append("update NOT offered:")
             lines.extend(f"  - {reason}" for reason in plan.refusal_reasons)
         else:
-            lines.append(
-                f"already at the latest release ({plan.latest_version}) -- nothing to do."
-            )
+            lines.append(f"already at the latest release ({plan.latest_version}) -- nothing to do.")
         return lines
     lines.append(f"update available: {plan.current_version} -> {plan.latest_version}")
     lines.append(f"the plan (launch folder {plan.launch_dir}):")
