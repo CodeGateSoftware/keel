@@ -29,6 +29,7 @@ from dataclasses import replace
 from typing import Any
 
 import click
+from keel_core import paths as _paths
 from keel_core.telemetry import bind_venue
 
 from keel.config import Config, load_config
@@ -42,8 +43,27 @@ DISCLAIMER = (
     "You are solely responsible for your own trading decisions."
 )
 
+#: The bare filenames a deployment folder uses. Kept as the historical constants because the
+#: profile/console code compares against them by name, and because a deployment folder's layout is
+#: unchanged by #434 -- what changed is only WHICH folder a bare invocation resolves them against.
 DEFAULT_DB_PATH = "keel.db"
 DEFAULT_CONFIG_PATH = "config.yaml"
+
+
+def default_db_path() -> str:
+    """`--db`'s default, resolved when the command runs rather than when this module is imported.
+
+    A callable default matters here: Click evaluates a literal `default=` once, at decoration time,
+    so a literal would freeze whatever directory the process happened to start in -- including
+    under test, where `monkeypatch.chdir` moves cwd after import. Resolving per invocation is also
+    the only way `KEEL_HOME` and deployment detection can mean anything.
+    """
+    return str(_paths.default_db_path())
+
+
+def default_config_path() -> str:
+    """`--config`'s default. See `default_db_path` for why this is a callable."""
+    return str(_paths.default_config_path())
 
 
 # -- disclaimer -------------------------------------------------------------------------------

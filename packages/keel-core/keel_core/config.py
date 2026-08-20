@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from keel_core.paths import default_env_path
 from keel_core.products import is_spot_base_code
 from keel_core.types import Granularity
 
@@ -953,13 +954,16 @@ def load_config(path: str | Path) -> Config:
     )
 
 
-def load_secrets(env_path: str | Path = ".env") -> dict:
+def load_secrets(env_path: str | Path | None = None) -> dict:
     """Load CDP API credentials from a git-ignored `.env` file.
 
     Returns `{"api_key": ..., "api_secret": ...}` when both are present, `{}` when the file is
     absent or empty so offline commands keep working without secrets configured.
     """
-    env_path = Path(env_path)
+    # `None` resolves against the state root -- the deployment folder when there is one, the
+    # OS app-data directory otherwise (see `keel_core.paths`). An explicit path is honoured
+    # unchanged, which is what every caller passing one already relies on.
+    env_path = Path(env_path) if env_path is not None else default_env_path()
     if not env_path.exists():
         return {}
 
@@ -971,7 +975,7 @@ def load_secrets(env_path: str | Path = ".env") -> dict:
     return {"api_key": api_key, "api_secret": api_secret}
 
 
-def load_alpaca_secrets(env_path: str | Path = ".env") -> dict:
+def load_alpaca_secrets(env_path: str | Path | None = None) -> dict:
     """Load Alpaca API credentials from the environment or a git-ignored `.env` file.
 
     Follows `load_secrets`' shape contract exactly -- `{"key_id": ..., "secret_key": ...}`
@@ -987,7 +991,8 @@ def load_alpaca_secrets(env_path: str | Path = ".env") -> dict:
       headers Alpaca's API documents), namespaced by venue so one deployment's `.env` can
       hold credentials for several adapters without collisions.
     """
-    values = dotenv_values(Path(env_path)) if Path(env_path).exists() else {}
+    resolved = Path(env_path) if env_path is not None else default_env_path()
+    values = dotenv_values(resolved) if resolved.exists() else {}
 
     def _read(name: str) -> str | None:
         return os.environ.get(name) or values.get(name)

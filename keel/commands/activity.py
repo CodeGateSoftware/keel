@@ -99,6 +99,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from keel_core.paths import resolve_under_state_root
+
 # -- bounds (see the module docstring) -----------------------------------------------------------
 
 #: Bytes of the log's TAIL that are ever read in one build. The whole point of the tail read is
@@ -397,7 +399,11 @@ def resolve_log_path(config: Any) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raw = _DEFAULT_LOG_PATH
     try:
-        return Path(raw).expanduser().resolve()
+        # `resolve_under_state_root`, not a bare `Path`: `logging.file` defaults to the RELATIVE
+        # `logs/keel.log` precisely so a deployment's log lands beside its database, and a bare
+        # relative path means "relative to cwd" -- which resolves to `/logs/keel.log` under an
+        # app-bundle launch (#434). An absolute configured path is returned unchanged.
+        return resolve_under_state_root(raw).resolve()
     except OSError:
         # `resolve()` can raise on a path with a broken symlink component on some platforms.
         return Path(raw)

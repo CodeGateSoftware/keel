@@ -36,6 +36,7 @@ from typing import Any
 
 from dotenv import dotenv_values
 
+from keel_core.paths import default_env_path
 from keel_core.telemetry import JsonFormatter
 
 #: Environment (or `.env`) key holding the POST target. Unset disables alerting entirely.
@@ -71,7 +72,7 @@ class WebhookAlertHandler(logging.Handler):
             self.handleError(record)
 
 
-def resolve_webhook_url(env_path: str | Path = ".env") -> str | None:
+def resolve_webhook_url(env_path: str | Path | None = None) -> str | None:
     """The configured alert URL, or `None` when alerting is off.
 
     Process environment wins over `.env` so a one-off run can redirect alerts without editing a
@@ -81,7 +82,7 @@ def resolve_webhook_url(env_path: str | Path = ".env") -> str | None:
     if from_env:
         return from_env
 
-    path = Path(env_path)
+    path = Path(env_path) if env_path is not None else default_env_path()
     if not path.exists():
         return None
     value = dotenv_values(path).get(ALERT_WEBHOOK_ENV)
