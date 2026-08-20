@@ -89,6 +89,7 @@ dl.terms dd.src { color: var(--muted); font-size: 0.82rem; }
 footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 0.8rem;
   padding: 1rem 1.25rem; }
 pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 0.85rem; }
+.job pre { margin-top: 0.6rem; max-height: 22rem; overflow-y: auto; }
 form { margin: 0.5rem 0 0; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.6rem 0; max-width: 26rem; }
 .field span { font-size: 0.8rem; color: var(--muted); }
@@ -620,6 +621,33 @@ _STEP_KIND_NOTE: dict[str, str] = {
 }
 
 
+def _job_panel(job: Any) -> str:
+    """A running, finished or failed background job, as a panel.
+
+    The progress lines are shown NEWEST LAST, unscrolled, exactly as the CLI prints them -- an
+    operator who has run `keel fetch` in a terminal should recognise what they are looking at
+    rather than have to learn a second vocabulary for the same thing.
+
+    A failure stays on screen. The whole point of running something in the background is that
+    nobody was watching when it broke."""
+    tone = {"running": "warn", "done": "good", "failed": "bad"}.get(job.state, "muted")
+    elapsed = f"{int(job.elapsed_sec)}s"
+    parts = [
+        '<div class="card job">',
+        f'<div class="kv"><span class="k">{esc(job.key)}</span>'
+        f'<span class="v {tone}">{esc(job.state)}</span></div>',
+        f'<p class="note">{esc(elapsed)} elapsed</p>',
+    ]
+    if job.error:
+        parts.append(f'<p class="bad"><strong>{esc(job.error)}</strong></p>')
+    if job.lines:
+        parts.append("<pre>" + esc("\n".join(job.lines)) + "</pre>")
+    elif job.is_running:
+        parts.append('<p class="muted">starting…</p>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def render_setup(
     state: Any,
     *,
@@ -627,6 +655,7 @@ def render_setup(
     not_automated: dict[str, str] | None = None,
     csrf: str = "",
     ran: str = "",
+    job: Any = None,
 ) -> str:
     """The first-run checklist, with a button for each MECHANICAL step and a command for every
     other one.
@@ -658,6 +687,9 @@ def render_setup(
             "run looks like. Work down the list; the paper stage places no orders at all.</span>"
             "</div>"
         )
+    if job is not None:
+        parts.append(_job_panel(job))
+
     nxt = state.next_step
     if nxt is not None:
         parts.append(
@@ -693,7 +725,12 @@ def render_setup(
                 f'<div class="muted">{esc(item.detail)}</div>'
             )
             action = by_key.get(item.step.key)
-            if item.blocking and action is not None and csrf:
+            # A running job owns its step: offering the button again would invite a second start
+            # that the job slot refuses anyway, which reads as the page ignoring the click.
+            running_here = job is not None and job.is_running and job.key == item.step.key
+            if running_here:
+                body += '<div class="muted">running — see the panel above</div>'
+            elif item.blocking and action is not None and csrf:
                 body += _action_form(action, csrf)
             elif item.blocking:
                 body += f"<div><code>{esc(item.step.how)}</code></div>"

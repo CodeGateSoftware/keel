@@ -64,6 +64,11 @@ _REFRESH_SEC = 15
 #: an action key and a token.
 _MAX_FORM_BYTES = 8 * 1024
 
+#: How often the setup page reloads WHILE a background job runs. Shorter than the dashboards'
+#: 15s: someone watching a fetch wants to see it moving, and the page is a few kilobytes of local
+#: HTML.
+_JOB_REFRESH_SEC = 5
+
 #: Journal rows rendered on the insights page. A cap, not a paginator: the page answers "how has
 #: this been going", and the full history is what `keel insights journal` is for.
 _JOURNAL_LIMIT = 50
@@ -153,8 +158,10 @@ def _deployment_state(cfg: ServeConfig) -> Any:
 
 
 def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
+    from keel.commands import jobs
     from keel.commands.setup import ACTIONS, NOT_AUTOMATED_YET
 
+    job = jobs.status()
     return (
         "Setup",
         render.render_setup(
@@ -163,8 +170,12 @@ def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str,
             not_automated=NOT_AUTOMATED_YET,
             csrf=csrf_token(cfg.token),
             ran=(query.get("ran") or [""])[0],
+            job=job,
         ),
-        None,
+        # Auto-refresh ONLY while something is running. A finished page that kept reloading would
+        # fight a reader, and the zero-JS meta refresh is the only progress mechanism available
+        # to a page that ships no scripts.
+        _JOB_REFRESH_SEC if job is not None and job.is_running else None,
     )
 
 

@@ -831,6 +831,72 @@ def store_market_data_credential(
     return ActionResult("credentials", True, "saved to the OS keychain")
 
 
+#: Years of history the first fetch ensures. The CLI's own `--years` default: a first run should
+#: land in the same state a `keel fetch` would, not a thinner one that quietly changes what a
+#: backtest is measured over.
+FIRST_FETCH_YEARS = 5
+
+
+def fetch_market_data(config_path: Path, db_path: Path, _values: dict[str, str]) -> ActionResult:
+    """Start the first candle fetch IN THE BACKGROUND, and return immediately.
+
+    This is the one action that cannot be synchronous. A first fetch runs for minutes across the
+    allowlist; a request that blocks that long is not a button -- the browser gives up, the user
+    reloads, and a second fetch starts on top of the first. `keel.commands.jobs` owns the single
+    slot that makes the second one a refusal instead.
+
+    `run_fetch` needs no adapting: its `echo` parameter is documented as the progress stream and
+    emits the same lines the CLI prints, and its `build_client` is a lazy factory, so nothing
+    constructs a broker until the fetch actually needs one.
+    """
+    from keel.commands import jobs
+
+    if jobs.is_running():
+        return ActionResult("market_data", False, "a job is already running")
+
+    def _run(echo: Callable[[str], None]) -> None:
+        import time as _time
+
+        from keel.commands._common import _build_broker
+        from keel.commands._products import parse_products_option
+        from keel.commands.fetch import run_fetch
+        from keel.config import load_config
+        from keel.data.db import connect
+        from keel.data.repository import Repository
+        from keel.data import freshness as freshness_mod
+
+        config = load_config(str(config_path))
+        products, _warnings = parse_products_option(None, config)
+        # Its own connection: this runs on a background thread, and a sqlite3 connection belongs
+        # to the thread that made it.
+        conn = connect(str(db_path))
+        try:
+            result = run_fetch(
+                Repository(conn),
+                config,
+                lambda: _build_broker(config),
+                db_path=str(db_path),
+                products=products,
+                years=FIRST_FETCH_YEARS,
+                now_ts=int(_time.time()),
+                tolerance_bars=freshness_mod.DEFAULT_TOLERANCE_BARS,
+                echo=echo,
+                echo_err=echo,
+            )
+        finally:
+            conn.close()
+        if result.error is not None:
+            # RAISED, so the job records it as a failure. `run_fetch` returns the error rather
+            # than raising because how a front-end fails is its business -- and this front-end
+            # fails by showing a failed job, which is what the operator needs to see.
+            raise RuntimeError(result.error)
+
+    jobs.start("market_data", _run)
+    return ActionResult(
+        "market_data", True, "fetching in the background -- this page will show its progress"
+    )
+
+
 #: THE closed set of steps a machine may perform on the operator's behalf.
 ACTIONS: tuple[Action, ...] = (
     Action(
@@ -871,19 +937,22 @@ ACTIONS: tuple[Action, ...] = (
             ActionInput("CDP_API_SECRET", "CDP API secret", secret=True),
         ),
     ),
+    Action(
+        key="market_data",
+        title="Fetch market data",
+        detail=(
+            "Downloads candle history for every allowlisted product. This runs in the background "
+            "and takes minutes on a first run; the page shows its progress."
+        ),
+        run=fetch_market_data,
+    ),
 )
 
-#: Mechanical steps that are deliberately NOT offered as one-click actions, and why. Recorded as
-#: data rather than omitted silently, so the gap is visible to the next person rather than
-#: looking like an oversight.
-NOT_AUTOMATED_YET: dict[str, str] = {
-    "market_data": (
-        "The first fetch is a network call that can run for minutes across the allowlist. A "
-        "request that blocks that long is not a button, it is a background job with progress "
-        "and cancellation -- so it stays `keel fetch` until there is somewhere for such a job "
-        "to live."
-    ),
-}
+#: Mechanical steps deliberately NOT offered as one-click actions, and why. Recorded as data
+#: rather than omitted silently, so a gap is visible to the next person rather than looking like
+#: an oversight. Empty is a fine value: `market_data` lived here until `keel.commands.jobs` gave
+#: a long-running step somewhere to live.
+NOT_AUTOMATED_YET: dict[str, str] = {}
 
 
 def action_for(key: str) -> Action | None:
