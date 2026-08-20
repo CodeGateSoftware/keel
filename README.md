@@ -2,6 +2,8 @@
 
 **English** | [العربية](README.ar.md)
 
+**Website:** [keeltrading.com](https://keeltrading.com) — the plain-English (and العربية, Français) tour: what keel is, how to start on paper, and the honest results.
+
 **keel is an auditable Shariah-compliance engine for spot crypto trading** — deterministic
 safety rails, attested asset screening that fails closed, and §65.4 *qabd* (constructive
 possession) encoded as an executable check — with a reference auto-trading agent built on top
