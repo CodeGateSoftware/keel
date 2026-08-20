@@ -75,9 +75,21 @@ READ_TABLES: tuple[str, ...] = (
 
 
 class StepKind(str, Enum):
-    """Who can perform a step -- which is what decides whether a wizard may touch it."""
+    """Who can perform a step -- which is what decides whether a wizard may touch it.
+
+    `OPERATOR_INPUT` was split out of `JUDGEMENT` when the credential step arrived (#437), and the
+    distinction is worth the fourth member. A JUDGEMENT is a DECISION only a human may make -- a
+    Shariah classification, a promotion -- and a wizard that made one would be making a compliance
+    ruling on the operator's behalf. An OPERATOR_INPUT is a FACT only the operator possesses: an
+    API key. A wizard may record one and cannot possibly invent one, so it is safe to offer as a
+    form in a way a judgement is not.
+
+    Collapsing the two would have forced one of two bad outcomes: either the browser could record
+    an attestation (wrong), or it could never accept a credential (which leaves a desktop user
+    with no way to configure keel at all, since they have no terminal to type one in)."""
 
     MECHANICAL = "mechanical"
+    OPERATOR_INPUT = "operator_input"
     JUDGEMENT = "judgement"
     OFF_VENUE = "off_venue"
 
@@ -153,6 +165,21 @@ STEPS: tuple[Step, ...] = (
             "agent has no strategies to evaluate at all, however the config is set."
         ),
         how="keel rules seed  (seeds candidates only; promotion is a separate, deliberate step)",
+    ),
+    Step(
+        key="credentials",
+        title="A market-data credential",
+        kind=StepKind.OPERATOR_INPUT,
+        stage=Stage.PAPER,
+        why=(
+            "Candle history is fetched through an authenticated client, so `keel fetch` without a "
+            "key fails outright -- even in paper mode, where no order can be placed. Only you "
+            "have this key; keel can store it and cannot obtain or guess one."
+        ),
+        how=(
+            "keel credentials set CDP_API_KEY   (a free, read-only Coinbase Developer Platform "
+            "key is enough for market data)"
+        ),
     ),
     Step(
         key="market_data",
@@ -342,6 +369,8 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
             f"{config_file} -- mode {mode}, {len(allowlist)} allowlisted asset(s)",
         )
 
+    observations["credentials"] = _credential_observation(config_file)
+
     # -- everything that needs the database --
     conn: sqlite3.Connection | None = None
     if db_file.exists():
@@ -442,6 +471,34 @@ def _database_observations(
     # inferring it from a filled row would report a supervised cycle that nobody supervised.
     out["confirm_cycle"] = (False, "keel cannot observe this -- it is yours to do and to judge")
     return out
+
+
+#: The pair `keel fetch` needs. Both must be present: a key with no secret authenticates nothing.
+MARKET_DATA_SECRETS: tuple[str, ...] = ("CDP_API_KEY", "CDP_API_SECRET")
+
+
+def _credential_observation(config_file: Path) -> tuple[bool | None, str]:
+    """Whether keel can see a market-data credential, and WHERE it is coming from.
+
+    The source is reported because it is the difference between the two support questions this
+    can produce -- "keel cannot see my key" and "keel is using a different key than the one I just
+    typed". The VALUE is never read into the message, and `ResolvedSecret` will not print one even
+    if a future edit tries."""
+    from keel_core.secrets import SecretSource, read_secret
+
+    env_path = config_file.parent / ".env"
+    resolved = [read_secret(name, env_path=env_path) for name in MARKET_DATA_SECRETS]
+    missing = [item.name for item in resolved if not item.found]
+    if missing:
+        return (False, f"missing: {', '.join(missing)}")
+    sources = {item.source for item in resolved}
+    if sources == {SecretSource.ENV_FILE}:
+        return (True, "found in your .env file")
+    if sources == {SecretSource.KEYCHAIN}:
+        return (True, "stored in the OS keychain")
+    if sources == {SecretSource.ENVIRONMENT}:
+        return (True, "set in this process's environment")
+    return (True, "found (" + ", ".join(sorted(s.value for s in sources)) + ")")
 
 
 def _asset_observation(conn: sqlite3.Connection, config: Any) -> tuple[bool | None, str]:
@@ -566,17 +623,27 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #
 # Everything below WRITES. Read the rules before adding to it:
 #
-# 1. Only steps declared `MECHANICAL` may appear here. `JUDGEMENT` steps are the operator's --
-#    a wizard may collect and record them but must never decide them -- and `OFF_VENUE` steps
-#    happen somewhere keel cannot reach. `tests/commands/test_setup_actions.py` enforces this
-#    against `STEPS`, so a new action for a judgement step fails rather than shipping.
+# 1. Only `MECHANICAL` and `OPERATOR_INPUT` steps may appear here, and the line between them and
+#    the rest is the point. A MECHANICAL step has no input: the machine simply does it. An
+#    OPERATOR_INPUT step is a FACT only the operator has -- an API key -- which a wizard can
+#    record and could not possibly invent.
 #
-# 2. Every action is IDEMPOTENT and NEVER destructive. A setup flow is something a nervous user
+#    `JUDGEMENT` steps are DECISIONS: a Shariah classification, a promotion. A form that recorded
+#    one would be making a compliance ruling on the operator's behalf, and no amount of "but they
+#    clicked it" makes that the same thing as their having decided it. `OFF_VENUE` steps happen
+#    somewhere keel cannot reach at all. Neither may ever be an action here, and the tests
+#    enforce it against `STEPS` rather than against a list kept in this file.
+#
+# 2. An action with `inputs` records ONLY what was submitted. It has no defaults, no fallbacks and
+#    no "sensible guess" -- an action that could fill in a field the operator left blank is one
+#    that could record something they never supplied.
+#
+# 3. Every action is IDEMPOTENT and NEVER destructive. A setup flow is something a nervous user
 #    clicks twice, and a browser reload re-submits. "The config already exists" is a successful
 #    outcome that changed nothing -- never an overwrite, and there is deliberately no `force`
 #    parameter for any web caller to pass.
 #
-# 3. Nothing here increases what keel can DO. Not one of the eleven capability-increasing actions
+# 4. Nothing here increases what keel can DO. Not one of the eleven capability-increasing actions
 #    in `keel/capabilities.py` is reachable from this module, and a test asserts the two sets are
 #    disjoint. Creating a config, a schema and a library of CANDIDATE rules leaves an engine that
 #    still places nothing: candidates trade nothing until a human promotes them, and promotion is
@@ -610,15 +677,35 @@ class ActionResult:
 
 
 @dataclass(frozen=True)
+class ActionInput:
+    """One field an action needs from the operator.
+
+    `secret=True` means the value must never be rendered back into a page, echoed into a log, or
+    put in a URL. It is the difference between a `password` field and a `text` one, and between a
+    form that can be submitted safely and one that leaks its own contents into browser history."""
+
+    name: str
+    label: str
+    secret: bool = False
+
+
+@dataclass(frozen=True)
 class Action:
     key: str
     title: str
     #: What it will do, in the operator's words, shown before they choose it.
     detail: str
-    run: Callable[[Path, Path], ActionResult]
+    run: Callable[[Path, Path, dict[str, str]], ActionResult]
+    #: Empty for an action the machine performs unaided. Non-empty means it records what the
+    #: operator supplied and nothing else -- see rule 2 above.
+    inputs: tuple[ActionInput, ...] = ()
+
+    @property
+    def needs_input(self) -> bool:
+        return bool(self.inputs)
 
 
-def create_config(config_path: Path, db_path: Path) -> ActionResult:
+def create_config(config_path: Path, _db_path: Path, _values: dict[str, str]) -> ActionResult:
     """Write the PAPER template if there is no config. Never overwrites.
 
     Paper deliberately, and never the live template from here: paper places nothing at all, which
@@ -632,7 +719,7 @@ def create_config(config_path: Path, db_path: Path) -> ActionResult:
     return ActionResult("config", True, f"wrote {config_path} (paper -- places no orders)")
 
 
-def create_database(config_path: Path, db_path: Path) -> ActionResult:
+def create_database(_config_path: Path, db_path: Path, _values: dict[str, str]) -> ActionResult:
     """Create the database if absent and apply outstanding migrations.
 
     Migrations run every time, not only on first run, because that is what makes an upgrade
@@ -653,7 +740,7 @@ def create_database(config_path: Path, db_path: Path) -> ActionResult:
     return ActionResult("database", True, f"created {db_path} at the current schema")
 
 
-def seed_rule_library(config_path: Path, db_path: Path) -> ActionResult:
+def seed_rule_library(config_path: Path, db_path: Path, _values: dict[str, str]) -> ActionResult:
     """Seed one CANDIDATE rule per (kind, allowlisted product).
 
     Candidates trade nothing. Promoting one is a separate, deliberate, human step -- which is why
@@ -699,6 +786,51 @@ def seed_rule_library(config_path: Path, db_path: Path) -> ActionResult:
     )
 
 
+def store_market_data_credential(
+    config_path: Path, _db_path: Path, values: dict[str, str]
+) -> ActionResult:
+    """Record the CDP key and secret in the OS keychain.
+
+    Records EXACTLY what was submitted. Both fields are required and neither has a default: an
+    action that could fill in a field the operator left blank is one that could record something
+    they never supplied.
+
+    Nothing about the value reaches the result message, and `ResolvedSecret` refuses to print one
+    even if a future edit tries. The confirmation is read back through the same resolver a real
+    caller uses, so if a `.env` shadows what was just stored, the operator hears it now rather
+    than at the first fetch that used the other key.
+    """
+    from keel_core.secrets import SecretSource, read_secret, store_secret
+
+    missing = [name for name in MARKET_DATA_SECRETS if not values.get(name, "").strip()]
+    if missing:
+        return ActionResult(
+            "credentials", False, f"nothing saved -- {', '.join(missing)} was blank"
+        )
+
+    try:
+        for name in MARKET_DATA_SECRETS:
+            store_secret(name, values[name].strip())
+    except Exception as exc:
+        # The message names the `.env` alternative; see `keel_core.secrets.store_secret`.
+        return ActionResult("credentials", False, str(exc))
+
+    env_path = config_path.parent / ".env"
+    shadowed = [
+        name
+        for name in MARKET_DATA_SECRETS
+        if read_secret(name, env_path=env_path).source is not SecretSource.KEYCHAIN
+    ]
+    if shadowed:
+        return ActionResult(
+            "credentials",
+            True,
+            "saved to the OS keychain, but keel will still read "
+            f"{', '.join(shadowed)} from your .env or environment, which takes precedence",
+        )
+    return ActionResult("credentials", True, "saved to the OS keychain")
+
+
 #: THE closed set of steps a machine may perform on the operator's behalf.
 ACTIONS: tuple[Action, ...] = (
     Action(
@@ -724,6 +856,20 @@ ACTIONS: tuple[Action, ...] = (
             "-- promoting one is your decision, and a separate step."
         ),
         run=seed_rule_library,
+    ),
+    Action(
+        key="credentials",
+        title="Save a market-data credential",
+        detail=(
+            "A free, read-only Coinbase Developer Platform key is enough for candle history. It "
+            "is stored in your operating system's keychain, not in a file, and keel never "
+            "displays it again."
+        ),
+        run=store_market_data_credential,
+        inputs=(
+            ActionInput("CDP_API_KEY", "CDP API key"),
+            ActionInput("CDP_API_SECRET", "CDP API secret", secret=True),
+        ),
     ),
 )
 

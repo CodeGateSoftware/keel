@@ -303,15 +303,20 @@ ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, 
 SETUP_ACTION_PREFIX = "/setup/"
 
 
-def run_setup_action(cfg: ServeConfig, key: str) -> Any:
-    """Perform one declared mechanical action. Returns its `ActionResult`, or `None` for a key
-    that is not in the closed set -- never a lookup that falls through to something else."""
+def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
+    """Perform one declared setup action. Returns its `ActionResult`, or `None` for a key that is
+    not in the closed set -- never a lookup that falls through to something else.
+
+    Only the fields the action DECLARES are passed through. A submitted field the action did not
+    ask for is dropped rather than forwarded: the form is attacker-shaped input the moment anyone
+    can craft a POST, and an action should never receive a key it has no name for."""
     from keel.commands.setup import action_for
 
     action = action_for(key)
     if action is None:
         return None
-    return action.run(Path(cfg.config_path), Path(cfg.db_path))
+    values = {field.name: form.get(field.name, "") for field in action.inputs}
+    return action.run(Path(cfg.config_path), Path(cfg.db_path), values)
 
 
 def _close(repo: Any) -> None:
@@ -463,7 +468,7 @@ class KeelHandler(BaseHTTPRequestHandler):
 
         key = parsed.path[len(SETUP_ACTION_PREFIX) :]
         try:
-            result = run_setup_action(self.cfg, key)
+            result = run_setup_action(self.cfg, key, body)
         except Exception as exc:
             self._refuse(500, "That step could not be completed", f"{type(exc).__name__}: {exc}")
             return
@@ -474,6 +479,11 @@ class KeelHandler(BaseHTTPRequestHandler):
         # POST/redirect/GET: a browser reload must not re-submit. The actions are idempotent, so
         # a re-submission would be harmless -- but "harmless" is not a reason to leave a
         # re-submitting page in a setup flow someone is clicking nervously.
+        #
+        # The Location carries the step KEY and nothing else. A submitted value in a redirect URL
+        # is a secret in browser history, in the Referer header of anything the page later loads,
+        # and in any proxy log between here and nowhere -- which is the whole reason the form is a
+        # POST in the first place.
         self._send(303, "", extra=(("Location", f"/setup?ran={quote(result.step_key)}"),))
 
     def _read_form(self) -> dict[str, str]:
