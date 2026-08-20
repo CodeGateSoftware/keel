@@ -1,10 +1,11 @@
 """The architectural thinness pin (issue #392 C6; PRD §6.2 -- "grep-able proof of no
 duplicated logic ... pinned by an architectural test").
 
-WHAT IT FORBIDS, precisely. The TUI layer is the console shell (`keel/commands/console.py`),
-the live loop (`keel/commands/tui.py`), and every console sub-menu module
-(`keel/commands/*console*.py`). Those files render and dispatch; all behavior must come
-from the services the CLI calls. The pin is an AST scan enforcing four rules:
+WHAT IT FORBIDS, precisely. The presentation layer is the console shell
+(`keel/commands/console.py`), the live loop (`keel/commands/tui.py`), every console sub-menu
+module (`keel/commands/*console*.py`), and -- since #435 -- every module of the local web UI
+(`keel/web/*.py`). Those files render and dispatch; all behavior must come from the services
+the CLI calls. The pin is an AST scan enforcing five rules:
 
 * **Rule 1 -- no compute-module imports.** Nothing may be imported from the compute
   trees -- `keel.strategy.*` (sizing/backtest/promotion math), `keel.execution.guards` /
@@ -59,11 +60,34 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: The console layer: the shell, the live loop, and every sub-menu module.
+#: The PRESENTATION layer: the console shell, the live loop, every sub-menu module -- and, since
+#: #435, every module of the local web UI (`keel/web/`).
+#:
+#: The web UI is scanned by the same five rules rather than a parallel pin of its own, because it
+#: is the same kind of thing: a second front-end over `keel/commands/*`. A separate pin would have
+#: drifted -- two files stating the same architecture, diverging one allowance at a time -- and
+#: the failure it is guarding against is identical in both. `keel/commands/serve.py` is NOT
+#: scanned: it is the command that binds the socket and launches a browser, which is service work
+#: and is exactly what Rule 5 says belongs outside this layer.
 def _console_module_paths() -> list[str]:
     paths = [os.path.join(REPO_ROOT, "keel", "commands", name) for name in ("console.py", "tui.py")]
     paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "commands", "*console*.py"))))
+    paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py"))))
     return sorted(set(paths))
+
+
+#: Rule 5's one entry-scoped exception, in the same shape as every other allowance here:
+#: (module stem, imported module).
+#:
+#: Rule 5 bans `urllib` by ROOT, which is the right coarseness for a rule about network egress --
+#: `urllib.request.urlopen` is the thing it exists to stop. But `urllib.parse` performs no I/O at
+#: all: it is string manipulation, and it is how `keel/web/server.py` splits a request path from
+#: its query string. The alternative was hand-rolling percent-decoding on attacker-influenced
+#: input, which is a strictly worse trade than one named, scoped allowance.
+#:
+#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in the same
+#: file still fails, and `urllib.parse` anywhere else still fails.
+RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({("server", "urllib.parse")})
 
 
 #: The compute trees -- where sizing/backtest/gate/screening/reporting math lives. The
@@ -372,7 +396,9 @@ def findings() -> dict[str, list[str]]:
             banned_imports = ("subprocess", "urllib.request", "urllib")
             if isinstance(node, ast.ImportFrom) and isinstance(node.module, str):
                 root = node.module.split(".")[0]
-                if node.module in banned_imports or root in banned_imports:
+                if (stem, node.module) in RULE5_IMPORT_ALLOWLIST:
+                    pass
+                elif node.module in banned_imports or root in banned_imports:
                     found.add(
                         "rule5_orchestration",
                         f"{stem}: imports {node.module} -- process/network orchestration "
@@ -381,6 +407,8 @@ def findings() -> dict[str, list[str]]:
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     root = alias.name.split(".")[0]
+                    if (stem, alias.name) in RULE5_IMPORT_ALLOWLIST:
+                        continue
                     if alias.name in banned_imports or root in banned_imports:
                         found.add(
                             "rule5_orchestration",
@@ -473,6 +501,11 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     paths = _console_module_paths()
     stems = {os.path.splitext(os.path.basename(p))[0] for p in paths}
     assert {"console", "tui"} <= stems
+    # #435: the web UI is a front-end over the same services and is pinned by the same rules.
+    # Named explicitly so that deleting or renaming a web module fails HERE, loudly, rather than
+    # quietly shrinking the scanned set and leaving the rules green over less code.
+    assert {"render", "security", "server"} <= stems
+    assert any(os.path.join("keel", "web") in path for path in paths)
     assert {
         "compliance_console",
         "strategy_console",

@@ -153,6 +153,7 @@ from keel.commands.monitor import run_monitor
 from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
 from keel.commands.rules import rules_group, rules_seed
+from keel.commands.serve import serve_cmd
 from keel.commands.simulate import (
     SIM_SLIPPAGE_PCT as _SIM_SLIPPAGE_PCT,  # noqa: F401 -- pinned by tests
 )
@@ -1311,6 +1312,16 @@ cli.add_command(status_cmd)
 # `keel status` was built as the substrate for this: `tui_cmd` is a curses view over the same
 # `gather_status` report, defined in `keel.commands.tui` and registered here.
 cli.add_command(tui_cmd)
+
+
+# -- serve (the same read surface in a browser, for machines and users a TUI cannot reach) -------
+
+# `curses` does not exist in CPython on Windows and a macOS app launched from Finder has no
+# controlling terminal at all, so the TUI is unreachable on both of the platforms a desktop
+# release targets. `keel serve` renders the same reports over loopback HTTP instead: read-only by
+# construction (GET and HEAD are the only verbs it implements), and pinned by the same thinness
+# test as the console layer. Defined in `keel.commands.serve` over `keel.web`.
+cli.add_command(serve_cmd)
 
 
 # -- insights (read-only promotion-gate + journal reporting, no broker call) --------------------

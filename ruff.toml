@@ -1,5 +1,11 @@
 line-length = 100
-target-version = "py314"
+# Must not exceed the `requires-python` floor every pyproject in this workspace declares
+# (`>=3.11`). It said `py314`, and that is not cosmetic: `ruff format` rewrote a
+# `except (OverflowError, OSError, ValueError):` into PEP 758's unparenthesised form, which is a
+# SyntaxError on every interpreter this project claims to support. A formatter that can silently
+# emit syntax the package cannot run is worse than no formatter. Pinned by
+# `tests/test_packaging.py`.
+target-version = "py311"
 
 [lint]
 select = ["E", "F", "I", "UP"]
