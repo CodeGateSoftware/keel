@@ -282,6 +282,17 @@ and has already produced one. Establish which account a number came from before 
 | cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) | daily, in the US session (UTC day-stamp) |
 | rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
 
+**Why there are three files per database.** Since keel serves a web UI, one process reads the
+database while another writes it — a page refreshing while a fetch or an agent cycle runs. SQLite's
+default journal cannot do that (a writer takes an exclusive lock), and it did not: a first fetch
+watched from the setup page died at 45 seconds with `disk I/O error`. The databases are now in
+**WAL** mode, so readers never block the writer and the writer never blocks readers.
+
+That means `keel.db-wal` and `keel.db-shm` sit beside each `keel*.db`. They are part of the
+database — do not delete them while keel is running, and prefer `keel update`'s backups (which use
+SQLite's own online-backup API) over copying the `.db` file by hand. Conversion happens on the
+next connection and needs nothing from you.
+
 **Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`,
 `keel serve`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures
