@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from importlib import metadata
 
@@ -88,6 +89,20 @@ def _package_version() -> str:
     return "unknown"
 
 
+def is_packaged() -> bool:
+    """True when running inside a frozen bundle rather than from a venv or a checkout.
+
+    Lives here rather than in `keel/install.py` (its first home) because `keel.version` is a leaf
+    -- it imports nothing from keel -- and "how was this built, and how is it running" is exactly
+    this module's subject. `keel.install` re-exports it so there is one detector, not two that
+    can disagree about the same process.
+
+    Both markers are checked: PyInstaller sets `sys.frozen` for every build mode but `sys._MEIPASS`
+    only for `--onefile`, and other freezers set one or the other.
+    """
+    return bool(getattr(sys, "frozen", False)) or hasattr(sys, "_MEIPASS")
+
+
 def _git(*args: str) -> str | None:
     try:
         result = subprocess.run(
@@ -117,6 +132,29 @@ def _embedded():
 def build_info() -> BuildInfo:
     """Resolve the running build. Never raises."""
     embedded = _embedded()
+
+    if is_packaged():
+        # A frozen bundle has no checkout, so there is nothing for git to tell us about it -- and
+        # asking is actively harmful. `_git` inherits the process CWD, so a packaged app launched
+        # from inside ANY git repository reads that repository's HEAD, finds it disagrees with the
+        # stamp, and marks a legitimate signed release DIRTY. The user then reads "this build is
+        # NOT reproducible -- do not run it against live funds" about a build that is both. A
+        # warning that fires on correct builds is a warning people learn to ignore, and this is
+        # the one that must never be ignored.
+        #
+        # The stale-stamp hazard the git cross-check below exists for cannot arise here: there is
+        # no working tree to have edited. An UNSTAMPED bundle is `unknown`, never `checkout` --
+        # it is not one -- which also keeps `plan_update`'s `source != "release"` refusal correct.
+        if embedded is None:
+            return BuildInfo(
+                version=_package_version(), commit="unknown", dirty=False, source="unknown"
+            )
+        return BuildInfo(
+            version=getattr(embedded, "VERSION", _package_version()),
+            commit=getattr(embedded, "COMMIT", "unknown"),
+            dirty=bool(getattr(embedded, "DIRTY", False)),
+            source="release",
+        )
 
     if embedded is not None:
         stamped_commit = getattr(embedded, "COMMIT", "unknown")
