@@ -112,9 +112,23 @@ def _open_repo(db_path: str) -> Any:
 
 
 def ensure_schema(db_path: str) -> None:
-    """Bring the database up to date once, at startup. Called by `serve`, not by any page."""
+    """Bring an EXISTING database up to date once, at startup. Called by `serve`, not by a page.
+
+    A missing database is a first run, not an error, and this used to treat it as one. On a
+    machine with no deployment the app-data directory does not exist either, so `sqlite3.connect`
+    raised `unable to open database file` and `keel serve` refused to start -- before serving the
+    setup page that exists to fix exactly that. Found by running a frozen bundle on a clean
+    machine; it reproduces unfrozen too, with `KEEL_HOME` pointed anywhere that does not exist.
+
+    So: migrate what is there, and leave what is not to the setup action, which creates the
+    parent directory and the schema together. Creating the database HERE would be worse -- a
+    read-only view would bring a deployment into existence merely by being started, and every
+    page would then report a healthy empty install rather than offering to set one up.
+    """
     from keel.data.db import connect, migrate
 
+    if not Path(db_path).exists():
+        return
     conn = connect(db_path)
     try:
         migrate(conn)
