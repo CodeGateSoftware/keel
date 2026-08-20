@@ -282,7 +282,8 @@ and has already produced one. Establish which account a number came from before 
 | cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) | daily, in the US session (UTC day-stamp) |
 | rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
 
-**Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`) the
+**Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`,
+`keel serve`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures
 describe, and `paper_cash_usdc` is printed in paper mode only. On the command line it is the
 `--config`/`--db` pair — and `--db` is the one that bites, because `keel.db` is its default, so a
@@ -292,6 +293,30 @@ account. Live commands always carry both:
 ```bash
 keel --config config.live-sandbox.yaml --db keel-live.db status
 ```
+
+**The same view in a browser: `keel serve`.** `keel tui` needs a terminal, and there are two
+places it cannot go — Windows, where CPython ships no `curses`, and a macOS app launched from
+Finder, which has no controlling terminal at all. `keel serve` renders the same reports over
+loopback HTTP instead:
+
+```bash
+keel --config config.live-sandbox.yaml --db keel-live.db serve
+```
+
+It prints a URL carrying a one-time token for that run and opens your browser (`--no-open` to
+skip). The `--config`/`--db` pair still decides which account you are looking at, and still bites
+the same way.
+
+It is **read-only**, and structurally so: the server answers `GET` and `HEAD` and implements no
+other verb, so there is no request it can answer that changes anything. Attesting, promoting a
+rule, recording a flow and arming autonomy stay CLI commands behind the interactive-terminal gate.
+
+Four things stand between that page and the rest of the machine: it binds `127.0.0.1`; it checks
+the `Host:` header, so a hostname rebound to loopback is refused even though its packets arrive
+on loopback; it requires the session token, which is minted per run and never written to disk; and
+it serves no write verb. `--host` will bind anywhere you ask, and says plainly what that costs —
+on a non-loopback address your positions, equity and full trade history are readable by anyone who
+can reach the port, with a cleartext token as the only obstacle.
 
 **Placing an order is gated differently.** Paper places freely against synthetic cash — nothing is
 asked and nothing real moves, which is the point. Live runs `mode: confirm`: each order is

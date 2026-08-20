@@ -235,3 +235,35 @@ def test_broker_strict_flags_match_mypy_strict():
         f"  no longer implied by --strict: {sorted(configured - expected)}\n"
         "Update the [[tool.mypy.overrides]] block for the broker packages to match."
     )
+
+
+# -- the formatter must not be able to emit syntax the package cannot run ------------------------
+
+
+def test_ruffs_target_version_does_not_exceed_the_python_floor():
+    """`ruff.toml`'s `target-version` must not be newer than the `requires-python` every
+    pyproject in this workspace declares.
+
+    This is not a style preference. With `target-version = "py314"`, `ruff format` rewrote
+
+        except (OverflowError, OSError, ValueError):
+
+    into PEP 758's unparenthesised form -- which is a SyntaxError on 3.11, 3.12 and 3.13, all of
+    which `requires-python = ">=3.11"` promises to support. The wheel still builds and still
+    installs; it fails at import, on the interpreters the metadata invited. A formatter that can
+    silently emit syntax the package cannot run is worse than no formatter, and the mismatch is
+    invisible unless something pins it.
+    """
+    ruff = tomllib.loads((_ROOT / "ruff.toml").read_text())
+    target = ruff["target-version"]
+    assert target.startswith("py")
+    target_pair = (int(target[2:3]), int(target[3:]))
+
+    for name, data in _pyprojects().items():
+        requires = data["project"]["requires-python"]
+        assert requires.startswith(">="), (name, requires)
+        floor = tuple(int(part) for part in requires[2:].strip().split("."))
+        assert target_pair <= floor, (
+            f"{name} supports Python {requires} but ruff formats for {target}: "
+            "the formatter can emit syntax this package cannot run"
+        )
