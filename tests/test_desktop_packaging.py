@@ -72,8 +72,20 @@ def test_every_artifact_carries_provenance_and_checksums(desktop_job: dict) -> N
     steps = desktop_job["steps"]
     attest = [s for s in steps if "attest-build-provenance" in str(s.get("uses", ""))]
     assert attest, "no build provenance attestation"
-    assert attest[0]["with"]["subject-path"] == "out/*"
-    assert "SHA256SUMS" in _steps_text(desktop_job)
+    # Subjects are per-OS FILES-ONLY globs: `out/*` would hand the action the unzipped
+    # keel.app/ and dmg-stage/ directories macOS packaging leaves beside the .dmg, and a
+    # shared `*.dmg *.zip` pattern would hand each leg one glob matching nothing.
+    subjects = {s["with"]["subject-path"] for s in attest}
+    assert subjects == {"out/*.dmg", "out/*.zip"}
+    macos = next(s for s in attest if s["with"]["subject-path"] == "out/*.dmg")
+    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip")
+    assert str(macos.get("if", "")).strip() == "runner.os == 'macOS'"
+    assert str(windows.get("if", "")).strip() == "runner.os == 'Windows'"
+    assert "SHA256SUMS-" in _steps_text(desktop_job)
+    # The checksums and the upload are files-only for the same reason as the subjects:
+    # a directory has no checksum and `gh release upload` cannot attach one.
+    assert "find . -maxdepth 1 -type f" in _steps_text(desktop_job)
+    assert "find out -maxdepth 1 -type f" in _steps_text(desktop_job)
 
     # The attestation needs OIDC, and the job must ask for it explicitly rather than relying on
     # a workflow-wide grant that would also widen the release job.
