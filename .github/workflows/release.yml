@@ -413,23 +413,41 @@ jobs:
           ls -l out
 
       # Checksums travel WITH the artifacts, in the same release, so a user who was handed a
-      # download link somewhere else has something local to compare against.
-      - name: Checksums
+      # download link somewhere else has something local to compare against. FILES ONLY:
+      # macOS packaging leaves the unzipped `keel.app/` and the `dmg-stage/` build directory
+      # beside the .dmg in out/ -- checksumming those (`shasum ./*`) is what failed the first
+      # publish-unsigned run, and a directory has no meaningful checksum anyway.      - name: Checksums
         shell: bash
         run: |
           set -euo pipefail
           cd out
-          if command -v sha256sum >/dev/null; then sha256sum ./* > SHA256SUMS.txt
-          else shasum -a 256 ./* > SHA256SUMS.txt; fi
-          cat SHA256SUMS.txt
+          # Per-leg name, not SHA256SUMS.txt: three matrix legs uploading one shared name
+          # under --clobber would leave only the LAST leg's sums on the release, and a macOS
+          # user could never verify their .dmg against Windows sums.
+          CKSUM_FILE="SHA256SUMS-${{ runner.os }}-${{ matrix.arch }}.txt"
+          if command -v sha256sum >/dev/null; then
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS-*' -print0 | sort -z | xargs -0 sha256sum > "$CKSUM_FILE"
+          else
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS-*' -print0 | sort -z | xargs -0 shasum -a 256 > "$CKSUM_FILE"
+          fi
+          cat "$CKSUM_FILE"
 
       # The substitute for a code-signing certificate, and free. Ties each artifact to this
       # workflow, this repository and this commit; a user verifies with
       #   gh attestation verify <file> --repo ${{ github.repository }}
-      - name: Attest build provenance
+      # Subjects are named per OS because the attest action has no files-only filter: an
+      # `out/*` glob would hand it the `keel.app/` directory, and a shared `*.dmg *.zip`
+      # pattern would hand one of the two legs a glob that matches nothing.
+      - name: Attest build provenance (macOS)
+        if: runner.os == 'macOS'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: out/*
+          subject-path: out/*.dmg
+      - name: Attest build provenance (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*.zip
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v4
@@ -446,6 +464,8 @@ jobs:
         run: |
           set -euo pipefail
           # `--clobber` so a re-run of one matrix leg replaces its own asset rather than failing
-          # the whole publish on a name collision.
-          gh release upload "v${{ inputs.version }}" out/* --clobber
-          echo "attached $(ls out | wc -l) file(s) to v${{ inputs.version }}"
+          # the whole publish on a name collision. FILES ONLY, same reason as Checksums:
+          # `gh release upload out/*` cannot attach a directory, and the .dmg (not the
+          # keel.app/ it was cut from) is the release artifact.
+          gh release upload "v${{ inputs.version }}" $(find out -maxdepth 1 -type f | sort) --clobber
+          echo "attached $(find out -maxdepth 1 -type f | wc -l | tr -d ' ') file(s) to v${{ inputs.version }}"
