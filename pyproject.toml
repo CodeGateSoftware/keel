@@ -23,11 +23,11 @@ dependencies = [
     # in one build, so `==` states a fact rather than guessing at compatibility. The cost is that
     # a version bump must move these numbers too -- the bump already edits every package's
     # `version`, and `tests/test_packaging.py` fails the build if a pin is left behind.
-    "keel-core==0.10.0",
-    "keel-broker-api==0.10.0",
+    "keel-core==0.11.0",
+    "keel-broker-api==0.11.0",
     # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
     # on the adapter keeps it available transitively. Phase B deletes those imports and this.
-    "keel-broker-coinbase==0.10.0",
+    "keel-broker-coinbase==0.11.0",
 ]
 
 [project.scripts]

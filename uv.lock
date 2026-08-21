@@ -546,7 +546,7 @@ wheels = [
 
 [[package]]
 name = "keel-broker-alpaca"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-broker-alpaca" }
 dependencies = [
     { name = "keel-broker-api" },
@@ -563,7 +563,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-broker-api"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-broker-api" }
 dependencies = [
     { name = "keel-core" },
@@ -583,7 +583,7 @@ provides-extras = ["conformance"]
 
 [[package]]
 name = "keel-broker-coinbase"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-broker-coinbase" }
 dependencies = [
     { name = "coinbase-advanced-py" },
@@ -600,7 +600,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-broker-fake"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-broker-fake" }
 dependencies = [
     { name = "keel-broker-api" },
@@ -615,7 +615,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-broker-robinhood"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-broker-robinhood" }
 dependencies = [
     { name = "keel-broker-api" },
@@ -634,7 +634,7 @@ requires-dist = [
 
 [[package]]
 name = "keel-core"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "packages/keel-core" }
 dependencies = [
     { name = "keyring" },

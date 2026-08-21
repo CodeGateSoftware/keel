@@ -1,6 +1,6 @@
 [project]
 name = "keel-broker-alpaca"
-version = "0.10.0"
+version = "0.11.0"
 description = "Alpaca Trading API adapter for keel (US equities, cash account)"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 # deliberately NO `alpaca-py` SDK: Alpaca's Trading + Market Data APIs are plain
 # JSON-over-HTTPS with two header credentials, so the SDK would add a version-churning
 # dependency for nothing the port needs.
-dependencies = ["keel-core==0.10.0", "keel-broker-api==0.10.0", "requests>=2.32.0"]
+dependencies = ["keel-core==0.11.0", "keel-broker-api==0.11.0", "requests>=2.32.0"]
 
 [project.entry-points."keel.brokers"]
 alpaca = "keel_broker_alpaca:AlpacaAdapter"

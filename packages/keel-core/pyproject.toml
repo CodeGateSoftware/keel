@@ -1,6 +1,6 @@
 [project]
 name = "keel-core"
-version = "0.10.0"
+version = "0.11.0"
 description = "Shared domain types, configuration, and logging for keel"
 license = "Apache-2.0"
 requires-python = ">=3.11"
