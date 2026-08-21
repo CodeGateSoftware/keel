@@ -416,7 +416,8 @@ jobs:
       # download link somewhere else has something local to compare against. FILES ONLY:
       # macOS packaging leaves the unzipped `keel.app/` and the `dmg-stage/` build directory
       # beside the .dmg in out/ -- checksumming those (`shasum ./*`) is what failed the first
-      # publish-unsigned run, and a directory has no meaningful checksum anyway.      - name: Checksums
+      # publish-unsigned run, and a directory has no meaningful checksum anyway.
+      - name: Checksums
         shell: bash
         run: |
           set -euo pipefail
