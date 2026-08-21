@@ -1,6 +1,6 @@
 [project]
 name = "keel-trader"
-version = "0.10.0"
+version = "0.11.0"
 description = "Offline-first, broker-agnostic, rule-based spot-trading agent (halal policy by default)"
 license = "Apache-2.0"
 readme = "README.md"
