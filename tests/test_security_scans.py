@@ -314,6 +314,49 @@ def test_preflight_readiness_includes_the_org_level_config_not_just_the_tokens()
     )
 
 
+def test_preflights_sonar_readiness_requires_a_value_not_just_an_uncommented_line() -> None:
+    """A blank `sonar.organization=` is not readiness -- it is #402 one edit later.
+
+    The readiness grep once accepted any uncommented `sonar.organization=` line, value or
+    none. But SonarCloud's "You must define the following mandatory properties ...:
+    sonar.organization" refusal fires for an EMPTY value exactly as for a missing one, so
+    that grep would flip `sonar_ready` to true the moment someone uncommented the line
+    without filling the key in -- and every push to `main` would go red again, the exact
+    permanently-red outcome the preflight exists to prevent. The pattern is extracted from
+    the workflow itself and pinned twice: as text (the non-blank tail must be there) and
+    as behaviour (translated to Python's re, on the exact lines SonarCloud does not
+    distinguish between).
+    """
+    workflow = _load_workflow(_OPTIONAL_TIER)
+    script = "\n".join(str(step.get("run", "")) for step in workflow["jobs"]["preflight"]["steps"])
+    grep_line = next(
+        (line for line in script.splitlines() if "grep -Eq" in line and "sonar" in line),
+        None,
+    )
+    assert grep_line is not None, (
+        "preflight must keep grep-ing sonar-project.properties for `sonar.organization` -- "
+        "an org-level check no repository secret can carry (#402)"
+    )
+    match = re.search(r"grep -Eq '([^']+)'", grep_line)
+    assert match is not None, "the readiness check's pattern must stay a quoted `grep -Eq` argument"
+    posix_ere = match.group(1)
+    # The non-blank requirement itself: something other than whitespace must follow the `=`.
+    assert "=[[:space:]]*[^[:space:]]" in posix_ere, (
+        f"the readiness pattern {posix_ere!r} must require a non-whitespace VALUE after "
+        "`sonar.organization=` -- an uncommented-but-empty key still trips SonarCloud's "
+        "mandatory-property refusal, so accepting it as ready reddens main again (#402)"
+    )
+    # Behaviour, on the lines the refusal does not distinguish between.
+    python_pattern = posix_ere.replace("[^[:space:]]", "[^ \\t]").replace("[[:space:]]", "[ \\t]")
+    ready = re.compile(python_pattern).search
+    assert ready("sonar.organization=x"), "a set key is ready"
+    assert ready("sonar.organization = codegate"), "whitespace around the = is still a set key"
+    assert not ready("sonar.organization="), "uncommented but EMPTY is not ready"
+    assert not ready("sonar.organization=   "), "only whitespace after the = is not ready"
+    assert not ready("#sonar.organization=x"), "a still-commented line is not ready"
+    assert not ready(""), "nothing set at all is not ready"
+
+
 def test_preflight_still_fails_loudly_only_when_a_human_dispatched_it():
     """The asymmetry that makes skipping honest: a human dispatch is refused loudly,
     an automatic trigger skips with an explanation. Reversed, the workflow either

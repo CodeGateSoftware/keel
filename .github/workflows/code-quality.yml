@@ -139,8 +139,14 @@ jobs:
           # SonarQube Cloud refuses the analysis without an active `sonar.organization`. It is
           # commented out in sonar-project.properties until the org owner fills in the real
           # key -- a wrong key fails with a misleading "project not found" -- so "the line is
-          # still commented" genuinely means "not ready", and the scan must not run.
-          grep -Eq '^[[:space:]]*sonar\.organization[[:space:]]*=' sonar-project.properties \
+          # still commented" genuinely means "not ready", and the scan must not run. The regex
+          # must demand a non-blank VALUE, not merely an uncommented line: SonarCloud's
+          # "You must define ... sonar.organization" refusal fires for an EMPTY value too, so
+          # accepting `sonar.organization=` (uncommented, nothing after the equals sign) as
+          # ready would mark the scan configured and redden every push to main again (#402's
+          # exact failure, one edit later).
+          grep -Eq '^[[:space:]]*sonar\.organization[[:space:]]*=[[:space:]]*[^[:space:]]' \
+            sonar-project.properties \
             || SONAR_MISSING="$SONAR_MISSING sonar.organization"
 
           [ -n "${SNYK_TOKEN:-}" ] || SNYK_MISSING="$SNYK_MISSING SNYK_TOKEN"
