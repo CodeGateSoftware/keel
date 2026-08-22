@@ -607,3 +607,30 @@ def test_the_release_notes_point_at_the_full_explanation() -> None:
     text = _WORKFLOW.read_text(encoding="utf-8")
     assert "docs/desktop-install.md" in text
     assert "cannot currently afford" in text
+
+
+def test_the_install_note_carries_the_operator_activation_checklist() -> None:
+    """#438 made activation a PURCHASE, not a code change -- and the skip notices in the
+    workflow point at this page. So the page must hold the complete shopping list: every
+    secret name the gates check, the product that sells it, the price from #438's signing
+    table, the `signing` environment by name, and the one manual step (release-notes
+    wording) whose forgetting errs safe. A checklist missing a name would send the
+    operator to GitHub with an incomplete list and a second dispatch they did not expect."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    for secret in (*_MACOS_SIGNING_SECRETS, *_WINDOWS_SIGNING_SECRETS):
+        assert secret in text, f"the activation checklist must name {secret}"
+    assert "Environments" in text and "`signing`" in text, (
+        "the checklist must say WHERE the secrets go -- an environment secret in the wrong "
+        "place is a repository secret, visible to every same-repo PR build"
+    )
+    # The prices from #438's signing table, restated where the decision is made.
+    assert "$99" in text and "$9.99" in text and "SmartScreen" in text
+    assert "EV" in text, (
+        "the checklist must warn EV is not worth extra -- no instant SmartScreen pass since 2024"
+    )
+    # The honest asymmetry: the notes wording cannot auto-detect signing, and the failure
+    # mode of forgetting it must be stated (and must be the safe direction).
+    assert "safe direction" in text
+    assert "notarised" in text or "un-notarised" in text, (
+        "the checklist must explain WHY the macOS gate is all five secrets or none"
+    )
