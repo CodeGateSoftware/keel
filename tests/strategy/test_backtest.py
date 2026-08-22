@@ -285,8 +285,12 @@ class _StaleThenReachableRule(Rule):
         self.detect_calls += 1
         window = next(iter(candles_by_tf.values()))
         latest = window[-1]
-        # Far above every price in the series, so neither entry nor stop is ever touched.
-        entry, stop, target = (Decimal(1000), Decimal(900), Decimal(1100))
+        # Entry far above and stop far BELOW every price in the series, so neither is ever
+        # touched. The stop has to sit below the market: since the #442 gap fix, a bar whose
+        # HIGH is below a long's stop counts as a touch (the level was passed wholesale), so
+        # the old fixture's stop at 900 over a ~100 market would exit at once -- a gap
+        # through the stop, not an untouched one.
+        entry, stop, target = (Decimal(1000), Decimal(50), Decimal(1100))
         if latest.ts >= self.switch_ts:
             entry, stop, target = (Decimal(110), Decimal(95), Decimal(130))
         return Setup(
@@ -515,9 +519,7 @@ class TestPerProductSlippageInBacktest:
         ]
 
     def _rule(self, product_id: str = "BTC-USD") -> _ScriptedRule:
-        return _ScriptedRule(
-            60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id
-        )
+        return _ScriptedRule(60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id)
 
     def _resolver(self, product_id: str) -> Decimal:
         return slippage_for_quote_volume(self._VOLUMES[product_id])
@@ -536,12 +538,8 @@ class TestPerProductSlippageInBacktest:
         the direction check #259 demands: the correction is conservative on thin assets, never
         favourable.
         """
-        btc = backtest(
-            self._rule("BTC-USD"), self._candles(), slippage_by_product=self._resolver
-        )
-        ton = backtest(
-            self._rule("TON-USD"), self._candles(), slippage_by_product=self._resolver
-        )
+        btc = backtest(self._rule("BTC-USD"), self._candles(), slippage_by_product=self._resolver)
+        ton = backtest(self._rule("TON-USD"), self._candles(), slippage_by_product=self._resolver)
 
         assert ton.trades[0].entry > btc.trades[0].entry
         assert ton.trades[0].exit < btc.trades[0].exit
@@ -564,9 +562,227 @@ class TestPerProductSlippageInBacktest:
         """The existing-caller guarantee, pinned: omitting the parameter must reproduce a run
         that passes the flat rate explicitly, trade for trade."""
         default_run = backtest(self._rule(), self._candles())
-        explicit_run = backtest(
-            self._rule(), self._candles(), slippage_pct=Decimal("0.0005")
-        )
+        explicit_run = backtest(self._rule(), self._candles(), slippage_pct=Decimal("0.0005"))
 
         assert default_run.trades[0].pnl == explicit_run.trades[0].pnl
         assert default_run.trades[0].entry == Decimal(105) * Decimal("1.0005")
+
+
+# ---------------------------------------------------------------------------
+# #442: the ratchet-only exit policy (trailing stop / break-even roll)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedParamRule(_ScriptedRule):
+    """`_ScriptedRule` carrying a `params` dict -- the per-family exit-policy knobs
+    (`trail_atr_mult` / `be_roll_rr` / `atr_period`) `strategy.exit_policy.policy_for`
+    reads off the rule. `detect`/`exit_signal` behave exactly as the parent's."""
+
+    def __init__(
+        self,
+        trigger_ts: int,
+        entry: Decimal,
+        stop: Decimal,
+        target: Decimal,
+        params: dict,
+        product_id: str = "BTC-USD",
+    ) -> None:
+        super().__init__(trigger_ts, entry, stop, target, product_id=product_id)
+        self.params = dict(params)
+
+
+def _flat_then_run_bars(trigger_ts: int, after: list[tuple[str, str, str, str]]) -> list[Candle]:
+    """Warmup bars flat at 100 (true range exactly 2 on every bar, so ATR(14) == 2
+    throughout), the trigger bar, then the caller's `(o, h, l, c)` tuples -- each rising
+    bar's true range is also 2 by construction where the caller keeps `l == prev c`,
+    `h == l + 2`."""
+    bars = [_candle(i * 3600, "100", "101", "99", "100") for i in range(trigger_ts // 3600 + 1)]
+    for i, (o, h, low, c) in enumerate(after, len(bars)):
+        bars.append(_candle(i * 3600, o, h, low, c))
+    return bars
+
+
+def test_trailing_exits_earlier_and_higher_than_the_static_stop() -> None:
+    """The #442 wiring, behaviorally: a 2xATR trail on a rising-then-retracing series
+    ratchets the stop up bar by bar and exits on the retrace at a level the STATIC stop
+    never reaches -- same series, same setup, only `trail_atr_mult` differs.
+
+    Bars (fee 0, slippage 0, ATR == 2 on every bar):
+      fill bar:  o100 h101 l99  c100  -> trail 100-4 = 96 (initial stop 94)
+      rising:    o100 h102 l100 c102  -> trail 102-4 = 98
+      rising:    o102 h104 l102 c104  -> trail 104-4 = 100
+      retrace:   o102 h103 l97  c98   -> low 97 touches the TRAILED stop 100 -> exit 100
+      (static arm: low 97 misses the static 94; the NEXT bar's low 93 exits at 94)
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("102", "103", "97", "98"),  # retrace: trailing arm exits here
+        ("98", "99", "93", "94"),  # static arm exits here
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    trail_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {"trail_atr_mult": Decimal("2")}
+    )
+    static_rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    trailed = backtest(trail_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    static = backtest(static_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert trailed.n_trades == 1
+    assert static.n_trades == 1
+    assert trailed.trades[0].exit == Decimal("100")  # the RATCHETED stop, not the static 94
+    assert trailed.trades[0].exit_ts == (trigger_ts + 4 * 3600)
+    assert static.trades[0].exit == Decimal("94")
+    assert static.trades[0].exit_ts == (trigger_ts + 5 * 3600)
+    assert trailed.trades[0].pnl is not None and static.trades[0].pnl is not None
+    assert trailed.trades[0].pnl > static.trades[0].pnl
+
+
+def test_break_even_roll_exits_at_entry_after_the_threshold_clears() -> None:
+    """`be_roll_rr=1`: once the bar's high clears entry + 1x the ORIGINAL risk (110 vs
+    risk 10), the stop rolls to the entry and the very next dip to 99 exits there -- a
+    scratch instead of the static arm's full ride down to the 90 stop."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar: high 101 misses the 110 threshold
+        ("100", "111", "100", "108"),  # high 111 clears +1R -> stop rolls to entry 100
+        ("106", "107", "99", "100"),  # low 99 touches the rolled stop -> exit at 100
+        ("100", "101", "89", "90"),  # static arm: low 89 touches the 90 stop
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    be_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("90"), Decimal("130"), {"be_roll_rr": Decimal("1")}
+    )
+    static_rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("90"), Decimal("130"), {})
+
+    rolled = backtest(be_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    static = backtest(static_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert rolled.n_trades == 1
+    assert static.n_trades == 1
+    assert rolled.trades[0].exit == Decimal("100")
+    assert rolled.trades[0].exit_ts == (trigger_ts + 3 * 3600)
+    assert rolled.trades[0].pnl == Decimal("0")  # a scratch at the rolled stop
+    assert static.trades[0].exit == Decimal("90")
+    assert static.trades[0].exit_ts == (trigger_ts + 4 * 3600)
+
+
+def test_a_rule_without_exit_params_is_byte_identical_to_explicit_off() -> None:
+    """The default-OFF guarantee: `params={}` (every existing rule row) and an explicit
+    `{"trail_atr_mult": None, "be_roll_rr": None}` produce identical trades -- the wiring
+    cannot change any existing rule's backtest until an operator turns a knob on."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("102", "103", "97", "98"),
+        ("98", "99", "93", "94"),
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    unset = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+    explicit_off = _ScriptedParamRule(
+        trigger_ts,
+        Decimal("100"),
+        Decimal("94"),
+        Decimal("130"),
+        {"trail_atr_mult": None, "be_roll_rr": None},
+    )
+
+    a = backtest(unset, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    b = backtest(explicit_off, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert [(t.entry, t.exit, t.exit_ts, t.pnl) for t in a.trades] == [
+        (t.entry, t.exit, t.exit_ts, t.pnl) for t in b.trades
+    ]
+
+
+# ---------------------------------------------------------------------------
+# #442 review: a bar that gaps ENTIRELY through the stop still exits
+# ---------------------------------------------------------------------------
+
+
+def test_a_static_stop_gapped_through_by_a_whole_bar_exits_at_that_bars_open() -> None:
+    """The containment-only touch check (`low <= stop <= high`) let a bar whose HIGH sits
+    below the stop slip past it silently: pre-fix, the gap bar triggered nothing, and the
+    recovery bar's in-range touch then exited at the STOP -- a better price than the market
+    ever offered after the gap. The gap bar must exit, at its OPEN (worse than the stop --
+    the honest fill for a level passed wholesale).
+
+      fill bar:  o100 h101 l99  c100  -> stop 94 clear
+      holding:   o99  h100 l98  c99   -> no touch
+      GAP:       o90  h92  l88  c89   -> high 92 < stop 94 -> exit at the open 90
+      recovery:  o89  h95  l88  c93   -> pre-fix exited HERE, flattered, at 94
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("99", "100", "98", "99"),
+        ("90", "92", "88", "89"),  # the gap through the stop
+        ("89", "95", "88", "93"),  # pre-fix: the flattered in-range exit at 94
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("90")  # the gap bar's OPEN, not the 94 stop
+    assert result.trades[0].exit_ts == trigger_ts + 3 * 3600
+    assert result.trades[0].pnl == Decimal("-10")  # 100 -> 90, fee 0, slippage 0
+    assert result.trades[0].outcome == "loss"
+
+
+def test_an_open_above_the_stop_with_a_piercing_low_still_fills_at_the_stop() -> None:
+    """The case the fix must NOT change: the bar OPENS above the stop and its low pierces
+    it -- the level traded, so the fill is the stop itself, exactly as before."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar
+        ("105", "106", "92", "95"),  # open 105 > stop 94, low 92 pierces -> exit at 94
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("94")
+    assert result.trades[0].exit_ts == trigger_ts + 2 * 3600
+
+
+def test_a_trailing_stop_stranded_by_a_gap_down_bar_exits_instead() -> None:
+    """The ratchet makes the gap hole bite hardest: a trail sitting near price is passed
+    wholesale by one gap-down bar, and the ratchet then REFUSES to lower the stop to
+    re-reach it -- pre-fix the position stranded open while every later bar's high stayed
+    below the stranded level, understating trailing losses. With the fix it exits on the
+    gap bar itself, at its open.
+
+      fill bar:  o100 h101 l99  c100  -> trail 96 (ATR 2)
+      rising:    o100 h102 l100 c102  -> trail 98
+      rising:    o102 h104 l102 c104  -> trail 100
+      GAP:       o97  h98  l95  c96   -> high 98 < trailed 100 -> exit at the open 97
+      stranded:  o96  h97  l94  c95   -> pre-fix: rides here and on, stop pinned at 100
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("97", "98", "95", "96"),  # the gap through the trailed stop
+        ("96", "97", "94", "95"),  # pre-fix: stranded, stop ratcheted at 100 forever
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    trail_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {"trail_atr_mult": Decimal("2")}
+    )
+
+    result = backtest(trail_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("97")  # the gap bar's OPEN
+    assert result.trades[0].exit_ts == trigger_ts + 4 * 3600
+    assert result.trades[0].outcome == "loss"

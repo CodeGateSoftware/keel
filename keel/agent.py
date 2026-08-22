@@ -122,13 +122,15 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
 
 # Constructor kwargs that must be coerced back from JSON-plain (str) to `Decimal`, per kind.
 _DECIMAL_PARAMS: dict[str, tuple[str, ...]] = {
-    "pullback_continuation": ("buffer_ticks",),
+    "pullback_continuation": ("buffer_ticks", "trail_atr_mult", "be_roll_rr"),
     "rsi_meanrev": (
         "atr_mult",
         "fixed_stop_pct",
         "fixed_rr",
         "level_tolerance",
         "support_proximity_pct",
+        "trail_atr_mult",
+        "be_roll_rr",
     ),
     "dca": ("budget_usd", "dip_bonus_pct"),
     "turtle_breakout": ("atr_stop_mult", "target_rr"),
@@ -184,8 +186,7 @@ def build_rule_from_params(kind: str, params: dict[str, Any]) -> Rule:
     rule_cls = RULE_REGISTRY.get(kind)
     if rule_cls is None:
         raise ValueError(
-            f"agent: no rule registered for kind {kind!r} -- known kinds: "
-            f"{sorted(RULE_REGISTRY)!r}"
+            f"agent: no rule registered for kind {kind!r} -- known kinds: {sorted(RULE_REGISTRY)!r}"
         )
 
     kwargs = dict(params)
@@ -621,6 +622,7 @@ def _paper_enter(
     existed to gate the guard check, and sizing the fill off it would score the track record on
     trades no real paper balance could have produced.
     """
+
     def _result(placed, order_id=None, vetoed_by=None, reason=""):
         return ExecutionResult(
             placed=placed,
@@ -870,7 +872,7 @@ def recorded_session_venues(repo: Repository) -> list[str]:
     prefix = f"{MARKET_SESSION_KEY}:"
     venues = [""]
     venues.extend(
-        key[len(prefix):] for key in repo.get_state_keys(prefix) if len(key) > len(prefix)
+        key[len(prefix) :] for key in repo.get_state_keys(prefix) if len(key) > len(prefix)
     )
     return venues
 
@@ -1081,9 +1083,11 @@ def latest_recorded_session(
         if repo.get_state(market_session_key(venue)) is None:
             continue
         recorded_ts = repo.get_state(market_session_ts_key(venue))
-        stamped = recorded_ts if isinstance(recorded_ts, int) and not isinstance(
-            recorded_ts, bool
-        ) else -1
+        stamped = (
+            recorded_ts
+            if isinstance(recorded_ts, int) and not isinstance(recorded_ts, bool)
+            else -1
+        )
         if best is None or stamped > best[0]:
             best = (stamped, venue)
     if best is None:
@@ -1114,9 +1118,7 @@ def latest_recorded_session(
     )
 
 
-def _slot_market_closed(
-    repo: Repository, config: Config, now_ts: int, venue: str
-) -> bool:
+def _slot_market_closed(repo: Repository, config: Config, now_ts: int, venue: str) -> bool:
     """`recorded_market_closed` for one venue slot -- see that function for the policy."""
     if repo.get_state(market_session_key(venue)) != SessionState.CLOSED.value:
         return False
@@ -1552,7 +1554,14 @@ def run_once(
             # the duplicate-order hazard this gate exists for applies to a SELL that closes an
             # existing position.
             product_exit_results = _handle_exits(
-                product_id, product_rules, candles_by_tf, repo, broker, config, mode, now_ts,
+                product_id,
+                product_rules,
+                candles_by_tf,
+                repo,
+                broker,
+                config,
+                mode,
+                now_ts,
                 confirm_fn=confirm_fn,
             )
             for exit_result in product_exit_results:
@@ -1621,9 +1630,7 @@ def run_once(
                     reason=result.reason,
                 )
                 if result.placed:
-                    order = (
-                        repo.get_order(result.order_id) if result.order_id is not None else None
-                    )
+                    order = repo.get_order(result.order_id) if result.order_id is not None else None
                     # `position_rule` is now ONLY the exit-rule ownership marker its docstring
                     # always described. The entry context it used to carry (`entry_fill`, `qty`,
                     # `entry_fee`) moved to the `positions` ledger: this key is per-PRODUCT, so a

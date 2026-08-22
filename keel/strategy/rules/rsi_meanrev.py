@@ -42,8 +42,7 @@ class RsiMeanReversion(Rule):
     # annotation for a class-level table either way.
     PARAM_DOCS: ClassVar[dict[str, str]] = {
         "oversold": (
-            "RSI level that marks oversold; the bounce trigger. Lower = fewer, "
-            "deeper-dip entries."
+            "RSI level that marks oversold; the bounce trigger. Lower = fewer, deeper-dip entries."
         ),
         "overbought": "RSI level that closes a held long. Higher = hold winners longer.",
         "require_divergence": (
@@ -60,6 +59,18 @@ class RsiMeanReversion(Rule):
         "atr_mult": "ATR multiple for the 'atr' stop method. Wider = fewer stop-outs.",
         "fixed_stop_pct": "fraction below entry for the 'fixed' stop method (0.03 = 3%).",
         "fixed_rr": "reward:risk multiple for the 'fixed_rr' target method.",
+        "trail_atr_mult": (
+            "ratchet-only trailing stop this many ATRs below each bar's close, once the "
+            "trade is open. Default off: measured WORSE than the static exit at the 120 bp "
+            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
+        ),
+        "be_roll_rr": (
+            "roll the stop to the entry once the trade has been up this many R. Default "
+            "off: measured no-better than the static exit at the 120 bp fee "
+            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
+        ),
         "level_tolerance": (
             "how close two prices must be to count as one support/resistance level."
         ),
@@ -88,6 +99,11 @@ class RsiMeanReversion(Rule):
     atr_mult: Decimal = Decimal("1.5")
     fixed_stop_pct: Decimal = Decimal("0.03")
     fixed_rr: Decimal = Decimal("2")
+    # #442: the per-family exit-policy knobs `strategy.exit_policy` reads. Default OFF
+    # (None) -- the wiring changes no rule's behavior until an operator/research run turns
+    # a knob on; the live executor has no management cycle to honor them (issue #502).
+    trail_atr_mult: Decimal | None = None
+    be_roll_rr: Decimal | None = None
     level_tolerance: Decimal = Decimal("0.002")
     level_min_touches: int = 3
     # KB §81.5: pivots inside one consolidation are one visit to a level, not several.
@@ -112,6 +128,8 @@ class RsiMeanReversion(Rule):
             "atr_mult": self.atr_mult,
             "fixed_stop_pct": self.fixed_stop_pct,
             "fixed_rr": self.fixed_rr,
+            "trail_atr_mult": self.trail_atr_mult,
+            "be_roll_rr": self.be_roll_rr,
             "level_tolerance": self.level_tolerance,
             "level_min_touches": self.level_min_touches,
             "level_min_separation_sec": self.level_min_separation_sec,

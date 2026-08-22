@@ -37,6 +37,14 @@ chosen by **walk-forward out-of-sample validation** on cached 5yr BTC/ETH/PAXG (
 lookback longer than 20 beat 20 out-of-sample; 40 was the most robust across held-out years). The
 2:1 asymmetric ratio, ADX(14) gate, and 20-day ATR "N" are unchanged.
 
+**No trailing stop, no break-even roll -- by choice (#442).** This family deliberately
+carries none of the `trail_atr_mult`/`be_roll_rr` exit-policy knobs the sim/backtest
+engines honor on `pullback_continuation` and `rsi_meanrev`: a trail or a BE-roll would cut
+the rare long winners a low-win-rate trend-follower exists to let run, which is exactly
+the trade the asymmetric exit channel is designed NOT to make. `strategy.exit_policy
+.policy_for` therefore reads this rule as OFF, and adding the knobs here would need to
+argue with that design, not just flip a param.
+
 **Forming-bar lookahead guard.** Three callers present the daily series differently:
 - The *edge* backtester (`strategy.backtest.backtest`) drives the rule on its native series
   only -- no `ONE_HOUR` key -- and every daily bar in it is already closed.
@@ -250,9 +258,7 @@ class TurtleBreakout(Rule):
         self.last_rejection = {"gate": gate, **numbers}
         return None
 
-    def _trading_series(
-        self, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> list[Candle]:
+    def _trading_series(self, candles_by_tf: dict[Granularity, list[Candle]]) -> list[Candle]:
         """The series this rule decides on: `candles_by_tf[self.granularity]`.
 
         At the `ONE_DAY` default that is `_completed_days`'s forming-bar-guarded daily series,
@@ -381,9 +387,7 @@ class TurtleBreakout(Rule):
             ts=current.ts,
         )
 
-    def exit_signal(
-        self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> bool:
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """The asymmetric Turtle channel exit: a close at/below the prior exit-lookback
         Donchian low.
 

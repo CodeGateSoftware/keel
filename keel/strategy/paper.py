@@ -21,6 +21,11 @@ paper fills -- since `rule_id` alone doesn't carry that bookkeeping. `track_reco
 back out (via `Repository.get_orders(mode='paper')`, P3 Task 1) to reconstruct `Trade`s and
 aggregates them via the shared `strategy.stats.summarize` helper into the same `BacktestResult`
 shape `backtest.py` produces, so paper and historical stats are directly comparable.
+
+**Exit-policy knobs are engine-only (#442/#502):** the `trail_atr_mult`/`be_roll_rr` knobs run in
+the sim/backtest engines (`strategy.exit_policy`); this trader does not manage stops -- its exits
+are the signal's own static stop/target touches (via `backtest.py`'s shared touch helpers) and
+signal-driven closes. The knobs' PARAM_DOCS say so outright.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ from decimal import Decimal
 from keel_core.telemetry import log_event
 
 from keel.data.repository import Repository
-from keel.strategy.backtest import TAKER_FEE_PCT
+from keel.strategy.backtest import TAKER_FEE_PCT, _stop_exit_price, _touches
 from keel.strategy.rules.base import Action, Setup, Signal, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Side
@@ -86,10 +91,6 @@ class _OpenPaperPosition:
     #: so the paired exit order writes the SAME `rule_id`, mirroring how `rule_name` above is
     #: taken from the position rather than re-read off the exit signal.
     rule_id: int | None = None
-
-
-def _touches(candle: Candle, price: Decimal) -> bool:
-    return candle.low <= price <= candle.high
 
 
 class PaperTrader:
@@ -267,8 +268,11 @@ class PaperTrader:
         """Advance MFE/MAE for `product_id`'s open paper position (if any) and close
         it -- writing an exit order -- if `candle`'s range touches the setup's stop
         or target (a bar touching both resolves conservatively to the stop, matching
-        `backtest.py`'s no-finer-data fallback). Returns the exit order id if a close
-        happened, else `None` (including when there is no open position).
+        `backtest.py`'s no-finer-data fallback). The touch checks are `backtest.py`'s
+        own shared helpers, so a candle that gaps ENTIRELY through the stop closes at
+        its open (see `backtest._stop_exit_price`), exactly as the engines would.
+        Returns the exit order id if a close happened, else `None` (including when
+        there is no open position).
         """
         position = self._open.get(product_id)
         if position is None:
@@ -279,12 +283,11 @@ class PaperTrader:
 
         stop = position.setup.stop
         target = position.setup.target
-        stop_touched = _touches(candle, stop)
-        target_touched = _touches(candle, target)
+        stop_exit = _stop_exit_price(candle, stop)
 
-        if stop_touched:
-            exit_price = stop
-        elif target_touched:
+        if stop_exit is not None:
+            exit_price = stop_exit
+        elif _touches(candle, target):
             exit_price = target
         else:
             return None

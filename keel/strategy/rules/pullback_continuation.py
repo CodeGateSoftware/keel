@@ -373,6 +373,18 @@ class PullbackContinuation(Rule):
             "'measured_1to1', 'swing' (the previous swing high) or 'fib_ext' (the Fib "
             "1.272 extension)."
         ),
+        "trail_atr_mult": (
+            "ratchet-only trailing stop this many ATRs below each bar's close, once the "
+            "trade is open. Default off: measured WORSE than the static exit at the 120 bp "
+            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
+        ),
+        "be_roll_rr": (
+            "roll the stop to the entry once the trade has been up this many R. Default "
+            "off: measured no-better than the static exit at the 120 bp fee "
+            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
+        ),
     }
 
     def __init__(
@@ -385,6 +397,8 @@ class PullbackContinuation(Rule):
         buffer_ticks: Decimal = Decimal("0.02"),
         stop_method: StopMethod = "fixed",
         target_method: TargetMethod = "measured_1to1",
+        trail_atr_mult: Decimal | None = None,
+        be_roll_rr: Decimal | None = None,
         name: str = "pullback_continuation",
     ) -> None:
         self.name = name
@@ -397,6 +411,8 @@ class PullbackContinuation(Rule):
             "buffer_ticks": buffer_ticks,
             "stop_method": stop_method,
             "target_method": target_method,
+            "trail_atr_mult": trail_atr_mult,
+            "be_roll_rr": be_roll_rr,
         }
         # Running per-bar state for the full-series reads (see `_RunningState`/#352). None
         # until the first call whose gates get past `regime.detect_condition` (#363 finding
@@ -531,9 +547,7 @@ class PullbackContinuation(Rule):
             ts=signal_candle.ts,
         )
 
-    def exit_signal(
-        self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> bool:
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """The bearish mirror of `detect()`: EMA fan inverted + bearish signal candle.
 
         `held` is accepted per the `Rule` interface but unused: this rule's exit is the

@@ -28,6 +28,14 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   lower expectations, not raise them") when finer data isn't available or is still ambiguous at
   that resolution: stop-vs-target ambiguity resolves to the **stop** (a loss). This applies on the
   fill bar too — filling at the open means the rest of that bar can reach either level.
+- **Gap-through-stop fills:** a bar that trades ENTIRELY below the protective stop (`high < stop`)
+  still triggers the exit, filling at that bar's OPEN — worse than the stop, the honest fill for a
+  level passed wholesale before any trade at it (the exit-side mirror of the market-order entry
+  fill above). Containment alone (`low <= stop <= high`) let such a bar slip past silently,
+  stranding a ratcheted trail above every later bar while the ratchet refused to lower it (#442
+  review). The TARGET deliberately keeps containment-only touches: a bar entirely above it is not
+  a touch, because filling that gap at its open would improve the exit — the flattering direction
+  this engine refuses.
 - **No overlap:** `detect()` is only called while **flat** — one instrument, one position at a
   time. A rule whose condition would fire on every bar still yields only sequential,
   non-overlapping trades. It is the *open position* that enforces this. (Under the touch-fill
@@ -40,6 +48,14 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   `slippage_by_product` to price each product's fills from its own liquidity statistic
   (`slippage_for_quote_volume`), leaving the flat `slippage_pct` as the default and the
   fallback for products without one.
+- **Managed stops (#442):** a rule whose `params` carry `trail_atr_mult`/`be_roll_rr` has
+  its stop RATCHETED by `strategy.exit_policy` at each bar the position survives — touch
+  checks run against the level carried INTO the bar, management runs at bar end on the
+  completed bar, and the stop never widens (the sim-side statement of rail 9). A rule
+  without the knobs (turtle by design, every pre-#442 row) trades exactly as before the
+  wiring existed — identity pinned by the unit-identity tests plus the unchanged
+  pre-existing suite with the wiring live (the later gap-through-stop fill above is a
+  separate semantic that applies to static stops too, tested in its own right).
 
 Position sizing (money management) is out of scope for this module (see the future
 `money_mgmt.py`): every trade uses a fixed 1-unit notional, sufficient for computing
@@ -55,6 +71,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
+from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
 from keel.strategy.rules.base import Rule, Setup, Trade, TradeOutcome
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
@@ -163,9 +180,9 @@ def slippage_for_quote_volume(median_daily_quote_volume: Decimal) -> Decimal:
     """
     if median_daily_quote_volume <= 0:
         return SLIPPAGE_CAP_PCT
-    unclamped = SLIPPAGE_FLOOR_PCT * (
-        SLIPPAGE_REFERENCE_QUOTE_VOLUME / median_daily_quote_volume
-    ).sqrt()
+    unclamped = (
+        SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / median_daily_quote_volume).sqrt()
+    )
     return min(max(unclamped, SLIPPAGE_FLOOR_PCT), SLIPPAGE_CAP_PCT)
 
 
@@ -194,6 +211,7 @@ class SlippageAssumption:
         return self.median_daily_quote_volume is not None and self.slippage_pct == (
             SLIPPAGE_CAP_PCT
         )
+
 
 # Default key used to present the single candle series to `Rule.detect()`/
 # `Rule.exit_signal()` in the `dict[Granularity, list[Candle]]` shape the interface
@@ -225,10 +243,47 @@ class _OpenPosition:
     entry_ts: int
     mfe: Decimal
     mae: Decimal
+    #: The protective stop CURRENTLY in force -- starts at the setup's own stop and, per
+    #: #442, is ratcheted by the rule's exit policy (`strategy.exit_policy`) at each bar
+    #: the position survives. Touch checks always run against THIS, the level carried
+    #: into the bar; `setup.stop` stays the ORIGINAL risk reference (`_close_trade`'s
+    #: R-multiple denominator), never the managed level.
+    stop: Decimal
 
 
 def _touches(candle: Candle, price: Decimal) -> bool:
     return candle.low <= price <= candle.high
+
+
+def _stop_touched(candle: Candle, stop: Decimal) -> bool:
+    """A LONG position's protective-stop touch check: the bar's range spans the level, OR
+    the bar gapped entirely below it (`high < stop`) -- the level was passed wholesale
+    before any trade at it, and the stop triggered on the bar's first tradeable price.
+
+    Containment alone let such a bar slip past the stop silently -- the gap-through hole
+    the #442 review flagged: with a ratcheted trail sitting near price, one gap-down bar
+    stranded the stop above every later bar while the ratchet refused to lower it,
+    understating trailing losses. Both engines and the paper trader share this predicate,
+    so the semantic lives in exactly one place. The TARGET deliberately keeps
+    containment-only touches: a bar entirely ABOVE it is not a touch, because filling
+    that gap at its open would improve the exit -- the flattering direction this engine
+    refuses.
+    """
+    return _touches(candle, stop) or candle.high < stop
+
+
+def _stop_exit_price(candle: Candle, stop: Decimal) -> Decimal | None:
+    """The price a touched stop fills at on `candle`, or `None` if it was not touched.
+
+    A bar that gapped entirely below the level fills at its OPEN -- worse than the stop,
+    the honest fill convention: the first price obtainable after the level was passed
+    (the exit-side mirror of #257's market-order entry logic). A bar whose range spans
+    the level -- including one whose OPEN gapped above it and whose low then pierced it
+    -- fills at the stop itself: the level traded.
+    """
+    if candle.high < stop:
+        return candle.open
+    return stop if _touches(candle, stop) else None
 
 
 def _resolve_order(
@@ -257,7 +312,14 @@ def _resolve_order(
         key=lambda c: c.ts,
     )
     for fc in window:
-        touched = [name for name, price in levels.items() if _touches(fc, price)]
+        touched = [
+            # The stop level gets the gap-through semantics (`_stop_touched`); the target
+            # stays containment-only -- see `_stop_touched` for why that asymmetry is the
+            # conservative direction.
+            name
+            for name, price in levels.items()
+            if (_stop_touched(fc, price) if name == "stop" else _touches(fc, price))
+        ]
         if len(touched) == 1:
             return touched[0]
         if len(touched) > 1:
@@ -362,6 +424,10 @@ def backtest(
     position: _OpenPosition | None = None
     pending: Setup | None = None
     trading_tf = _rule_trading_tf(rule)
+    #: The rule's per-family stop-management policy (#442): ratchet-only trailing /
+    #: break-even roll, OFF for every rule whose params do not ask for it (turtle by
+    #: design, and every pre-#442 rule row). See `strategy/exit_policy.py`.
+    exit_policy: ExitPolicy = policy_for(rule)
     #: Bars the current `pending` has survived. Since #257 a setup detected on bar i is filled
     #: unconditionally at bar i+1's open, so this can only ever reach 1 -- see the invariant
     #: check at the top of the loop.
@@ -442,6 +508,7 @@ def backtest(
                 entry_ts=candle.ts,
                 mfe=Decimal(0),
                 mae=Decimal(0),
+                stop=pending.stop,
             )
             pending = None
             # Fall through to the shared stop/target block for the REMAINDER of this bar. Unlike
@@ -449,22 +516,30 @@ def backtest(
             # open, so this bar's range can reach either level, and the shared block's
             # stop-vs-target `_resolve_order` is exactly the right adjudicator.
 
-
         assert position is not None  # noqa: S101 - narrows type for the checks below
         position.mfe = max(position.mfe, candle.high - position.entry_fill)
         position.mae = max(position.mae, position.entry_fill - candle.low)
 
-        stop = position.setup.stop
+        # The MANAGED stop (the level carried into this bar), not the setup's original:
+        # the exit policy (#442) may have ratcheted it on a prior bar. R-multiples still
+        # divide by the ORIGINAL risk (`_close_trade` reads `position.setup.stop`).
+        stop = position.stop
         target = position.setup.target
-        stop_touched = _touches(candle, stop)
+        #: The stop's exit fill: `None` when the bar never reached it, the bar's OPEN
+        #: when it gapped entirely through it (`_stop_exit_price`).
+        stop_exit = _stop_exit_price(candle, stop)
+        stop_touched = stop_exit is not None
         target_touched = _touches(candle, target)
 
         exit_price: Decimal | None = None
         if stop_touched and target_touched:
             order = _resolve_order(i, candles, finer_candles, {"target": target, "stop": stop})
-            exit_price = target if order == "target" else stop
+            # `stop_exit` is exactly `stop` in this branch: a bar that gapped through the
+            # stop cannot also touch the target (target > stop for a long), so the
+            # both-touched case is always an in-range touch.
+            exit_price = target if order == "target" else stop_exit
         elif stop_touched:
-            exit_price = stop
+            exit_price = stop_exit
         elif target_touched:
             exit_price = target
         elif rule.exit_signal(position.setup, candles_by_tf):
@@ -475,6 +550,24 @@ def backtest(
                 _close_trade(position, exit_price, candle.ts, fee_pct, effective_slippage)
             )
             position = None
+        else:
+            # Stop management runs at BAR END, on the bar that just completed, and the
+            # resulting level binds from the NEXT bar (#442 -- see `exit_policy`'s
+            # module docstring for the no-lookahead/live-parity sequencing argument).
+            # Live, the bracket rests at the old level until a management cycle replaces
+            # it; touch checks above ran against exactly that old level. An OFF policy
+            # (every rule without the knobs) returns the stop unchanged, so only the
+            # trailing arm pays for the ATR read.
+            position.stop = next_stop(
+                exit_policy,
+                position.entry_fill,
+                position.setup.stop,
+                position.stop,
+                candle,
+                trailing_atr(candles_by_tf[trading_tf], exit_policy.atr_period)
+                if exit_policy.trail_atr_mult is not None
+                else None,
+            )
 
     if position is not None:
         trades.append(_open_trade(position))
