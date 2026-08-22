@@ -1155,9 +1155,45 @@ def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
     )
 
 
+class SizePrecisionUnavailable(RuntimeError):
+    """No quote increment is known for this product, so no size can be safely serialised (#513).
+
+    Raised rather than guessing a precision. An order whose size cannot be expressed in the
+    venue's units is not an order that should be sent with a plausible-looking number instead.
+    """
+
+
 def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
+    """Serialise the order's size at the VENUE's precision, not the engine's (#513).
+
+    Everything upstream computes in full `Decimal` precision -- `sizing.size()` returns
+    `(equity * risk_pct) / stop_distance`, which is essentially never round -- and `str(Decimal)`
+    faithfully emits every digit of it. Coinbase answers `INVALID_SIZE_PRECISION` to anything
+    finer than the product's increment, which is how the first live `turtle_breakout` entry was
+    rejected (order 3, 2026-08-22, `quote_size: "23.00803473938010547532738517"`).
+
+    DCA never tripped this only because its `budget_usd` is a round constant: `"50.000...0"` is
+    26 decimal places too, and the venue accepts it because the VALUE is exactly 50.
+
+    SELL is deliberately left unquantized for now. Its `base_size` needs the product's
+    `base_increment`, which varies per asset and which nothing on the Coinbase path fetches yet;
+    guessing one could round an exit down to dust or fail it outright, and an exit that cannot
+    leave is strictly worse than the bug being fixed. Tracked as #513's follow-up.
+    """
     if intent.side == Side.BUY:
-        return {"market_market_ioc": {"quote_size": str(intent.notional)}}
+        increment = sizing.quote_increment_for(intent.product_id)
+        if increment is None:
+            raise SizePrecisionUnavailable(
+                f"no quote increment known for {intent.product_id!r} -- refusing to guess a "
+                "size precision for a live order"
+            )
+        notional = sizing.quantize_down(intent.notional, increment)
+        if notional <= 0:
+            raise SizePrecisionUnavailable(
+                f"{intent.product_id!r} notional {intent.notional} quantizes to {notional} at "
+                f"increment {increment} -- refusing to send a zero-size order"
+            )
+        return {"market_market_ioc": {"quote_size": str(notional)}}
     return {"market_market_ioc": {"base_size": str(intent.qty)}}
 
 
