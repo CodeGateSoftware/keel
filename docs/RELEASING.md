@@ -45,8 +45,9 @@ the wheels it just built.
 | asset | what it is |
 |---|---|
 | `keel_trader-<version>-py3-none-any.whl` | the CLI. Install **by path**, never by bare name. |
-| `keel_core-*`, `keel_broker_api-*`, `keel_broker_coinbase-*` | what `keel-trader` depends on, pinned `==` to this same version. Install all four wheels by path. |
-| `keel_broker_fake-*`, `keel_broker_robinhood-*` | built by `--all-packages` and published, but **not** part of a deployment: the fake is a dev-only venue, Robinhood is optional (and drags in an Ed25519 stack). Do not install them into one. |
+| `keel_core-*`, `keel_broker_api-*`, `keel_broker_coinbase-*` | what `keel-trader` depends on, pinned `==` to this same version. |
+| `keel_broker_alpaca-*` | the US-equities venue. Part of the production set since #425: a deployment installs the four wheels above plus this one (five, by path) — an equities deployment (`config.paper-equities.yaml`, `broker: name: alpaca`) selects it through its `alpaca` entry point, and `keel update` moves all five as one set so such a deployment can self-update. Its only dependency (`requests`) already rides every deployment via the Coinbase SDK. |
+| `keel_broker_fake-*`, `keel_broker_kraken-*`, `keel_broker_robinhood-*` | built by `--all-packages` and published, but **not** part of a deployment: the fake is a dev-only venue, Kraken is a stub (#313) whose every data method raises, Robinhood is optional (and drags in an Ed25519 stack). Do not install them into one. |
 | `config.yaml` | the **production** config: real allowlist/caps in `auto_trade.mode: confirm`. |
 
 `config.yaml` is `keel/templates/config.live.yaml`, committed and reviewed like any other code.

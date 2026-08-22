@@ -137,27 +137,36 @@ uv pip install --python .venv --find-links Release \
   Release/keel_core-$V-py3-none-any.whl \
   Release/keel_broker_api-$V-py3-none-any.whl \
   Release/keel_broker_coinbase-$V-py3-none-any.whl \
+  Release/keel_broker_alpaca-$V-py3-none-any.whl \
   Release/keel_trader-$V-py3-none-any.whl
 .venv/bin/keel versions
 .venv/bin/keel status
 ```
 
-Set `V` to the version being deployed; nothing else changes between releases.
+Set `V` to the version being deployed; nothing else changes between releases. The five named
+wheels are the production set (#425): the four base wheels plus `keel_broker_alpaca`, the
+US-equities venue an equities deployment (`config.paper-equities.yaml`, `broker: name: alpaca`)
+resolves through its `alpaca` entry point. A Coinbase-only deployment gets the adapter too — one
+unused module, whose single dependency (`requests`) already rides every deployment transitively
+via the Coinbase SDK — which is the price of a set stated by name rather than derived from each
+deployment's config: an equities deployment must never be upgraded without its adapter, or
+`keel versions` fails it with PARTIAL INSTALL.
 
 **Every wheel is named, and that is the fix for a real bug.** Installing `keel_trader` alone
 upgraded *only* `keel_trader`: its siblings were required without a version, so the `keel-core`
 already on disk satisfied `keel-core` and stayed put. `~/keel` ran `keel-trader 0.5.7` against
 `keel-core 0.5.5` for two releases that way. A wheel **path** is a direct requirement — that exact
-file is installed whatever is already there — so naming all four is what actually moves them.
+file is installed whatever is already there — so naming all five is what actually moves them.
 The wheels now also pin their siblings exactly (`Requires-Dist: keel-core==0.6.0`), which forces
-the upgrade even for someone who installs `keel_trader` alone; the four paths are the same
+the upgrade even for someone who installs `keel_trader` alone; the named paths are the same
 guarantee stated where the operator can see it.
 
-**Not `Release/*.whl`.** The release ships *every* workspace wheel, two of which a deployment must
-not have: `keel_broker_fake`, a dev-only fake venue that registers a `fake` entry point under
-`keel.brokers`, and `keel_broker_robinhood`, an optional venue that pulls an Ed25519 stack
-(`pynacl`, `cffi`) in for an adapter nothing constructs. The four named wheels are production's
-whole dependency closure. `--find-links Release` still points at that directory so the pinned
+**Not `Release/*.whl`.** The release ships *every* workspace wheel, three of which a deployment
+must not have: `keel_broker_fake`, a dev-only fake venue that registers a `fake` entry point under
+`keel.brokers`; `keel_broker_robinhood`, an optional venue that pulls an Ed25519 stack
+(`pynacl`, `cffi`) in for an adapter nothing constructs; and `keel_broker_kraken`, a
+port-complete stub (#313) whose every data method raises. The five named wheels are production's
+whole set. `--find-links Release` still points at that directory so the pinned
 siblings resolve locally rather than from PyPI, where they do not exist — which is why step 1
 downloads them all. Installing **by path** rather than by bare name is deliberate and unchanged:
 `keel` on PyPI is an unrelated project, so `pip install keel` fetches a stranger's code (see
@@ -172,16 +181,19 @@ then every keel distribution in that venv, and **exits non-zero** when they disa
 ```
 keel 0.6.0+deb8fa7e978d [release]
 
-keel-broker-api       0.6.0
-keel-broker-coinbase  0.6.0
-keel-core             0.6.0
-keel-trader           0.6.0
+keel-broker-alpaca     0.6.0
+keel-broker-api        0.6.0
+keel-broker-coinbase   0.6.0
+keel-core              0.6.0
+keel-trader            0.6.0
 
-ok: 4 keel distributions, all at 0.6.0.
+ok: 5 keel distributions, all at 0.6.0.
 ```
 
-A partial upgrade fails it, with the numbers: `error: PARTIAL INSTALL: 4 keel distributions at 2
-different versions (0.5.5, 0.6.0)`. So does finding `keel-broker-fake` installed — it was, at
+A partial upgrade fails it, with the numbers: `error: PARTIAL INSTALL: 5 keel distributions at 2
+different versions (0.5.5, 0.6.0)` — the exact failure an equities deployment hit on every
+self-update before #425 moved `keel_broker_alpaca` with the rest. So does finding
+`keel-broker-fake` installed — it was, at
 `0.5.5`, in `~/keel`. Remove it: `uv pip uninstall --python .venv keel-broker-fake`. Nothing calls
 `load_broker()` today so it is inert, but that is a property of this release, not of the package,
 and no reason to leave a fake venue registered on the box that moves money.
@@ -207,9 +219,10 @@ whole plan.
 **What it does, in the manual procedure's own order.** It reads the latest release from the
 public GitHub API (no auth, no tokens — an unauthenticated read is rate-limited to 60/hour per
 IP, which a human-gated check never approaches; a rate-limit or network failure is an honest
-error, not a guessed "up to date"). It downloads exactly the **four production wheels** —
-`keel_core`, `keel_broker_api`, `keel_broker_coinbase`, `keel_trader`, by exact name, never
-`Release/*.whl`, so the fake and Robinhood wheels can never ride along — into `Release/` in the
+error, not a guessed "up to date"). It downloads exactly the **five production wheels** —
+`keel_core`, `keel_broker_api`, `keel_broker_coinbase`, `keel_broker_alpaca`, `keel_trader`, by
+exact name, never `Release/*.whl`, so the fake, Robinhood and Kraken wheels can never ride
+along — into `Release/` in the
 launch folder, verifying each file landed non-empty (and bounding the read at 200 MiB, far above
 the ~1 MiB wheels — a mis-pointed URL is refused, not streamed to disk; a failed download or
 install removes the partial files so a torn wheel cannot poison a later rollback).
@@ -217,15 +230,15 @@ install removes the partial files so a torn wheel cannot poison a later rollback
 launch folder is copied to `<db>.bak-before-<version>-<timestamp>` before anything is installed
 — through SQLite's own backup API, a consistent snapshot even with a writer mid-transaction,
 where a plain file copy can be torn — and the backups are **never deleted** — not on success,
-not on failure. It installs the four
+not on failure. It installs the five
 wheels by path into the RUNNING
-venv with `uv pip install --python <venv> --find-links Release <the four paths>` — the manual
+venv with `uv pip install --python <venv> --find-links Release <the five paths>` — the manual
 command exactly, `--find-links Release` and all — uv is a **deployment dependency**
 of self-update for exactly the reason the manual procedure uses it; an absent uv is an honest
 error naming this section. It runs `keel migrate --db` for each database **with the new build**,
 then **verifies** with the new build's `keel versions` — every keel distribution must report the
 new version, the check that can actually fail. Only a verified success removes the **superseded
-wheels** (the old version's four) from `Release/`; the new four stay for the next update.
+wheels** (the old version's five) from `Release/`; the new five stay for the next update.
 
 **Never automatic from what keel ships — always typed.** The full run demands a typed `yes` at
 a terminal (the CLI's own confirmation gate, called inside the service before any mutation;
