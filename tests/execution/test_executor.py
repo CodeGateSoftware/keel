@@ -663,6 +663,39 @@ def test_build_intent_uses_equity_override(repo):
     )
 
 
+def test_live_sizing_equity_is_the_config_constant_immune_to_reward_accruals(repo):
+    """#490: the live path's sizing-equity stand-in is `config.caps.max_exposure_usd` (see the
+    module docstring) -- a config constant, not a balance read -- so accrued-but-unpurified
+    reward income cannot inflate live sizing through `_build_intent`. Pinned so the invariant
+    cannot silently regress: a repo full of reward income must leave the sized qty exactly
+    `sizing.size(max_exposure_usd, ...)`. If this ever fails because sizing moved to a live
+    balance read, the #490 purification exclusion must move with it."""
+    from keel.execution import executor, sizing
+
+    repo.upsert_transaction(
+        {
+            "coinbase_id": "rx1",
+            "source": "coinbase",
+            "type": "Reward Income",
+            "asset": "USDC",
+            "ts": 1_700_000_000,
+            "qty": Decimal("1"),
+            "price": Decimal("1"),
+            "subtotal": Decimal("999999"),
+            "total": Decimal("999999"),
+            "fees": Decimal("0"),
+        }
+    )
+    signal = _enter_signal()
+    config = _config()
+
+    intent = executor._build_intent(signal, None, repo, config, now_ts=NOW_TS)
+
+    assert intent.qty == sizing.size(
+        config.caps.max_exposure_usd, config.risk_pct, signal.setup.entry, signal.setup.stop
+    )
+
+
 # -- DCA sizing --------------------------------------------------------------------------------
 
 

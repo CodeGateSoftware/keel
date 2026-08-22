@@ -1936,6 +1936,56 @@ def test_seed_uses_real_equity_when_starting_equity_usd_is_zero(repo, monkeypatc
     assert repo.get_state("paper_cash_usdc") == Decimal("42000")
 
 
+def _reward_income_tx(coinbase_id: str, total: str) -> dict[str, Any]:
+    """A reward-income row in the imported transaction ledger -- the shape `keel data import`
+    writes from a Coinbase export. USDC Rewards accrue INSIDE the trading account (runbook §1:
+    they cannot be switched off via the Advanced Trade API), so they reach the balance the
+    paper seed reads, and this row is what makes that accrual visible to purification."""
+    return {
+        "coinbase_id": coinbase_id,
+        "source": "coinbase",
+        "type": "Reward Income",
+        "asset": "USDC",
+        "ts": 1_700_000_000,
+        "qty": Decimal("1"),
+        "price": Decimal("1"),
+        "subtotal": Decimal(total),
+        "total": Decimal(total),
+        "fees": Decimal("0"),
+    }
+
+
+def test_paper_seed_excludes_accrued_but_unpurified_reward_income(repo, monkeypatch):
+    """#490: the balance-derived paper seed is sizing equity, so it must subtract pending
+    purification. `_mark_to_market_equity` sums broker balances at face value, and reward
+    income accrues inside the account -- left in, the tainted seed becomes `paper_cash_usdc`,
+    which is exactly the equity `_paper_enter` sizes from (`equity_override`), i.e. riba
+    compounding into position size (discussion #472). The seed must equal
+    `mark_to_market_equity - pending_purification_usd`."""
+    repo.upsert_transaction(_reward_income_tx("rx1", "2000"))
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    monkeypatch.setattr(agent, "_mark_to_market_equity", lambda *a, **k: Decimal("42000"))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("40000")
+
+
+def test_funded_paper_seed_is_the_configured_amount_not_purified(repo):
+    """The other seed branch is a DELIBERATE operator-chosen funding amount, not a balance
+    read -- it contains no reward accruals by construction, so purification does not apply to
+    it. Pinning the boundary so the #490 exclusion stays scoped to balance-derived equity
+    (the same reason the live path's config-constant stand-in is immune)."""
+    repo.upsert_transaction(_reward_income_tx("rx1", "2000"))
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("10000")
+
+
 # -- paper fills sized off paper equity (P4 Task 6) -----------------------------
 
 
