@@ -12,16 +12,15 @@ import dataclasses
 from decimal import Decimal
 from pathlib import Path
 
-import keel.research.walkforward as wf
 from click.testing import CliRunner
 
+import keel.research.walkforward as wf
 from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
-
 
 # -- fixtures: candles whose every trade is hand-computable ---------------------------------------
 #
@@ -226,7 +225,7 @@ def test_walk_forward_test_trades_stay_inside_their_test_window():
     )
     for b, m in zip(bounds, report.fold_metrics):
         assert b.train_end == b.test_start  # windows disjoint by construction
-        window_ts = [c.ts for c in candles[b.test_start : b.test_end]]
+        assert b.test_end <= len(candles)
         assert m.test_n_trades == len(m.test_trade_pnl)
         # the pooled series cannot reach outside the fold's own test trades
         assert len(m.test_trade_pnl) == m.test_n_trades
@@ -306,9 +305,7 @@ def test_walk_forward_refuses_zero_folds():
     import pytest
 
     with pytest.raises(ValueError, match="fold"):
-        wf.walk_forward(
-            FixedBandRule(), _rising(30), folds_bounds=[], fee_pct=Decimal(0)
-        )
+        wf.walk_forward(FixedBandRule(), _rising(30), folds_bounds=[], fee_pct=Decimal(0))
 
 
 # -- the refusal to rank, stated and enforced -----------------------------------------------------
@@ -355,8 +352,15 @@ def test_report_dataclass_has_no_selection_fields():
     assert not any(name.startswith("best") for name in names), names
     assert not any("select" in name or "chosen" in name for name in names), names
     # what the report DOES carry: the given set's descriptor and per-fold test metrics
-    for required in ("rule_name", "n_folds", "fold_metrics", "median_test_expectancy",
-                     "n_folds_test_positive", "degradation", "stability_note"):
+    for required in (
+        "rule_name",
+        "n_folds",
+        "fold_metrics",
+        "median_test_expectancy",
+        "n_folds_test_positive",
+        "degradation",
+        "stability_note",
+    ):
         assert required in names
 
 
@@ -477,8 +481,15 @@ def _invoke_wf(runner: CliRunner, db: Path, ledger: Path, *extra: str):
 def test_cli_help_lists_the_knobs_and_pins_the_absence_of_a_seed():
     result = CliRunner().invoke(cli, ["trials", "walk-forward", "--help"])
     assert result.exit_code == 0
-    for needle in ("--rule", "--train-bars", "--test-bars", "--step-bars",
-                   "--granularity", "--ledger", "--session"):
+    for needle in (
+        "--rule",
+        "--train-bars",
+        "--test-bars",
+        "--step-bars",
+        "--granularity",
+        "--ledger",
+        "--session",
+    ):
         assert needle in result.output
     # Deterministic by construction: nothing samples, so nothing takes a seed.
     assert "--seed" not in result.output
@@ -487,9 +498,7 @@ def test_cli_help_lists_the_knobs_and_pins_the_absence_of_a_seed():
 def test_cli_appends_exactly_one_row_per_fold_and_the_chain_verifies(tmp_path):
     db = _wf_db(tmp_path, candles=True)
     ledger = tmp_path / "trials.jsonl"
-    result = _invoke_wf(
-        CliRunner(), db, ledger, "--train-bars", "20", "--test-bars", "10"
-    )
+    result = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "20", "--test-bars", "10")
     assert result.exit_code == 0, result.output
     assert "does not rank" in result.output
     assert "fee_pct" in result.output  # every printed number travels with its fee
@@ -515,16 +524,18 @@ def test_cli_refusals_write_no_rows(tmp_path):
     ledger = tmp_path / "trials.jsonl"
 
     # window larger than the cached series: ValueError -> ClickException, no rows.
-    too_big = _invoke_wf(
-        CliRunner(), db, ledger, "--train-bars", "90", "--test-bars", "90"
-    )
+    too_big = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "90", "--test-bars", "90")
     assert too_big.exit_code != 0
     assert "exceeds" in too_big.output
     assert not ledger.exists() or trials_ledger.read_trials(ledger) == []
 
     # no candles cached: nothing to fold over.
-    empty_db = _wf_db(tmp_path / "bare", candles=False)
-    no_candles = _invoke_wf(CliRunner(), empty_db, ledger)
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    empty_db = _wf_db(bare, candles=False)
+    no_candles = _invoke_wf(
+        CliRunner(), empty_db, ledger, "--train-bars", "20", "--test-bars", "10"
+    )
     assert no_candles.exit_code != 0
     assert "no candles" in no_candles.output
     assert not ledger.exists() or trials_ledger.read_trials(ledger) == []

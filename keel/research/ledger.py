@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import Any
 
 PROVENANCE = frozenset({"a_priori", "fitted"})
-KINDS = frozenset({"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge"})
+#: `walk_forward` (#445): one diagnostic row per fold of a rolling-origin validation of a
+#: GIVEN parameter set -- never a selection among sets, so always `diagnostic_only`.
+KINDS = frozenset(
+    {"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge", "walk_forward"}
+)
 DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
 
 #: A CSCV column is a diagnostic, not a decision (spec §4.4) -- it does not count toward N.
