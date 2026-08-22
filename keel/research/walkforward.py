@@ -25,7 +25,9 @@ float, exactly as `deflate.py` documents its probabilities -- none of it is mone
 
 Fold semantics (rolling-origin, sliding both windows):
     fold k:  train [k*step, k*step + train_bars)  test [k*step + train_bars, ... + test_bars)
-`step` defaults to `test_bars` (non-overlapping tests); a smaller step overlaps them.
+`step` defaults to `test_bars` (non-overlapping tests); a smaller step overlaps them, and
+the pooled test series then DEDUPLICATES by trade identity (entry_ts, exit_ts, pnl) so a
+trade covered by two windows is counted once, not once per covering fold (#445).
 
 Warmup/context, stated rather than implied. Rules need lookback before they can detect, so a
 slice's first bars are spent warming up. The TRAIN run of fold k is walked over
@@ -36,7 +38,12 @@ that asymmetry is the honest reading of "when available" and biases nothing down
 train side exists for the in-sample vs out-of-sample honesty table, never for selection).
 The TEST run is walked over the test bars ALONE: the out-of-sample side is given no
 information from before its window, so it pays its own warmup cost -- fewer possible test
-trades, i.e. the conservative direction, never the flattering one.
+trades, i.e. the conservative direction, never the flattering one. The limit of that
+conservatism is a fold whose test window closes NO trades (a warmup-hungry rule in short
+test windows): such a fold measured NOTHING, so it is excluded from every aggregate and
+named in the stability note ("N of M folds closed no test trades") -- counting it as a zero
+would fabricate a break-even fold and pull a losing rule's median UP, the flattering
+direction the line above forswears (#445).
 """
 
 from __future__ import annotations
@@ -93,7 +100,13 @@ class FoldMetrics:
     The TEST side is the finding; `train_*` exists so the report can state in-sample vs
     out-of-sample side by side (the honesty table). `test_trade_pnl` is the fold's closed
     per-trade test P&L in run order -- the series the CLI's ledger row for this fold
-    carries, so a reader can recompute every number above from the ledger alone."""
+    carries, so a reader can recompute every number above from the ledger alone.
+
+    A fold that closed no test trades (`test_n_trades == 0`) measured nothing on the test
+    side: its `test_expectancy`/`test_win_rate`/`test_max_drawdown` are the empty-series
+    zeros `stats.summarize` returns, `test_n_trades` is the marker that says so, and every
+    report aggregate excludes such folds (#445) -- a zero there would fabricate a
+    break-even fold out of a measurement that never happened."""
 
     fold_index: int
     train_start: int
@@ -114,21 +127,30 @@ class WalkForwardReport:
     """Per-fold test metrics plus aggregates for ONE given rule. Carries the identity of
     nothing to favour -- see the module docstring's Strathern rail.
 
-    Halves convention (pinned by test): with an ODD fold count the middle fold belongs to
-    neither half -- the early half is the first n//2 folds, the late half the last n//2 --
-    so the degradation compares equal-sized halves around a dropped middle. With fewer than
-    two folds there are no halves and `degradation` is None rather than an invented 0.
+    Aggregates are computed over the folds that MEASURED something (`test_n_trades > 0`,
+    reported as `n_folds_with_test_trades`); a zero-test-trade fold is named in the
+    stability note, never counted as a zero (#445).
 
-    `test_trade_pnl` pools every fold's closed test P&L (run order) and `test_span_seconds`
-    spans the first test window's first bar to the last test window's last bar; the two
-    exist only to feed the render-time window-size guidance its raw quantities."""
+    Halves convention (pinned by test): with an ODD count of measuring folds the middle
+    measuring fold belongs to neither half -- the early half is the first n//2 measuring
+    folds, the late half the last n//2 -- so the degradation compares equal-sized halves
+    around a dropped middle. With fewer than two measuring folds there are no halves and
+    `degradation` is None rather than an invented 0; likewise `median_test_expectancy` is
+    None when no fold measured anything.
+
+    `test_trade_pnl` pools every fold's closed test P&L (run order), DEDUPLICATED by trade
+    identity (entry_ts, exit_ts, pnl) so an overlapping-step run counts each underlying
+    test trade once instead of once per covering fold; `test_span_seconds` spans the first
+    test window's first bar to the last test window's last bar. The two exist only to feed
+    the render-time window-size guidance its raw quantities."""
 
     rule_name: str
     rule_params: dict[str, Any]
     n_folds: int
     fold_metrics: tuple[FoldMetrics, ...]
-    median_test_expectancy: Decimal
+    median_test_expectancy: Decimal | None
     n_folds_test_positive: int
+    n_folds_with_test_trades: int
     early_half_median: Decimal | None
     late_half_median: Decimal | None
     degradation: Decimal | None
@@ -201,10 +223,25 @@ def _median(values: Sequence[Decimal]) -> Decimal:
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
-def _stability_note(n_folds: int, n_positive: int, degradation: Decimal | None) -> str:
+def _stability_note(
+    n_folds: int,
+    n_positive: int,
+    n_with_test_trades: int,
+    degradation: Decimal | None,
+) -> str:
     """A description of what the folds showed, and nothing else -- no fold, window or
-    parameter set is pointed at, because none was compared for selection."""
-    parts = [f"positive in {n_positive}/{n_folds} folds on test expectancy"]
+    parameter set is pointed at, because none was compared for selection.
+
+    A fold that closed no test trades measured NOTHING: it is named as such ("N of M folds
+    closed no test trades") rather than narrated through the zeros its empty series would
+    inject into the aggregates (#445) -- "degradation level with the early half" over two
+    folds that never traded is drift narration about a measurement that never happened."""
+    parts: list[str] = []
+    if n_with_test_trades:
+        parts.append(f"positive in {n_positive}/{n_folds} folds on test expectancy")
+    n_zero = n_folds - n_with_test_trades
+    if n_zero:
+        parts.append(f"{n_zero} of {n_folds} folds closed no test trades")
     if degradation is None:
         parts.append("degradation not computable (fewer than two halves to compare)")
     elif degradation < 0:
@@ -235,6 +272,13 @@ def walk_forward(
 
     metrics: list[FoldMetrics] = []
     pooled: list[Decimal] = []
+    # Trade identity for the pooled series: with step < test_bars consecutive test windows
+    # overlap and the SAME underlying trade is re-run in every covering fold's window-alone
+    # backtest. Counting it once per fold would inflate n (and so trades/year) and
+    # understate min_trades -- the flattering direction -- so the pool deduplicates by
+    # (entry_ts, exit_ts, pnl). A trade enters at most once per bar, so the tuple is a
+    # sound identity within one report (#445; a no-op at the non-overlapping default).
+    seen_identities: set[tuple[int, int | None, Decimal]] = set()
     span_first_ts: int | None = None
     span_last_ts: int | None = None
 
@@ -286,7 +330,11 @@ def walk_forward(
                 test_trade_pnl=test_pnls,
             )
         )
-        pooled.extend(test_pnls)
+        for trade, pnl in zip(test_trades, test_pnls):
+            identity = (trade.entry_ts, trade.exit_ts, pnl)
+            if identity not in seen_identities:
+                seen_identities.add(identity)
+                pooled.append(pnl)
         fold_first_ts = candles[bounds.test_start].ts
         fold_last_ts = candles[bounds.test_end - 1].ts
         if span_first_ts is None or fold_first_ts < span_first_ts:
@@ -294,14 +342,18 @@ def walk_forward(
         if span_last_ts is None or fold_last_ts > span_last_ts:
             span_last_ts = fold_last_ts
 
-    expectancies = [m.test_expectancy for m in metrics]
-    half = len(metrics) // 2
+    # Aggregates read ONLY the folds that measured something: a zero-test-trade fold's
+    # empty series would otherwise inject a fabricated break-even 0 into every median and
+    # half -- pulling a losing rule's aggregates UP, the flattering direction (#445).
+    measuring = [m for m in metrics if m.test_n_trades > 0]
+    expectancies = [m.test_expectancy for m in measuring]
+    half = len(measuring) // 2
     early_median: Decimal | None = None
     late_median: Decimal | None = None
     degradation: Decimal | None = None
     if half:
         early_median = _median(expectancies[:half])
-        late_median = _median(expectancies[len(metrics) - half :])
+        late_median = _median(expectancies[len(measuring) - half :])
         degradation = late_median - early_median
     n_positive = sum(1 for value in expectancies if value > 0)
 
@@ -310,12 +362,13 @@ def walk_forward(
         rule_params=dict(getattr(rule, "params", {}) or {}),
         n_folds=len(metrics),
         fold_metrics=tuple(metrics),
-        median_test_expectancy=_median(expectancies),
+        median_test_expectancy=_median(expectancies) if expectancies else None,
         n_folds_test_positive=n_positive,
+        n_folds_with_test_trades=len(measuring),
         early_half_median=early_median,
         late_half_median=late_median,
         degradation=degradation,
-        stability_note=_stability_note(len(metrics), n_positive, degradation),
+        stability_note=_stability_note(len(metrics), n_positive, len(measuring), degradation),
         test_trade_pnl=tuple(pooled),
         test_span_seconds=(
             (span_last_ts - span_first_ts)
@@ -404,10 +457,24 @@ def render_lines(report: WalkForwardReport) -> list[str]:
             f"{m.train_expectancy:>10} {m.test_expectancy:>10} "
             f"{m.test_win_rate:>9} {m.test_max_drawdown:>11}"
         )
-    halves = "middle fold excluded from both halves" if report.n_folds % 2 else "equal halves"
+    halves = (
+        "middle fold excluded from both halves"
+        if report.n_folds_with_test_trades % 2
+        else "equal halves"
+    )
+    if report.n_folds_with_test_trades < report.n_folds:
+        halves += (
+            f"; halves span only the {report.n_folds_with_test_trades} fold(s) "
+            "that closed test trades"
+        )
+    median = (
+        str(report.median_test_expectancy)
+        if report.median_test_expectancy is not None
+        else "not computable (no fold closed a test trade)"
+    )
     lines += [
         "",
-        f"  median test expectancy : {report.median_test_expectancy}",
+        f"  median test expectancy : {median}",
         f"  folds test-positive    : {report.n_folds_test_positive}/{report.n_folds}",
         f"  degradation            : {report.degradation} "
         f"(late-half median minus early-half; {halves})",

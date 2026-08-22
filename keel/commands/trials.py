@@ -619,6 +619,7 @@ def trials_walk_forward(
                     for key, value in {
                         "n_folds": report.n_folds,
                         "n_folds_test_positive": report.n_folds_test_positive,
+                        "n_folds_with_test_trades": report.n_folds_with_test_trades,
                         "median_test_expectancy": report.median_test_expectancy,
                         "degradation": report.degradation,
                         "train_n_trades": fold.train_n_trades,

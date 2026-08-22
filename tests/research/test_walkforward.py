@@ -19,6 +19,7 @@ from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
+from keel.strategy import backtest as backtest_mod
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
 
@@ -71,6 +72,54 @@ class NeverEnterRule(FixedBandRule):
 
     def detect(self, candles_by_tf) -> Setup | None:  # type: ignore[no-untyped-def]
         return None
+
+
+class WarmupHungryRule(FixedBandRule):
+    """Needs `needed` bars of history before it will ever fire -- a 56-bar rule handed
+    20-bar test windows is the #445 warmup-starvation shape: the train side (walked with
+    all earlier bars) can measure, the test side (window bars alone) never can."""
+
+    def __init__(self, needed: int = 56) -> None:
+        super().__init__()
+        self.name = "warmup_hungry"
+        self._needed = needed
+
+    def detect(self, candles_by_tf) -> Setup | None:  # type: ignore[no-untyped-def]
+        candles = candles_by_tf.get(Granularity.ONE_HOUR) or list(candles_by_tf.values())[-1]
+        if len(candles) < self._needed:
+            return None
+        return super().detect(candles_by_tf)
+
+
+class LevelGatedRule(FixedBandRule):
+    """Fires only when the last close is at/above `level` -- bar CONTENT, not window
+    length, decides, so some folds measure and others close no test trades."""
+
+    def __init__(self, level: str = "500") -> None:
+        super().__init__()
+        self.name = "level_gated"
+        self._level = Decimal(level)
+
+    def detect(self, candles_by_tf) -> Setup | None:  # type: ignore[no-untyped-def]
+        candles = candles_by_tf.get(Granularity.ONE_HOUR) or list(candles_by_tf.values())[-1]
+        if candles[-1].close < self._level:
+            return None
+        return super().detect(candles_by_tf)
+
+
+class EveryFourthBarRule(FixedBandRule):
+    """Signal-anchored entries (bars at index 0 mod 4): the SAME entries re-run in every
+    covering fold of an overlapping-step run, the #445 pooled-double-count shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = "every_fourth_bar"
+
+    def detect(self, candles_by_tf) -> Setup | None:  # type: ignore[no-untyped-def]
+        candles = candles_by_tf.get(Granularity.ONE_HOUR) or list(candles_by_tf.values())[-1]
+        if ((candles[-1].ts - 1_700_000_000) // 86400) % 4 != 0:
+            return None
+        return super().detect(candles_by_tf)
 
 
 def _rising(n: int, *, ts0: int = 1_700_000_000, p0: Decimal = Decimal(100), gap: int = 0):
@@ -308,6 +357,118 @@ def test_walk_forward_refuses_zero_folds():
         wf.walk_forward(FixedBandRule(), _rising(30), folds_bounds=[], fee_pct=Decimal(0))
 
 
+# -- zero-test-trade folds never fabricate aggregates (#445) ---------------------------------------
+
+
+def test_warmup_starved_folds_never_fabricate_aggregates():
+    """THE #445 MAJOR: a 56-bar rule in 20-bar test windows closes zero test trades in
+    EVERY fold. Before the fix the report narrated measurements that never happened --
+    median test expectancy 0, degradation 0, "late-half median level with the early half"
+    -- and for a losing rule those injected zeros pulled the median UP, the flattering
+    direction. Now: nothing measured is nothing reported."""
+    candles = _rising(100)
+    bounds = wf.folds(100, train_bars=60, test_bars=20)
+    assert len(bounds) == 2
+    report = wf.walk_forward(
+        WarmupHungryRule(56),
+        candles,
+        folds_bounds=bounds,
+        fee_pct=Decimal(0),
+        slippage_pct=Decimal(0),
+    )
+    # every fold closed zero test trades (the train side, walked with earlier bars, can)
+    assert [m.test_n_trades for m in report.fold_metrics] == [0, 0]
+    assert all(m.train_n_trades > 0 for m in report.fold_metrics)
+    # no aggregate is fabricated from the empty series
+    assert report.n_folds_with_test_trades == 0
+    assert report.median_test_expectancy is None
+    assert report.early_half_median is None
+    assert report.late_half_median is None
+    assert report.degradation is None
+    # the note NAMES the unmeasured folds instead of narrating drift through their zeros
+    assert "2 of 2 folds closed no test trades" in report.stability_note
+    assert "not computable" in report.stability_note
+    assert "level with the early half" not in report.stability_note
+    rendered = "\n".join(wf.render_lines(report))
+    assert "not computable (no fold closed a test trade)" in rendered
+    assert "level with the early half" not in rendered
+
+
+def test_aggregates_use_only_measuring_folds_mixed_case():
+    """Some folds measure, some close no test trades: aggregates read ONLY the measuring
+    folds, exactly. Pinned case (train 10 / test 10 over 40 bars): fold 0's test window
+    sits below the rule's 500 level (0 trades), folds 1 and 2 measure +20 and +18 -- so
+    the median is 19 and the degradation is -2. (Before the fix fold 0's fabricated 0 sat
+    in the early half and the degradation rendered +18, the flattering direction.)"""
+    candles = (
+        _rising(20)
+        + _rising(10, ts0=1_700_000_000 + 20 * 86400, p0=Decimal(1000))
+        + _rising(10, ts0=1_700_000_000 + 30 * 86400, p0=Decimal(1010), gap=2)
+    )
+    report = wf.walk_forward(
+        LevelGatedRule("500"),
+        candles,
+        folds_bounds=wf.folds(40, train_bars=_TRAIN, test_bars=_TEST),
+        fee_pct=Decimal(0),
+        slippage_pct=Decimal(0),
+    )
+    assert [m.test_n_trades for m in report.fold_metrics] == [0, 5, 5]
+    assert [m.test_expectancy for m in report.fold_metrics[1:]] == [Decimal(20), Decimal(18)]
+    assert report.n_folds_with_test_trades == 2
+    assert report.median_test_expectancy == Decimal(19)  # median of [20, 18], NOT of [0,20,18]
+    assert report.n_folds_test_positive == 2
+    assert report.early_half_median == Decimal(20)
+    assert report.late_half_median == Decimal(18)
+    assert report.degradation == Decimal(-2)  # 18 - 20 over the MEASURING folds only
+    assert "1 of 3 folds closed no test trades" in report.stability_note
+    assert "below the early half" in report.stability_note
+
+
+def test_overlapping_step_pools_each_underlying_trade_once():
+    """#445 m2: with step < test_bars the same signal-anchored trade is re-run in every
+    covering fold's window-alone backtest. The pooled guidance series counts it ONCE
+    (identity = entry_ts + exit_ts + pnl): 11 per-fold trades, 7 distinct underlying
+    trades -- the pre-dedupe pool of 11 inflated n and trades/year and understated
+    min_trades, the flattering direction."""
+    report = wf.walk_forward(
+        EveryFourthBarRule(),
+        _rising(40),
+        folds_bounds=wf.folds(40, train_bars=_TRAIN, test_bars=_TEST, step_bars=5),
+        fee_pct=Decimal(0),
+        slippage_pct=Decimal(0),
+    )
+    assert [m.test_n_trades for m in report.fold_metrics] == [2, 2, 3, 2, 2]
+    assert sum(m.test_n_trades for m in report.fold_metrics) == 11
+    assert len(report.test_trade_pnl) == 7
+    assert report.test_trade_pnl == (Decimal(20),) * 7
+
+
+def test_train_metrics_count_only_trades_entered_inside_the_train_window():
+    """#445 m3: the train run is walked over `candles[:train_end]` (full earlier-bar
+    context) but reports ONLY trades ENTERED inside the window -- the exact-count pin.
+    Fold 2 (train [20,30)) closes 15 trades over candles[:30]; exactly 5 of them enter
+    inside [20,30), and 5 is what the fold reports. Without the filter the honesty table
+    would credit the window with 15 trades, 10 of which belong to earlier windows."""
+    candles = _rising(40)
+    report = wf.walk_forward(
+        FixedBandRule(),
+        candles,
+        folds_bounds=wf.folds(40, train_bars=_TRAIN, test_bars=_TEST),
+        fee_pct=Decimal(0),
+        slippage_pct=Decimal(0),
+    )
+    assert [m.train_n_trades for m in report.fold_metrics] == [5, 5, 5]
+    # the unfiltered count the filter is holding back: fold 2's raw run over candles[:30]
+    raw = backtest_mod.backtest(
+        FixedBandRule(), candles[:30], fee_pct=Decimal(0), slippage_pct=Decimal(0)
+    )
+    lo, hi = candles[20].ts, candles[29].ts
+    entered_in_window = [t for t in raw.trades if t.outcome != "open" and lo <= t.entry_ts <= hi]
+    assert len([t for t in raw.trades if t.outcome != "open"]) == 15
+    assert len(entered_in_window) == 5
+    assert report.fold_metrics[2].train_n_trades == len(entered_in_window) == 5
+
+
 # -- the refusal to rank, stated and enforced -----------------------------------------------------
 
 
@@ -433,8 +594,12 @@ def _cli_candles(n: int) -> list[Candle]:
     return candles
 
 
-def _wf_db(tmp_path: Path, *, candles: bool) -> Path:
-    """A temp db holding one small-lookback turtle rule and (optionally) its candles."""
+def _wf_db(tmp_path: Path, *, candles: bool, entry_lookback: int = 5, bars: int = 96) -> Path:
+    """A temp db holding one small-lookback turtle rule and (optionally) its candles.
+
+    `entry_lookback`/`bars` let a test build the warmup-starved shape: the rule needs
+    `max(entry_lookback, adx_period=14, atr_period=5) + 2` bars of history before it can
+    detect, so e.g. entry_lookback=54 needs 56 -- more than any 20-bar test window."""
     conn = connect(str(tmp_path / "wf.db"))
     migrate(conn)
     repo = Repository(conn)
@@ -442,7 +607,7 @@ def _wf_db(tmp_path: Path, *, candles: bool) -> Path:
         "turtle_breakout",
         {
             "product_id": "BTC-USD",
-            "entry_lookback": 5,
+            "entry_lookback": entry_lookback,
             "exit_lookback": 3,
             "atr_period": 5,
             "atr_stop_mult": "2",
@@ -451,7 +616,7 @@ def _wf_db(tmp_path: Path, *, candles: bool) -> Path:
         now_ts=1_800_000_000,
     )
     if candles:
-        repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _cli_candles(96))
+        repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _cli_candles(bars))
     conn.close()
     return tmp_path / "wf.db"
 
@@ -514,8 +679,64 @@ def test_cli_appends_exactly_one_row_per_fold_and_the_chain_verifies(tmp_path):
     assert first.params["train_start"] == 0 and first.params["test_end"] == 30
     assert last.params["train_start"] == 60 and last.params["test_end"] == 90
     assert first.params["granularity"] == "ONE_DAY"
-    assert first.summary["test_n_trades"] >= 0  # fold metrics ride the summary
-    assert "median_test_expectancy" in first.summary
+
+    # This fixture's rule needs 16 bars of history (max(5, adx 14, atr 5) + 2) and every
+    # test window is 10 bars alone, so every fold closes ZERO test trades: the rows stay
+    # ledgered with series_missing=True (#445 m3) and the summary carries the per-fold
+    # counts but OMITS the aggregates it cannot compute -- no fabricated 0 median (#445).
+    assert all(r.summary["test_n_trades"] == 0 for r in rows)
+    assert all(r.series_missing is True for r in rows)
+    assert all("degradation" not in r.summary for r in rows)
+    assert all("median_test_expectancy" not in r.summary for r in rows)
+    assert first.summary["n_folds"] == 7
+    assert first.summary["n_folds_with_test_trades"] == 0
+    assert "7 of 7 folds closed no test trades" in result.output
+    assert trials_ledger.verify_chain(ledger) == []
+
+
+def test_cli_single_fold_run_reads_back_and_never_bricks_the_ledger(tmp_path):
+    """THE #445 BLOCKER, end to end: folds(80, train_bars=60, test_bars=20) yields exactly
+    ONE fold, so degradation is None by design. The writer must OMIT the key (never write
+    a JSON null -- one null row made every later read of the append-only ledger raise
+    Decimal(None) forever) and the ledger must read back and verify afterwards."""
+    db = _wf_db(tmp_path, candles=True)  # 96 bars: one fold at [0,80), start 20 won't fit
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "60", "--test-bars", "20")
+    assert result.exit_code == 0, result.output
+    assert "degradation not computable" in result.output
+
+    rows = trials_ledger.read_trials(ledger)  # read-back succeeds -- the pre-fix writer's
+    # null degradation bricked exactly here
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.summary["n_folds"] == 1
+    assert "degradation" not in row.summary  # omitted, never nulled
+    assert "null" not in (ledger.read_text(encoding="utf-8"))
+    assert trials_ledger.verify_chain(ledger) == []
+
+
+def test_cli_warmup_starved_rule_reports_zeros_honestly(tmp_path):
+    """A 56-bar rule (entry_lookback=54) over 20-bar test windows: every fold closes zero
+    test trades (#445 MAJOR at the CLI). The rows exist, say series_missing, omit the
+    not-computable aggregates, and the rendered note names the no-test-trade folds -- no
+    fabricated median 0, no "level with the early half" drift narration."""
+    db = _wf_db(tmp_path, candles=True, entry_lookback=54, bars=156)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "60", "--test-bars", "20")
+    assert result.exit_code == 0, result.output
+
+    # 156 bars, train 60 + test 20 stepping 20: folds at starts 0/20/40/60 -> exactly 4.
+    rows = trials_ledger.read_trials(ledger)
+    assert len(rows) == 4
+    assert all(r.summary["test_n_trades"] == 0 for r in rows)
+    assert all(r.series_missing is True for r in rows)
+    assert all("degradation" not in r.summary for r in rows)
+    assert all("median_test_expectancy" not in r.summary for r in rows)
+    assert all(r.summary["n_folds_with_test_trades"] == 0 for r in rows)
+    rendered = result.output
+    assert "4 of 4 folds closed no test trades" in rendered
+    assert "level with the early half" not in rendered
+    assert "not computable (no fold closed a test trade)" in rendered
     assert trials_ledger.verify_chain(ledger) == []
 
 
@@ -539,24 +760,3 @@ def test_cli_refusals_write_no_rows(tmp_path):
     assert no_candles.exit_code != 0
     assert "no candles" in no_candles.output
     assert not ledger.exists() or trials_ledger.read_trials(ledger) == []
-
-
-def test_cli_single_fold_run_reads_back_and_never_bricks_the_ledger(tmp_path):
-    """THE #445 BLOCKER, end to end: folds(80, train_bars=60, test_bars=20) yields exactly
-    ONE fold, so degradation is None by design. The writer must OMIT the key (never write
-    a JSON null -- one null row made every later read of the append-only ledger raise
-    Decimal(None) forever) and the ledger must read back and verify afterwards."""
-    db = _wf_db(tmp_path, candles=True)  # 96 bars: one fold at [0,80), start 20 won't fit
-    ledger = tmp_path / "trials.jsonl"
-    result = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "60", "--test-bars", "20")
-    assert result.exit_code == 0, result.output
-    assert "degradation not computable" in result.output
-
-    rows = trials_ledger.read_trials(ledger)  # read-back succeeds -- the pre-fix writer's
-    # null degradation bricked exactly here
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.summary["n_folds"] == 1
-    assert "degradation" not in row.summary  # omitted, never nulled
-    assert "null" not in ledger.read_text(encoding="utf-8")
-    assert trials_ledger.verify_chain(ledger) == []
