@@ -220,9 +220,9 @@ jobs:
   # ONE whole-repo scan, not the reference's per-module matrix. The reference fans out over a
   # Node monorepo whose modules each have their own package.json, tsconfig and test run, and it
   # builds that list with a `./.github/actions/load-services` composite action. keel has no such
-  # action, and its five `packages/*` workspace members are not independent in that way: they
+  # action, and its seven `packages/*` workspace members are not independent in that way: they
   # share one lockfile, one interpreter, one `pytest` invocation and one coverage report. Splitting
-  # them into five Sonar projects would fragment the quality gate and the coverage number across
+  # them into seven Sonar projects would fragment the quality gate and the coverage number across
   # units nobody releases separately. `sonar.sources` in sonar-project.properties covers keel/,
   # packages/ and scripts/ in a single analysis instead.
   sonarqube:
@@ -302,7 +302,7 @@ jobs:
       #   --no-dev              scan what ships. mypy/pytest/ruff never reach a user's machine, so
       #                         a CVE in one is not a vulnerability in keel. Drop this flag to
       #                         widen the scan to the dev toolchain.
-      #   --no-emit-workspace   omit the five `-e ./packages/...` editable entries. Those are keel's
+      #   --no-emit-workspace   omit the seven `-e ./packages/...` editable entries. Those are keel's
       #                         own code, not third-party dependencies, and a local path is not
       #                         something Snyk can look up.
       - name: Export the locked dependencies as requirements.txt

@@ -51,7 +51,7 @@ def test_the_lockfile_is_checked_before_anything_can_mutate_it(
 ) -> None:
     """#424: the 0.10.0 release, and the error that pointed everywhere but at the cause.
 
-    A version bump touches seven pyproject.toml files; `uv.lock` is the eighth thing that
+    A version bump touches eight pyproject.toml files; `uv.lock` is the ninth thing that
     must move with them. When it does not, `uv sync` silently re-locks the checkout, the
     release is stamped from a dirty tree, and the failure surfaces FIVE steps later as
     "artifact reports a dirty tree" -- after lint, types, tests and a full build have all

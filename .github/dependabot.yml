@@ -1,7 +1,7 @@
 # Dependabot, watching every manifest the workspace ships (#291).
 #
-# The `pip` ecosystem works per manifest directory, and this workspace is seven
-# distributions: the root plus six under packages/. A directory not listed here is a
+# The `pip` ecosystem works per manifest directory, and this workspace is eight
+# distributions: the root plus seven under packages/. A directory not listed here is a
 # distribution whose dependencies update without review -- tests/test_security_scans.py
 # pins the full set so adding another distribution means adding it here or failing CI.
 # Updates are grouped (one PR per week per ecosystem, not one per package) because this

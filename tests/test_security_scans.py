@@ -9,7 +9,7 @@ the manifests, a weekly `pip-audit` reads the exact locked set the app ships wit
 CodeQL (Python) reads the source -- and `code-quality.yml` stays the OPTIONAL enhanced
 tier (SonarQube + Snyk) for if those tokens are ever created.
 
-This file pins that split. The manifest lists are DERIVED FROM THE FILESYSTEM (a seventh
+This file pins that split. The manifest lists are DERIVED FROM THE FILESYSTEM (a new
 distribution under packages/ that Dependabot and the export do not know about fails here,
 rather than passing because a hand-maintained list was never told), the audit is pinned to
 `uv export --frozen` (the lock as committed, never a fresh resolve), and the secrets rule
@@ -85,9 +85,9 @@ def _pyprojects() -> dict[str, dict]:
 def test_dependabot_watches_every_python_manifest_and_the_actions():
     """Every manifest the filesystem declares -- nothing updates silently.
 
-    The workspace is six distributions today, and Dependabot's `pip` ecosystem works per
+    The workspace is eight distributions today, and Dependabot's `pip` ecosystem works per
     manifest directory: an unlisted directory gets no update PRs, ever. The expected set
-    is DERIVED from packages/*/pyproject.toml, so adding a seventh distribution without
+    is DERIVED from packages/*/pyproject.toml, so adding another distribution without
     telling Dependabot fails here instead of shipping a blind spot.
     """
     path = _ROOT / ".github" / "dependabot.yml"
