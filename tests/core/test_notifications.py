@@ -68,11 +68,12 @@ def test_building_an_event_outside_the_taxonomy_is_refused():
 
 def test_unknown_keys_in_settings_are_ignored_not_errors():
     """Freqtrade's shape: per-event booleans, default off. A settings block naming a key the
-    taxonomy does not know is a stale entry, not a crash -- it simply opts into nothing."""
+    taxonomy does not know is a stale entry, not a crash -- and because the taxonomy is
+    closed, no event can ever carry that key, so it opts into nothing."""
     settings = NotificationSettings(events=frozenset({"rail.armed", "not.a.real.event"}))
 
     assert settings.opted_in("rail.armed") is True
-    assert settings.opted_in("not.a.real.event") is False
+    assert "not.a.real.event" not in EVENTS_BY_KEY  # nothing can ever be sent for it
     assert NotificationSettings().opted_in("rail.armed") is False  # default off
 
 
@@ -124,7 +125,8 @@ def test_an_event_that_is_not_opted_in_is_never_sent():
     settings = NotificationSettings()  # nothing opted in
 
     assert (
-        send_event("https://alerts.example/hook", _expiry_event(), settings, transport=sink) is False
+        send_event("https://alerts.example/hook", _expiry_event(), settings, transport=sink)
+        is False
     )
 
     assert sink.calls == []

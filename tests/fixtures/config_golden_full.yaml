@@ -114,3 +114,9 @@ broker:
   name: alpaca
   endpoint: live
   data_feed: sip
+
+notifications:
+  format: slack
+  events:
+    attestation.expiring: true
+    rail.armed: true

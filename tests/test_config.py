@@ -121,9 +121,7 @@ def test_every_shipped_config_allowlist_still_loads(write_config):
 
 
 def test_load_config_negative_cap_raises_configerror(write_config):
-    text = VALID_CONFIG_YAML.replace(
-        "max_per_order_usd: 100", "max_per_order_usd: -100"
-    )
+    text = VALID_CONFIG_YAML.replace("max_per_order_usd: 100", "max_per_order_usd: -100")
     path = write_config(text)
 
     with pytest.raises(ConfigError, match="max_per_order_usd"):
@@ -188,9 +186,7 @@ def test_assumed_free_volume_usd_parses(write_config) -> None:
     from tests.conftest import VALID_CONFIG_YAML
 
     path = write_config(
-        VALID_CONFIG_YAML.replace(
-            "assumed_free_volume_usd: 500", "assumed_free_volume_usd: 1234.5"
-        )
+        VALID_CONFIG_YAML.replace("assumed_free_volume_usd: 500", "assumed_free_volume_usd: 1234.5")
     )
     config = load_config(path)
     assert config.subscription.assumed_free_volume_usd == Decimal("1234.5")
@@ -209,9 +205,7 @@ def test_unsubscribed_allowance_parses(write_config) -> None:
     # take the last occurrence -- the test would have kept passing while asserting nothing about
     # a document any stricter loader would reject.
     path = write_config(
-        VALID_CONFIG_YAML.replace(
-            "unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: 25"
-        )
+        VALID_CONFIG_YAML.replace("unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: 25")
     )
     assert load_config(path).subscription.unsubscribed_allowance_usd == Decimal("25")
 
@@ -508,11 +502,6 @@ tiers:
 
     with pytest.raises(ConfigError, match="tiers"):
         load_config(path)
-
-
-
-
-
 
 
 # -- logging (engine-activity logging feature) --------------------------------------------------

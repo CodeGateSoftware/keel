@@ -52,6 +52,13 @@
     "profit_trigger_pct": "0.22",
     "streak_cooloff_days": 2
   },
+  "notifications": {
+    "events": [
+      "attestation.expiring",
+      "rail.armed"
+    ],
+    "format": "slack"
+  },
   "paper": {
     "monthly_contribution_usd": "500",
     "starting_equity_usd": "30000"

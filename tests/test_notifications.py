@@ -19,8 +19,8 @@ from decimal import Decimal
 
 from keel_core.notifications import NotificationSettings
 
-from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.commands.doctor import attestation_findings, rail_state_findings
+from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.notifications import (
     ALLOWANCE_NEARING_USED_PCT,
     UnplacedSetup,
@@ -88,8 +88,8 @@ def test_an_attestation_due_within_two_days_fires_and_a_fresh_one_does_not():
     fires on exactly that threshold, from exactly that computation."""
     due_soon = _state(attestation=_attestation(NOW - 5 * DAY))  # 2 of 7 days remain
     assert [e.key for e in due_soon] == ["attestation.expiring"]
-    assert "2 day(s)" in due_soon[0].message
-    assert due_soon[0].fields["days_remaining"] == 2
+    assert "2 day(s)" in due_soon[0].message  # doctor's own detail, numbers included
+    assert due_soon[0].fields["status"] == "warn"
 
     fresh = _state(attestation=_attestation(NOW))  # 7 days remain
     assert fresh == []
@@ -151,9 +151,7 @@ def test_a_comfortable_or_unlimited_allowance_does_not_fire():
     assert unlimited == []
 
     # and the threshold itself is the boundary, not a surprise
-    exactly_at = _state(
-        month_to_date_spend=ALLOWANCE_NEARING_USED_PCT, allowance=Decimal("100")
-    )
+    exactly_at = _state(month_to_date_spend=ALLOWANCE_NEARING_USED_PCT, allowance=Decimal("100"))
     assert [e.key for e in exactly_at] == ["allowance.nearing_exhaustion"]
 
 
