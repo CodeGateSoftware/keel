@@ -586,6 +586,55 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
     return findings
 
 
+def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
+    """Partially-filled live orders (#446) -- the condition the brackets are sized wrong for.
+
+    A row whose venue-observed `filled_quantity` is below its ordered `qty` means either a
+    resting order the venue is partway through (`partially_filled`, still working, expected to
+    resolve on its own) or a terminal order that filled short -- the one that matters, because
+    everything sized from the order assumed it all filled and the exit bracket can be oversized
+    for what is actually held. WARN, not FAIL: a partial is a real state a human should size the
+    bracket to, not a fault in the deployment -- and the resting kind usually resolves itself.
+
+    Rows with no `filled_quantity` (everything written before #446) are not judged: NULL means
+    "not observed", and guessing a partial from `status` alone would flag resting orders the
+    venue never began executing.
+    """
+    partials = [
+        o
+        for o in orders
+        if o.get("mode") == "live"
+        and o.get("filled_quantity") is not None
+        and o.get("qty") is not None
+        and Decimal(str(o["filled_quantity"])) < Decimal(str(o["qty"]))
+    ]
+    if not partials:
+        return [
+            Finding(
+                "fill.partial",
+                OK,
+                "no partially-filled orders",
+                "every observed fill matches its ordered size",
+                "-",
+            )
+        ]
+    described = ", ".join(
+        f"{o.get('product_id')} order {o.get('id')}: {o.get('filled_quantity')} of "
+        f"{o.get('qty')} filled"
+        for o in partials
+    )
+    return [
+        Finding(
+            "fill.partial",
+            WARN,
+            f"{len(partials)} order(s) partially filled",
+            f"{described} -- a bracket sized from the ORDERED quantity may be oversized for "
+            "what is held",
+            "cancel & re-place the bracket at the filled size (automated resize: #502)",
+        )
+    ]
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -722,6 +771,8 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         mean_buy_notional=None,
     )
     findings += veto_findings(log_lines, since_ts=now_ts - 7 * 86_400)
+    # A repo read, like every other check -- pinned read-only by the same change-counter test.
+    findings += partial_fill_findings(repo.get_orders(mode="live"))
 
     from keel.data import freshness as freshness_mod
 

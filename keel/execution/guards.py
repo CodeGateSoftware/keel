@@ -474,15 +474,29 @@ def check(
 
     # 8. No averaging into losers (no martingale, §5.1). DCA is exempt — its whole design is
     #    to keep buying through drawdowns on a fixed small budget (§8/§12.1).
+    #
+    #    The basis is the position's average cost across FILLS, not across INTENTS (#446): a
+    #    partially-filled BUY contributes its `filled_quantity` at its observed average price,
+    #    never its ordered size. Counting the unfilled remainder would weight the basis toward
+    #    a price that bought nothing; skipping the row entirely (the old `status="filled"`-only
+    #    query) would leave the basis blind to real, held inventory.
     if is_buy and not intent.is_dca:
         buy_orders = [
             o
-            for o in repo.get_orders(mode="live", product_id=intent.product_id, status="filled")
+            for o in repo.get_orders(mode="live", product_id=intent.product_id)
             if o["side"] == Side.BUY.value
+            and o["status"] in ("filled", "partially_filled")
         ]
-        total_qty = sum((o["qty"] for o in buy_orders), Decimal("0"))
+        total_qty = Decimal("0")
+        total_cost = Decimal("0")
+        for order in buy_orders:
+            qty = order.get("filled_quantity") or order["qty"] or Decimal("0")
+            price = (
+                order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
+            )
+            total_qty += qty
+            total_cost += qty * (price or Decimal("0"))
         if total_qty > 0:
-            total_cost = sum((_order_notional(o) for o in buy_orders), Decimal("0"))
             avg_cost = total_cost / total_qty
             if intent.entry < avg_cost:
                 violations.append(
