@@ -1,0 +1,54 @@
+name: Installer smoke
+
+# The terminal installer's acceptance evidence (#479): "works on macOS and Linux".
+#
+# This workflow RUNS scripts/install.sh for real -- public repo, real network, real
+# release wheels -- on both platforms it claims, then asserts the installed venv's own
+# `keel versions` exits 0. The installer already runs that verification internally
+# before printing success; the explicit second run is the CI-visible assertion, so a
+# red leg names the installer and not just a step inside it.
+#
+# Triggers: `workflow_dispatch` for on-demand runs, and `pull_request` filtered to the
+# script's path ONLY -- a paths filter any broader would spend two runners per PR on a
+# script that did not change, while no filter at all would spend them on every push to
+# every file. The full suite (which pins the script's properties as text, in
+# tests/test_install_script.py) runs in CI on every PR regardless.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ["scripts/install.sh"]
+
+concurrency:
+  group: installer-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # shellcheck is preinstalled on ubuntu runners and NOT on macOS runners; rather
+      # than add a setup action, the Linux leg carries the lint for both -- the script
+      # is the same bytes on every platform it runs on.
+      - name: Shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/install.sh
+
+      # A throwaway HOME keeps the runner's real home clean and proves the script needs
+      # nothing outside it: the install lands wholly under $HOME/.keel.
+      - name: Run the installer for real, into an isolated HOME
+        run: |
+          export HOME="$RUNNER_TEMP/keel-home"
+          mkdir -p "$HOME"
+          bash scripts/install.sh
+
+      - name: Assert the installed keel verifies
+        run: |
+          export HOME="$RUNNER_TEMP/keel-home"
+          cd "$HOME/.keel"
+          ./.venv/bin/keel versions
