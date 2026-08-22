@@ -7,10 +7,13 @@ from decimal import Decimal
 
 from click.testing import CliRunner
 
+from keel.agent import build_rule_from_params
 from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
+from keel.research.montecarlo import equity_curve, max_drawdown
+from keel.strategy.backtest import backtest
 from keel.types import Candle, Granularity
 
 
@@ -209,7 +212,7 @@ def _mc_candles(n: int, *, start: int = 1_700_000_000) -> list[Candle]:
     return candles
 
 
-def _mc_db(tmp_path):
+def _mc_db(tmp_path, *, bars: int = 96):
     """A temp db holding one turtle rule (small lookbacks, short ATR) and its daily candles --
     96 bars = 5 full sawtooth cycles, whose backtest closes 2 wins and 2 losses."""
     conn = connect(str(tmp_path / "mc.db"))
@@ -227,7 +230,7 @@ def _mc_db(tmp_path):
         status="candidate",
         now_ts=1_800_000_000,
     )
-    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(96))
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(bars))
     conn.close()
     return tmp_path / "mc.db"
 
@@ -415,13 +418,53 @@ def test_monte_carlo_refuses_when_no_closed_trades_and_writes_no_row(tmp_path):
     assert not ledger.exists()
 
 
+def _open_only_candles(*, flat: int = 50, rally: int = 8, start: int = 1_700_000_000):
+    """Bars for the genuinely-all-open case: a long flat run (no breakout, ADX stays low),
+    then a sustained rally that clears both the breakout and the ADX filter -- the rule's
+    FIRST entry fills on the rally and the series ends before any exit bar exists."""
+    candles = []
+    for i in range(flat + rally):
+        o = Decimal(100) if i < flat else Decimal(100 + 8 * (i - flat + 1))
+        close = o + (Decimal("0.5") if i % 2 else Decimal("-0.5"))
+        candles.append(
+            Candle(
+                ts=start + i * 86400,
+                open=o,
+                high=max(o, close) + Decimal(1),
+                low=min(o, close) - Decimal(1),
+                close=close,
+                volume=Decimal("10"),
+            )
+        )
+    return candles
+
+
 def test_monte_carlo_refuses_when_every_trade_is_genuinely_open(tmp_path):
-    """The honest all-open case: candles EXIST at the granularity the rule reads (pinned
-    with --granularity), dca enters on cadence and never exits on a signal, so every trade
-    in the observed backtest is still open at series end -- no realised P&L to resample."""
-    db = _dca_db(tmp_path, candles=True)
+    """The honest all-open case, verified against the backtester before it was written here:
+    with the same turtle params as `_mc_db` over `_open_only_candles()` the observed backtest
+    produces exactly ONE trade and its outcome is "open" -- real candles, a real entry, and
+    zero realised P&L to resample, so the command refuses rather than emitting a degenerate
+    row."""
+    conn = connect(str(tmp_path / "open-only.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule(
+        "turtle_breakout",
+        {
+            "product_id": "BTC-USD",
+            "entry_lookback": 5,
+            "exit_lookback": 3,
+            "atr_period": 5,
+            "atr_stop_mult": "2",
+        },
+        status="candidate",
+        now_ts=1_800_000_000,
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _open_only_candles())
+    conn.close()
+
     ledger = tmp_path / "trials.jsonl"
-    result = _invoke_mc(CliRunner(), db, ledger, "--seed", "3", "--granularity", "ONE_DAY")
+    result = _invoke_mc(CliRunner(), tmp_path / "open-only.db", ledger, "--seed", "3")
     assert result.exit_code != 0
     assert "no closed trades" in result.output
     assert not ledger.exists()
@@ -437,6 +480,25 @@ def test_monte_carlo_candles_mode_refuses_cleanly_when_no_candles_are_cached(tmp
     assert "no candles cached for BTC-USD ONE_HOUR" in result.output
     assert "fetch first" in result.output
     assert not ledger.exists()
+
+
+def test_reported_observed_drawdown_equals_the_engine_statistic():
+    """The equality the CLI comment relies on: montecarlo.max_drawdown over equity_curve of
+    the closed trades equals BacktestResult.max_drawdown (keel/strategy/stats.py's loop) for
+    the same run -- pinned so the two drawdown loops cannot drift apart silently."""
+    rule = build_rule_from_params(
+        "turtle_breakout",
+        {
+            "product_id": "BTC-USD",
+            "entry_lookback": 5,
+            "exit_lookback": 3,
+            "atr_period": 5,
+            "atr_stop_mult": "2",
+        },
+    )
+    res = backtest(rule, _mc_candles(96))
+    pnls = [t.pnl for t in res.trades if t.pnl is not None and t.outcome != "open"]
+    assert max_drawdown(equity_curve(pnls, Decimal("0"))) == res.max_drawdown
 
 
 def test_monte_carlo_caps_paths_at_2000(tmp_path):
