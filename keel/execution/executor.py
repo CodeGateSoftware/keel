@@ -343,6 +343,76 @@ def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
     return bool(enabled)
 
 
+#: `agent_state` key prefix for a product's venue-declared `base_increment` (#516).
+BASE_INCREMENT_PREFIX = "base_increment:"
+
+#: How long a cached increment is trusted. Increments change rarely -- a venue re-scaling a
+#: product is an announced event -- so this is long, and the cost of being wrong is bounded:
+#: a stale increment is still a multiple the venue accepts unless it got FINER, and a finer one
+#: only means we round a little more than needed. Matches rail 17's 7-day attestation TTL rather
+#: than inventing a second cadence.
+BASE_INCREMENT_TTL_SEC = 7 * 24 * 60 * 60
+
+
+def _base_increment_for(
+    broker: Any, repo: Repository, product_id: str, now_ts: int
+) -> Decimal | None:
+    """The venue's finest acceptable `base_size` for `product_id`, cached, or `None` if unknown.
+
+    `None` means UNKNOWN and, for a SELL, means "send the quantity unquantized" -- NOT "refuse".
+    See `_order_configuration`. This function therefore **never raises**: every failure path
+    (no broker in paper mode, a venue error, a malformed or absent field) returns `None`, and the
+    exit proceeds exactly as it did before #516.
+
+    One `list_products` call returns every product, so a miss caches ALL of them rather than
+    re-fetching ~900 products once per allowlisted asset.
+    """
+    key = f"{BASE_INCREMENT_PREFIX}{product_id}"
+    cached = repo.get_state(key)
+    if isinstance(cached, dict):
+        fetched_at = cached.get("fetched_at")
+        raw = cached.get("increment")
+        if isinstance(fetched_at, int) and now_ts - fetched_at < BASE_INCREMENT_TTL_SEC:
+            return _coerce_increment(raw)
+
+    if broker is None:
+        # Paper mode passes no broker; expected, not an error (same reasoning as
+        # `_fetch_available_quote`).
+        return None
+    try:
+        products = broker.list_products()
+    except Exception:
+        log_venue_failure(logger, "executor.base_increment_fetch_failed", product=product_id)
+        return None
+
+    found: Decimal | None = None
+    for product in products or []:
+        pid = product.get("product_id") if isinstance(product, dict) else None
+        if not isinstance(pid, str):
+            continue
+        increment = _coerce_increment(product.get("base_increment"))
+        if increment is None:
+            continue
+        repo.set_state(
+            f"{BASE_INCREMENT_PREFIX}{pid}",
+            {"increment": str(increment), "fetched_at": now_ts},
+        )
+        if pid == product_id:
+            found = increment
+    return found
+
+
+def _coerce_increment(raw: object) -> Decimal | None:
+    """A positive `Decimal` from the venue's string, or `None` -- never raises."""
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal | None:
     """Live available balance of `quote_currency` from `broker.get_accounts()`.
 
@@ -472,6 +542,9 @@ def _build_intent(
         is_dca=False,
         rule_kind=signal.rule_name,
         rule_id=signal.rule_id,
+        # #516. Fetched here, like `available_quote` above, so `_order_configuration` stays a
+        # pure function of the intent. `None` is fine and means "send unquantized".
+        base_increment=_base_increment_for(broker, repo, signal.product_id, now_ts),
     )
 
 
@@ -1206,10 +1279,21 @@ def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
     DCA never tripped this only because its `budget_usd` is a round constant: `"50.000...0"` is
     26 decimal places too, and the venue accepts it because the VALUE is exactly 50.
 
-    SELL is deliberately left unquantized for now. Its `base_size` needs the product's
-    `base_increment`, which varies per asset and which nothing on the Coinbase path fetches yet;
-    guessing one could round an exit down to dust or fail it outright, and an exit that cannot
-    leave is strictly worse than the bug being fixed. Tracked as #513's follow-up.
+    **SELL is quantized too (#516), but its UNKNOWN case is the opposite of BUY's, deliberately.**
+
+    | increment | BUY | SELL |
+    |---|---|---|
+    | known | quantize down, send | quantize down, send |
+    | unknown | REFUSE | send as-is, log |
+
+    A refused BUY costs nothing -- the opportunity passes and no position is affected. A refused
+    SELL strands a position that wanted to exit. Sending full precision at least *sometimes*
+    works (a round quantity is accepted), so refusing would replace "sometimes exits" with
+    "never exits" and make the engine worse than before the fix. **Do not "fix" this asymmetry
+    into consistency.**
+
+    Down, not nearest, on both sides: selling slightly less than held leaves dust, while selling
+    more is rejected for insufficient funds anyway.
     """
     if intent.side == Side.BUY:
         increment = sizing.quote_increment_for(intent.product_id)
@@ -1225,7 +1309,41 @@ def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
                 f"increment {increment} -- refusing to send a zero-size order"
             )
         return {"market_market_ioc": {"quote_size": str(notional)}}
-    return {"market_market_ioc": {"base_size": str(intent.qty)}}
+    return {"market_market_ioc": {"base_size": str(_sell_base_size(intent))}}
+
+
+def _sell_base_size(intent: OrderIntent) -> Decimal:
+    """The SELL quantity at the venue's precision, or unchanged if we cannot know it (#516).
+
+    Never raises and never returns zero-or-less: both would strand an exit, and this function's
+    whole contract is that it can only ever make an exit MORE likely to be accepted.
+    """
+    increment = intent.base_increment
+    if increment is None or increment <= 0:
+        log_event(
+            logger,
+            logging.INFO,
+            "executor.base_increment_unknown",
+            product=intent.product_id,
+            qty=str(intent.qty),
+            detail="sending base_size unquantized -- refusing an exit is worse than imprecision",
+        )
+        return intent.qty
+    quantized = sizing.quantize_down(intent.qty, increment)
+    if quantized <= 0:
+        # The whole position is smaller than one increment -- dust the venue cannot express. Send
+        # the original and let the venue answer; suppressing the order would silently retire a
+        # holding keel still believes it has, and an audited rejection beats a silent no-op.
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.base_size_quantizes_to_zero",
+            product=intent.product_id,
+            qty=str(intent.qty),
+            increment=str(increment),
+        )
+        return intent.qty
+    return quantized
 
 
 def _initial_status(order_configuration: dict[str, Any]) -> str:
@@ -1342,7 +1460,7 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
 
 
 def _bracket_order_configuration(
-    qty: Decimal, target: Decimal, stop: Decimal
+    qty: Decimal, target: Decimal, stop: Decimal, base_increment: Decimal | None = None
 ) -> dict[str, dict[str, str]]:
     """Coinbase's NATIVE trigger bracket: ONE order carrying both exit prices.
 
@@ -1360,13 +1478,28 @@ def _bracket_order_configuration(
     reaches it through the `place_order`/`create_order` path we already use -- no new broker API
     surface, no new transport method.
     """
+    # 516: the protective legs carry a `base_size` too, and had the identical full-precision
+    # defect as a plain SELL. Same rule, same asymmetry: quantize DOWN when the increment is
+    # known, send unchanged when it is not. A bracket that the venue refuses leaves the position
+    # unprotected, so this path must never become more likely to fail than it is today.
+    size = (
+        qty
+        if base_increment is None or base_increment <= 0
+        else _floor_or_original(qty, base_increment)
+    )
     return {
         "trigger_bracket_gtc": {
-            "base_size": str(qty),
+            "base_size": str(size),
             "limit_price": str(target),
             "stop_trigger_price": str(stop),
         }
     }
+
+
+def _floor_or_original(qty: Decimal, increment: Decimal) -> Decimal:
+    """`qty` floored to `increment`, or `qty` unchanged if that would be zero-or-less."""
+    quantized = sizing.quantize_down(qty, increment)
+    return quantized if quantized > 0 else qty
 
 
 # -- exit bracket ------------------------------------------------------------------------------
@@ -1426,7 +1559,9 @@ def place_bracket(
         "autonomous",
         None,
         now_ts,
-        order_configuration=_bracket_order_configuration(qty, target, stop),
+        order_configuration=_bracket_order_configuration(
+            qty, target, stop, _base_increment_for(broker, repo, product_id, now_ts)
+        ),
     )
     if not result.placed:
         # The entry has ALREADY filled by the time we get here, so this is a real position with
@@ -1587,7 +1722,9 @@ def _roll_stop(
         "autonomous",
         None,
         now_ts,
-        order_configuration=_bracket_order_configuration(qty, target, new_stop),
+        order_configuration=_bracket_order_configuration(
+            qty, target, new_stop, _base_increment_for(broker, repo, product_id, now_ts)
+        ),
     )
     if not result.placed:
         # The old bracket is already cancelled, so the position is NAKED right now. There is no
