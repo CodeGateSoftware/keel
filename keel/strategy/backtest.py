@@ -28,6 +28,14 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   lower expectations, not raise them") when finer data isn't available or is still ambiguous at
   that resolution: stop-vs-target ambiguity resolves to the **stop** (a loss). This applies on the
   fill bar too — filling at the open means the rest of that bar can reach either level.
+- **Gap-through-stop fills:** a bar that trades ENTIRELY below the protective stop (`high < stop`)
+  still triggers the exit, filling at that bar's OPEN — worse than the stop, the honest fill for a
+  level passed wholesale before any trade at it (the exit-side mirror of the market-order entry
+  fill above). Containment alone (`low <= stop <= high`) let such a bar slip past silently,
+  stranding a ratcheted trail above every later bar while the ratchet refused to lower it (#442
+  review). The TARGET deliberately keeps containment-only touches: a bar entirely above it is not
+  a touch, because filling that gap at its open would improve the exit — the flattering direction
+  this engine refuses.
 - **No overlap:** `detect()` is only called while **flat** — one instrument, one position at a
   time. A rule whose condition would fire on every bar still yields only sequential,
   non-overlapping trades. It is the *open position* that enforces this. (Under the touch-fill
@@ -44,7 +52,10 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   its stop RATCHETED by `strategy.exit_policy` at each bar the position survives — touch
   checks run against the level carried INTO the bar, management runs at bar end on the
   completed bar, and the stop never widens (the sim-side statement of rail 9). A rule
-  without the knobs (turtle by design, every pre-#442 row) trades exactly as before.
+  without the knobs (turtle by design, every pre-#442 row) trades exactly as before the
+  wiring existed — identity pinned by the unit-identity tests plus the unchanged
+  pre-existing suite with the wiring live (the later gap-through-stop fill above is a
+  separate semantic that applies to static stops too, tested in its own right).
 
 Position sizing (money management) is out of scope for this module (see the future
 `money_mgmt.py`): every trade uses a fixed 1-unit notional, sufficient for computing
@@ -244,6 +255,37 @@ def _touches(candle: Candle, price: Decimal) -> bool:
     return candle.low <= price <= candle.high
 
 
+def _stop_touched(candle: Candle, stop: Decimal) -> bool:
+    """A LONG position's protective-stop touch check: the bar's range spans the level, OR
+    the bar gapped entirely below it (`high < stop`) -- the level was passed wholesale
+    before any trade at it, and the stop triggered on the bar's first tradeable price.
+
+    Containment alone let such a bar slip past the stop silently -- the gap-through hole
+    the #442 review flagged: with a ratcheted trail sitting near price, one gap-down bar
+    stranded the stop above every later bar while the ratchet refused to lower it,
+    understating trailing losses. Both engines and the paper trader share this predicate,
+    so the semantic lives in exactly one place. The TARGET deliberately keeps
+    containment-only touches: a bar entirely ABOVE it is not a touch, because filling
+    that gap at its open would improve the exit -- the flattering direction this engine
+    refuses.
+    """
+    return _touches(candle, stop) or candle.high < stop
+
+
+def _stop_exit_price(candle: Candle, stop: Decimal) -> Decimal | None:
+    """The price a touched stop fills at on `candle`, or `None` if it was not touched.
+
+    A bar that gapped entirely below the level fills at its OPEN -- worse than the stop,
+    the honest fill convention: the first price obtainable after the level was passed
+    (the exit-side mirror of #257's market-order entry logic). A bar whose range spans
+    the level -- including one whose OPEN gapped above it and whose low then pierced it
+    -- fills at the stop itself: the level traded.
+    """
+    if candle.high < stop:
+        return candle.open
+    return stop if _touches(candle, stop) else None
+
+
 def _resolve_order(
     idx: int,
     candles: list[Candle],
@@ -270,7 +312,14 @@ def _resolve_order(
         key=lambda c: c.ts,
     )
     for fc in window:
-        touched = [name for name, price in levels.items() if _touches(fc, price)]
+        touched = [
+            # The stop level gets the gap-through semantics (`_stop_touched`); the target
+            # stays containment-only -- see `_stop_touched` for why that asymmetry is the
+            # conservative direction.
+            name
+            for name, price in levels.items()
+            if (_stop_touched(fc, price) if name == "stop" else _touches(fc, price))
+        ]
         if len(touched) == 1:
             return touched[0]
         if len(touched) > 1:
@@ -476,15 +525,21 @@ def backtest(
         # divide by the ORIGINAL risk (`_close_trade` reads `position.setup.stop`).
         stop = position.stop
         target = position.setup.target
-        stop_touched = _touches(candle, stop)
+        #: The stop's exit fill: `None` when the bar never reached it, the bar's OPEN
+        #: when it gapped entirely through it (`_stop_exit_price`).
+        stop_exit = _stop_exit_price(candle, stop)
+        stop_touched = stop_exit is not None
         target_touched = _touches(candle, target)
 
         exit_price: Decimal | None = None
         if stop_touched and target_touched:
             order = _resolve_order(i, candles, finer_candles, {"target": target, "stop": stop})
-            exit_price = target if order == "target" else stop
+            # `stop_exit` is exactly `stop` in this branch: a bar that gapped through the
+            # stop cannot also touch the target (target > stop for a long), so the
+            # both-touched case is always an in-range touch.
+            exit_price = target if order == "target" else stop_exit
         elif stop_touched:
-            exit_price = stop
+            exit_price = stop_exit
         elif target_touched:
             exit_price = target
         elif rule.exit_signal(position.setup, candles_by_tf):

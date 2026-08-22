@@ -1052,3 +1052,61 @@ def test_a_rule_without_exit_params_trades_identically_in_the_sim():
         return [(t.entry_ts, t.exit_ts, t.entry, t.exit, t.pnl, t.outcome) for t in result.trades]
 
     assert _shape(unset) == _shape(explicit_off)
+
+
+# ---------------------------------------------------------------------------
+# #442 review: a bar that gaps ENTIRELY through the stop still exits (shared helpers,
+# so the sim inherits the hole -- and the fix -- with the backtester)
+# ---------------------------------------------------------------------------
+
+
+def test_a_static_stop_gapped_through_by_a_whole_bar_exits_at_that_bars_open():
+    """Sim-side twin of the backtester's static-gap test: a bar whose high sits wholly
+    below the stop must exit at its OPEN, not slip past and exit on a later recovery bar
+    at the flattered stop price."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),  # bar0: trigger
+        _candle(_HOUR, "100", "101", "99", "100"),  # bar1: fill at open 100
+        _candle(2 * _HOUR, "99", "100", "98", "99"),  # holding
+        _candle(3 * _HOUR, "90", "92", "88", "89"),  # GAP: exits at the open 90
+        _candle(4 * _HOUR, "89", "95", "88", "93"),  # pre-fix: flattered exit at 94
+    ]
+    result = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule("BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"), {}),
+        hourly,
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit == Decimal("90")  # the gap bar's OPEN, not the 94 stop
+    assert result.trades[0].exit_ts == 3 * _HOUR
+    assert result.trades[0].outcome == "loss"
+
+
+def test_a_trailing_stop_stranded_by_a_gap_down_bar_exits_instead():
+    """Sim-side twin of the backtester's trailing-gap test: the ratcheted trail (100 after
+    the rising bars) is passed wholesale by the gap bar (high 98), so it exits at that
+    bar's open 97 -- pre-fix it stranded open with the stop ratcheted above every later
+    bar, understating trailing losses."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "101", "99", "100"),  # fill at open 100
+        _candle(2 * _HOUR, "100", "102", "100", "102"),  # trail 98
+        _candle(3 * _HOUR, "102", "104", "102", "104"),  # trail 100
+        _candle(4 * _HOUR, "97", "98", "95", "96"),  # GAP -> exit at the open 97
+        _candle(5 * _HOUR, "96", "97", "94", "95"),  # pre-fix: stranded
+    ]
+    trailed = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule(
+            "BTC-USD",
+            Decimal("100"),
+            Decimal("94"),
+            Decimal("130"),
+            {"trail_atr_mult": Decimal("2"), "atr_period": 2},
+        ),
+        hourly,
+    )
+
+    assert len(trailed.trades) == 1
+    assert trailed.trades[0].exit == Decimal("97")  # the gap bar's OPEN
+    assert trailed.trades[0].exit_ts == 4 * _HOUR
+    assert trailed.trades[0].outcome == "loss"

@@ -174,9 +174,7 @@ class TestEnterThenTargetHit:
         exit_order = repo.get_order(exit_order_id)
         assert exit_order["rule_id"] == rule_id
 
-    def test_no_touch_leaves_position_open_and_writes_no_exit_order(
-        self, repo: Repository
-    ) -> None:
+    def test_no_touch_leaves_position_open_and_writes_no_exit_order(self, repo: Repository) -> None:
         trader = PaperTrader(repo)
         trader.on_signal(_enter_signal(ts=1_000))
 
@@ -243,6 +241,30 @@ class TestStopHit:
         exit_fill = Decimal("90") * (Decimal(1) - SLIPPAGE_PCT)
         assert Decimal(payload["exit"]) == exit_fill
         assert Decimal(payload["entry"]) == entry_fill
+
+    def test_a_candle_gapping_entirely_through_the_stop_closes_at_its_open(
+        self, repo: Repository
+    ) -> None:
+        """The gap-through hole, paper-side (the paper trader duplicates the engines'
+        touch check): a candle whose HIGH sits below the stop used to count as no touch at
+        all, leaving the position open under a stop the market had already passed. It
+        closes, at the candle's OPEN -- worse than the stop, the honest fill for a level
+        passed wholesale, matching the engines' convention (#442 review)."""
+        trader = PaperTrader(repo)
+        trader.on_signal(_enter_signal(ts=1_000))
+
+        gap_candle = _candle(1_060, "85", "88", "82", "84")  # high 88 < stop 90
+        exit_order_id = trader.on_candle("BTC-USD", gap_candle)
+
+        assert exit_order_id is not None
+        order = repo.get_order(exit_order_id)
+        payload = json.loads(order["raw_response"])
+        assert payload["outcome"] == "loss"
+        entry_fill = Decimal("100") * (Decimal(1) + SLIPPAGE_PCT)
+        exit_fill = Decimal("85") * (Decimal(1) - SLIPPAGE_PCT)  # the open, not the 90 stop
+        assert Decimal(payload["exit"]) == exit_fill
+        assert Decimal(payload["entry"]) == entry_fill
+        assert order["limit_price"] == Decimal("85")
 
 
 class TestExitSignal:

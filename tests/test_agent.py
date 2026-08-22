@@ -2321,8 +2321,11 @@ def test_paper_full_loop_drawdown_halt_vetoes_subsequent_buys(repo, monkeypatch)
     assert hwm_before is not None and hwm_before > Decimal("9000")
     assert repo.get_state("drawdown_total_pct") == Decimal("0")
 
-    # Cycle 2 (now_ts inside day 2 -> day 1's candle is now the latest closed): the position
-    # marks down to $1/unit, crashing equity far below the high-water mark.
+    # Cycle 2 (now_ts inside day 2 -> day 1's candle is now the latest closed): the
+    # catastrophic mark-down. Since the #442 gap fix, that candle -- entirely below the
+    # position's stop (50) -- CLOSES the position at its open ($1/unit), so equity crashes
+    # through the realized loss rather than an open-position mark; either way the scalar
+    # the loop reads is the same one rail 11 acts on.
     now_ts_2 = 86_400 + 90_000
     run_once(broker, repo, cfg, now_ts=now_ts_2)
 
@@ -2344,6 +2347,10 @@ def test_paper_full_loop_drawdown_halt_vetoes_subsequent_buys(repo, monkeypatch)
         ts=now_ts_2 + 1,
     )
 
+    # The entry plus the gap-through exit are the only paper orders on record so far.
+    orders_before_attempt = len(repo.get_orders(mode="paper", product_id=PRODUCT))
+    assert orders_before_attempt == 2  # the entry, and the exit the gap through the stop wrote
+
     entry_result = agent._paper_enter(
         post_crash_trader, next_signal, repo, cfg, now_ts=now_ts_2, paper_equity=post_crash_equity
     )
@@ -2352,7 +2359,7 @@ def test_paper_full_loop_drawdown_halt_vetoes_subsequent_buys(repo, monkeypatch)
     assert any("account_dd_breaker_total" in v for v in entry_result.vetoed_by), (
         entry_result.vetoed_by
     )
-    assert len(repo.get_orders(mode="paper", product_id=PRODUCT)) == 1, (
+    assert len(repo.get_orders(mode="paper", product_id=PRODUCT)) == orders_before_attempt, (
         "no new paper order should have been filled once the breaker tripped"
     )
 

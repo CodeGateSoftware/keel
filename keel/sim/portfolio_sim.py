@@ -50,10 +50,12 @@ evaluation.
 - **Managed stops (#442):** a rule whose `params` carry `trail_atr_mult`/`be_roll_rr` has its
   stop RATCHETED by `strategy.exit_policy` at each bar the position survives (see
   `_process_held`): touch checks run against the level carried INTO the bar, management runs
-  at bar end on the completed bar, and the stop never widens. A rule without the knobs trades
-  exactly as before the wiring existed. This is the sim-side expression of the live
-  `executor` stop-management primitives, which themselves stay uncalled on the live path
-  (port-blocked, issue #502).
+  at bar end on the completed bar, and the stop never widens; a bar that gaps entirely
+  through the stop exits at its OPEN (`strategy.backtest._stop_exit_price`, the shared
+  convention). A rule without the knobs trades exactly as before the wiring existed --
+  identity pinned by the unit-identity tests plus the unchanged pre-existing suite with the
+  wiring live. This is the sim-side expression of the live `executor` stop-management
+  primitives, which themselves stay uncalled on the live path (port-blocked, issue #502).
 
 **No lookahead:** the per-bar `candles_by_tf` window handed to `Rule.detect`/`exit_signal` and to
 `engine.evaluate` only ever contains candles with `ts <= t` (the current bar). The one deliberate
@@ -75,7 +77,13 @@ from keel.execution import sizing
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.strategy import engine, indicators_cts
-from keel.strategy.backtest import TAKER_FEE_PCT, _resolve_order, _rule_trading_tf, _touches
+from keel.strategy.backtest import (
+    TAKER_FEE_PCT,
+    _resolve_order,
+    _rule_trading_tf,
+    _stop_exit_price,
+    _touches,
+)
 from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
 from keel.strategy.rules.base import Rule, Setup, Signal
 from keel.types import Candle, Granularity
@@ -445,14 +453,20 @@ def _process_held(
 
     # The MANAGED stop (the level carried into this bar), not the setup's original: the
     # rule's exit policy (#442) may have ratcheted it on a prior bar. R-multiples still
-    # divide by the ORIGINAL risk (`risk` below reads `setup.stop`).
-    stop_touched = _touches(current, h.stop)
+    # divide by the ORIGINAL risk (`risk` below reads `setup.stop`). The stop's exit fill
+    # comes from the shared `strategy.backtest._stop_exit_price`: `None` when the bar
+    # never reached it, the bar's OPEN when it gapped entirely through it.
+    stop_exit = _stop_exit_price(current, h.stop)
+    stop_touched = stop_exit is not None
     target_touched = _touches(current, setup.target)
     if stop_touched and target_touched:
         order = _resolve_order(idx, hourly, None, {"target": setup.target, "stop": h.stop})
-        exit_price = setup.target if order == "target" else h.stop
+        # `stop_exit` is exactly `h.stop` in this branch: a bar that gapped through the
+        # stop cannot also touch the target (target > stop for a long), so the
+        # both-touched case is always an in-range touch.
+        exit_price = setup.target if order == "target" else stop_exit
     elif stop_touched:
-        exit_price = h.stop
+        exit_price = stop_exit
     elif target_touched:
         exit_price = setup.target
 

@@ -285,8 +285,12 @@ class _StaleThenReachableRule(Rule):
         self.detect_calls += 1
         window = next(iter(candles_by_tf.values()))
         latest = window[-1]
-        # Far above every price in the series, so neither entry nor stop is ever touched.
-        entry, stop, target = (Decimal(1000), Decimal(900), Decimal(1100))
+        # Entry far above and stop far BELOW every price in the series, so neither is ever
+        # touched. The stop has to sit below the market: since the #442 gap fix, a bar whose
+        # HIGH is below a long's stop counts as a touch (the level was passed wholesale), so
+        # the old fixture's stop at 900 over a ~100 market would exit at once -- a gap
+        # through the stop, not an untouched one.
+        entry, stop, target = (Decimal(1000), Decimal(50), Decimal(1100))
         if latest.ts >= self.switch_ts:
             entry, stop, target = (Decimal(110), Decimal(95), Decimal(130))
         return Setup(
@@ -694,3 +698,91 @@ def test_a_rule_without_exit_params_is_byte_identical_to_explicit_off() -> None:
     assert [(t.entry, t.exit, t.exit_ts, t.pnl) for t in a.trades] == [
         (t.entry, t.exit, t.exit_ts, t.pnl) for t in b.trades
     ]
+
+
+# ---------------------------------------------------------------------------
+# #442 review: a bar that gaps ENTIRELY through the stop still exits
+# ---------------------------------------------------------------------------
+
+
+def test_a_static_stop_gapped_through_by_a_whole_bar_exits_at_that_bars_open() -> None:
+    """The containment-only touch check (`low <= stop <= high`) let a bar whose HIGH sits
+    below the stop slip past it silently: pre-fix, the gap bar triggered nothing, and the
+    recovery bar's in-range touch then exited at the STOP -- a better price than the market
+    ever offered after the gap. The gap bar must exit, at its OPEN (worse than the stop --
+    the honest fill for a level passed wholesale).
+
+      fill bar:  o100 h101 l99  c100  -> stop 94 clear
+      holding:   o99  h100 l98  c99   -> no touch
+      GAP:       o90  h92  l88  c89   -> high 92 < stop 94 -> exit at the open 90
+      recovery:  o89  h95  l88  c93   -> pre-fix exited HERE, flattered, at 94
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("99", "100", "98", "99"),
+        ("90", "92", "88", "89"),  # the gap through the stop
+        ("89", "95", "88", "93"),  # pre-fix: the flattered in-range exit at 94
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("90")  # the gap bar's OPEN, not the 94 stop
+    assert result.trades[0].exit_ts == trigger_ts + 3 * 3600
+    assert result.trades[0].pnl == Decimal("-10")  # 100 -> 90, fee 0, slippage 0
+    assert result.trades[0].outcome == "loss"
+
+
+def test_an_open_above_the_stop_with_a_piercing_low_still_fills_at_the_stop() -> None:
+    """The case the fix must NOT change: the bar OPENS above the stop and its low pierces
+    it -- the level traded, so the fill is the stop itself, exactly as before."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar
+        ("105", "106", "92", "95"),  # open 105 > stop 94, low 92 pierces -> exit at 94
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("94")
+    assert result.trades[0].exit_ts == trigger_ts + 2 * 3600
+
+
+def test_a_trailing_stop_stranded_by_a_gap_down_bar_exits_instead() -> None:
+    """The ratchet makes the gap hole bite hardest: a trail sitting near price is passed
+    wholesale by one gap-down bar, and the ratchet then REFUSES to lower the stop to
+    re-reach it -- pre-fix the position stranded open while every later bar's high stayed
+    below the stranded level, understating trailing losses. With the fix it exits on the
+    gap bar itself, at its open.
+
+      fill bar:  o100 h101 l99  c100  -> trail 96 (ATR 2)
+      rising:    o100 h102 l100 c102  -> trail 98
+      rising:    o102 h104 l102 c104  -> trail 100
+      GAP:       o97  h98  l95  c96   -> high 98 < trailed 100 -> exit at the open 97
+      stranded:  o96  h97  l94  c95   -> pre-fix: rides here and on, stop pinned at 100
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("97", "98", "95", "96"),  # the gap through the trailed stop
+        ("96", "97", "94", "95"),  # pre-fix: stranded, stop ratcheted at 100 forever
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    trail_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {"trail_atr_mult": Decimal("2")}
+    )
+
+    result = backtest(trail_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    assert result.trades[0].exit == Decimal("97")  # the gap bar's OPEN
+    assert result.trades[0].exit_ts == trigger_ts + 4 * 3600
+    assert result.trades[0].outcome == "loss"
