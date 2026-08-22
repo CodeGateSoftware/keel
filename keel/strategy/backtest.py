@@ -40,6 +40,11 @@ Walks a single-instrument candle series bar-by-bar, driving a `Rule` to produce 
   `slippage_by_product` to price each product's fills from its own liquidity statistic
   (`slippage_for_quote_volume`), leaving the flat `slippage_pct` as the default and the
   fallback for products without one.
+- **Managed stops (#442):** a rule whose `params` carry `trail_atr_mult`/`be_roll_rr` has
+  its stop RATCHETED by `strategy.exit_policy` at each bar the position survives — touch
+  checks run against the level carried INTO the bar, management runs at bar end on the
+  completed bar, and the stop never widens (the sim-side statement of rail 9). A rule
+  without the knobs (turtle by design, every pre-#442 row) trades exactly as before.
 
 Position sizing (money management) is out of scope for this module (see the future
 `money_mgmt.py`): every trade uses a fixed 1-unit notional, sufficient for computing
@@ -55,6 +60,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
+from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
 from keel.strategy.rules.base import Rule, Setup, Trade, TradeOutcome
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
@@ -163,9 +169,9 @@ def slippage_for_quote_volume(median_daily_quote_volume: Decimal) -> Decimal:
     """
     if median_daily_quote_volume <= 0:
         return SLIPPAGE_CAP_PCT
-    unclamped = SLIPPAGE_FLOOR_PCT * (
-        SLIPPAGE_REFERENCE_QUOTE_VOLUME / median_daily_quote_volume
-    ).sqrt()
+    unclamped = (
+        SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / median_daily_quote_volume).sqrt()
+    )
     return min(max(unclamped, SLIPPAGE_FLOOR_PCT), SLIPPAGE_CAP_PCT)
 
 
@@ -194,6 +200,7 @@ class SlippageAssumption:
         return self.median_daily_quote_volume is not None and self.slippage_pct == (
             SLIPPAGE_CAP_PCT
         )
+
 
 # Default key used to present the single candle series to `Rule.detect()`/
 # `Rule.exit_signal()` in the `dict[Granularity, list[Candle]]` shape the interface
@@ -225,6 +232,12 @@ class _OpenPosition:
     entry_ts: int
     mfe: Decimal
     mae: Decimal
+    #: The protective stop CURRENTLY in force -- starts at the setup's own stop and, per
+    #: #442, is ratcheted by the rule's exit policy (`strategy.exit_policy`) at each bar
+    #: the position survives. Touch checks always run against THIS, the level carried
+    #: into the bar; `setup.stop` stays the ORIGINAL risk reference (`_close_trade`'s
+    #: R-multiple denominator), never the managed level.
+    stop: Decimal
 
 
 def _touches(candle: Candle, price: Decimal) -> bool:
@@ -362,6 +375,10 @@ def backtest(
     position: _OpenPosition | None = None
     pending: Setup | None = None
     trading_tf = _rule_trading_tf(rule)
+    #: The rule's per-family stop-management policy (#442): ratchet-only trailing /
+    #: break-even roll, OFF for every rule whose params do not ask for it (turtle by
+    #: design, and every pre-#442 rule row). See `strategy/exit_policy.py`.
+    exit_policy: ExitPolicy = policy_for(rule)
     #: Bars the current `pending` has survived. Since #257 a setup detected on bar i is filled
     #: unconditionally at bar i+1's open, so this can only ever reach 1 -- see the invariant
     #: check at the top of the loop.
@@ -442,6 +459,7 @@ def backtest(
                 entry_ts=candle.ts,
                 mfe=Decimal(0),
                 mae=Decimal(0),
+                stop=pending.stop,
             )
             pending = None
             # Fall through to the shared stop/target block for the REMAINDER of this bar. Unlike
@@ -449,12 +467,14 @@ def backtest(
             # open, so this bar's range can reach either level, and the shared block's
             # stop-vs-target `_resolve_order` is exactly the right adjudicator.
 
-
         assert position is not None  # noqa: S101 - narrows type for the checks below
         position.mfe = max(position.mfe, candle.high - position.entry_fill)
         position.mae = max(position.mae, position.entry_fill - candle.low)
 
-        stop = position.setup.stop
+        # The MANAGED stop (the level carried into this bar), not the setup's original:
+        # the exit policy (#442) may have ratcheted it on a prior bar. R-multiples still
+        # divide by the ORIGINAL risk (`_close_trade` reads `position.setup.stop`).
+        stop = position.stop
         target = position.setup.target
         stop_touched = _touches(candle, stop)
         target_touched = _touches(candle, target)
@@ -475,6 +495,24 @@ def backtest(
                 _close_trade(position, exit_price, candle.ts, fee_pct, effective_slippage)
             )
             position = None
+        else:
+            # Stop management runs at BAR END, on the bar that just completed, and the
+            # resulting level binds from the NEXT bar (#442 -- see `exit_policy`'s
+            # module docstring for the no-lookahead/live-parity sequencing argument).
+            # Live, the bracket rests at the old level until a management cycle replaces
+            # it; touch checks above ran against exactly that old level. An OFF policy
+            # (every rule without the knobs) returns the stop unchanged, so only the
+            # trailing arm pays for the ATR read.
+            position.stop = next_stop(
+                exit_policy,
+                position.entry_fill,
+                position.setup.stop,
+                position.stop,
+                candle,
+                trailing_atr(candles_by_tf[trading_tf], exit_policy.atr_period)
+                if exit_policy.trail_atr_mult is not None
+                else None,
+            )
 
     if position is not None:
         trades.append(_open_trade(position))

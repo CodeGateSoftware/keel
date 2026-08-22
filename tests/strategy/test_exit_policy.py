@@ -90,9 +90,23 @@ def test_policy_for_uses_the_rules_own_atr_period_when_it_has_one() -> None:
 def test_trailing_arm_ratchets_up_as_price_rises() -> None:
     policy = ExitPolicy(trail_atr_mult=Decimal("2"), be_roll_rr=None, atr_period=14)
     stop = Decimal("94")
-    stop = next_stop(policy, Decimal("100"), Decimal("94"), stop, _candle(0, "100", "101", "99", "100"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("94"),
+        stop,
+        _candle(0, "100", "101", "99", "100"),
+        Decimal("2"),
+    )
     assert stop == Decimal("96")  # 100 - 2*2
-    stop = next_stop(policy, Decimal("100"), Decimal("94"), stop, _candle(1, "100", "102", "100", "102"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("94"),
+        stop,
+        _candle(1, "100", "102", "100", "102"),
+        Decimal("2"),
+    )
     assert stop == Decimal("98")  # 102 - 4
 
 
@@ -100,47 +114,103 @@ def test_trailing_arm_never_widens_on_a_dip() -> None:
     policy = ExitPolicy(trail_atr_mult=Decimal("2"), be_roll_rr=None, atr_period=14)
     stop = Decimal("98")
     # A close far below the prior trail computes 90 - 2*2 = 86 < 98 -- the stop MUST stay.
-    stop = next_stop(policy, Decimal("100"), Decimal("94"), stop, _candle(0, "99", "100", "85", "90"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("94"),
+        stop,
+        _candle(0, "99", "100", "85", "90"),
+        Decimal("2"),
+    )
     assert stop == Decimal("98")
 
 
 def test_trailing_arm_is_inert_when_atr_is_unavailable() -> None:
     policy = ExitPolicy(trail_atr_mult=Decimal("2"), be_roll_rr=None, atr_period=14)
-    stop = next_stop(policy, Decimal("100"), Decimal("94"), Decimal("94"), _candle(0, "100", "101", "99", "100"), None)
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("94"),
+        Decimal("94"),
+        _candle(0, "100", "101", "99", "100"),
+        None,
+    )
     assert stop == Decimal("94")
 
 
 def test_be_roll_arm_moves_the_stop_to_entry_once_the_threshold_clears() -> None:
     policy = ExitPolicy(trail_atr_mult=None, be_roll_rr=Decimal("1"), atr_period=14)
     # entry 100, initial stop 90 -> risk 10; a high of 110 clears +1R.
-    stop = next_stop(policy, Decimal("100"), Decimal("90"), Decimal("90"), _candle(0, "100", "110", "99", "108"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("90"),
+        Decimal("90"),
+        _candle(0, "100", "110", "99", "108"),
+        Decimal("2"),
+    )
     assert stop == Decimal("100")
 
 
 def test_be_roll_arm_does_not_fire_below_the_threshold() -> None:
     policy = ExitPolicy(trail_atr_mult=None, be_roll_rr=Decimal("1"), atr_period=14)
-    stop = next_stop(policy, Decimal("100"), Decimal("90"), Decimal("90"), _candle(0, "100", "109", "99", "108"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("90"),
+        Decimal("90"),
+        _candle(0, "100", "109", "99", "108"),
+        Decimal("2"),
+    )
     assert stop == Decimal("90")
 
 
 def test_be_roll_arm_never_widens_after_a_ratchet() -> None:
     policy = ExitPolicy(trail_atr_mult=None, be_roll_rr=Decimal("1"), atr_period=14)
     # Already rolled to entry; a subsequent pullback bar computes nothing above entry.
-    stop = next_stop(policy, Decimal("100"), Decimal("90"), Decimal("100"), _candle(0, "99", "101", "95", "96"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("90"),
+        Decimal("100"),
+        _candle(0, "99", "101", "95", "96"),
+        Decimal("2"),
+    )
     assert stop == Decimal("100")
 
 
 def test_both_arms_combine_by_max_and_can_ride_above_entry() -> None:
     policy = ExitPolicy(trail_atr_mult=Decimal("2"), be_roll_rr=Decimal("1"), atr_period=14)
     # BE proposes entry=100; the trail proposes 104-4=100 as well; a later bar proposes more.
-    stop = next_stop(policy, Decimal("100"), Decimal("90"), Decimal("90"), _candle(0, "100", "110", "99", "104"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("90"),
+        Decimal("90"),
+        _candle(0, "100", "110", "99", "104"),
+        Decimal("2"),
+    )
     assert stop == Decimal("100")
-    stop = next_stop(policy, Decimal("100"), Decimal("90"), stop, _candle(1, "104", "106", "103", "106"), Decimal("2"))
+    stop = next_stop(
+        policy,
+        Decimal("100"),
+        Decimal("90"),
+        stop,
+        _candle(1, "104", "106", "103", "106"),
+        Decimal("2"),
+    )
     assert stop == Decimal("102")
 
 
 def test_off_policy_returns_the_stop_unchanged() -> None:
-    stop = next_stop(EXIT_POLICY_OFF, Decimal("100"), Decimal("94"), Decimal("94"), _candle(0, "100", "110", "99", "108"), Decimal("2"))
+    stop = next_stop(
+        EXIT_POLICY_OFF,
+        Decimal("100"),
+        Decimal("94"),
+        Decimal("94"),
+        _candle(0, "100", "110", "99", "108"),
+        Decimal("2"),
+    )
     assert stop == Decimal("94")
 
 

@@ -515,9 +515,7 @@ class TestPerProductSlippageInBacktest:
         ]
 
     def _rule(self, product_id: str = "BTC-USD") -> _ScriptedRule:
-        return _ScriptedRule(
-            60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id
-        )
+        return _ScriptedRule(60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id)
 
     def _resolver(self, product_id: str) -> Decimal:
         return slippage_for_quote_volume(self._VOLUMES[product_id])
@@ -536,12 +534,8 @@ class TestPerProductSlippageInBacktest:
         the direction check #259 demands: the correction is conservative on thin assets, never
         favourable.
         """
-        btc = backtest(
-            self._rule("BTC-USD"), self._candles(), slippage_by_product=self._resolver
-        )
-        ton = backtest(
-            self._rule("TON-USD"), self._candles(), slippage_by_product=self._resolver
-        )
+        btc = backtest(self._rule("BTC-USD"), self._candles(), slippage_by_product=self._resolver)
+        ton = backtest(self._rule("TON-USD"), self._candles(), slippage_by_product=self._resolver)
 
         assert ton.trades[0].entry > btc.trades[0].entry
         assert ton.trades[0].exit < btc.trades[0].exit
@@ -564,9 +558,7 @@ class TestPerProductSlippageInBacktest:
         """The existing-caller guarantee, pinned: omitting the parameter must reproduce a run
         that passes the flat rate explicitly, trade for trade."""
         default_run = backtest(self._rule(), self._candles())
-        explicit_run = backtest(
-            self._rule(), self._candles(), slippage_pct=Decimal("0.0005")
-        )
+        explicit_run = backtest(self._rule(), self._candles(), slippage_pct=Decimal("0.0005"))
 
         assert default_run.trades[0].pnl == explicit_run.trades[0].pnl
         assert default_run.trades[0].entry == Decimal(105) * Decimal("1.0005")

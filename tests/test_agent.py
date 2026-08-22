@@ -58,9 +58,7 @@ class FakeBroker:
     `CoinbaseClient`-shaped responses (like `test_executor.FakeBroker`).
     """
 
-    def __init__(
-        self, series: dict[tuple[str, Granularity], list[Candle]] | None = None
-    ) -> None:
+    def __init__(self, series: dict[tuple[str, Granularity], list[Candle]] | None = None) -> None:
         self._series = series or {}
         self.get_candles_calls: list[tuple[str, Granularity, int, int]] = []
         self.preview_calls: list[dict[str, Any]] = []
@@ -112,7 +110,7 @@ class FakeBroker:
         }
 
     def cancel_order(self, order_id: str) -> bool:
-        return True        # a CONFIRMED cancel -- see `_cancel_at_exchange`
+        return True  # a CONFIRMED cancel -- see `_cancel_at_exchange`
 
 
 class _AlwaysExitRule(Rule):
@@ -243,8 +241,13 @@ def _seed_open_position(
     )
     if rule_name is not None:
         repo.open_position(
-            product_id=product_id, rule_name=rule_name, opened_at=ts, qty=qty,
-            entry_fill=price, entry_fee=entry_fee, bracket_order_id=bracket_order_id,
+            product_id=product_id,
+            rule_name=rule_name,
+            opened_at=ts,
+            qty=qty,
+            entry_fill=price,
+            entry_fee=entry_fee,
+            bracket_order_id=bracket_order_id,
         )
 
 
@@ -451,9 +454,7 @@ def test_unreadable_clock_fails_closed_with_a_distinct_reason(repo, caplog):
     assert result.skip_reason == "market_clock_unavailable"
     assert broker.get_candles_calls == []
     assert repo.get_state("market_session") == "clock_unavailable"
-    assert _skip_events(caplog) == [
-        ("agent.cycle_skipped", {"reason": "market_clock_unavailable"})
-    ]
+    assert _skip_events(caplog) == [("agent.cycle_skipped", {"reason": "market_clock_unavailable"})]
 
 
 def test_a_clock_that_raises_rather_than_answering_fails_closed(repo):
@@ -1377,14 +1378,16 @@ def test_equity_counts_the_net_held_qty_across_multiple_buys(repo: Repository) -
     # what the ENTER path actually writes -- the last leg only
     repo.set_state(
         f"position_rule:{PRODUCT}",
-        {"rule_name": "dca", "opened_at": 1_000, "entry_fill": Decimal("100"),
-         "qty": Decimal("0.5")},
+        {
+            "rule_name": "dca",
+            "opened_at": 1_000,
+            "entry_fill": Decimal("100"),
+            "qty": Decimal("0.5"),
+        },
     )
     broker = FakeBroker()
 
-    equity = agent._mark_to_market_equity(
-        repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USD"
-    )
+    equity = agent._mark_to_market_equity(repo, broker, [PRODUCT], {PRODUCT: Decimal("100")}, "USD")
 
     # 2.5 BTC held, not 0.5 -- cash is FakeBroker's 1_000_000
     assert equity == Decimal("1000000") + Decimal("2.5") * Decimal("100")
@@ -1396,9 +1399,7 @@ def test_equity_counts_a_held_position_whose_rule_is_no_longer_live(repo: Reposi
     _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
     broker = FakeBroker()
 
-    equity = agent._mark_to_market_equity(
-        repo, broker, [], {PRODUCT: Decimal("100")}, "USD"
-    )
+    equity = agent._mark_to_market_equity(repo, broker, [], {PRODUCT: Decimal("100")}, "USD")
 
     assert equity == Decimal("1000000") + Decimal("2") * Decimal("100")
 
@@ -1430,8 +1431,9 @@ def test_exit_records_a_trade_outcome(repo: Repository) -> None:
     the producer does nothing.
     """
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
-                        rule_name="fake_exit")
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
     repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
@@ -1469,10 +1471,12 @@ def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
     agent.RULE_REGISTRY["dca"] = lambda **kw: _ExitingDca()
     try:
         repo.insert_rule("dca", {}, status="live")
-        _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
-                            rule_name="dca")
+        _seed_open_position(
+            repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000, rule_name="dca"
+        )
         repo.set_state(
-            f"position_rule:{PRODUCT}", {"rule_name": "dca", "opened_at": 1_000},
+            f"position_rule:{PRODUCT}",
+            {"rule_name": "dca", "opened_at": 1_000},
         )
         broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
@@ -1482,8 +1486,8 @@ def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
 
     outcomes = repo.get_trade_outcomes()
     assert len(outcomes) == 1
-    assert outcomes[0]["is_dca"] is True          # recorded as DCA...
-    assert repo.get_state("consecutive_losses", default=0) == 0   # ...and exempt from the streak
+    assert outcomes[0]["is_dca"] is True  # recorded as DCA...
+    assert repo.get_state("consecutive_losses", default=0) == 0  # ...and exempt from the streak
 
 
 def test_the_enter_path_records_the_entry_fee_onto_the_position(repo: Repository) -> None:
@@ -1523,24 +1527,47 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     """
     _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=1_000)
     bracket_id = repo.insert_order(
-        dict(mode="live", product_id=PRODUCT, side=Side.SELL.value, order_type="market",
-             qty=Decimal("0.01"), limit_price=None, status="pending", fee=None,
-             expected_fill=Decimal("49000"), actual_fill=None,
-             raw_response='{"order_id": "cb-1"}', created_at=1_000, updated_at=1_000)
+        dict(
+            mode="live",
+            product_id=PRODUCT,
+            side=Side.SELL.value,
+            order_type="market",
+            qty=Decimal("0.01"),
+            limit_price=None,
+            status="pending",
+            fee=None,
+            expected_fill=Decimal("49000"),
+            actual_fill=None,
+            raw_response='{"order_id": "cb-1"}',
+            created_at=1_000,
+            updated_at=1_000,
+        )
     )
-    repo.set_state(f"position_rule:{PRODUCT}", {
-        "rule_name": "turtle_breakout", "opened_at": 1_000,
-    })
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "turtle_breakout",
+            "opened_at": 1_000,
+        },
+    )
     repo.open_position(
-        product_id=PRODUCT, rule_name="turtle_breakout", opened_at=1_000, qty=Decimal("0.01"),
-        entry_fill=Decimal("50000"), entry_fee=Decimal("3"), bracket_order_id=bracket_id,
+        product_id=PRODUCT,
+        rule_name="turtle_breakout",
+        opened_at=1_000,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("3"),
+        bracket_order_id=bracket_id,
     )
 
     class _ReconcilingBroker(FakeBroker):
         def get_order(self, order_id: str) -> dict[str, Any]:
             return {
-                "order_id": order_id, "status": "FILLED", "filled_size": Decimal("0.01"),
-                "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+                "order_id": order_id,
+                "status": "FILLED",
+                "filled_size": Decimal("0.01"),
+                "average_filled_price": Decimal("48900"),
+                "total_fees": Decimal("2.93"),
             }
 
     broker = _ReconcilingBroker(
@@ -1563,17 +1590,31 @@ def test_run_once_brackets_a_tranche_whose_bracket_was_never_placed(repo: Reposi
     protects nothing.
     """
     _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=1_000)
-    repo.set_state(f"position_rule:{PRODUCT}", {
-        "rule_name": "turtle_breakout", "opened_at": 1_000,
-    })
+    repo.set_state(
+        f"position_rule:{PRODUCT}",
+        {
+            "rule_name": "turtle_breakout",
+            "opened_at": 1_000,
+        },
+    )
     # A tranche naming NO bracket: the entry filled, the protective order was refused.
     position_id = repo.open_position(
-        product_id=PRODUCT, rule_name="turtle_breakout", opened_at=1_000, qty=Decimal("0.01"),
-        entry_fill=Decimal("50000"), entry_fee=Decimal("3"), bracket_order_id=None,
+        product_id=PRODUCT,
+        rule_name="turtle_breakout",
+        opened_at=1_000,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("3"),
+        bracket_order_id=None,
     )
-    repo.set_state(f"unbracketed:{PRODUCT}", {
-        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
-    })
+    repo.set_state(
+        f"unbracketed:{PRODUCT}",
+        {
+            "stop": Decimal("49000"),
+            "target": Decimal("53000"),
+            "qty": Decimal("0.01"),
+        },
+    )
     broker = FakeBroker(
         series={(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
     )
@@ -1598,10 +1639,12 @@ def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:
     trade -- hiding a loss rail 16 is supposed to count.
     """
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
-                        rule_name="fake_exit")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("52000"), ts=2_000,
-                        rule_name="fake_exit")
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.1"), Decimal("52000"), ts=2_000, rule_name="fake_exit"
+    )
     repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
 
@@ -1622,10 +1665,12 @@ def test_a_rule_exit_apportions_the_exit_fee_across_tranches(repo: Repository) -
     multiply the cost by the tranche count; charging it to none would make `pnl_net` gross on
     the exit leg -- and its SIGN is what rail 16 counts. The shares must sum to the whole."""
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
-                        rule_name="fake_exit")
-    _seed_open_position(repo, PRODUCT, Decimal("0.3"), Decimal("50000"), ts=2_000,
-                        rule_name="fake_exit")
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.3"), Decimal("50000"), ts=2_000, rule_name="fake_exit"
+    )
 
     class _FeeBroker(FakeBroker):
         def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
@@ -1655,8 +1700,15 @@ def test_a_rule_exit_clears_the_stop_and_target_state(repo: Repository) -> None:
     and left them.
     """
     repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
-    _seed_open_position(repo, PRODUCT, Decimal("0.1"), Decimal("50000"), ts=1_000,
-                        rule_name="fake_exit", entry_fee=Decimal("3"))
+    _seed_open_position(
+        repo,
+        PRODUCT,
+        Decimal("0.1"),
+        Decimal("50000"),
+        ts=1_000,
+        rule_name="fake_exit",
+        entry_fee=Decimal("3"),
+    )
     repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
     repo.set_state(f"open_target:{PRODUCT}", Decimal("53000"))
@@ -1694,9 +1746,7 @@ class _MarketDataOnlyBroker(FakeBroker):
 class _AlwaysEnterRule(Rule):
     """Fires an ENTER on every bar, so one cycle is enough to exercise the paper fill path."""
 
-    def __init__(
-        self, product_id: str, name: str = "fake_enter", stop_mult: str = "0.95"
-    ) -> None:
+    def __init__(self, product_id: str, name: str = "fake_enter", stop_mult: str = "0.95") -> None:
         self.name = name
         self.product_id = product_id
         self.stop_mult = Decimal(stop_mult)
@@ -2550,9 +2600,7 @@ def test_equity_counts_settled_cash_in_EVERY_quote_leg_being_traded(repo):
                 {"currency": "USDC", "available_balance": Decimal("7")},
             ]
 
-    equity = agent._mark_to_market_equity(
-        repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC"
-    )
+    equity = agent._mark_to_market_equity(repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC")
     assert equity is not None
     assert equity >= Decimal("1000"), (
         f"equity {equity} ignored the USD cash that funds BTC-USD orders"

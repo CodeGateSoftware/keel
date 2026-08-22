@@ -47,6 +47,13 @@ evaluation.
 - **`SimResult.coverage`**: `run()`'s signature (per the plan) takes no coverage/history input,
   so this is always `{}` here -- a passthrough placeholder for the CLI (Task 8), which does have
   access to `data/history.py`'s per-asset `CoverageInfo` and can attach it after calling `run()`.
+- **Managed stops (#442):** a rule whose `params` carry `trail_atr_mult`/`be_roll_rr` has its
+  stop RATCHETED by `strategy.exit_policy` at each bar the position survives (see
+  `_process_held`): touch checks run against the level carried INTO the bar, management runs
+  at bar end on the completed bar, and the stop never widens. A rule without the knobs trades
+  exactly as before the wiring existed. This is the sim-side expression of the live
+  `executor` stop-management primitives, which themselves stay uncalled on the live path
+  (port-blocked, issue #502).
 
 **No lookahead:** the per-bar `candles_by_tf` window handed to `Rule.detect`/`exit_signal` and to
 `engine.evaluate` only ever contains candles with `ts <= t` (the current bar). The one deliberate
@@ -68,7 +75,8 @@ from keel.execution import sizing
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.strategy import engine, indicators_cts
-from keel.strategy.backtest import TAKER_FEE_PCT, _resolve_order, _touches
+from keel.strategy.backtest import TAKER_FEE_PCT, _resolve_order, _rule_trading_tf, _touches
+from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
 from keel.strategy.rules.base import Rule, Setup, Signal
 from keel.types import Candle, Granularity
 
@@ -173,6 +181,12 @@ class _Held:
     qty: Decimal
     cts_score: int
     entry_technique: str
+    #: The protective stop CURRENTLY in force -- starts at the setup's own stop and is
+    #: ratcheted by the rule's exit policy (#442, `strategy.exit_policy`) at each bar the
+    #: position survives. Touch checks run against THIS level; `setup.stop` stays the
+    #: ORIGINAL risk reference the closed trade's R-multiple divides by. Required, not
+    #: defaulted: a silent 0 stop would be a stop that never triggers.
+    stop: Decimal
     mfe: Decimal = Decimal("0")
     mae: Decimal = Decimal("0")
 
@@ -319,8 +333,16 @@ def run(
             # Snapshot the keys first: `_process_held` mutates `held` when a position closes.
             for key in [key for key in held if key[0] == asset]:
                 _process_held(
-                    key, idx, hourly, current, candles_by_tf, held, account, config,
-                    trades, telemetry,
+                    key,
+                    idx,
+                    hourly,
+                    current,
+                    candles_by_tf,
+                    held,
+                    account,
+                    config,
+                    trades,
+                    telemetry,
                 )
 
             asset_rules = rules_by_asset.get(asset)
@@ -338,8 +360,17 @@ def run(
             )
 
             fired = _process_rule_signals(
-                asset, idx, hourly, signals, rules_by_asset[asset], account, config,
-                latest_price, held, t, monthly_volume_cap,
+                asset,
+                idx,
+                hourly,
+                signals,
+                rules_by_asset[asset],
+                account,
+                config,
+                latest_price,
+                held,
+                t,
+                monthly_volume_cap,
             )
             _track_idle(asset, current, fired, idle, telemetry)
 
@@ -412,13 +443,16 @@ def _process_held(
 
     exit_price: Decimal | None = None
 
-    stop_touched = _touches(current, setup.stop)
+    # The MANAGED stop (the level carried into this bar), not the setup's original: the
+    # rule's exit policy (#442) may have ratcheted it on a prior bar. R-multiples still
+    # divide by the ORIGINAL risk (`risk` below reads `setup.stop`).
+    stop_touched = _touches(current, h.stop)
     target_touched = _touches(current, setup.target)
     if stop_touched and target_touched:
-        order = _resolve_order(idx, hourly, None, {"target": setup.target, "stop": setup.stop})
-        exit_price = setup.target if order == "target" else setup.stop
+        order = _resolve_order(idx, hourly, None, {"target": setup.target, "stop": h.stop})
+        exit_price = setup.target if order == "target" else h.stop
     elif stop_touched:
-        exit_price = setup.stop
+        exit_price = h.stop
     elif target_touched:
         exit_price = setup.target
 
@@ -426,6 +460,25 @@ def _process_held(
         exit_price = current.close
 
     if exit_price is None:
+        # Stop management runs at BAR END, on the bar that just completed, and the
+        # resulting level binds from the NEXT bar (#442 -- `strategy.exit_policy`'s
+        # module docstring states the no-lookahead/live-parity sequencing). An OFF
+        # policy (turtle by design, every rule without the knobs) leaves `h.stop`
+        # untouched, so only a trailing arm pays for the ATR read. The ATR window is
+        # the RULE's own trading timeframe (ONE_HOUR for both knob-carrying families),
+        # resolved the same way `strategy.backtest` resolves it.
+        policy = policy_for(h.rule)
+        series = candles_by_tf.get(_rule_trading_tf(h.rule))
+        h.stop = next_stop(
+            policy,
+            h.entry_fill,
+            setup.stop,
+            h.stop,
+            current,
+            trailing_atr(series, policy.atr_period)
+            if (policy.trail_atr_mult is not None and series is not None)
+            else None,
+        )
         return
 
     pnl = account.close(asset, exit_price, current.ts, slot=slot)
@@ -651,6 +704,7 @@ def _process_rule_signals(
             qty=pos.qty,
             cts_score=signal.cts_score,
             entry_technique=signal.entry_technique,
+            stop=setup.stop,
         )
 
     return rule_signal_fired

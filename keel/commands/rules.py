@@ -1833,6 +1833,14 @@ def _param_type(hint: Any, default: Any) -> tuple[str, tuple[str, ...] | None]:
         return "list", None
     if hint is Granularity or isinstance(default, Granularity):
         return "granularity", None
+    # An OPTIONAL param (`Decimal | None`, the #442 exit-policy knobs): the help names
+    # the type a supplied value must be, not the NoneType of its off-default -- an
+    # operator reading "NoneType" would reasonably conclude the param cannot be set.
+    hint_args = get_args(hint)
+    if type(None) in hint_args:
+        member = next((arg for arg in hint_args if arg is not type(None)), None)
+        if member is not None:
+            return getattr(member, "__name__", type(default).__name__), None
     return type(default).__name__, None
 
 

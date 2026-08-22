@@ -30,6 +30,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution import guards
 from keel.execution.executor import (
     CancelPending,
     CancelUnavailable,
@@ -40,7 +41,6 @@ from keel.execution.executor import (
     scale_out,
     trail_stop_atr,
 )
-from keel.execution import guards
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
@@ -100,9 +100,7 @@ class FakeBroker:
     def get_accounts(self) -> list[dict[str, Any]]:
         self.get_accounts_calls += 1
         if self._balances is not None:
-            return [
-                {"currency": c, "available_balance": b} for c, b in self._balances.items()
-            ]
+            return [{"currency": c, "available_balance": b} for c, b in self._balances.items()]
         if self._usdc_balance is None:
             return [
                 {"currency": "USD", "available_balance": None},
@@ -1218,16 +1216,28 @@ def test_a_broker_without_cancel_order_raises_instead_of_silently_marking_cancel
     """
     broker = _NoCancelBroker()
     stop_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     with pytest.raises(CancelUnavailable, match="cancel_order"):
         roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     # the bracket must still read as live -- our state may not claim a cancel that never happened
@@ -1245,16 +1255,28 @@ def test_a_failing_cancel_call_does_not_mark_the_sibling_canceled(repo):
 
     broker = _RaisingCancelBroker()
     stop_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     with pytest.raises(RuntimeError, match="refused the cancel"):
         roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     assert repo.get_order(stop_id)["status"] == "pending"
@@ -1265,17 +1287,29 @@ def test_a_leg_with_no_broker_side_id_cannot_be_cancelled_and_says_so(repo):
     nothing to cancel AT the exchange, so the same rule applies: raise, do not rewrite state."""
     broker = FakeBroker()
     stop_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
     repo.update_order(stop_id, raw_response=json.dumps({"success": True}))  # no order_id
 
     with pytest.raises(CancelUnavailable, match="broker-side id"):
         roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     assert repo.get_order(stop_id)["status"] == "pending"
@@ -1308,9 +1342,15 @@ def test_bracket_places_exactly_one_order_committing_the_position_once(repo):
     broker = FakeBroker()
 
     order_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     assert order_id is not None
@@ -1322,8 +1362,8 @@ def test_bracket_places_exactly_one_order_committing_the_position_once(repo):
     assert "trigger_bracket_gtc" in config
     leg = config["trigger_bracket_gtc"]
     assert leg["base_size"] == "0.01"
-    assert leg["limit_price"] == "53000"          # take-profit
-    assert leg["stop_trigger_price"] == "49000"   # stop-loss
+    assert leg["limit_price"] == "53000"  # take-profit
+    assert leg["stop_trigger_price"] == "49000"  # stop-loss
 
 
 def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo):
@@ -1333,9 +1373,15 @@ def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo
     broker = FakeBroker()
 
     place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
@@ -1356,7 +1402,7 @@ def test_execute_surfaces_the_bracket_order_id_it_placed(repo):
     bracket = repo.get_order(result.bracket_order_id)
     assert bracket["side"] == "SELL"
     assert bracket["status"] == "pending"
-    assert result.bracket_order_id != result.order_id      # the bracket, not the entry
+    assert result.bracket_order_id != result.order_id  # the bracket, not the entry
 
 
 def test_a_vetoed_bracket_leaves_no_bracket_order_id(repo):
@@ -1368,7 +1414,11 @@ def test_a_vetoed_bracket_leaves_no_bracket_order_id(repo):
     # DCA carries no stop, so no bracket is ever placed for it.
     result = execute(
         _enter_signal(setup=_setup(context={"order_class": "dca"})),
-        broker, repo, _config(), mode="autonomous", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        mode="autonomous",
+        now_ts=NOW_TS,
     )
 
     assert result.placed is True
@@ -1382,9 +1432,15 @@ def test_a_vetoed_bracket_places_nothing_and_returns_none(repo):
     broker = FakeBroker()
 
     order_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     assert order_id is None
@@ -1402,15 +1458,27 @@ def test_rolling_the_stop_carries_the_original_target_forward(repo):
     """
     broker = FakeBroker()
     old_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     new_id = roll_to_break_even(
-        broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=old_id,
-        entry_price=Decimal("50000"), qty=Decimal("0.01"),
-        rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=old_id,
+        entry_price=Decimal("50000"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
     )
 
     assert new_id is not None and new_id != old_id
@@ -1422,7 +1490,7 @@ def test_rolling_the_stop_carries_the_original_target_forward(repo):
     # it for insufficient funds (the resting bracket commits the whole position).
     assert broker.events == ["place", "cancel", "place"], broker.events
     replacement = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
-    assert replacement["limit_price"] == "53000"        # original target preserved
+    assert replacement["limit_price"] == "53000"  # original target preserved
     assert replacement["stop_trigger_price"] == "50000"  # stop moved to break-even
 
 
@@ -1437,22 +1505,34 @@ def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_nak
 
         def place_order(self, product_id, side, order_configuration):
             self.calls += 1
-            if self.calls > 1:          # the original bracket places; the replacement fails
+            if self.calls > 1:  # the original bracket places; the replacement fails
                 return {"success": False, "error": "INSUFFICIENT_FUND"}
             return super().place_order(product_id, side, order_configuration)
 
     broker = _RejectingBroker()
     old_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     with caplog.at_level(logging.CRITICAL):
         new_id = roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=old_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=old_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     assert new_id is None
@@ -1471,20 +1551,32 @@ def test_a_cancel_the_exchange_REFUSES_is_not_recorded_as_a_cancel(repo):
     class _RefusingBroker(FakeBroker):
         def cancel_order(self, order_id: str) -> bool:
             self.cancel_calls.append(order_id)
-            return False        # the exchange says: no
+            return False  # the exchange says: no
 
     broker = _RefusingBroker()
     stop_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     with pytest.raises(CancelUnavailable, match="REFUSED"):
         roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     assert repo.get_order(stop_id)["status"] == "pending"
@@ -1520,16 +1612,28 @@ def test_a_cancel_the_venue_ACCEPTS_but_has_not_settled_still_stops_the_caller(r
 
     broker = _AcceptingBroker()
     stop_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     with pytest.raises(CancelPending, match="accepted"):
         roll_to_break_even(
-            broker, repo, _config(), product_id="BTC-USD", old_stop_order_id=stop_id,
-            entry_price=Decimal("50000"), qty=Decimal("0.01"),
-            rule_name="pullback_continuation", now_ts=NOW_TS + 100,
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
         )
 
     # Still pending, so the reconciliation poll at the top of the next cycle reads the terminal
@@ -1541,7 +1645,6 @@ def test_cancel_pending_is_caught_by_every_existing_cancel_unavailable_handler()
     """The subclassing is the whole reason this distinction is safe to introduce on the live
     money path: control flow is provably unchanged, and only the reporting differs."""
     assert issubclass(CancelPending, CancelUnavailable)
-
 
 
 def _exit_signal() -> Signal:
@@ -1580,9 +1683,15 @@ def test_an_exit_cancels_the_resting_bracket_before_selling(repo):
     _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
     broker = FakeBroker()
     bracket_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     result = execute(
@@ -1591,8 +1700,10 @@ def test_an_exit_cancels_the_resting_bracket_before_selling(repo):
 
     assert result.placed is True
     assert repo.get_order(bracket_id)["status"] == "canceled"
-    assert bracket_id in [int(c) if str(c).isdigit() else c for c in broker.cancel_calls] or \
-        broker.cancel_calls, "the resting bracket was never cancelled at the exchange"
+    assert (
+        bracket_id in [int(c) if str(c).isdigit() else c for c in broker.cancel_calls]
+        or broker.cancel_calls
+    ), "the resting bracket was never cancelled at the exchange"
 
 
 def test_an_exit_is_refused_when_the_resting_bracket_cannot_be_cancelled(repo):
@@ -1608,9 +1719,15 @@ def test_an_exit_is_refused_when_the_resting_bracket_cannot_be_cancelled(repo):
     _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
     broker = _RefusingBroker()
     place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
     placed_before = len(broker.place_calls)
 
@@ -1645,9 +1762,11 @@ def test_an_immediately_filled_order_upgrades_to_the_OBSERVED_fill_and_fee(repo)
     class _ObservingBroker(FakeBroker):
         def get_order(self, order_id: str) -> dict:
             return {
-                "order_id": order_id, "status": "FILLED", "filled_size": Decimal("0.001"),
-                "average_filled_price": Decimal("50123.45"),   # not the expected 50000
-                "total_fees": Decimal("0.42"),                 # not the previewed 0.30
+                "order_id": order_id,
+                "status": "FILLED",
+                "filled_size": Decimal("0.001"),
+                "average_filled_price": Decimal("50123.45"),  # not the expected 50000
+                "total_fees": Decimal("0.42"),  # not the previewed 0.30
             }
 
     broker = _ObservingBroker()
@@ -1674,8 +1793,8 @@ def test_an_unobservable_immediate_fill_keeps_the_estimate_rather_than_failing(r
 
     assert result.placed is True
     order = repo.get_order(result.order_id)
-    assert order["actual_fill"] == Decimal("50000")   # the expected price, as before
-    assert order["fee"] == Decimal("0.30")            # the previewed commission, as before
+    assert order["actual_fill"] == Decimal("50000")  # the expected price, as before
+    assert order["fee"] == Decimal("0.30")  # the previewed commission, as before
 
 
 def test_scale_out_has_no_production_caller(repo):
@@ -1722,8 +1841,12 @@ def test_ample_configured_currency_does_NOT_fund_a_differently_quoted_product(re
     signal = _enter_signal()  # BTC-USD -> spends USD
 
     result = execute(
-        signal, broker, repo, _config(quote_currency="USDC"),
-        mode="autonomous", now_ts=NOW_TS,
+        signal,
+        broker,
+        repo,
+        _config(quote_currency="USDC"),
+        mode="autonomous",
+        now_ts=NOW_TS,
     )
 
     assert result.placed is False, "an order spending USD was funded from a USDC balance"
@@ -1740,8 +1863,12 @@ def test_the_products_own_quote_balance_is_what_permits_the_buy(repo):
     signal = _enter_signal()
 
     result = execute(
-        signal, broker, repo, _config(quote_currency="USDC"),
-        mode="autonomous", now_ts=NOW_TS,
+        signal,
+        broker,
+        repo,
+        _config(quote_currency="USDC"),
+        mode="autonomous",
+        now_ts=NOW_TS,
     )
 
     assert result.placed is True, result.vetoed_by
@@ -1763,8 +1890,12 @@ def test_the_veto_message_names_the_currency_actually_required(repo):
     signal = _enter_signal()
 
     result = execute(
-        signal, broker, repo, _config(quote_currency="USDC"),
-        mode="autonomous", now_ts=NOW_TS,
+        signal,
+        broker,
+        repo,
+        _config(quote_currency="USDC"),
+        mode="autonomous",
+        now_ts=NOW_TS,
     )
 
     message = next(v for v in result.vetoed_by if v.startswith("usdc_funding"))
@@ -1852,30 +1983,49 @@ def test_a_bracket_that_could_not_be_placed_records_the_levels_it_failed_at(repo
     broker = FakeBroker(place_success=False)
 
     order_id = place_bracket(
-        broker, repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     assert order_id is None
     assert repo.get_state("open_stop:BTC-USD") is None
     assert repo.get_state("open_target:BTC-USD") is None
     assert repo.get_state("unbracketed:BTC-USD") == {
-        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
+        "stop": Decimal("49000"),
+        "target": Decimal("53000"),
+        "qty": Decimal("0.01"),
     }
 
 
 def test_a_placed_bracket_clears_an_earlier_unprotected_record(repo):
     """A retry that succeeds must retire the trigger that drove it, or the sweep re-places a
     bracket the position already holds on every subsequent cycle."""
-    repo.set_state("unbracketed:BTC-USD", {
-        "stop": Decimal("49000"), "target": Decimal("53000"), "qty": Decimal("0.01"),
-    })
+    repo.set_state(
+        "unbracketed:BTC-USD",
+        {
+            "stop": Decimal("49000"),
+            "target": Decimal("53000"),
+            "qty": Decimal("0.01"),
+        },
+    )
 
     place_bracket(
-        FakeBroker(), repo, _config(), product_id="BTC-USD", qty=Decimal("0.01"),
-        stop=Decimal("49000"), target=Decimal("53000"),
-        rule_name="pullback_continuation", now_ts=NOW_TS,
+        FakeBroker(),
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
     )
 
     assert repo.get_state("unbracketed:BTC-USD") is None
@@ -2478,9 +2628,7 @@ class TestMaxSpreadEntryGate:
         huge = FakeBroker(preview=_book_preview(Decimal("1E+999999999"), Decimal("9E+999999999")))
 
         with caplog.at_level(logging.WARNING):
-            result = execute(
-                _enter_signal(), huge, repo, _config(), "autonomous", now_ts=NOW_TS
-            )
+            result = execute(_enter_signal(), huge, repo, _config(), "autonomous", now_ts=NOW_TS)
 
         assert result.placed is False
         assert result.vetoed_by == [BOOK_UNREADABLE_VETO]

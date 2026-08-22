@@ -469,9 +469,7 @@ def test_sufficient_usdc_opens_rule_positions_instead_of_zero_trades():
         _candle(_HOUR, "100", "102", "98", "101"),
         _candle(2 * _HOUR, "101", "103", "100", "102"),
     ]
-    rule = _FirstBarRule(
-        "BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200")
-    )
+    rule = _FirstBarRule("BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200"))
     candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
     config = _config(
         caps=Caps(
@@ -505,9 +503,7 @@ def test_cash_constrained_account_clamps_notional_to_available_usdc():
         _candle(_HOUR, "100", "102", "98", "101"),
         _candle(2 * _HOUR, "101", "103", "100", "102"),
     ]
-    rule = _FirstBarRule(
-        "BTC-USD", entry=Decimal("100"), stop=Decimal("99"), target=Decimal("200")
-    )
+    rule = _FirstBarRule("BTC-USD", entry=Decimal("100"), stop=Decimal("99"), target=Decimal("200"))
     candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
     config = _config()  # every other cap roomy -- cash is the only binding constraint
     cash = Decimal("500")
@@ -656,9 +652,7 @@ def test_monthly_volume_aggregates_by_utc_month():
         _candle(_HOUR, "100", "102", "98", "101"),
         _candle(2 * _HOUR, "101", "103", "100", "102"),
     ]
-    rule = _FirstBarRule(
-        "BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200")
-    )
+    rule = _FirstBarRule("BTC-USD", entry=Decimal("100"), stop=Decimal("90"), target=Decimal("200"))
     candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
     config = _config()
 
@@ -837,13 +831,10 @@ def test_permissive_dd_thresholds_never_suppress_entries():
     generous = _drawdown_backtest(
         max_total_dd_pct=Decimal("0.90"), max_weekly_dd_pct=Decimal("0.90")
     )
-    unreachable = _drawdown_backtest(
-        max_total_dd_pct=Decimal("1"), max_weekly_dd_pct=Decimal("1")
-    )
+    unreachable = _drawdown_backtest(max_total_dd_pct=Decimal("1"), max_weekly_dd_pct=Decimal("1"))
 
     assert len(generous.trades) == len(unreachable.trades)
     assert [t.pnl for t in generous.trades] == [t.pnl for t in unreachable.trades]
-
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +962,10 @@ def test_trailing_exits_earlier_and_higher_than_the_static_stop():
     ]
     trailed = _run_exit_policy_sim(
         _ExitPolicyFirstBarRule(
-            "BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"),
+            "BTC-USD",
+            Decimal("100"),
+            Decimal("94"),
+            Decimal("130"),
             {"trail_atr_mult": Decimal("2"), "atr_period": 2},
         ),
         hourly,
@@ -1005,7 +999,10 @@ def test_break_even_roll_exits_at_entry_once_and_never_widens():
     ]
     rolled = _run_exit_policy_sim(
         _ExitPolicyFirstBarRule(
-            "BTC-USD", Decimal("100"), Decimal("90"), Decimal("130"),
+            "BTC-USD",
+            Decimal("100"),
+            Decimal("90"),
+            Decimal("130"),
             {"be_roll_rr": Decimal("1"), "atr_period": 2},
         ),
         hourly,
@@ -1042,15 +1039,16 @@ def test_a_rule_without_exit_params_trades_identically_in_the_sim():
     )
     explicit_off = _run_exit_policy_sim(
         _ExitPolicyFirstBarRule(
-            "BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"),
+            "BTC-USD",
+            Decimal("100"),
+            Decimal("94"),
+            Decimal("130"),
             {"trail_atr_mult": None, "be_roll_rr": None},
         ),
         hourly,
     )
 
     def _shape(result):
-        return [
-            (t.entry_ts, t.exit_ts, t.entry, t.exit, t.pnl, t.outcome) for t in result.trades
-        ]
+        return [(t.entry_ts, t.exit_ts, t.entry, t.exit, t.pnl, t.outcome) for t in result.trades]
 
     assert _shape(unset) == _shape(explicit_off)

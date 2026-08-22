@@ -33,15 +33,34 @@ committed a 1x position 2x, since both legs carried the full qty. The native bra
 both problems by construction. It still runs through `guards.check` like any other order
 (un-overridable); a vetoed bracket is simply never placed and `place_bracket` returns `None`.
 
-**Stop management** (`roll_to_break_even` / `trail_stop_atr`) cancels the existing protective
-stop leg and replaces it at a new price, but never widens it: both delegate to `_roll_stop`,
-which refuses (returns `None`, leaving the existing stop in force) if the proposed new stop is
+**Stop management -- IMPLEMENTED, TESTED, AND NOT CALLED ON THE LIVE PATH (#442; be not
+misled).** `roll_to_break_even` / `trail_stop_atr` cancel the existing protective stop leg
+and replace it at a new price, never widening it: both delegate to `_roll_stop`, which
+refuses (returns `None`, leaving the existing stop in force) if the proposed new stop is
 below the last-recorded `open_stop:<product_id>` -- the same "only ratchet toward profit"
-invariant rail 9 enforces on entries, applied directly here since the replacement order's own
-`guards.check` call (still mandatory) can't reuse rail 9 as-is: rail 9 is paired with the
-min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has no
-separate entry price of its own. `scale_out` closes part of a position (a rule-driven partial
-profit-take) through the same guard+preview+place+log pipeline as a plain SELL leg.
+invariant rail 9 enforces on entries, applied directly here since the replacement order's
+own `guards.check` call (still mandatory) can't reuse rail 9 as-is: rail 9 is paired with
+the min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has
+no separate entry price of its own. `scale_out` closes part of a position (a rule-driven
+partial profit-take) through the same guard+preview+place+log pipeline as a plain SELL leg.
+NONE of the three has a live caller: nothing in the agent cycle manages a stop after
+placement (`agent._handle_exits` executes rule EXIT signals only), so reading this module
+alone OVERSTATES what keel does -- live, a position's exits are exactly the entry-time
+bracket above and a rule EXIT signal, nothing that ratchets. Why unwired, established in
+#442: (1) ratchet-only is rail-9-safe BY CONSTRUCTION (`_roll_stop` refuses a widening
+proposal before `guards.check` ever runs; pinned by `tests/execution/
+test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`); (2) live wiring needs
+a cancel-and-replace of the native bracket, and the broker port has NO bracket/OCO
+`OrderSpec` kind -- the bracket reaches the venue only because this module bypasses the
+port with a raw configuration dict -- so live stop management is split out to issue #502
+rather than solved here; (3) the exit POLICY those primitives encode (the same
+ratchet-only ATR trail and break-even roll) IS wired where exits are driven per bar: the
+sim/backtest engines, via `strategy/exit_policy.py` and the per-family `trail_atr_mult` /
+`be_roll_rr` params on `pullback_continuation` and `rsi_meanrev`. `turtle_breakout`
+deliberately carries neither knob -- its real exit is the Donchian channel, and a trail
+would cut the long winners the system exists to let run. `scale_out` stays unwired until
+#502 also covers its two pinned prerequisites (bracket resize for a partial SELL, and a
+`trade_outcomes` row so rail 16 does not count a scaled-out winner as a loss).
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
 available balance of the PRODUCT's quote leg from `broker.get_accounts()` and hands
