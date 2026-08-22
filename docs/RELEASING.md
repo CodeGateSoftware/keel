@@ -25,13 +25,17 @@ the wheels it just built.
 
 ## Cutting a release
 
-1. **Bump the version in a reviewed PR.** Edit `version` in `pyproject.toml`. The release workflow
+1. **Bump the version in a reviewed PR.** Edit `version` in `pyproject.toml`, then run `uv lock`
+   and commit the refreshed `uv.lock` with it — the bump moves every workspace `pyproject.toml`,
+   and the lockfile is the one more thing that must move with them (#424; the workflow checks it
+   before anything else and fails the release if it was left behind). The release workflow
    refuses to change the version itself — that decision belongs in a PR a human reviewed, so CI
    never writes to `main`. (The **first** release needs no bump: `pyproject.toml` already says
    `0.1.0`.)
 2. **Merge it**, then **Actions → Release → Run workflow**, entering the same version.
 3. The workflow: validates the input is semver and matches `pyproject.toml` and no such tag exists
-   → runs tests + ruff → stamps the commit into `keel/_build_info.py` → `uv build --all-packages`
+   → checks `uv.lock` is current → runs tests + ruff → stamps the commit into
+   `keel/_build_info.py` → `uv build --all-packages`
    → installs the wheel into a clean venv **by path** and asserts it self-identifies as a clean
    `[release]` → verifies the live config asset is `mode: confirm` → tags `v<version>` → composes
    release notes → publishes the GitHub Release with all wheels **and `config.yaml`** attached.
