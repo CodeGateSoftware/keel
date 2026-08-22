@@ -1616,11 +1616,77 @@ def test_best_bid_ask_legs_cross_on_a_tight_pair_and_that_is_the_venue_not_the_f
     assert gap < Decimal("0.0005"), "a crossing this wide would not be a sampling artefact"
 
 
+# --- best_bid_ask: the #413 contract, decided before any consumer exists ------------------------
+# The endpoint's two legs are sampled independently and stamped with one timestamp, so on the
+# tightest pairs they arrive CROSSED. `RobinhoodAdapter.best_bid_ask` is the decided contract:
+# it returns the pair only when the venue's own numbers order coherently (bid < ask), and `None`
+# otherwise -- never a crossed book, never a raise. `estimated_price` remains the only pricing
+# source (see that method's docstring for why normalising lo/hi was rejected).
+
+
+def test_best_bid_ask_refuses_to_return_a_crossed_row_as_a_book() -> None:
+    """The #413 symptom, met with a refusal rather than a laundering.
+
+    BTC-USD's row carries `bid` 68329.2 above `ask` 68324.17. Returning it as a book would hand
+    `to_price_side`'s BUY->ask / SELL->bid mapping two inverted legs, making BOTH directions
+    optimistic -- the exact bias that mapping exists to prevent. `None` claims nothing, and a
+    caller priced off `preview_order` instead is priced off a self-consistent row. The read is
+    filtered by symbol, the same lesson #230 taught the sizing read.
+    """
+    transport = FakeTransport(best_bid_ask=load_fixture("rh_best_bid_ask.json"))
+
+    book = RobinhoodAdapter(transport).best_bid_ask("BTC-USD")
+
+    assert book is None
+    assert transport.calls["get_best_bid_ask"] == {"symbol": "BTC-USD"}
+
+
+def test_best_bid_ask_passes_a_coherent_row_through_unchanged() -> None:
+    """The control case. XLM-USD's real spread (2-5 bps) exceeds the sampling jitter, so its legs
+    arrive in order -- and a row the venue's own numbers vouch for is returned exactly as sent,
+    as `Decimal`s, never strings."""
+    transport = FakeTransport(best_bid_ask=load_fixture("rh_best_bid_ask_uncrossed.json"))
+
+    book = RobinhoodAdapter(transport).best_bid_ask("XLM-USD")
+
+    assert book == (Decimal("0.165446"), Decimal("0.165522"))
+
+
+def test_best_bid_ask_refuses_a_locked_market_rather_than_pricing_off_it() -> None:
+    """`bid == ask` is not a book either. On an endpoint whose legs are sampled independently,
+    equality is the same absence of simultaneity a crossing is -- one leg moved and happened to
+    land on the other. Only a strictly ordered pair is a snapshot the venue vouches for."""
+    transport = FakeTransport(best_bid_ask={"results": [{"bid": "100.0", "ask": "100.0"}]})
+
+    assert RobinhoodAdapter(transport).best_bid_ask("BTC-USD") is None
+
+
+def test_best_bid_ask_refuses_a_row_it_cannot_read() -> None:
+    """A row missing a leg, or an answer with no row at all, is no book -- `None`, never a partial
+    pair a caller might index into, and never an exception on a read path."""
+    missing_leg = FakeTransport(best_bid_ask={"results": [{"bid": "100.0"}]})
+    no_rows = FakeTransport(best_bid_ask={"results": []})
+
+    assert RobinhoodAdapter(missing_leg).best_bid_ask("BTC-USD") is None
+    assert RobinhoodAdapter(no_rows).best_bid_ask("BTC-USD") is None
+
+
+def test_best_bid_ask_requires_a_transport_like_every_network_read() -> None:
+    """Constructed without a transport, a network read must fail with the same clear error every
+    other network-backed method here raises -- not an opaque `AttributeError`."""
+    with pytest.raises(RuntimeError, match="without a transport"):
+        RobinhoodAdapter().best_bid_ask("BTC-USD")
+
+
 # --- pre-flight sizing (#410) ------------------------------------------------------------------
-# Reported through `Preview.errors`, never enforced in `place_order`. Every order this adapter can
-# place is an exit or a protective leg, and the venue's behaviour on an out-of-bounds order has
-# never been observed (#412) -- so refusing locally could invent a failure the venue would not
-# have produced. These pin the reporting, and the denominations, which are the part that bites.
+# Two halves, on purpose. `preview_order` REPORTS the venue's bounds through `Preview.errors` --
+# a note beside a number a human is about to approve. `place_order` ENFORCES them, with an
+# asymmetry the issue mandates and the module's own exit-safety rule forces: a BUY (an entry)
+# is refused with a reason naming the bound and the requested value, because a refused entry
+# strands nothing; a SELL (an exit, or the protective leg of one) is NEVER refused -- it is
+# rounded down to the venue's tick and placed, because a check that strands a position keel has
+# decided to close is strictly worse than a venue rejection. These pin both halves, and the
+# denominations, which are the part that bites.
 
 
 def _priced_transport(**kwargs: Any) -> Any:
@@ -1629,6 +1695,7 @@ def _priced_transport(**kwargs: Any) -> Any:
         estimated_price=load_fixture("rh_estimated_price.json"),
         **kwargs,
     )
+
 
 
 def test_min_order_amount_is_measured_against_the_QUOTE_size_not_the_base_size() -> None:
@@ -1755,24 +1822,247 @@ def test_the_sizing_read_asks_the_venue_to_filter_rather_than_picking_results_ze
     assert transport.calls["get_trading_pairs"] == {"symbol": "BTC-USD"}
 
 
-def test_place_order_does_not_consult_the_sizing_bounds() -> None:
-    """The boundary, pinned so it cannot erode by accident. Enforcement is a separate decision
-    that needs #412's observation of a real rejection first; until then `place_order` must place
-    exactly what it was given, and must not spend a request deciding not to."""
-    transport = FakeTransport(placed=load_fixture("rh_order_open.json"), trading_pairs=_pairs())
-    adapter = RobinhoodAdapter(transport)
+def _placing_transport(**kwargs: Any) -> FakeTransport:
+    """A venue that can place the standard open-order fixture and answers the BTC-USD pair row."""
+    return FakeTransport(
+        placed=load_fixture("rh_order_open.json"), trading_pairs=_pairs(), **kwargs
+    )
 
-    result = adapter.place_order(
+
+def _buy(**overrides: Any) -> LimitGTC:
+    """A limit BUY -- the entry shape -- overridable per test."""
+    fields: dict[str, Any] = {
+        "product_id": "BTC-USD",
+        "side": Side.BUY,
+        "base_size": Decimal("0.1"),
+        "limit_price": Decimal("65000"),
+    }
+    fields.update(overrides)
+    return LimitGTC(**fields)
+
+
+def test_place_order_refuses_a_buy_below_the_quote_minimum() -> None:
+    """#410's headline case, with the refusal text pinned exactly.
+
+    One satoshi at $65,000 is $0.00065 -- under the venue's `min_order_amount` of $0.10 by three
+    orders of magnitude. A BUY is an entry: refusing it strands no position, and letting it reach
+    the venue turns a check keel can make locally into a rejection discovered at placement time.
+
+    The reason must carry everything an operator needs to act: the requested notional, the bound,
+    the denomination (QUOTE currency, the field's whole hazard -- see `_PairRules`), and what to
+    do about it. A refusal that names only "order too small" sends someone to the docs to find
+    out which of the three bounds fired and in which unit.
+    """
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        _buy(base_size=Decimal("0.00000001"))
+    )
+
+    assert result.success is False
+    assert result.broker_order_id is None
+    assert result.reason == (
+        "robinhood pre-flight refused this buy: notional 0.00065 USD (base_size 0.00000001 x "
+        "limit_price 65000) is below the venue's min_order_amount 0.1 for BTC-USD, which is a "
+        "QUOTE-currency (USD) minimum, not a base-size minimum -- size the order to at least "
+        "0.1 USD"
+    )
+    assert "create_order" not in transport.calls, "a refused entry must never reach the venue"
+
+
+def test_place_order_refuses_an_off_increment_buy() -> None:
+    """Half a satoshi. The bound, the requested value, and the disposition of the OTHER side all
+    belong in the reason: a caller who learns sells are rounded automatically will not wonder why
+    this one was not."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        _buy(base_size=Decimal("0.000000005"))
+    )
+
+    assert result.success is False
+    assert result.reason == (
+        "robinhood pre-flight refused this buy: base_size 0.000000005 is not a multiple of the "
+        "venue's asset_increment 0.00000001 for BTC-USD -- size it to the tick (a sell is "
+        "rounded down automatically; a buy is refused rather than silently re-sized)"
+    )
+    assert "create_order" not in transport.calls
+
+
+def test_place_order_refuses_a_buy_over_the_base_maximum() -> None:
+    """`max_order_size` is base-denominated (20 BTC here), so the refusal names both values in
+    base units and says what to do: split the order."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(_buy(base_size=Decimal("21")))
+
+    assert result.success is False
+    assert "base_size 21 exceeds the venue's max_order_size 20.0000000000000000" in result.reason
+    assert "both in base units" in result.reason
+    assert "create_order" not in transport.calls
+
+
+def test_place_order_places_a_buy_on_a_pair_that_carries_no_minimum() -> None:
+    """26 of the 89 pairs carry no `min_order_amount` (#230). Absent is a fact about the pair, not
+    a violation: an entry on such a pair must place exactly as it would have before the check
+    existed. The size here is the same sub-$0.10 satoshi the BTC test refuses above, so this test
+    fails if absence is ever read as a bound of zero -- or as a refusal."""
+    row = dict(load_fixture("rh_trading_pairs.json")["results"][0])
+    del row["min_order_amount"]
+    transport = FakeTransport(
+        placed=load_fixture("rh_order_open.json"), trading_pairs={"results": [row]}
+    )
+
+    result = RobinhoodAdapter(transport).place_order(
+        _buy(base_size=Decimal("0.00000001"))
+    )
+
+    assert result.success
+    assert result.broker_order_id == load_fixture("rh_order_open.json")["id"]
+
+
+def test_place_order_never_refuses_a_sell_below_the_minimum() -> None:
+    """The constraint that shapes the whole design (#410): a pre-flight refusal is correct for an
+    entry and DANGEROUS for an exit -- refusing to sell a holding because it sits under the venue
+    minimum strands a position keel has decided to close. The same order the BUY test refuses
+    must place cleanly as a SELL, size unchanged, and let the venue answer."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
         LimitGTC(
             product_id="BTC-USD",
             side=Side.SELL,
-            base_size=Decimal("0.00000001"),  # below the $0.10 minimum by any reading
+            base_size=Decimal("0.00000001"),
             limit_price=Decimal("65000"),
         )
     )
 
     assert result.success
-    assert "get_trading_pairs" not in transport.calls
+    body = transport.calls["create_order"]["body"]
+    assert body["limit_order_config"]["asset_quantity"] == "0.00000001"
+
+
+def test_place_order_never_refuses_a_sell_over_the_maximum() -> None:
+    """Same rule, other bound: 21 BTC against a `max_order_size` of 20 places anyway on the exit
+    path. The venue's rejection is observable and honest; a local refusal would leave the
+    position running with local state believing it closed."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        LimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=Decimal("21"),
+            limit_price=Decimal("65000"),
+        )
+    )
+
+    assert result.success
+    assert transport.calls["create_order"]["body"]["limit_order_config"]["asset_quantity"] == "21"
+
+
+def test_place_order_rounds_an_off_increment_sell_down_to_the_venue_tick() -> None:
+    """The exit disposition for an off-increment size: round DOWN to the increment and proceed.
+    Down, because rounding up would sell more than the holding the exit was sized from; 0.100000005
+    BTC becomes 0.10000000 BTC on the wire, and the body -- not just the result -- must show it."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        LimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=Decimal("0.100000005"),
+            limit_price=Decimal("65000"),
+        )
+    )
+
+    assert result.success
+    body = transport.calls["create_order"]["body"]
+    assert body["limit_order_config"]["asset_quantity"] == "0.10000000"
+
+
+def test_place_order_places_a_below_one_tick_sell_as_given_rather_than_minting_a_zero_order() -> None:
+    """Flooring half a satoshi to the tick yields zero, and `"asset_quantity": "0"` is not an
+    order -- it is a malformed body this package would have invented. A size below one increment
+    is placed exactly as given and the venue answers it; that keeps the never-refuse rule intact
+    without minting a zero-size order on the exit path."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        LimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=Decimal("0.000000005"),
+            limit_price=Decimal("65000"),
+        )
+    )
+
+    assert result.success
+    body = transport.calls["create_order"]["body"]
+    assert body["limit_order_config"]["asset_quantity"] == "0.000000005"
+
+
+def test_place_order_consults_the_sizing_bounds_once_per_symbol_per_process() -> None:
+    """#410 constraint 3: `get_trading_pairs` costs a request against a 100 req/min limit with no
+    backoff, so the rules are cached per symbol for the adapter's lifetime -- the same shape
+    `RobinhoodTransport._account()` uses for the account number. Two placements, one read."""
+    transport = _placing_transport()
+    adapter = RobinhoodAdapter(transport)
+    spec = _buy()
+
+    adapter.place_order(spec)
+    adapter.place_order(spec)
+
+    assert transport.call_counts.get("get_trading_pairs", 0) == 1
+    assert transport.calls["get_trading_pairs"] == {"symbol": "BTC-USD"}
+
+
+def test_place_order_retries_the_sizing_read_after_a_failure_rather_than_caching_it() -> None:
+    """Only a SUCCESSFUL read is cached. A transient 5xx on the bounds read must not disable
+    pre-flight for the rest of the process's life -- a cached failure is a check that silently
+    stops checking, the always-passing rail this package refuses everywhere else. The failed read
+    costs one request per attempt and degrades to placing as given, exactly as before the check
+    existed."""
+    transport = FakeTransport(placed=load_fixture("rh_order_open.json"))
+    adapter = RobinhoodAdapter(transport)
+
+    first = adapter.place_order(_buy())
+    second = adapter.place_order(_buy())
+
+    assert first.success
+    assert second.success
+    assert transport.call_counts.get("get_trading_pairs", 0) == 2
+
+
+def test_a_market_buy_is_still_checked_against_the_base_denominated_bounds() -> None:
+    """A market BUY names no price of its own, but `asset_increment` and `max_order_size` are
+    base-denominated and need none -- so the off-increment refusal still fires on the market
+    path, and no `estimated_price` request is spent to make it happen."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.000000005"))
+    )
+
+    assert result.success is False
+    assert "asset_increment" in result.reason
+    assert "get_estimated_price" not in transport.calls
+
+
+def test_a_market_buy_skips_the_quote_minimum_it_cannot_price() -> None:
+    """`min_order_amount` is QUOTE-denominated, and a market order carries no price to check it
+    against. Spending an `estimated_price` request per placement to manufacture one would trade a
+    known request budget for an estimate, and comparing against an ABSENT number is the module's
+    cardinal sin (`_decimal_or_none`). So the minimum is skipped -- visibly unpriced, never
+    guessed -- and the on-increment, under-max order places."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(
+        MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.00000001"))
+    )
+
+    assert result.success
+    assert "get_estimated_price" not in transport.calls
 
 
 def test_an_idempotency_key_pins_the_client_order_id_across_attempts() -> None:
