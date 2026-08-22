@@ -55,6 +55,11 @@ disclaimers below.
 
 ## Try it in five minutes
 
+No terminal? The macOS/Windows app is on the [releases page](https://github.com/CodeGateSoftware/keel/releases)
+(with [`docs/desktop-install.md`](docs/desktop-install.md) for the first launch). Terminal
+person, no cloning? The installer does this from the published wheels instead:
+`curl -fsSL https://raw.githubusercontent.com/CodeGateSoftware/keel/main/scripts/install.sh | bash`.
+
 Everything here is read-only and paper-side: no funds, and nothing in this path can place an
 order. Verified on a clean clone. You need [uv](https://docs.astral.sh/uv/) and a **free,
 read-only Coinbase Developer Platform (CDP) API key** — candle history is fetched through the

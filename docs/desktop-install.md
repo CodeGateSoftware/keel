@@ -5,18 +5,23 @@ broken. This page explains exactly what happened, why, and what to do about it.
 
 ## Would you rather not deal with this at all?
 
-There is a path with no warning on any platform, because nothing is downloaded as an application:
-the install-from-source route in the README's **"Try it in five minutes"**. `pip` and `uv` fetch
-the published wheels directly, and no operating system objects to that.
+There is a path with no warning on any platform, because nothing is downloaded as an
+application: the terminal installer. It fetches the published wheels directly into a per-user
+venv at `~/.keel`, and no operating system objects to that.
 
 ```
-pip install --find-links . ./keel_trader-<version>-py3-none-any.whl
-keel versions
+curl -fsSL https://raw.githubusercontent.com/CodeGateSoftware/keel/main/scripts/install.sh | bash
 ```
 
-It needs a terminal and Python 3.11 or later — which is exactly the friction the desktop app
-exists to remove, so this is not the recommendation for everyone. But if you already have both, it
-is the shorter road and the rest of this page does not apply to you.
+You do not have to trust that line blind: the script is
+[`scripts/install.sh`](../scripts/install.sh) in this repository, written to be read — every step
+prints what it is about to do before it does it, it runs no privileged commands, and it verifies
+itself with `keel versions` before claiming success. It needs a terminal and Python 3.11 or
+later. To build from a source checkout instead, see the README's **"Try it in five minutes"**.
+
+Both are exactly the friction the desktop app exists to remove, so this is not the recommendation
+for everyone. But if you already have a terminal, either is the shorter road and the rest of this
+page does not apply to you.
 
 ## The short version
 
