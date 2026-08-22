@@ -62,6 +62,12 @@ keel-broker-robinhood = { workspace = true }
 dev = [
     "mypy>=1.18.0",
     "pytest>=9.1.1",
+    # Dev-only, like every entry below: optuna powers the RESEARCH-side parameter study
+    # (keel/research/tuning.py, issue #476) and is imported lazily inside run_study only,
+    # so the shipped wheel and every runtime path stay clean of it. It rides the dev group
+    # (uv sync's default) rather than its own group so the study's determinism tests
+    # actually run in CI; uninstalling it must never break `import keel.research.tuning`.
+    "optuna>=4.5.0",
     # tests/test_security_scans.py parses .github/dependabot.yml directly, so the test
     # suite imports pyyaml itself rather than riding keel-core's transitive copy (the
     # rule the [project] comment above states for `keel/`, applied where it now applies).
@@ -161,8 +167,21 @@ ignore_missing_imports = true
 # keel-core moved in the previous plan but predates strict mode; it is tightened
 # when its remaining consumers migrate.
 [[tool.mypy.overrides]]
-module = "keel_core.*"
+module = ["keel_core.*"]
 ignore_errors = true
+
+# numpy rides in with optuna (the #476 research extra, dev group only) and is reached only
+# by the ONE lazy `import optuna` inside keel/research/tuning.py's runner -- nothing under
+# keel/ imports numpy itself. numpy's bundled stubs use PEP 695 `type` statements, which
+# this run's python_version=3.11 floor cannot parse, so the transitive crawl is silenced
+# here rather than by raising the floor every package in this workspace pins.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
+# `follow_imports` alone ignores .pyi files by design; numpy ships BUNDLED STUBS whose
+# PEP 695 `type` statements cannot parse under the python_version=3.11 floor above, so the
+# skip must reach the stubs too.
+follow_imports_for_stubs = true
 
 # Coverage is measured only when `--cov` is passed (see the pytest-cov note in [dependency-groups]).
 # This section exists so that a bare `--cov` -- with no value -- measures the right thing instead of
