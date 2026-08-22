@@ -46,6 +46,13 @@ human runs it, and it refuses to run anywhere that procedure would be wrong:
   directory under the launch folder would be shadowed by the wheels, a package
   resolving from outside the launch folder belongs to some other venv (a repo run),
   and an install whose origin is not one of the wheels is not a deployment to update.
+* **A packaged install NEVER self-updates (D6, #439)** -- decided in
+  `docs/decisions/0001-desktop-update-path.md`: the desktop product's update path is
+  the next signed installer, so for a bundled layout this service only ever REPORTS
+  (`packaged_check_lines`: the version comparison and the download URL, in desktop
+  vocabulary), the plan's one refusal is the packaged one, and an unreachable check is
+  a calm "could not check", never an error. The uv-venv path above is unchanged and
+  remains the answer for terminal deployments.
 
 No secrets, no auth: the GitHub releases API is read unauthenticated (60 requests/hour
 per IP is plenty for a human-gated check), and the wheels' download URLs are public.
@@ -71,7 +78,7 @@ from typing import NoReturn
 
 import click
 
-from keel.install import is_packaged, packaged_update_refusal
+from keel.install import RELEASES_URL, is_packaged, packaged_update_refusal
 from keel.version import BuildInfo, build_info, installed_distributions
 
 #: The public, unauthenticated latest-release endpoint. NO auth, NO tokens: this
@@ -313,7 +320,9 @@ def deployment_layout_refusal(launch_dir: Path, package_file: Path | None) -> st
       the working tree, not update it;
     * a path OUTSIDE the launch folder -- a repo run from another directory or a
       system python: the venv the wheels would land in is not this launch folder's
-      own, so there is no deployment here to update;
+      own, so there is no deployment here to update. A packaged install also lands
+      here (a frozen bundle is outside any launch folder), so the message names the
+      desktop path -- the installer, never a command (#439);
     * no package file at all -- refusing rather than guessing.
     """
     if package_file is None:
@@ -328,7 +337,9 @@ def deployment_layout_refusal(launch_dir: Path, package_file: Path | None) -> st
             f"the running keel package resolves from OUTSIDE the launch folder "
             f"({package_file}) -- a repo run or a system python, not this launch "
             "folder's deployment: the wheels would install into a venv that is not "
-            "the one this launch folder runs on."
+            "the one this launch folder runs on. (A packaged install also resolves "
+            "from outside any launch folder -- it updates by downloading the new "
+            "installer, not by running a command; see docs/desktop-install.md.)"
         )
     parts = rel.parts
     if ".venv" in parts and "site-packages" in parts[parts.index(".venv") + 1 :]:
@@ -427,12 +438,33 @@ def plan_update(
     An update is offered only when EVERY refusal check passes AND the latest version
     is strictly newer than the running one. "Not newer" with no refusals is the calm
     up-to-date state, not a refusal; a version that cannot be compared IS a refusal
-    (never a guess)."""
+    (never a guess).
+
+    A PACKAGED install short-circuits to its one refusal and offers nothing, ever:
+    D6 (#439, docs/decisions/0001-desktop-update-path.md) decided the desktop product
+    updates per-release installer, so there is no plan to build. Every other refusal
+    below is venv vocabulary -- a frozen bundle would pile "outside the launch folder"
+    and "no distributions installed" onto the packaged reason, each true and each
+    useless to someone whose update path is a download."""
     info = build if build is not None else build_info()
     dists = installed if installed is not None else installed_distributions()
     launch = launch_dir if launch_dir is not None else _launch_dir()
     venv = venv_python if venv_python is not None else _running_python()
     pkg_file = package_file if package_file is not None else _running_package_file()
+
+    if is_packaged():
+        return UpdatePlan(
+            current_version=info.version,
+            latest_version=release.version,
+            latest_tag=release.tag,
+            wheel_names=(),
+            wheel_urls=(),
+            release_dir=launch / "Release",
+            db_paths=tuple(sorted(launch.glob("keel*.db"))),
+            venv_python=venv,
+            offered=False,
+            refusal_reasons=(packaged_update_refusal(),),
+        )
 
     reasons: list[str] = []
     wheels: tuple[ReleaseAsset, ...] = ()
@@ -441,12 +473,6 @@ def plan_update(
     except UpdateError as exc:
         reasons.append(str(exc))
 
-    if is_packaged():
-        # First, and on its own terms: every other refusal below talks about `site-packages`
-        # layouts and tells the reader to put `uv` on PATH. A packaged user has no venv and no
-        # `uv`, and never will -- so the message that reaches them has to name the real update
-        # path rather than an impossible one (#439).
-        reasons.append(packaged_update_refusal())
     if info.source != "release":
         reasons.append(
             f"this is a [{info.source}] build, not a release install -- the updater "
@@ -602,7 +628,9 @@ def _uv_install(venv_python: Path, wheels: Sequence[Path]) -> None:
         raise UpdateError(
             "uv is not on PATH -- the updater installs with `uv pip install` (the "
             "runbook's own tool, a deployment dependency). Install uv, or run the "
-            "manual procedure in docs/operator-runbook.md ('Deploying a new version')."
+            "manual procedure in docs/operator-runbook.md ('Deploying a new version'). "
+            "(A packaged install never needs uv and never reaches this step: it "
+            "updates by downloading the new installer -- docs/desktop-install.md.)"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise UpdateError(
@@ -1008,6 +1036,33 @@ def typed_update_gate(plan: UpdatePlan) -> bool:
 # -- the renderers: one implementation, both front-ends --------------------------------------------
 
 
+def packaged_check_lines(build: BuildInfo, release: ReleaseInfo) -> list[str]:
+    """The check report for a PACKAGED install (D6, #439): the same first line as
+    `render_plan_lines` (current vs latest, so the two front-ends cannot disagree about
+    the facts), then exactly one verdict line in DESKTOP vocabulary -- the download URL
+    and docs/desktop-install.md, never a venv word (`uv`, `site-packages`, `not
+    offered`): a packaged install is not being refused an update, it has a different
+    one. The version comparison is `is_newer_version`'s, so a junk tag stays an honest
+    "cannot compare" with the releases URL as the user's path. PURE."""
+    lines = [f"current: {build.version}   latest: {release.version} (tag {release.tag})"]
+    newer = is_newer_version(release.version, build.version)
+    if newer is None:
+        lines.append(
+            f"cannot compare the running version {build.version!r} with the release tag "
+            f"{release.tag!r} -- not semver. The latest installer is always at "
+            f"{RELEASES_URL}."
+        )
+    elif newer:
+        lines.append(
+            f"a newer release exists: {release.tag} -- a packaged install updates by "
+            f"re-downloading the installer; get it from {RELEASES_URL} (see "
+            "docs/desktop-install.md, 'How updates arrive')."
+        )
+    else:
+        lines.append(f"you are at the latest release ({build.version}) -- nothing to do.")
+    return lines
+
+
 def render_plan_lines(plan: UpdatePlan) -> list[str]:
     """The check report: current vs latest, then the whole plan (or every refusal).
     The exact lines the CLI prints and the console's update view renders -- ONE
@@ -1078,17 +1133,40 @@ def update_cmd(ctx: click.Context, check: bool) -> None:
     """Check for a newer release and deploy it into this launch folder.
 
     The procedure docs/operator-runbook.md spells out by hand, automated and still
-    human-gated: download the production wheels to Release/, back up every
+    human-gated: download the five production wheels to Release/, back up every
     keel*.db first, install into the RUNNING venv with uv, migrate, verify with
     `keel versions`, and only then clean the superseded wheels. NEVER automatic: the
     full run demands a typed confirmation at a terminal. `--check` mutates nothing.
+
+    On a PACKAGED install (D6, #439) there is nothing to run -- the desktop product
+    updates per-release installer -- so both `--check` and the full command are the
+    same read-only report: the version comparison and where to download, with no gate
+    (nothing mutates, so there is nothing to confirm) and a network failure rendered
+    calm with exit 0 (an unavailable check is not an error state).
 
     On success this command does NOT relaunch anything (a CLI process is not the
     TUI) -- it prints the command to start the new build. Only the TUI relaunches
     itself.
     """
     try:
-        plan = plan_update(latest_release())
+        release = latest_release()
+    except UpdateError as exc:
+        if is_packaged():
+            click.echo(
+                f"could not check for a newer release ({exc}) -- you are running "
+                f"{build_info().version}; the latest installer is always at "
+                f"{RELEASES_URL}."
+            )
+            return
+        raise click.ClickException(str(exc)) from exc
+
+    if is_packaged():
+        for line in packaged_check_lines(build_info(), release):
+            click.echo(line)
+        return
+
+    try:
+        plan = plan_update(release)
     except UpdateError as exc:
         raise click.ClickException(str(exc)) from exc
 
