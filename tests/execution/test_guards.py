@@ -362,6 +362,105 @@ def test_rail8_dca_exempt_from_averaging_into_losers(repo):
     assert result.violations == []
 
 
+def _seed_partial_buy(
+    repo: Repository,
+    *,
+    ordered_qty: Decimal,
+    filled_qty: Decimal,
+    price: Decimal,
+    limit_price: Decimal,
+    created_at: int,
+) -> None:
+    """A live BUY the venue has only partly executed, as reconciliation now records it
+    (#446): the ORDERED size stays in `qty`, the observed fill in `filled_quantity`, and the
+    status is the distinct non-terminal `partially_filled`."""
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=Side.BUY.value,
+            order_type="limit",
+            qty=ordered_qty,
+            limit_price=limit_price,
+            status="partially_filled",
+            fee=Decimal("0"),
+            expected_fill=limit_price,
+            actual_fill=price,  # the venue's running average across the fills so far
+            filled_quantity=filled_qty,
+            raw_response=None,
+            confirmation="auto",
+            rule_id=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def test_rail8_counts_a_partially_filled_entry_in_the_basis(repo):
+    """A partially-filled BUY has really bought `filled_quantity` at the observed average.
+    Excluding the row leaves the basis at the fully-filled tranche alone and lets a new entry
+    slip UNDER the true cost unnoticed -- the wrong-basis decision #446 names.
+
+    Basis on the FILLED quantities: (0.006*50000 + 0.002*50800) / 0.008 = 50200.
+    Excluding the partial (the old query, `status="filled"` only) gives 50000, so an entry
+    at 50100 discriminated nothing; here it must VETO."""
+    config = _config(max_exposure_usd=Decimal("1000000"), max_per_asset_pct=Decimal("1"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.006"),
+        price=Decimal("50000"),
+        created_at=NOW_TS - 2_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.01"),
+        filled_qty=Decimal("0.002"),
+        price=Decimal("50800"),
+        limit_price=Decimal("51000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+
+    result = check(
+        _intent(entry=Decimal("50100"), stop=Decimal("49000")), repo, config, NOW_TS
+    )
+
+    assert result.ok is False
+    assert _keys(result) == {"no_averaging_into_losers"}
+
+
+def test_rail8_uses_the_FILLED_size_not_the_ordered_size_of_a_partial(repo):
+    """Same history, the other direction: the unfilled remainder was never bought, so it must
+    not weight the basis. On the ORDERED sizes the basis would be
+    (0.006*50000 + 0.01*50800) / 0.016 = 50500, vetoing this 50300 entry; on the filled ones
+    it is 50200 and the entry -- ABOVE the true basis -- is not averaging into a loser."""
+    config = _config(max_exposure_usd=Decimal("1000000"), max_per_asset_pct=Decimal("1"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.006"),
+        price=Decimal("50000"),
+        created_at=NOW_TS - 2_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.01"),
+        filled_qty=Decimal("0.002"),
+        price=Decimal("50800"),
+        limit_price=Decimal("51000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+
+    result = check(
+        _intent(entry=Decimal("50300"), stop=Decimal("49000")), repo, config, NOW_TS
+    )
+
+    assert result.ok is True
+    assert result.violations == []
+
+
 # -- rail 9: no stop-loss widening -----------------------------------------------------------------
 
 

@@ -308,19 +308,166 @@ def test_a_broker_error_on_one_order_does_not_abandon_the_rest(repo):
     assert repo.get_order(second)["status"] == "filled"
 
 
-def test_a_partial_fill_is_left_alone_rather_than_recorded_as_a_full_exit(repo):
+def test_a_partial_fill_is_recorded_as_its_own_non_terminal_state(repo):
     """A partially-filled bracket has NOT closed the position. Recording it as a full exit
-    would book a P&L for size that never sold and release a position still partly held."""
+    would book a P&L for size that never sold and release a position still partly held.
+
+    But "leave the row untouched as `pending`" (the old behaviour) hides the fill from every
+    reader: nothing distinguished an untouched order from one the venue had already begun
+    executing, so the position basis and the bracket-sizing question were both blind to it
+    (#446). The row now carries a DISTINCT non-terminal state plus the venue-observed filled
+    quantity and running average price."""
     bracket_id = _seed_bracket(repo)
     broker = _Broker({"cb-1": {
         "order_id": "cb-1", "status": "OPEN", "filled_size": Decimal("0.004"),
         "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.2"),
     }})
 
+    changed = reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    row = repo.get_order(bracket_id)
+    assert changed == [bracket_id]                  # a state change, so it is reported as one
+    assert row["status"] == "partially_filled"      # its own state, not "pending"
+    assert row["filled_quantity"] == Decimal("0.004")
+    assert row["actual_fill"] == Decimal("48900")   # the venue's running average across fills
+    assert row["fee"] == Decimal("1.2")
+    assert row["qty"] == Decimal("0.01")            # the ORDERED size stays the ordered size
+    # ...and the terminal half is unchanged: no outcome, no release, the tranche is still open.
+    assert repo.get_trade_outcomes() == []
+    assert repo.get_open_positions(PRODUCT)
+
+
+def test_partial_then_more_then_full_drives_the_states_and_the_weighted_average(repo):
+    """The recognition state machine, driven by a fake venue through the whole life of one
+    order. The average recorded at every step is the QUANTITY-WEIGHTED average of the fills
+    observed so far -- exactly what rail 8 must later read as the basis (#446).
+
+    The numbers are hand-computed so the arithmetic is pinned, not emergent:
+      0.004 @ 48900                                        -> avg  48900.0
+      +0.003 @ 50300 (0.004*48900 + 0.003*50300)/0.007     -> avg  49500.0
+      +0.003 @ 51400 (...       + 0.003*51400)/0.01        -> avg  50070.0
+    """
+    bracket_id = _seed_bracket(repo)
+    snapshots = [
+        ("OPEN", Decimal("0.004"), Decimal("48900"), Decimal("1.17")),
+        ("OPEN", Decimal("0.007"), Decimal("49500"), Decimal("2.05")),
+        ("FILLED", Decimal("0.01"), Decimal("50070"), Decimal("2.93")),
+    ]
+    for status, filled, average, fees in snapshots:
+        broker = _Broker({"cb-1": {
+            "order_id": "cb-1", "status": status, "filled_size": filled,
+            "average_filled_price": average, "total_fees": fees,
+        }})
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+        row = repo.get_order(bracket_id)
+        assert row["filled_quantity"] == filled
+        assert row["actual_fill"] == average, f"weighted average wrong at {filled}"
+
+    # Terminal: the outcome is booked ONCE, on the observed economics of the whole fill.
+    row = repo.get_order(bracket_id)
+    assert row["status"] == "filled"
+    (outcome,) = repo.get_trade_outcomes()
+    assert outcome["exit_fill"] == Decimal("50070")
+    assert outcome["qty"] == Decimal("0.01")
+    assert repo.get_open_positions(PRODUCT) == []
+
+
+def test_a_partially_filled_order_is_still_polled_next_cycle(repo):
+    """`partially_filled` is NON-terminal: if the sweep only fetched `pending` rows, the very
+    state it just wrote would take the order out of its own polling set and the remaining
+    0.006 would never be observed -- the exact blindness this issue exists to end."""
+    _seed_bracket(repo)
+    partial = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "OPEN", "filled_size": Decimal("0.004"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.17"),
+    }})
+    reconcile.reconcile_open_orders(partial, repo, _config(), now_ts=NOW)
+
+    terminal = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("49500"), "total_fees": Decimal("2.93"),
+    }})
+    reconcile.reconcile_open_orders(terminal, repo, _config(), now_ts=NOW)
+
+    assert len(repo.get_trade_outcomes()) == 1
+
+
+def test_a_repeat_partial_observation_is_idempotent(repo, caplog):
+    """The sweep runs every cycle; a resting partial that has not moved must not re-write the
+    row or re-warn on every cycle -- that trains the alert to be ignored."""
+    bracket_id = _seed_bracket(repo)
+    snapshot = {"cb-1": {
+        "order_id": "cb-1", "status": "OPEN", "filled_size": Decimal("0.004"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.17"),
+    }}
+    broker = _Broker(snapshot)
+
+    with caplog.at_level(logging.WARNING):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+        first = repo.get_order(bracket_id)["updated_at"]
+        assert caplog.text.count("reconcile.order_partially_filled") == 1
+
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW + 900)
+
+    assert caplog.text.count("reconcile.order_partially_filled") == 1
+    assert repo.get_order(bracket_id)["updated_at"] == first
+
+
+def test_a_partially_filled_bracket_that_cancels_records_the_sold_part(repo):
+    """partial -> CANCELLED. The dead-order branch already knew how to book `filled_size` of a
+    cancelled order; what changes is that the row ARRIVES there from the `partially_filled`
+    state rather than from `pending` -- the booked quantity must still be only what sold."""
+    bracket_id = _seed_bracket(repo)
+    partial = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "OPEN", "filled_size": Decimal("0.004"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.17"),
+    }})
+    reconcile.reconcile_open_orders(partial, repo, _config(), now_ts=NOW)
+
+    dead = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "CANCELLED", "filled_size": Decimal("0.004"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("1.17"),
+    }})
+    reconcile.reconcile_open_orders(dead, repo, _config(), now_ts=NOW)
+
+    row = repo.get_order(bracket_id)
+    assert row["status"] == "filled"
+    assert row["qty"] == Decimal("0.004")
+    (outcome,) = repo.get_trade_outcomes()
+    assert outcome["qty"] == Decimal("0.004")
+    # The still-held remainder is not dropped out of the ledger.
+    assert repo.get_open_positions(PRODUCT)
+
+
+def test_a_full_fill_also_records_the_filled_quantity(repo):
+    """`filled_quantity` is not a partial-only field: a fully-filled row carries it too, so a
+    reader never has to special-case which statuses have an observed quantity."""
+    bracket_id = _seed_bracket(repo)
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+    }})
+
     reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
 
-    assert repo.get_trade_outcomes() == []
-    assert repo.get_order(bracket_id)["status"] == "pending"
+    assert repo.get_order(bracket_id)["filled_quantity"] == Decimal("0.01")
+
+
+def test_an_old_row_without_filled_quantity_still_reconciles(repo):
+    """Back-compat: every order written before this change has NULL `filled_quantity`, and a
+    NULL must read as "not observed" -- the row behaves exactly as it did before."""
+    bracket_id = _seed_bracket(repo)
+    assert repo.get_order(bracket_id)["filled_quantity"] is None
+
+    broker = _Broker({"cb-1": {
+        "order_id": "cb-1", "status": "FILLED", "filled_size": Decimal("0.01"),
+        "average_filled_price": Decimal("48900"), "total_fees": Decimal("2.93"),
+    }})
+    reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    row = repo.get_order(bracket_id)
+    assert row["status"] == "filled"
+    assert row["filled_quantity"] == Decimal("0.01")
 
 
 def test_a_partially_filled_then_cancelled_bracket_records_the_part_that_sold(repo):

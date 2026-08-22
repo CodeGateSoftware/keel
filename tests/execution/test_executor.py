@@ -1194,6 +1194,83 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
     assert order["fee"] == Decimal("0.30")
 
 
+# -- partially filled market entries (#446) -------------------------------------------------------
+
+
+class _PartiallyFillingBroker(FakeBroker):
+    """The venue's answer for a market IOC that only partly filled: the IOC cancelled the
+    remainder at the venue, `filled_size` is what actually executed, and `average_filled_price`
+    is the running average over those fills."""
+
+    def __init__(self, filled_size: Decimal, average_price: Decimal) -> None:
+        super().__init__()
+        self._observed = {
+            "order_id": "broker-order-1",
+            "product_id": "BTC-USD",
+            "side": "BUY",
+            "status": "FILLED",
+            "filled_size": filled_size,
+            "average_filled_price": average_price,
+            "total_fees": Decimal("0.18"),
+        }
+
+    def get_order(self, order_id: str) -> dict:
+        return dict(self._observed)
+
+
+def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, caplog):
+    """The entry-side half of #446. A market IOC entry that only partly filled still leaves a
+    row claiming the FULL ordered size was bought -- and `execute` then places the exit bracket
+    for that ordered size, i.e. for more than is held.
+
+    The bracket AMEND/cancel-and-replace policy is #502's (the port has no bracket kind), so
+    what this path owes today is DETECTION: record the observed filled quantity on the row and
+    warn loudly enough that a human sizes the bracket to reality. The bracket itself is still
+    placed for the ordered size -- detect-and-surface, not auto-resize."""
+    # The standard enter signal sizes to qty = 1 (equity 1,000,000 x risk 0.001 / the 1000
+    # entry-to-stop distance); the venue reports only 0.6 of it executed.
+    broker = _PartiallyFillingBroker(
+        filled_size=Decimal("0.6"), average_price=Decimal("50010")
+    )
+    signal = _enter_signal()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            signal, broker, repo, _config(), "autonomous", confirm_fn=None, now_ts=NOW_TS
+        )
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["status"] == "filled"                    # terminal for an IOC, as before
+    assert order["qty"] == Decimal("1")                   # the ordered size, unchanged
+    assert order["filled_quantity"] == Decimal("0.6")     # ...but the observed fill is recorded
+    assert order["actual_fill"] == Decimal("50010")
+    assert order["fee"] == Decimal("0.18")
+    assert "executor.entry_partially_filled" in caplog.text
+    # Detect-and-surface, NOT auto-resize: the bracket is still placed for the ORDERED size
+    # (resizing it is the amend-vs-replace decision #502 owns).
+    bracket = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
+    assert bracket["base_size"] == "1.000"
+
+
+def test_a_fully_filled_entry_records_the_filled_quantity_without_warning(repo, caplog):
+    """The negative control: `filled_quantity == qty` is the ordinary case and must not warn --
+    a warning on every entry trains the alert to be ignored."""
+    broker = _PartiallyFillingBroker(
+        filled_size=Decimal("1"), average_price=Decimal("50010")
+    )
+    signal = _enter_signal()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            signal, broker, repo, _config(), "autonomous", confirm_fn=None, now_ts=NOW_TS
+        )
+
+    order = repo.get_order(result.order_id)
+    assert order["filled_quantity"] == Decimal("1") == order["qty"]
+    assert "executor.entry_partially_filled" not in caplog.text
+
+
 # -- a cancel that cannot actually reach the exchange must be LOUD ------------------------------
 
 
