@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from keel_core.notifications import NotificationSettings
 from keel_core.paths import default_env_path
 from keel_core.products import is_spot_base_code
 from keel_core.types import Granularity
@@ -248,6 +249,16 @@ class FeesConfig:
     maker_pct: Decimal = Decimal("0.006")
 
 
+# The `notifications:` section's type is `keel_core.notifications.NotificationSettings` --
+# the ONE settings class, defined beside the taxonomy it opts into and the emitter that
+# consumes it, rather than a config-side duplicate the two could drift apart on. Its fields:
+# `events` (the keys opted in with `true`; absent/false/unknown keys opt into nothing) and
+# `format` ("plain" generic JSON, or "slack"-compatible text). Deliberately NO webhook URL
+# here: the URL stays in `KEEL_ALERT_WEBHOOK` (environment or git-ignored `.env`, via
+# `keel_core.alerting.resolve_webhook_url`) because it is closer to a credential than to
+# configuration and `config.yaml` is committed -- no URL means no delivery and no network.
+
+
 def _default_tiers() -> tuple[TierConfig, ...]:
     """Real Coinbase One tiers (Issue #86) -- see `TierConfig`'s docstring for `free_volume_usd
     is None` ("Premium" is unlimited)."""
@@ -260,9 +271,7 @@ def _default_tiers() -> tuple[TierConfig, ...]:
             free_volume_usd=Decimal("10000"),
             subscription_usd_month=Decimal("29.99"),
         ),
-        TierConfig(
-            name="Premium", free_volume_usd=None, subscription_usd_month=Decimal("299.99")
-        ),
+        TierConfig(name="Premium", free_volume_usd=None, subscription_usd_month=Decimal("299.99")),
     )
 
 
@@ -375,6 +384,10 @@ class Config:
     # pre-existing configs that omit the section parse to the same Coinbase deployment they
     # always were -- see `BrokerConfig` for why the default is a statement, not a guess.
     broker: BrokerConfig = field(default_factory=BrokerConfig)
+    # Opt-in notifications over the generic webhook (issue #444). Defaulted to disabled so
+    # every pre-existing config parses to exactly the deployment it always was: the section
+    # changes nothing until an operator opts events in AND configures `KEEL_ALERT_WEBHOOK`.
+    notifications: NotificationSettings = field(default_factory=NotificationSettings)
 
 
 # Only the real, binding caps are required; `max_per_order_usd`/`max_per_day_usd` are optional
@@ -627,9 +640,7 @@ def _parse_logging(raw: dict[str, Any]) -> LoggingConfig:
             f"logging.max_file_mb: expected a positive integer, got {max_file_mb!r}"
         ) from exc
     if max_file_mb <= 0:
-        raise ConfigError(
-            f"logging.max_file_mb: must be a positive integer, got {max_file_mb!r}"
-        )
+        raise ConfigError(f"logging.max_file_mb: must be a positive integer, got {max_file_mb!r}")
 
     file_count = logging_raw.get("file_count", 5)
     try:
@@ -645,9 +656,37 @@ def _parse_logging(raw: dict[str, Any]) -> LoggingConfig:
     if not isinstance(file, str) or not file:
         raise ConfigError(f"logging.file: must be a non-empty string, got {file!r}")
 
-    return LoggingConfig(
-        verbose=verbose, file=file, max_file_mb=max_file_mb, file_count=file_count
-    )
+    return LoggingConfig(verbose=verbose, file=file, max_file_mb=max_file_mb, file_count=file_count)
+
+
+#: The payload formats `notifications.format` may name (`keel_core.notifications` owns them).
+_VALID_NOTIFICATION_FORMATS = ("plain", "slack")
+
+
+def _parse_notifications(raw: dict[str, Any]) -> NotificationSettings:
+    """Parse `notifications:` -- optional, absent means entirely disabled (#444 ships it
+    off). Unknown event KEYS are kept but harmless (they match nothing in the taxonomy);
+    an unknown FORMAT is refused, because a typo there would silently keep every payload in
+    the wrong shape for the receiver the operator pointed at the webhook."""
+    notifications_raw = raw.get("notifications") or {}
+    if not isinstance(notifications_raw, dict):
+        raise ConfigError(f"notifications: must be a mapping, got {notifications_raw!r}")
+
+    events_raw = notifications_raw.get("events") or {}
+    if not isinstance(events_raw, dict):
+        raise ConfigError(
+            f"notifications.events: must be a mapping of event key to boolean, got {events_raw!r}"
+        )
+    events = frozenset(str(key) for key, enabled in events_raw.items() if bool(enabled))
+
+    fmt = notifications_raw.get("format", "plain")
+    if fmt not in _VALID_NOTIFICATION_FORMATS:
+        raise ConfigError(
+            f"notifications.format: invalid value {fmt!r}; must be one of "
+            f"{_VALID_NOTIFICATION_FORMATS!r} (plain = generic JSON, slack = Slack-compatible "
+            f"text)"
+        )
+    return NotificationSettings(events=events, format=fmt)
 
 
 def _parse_research(raw: dict[str, Any]) -> ResearchConfig:
@@ -669,9 +708,7 @@ def _parse_research(raw: dict[str, Any]) -> ResearchConfig:
     try:
         slope_floor = Decimal(str(raw_slope))
     except (TypeError, ValueError, InvalidOperation) as exc:
-        raise ConfigError(
-            f"research.slope_floor: expected a number, got {raw_slope!r}"
-        ) from exc
+        raise ConfigError(f"research.slope_floor: expected a number, got {raw_slope!r}") from exc
 
     return ResearchConfig(pbo_max=pbo_max, slope_floor=slope_floor)
 
@@ -769,8 +806,7 @@ def _parse_execution(raw: dict[str, Any]) -> ExecutionConfig:
     )
     if not pct.is_finite():
         raise ConfigError(
-            f"execution.max_entry_spread_pct: must be a finite number in (0, 0.10], "
-            f"got {pct!r}"
+            f"execution.max_entry_spread_pct: must be a finite number in (0, 0.10], got {pct!r}"
         )
     if pct <= 0 or pct > _MAX_ENTRY_SPREAD_PCT_CEILING:
         raise ConfigError(
@@ -814,8 +850,7 @@ def load_config(path: str | Path) -> Config:
     pacing = subscription_raw.get("pacing", "opportunistic")
     if pacing not in _VALID_PACING_MODES:
         raise ConfigError(
-            f"subscription.pacing: invalid value {pacing!r}; must be one of "
-            f"{_VALID_PACING_MODES!r}"
+            f"subscription.pacing: invalid value {pacing!r}; must be one of {_VALID_PACING_MODES!r}"
         )
 
     if "monthly_allowance_usd" in subscription_raw:
@@ -838,9 +873,7 @@ def load_config(path: str | Path) -> Config:
     # directory legitimately does not exist yet on a fresh install.
     proposals_dir = raw.get("proposals_dir", "~/keel/proposals")
     if not isinstance(proposals_dir, str) or not proposals_dir:
-        raise ConfigError(
-            f"proposals_dir: must be a non-empty string, got {proposals_dir!r}"
-        )
+        raise ConfigError(f"proposals_dir: must be a non-empty string, got {proposals_dir!r}")
 
     settlement_currencies = _parse_settlement_currencies(raw)
 
@@ -951,6 +984,7 @@ def load_config(path: str | Path) -> Config:
         research=_parse_research(raw),
         execution=_parse_execution(raw),
         broker=_parse_broker(raw),
+        notifications=_parse_notifications(raw),
     )
 
 
@@ -1029,6 +1063,7 @@ __all__ = [
     "ExecutionConfig",
     "FeesConfig",
     "BrokerConfig",
+    "NotificationSettings",
     "Config",
     "load_config",
     "load_secrets",

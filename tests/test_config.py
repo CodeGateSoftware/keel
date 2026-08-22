@@ -121,9 +121,7 @@ def test_every_shipped_config_allowlist_still_loads(write_config):
 
 
 def test_load_config_negative_cap_raises_configerror(write_config):
-    text = VALID_CONFIG_YAML.replace(
-        "max_per_order_usd: 100", "max_per_order_usd: -100"
-    )
+    text = VALID_CONFIG_YAML.replace("max_per_order_usd: 100", "max_per_order_usd: -100")
     path = write_config(text)
 
     with pytest.raises(ConfigError, match="max_per_order_usd"):
@@ -188,9 +186,7 @@ def test_assumed_free_volume_usd_parses(write_config) -> None:
     from tests.conftest import VALID_CONFIG_YAML
 
     path = write_config(
-        VALID_CONFIG_YAML.replace(
-            "assumed_free_volume_usd: 500", "assumed_free_volume_usd: 1234.5"
-        )
+        VALID_CONFIG_YAML.replace("assumed_free_volume_usd: 500", "assumed_free_volume_usd: 1234.5")
     )
     config = load_config(path)
     assert config.subscription.assumed_free_volume_usd == Decimal("1234.5")
@@ -209,9 +205,7 @@ def test_unsubscribed_allowance_parses(write_config) -> None:
     # take the last occurrence -- the test would have kept passing while asserting nothing about
     # a document any stricter loader would reject.
     path = write_config(
-        VALID_CONFIG_YAML.replace(
-            "unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: 25"
-        )
+        VALID_CONFIG_YAML.replace("unsubscribed_allowance_usd: 0", "unsubscribed_allowance_usd: 25")
     )
     assert load_config(path).subscription.unsubscribed_allowance_usd == Decimal("25")
 
@@ -510,11 +504,6 @@ tiers:
         load_config(path)
 
 
-
-
-
-
-
 # -- logging (engine-activity logging feature) --------------------------------------------------
 
 
@@ -783,4 +772,44 @@ def test_paper_config_defaults_when_absent(valid_config_path):
 def test_paper_config_rejects_negative(write_config):
     cfg_text = VALID_CONFIG_YAML + "\npaper:\n  starting_equity_usd: -1\n"
     with pytest.raises(ConfigError):
+        load_config(write_config(cfg_text))
+
+
+# -- notifications: NotificationSettings (#444 -- per-event opt-in, default off) ----------------
+
+
+def test_notifications_default_to_disabled(valid_config_path):
+    """No `notifications:` block means nothing opted in -- the CRITICAL webhook and every
+    existing deployment behave exactly as before the section existed."""
+    cfg = load_config(valid_config_path)
+
+    assert cfg.notifications.events == frozenset()
+    assert cfg.notifications.format == "plain"
+
+
+def test_notifications_events_parse_from_yaml_and_unknown_keys_are_kept_harmless(write_config):
+    """Freqtrade's `notification_settings` shape: per-event booleans. A key the taxonomy
+    does not know is ignored rather than refused -- it opts into nothing, exactly like a
+    settings entry naming a retired event."""
+    cfg_text = (
+        VALID_CONFIG_YAML
+        + "\nnotifications:\n"
+        + "  format: slack\n"
+        + "  events:\n"
+        + "    attestation.expiring: true\n"
+        + "    rail.armed: true\n"
+        + "    setup.unplaced: false\n"
+        + "    not.a.real.event: true\n"
+    )
+    cfg = load_config(write_config(cfg_text))
+
+    assert cfg.notifications.events == frozenset(
+        {"attestation.expiring", "rail.armed", "not.a.real.event"}
+    )
+    assert cfg.notifications.format == "slack"
+
+
+def test_an_unknown_notification_format_is_refused_at_load(write_config):
+    cfg_text = VALID_CONFIG_YAML + "\nnotifications:\n  format: carrier-pigeon\n"
+    with pytest.raises(ConfigError, match="notifications.format"):
         load_config(write_config(cfg_text))

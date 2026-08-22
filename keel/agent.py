@@ -1642,7 +1642,7 @@ def run_once(
                     )
                     _open_tranche(repo, product_id, signal.rule_name, order, result, now_ts)
 
-        return LoopResult(
+        cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,
             skip_reason=None,
@@ -1658,6 +1658,18 @@ def run_once(
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,
         )
+
+        # Post-cycle notifications (#444): derive the opted-in events from the same seams
+        # doctor reads and fire-and-forget them. AFTER every trading work, default-off at the
+        # config, and `notify_after_cycle` swallows everything -- a notification failure must
+        # never cost a cycle. The import is lazy for the same reason `gather_findings`'s is:
+        # `keel.notifications` bridges to `keel.commands.doctor`, and keeping it out of this
+        # module's import graph keeps the loop importable without the diagnostic layer.
+        from keel.notifications import notify_after_cycle
+
+        notify_after_cycle(repo, config, cycle_result, now_ts)
+
+        return cycle_result
     finally:
         unbind_cycle(cycle_token)
 
