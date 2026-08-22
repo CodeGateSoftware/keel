@@ -382,6 +382,139 @@ def test_the_inno_script_is_smoke_compiled_before_any_release_needs_it() -> None
     )
 
 
+# -- signing: implemented, gated on the certificates, honest about skipping ---------------------
+#
+# #438's delta on the "ship unsigned" decision: the signing work is REAL -- codesign with
+# the hardened runtime, notarytool --wait, stapler, signtool with an RFC 3161 timestamp --
+# but each leg runs only when that leg's credentials exist on the `signing` environment.
+# Missing credentials must SKIP WITH A NOTICE that names every secret and what it costs
+# (#402's discipline: a missing prerequisite is announced, never a red release), and the
+# checks below exist so the gate can never be detached from the step it guards.
+
+_MACOS_SIGNING_SECRETS = (
+    "MACOS_CERT_P12_BASE64",
+    "MACOS_CERT_PASSWORD",
+    "APP_STORE_CONNECT_KEY_ID",
+    "APP_STORE_CONNECT_ISSUER_ID",
+    "APP_STORE_CONNECT_KEY_CONTENT",
+)
+_WINDOWS_SIGNING_SECRETS = ("WINDOWS_CERT_PFX_BASE64", "WINDOWS_CERT_PASSWORD")
+
+
+def _step(job: dict, name: str) -> dict:
+    step = next((s for s in job["steps"] if str(s.get("name", "")) == name), None)
+    assert step is not None, f"release.yml's desktop job must keep a step named {name!r}"
+    return step
+
+
+def test_the_signing_secrets_live_on_a_protected_environment(desktop_job: dict) -> None:
+    """#438: the certificates must be ENVIRONMENT secrets, not repository ones -- a
+    repository secret is handed to every same-repo PR build, while an environment secret
+    stops at the environment's reviewers. Until the environment exists the reference is
+    inert (GitHub treats a missing environment as unprotected) and the signing steps skip
+    honestly, which is why this can be declared unconditionally."""
+    assert desktop_job["environment"] == "signing", (
+        "the desktop job must reference the `signing` environment -- that is the only "
+        "thing that stands between a certificate secret and every PR build"
+    )
+
+
+def test_macos_signing_runs_only_when_every_apple_credential_exists(desktop_job: dict) -> None:
+    """All FIVE or none: a signed-but-un-notarised app is the worst state on macOS (it
+    still trips Gatekeeper, and now looks like it tried not to), so the gate is the whole
+    Apple set -- the Developer ID Application .p12 to sign, and the App Store Connect API
+    key trio notarytool needs. #402's lesson is measured per component, not by one token."""
+    condition = str(_step(desktop_job, "Sign, notarise and staple (macOS)").get("if", ""))
+    assert "runner.os == 'macOS'" in condition
+    for secret in _MACOS_SIGNING_SECRETS:
+        assert f"secrets.{secret} != ''" in condition, (
+            f"the macOS sign step must require {secret} -- a partial credential set must "
+            "skip, not half-sign"
+        )
+
+
+def test_windows_signing_runs_only_when_the_certificate_exists(desktop_job: dict) -> None:
+    condition = str(_step(desktop_job, "Sign the installer (Windows)").get("if", ""))
+    assert "runner.os == 'Windows'" in condition
+    for secret in _WINDOWS_SIGNING_SECRETS:
+        assert f"secrets.{secret} != ''" in condition
+
+
+def test_each_skip_notice_names_every_missing_secret_and_the_price_of_fixing_it(
+    desktop_job: dict,
+) -> None:
+    """The honest skip: each notice fires on the exact COMPLEMENT of its sign step's gate,
+    and says what to buy, which secrets to create, and where the checklist is -- so a
+    reader of a green run learns signing was SKIPPED, never believes it happened, and
+    knows the purchase that would turn it on (#438's signing table, restated as text)."""
+    cases = [
+        ("Notice: macOS signing skipped", _MACOS_SIGNING_SECRETS, "$99"),
+        ("Notice: Windows signing skipped", _WINDOWS_SIGNING_SECRETS, "SmartScreen"),
+    ]
+    for name, secrets, product in cases:
+        notice = _step(desktop_job, name)
+        condition = str(notice.get("if", ""))
+        run = str(notice.get("run", ""))
+        assert "::notice" in run, f"{name} must be a ::notice, not a log line"
+        assert "docs/desktop-install.md" in run
+        assert product in run.replace("\\", ""), (
+            f"{name} must name the paid product that unlocks signing -- the reader is "
+            "being asked to accept an unsigned binary, and the price is the context"
+        )
+        for secret in secrets:
+            assert f"secrets.{secret} == ''" in condition, (
+                f"{name} must fire when {secret} is missing -- every gap in the gate "
+                "needs its explanation"
+            )
+            assert secret in run, (
+                f"{name} must NAME {secret} -- a notice that says only 'not configured' "
+                "has already been failed by code-quality.yml's preflight prose (#402)"
+            )
+
+
+def test_signing_happens_between_packaging_and_the_checksums(desktop_job: dict) -> None:
+    """The sums must cover the SIGNED bytes: checksumming first and signing after would
+    publish hashes that prove nothing about what the user downloads. Signing must also
+    come after packaging, because the steps sign out/keel.app and out/*-setup.exe."""
+    names = [str(s.get("name", "")) for s in desktop_job["steps"]]
+    package_at = names.index("Package (macOS)")
+    installer_at = names.index("Build the installer (Windows)")
+    sign_at = names.index("Sign, notarise and staple (macOS)")
+    win_sign_at = names.index("Sign the installer (Windows)")
+    checksums_at = names.index("Checksums")
+    assert package_at < sign_at and installer_at < win_sign_at < checksums_at
+    assert sign_at < checksums_at
+
+
+def test_the_macos_leg_uses_the_hardened_runtime_and_waits_for_notarisation(
+    desktop_job: dict,
+) -> None:
+    """`--options runtime` is REQUIRED for notarisation (an app signed without the
+    hardened runtime is rejected server-side, after the upload); `--wait` is what makes a
+    Rejected submission FAIL the step instead of returning an id; stapling is what lets a
+    machine that never queries Apple verify the ticket. And the certificate must live in
+    an EPHEMERAL keychain that is deleted after -- imported into the login keychain it
+    would outlive the step until the job ends."""
+    run = str(_step(desktop_job, "Sign, notarise and staple (macOS)").get("run", ""))
+    assert "--options runtime" in run
+    assert "notarytool" in run and "--wait" in run
+    assert "stapler staple" in run
+    assert "security create-keychain" in run
+    assert "security delete-keychain" in run
+
+
+def test_the_windows_leg_timestamps_its_signature_and_verifies_it(
+    desktop_job: dict,
+) -> None:
+    """An untimestamped signature dies with the certificate -- /tr (RFC 3161) is what
+    makes it outlive the cert's expiry -- and an unverified signature is a hope, so the
+    step must signtool-verify /pa against the machine's default policy afterwards."""
+    run = str(_step(desktop_job, "Sign the installer (Windows)").get("run", ""))
+    assert "signtool" in run
+    assert "/tr http" in run and "/td SHA256" in run and "/fd SHA256" in run
+    assert "verify" in run
+
+
 # -- what the person downloading it is told ----------------------------------------------------
 
 _INSTALL_DOC = _ROOT / "docs" / "desktop-install.md"

@@ -300,9 +300,20 @@ jobs:
   #
   # keel is open source on a small budget and has chosen not to pay either.
   #
+  # #438 REVISITED THE "IF WE EVER PAY" HALF WITHOUT PAYING: the signing steps are now
+  # IMPLEMENTED BELOW, per OS, gated on secrets that do not exist -- the #402 pattern the
+  # code-quality scans use (a missing prerequisite skips with a notice that names it, it
+  # never reddens the run). The macOS leg signs (codesign --options runtime), notarises
+  # (notarytool submit --wait) and staples (stapler) the .app and the .dmg when the Apple
+  # credentials appear on the `signing` environment; the Windows leg signs the setup.exe
+  # with signtool when the certificate secret does. Until then the artifacts ship exactly
+  # as before, with the same honest skips naming every secret to add and what it costs.
+  # The OPERATOR CHECKLIST (which product to buy, which secrets to create where) lives in
+  # docs/desktop-install.md -- it is a purchase decision, not a code one.
+  #
   # What that costs the user is real and is documented rather than hidden: a `.dmg` downloaded
-  # from the internet carries a quarantine flag, so macOS refuses the first open until they go to
-  # System Settings -> Privacy & Security -> Open Anyway. Windows SmartScreen warns similarly.
+  # from the internet carries a quarantine flag, so macOS refuses the first open until they go
+  # to System Settings -> Privacy & Security -> Open Anyway. Windows SmartScreen warns similarly.
   #
   # What replaces OS-level trust here is PROVENANCE, which is free and is arguably the more
   # honest answer for an auditable project anyway: every artifact carries a GitHub build
@@ -319,6 +330,13 @@ jobs:
   desktop:
     needs: release
     if: ${{ inputs.desktop != 'skip' }}
+    # #438: the signing secrets live on the `signing` ENVIRONMENT, not the repo, so they are
+    # visible only to this job and only after the environment's reviewers (once any are
+    # configured) approve the run. A repo-level secret would leak into every same-repo PR
+    # build; an environment secret stops at the gate. Until the environment exists this line
+    # is inert -- GitHub treats a missing environment as unprotected -- and the signing steps
+    # below skip themselves honestly rather than fail the release.
+    environment: signing
     timeout-minutes: 45
     permissions:
       contents: write # attach the artifacts to the release
@@ -459,6 +477,175 @@ jobs:
           Get-ChildItem out -Filter "*-setup.exe" | ForEach-Object {
             "built $($_.Name) ($($_.Length) bytes)"
           }
+
+      # ── SIGNING (#438): implemented, gated, honest about skipping ────────────────────────────
+      #
+      # These four steps are the "#402 pattern" applied to certificates: the signing work is
+      # REAL and complete, and each leg runs it only when that leg's credentials exist as
+      # secrets on the `signing` environment. When they do not, the paired notice step fires
+      # INSTEAD and says exactly which secrets are missing, what they cost, and where the
+      # checklist is -- a skip that announces itself, never a red X on a release.
+      #
+      # ORDER MATTERS: packaging first (the steps sign out/keel.app and out/*-setup.exe),
+      # Checksums AFTER (the sums must cover the signed bytes -- a checksum of an unsigned
+      # binary that is then signed proves nothing about what the user downloads).
+
+      # macOS: Developer ID Application certificate (p12) + App Store Connect API key (the
+      # notarytool credential). Sign with the hardened runtime notarisation requires,
+      # notarise the app and the dmg (--wait, so a Rejected submission fails the step),
+      # staple both, and re-cut the dmg from the signed app -- the unsigned dmg
+      # macos_app.sh produced carries a READ ME that explains Gatekeeper refusals, and a
+      # signed build must not ship a note about a warning it no longer triggers.
+      - name: Sign, notarise and staple (macOS)
+        if: >-
+          runner.os == 'macOS' && secrets.MACOS_CERT_P12_BASE64 != '' &&
+          secrets.MACOS_CERT_PASSWORD != '' && secrets.APP_STORE_CONNECT_KEY_ID != '' &&
+          secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APP_STORE_CONNECT_KEY_CONTENT != ''
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          DMG="out/keel-$VERSION-$(uname -m).dmg"
+
+          # The certificate lives in an EPHEMERAL keychain that dies with the step (trap, so
+          # a failed notarisation cannot leave it behind either). The runner is wiped after
+          # the job regardless; the habit is the point.
+          KEYCHAIN="keel-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+          CERT_P12="$(mktemp -t keel-cert)"
+          ASC_KEY="$(mktemp -t keel-asc)"
+          trap 'security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true; rm -f "$CERT_P12" "$ASC_KEY"' EXIT
+
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_P12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$CERT_P12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          # Without the partition list codesign cannot use the private key headlessly.
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # First in the search list, KEEPING the login keychain -- dropping it breaks the
+          # notarytool profile store below.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          [ -n "$IDENTITY" ] || {
+            echo "::error::no 'Developer ID Application' identity in the imported certificate. MACOS_CERT_P12_BASE64 must hold a Developer ID APPLICATION cert -- an Installer cert productsign uses will not sign an .app."
+            exit 1
+          }
+
+          # 1. Sign the app. `--options runtime` (hardened runtime) is REQUIRED for
+          #    notarisation; `--timestamp` is the secure counterpart of Windows RFC 3161.
+          codesign --deep --force --options runtime --timestamp --sign "$IDENTITY" out/keel.app
+          codesign --verify --deep --strict --verbose=2 out/keel.app
+
+          # 2. Notarise the APP (as a zip, per Apple's guidance for bundles) and staple it.
+          #    `store-credentials` once; the profile is a generic password in the login
+          #    keychain and dies with the runner.
+          ditto -c -k --keepParent out/keel.app keel-notary.zip
+          printf '%s' "$APP_STORE_CONNECT_KEY_CONTENT" > "$ASC_KEY"
+          xcrun notarytool store-credentials keel-notary \
+            --key "$ASC_KEY" --key-id "$APP_STORE_CONNECT_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_ISSUER_ID" --force
+          xcrun notarytool submit keel-notary.zip --keychain-profile keel-notary --wait
+          xcrun stapler staple out/keel.app
+          spctl -a -t exec -vv out/keel.app
+
+          # 3. Re-cut the DMG from the signed, stapled app, with the note a SIGNED build
+          #    deserves: the unsigned README's "macOS will refuse this" instructions would
+          #    be false in exactly the dangerous direction.
+          STAGE="$(mktemp -d)"
+          cp -R out/keel.app "$STAGE/keel.app"
+          cat > "$STAGE/READ ME FIRST.txt" <<NOTE
+          keel $VERSION
+
+          This copy of keel is signed and notarised: it was built by CodeGateSoftware's
+          release workflow, signed with a Developer ID Application certificate, and
+          notarised with Apple. macOS should open it with no warning.
+
+          IF MACOS STILL REFUSES TO OPEN IT, the copy you have did not come from keel's
+          releases. Check it before running anything:
+
+            gh attestation verify <this .dmg> --repo CodeGateSoftware/keel
+
+          Drag keel.app to your Applications folder, eject this image, and open keel.
+
+          Your config, database and credentials live in your user Application Support
+          folder and are never touched by an update.
+
+          keel is a personal tool. It is not financial advice and not religious (Shariah)
+          advice.
+          NOTE
+          rm -f "$DMG"
+          hdiutil create -quiet -srcfolder "$STAGE" -volname "keel $VERSION" -format UDZO "$DMG"
+          rm -rf "$STAGE"
+
+          # 4. Notarise and staple the DMG itself: it is what the user downloads, so its own
+          #    ticket is what Gatekeeper assesses first.
+          xcrun notarytool submit "$DMG" --keychain-profile keel-notary --wait
+          xcrun stapler staple "$DMG"
+          echo "signed, notarised and stapled: $DMG"
+
+      # The honest skip: this fires exactly when the sign step above does not, and it names
+      # every missing secret and the product that unlocks them -- the #402 discipline, so a
+      # future reader of a green run learns signing was SKIPPED, not forgotten.
+      - name: "Notice: macOS signing skipped"
+        if: >-
+          runner.os == 'macOS' && (secrets.MACOS_CERT_P12_BASE64 == '' ||
+          secrets.MACOS_CERT_PASSWORD == '' || secrets.APP_STORE_CONNECT_KEY_ID == '' ||
+          secrets.APP_STORE_CONNECT_ISSUER_ID == '' || secrets.APP_STORE_CONNECT_KEY_CONTENT == '')
+        run: |
+          echo "::notice::macOS build shipped UNSIGNED -- signing, notarisation and stapling are implemented in this workflow but skipped: the Apple credentials are not configured. Notarisation requires the \$99/yr Apple Developer Program (a Developer ID Application certificate, plus an App Store Connect API key for notarytool). To activate: Settings > Environments > 'signing' > add repository secrets MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_CONTENT -- the full checklist is in docs/desktop-install.md. Until then the artifacts carry build attestations and SHA256SUMS instead."
+
+      # Windows: sign the setup.exe ONLY (the zip cannot carry a signature). RFC 3161
+      # timestamping is not optional: an untimestamped signature dies with the certificate.
+      - name: Sign the installer (Windows)
+        if: >-
+          runner.os == 'Windows' && secrets.WINDOWS_CERT_PFX_BASE64 != '' &&
+          secrets.WINDOWS_CERT_PASSWORD != ''
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pfx = New-TemporaryFile
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          # Full SDK path first, PATH second: preferring the SDK copy means a PATH change on
+          # the image cannot silently hand the build a different signtool.
+          $signtool = (Get-Command signtool -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match "\\x64\\" } |
+              Sort-Object FullName | Select-Object -Last 1).FullName
+          }
+          if (-not $signtool) {
+            "::error::signtool not found -- the Windows runner image no longer ships the SDK"
+            exit 1
+          }
+          $setup = Get-ChildItem out -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) {
+            "::error::no *-setup.exe under out/ -- the installer must be built before it is signed"
+            exit 1
+          }
+          & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_CERT_PASSWORD $setup.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $signtool verify /pa /v $setup.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item $pfx -Force
+          "signed $($setup.Name)"
+
+      - name: "Notice: Windows signing skipped"
+        if: >-
+          runner.os == 'Windows' && (secrets.WINDOWS_CERT_PFX_BASE64 == '' ||
+          secrets.WINDOWS_CERT_PASSWORD == '')
+        run: |
+          echo "::notice::setup.exe shipped UNSIGNED -- signing is implemented in this workflow but skipped: the Windows certificate is not configured. An OV code-signing certificate costs ~\$70-500/yr from a CA (SSL.com, Certum, Sectigo) or Azure Trusted Signing is \$9.99/mo (~\$120/yr); since 2024 an EV certificate no longer buys an instant SmartScreen pass, so EV is not worth paying extra for. To activate: Settings > Environments > 'signing' > add repository secrets WINDOWS_CERT_PFX_BASE64 and WINDOWS_CERT_PASSWORD -- the full checklist is in docs/desktop-install.md. Until then the artifacts carry build attestations and SHA256SUMS instead."
 
       # Checksums travel WITH the artifacts, in the same release, so a user who was handed a
       # download link somewhere else has something local to compare against. FILES ONLY:
