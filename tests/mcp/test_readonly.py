@@ -46,8 +46,8 @@ import sys
 from pathlib import Path
 
 from keel.capabilities import CAPABILITIES
-from keel.mcp.tools import TOOLS
 from keel.mcp.server import serve
+from keel.mcp.tools import TOOLS
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MCP_DIR = _ROOT / "keel" / "mcp"
@@ -122,7 +122,11 @@ def _mcp_sources() -> list[Path]:
 
 
 def _forbidden_hits(text: str) -> list[str]:
-    return [word for word, pattern in zip(FORBIDDEN_SUBSTRINGS, _FORBIDDEN_WORD_RES) if pattern.search(text)]
+    return [
+        word
+        for word, pattern in zip(FORBIDDEN_SUBSTRINGS, _FORBIDDEN_WORD_RES)
+        if pattern.search(text)
+    ]
 
 
 # -- wall 1: the vocabulary ----------------------------------------------------------------------
@@ -163,7 +167,9 @@ def test_the_vocabulary_catches_the_unregistered_mutators() -> None:
     are ungated), which is exactly why the vocabulary is defined here and not derived from
     CAPABILITIES."""
     for invocation in _UNREGISTERED_MUTATORS:
-        assert _forbidden_hits(invocation), f"ungated mutator not caught by the vocabulary: {invocation}"
+        assert _forbidden_hits(invocation), (
+            f"ungated mutator not caught by the vocabulary: {invocation}"
+        )
 
 
 def test_there_are_exactly_eight_tools() -> None:
@@ -225,7 +231,9 @@ def _write_calls_in(source: str) -> list[str]:
 def test_no_write_shaped_call_exists_in_the_server_package() -> None:
     offenders: list[str] = []
     for path in _mcp_sources():
-        offenders += [f"{path.name}: .{attr}()" for attr in _write_calls_in(path.read_text(encoding="utf-8"))]
+        offenders += [
+            f"{path.name}: .{attr}()" for attr in _write_calls_in(path.read_text(encoding="utf-8"))
+        ]
     assert not offenders, (
         "write-shaped calls in the read-only server: "
         f"{offenders}. A read-only tool has no legitimate state-changing call; if you believe "
@@ -270,7 +278,11 @@ def _gate_call_sites_in(source: str) -> set[tuple[str, str]]:
             continue
         callee = node.func
         name = (
-            callee.id if isinstance(callee, ast.Name) else callee.attr if isinstance(callee, ast.Attribute) else None
+            callee.id
+            if isinstance(callee, ast.Name)
+            else callee.attr
+            if isinstance(callee, ast.Attribute)
+            else None
         )
         if name == GATE_FUNCTION:
             found.add((owners.get(node, "<module>"),))
@@ -310,7 +322,9 @@ def test_the_server_package_does_not_import_the_trading_paths() -> None:
             else:
                 continue
             for name in names:
-                if any(name == banned or name.startswith(banned + ".") for banned in FORBIDDEN_IMPORTS):
+                if any(
+                    name == banned or name.startswith(banned + ".") for banned in FORBIDDEN_IMPORTS
+                ):
                     offenders.append(f"{path.name}: imports {name}")
     assert not offenders, (
         f"keel/mcp imports the trading paths directly: {offenders}. Read seams are shared "
@@ -331,7 +345,8 @@ def test_the_docs_tool_table_matches_the_exposed_tools_exactly() -> None:
             documented.add(match.group(1))
     exposed = {tool.name for tool in TOOLS}
     assert documented == exposed, (
-        f"docs/mcp-server.md table and the server disagree: only in docs={sorted(documented - exposed)}, "
+        "docs/mcp-server.md table and the server disagree: "
+        f"only in docs={sorted(documented - exposed)}, "
         f"only in server={sorted(exposed - documented)}. An auditor must be able to read the "
         "docs as the whole surface"
     )
@@ -344,13 +359,15 @@ def test_the_server_module_is_click_free_in_a_fresh_interpreter() -> None:
     program = (
         "import sys, keel.mcp.server; "
         "assert 'click' not in sys.modules, 'click leaked into the protocol module'; "
-        "assert 'keel.cli' not in sys.modules, 'the composition root leaked into the protocol module'"
+        "assert 'keel.cli' not in sys.modules, "
+        "'the composition root leaked into the protocol module'"
     )
     completed = subprocess.run(
         [sys.executable, "-c", program], capture_output=True, text=True, check=False, cwd=str(_ROOT)
     )
     assert completed.returncode == 0, (
-        f"keel.mcp.server failed its click-free import check:\n{completed.stdout}\n{completed.stderr}"
+        "keel.mcp.server failed its click-free import check:\n"
+        f"{completed.stdout}\n{completed.stderr}"
     )
 
 
