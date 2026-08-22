@@ -376,6 +376,29 @@ def test_rule_that_never_fires_is_clean() -> None:
     assert report.n_bars_checked == 70
 
 
+# -- coverage notes -------------------------------------------------------------------------------
+
+
+def test_single_tf_report_notes_the_higher_tf_axis_did_not_run() -> None:
+    """No coarser series in the dataset -> Axis B never ran -> the report says so, and the
+    render prints it: a clean single-TF verdict must not read as full coverage."""
+    candles = _peak_close_series()
+    report = lookahead_analysis(
+        _leaky_target_detect, {Granularity.ONE_HOUR: candles}, rule_id="solo"
+    )
+    assert report.notes == ("higher-TF axis not run: no coarser series cached",)
+    joined = "\n".join(render_lines(report))
+    assert "higher-TF axis not run: no coarser series cached" in joined
+
+
+def test_multi_tf_report_carries_no_notes() -> None:
+    candles_by_tf = _two_tf_series()
+    report = lookahead_analysis(
+        _closed_coarse_reader_detect, candles_by_tf, rule_id="two-tf", warmup=50
+    )
+    assert report.notes == ()
+
+
 # -- recursive_analysis -----------------------------------------------------------------------
 
 

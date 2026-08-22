@@ -414,8 +414,9 @@ def run_rule_backtest(
 # prefix), and the saved-rule path into it is the SAME one `rules backtest` resolves through:
 # `resolve_rule_backtest` reads the row, rebuilds the rule and fetches its cached candles.
 # The rule families' own bar-count params raise the harness's warmup floor past their
-# indicator warmup region, and the coarser series cached beside the rule's timeframe (when
-# one is) activates the higher-timeframe poison axis -- the engine-veto leak check.
+# indicator warmup region, and every coarser series cached beside the rule's timeframe (the
+# coarsest included) activates the higher-timeframe poison axis -- the engine-veto leak
+# check; when none is cached the report says the axis was not run, never implies coverage.
 
 #: Constructor params that count BARS for the rule's indicators. The lookahead walk skips
 #: the first max(DEFAULT_WARMUP, these) bars: below them a rule's detect returns warmup
@@ -455,25 +456,33 @@ def _lookahead_warmup(rule: Any) -> int:
     return max([bias_mod.DEFAULT_WARMUP, *hints])
 
 
-def _next_coarser(granularity: Granularity) -> Granularity | None:
-    """The next granularity coarser than `granularity`, or `None` at the top of the table."""
-    coarser = [g for g in Granularity if GRANULARITY_SECONDS[g] > GRANULARITY_SECONDS[granularity]]
-    return min(coarser, key=lambda g: GRANULARITY_SECONDS[g]) if coarser else None
-
-
 def _lookahead_views(
     repo: Repository, rule: Any, granularity: Granularity, candles: list[Candle]
 ) -> dict[Granularity, list[Candle]]:
     """The multi-timeframe dataset the lookahead harness walks for `rule`: its own resolved
-    granularity's cached candles, plus the NEXT COARSER granularity's when the deployment
-    caches one -- without a coarser series there is nothing for the higher-TF poison axis
-    (the engine-veto leak) to test, exactly as the engine's bias gate is a no-op then."""
+    granularity's cached candles, plus EVERY coarser granularity the repo actually holds
+    candles for -- queried in GRANULARITY_SECONDS order, so the coarsest CACHED series is
+    always among them when one exists.
+
+    Every, not just the next one up, because the engine-veto leak runs through the COARSEST
+    *cached* higher TF (`engine._higher_tf_bias_ok` picks `max` over what it is handed), and
+    deployments cache non-adjacent sets -- every shipped config ships [ONE_DAY, ONE_HOUR,
+    FIFTEEN_MINUTE] with no SIX_HOUR. A one-step-coarser pick asked the repo for SIX_HOUR,
+    got nothing back, and handed the poison axis an empty series: the axis silently no-oped
+    and a rule blindly reading the last ONE_DAY bar -- the canonical engine-veto leak --
+    was reported clean. Granularities with no cached candles are skipped (nothing to poison
+    with); when NOT ONE coarser series is cached there is genuinely no higher-TF axis to
+    run, and `bias.lookahead_analysis` carries that on the report's `notes` so the render
+    says the axis was not run instead of implying coverage."""
     views: dict[Granularity, list[Candle]] = {granularity: candles}
-    coarser = _next_coarser(granularity)
-    if coarser is not None:
-        coarse_candles = repo.get_candles(rule.product_id, coarser)
+    coarser = sorted(
+        (g for g in Granularity if GRANULARITY_SECONDS[g] > GRANULARITY_SECONDS[granularity]),
+        key=lambda g: GRANULARITY_SECONDS[g],
+    )
+    for gran in coarser:
+        coarse_candles = repo.get_candles(rule.product_id, gran)
         if coarse_candles:
-            views[coarser] = coarse_candles
+            views[gran] = coarse_candles
     return views
 
 
@@ -794,6 +803,13 @@ def attempt_promotion(
             "use --force deliberately to bypass this and every other gate."
         )
         raise RulesRefused(f"rule {rule_id} fails the lookahead check")
+    # Coverage honesty: a clean verdict over the one time frame (no coarser series cached,
+    # so the higher-TF poison axis never ran) must not read out of the promote gate as full
+    # coverage -- the report's notes say what did not run; carry them here too. On the
+    # STDOUT sink (like the recursive no-suspect line): the promotion PROCEEDS past this
+    # point, and the strategy console renders a stderr line as a refusal.
+    for note in lookahead.notes:
+        sink(f"warning: rule {rule_id} ({row['kind']}): {note}")
 
     fee_pct, fee_source = _backtest_fee(config)
     stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)

@@ -55,6 +55,11 @@ arrives is not thereby lookahead (an argmax anchor legitimately moves); only the
 bar both views agree on, and presence-versus-absence at the full run's claimed anchor, are
 evidence.
 
+**Coverage honesty:** when the dataset carries no granularity coarser than the anchor's,
+Axis B cannot run at all and a clean verdict speaks for the one time frame only -- the
+report then carries a ``notes`` line saying the axis was not run, and every renderer
+prints it, so a clean single-TF verdict never reads as full coverage.
+
 Cost: ~2 detect calls per sampled anchor plus 1 for the full run; ``sample_step`` bounds the
 anchor count, ``warmup`` skips the indicator warmup region where every rule returns None or
 noise.
@@ -77,6 +82,7 @@ from keel.types import Candle, Granularity
 
 __all__ = [
     "DEFAULT_WARMUP",
+    "HIGHER_TF_NOT_RUN_NOTE",
     "LookaheadDivergence",
     "LookaheadReport",
     "RecursiveReport",
@@ -97,6 +103,12 @@ _DEFAULT_SAMPLE_STEP = 1
 #: a divergence there would be an artifact of the harness, not of the rule. Callers with the
 #: rule in hand (`keel rules lookahead`) raise it to the rule's own longest period.
 DEFAULT_WARMUP = 50
+
+#: Carried on the report (and rendered) when the dataset holds no granularity coarser than
+#: the anchor's: Axis B -- the higher-TF poison view, the engine-veto leak check -- could not
+#: run, so a clean verdict there is a verdict about the one time frame only. Saying so beats
+#: implying coverage the run did not have.
+HIGHER_TF_NOT_RUN_NOTE = "higher-TF axis not run: no coarser series cached"
 
 
 @dataclass(frozen=True)
@@ -128,6 +140,9 @@ class LookaheadReport:
     n_divergences: int = 0
     sample_step: int = _DEFAULT_SAMPLE_STEP
     anchor_granularity: str | None = None
+    #: Coverage caveats -- e.g. the higher-TF poison axis not running because no coarser
+    #: series was supplied. Rendered by ``render_lines``; empty on a fully-covered run.
+    notes: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> str:
@@ -258,7 +273,12 @@ def lookahead_analysis(
     if sample_step < 1:
         raise ValueError(f"sample_step must be >= 1, got {sample_step}")
     if not candles_by_tf:
-        return LookaheadReport(rule_id=rule_id, n_bars_checked=0, sample_step=sample_step)
+        return LookaheadReport(
+            rule_id=rule_id,
+            n_bars_checked=0,
+            sample_step=sample_step,
+            notes=(HIGHER_TF_NOT_RUN_NOTE,),
+        )
 
     anchor_tf = min(candles_by_tf, key=_gran_rank)
     anchor_step = GRANULARITY_SECONDS[anchor_tf]
@@ -318,6 +338,7 @@ def lookahead_analysis(
         n_divergences=n_divergences,
         sample_step=sample_step,
         anchor_granularity=anchor_tf.value,
+        notes=() if has_coarser else (HIGHER_TF_NOT_RUN_NOTE,),
     )
 
 
@@ -378,6 +399,8 @@ def render_lines(report: BiasReport) -> list[str]:
             f"(sample_step={report.sample_step})",
             f"verdict: {report.verdict}",
         ]
+        for note in report.notes:
+            lines.append(f"  note: {note}")
         for divergence in report.divergences:
             lines.append(
                 f"  bar ts={divergence.bar_ts} field={divergence.field}: "
