@@ -7,9 +7,9 @@ is injected, exactly as the fake-environment contract demands.
 Three surfaces, pinned here:
 
 * **The pure parts** -- `parse_release` (the GitHub payload -> `ReleaseInfo`), the
-  semver comparison (honest on pre-releases and junk tags), the four-production-wheels
-  selection (never fake/robinhood), and `plan_update`'s offer/refusal semantics,
-  including the dev-checkout refusal.
+  semver comparison (honest on pre-releases and junk tags), the production-wheels
+  selection (the FIVE named prefixes, #425; never fake/robinhood/kraken), and
+  `plan_update`'s offer/refusal semantics, including the dev-checkout refusal.
 * **`run_update` against a FAKE environment** -- the fail-safe ordering pins: backups
   exist BEFORE anything installs (asserted from inside the install fake), the
   superseded wheels are deleted ONLY after a verified success, backups are NEVER
@@ -46,6 +46,7 @@ def _release_json(version: str = "0.7.0", extra: tuple[str, ...] = ()) -> bytes:
     names = [
         *(f"{prefix}-{version}-py3-none-any.whl" for prefix in up.PRODUCTION_WHEEL_PREFIXES),
         f"keel_broker_fake-{version}-py3-none-any.whl",
+        f"keel_broker_kraken-{version}-py3-none-any.whl",
         f"keel_broker_robinhood-{version}-py3-none-any.whl",
         "config.yaml",
         *extra,
@@ -58,11 +59,15 @@ def _release_json(version: str = "0.7.0", extra: tuple[str, ...] = ()) -> bytes:
 
 
 _RELEASE_BUILD = BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="release")
+#: The equities deployment of #425 (`config.paper-equities.yaml`, `broker: name: alpaca`):
+#: the four base distributions plus the adapter wheel the profile selects -- the install
+#: `keel update` must be able to move as ONE set.
 _INSTALLED = {
     "keel-trader": "0.6.0",
     "keel-core": "0.6.0",
     "keel-broker-api": "0.6.0",
     "keel-broker-coinbase": "0.6.0",
+    "keel-broker-alpaca": "0.6.0",
 }
 
 
@@ -281,14 +286,43 @@ def test_is_newer_version_is_honest_about_pre_releases_and_junk() -> None:
     assert up.is_newer_version("banana", "0.6.0") is None
 
 
-def test_the_production_wheels_are_exactly_four_and_never_fake_or_robinhood() -> None:
+def test_the_production_wheel_set_is_pinned_by_name_and_alpaca_is_in_it() -> None:
+    """#425: the equities profile (`config.paper-equities.yaml`, `broker: name: alpaca`,
+    #386) deploys `keel_broker_alpaca` beside the four base wheels, so self-update must
+    move it with them -- an updater that left it behind installed four new wheels next to
+    one old adapter, failed the verify step's `keel versions` with PARTIAL INSTALL, and
+    rolled the WHOLE deployment back to the previous version: every self-update on such a
+    box failed, by construction. The set stays STATED BY NAME (never `Release/*.whl`,
+    never derived from the config): the release also ships venues a deployment must never
+    ride -- fake (registers a `fake` venue entry point), robinhood (an Ed25519 stack for
+    an adapter nothing constructs) and kraken (a stub whose every data method raises,
+    #313) -- and an exact-tuple pin keeps any future venue a deliberate addition to this
+    list rather than an accident of a glob."""
+    assert up.PRODUCTION_WHEEL_PREFIXES == (
+        "keel_core",
+        "keel_broker_api",
+        "keel_broker_coinbase",
+        "keel_broker_alpaca",
+        "keel_trader",
+    )
+    assert "keel_broker_alpaca" in up.PRODUCTION_WHEEL_PREFIXES
+    for excluded in ("keel_broker_fake", "keel_broker_robinhood", "keel_broker_kraken"):
+        assert excluded not in up.PRODUCTION_WHEEL_PREFIXES, excluded
+
+
+def test_the_production_wheels_are_exactly_the_prefixes_and_never_fake_robinhood_kraken() -> None:
+    """The selection returns exactly the pinned prefixes' wheels, in order, even though
+    the release CARRIES the excluded venue wheels too -- matching by exact
+    `<prefix>-<version>-` name is what keeps fake, robinhood and the kraken stub from
+    ever riding an update into a deployment."""
     release = up.parse_release(_release_json("0.7.0"))
     wheels = up.select_production_wheels(release, "0.7.0")
     assert [wheel.name for wheel in wheels] == [
         f"{prefix}-0.7.0-py3-none-any.whl" for prefix in up.PRODUCTION_WHEEL_PREFIXES
     ]
     joined = " ".join(wheel.name for wheel in wheels)
-    assert "fake" not in joined and "robinhood" not in joined
+    for excluded in ("fake", "robinhood", "kraken"):
+        assert excluded not in joined, excluded
 
 
 def test_an_ambiguous_wheel_match_is_refused_naming_both() -> None:
@@ -307,6 +341,7 @@ def test_an_ambiguous_wheel_match_is_refused_naming_both() -> None:
                     "keel_core-0.7.0-cp312-cp312-macosx_11_0.whl",
                     "keel_broker_api-0.7.0-py3-none-any.whl",
                     "keel_broker_coinbase-0.7.0-py3-none-any.whl",
+                    "keel_broker_alpaca-0.7.0-py3-none-any.whl",
                     "keel_trader-0.7.0-py3-none-any.whl",
                 )
             ],
@@ -407,7 +442,7 @@ def test_the_plan_refuses_a_repo_run_from_outside_the_launch_folder(tmp_path: Pa
 def test_the_plan_refuses_an_install_that_is_not_a_wheel(tmp_path: Path) -> None:
     """The deployment layout but a non-wheel origin: the `keel_trader` distribution's
     own `direct_url.json` names a source directory (an editable or `pip install .`
-    install), not a `.whl` -- a deployment is the four release wheels, so this is
+    install), not a `.whl` -- a deployment is the release wheels, so this is
     refused rather than updated in place."""
     plan = _plan(tmp_path, direct_url="file:///Users/op/keel-repo")
     assert plan.offered is False
@@ -526,12 +561,14 @@ def test_run_update_backs_up_before_installing_and_finishes_the_whole_procedure(
 
     assert result.ok is True, result.error
     # the order: download (backups already on disk) -> install -> migrate -> verify,
-    # and the gate ran inside the service before ANY of it
+    # and the gate ran inside the service before ANY of it. One download per production
+    # wheel -- FIVE since #425 (alpaca rides with the four), never a count-free glob.
+    n_wheels = len(up.PRODUCTION_WHEEL_PREFIXES)
     kinds = [event[0] for event in ops.events]
-    assert kinds == ["download"] * 4 + ["install", "migrate", "migrate", "verify"]
-    # the install carried the four wheel PATHS and the RUNNING venv's python
+    assert kinds == ["download"] * n_wheels + ["install", "migrate", "migrate", "verify"]
+    # the install carried every wheel PATH and the RUNNING venv's python
     venv = launch / ".venv/bin/python"
-    assert ops.events[4] == (
+    assert ops.events[n_wheels] == (
         "install",
         [f"{prefix}-0.7.0-py3-none-any.whl" for prefix in up.PRODUCTION_WHEEL_PREFIXES],
     )
@@ -597,8 +634,9 @@ def test_run_update_refuses_a_zero_byte_download(tmp_path: Path) -> None:
         "removed" in step.lower() for step in steps
     )
     assert not list((launch / "Release").glob("*0.7.0*.whl"))
-    # the previous wheels (the recovery path) stay
-    assert len(list((launch / "Release").glob("*.whl"))) == 4
+    # the previous wheels (the recovery path) stay -- every production wheel's
+    # superseded copy, which since #425 includes the alpaca adapter's
+    assert len(list((launch / "Release").glob("*.whl"))) == len(up.PRODUCTION_WHEEL_PREFIXES)
 
 
 def test_a_download_larger_than_the_guard_is_refused_not_streamed(
@@ -778,7 +816,7 @@ def test_run_update_verify_failure_without_previous_wheels_says_manual_recovery(
     assert len(list(launch.glob("*.bak-before-0.7.0-*"))) == 2
 
 
-def test_the_default_install_runs_uv_with_the_venv_and_the_four_paths(
+def test_the_default_install_runs_uv_with_the_venv_and_every_production_wheel_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     launch = _deployment(tmp_path)
@@ -842,10 +880,28 @@ def test_parse_versions_output_reads_the_distribution_rows() -> None:
     }
 
 
-def test_the_default_verify_demands_all_four_distributions_at_the_target(
+def test_the_default_verify_demands_every_production_distribution_at_the_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Since #425 the demanded set is FIVE: `keel-broker-alpaca` must be present and at
+    the target too, or an equities deployment whose adapter was never moved would
+    verify as healthy while its venue import stayed a release behind."""
+
     def _keel_versions(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        text = (
+            "keel 0.7.0+abc [release]\n\nkeel-core  0.7.0\nkeel-trader  0.7.0\n"
+            "keel-broker-api  0.7.0\nkeel-broker-coinbase  0.7.0\n"
+            "keel-broker-alpaca  0.7.0\n\n"
+            "ok: 5 keel distributions, all at 0.7.0.\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, text, "")
+
+    monkeypatch.setattr(up.subprocess, "run", _keel_versions)
+    up._verify_versions(Path("/venv/bin/keel"), "0.7.0")  # agrees -> silent
+
+    def _missing_alpaca(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # the pre-#425 healthy shape: no alpaca row at all -- now a verify failure,
+        # because an equities deployment without the adapter is not a healthy install
         text = (
             "keel 0.7.0+abc [release]\n\nkeel-core  0.7.0\nkeel-trader  0.7.0\n"
             "keel-broker-api  0.7.0\nkeel-broker-coinbase  0.7.0\n\n"
@@ -853,8 +909,9 @@ def test_the_default_verify_demands_all_four_distributions_at_the_target(
         )
         return subprocess.CompletedProcess(argv, 0, text, "")
 
-    monkeypatch.setattr(up.subprocess, "run", _keel_versions)
-    up._verify_versions(Path("/venv/bin/keel"), "0.7.0")  # agrees -> silent
+    monkeypatch.setattr(up.subprocess, "run", _missing_alpaca)
+    with pytest.raises(up.UpdateError, match="keel-broker-alpaca is not installed"):
+        up._verify_versions(Path("/venv/bin/keel"), "0.7.0")
 
     def _partial(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         text = (

@@ -622,7 +622,7 @@ def test_build_update_result_lines_hold_the_progress_and_the_recovery(
         backups=(),
     )
     lines = ac.build_update_result_lines(
-        result, progress=("backing up keel.db", "installing the four wheels")
+        result, progress=("backing up keel.db", "installing the production wheels")
     )
     joined = "\n".join(line.text for line in lines)
     assert "backing up keel.db" in joined  # the streamed lines are HELD, verbatim

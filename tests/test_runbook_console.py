@@ -158,8 +158,16 @@ def test_the_runbook_has_a_self_update_subsection_under_deploying() -> None:
 def test_the_self_update_section_states_what_it_does() -> None:
     section = _self_update_section()
     lowered = section.lower()
-    # the four production wheels, by path; the fake/robinhood exclusion travels with it
-    for prefix in ("keel_core", "keel_broker_api", "keel_broker_coinbase", "keel_trader"):
+    # the FIVE production wheels, by path (#425: alpaca rides with the four, or an
+    # equities deployment cannot self-update); the fake/robinhood/kraken exclusion
+    # travels with it
+    for prefix in (
+        "keel_core",
+        "keel_broker_api",
+        "keel_broker_coinbase",
+        "keel_broker_alpaca",
+        "keel_trader",
+    ):
         assert prefix in section, prefix
     assert "release/" in lowered
     assert "back" in lowered and ".bak-before-" in section  # backups FIRST, named
