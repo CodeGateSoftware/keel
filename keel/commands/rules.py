@@ -497,20 +497,52 @@ def _recursive_periods(rule: Any) -> list[int]:
     return []
 
 
-def _atr_last(candles: list[Candle], period: int) -> float:
-    """`analysis.indicators.atr(candles, period)[-1]` -- the indicator value the rule's own
-    stop is sized from."""
-    return indicators.atr(candles, period)[-1]
+def _turtle_atr_window(params: dict[str, Any], period: int) -> int | None:
+    """The tail length `turtle_breakout`'s detect() feeds its own ATR -- `work = series
+    [-needed:]` with `needed = max(entry_lookback + 1, exit_lookback + 1, adx_period * 4,
+    atr_period * 4)` (its PERFORMANCE window) -- or `None` when the params are not turtle's.
+
+    Read off the params rather than the class name so a kind that grows the same bar-count
+    knobs is measured by its own declared window, and so the formula here can be checked
+    against the rule source it mirrors by eye."""
+    entry = params.get("entry_lookback")
+    exit_lb = params.get("exit_lookback")
+    adx = params.get("adx_period")
+    if not (
+        isinstance(entry, int)
+        and not isinstance(entry, bool)
+        and isinstance(exit_lb, int)
+        and not isinstance(exit_lb, bool)
+        and isinstance(adx, int)
+        and not isinstance(adx, bool)
+    ):
+        return None
+    return max(entry + 1, exit_lb + 1, adx * 4, period * 4)
 
 
-def _atr_indicator(period: int) -> Callable[[list[Candle]], float]:
-    """`_atr_last` bound to one period, as the growing-prefix callable `recursive_analysis`
-    samples."""
+def _atr_indicator(rule: Any, period: int) -> tuple[Callable[[list[Candle]], float], str, int]:
+    """(indicator, name, min_warmup) for the rule family's OWN ATR at `period` -- the
+    growing-prefix callable `recursive_analysis` samples, named and floored to match.
 
-    def indicator(candles: list[Candle]) -> float:
-        return _atr_last(candles, period)
+    turtle_breakout sizes its stop from ATR over a bounded tail (see `_turtle_atr_window`);
+    every other `atr_period` family (rsi_meanrev) feeds full history -- the check mirrors
+    whichever the family actually computes rather than one shape for all, so its verdict is
+    about the indicator the rule trades. `min_warmup` floors the walk at the family's own
+    real window: past it, drift is the indicator's, not warmup's."""
+    params: dict[str, Any] = getattr(rule, "params", None) or {}
+    window = _turtle_atr_window(params, period)
+    if window is not None:
+        tail = window
 
-    return indicator
+        def windowed(candles: list[Candle]) -> float:
+            return indicators.atr(candles[-tail:], period)[-1]
+
+        return windowed, f"atr[-{window}:]({period})[-1]", window
+
+    def full_history(candles: list[Candle]) -> float:
+        return indicators.atr(candles, period)[-1]
+
+    return full_history, f"atr({period})[-1]", 4 * period
 
 
 @rules_group.command("lookahead")
@@ -530,8 +562,9 @@ def _atr_indicator(period: int) -> Callable[[list[Candle]], float]:
     "--recursive",
     is_flag=True,
     default=False,
-    help="Also run the recursive warmup-drift check on the rule's own ATR (the atr_period "
-    "families); a family without one is reported honestly as having nothing to check.",
+    help="Also run the recursive warmup-drift check on the rule's own ATR exactly as its "
+    "family computes it (turtle's bounded tail window, rsi's full history); a family "
+    "without one is reported honestly as having nothing to check.",
 )
 @click.pass_context
 @with_disclaimer
@@ -606,14 +639,16 @@ def run_rule_lookahead(
                 f"{resolved.row['kind']} (no {_ATR_PERIOD_KEY} param) -- nothing to check"
             )
         for period in periods:
+            indicator_fn, indicator_name, min_warmup = _atr_indicator(resolved.rule, period)
             recursive_report = bias_mod.recursive_analysis(
                 resolved.candles,
-                indicator_fn=_atr_indicator(period),
-                # 4 x period: the same work-window multiple the ATR-stopped rules themselves
-                # feed their indicators -- past it, drift is the indicator's, not warmup's.
-                min_warmup=4 * period,
+                indicator_fn=indicator_fn,
+                # The family's own window (turtle's bounded tail; rsi's 4 x period floor
+                # over full history) -- whatever `_atr_indicator` derived, so the prefixes
+                # sampled are the ones the rule's own stop could have been sized from.
+                min_warmup=min_warmup,
                 rule_id=str(rule_id),
-                indicator_name=f"atr({period})[-1]",
+                indicator_name=indicator_name,
             )
             for line in bias_mod.render_lines(recursive_report):
                 sink(line)

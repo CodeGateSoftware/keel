@@ -11,8 +11,9 @@ gate refuses a rule whose verdict is `lookahead_detected`. Pinned here:
   the canonical engine-veto leak -- is caught through the real service seam;
 - when only the trading TF is cached, the render and the promote gate SAY the higher-TF
   axis did not run rather than implying coverage;
-- `--recursive` maps each rule family to its own ATR (turtle/rsi) or reports honestly that
-  the family configures no recursive-suspect indicator (dca);
+- `--recursive` maps each rule family to its own ATR exactly as the family computes it
+  (turtle's bounded tail window, rsi's full history) or reports honestly that the family
+  configures no recursive-suspect indicator (dca);
 - `rules promote` refuses a leaky rule without mutating the row, and `--force` remains the
   documented bypass, exactly as it is for the rest of the gate.
 """
@@ -291,6 +292,25 @@ def test_recursive_flag_reports_honestly_when_no_suspect_indicator(
 
     assert result.exit_code == 0, result.output
     assert "no recursive-suspect indicator" in result.output
+
+
+def test_recursive_flag_windows_turtles_atr_like_the_rule_does(tmp_path, valid_config_path) -> None:
+    """Turtle sizes its stop from ATR over a bounded tail (`work = series[-needed:]`,
+    `needed = max(entry+1, exit+1, adx*4, atr*4)` = 80 at the defaults), not full history --
+    the recursive check must replay the indicator the rule actually trades, and say so in
+    the indicator's name."""
+    repo = _repo(tmp_path)
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _flat_daily())
+
+    result = _invoke(
+        tmp_path, valid_config_path, "rules", "lookahead", "1", "--recursive", "--sample-step", "10"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "atr[-80:](20)[-1]" in result.output
 
 
 # -- the higher-TF poison axis over the deployment-shaped cache -----------------------------------
