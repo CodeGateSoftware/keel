@@ -422,13 +422,43 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # Inno Setup is the intended installer (per-user, no admin prompt, and the install-path
-          # and version-decision UX #438 specifies). Until that script is written and tested on a
-          # Windows runner, a zip is shipped rather than an untested installer -- an installer
-          # nobody has run is a worse artifact than an archive everyone understands.
+          # The zip STAYS beside the installer, deliberately: it is the no-install route
+          # (extract anywhere, run keel.exe) that docs/desktop-install.md documents --
+          # including the Unblock-before-extract step that keeps SmartScreen from
+          # re-prompting. An installer nobody has run was a worse artifact than an archive
+          # everyone understands; now the installer has been compiled first (see
+          # .github/workflows/installer-smoke.yml, which runs ISCC on the same script on
+          # every PR that touches it), both ship.
           mkdir -p out
           7z a -tzip "out/keel-${{ inputs.version }}-windows-${{ matrix.arch }}.zip" ./dist/keel/* >/dev/null
           ls -l out
+
+      # The installer #438 specifies: ONE setup.exe wrapping the frozen --onedir tree,
+      # per-user to %LOCALAPPDATA%\Programs\keel, no admin prompt. The requirements live
+      # in packaging/keel.iss (privileges, paths, what is never touched); this step only
+      # passes the release's version and arch and points ISCC at it.
+      # Full path first, PATH second, never the other way round: the hosted image ships
+      # Inno Setup 6 at this path, and preferring it means a PATH change on the image
+      # cannot silently hand the build a different compiler version. pwsh because ISCC's
+      # /D<define> arguments look like Unix paths to MSYS bash, which rewrites them.
+      - name: Build the installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $iscc) {
+            "::error::ISCC.exe not found -- the Windows runner image no longer ships Inno Setup 6"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          & $iscc "/DKeelVersion=${{ inputs.version }}" "/DKeelArch=${{ matrix.arch }}" "packaging\keel.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem out -Filter "*-setup.exe" | ForEach-Object {
+            "built $($_.Name) ($($_.Length) bytes)"
+          }
 
       # Checksums travel WITH the artifacts, in the same release, so a user who was handed a
       # download link somewhere else has something local to compare against. FILES ONLY:
@@ -466,7 +496,10 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: out/*.zip
+          # Both Windows deliverables: the zip AND the setup.exe. Multiple globs in one
+          # subject-path are space-separated (attestations grew multi-subject support in
+          # Dec 2024); a second attestation step would work too but duplicates the job.
+          subject-path: out/*.zip out/*-setup.exe
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v7

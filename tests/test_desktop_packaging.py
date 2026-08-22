@@ -158,10 +158,13 @@ def test_every_artifact_carries_provenance_and_checksums(desktop_job: dict) -> N
     # Subjects are per-OS FILES-ONLY globs: `out/*` would hand the action the unzipped
     # keel.app/ and dmg-stage/ directories macOS packaging leaves beside the .dmg, and a
     # shared `*.dmg *.zip` pattern would hand each leg one glob matching nothing.
+    # Windows carries BOTH its deliverables (the zip and the setup.exe) in one
+    # space-separated subject-path -- multi-subject attestation, supported since Dec 2024 --
+    # because both are attached to the release, so both must be verifiable.
     subjects = {s["with"]["subject-path"] for s in attest}
-    assert subjects == {"out/*.dmg", "out/*.zip"}
+    assert subjects == {"out/*.dmg", "out/*.zip out/*-setup.exe"}
     macos = next(s for s in attest if s["with"]["subject-path"] == "out/*.dmg")
-    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip")
+    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip out/*-setup.exe")
     assert str(macos.get("if", "")).strip() == "runner.os == 'macOS'"
     assert str(windows.get("if", "")).strip() == "runner.os == 'Windows'"
     assert "SHA256SUMS-" in _steps_text(desktop_job)
@@ -290,6 +293,93 @@ def test_the_script_runs_no_signing_command() -> None:
     for command in ("codesign", "notarytool", "stapler", "productsign"):
         offenders = [line for line in code if command in line]
         assert not offenders, f"{command} is invoked: {offenders}"
+
+
+# -- the Windows installer ---------------------------------------------------------------------
+
+
+def test_the_inno_script_installs_per_user_without_an_admin_prompt() -> None:
+    """#438's Windows deliverable: one setup.exe installing per-user to
+    %LOCALAPPDATA%\\Programs\\keel, so the first thing a non-technical user is asked for is
+    not an administrator password. `PrivilegesRequired=lowest` is the directive that keeps
+    the UAC dialog away; `{localappdata}` is the per-user location Windows itself uses for
+    per-user application installs."""
+    text = _INNO_SCRIPT.read_text(encoding="utf-8")
+    assert "PrivilegesRequired=lowest" in text
+    assert "DefaultDirName={localappdata}\\Programs\\keel" in text
+
+
+def test_the_installer_touches_the_program_and_never_the_deployment() -> None:
+    """#438's two locations, kept separate by the installer: the PROGRAM (the frozen binary
+    and its bundled runtime) is replaced wholesale; the DEPLOYMENT (config.yaml, keel*.db,
+    .env, logs/) is never written, moved, or uninstalled. "config.yaml is never overwritten
+    by an installer" and "no database is ever replaced, moved, or migrated by the installer"
+    are the issue's hard rules -- an operator's allowlist and caps are hand-edited and
+    irreplaceable, and keel has no down-migrations."""
+    # Comment lines are excluded, as with the macOS script: the .iss EXPLAINS in prose
+    # why there is no [UninstallDelete] section, and a test that forbade the words would
+    # forbid documenting them.
+    code = [
+        line
+        for line in _INNO_SCRIPT.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith(";")
+    ]
+    assert not any("[UninstallDelete]" in line for line in code), (
+        "an [UninstallDelete] section is how an installer starts deleting things it was "
+        "never pointed at -- the deployment must survive an uninstall"
+    )
+    for forbidden in ("config.yaml", "keel.db", ".env", "logs"):
+        assert not any(forbidden in line for line in code), (
+            f"the installer must never name the deployment's {forbidden} -- the program "
+            "directory is all it owns"
+        )
+    # The only directory it creates is the program directory.
+    assert 'DestDir: "{app}"' in "\n".join(code)
+
+
+def test_the_workflow_builds_the_setup_exe_beside_the_zip(desktop_job: dict) -> None:
+    """The zip is the no-install route and stays; the setup.exe is the installer #438
+    specified. BOTH are attached to the release, so both must be built on the Windows leg
+    and covered by the same files-only checksum/upload globs (which they are by
+    construction -- those steps glob every file in out/)."""
+    text = _steps_text(desktop_job)
+    assert "keel.iss" in text, "the Windows leg must compile packaging/keel.iss"
+    assert "ISCC" in text, "the Windows leg must invoke the Inno Setup compiler"
+    assert "7z a -tzip" in text, "the zip must stay -- it is the no-install route"
+    assert "-setup.exe" in "\n".join(
+        str(s.get("with", {}).get("subject-path", "")) for s in desktop_job["steps"]
+    ), "the setup.exe must be an attestation subject -- it is attached to the release"
+
+
+def test_the_inno_script_is_smoke_compiled_before_any_release_needs_it() -> None:
+    """The release workflow is manual-only and its desktop job runs AFTER the release is
+    published, so without this the first real ISCC compile of keel.iss would be a release
+    dispatch -- a script typo failing a release with the tag already pushed. The smoke
+    workflow compiles the same script against a placeholder bundle on a Windows runner.
+
+    It must trigger on PRs touching the script (that is where a compile break is
+    introduced, and a workflow not yet on the default branch cannot be dispatched onto a
+    branch at all), but ONLY those -- the `paths` filter is what keeps a Windows runner
+    from being spent on every PR."""
+    assert _SMOKE_WORKFLOW.is_file()
+    smoke = strict_load(_SMOKE_WORKFLOW.read_text(encoding="utf-8"), source="installer-smoke.yml")
+    triggers = smoke[True]  # PyYAML parses the bare `on` key as boolean True
+    assert "workflow_dispatch" in triggers, "a human must always be able to ask for a compile"
+    assert set(triggers["pull_request"]["paths"]) == {
+        "packaging/keel.iss",
+        ".github/workflows/installer-smoke.yml",
+    }, (
+        "the PR trigger must fire ONLY when the compile can have broken -- the .iss or "
+        "the workflow itself -- or every PR pays for a Windows runner"
+    )
+    run = "\n".join(
+        str(step.get("run", "")) for job in smoke["jobs"].values() for step in job["steps"]
+    )
+    assert "keel.iss" in run and "ISCC" in run, "the smoke must compile the real script"
+    assert "placeholder" in run.lower(), (
+        "the smoke must not need a freeze -- ISCC packages files, it does not run them, "
+        "so a placeholder keel.exe exercises the whole script for one cheap compile"
+    )
 
 
 # -- what the person downloading it is told ----------------------------------------------------
