@@ -209,19 +209,30 @@ def test_deflate_refuses_on_too_few_decision_trials(tmp_path):
 
 
 def _mc_candles(n: int, *, start: int = 1_700_000_000) -> list[Candle]:
-    """`n` daily bars with a deterministic oscillation, so a turtle rule both enters and gets
-    stopped out -- a backtest that CLOSES trades is the minimum the resample needs."""
-    base = Decimal("100")
+    """`n` daily bars in an asymmetric 19-bar sawtooth -- an 8-bar rally, a 9-bar crash, a
+    2-bar drift, then again -- so a turtle rule both enters and gets stopped out AND its
+    closed P&L comes out MIXED-SIGN: wins and losses in one multiset is what makes
+    reshuffling move max drawdown (a big loss early digs a different hole than the same
+    loss late), which is the statistic trades mode exists to measure."""
     candles = []
+    price = Decimal(100)
     for i in range(n):
-        wiggle = Decimal(i % 7) * Decimal("2") + Decimal("1")
+        phase = i % 19
+        if phase < 8:
+            price += Decimal(4)
+        elif phase < 17:
+            price -= Decimal(9)
+        else:
+            price -= Decimal(1)
+        open_ = price
+        close = price + (Decimal("1.5") if i % 2 else Decimal("-1.5"))
         candles.append(
             Candle(
                 ts=start + i * 86400,
-                open=base + wiggle,
-                high=base + wiggle + Decimal(i % 3),
-                low=base - wiggle - Decimal(i % 5),
-                close=base + (wiggle if i % 2 else -wiggle),
+                open=open_,
+                high=max(open_, close) + Decimal(1),
+                low=min(open_, close) - Decimal(1),
+                close=close,
                 volume=Decimal("10"),
             )
         )
@@ -229,17 +240,24 @@ def _mc_candles(n: int, *, start: int = 1_700_000_000) -> list[Candle]:
 
 
 def _mc_db(tmp_path):
-    """A temp db holding one turtle rule (small lookbacks) and its daily candles."""
+    """A temp db holding one turtle rule (small lookbacks, short ATR) and its daily candles --
+    96 bars = 5 full sawtooth cycles, whose backtest closes 2 wins and 2 losses."""
     conn = connect(str(tmp_path / "mc.db"))
     migrate(conn)
     repo = Repository(conn)
     repo.insert_rule(
         "turtle_breakout",
-        {"product_id": "BTC-USD", "entry_lookback": 5, "exit_lookback": 3, "atr_stop_mult": "1"},
+        {
+            "product_id": "BTC-USD",
+            "entry_lookback": 5,
+            "exit_lookback": 3,
+            "atr_period": 5,
+            "atr_stop_mult": "2",
+        },
         status="candidate",
         now_ts=1_800_000_000,
     )
-    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(60))
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(96))
     conn.close()
     return tmp_path / "mc.db"
 
@@ -302,6 +320,31 @@ def test_monte_carlo_trades_mode_appends_exactly_one_diagnostic_row(tmp_path):
     assert trials_ledger.verify_chain(ledger) == []
 
 
+def test_monte_carlo_trades_mode_reports_a_non_degenerate_drawdown_distribution(tmp_path):
+    """The shape statistic, not the permutation invariant: the fixture's closed P&L is
+    mixed-sign, so reordering the SAME trades moves max drawdown (a big loss early digs a
+    different hole than late) and the drawdown percentile is a real measurement -- while
+    final equity stays pinned at one value, stated as the by-construction invariant it is."""
+    db = _mc_db(tmp_path)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(CliRunner(), db, ledger, "--mode", "trades", "--paths", "20", "--seed", "7")
+    assert result.exit_code == 0, result.output
+    assert "observed max drawdown" in result.output
+    assert "resampled max drawdown" in result.output
+    assert "observed drawdown percentile" in result.output
+    assert "by construction" in result.output  # the final-equity invariant stays named
+
+    summary = trials_ledger.read_trials(ledger)[0].summary
+    # Final equity: the invariant -- one value, percentile exactly 1/2.
+    assert summary["distribution_min"] == summary["distribution_max"]
+    assert summary["percentile"] == Decimal("0.5")
+    # Max drawdown: the measurement -- the reshuffles genuinely spread...
+    assert summary["drawdown_min"] < summary["drawdown_max"]
+    assert summary["drawdown_min"] <= summary["observed_drawdown"] <= summary["drawdown_max"]
+    # ...so the drawdown percentile is NOT the forced 1/2 of a permutation invariant.
+    assert summary["drawdown_percentile"] != Decimal("0.5")
+
+
 def test_monte_carlo_candles_mode_rebacktests_bootstrapped_paths(tmp_path):
     db = _mc_db(tmp_path)
     ledger = tmp_path / "trials.jsonl"
@@ -321,6 +364,18 @@ def test_monte_carlo_candles_mode_rebacktests_bootstrapped_paths(tmp_path):
     assert result.exit_code == 0, result.output
     assert "candles mode" in result.output
     assert "block_len=10" in result.output
+    # Drawdown is informative in candles mode too: each path is a full re-backtest, so its
+    # curve has a shape worth reading, not just an endpoint.
+    assert "observed max drawdown" in result.output
+    summary = trials_ledger.read_trials(ledger)[0].summary
+    for key in (
+        "observed_drawdown",
+        "drawdown_min",
+        "drawdown_median",
+        "drawdown_max",
+        "drawdown_percentile",
+    ):
+        assert key in summary
     rows = trials_ledger.read_trials(ledger)
     assert len(rows) == 1 and rows[0].kind == "monte_carlo"
     assert trials_ledger.verify_chain(ledger) == []

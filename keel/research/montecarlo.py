@@ -10,10 +10,11 @@ overfit?" (`cscv.py`'s PBO) -- it is "did one lucky PATH produce this curve?". T
 * **Trade reshuffle** (`reshuffle`): the SAME trades in different orders. Ordering luck is
   what this null can reveal -- and its endpoint is honest by construction: a permutation of
   a multiset sums to the same number, so every reshuffled path ends at the observed final
-  equity and the percentile reads exactly 1/2 (ties count half). The report SAYS this
-  rather than inventing spread; the ordering luck itself lives in the path between start
-  and end (drawdown depth, time underwater), which `equity_curve` exposes to any caller
-  who wants it.
+  equity and THAT percentile reads exactly 1/2 (ties count half). The report keeps the
+  final-equity lines (the invariant is stated, not hidden), but the ordering luck itself
+  lives in the path between start and end (drawdown depth, time underwater): `equity_curve`
+  exposes that shape and `max_drawdown` measures it -- the statistic the CLI's trades mode
+  now reports as its headline, because the shape is exactly what reordering moves.
 * **Moving-block candle bootstrap** (`moving_block_bootstrap`): consecutive blocks of real
   candles resampled with wrap-around to the SAME total length, then re-run through the
   backtest. This is the valuable null, because it preserves the local autocorrelation a
@@ -44,6 +45,7 @@ __all__ = [
     "MonteCarloReport",
     "equity_curve",
     "final_equities",
+    "max_drawdown",
     "median",
     "moving_block_bootstrap",
     "percentile_of",
@@ -89,6 +91,28 @@ def equity_curve(pnls: Sequence[Decimal], start: Decimal) -> list[Decimal]:
 def final_equities(paths: Sequence[Sequence[Decimal]], start: Decimal) -> list[Decimal]:
     """The last point of each path's equity curve -- `[equity_curve(p, start)[-1]]`."""
     return [equity_curve(path, start)[-1] for path in paths]
+
+
+def max_drawdown(curve: Sequence[Decimal]) -> Decimal:
+    """The deepest peak-to-trough decline on `curve`, as an exact non-negative `Decimal`.
+
+    The same running-peak loop `keel.strategy.stats.summarize` runs over closed-trade P&L
+    (stats.py: peak tracked per step, drawdown is `peak - running`, the max of those) -- but
+    over the ADDITIVE curve `equity_curve` produces, so observed and resampled paths are
+    measured by one definition. For a curve built from a zero start over the same closed
+    trades, the two agree by construction; computing both sides here (rather than reading
+    `BacktestResult.max_drawdown` for the observed side) makes the apples-to-apples
+    comparison self-evident instead of promised. A monotonic curve is never underwater and
+    draws exactly 0. Raises on an empty curve rather than inventing a zero.
+    """
+    if not curve:
+        raise ValueError("max drawdown of an empty curve is undefined")
+    peak = curve[0]
+    deepest = Decimal(0)
+    for point in curve:
+        peak = max(peak, point)
+        deepest = max(deepest, peak - point)
+    return deepest
 
 
 def median(values: Sequence[Decimal]) -> Decimal:
@@ -183,10 +207,15 @@ def moving_block_bootstrap(
 class MonteCarloReport:
     """One equity curve read against one resampled distribution.
 
-    Every money quantity is exact `Decimal`. `percentile` follows `percentile_of`'s
-    convention (strictly-below fraction, ties half), and in trades mode it is exactly 1/2
-    BY CONSTRUCTION -- the same multiset cannot sum differently -- which `render_lines`
-    states rather than lets read as a verdict.
+    Every money quantity is exact `Decimal`. Both statistics travel together: the FINAL
+    equity (`observed_final` + `distribution_*` + `percentile`) and the curve's SHAPE
+    (`observed_drawdown` + `drawdown_*` + `drawdown_percentile`). In trades mode the final
+    percentile is exactly 1/2 BY CONSTRUCTION -- the same multiset cannot sum differently,
+    which `render_lines` states rather than lets read as a verdict -- while the drawdown
+    distribution is the measurement that mode exists for: reordering the same trades moves
+    the depth of the hole between start and end, and that spread is what the reshuffles
+    reveal. All percentiles follow `percentile_of`'s convention (strictly-below fraction,
+    ties half).
     """
 
     mode: str  # "trades" | "candles"
@@ -199,12 +228,21 @@ class MonteCarloReport:
     distribution_median: Decimal
     distribution_max: Decimal
     percentile: Decimal
+    #: The shape statistic: deepest peak-to-trough decline (`max_drawdown`) of the observed
+    #: curve and of each resampled path's curve. Trades mode's HEADLINE -- final equity is
+    #: permutation-invariant there, drawdown is not.
+    observed_drawdown: Decimal
+    drawdown_min: Decimal
+    drawdown_median: Decimal
+    drawdown_max: Decimal
+    drawdown_percentile: Decimal
     #: Candles mode only; `None` in trades mode, which has no block structure.
     block_len: int | None = None
 
     def render_lines(self) -> list[str]:
-        """The report, always naming mode, seed, n_paths, the observed final, the resampled
-        `[min..max]`, the percentile -- and the refusal: what this does NOT answer."""
+        """The report, always naming mode, seed, n_paths, the observed final AND drawdown,
+        each statistic's resampled `[min..max]` and percentile -- and the refusal: what this
+        does NOT answer."""
         head = f"monte-carlo ({self.mode} mode"
         if self.block_len is not None:
             head += f", block_len={self.block_len}"
@@ -218,19 +256,26 @@ class MonteCarloReport:
             f"/ max {self.distribution_max}",
             "  observed percentile: "
             f"{self.percentile} (fraction of paths strictly below; ties count half)",
+            f"  observed max drawdown {self.observed_drawdown}",
+            "  resampled max drawdown: "
+            f"min {self.drawdown_min} / median {self.drawdown_median} "
+            f"/ max {self.drawdown_max}",
+            f"  observed drawdown percentile: {self.drawdown_percentile} (same convention)",
         ]
         if self.mode == "trades":
             lines.append(
                 "  trades mode: every path ends at the SAME final equity by construction -- "
-                "reordering a multiset cannot change its sum, so the percentile is exactly "
-                "1/2; the ordering luck this null exposes lives in the path between (see "
-                "equity_curve), not the endpoint"
+                "reordering a multiset cannot change its sum, so that percentile is exactly "
+                "1/2; the ordering luck this null exposes lives in the path between, which "
+                "is why max drawdown -- the shape statistic reordering moves -- is the "
+                "headline above"
             )
         else:
             lines.append(
                 "  candles mode: blocks are stitched from real bars, so each seam is a price "
                 "discontinuity the real series never had -- the null keeps local structure, "
-                "not global narrative"
+                "not global narrative; both the final-equity and drawdown distributions are "
+                "re-backtests of that stitched series"
             )
         lines.append(
             "  a percentile here is path luck, not evidence of edge -- and it does not "

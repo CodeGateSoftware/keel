@@ -376,7 +376,7 @@ def trials_monte_carlo(
             raise click.ClickException(
                 "no closed trades in the observed backtest -- nothing to reshuffle"
             )
-        finals = mc_mod.final_equities(mc_mod.reshuffle(pnls, paths, seed), _MC_START)
+        resampled = mc_mod.reshuffle(pnls, paths, seed)
     else:
         candle_paths = mc_mod.moving_block_bootstrap(
             resolved.candles,
@@ -385,15 +385,26 @@ def trials_monte_carlo(
             seed=seed,
             step_sec=GRANULARITY_SECONDS[resolved.granularity],
         )
-        path_pnls: list[list[Decimal]] = []
+        resampled = []
         for candle_path in candle_paths:
             # Same fee as the observed run, so a percentile difference is path luck, not a
             # pricing difference between the observed and resampled worlds.
             replay = backtest_mod.backtest(resolved.rule, candle_path, fee_pct=resolved.fee_pct)
-            path_pnls.append(_closed_pnls(replay))
-        finals = mc_mod.final_equities(path_pnls, _MC_START)
+            resampled.append(_closed_pnls(replay))
 
-    observed_final = mc_mod.equity_curve(pnls, _MC_START)[-1]
+    # Both statistics read the SAME construction on both sides: each path's additive curve
+    # from `_MC_START`, its final point and its `max_drawdown`. The observed drawdown is
+    # computed here from the same helpers over the same closed-trade P&L the resamples read
+    # (numerically equal to `observed.max_drawdown` -- `stats.summarize` runs the same
+    # running-peak loop over the same closed trades from the same zero base) rather than
+    # lifted from the BacktestResult, so apples-to-apples is by construction, not by claim.
+    observed_curve = mc_mod.equity_curve(pnls, _MC_START)
+    curves = [mc_mod.equity_curve(path, _MC_START) for path in resampled]
+    finals = [curve[-1] for curve in curves]
+    drawdowns = [mc_mod.max_drawdown(curve) for curve in curves]
+
+    observed_final = observed_curve[-1]
+    observed_drawdown = mc_mod.max_drawdown(observed_curve)
     report = mc_mod.MonteCarloReport(
         mode=mode,
         n_paths=paths,
@@ -405,6 +416,11 @@ def trials_monte_carlo(
         distribution_median=mc_mod.median(finals),
         distribution_max=max(finals),
         percentile=mc_mod.percentile_of(observed_final, finals),
+        observed_drawdown=observed_drawdown,
+        drawdown_min=min(drawdowns),
+        drawdown_median=mc_mod.median(drawdowns),
+        drawdown_max=max(drawdowns),
+        drawdown_percentile=mc_mod.percentile_of(observed_drawdown, drawdowns),
         block_len=block_len if mode == "candles" else None,
     )
     for line in report.render_lines():
@@ -436,6 +452,11 @@ def trials_monte_carlo(
                 "distribution_median": report.distribution_median,
                 "distribution_max": report.distribution_max,
                 "percentile": report.percentile,
+                "observed_drawdown": observed_drawdown,
+                "drawdown_min": report.drawdown_min,
+                "drawdown_median": report.drawdown_median,
+                "drawdown_max": report.drawdown_max,
+                "drawdown_percentile": report.drawdown_percentile,
                 "n_trades": len(pnls),
                 "n_paths": paths,
             },

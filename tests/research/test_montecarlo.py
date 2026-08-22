@@ -24,6 +24,7 @@ from keel.research.montecarlo import (
     MonteCarloReport,
     equity_curve,
     final_equities,
+    max_drawdown,
     median,
     moving_block_bootstrap,
     percentile_of,
@@ -78,7 +79,7 @@ def test_reshuffle_different_seed_moves_at_least_one_path() -> None:
     assert reshuffle(_PNLS, 10, seed=1) != reshuffle(_PNLS, 10, seed=2)
 
 
-# -- equity curve / final equities / median -------------------------------------------------------
+# -- equity curve / final equities / max drawdown / median ----------------------------------------
 
 
 def test_equity_curve_is_exact_cumulative_arithmetic() -> None:
@@ -103,6 +104,32 @@ def test_final_equities_and_median_handle_length_parity_exactly() -> None:
     # Odd length: the middle of the sorted values; even: the exact mean of the two middles.
     assert median([Decimal(13), Decimal(12), Decimal(15)]) == Decimal(13)
     assert median([Decimal(1), Decimal(2), Decimal(3), Decimal(10)]) == Decimal("2.5")
+
+
+def test_max_drawdown_exact_hand_computed_cases() -> None:
+    # [0, 3, 2, -1, 5]: peak 3, trough -1 -> 4; the recovery to 5 opens no new hole.
+    curve = equity_curve([Decimal(3), Decimal(-1), Decimal(-3), Decimal(6)], Decimal(0))
+    assert curve == [Decimal(0), Decimal(3), Decimal(2), Decimal(-1), Decimal(5)]
+    assert max_drawdown(curve) == Decimal(4)
+    # A monotonic curve is never underwater.
+    assert max_drawdown([Decimal("0.5"), Decimal(1), Decimal("2.5")]) == Decimal(0)
+    # Underwater from the first point: peak 10, trough 4 -> 6 (the rise to 6 only digs 4).
+    assert max_drawdown([Decimal(10), Decimal(4), Decimal(6)]) == Decimal(6)
+    # A single point has no decline; an empty curve is refused rather than zeroed.
+    assert max_drawdown([Decimal(7)]) == Decimal(0)
+    with pytest.raises(ValueError, match="empty"):
+        max_drawdown([])
+
+
+def test_max_drawdown_spreads_when_ordering_matters() -> None:
+    """The statistic trades mode exists to measure: the SAME multiset, different orders,
+    different max drawdowns -- clustered losses (6,5,-4,-4: dd 8) dig deeper than
+    interleaved ones (6,-4,5,-4: dd 4), while every ordering still sums to 3."""
+    pnls = [Decimal(6), Decimal(5), Decimal(-4), Decimal(-4)]
+    paths = reshuffle(pnls, 40, seed=4)
+    drawdowns = {max_drawdown(equity_curve(path, Decimal(0))) for path in paths}
+    assert drawdowns == {Decimal(4), Decimal(8)}
+    assert {equity_curve(path, Decimal(0))[-1] for path in paths} == {Decimal(3)}
 
 
 # -- moving-block bootstrap ------------------------------------------------------------------------
@@ -194,6 +221,11 @@ def _report(**overrides: object) -> MonteCarloReport:
         distribution_median=Decimal(9),
         distribution_max=Decimal(21),
         percentile=Decimal("0.714"),
+        observed_drawdown=Decimal("2.25"),
+        drawdown_min=Decimal("1"),
+        drawdown_median=Decimal("4.5"),
+        drawdown_max=Decimal("9"),
+        drawdown_percentile=Decimal("0.286"),
         block_len=24,
     )
     base.update(overrides)
@@ -202,7 +234,22 @@ def _report(**overrides: object) -> MonteCarloReport:
 
 def test_render_lines_always_state_the_load_bearing_numbers_and_the_refusal() -> None:
     lines = "\n".join(_report().render_lines())
-    for needle in ("candles", "42", "7", "12.5", "-3", "21", "0.714", "24"):
+    for needle in (
+        "candles",
+        "42",
+        "7",
+        "12.5",
+        "-3",
+        "21",
+        "0.714",
+        "24",
+        # The shape statistic rides along in both modes, with its own distribution and
+        # percentile -- never only the endpoint.
+        "max drawdown",
+        "2.25",
+        "drawdown percentile",
+        "0.286",
+    ):
         assert needle in lines
     assert "path luck" in lines
     # The one-line refusal: what this does NOT answer, naming where that question lives.
@@ -212,7 +259,8 @@ def test_render_lines_always_state_the_load_bearing_numbers_and_the_refusal() ->
 
 def test_render_lines_in_trades_mode_name_the_by_construction_invariance() -> None:
     """Reshuffling the SAME trades cannot move the final equity; the report must say so rather
-    than let a degenerate 1/2 percentile read as 'perfectly median path luck'."""
+    than let a degenerate 1/2 percentile read as 'perfectly median path luck' -- and point at
+    the drawdown block as the statistic that ordering actually moves."""
     lines = "\n".join(
         _report(
             mode="trades",
@@ -224,6 +272,7 @@ def test_render_lines_in_trades_mode_name_the_by_construction_invariance() -> No
         ).render_lines()
     )
     assert "by construction" in lines
+    assert "max drawdown" in lines
 
 
 def test_a_reshuffled_sample_reports_the_median_by_construction() -> None:
