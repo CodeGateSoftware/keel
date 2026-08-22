@@ -22,7 +22,7 @@ from keel.config import (
     MoneyMgmtConfig,
     SubscriptionConfig,
 )
-from keel.sim.portfolio_sim import MOVE_THRESHOLD_PCT, run
+from keel.sim.portfolio_sim import MOVE_THRESHOLD_PCT, SimResult, run
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
 
@@ -911,3 +911,146 @@ def test_a_single_rule_run_is_unchanged_by_the_multi_slot_model():
     for prev, nxt in zip(trades, trades[1:]):
         assert prev.exit_ts is not None
         assert prev.exit_ts <= nxt.entry_ts
+
+
+# ---------------------------------------------------------------------------
+# #442: the ratchet-only exit policy (trailing stop / break-even roll)
+# ---------------------------------------------------------------------------
+
+
+class _ExitPolicyFirstBarRule(_FirstBarRule):
+    """`_FirstBarRule` carrying a `params` dict -- the per-family exit-policy knobs
+    (`trail_atr_mult` / `be_roll_rr` / `atr_period`) the simulator's exit resolution reads
+    through `strategy.exit_policy.policy_for`. Detect/exit_signal behave exactly as the
+    parent's (fires on the asset's very first bar)."""
+
+    def __init__(
+        self,
+        product_id: str,
+        entry: Decimal,
+        stop: Decimal,
+        target: Decimal,
+        params: dict,
+    ) -> None:
+        super().__init__(product_id, entry=entry, stop=stop, target=target)
+        self.params = dict(params)
+
+
+def _run_exit_policy_sim(rule: Rule, hourly: list[Candle]) -> SimResult:
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    return run(
+        [rule],
+        candles_by_asset,
+        _config(),
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+        fee_pct=Decimal("0"),
+        slippage_pct=Decimal("0"),
+    )
+
+
+def test_trailing_exits_earlier_and_higher_than_the_static_stop():
+    """Same shape as the single-rule backtester's test, driven through the PORTFOLIO sim:
+    a 2xATR trail (period 2, so it arms on the third bar) ratchets 94 -> 98 -> 100 on the
+    rising bars and exits the retrace at 100, where the static arm rides down to 94.
+
+      bar0: trigger. bar1: fill at open 100.
+      bar2: o100 h102 l100 c102 -> ATR(2)=2, trail 102-4=98
+      bar3: o102 h104 l102 c104 -> trail 104-4=100
+      bar4: o102 h103 l97  c98  -> low 97 touches the TRAILED stop 100 -> exit
+      bar5: o98  h99  l93  c94  -> static arm exits at 94
+    """
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "101", "99", "100"),
+        _candle(2 * _HOUR, "100", "102", "100", "102"),
+        _candle(3 * _HOUR, "102", "104", "102", "104"),
+        _candle(4 * _HOUR, "102", "103", "97", "98"),
+        _candle(5 * _HOUR, "98", "99", "93", "94"),
+    ]
+    trailed = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule(
+            "BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"),
+            {"trail_atr_mult": Decimal("2"), "atr_period": 2},
+        ),
+        hourly,
+    )
+    static = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule("BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"), {}),
+        hourly,
+    )
+
+    assert len(trailed.trades) == 1
+    assert len(static.trades) == 1
+    assert trailed.trades[0].exit == Decimal("100")
+    assert trailed.trades[0].exit_ts == 4 * _HOUR
+    assert static.trades[0].exit == Decimal("94")
+    assert static.trades[0].exit_ts == 5 * _HOUR
+    assert trailed.trades[0].pnl is not None and static.trades[0].pnl is not None
+    assert trailed.trades[0].pnl > static.trades[0].pnl
+
+
+def test_break_even_roll_exits_at_entry_once_and_never_widens():
+    """`be_roll_rr=1`: bar2's high 111 clears entry + 1x the ORIGINAL risk (10), the stop
+    rolls to the entry ONCE, and the next dip to 99 exits there -- a scratch. The static
+    arm rides to the full 90 stop. Between the roll and the exit the retrace computes
+    nothing above entry, and the stop must not move down -- that is the ratchet."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "101", "99", "100"),
+        _candle(2 * _HOUR, "100", "111", "100", "108"),  # +1R cleared -> roll to entry
+        _candle(3 * _HOUR, "106", "107", "99", "100"),  # low 99 touches the rolled stop
+        _candle(4 * _HOUR, "100", "101", "89", "90"),  # static arm exits at 90
+    ]
+    rolled = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule(
+            "BTC-USD", Decimal("100"), Decimal("90"), Decimal("130"),
+            {"be_roll_rr": Decimal("1"), "atr_period": 2},
+        ),
+        hourly,
+    )
+    static = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule("BTC-USD", Decimal("100"), Decimal("90"), Decimal("130"), {}),
+        hourly,
+    )
+
+    assert len(rolled.trades) == 1
+    assert len(static.trades) == 1
+    assert rolled.trades[0].exit == Decimal("100")
+    assert rolled.trades[0].exit_ts == 3 * _HOUR
+    assert rolled.trades[0].pnl == Decimal("0")
+    assert rolled.trades[0].outcome == "scratch"
+    assert static.trades[0].exit == Decimal("90")
+    assert static.trades[0].exit_ts == 4 * _HOUR
+
+
+def test_a_rule_without_exit_params_trades_identically_in_the_sim():
+    """The default-OFF guarantee on the portfolio path (the turtle guarantee in
+    miniature: any rule whose params carry no trail/BE knobs -- turtle among them --
+    must trade exactly as before the wiring existed)."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "101", "99", "100"),
+        _candle(2 * _HOUR, "100", "102", "100", "102"),
+        _candle(3 * _HOUR, "102", "104", "102", "104"),
+        _candle(4 * _HOUR, "102", "103", "97", "98"),
+        _candle(5 * _HOUR, "98", "99", "93", "94"),
+    ]
+    unset = _run_exit_policy_sim(
+        _FirstBarRule("BTC-USD", Decimal("100"), Decimal("94"), Decimal("130")), hourly
+    )
+    explicit_off = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule(
+            "BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"),
+            {"trail_atr_mult": None, "be_roll_rr": None},
+        ),
+        hourly,
+    )
+
+    def _shape(result):
+        return [
+            (t.entry_ts, t.exit_ts, t.entry, t.exit, t.pnl, t.outcome) for t in result.trades
+        ]
+
+    assert _shape(unset) == _shape(explicit_off)

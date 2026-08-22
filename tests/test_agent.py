@@ -1206,11 +1206,13 @@ def test_coerced_param_keys_names_every_param_that_arrives_as_a_string():
             "fixed_rr",
             "level_tolerance",
             "support_proximity_pct",
+            "trail_atr_mult",
+            "be_roll_rr",
             "timeframe",
         }
     )
     assert agent.coerced_param_keys("pullback_continuation") == frozenset(
-        {"buffer_ticks", "granularity"}
+        {"buffer_ticks", "trail_atr_mult", "be_roll_rr", "granularity"}
     )
     assert agent.coerced_param_keys("dca") == frozenset({"budget_usd", "dip_bonus_pct"})
     assert agent.coerced_param_keys("turtle_breakout") == frozenset(

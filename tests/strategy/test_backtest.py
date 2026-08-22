@@ -570,3 +570,135 @@ class TestPerProductSlippageInBacktest:
 
         assert default_run.trades[0].pnl == explicit_run.trades[0].pnl
         assert default_run.trades[0].entry == Decimal(105) * Decimal("1.0005")
+
+
+# ---------------------------------------------------------------------------
+# #442: the ratchet-only exit policy (trailing stop / break-even roll)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedParamRule(_ScriptedRule):
+    """`_ScriptedRule` carrying a `params` dict -- the per-family exit-policy knobs
+    (`trail_atr_mult` / `be_roll_rr` / `atr_period`) `strategy.exit_policy.policy_for`
+    reads off the rule. `detect`/`exit_signal` behave exactly as the parent's."""
+
+    def __init__(
+        self,
+        trigger_ts: int,
+        entry: Decimal,
+        stop: Decimal,
+        target: Decimal,
+        params: dict,
+        product_id: str = "BTC-USD",
+    ) -> None:
+        super().__init__(trigger_ts, entry, stop, target, product_id=product_id)
+        self.params = dict(params)
+
+
+def _flat_then_run_bars(trigger_ts: int, after: list[tuple[str, str, str, str]]) -> list[Candle]:
+    """Warmup bars flat at 100 (true range exactly 2 on every bar, so ATR(14) == 2
+    throughout), the trigger bar, then the caller's `(o, h, l, c)` tuples -- each rising
+    bar's true range is also 2 by construction where the caller keeps `l == prev c`,
+    `h == l + 2`."""
+    bars = [_candle(i * 3600, "100", "101", "99", "100") for i in range(trigger_ts // 3600 + 1)]
+    for i, (o, h, low, c) in enumerate(after, len(bars)):
+        bars.append(_candle(i * 3600, o, h, low, c))
+    return bars
+
+
+def test_trailing_exits_earlier_and_higher_than_the_static_stop() -> None:
+    """The #442 wiring, behaviorally: a 2xATR trail on a rising-then-retracing series
+    ratchets the stop up bar by bar and exits on the retrace at a level the STATIC stop
+    never reaches -- same series, same setup, only `trail_atr_mult` differs.
+
+    Bars (fee 0, slippage 0, ATR == 2 on every bar):
+      fill bar:  o100 h101 l99  c100  -> trail 100-4 = 96 (initial stop 94)
+      rising:    o100 h102 l100 c102  -> trail 102-4 = 98
+      rising:    o102 h104 l102 c104  -> trail 104-4 = 100
+      retrace:   o102 h103 l97  c98   -> low 97 touches the TRAILED stop 100 -> exit 100
+      (static arm: low 97 misses the static 94; the NEXT bar's low 93 exits at 94)
+    """
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("102", "103", "97", "98"),  # retrace: trailing arm exits here
+        ("98", "99", "93", "94"),  # static arm exits here
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    trail_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {"trail_atr_mult": Decimal("2")}
+    )
+    static_rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    trailed = backtest(trail_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    static = backtest(static_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert trailed.n_trades == 1
+    assert static.n_trades == 1
+    assert trailed.trades[0].exit == Decimal("100")  # the RATCHETED stop, not the static 94
+    assert trailed.trades[0].exit_ts == (trigger_ts + 4 * 3600)
+    assert static.trades[0].exit == Decimal("94")
+    assert static.trades[0].exit_ts == (trigger_ts + 5 * 3600)
+    assert trailed.trades[0].pnl is not None and static.trades[0].pnl is not None
+    assert trailed.trades[0].pnl > static.trades[0].pnl
+
+
+def test_break_even_roll_exits_at_entry_after_the_threshold_clears() -> None:
+    """`be_roll_rr=1`: once the bar's high clears entry + 1x the ORIGINAL risk (110 vs
+    risk 10), the stop rolls to the entry and the very next dip to 99 exits there -- a
+    scratch instead of the static arm's full ride down to the 90 stop."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),  # fill bar: high 101 misses the 110 threshold
+        ("100", "111", "100", "108"),  # high 111 clears +1R -> stop rolls to entry 100
+        ("106", "107", "99", "100"),  # low 99 touches the rolled stop -> exit at 100
+        ("100", "101", "89", "90"),  # static arm: low 89 touches the 90 stop
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    be_rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("90"), Decimal("130"), {"be_roll_rr": Decimal("1")}
+    )
+    static_rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("90"), Decimal("130"), {})
+
+    rolled = backtest(be_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    static = backtest(static_rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert rolled.n_trades == 1
+    assert static.n_trades == 1
+    assert rolled.trades[0].exit == Decimal("100")
+    assert rolled.trades[0].exit_ts == (trigger_ts + 3 * 3600)
+    assert rolled.trades[0].pnl == Decimal("0")  # a scratch at the rolled stop
+    assert static.trades[0].exit == Decimal("90")
+    assert static.trades[0].exit_ts == (trigger_ts + 4 * 3600)
+
+
+def test_a_rule_without_exit_params_is_byte_identical_to_explicit_off() -> None:
+    """The default-OFF guarantee: `params={}` (every existing rule row) and an explicit
+    `{"trail_atr_mult": None, "be_roll_rr": None}` produce identical trades -- the wiring
+    cannot change any existing rule's backtest until an operator turns a knob on."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("100", "102", "100", "102"),
+        ("102", "104", "102", "104"),
+        ("102", "103", "97", "98"),
+        ("98", "99", "93", "94"),
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    unset = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+    explicit_off = _ScriptedParamRule(
+        trigger_ts,
+        Decimal("100"),
+        Decimal("94"),
+        Decimal("130"),
+        {"trail_atr_mult": None, "be_roll_rr": None},
+    )
+
+    a = backtest(unset, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+    b = backtest(explicit_off, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert [(t.entry, t.exit, t.exit_ts, t.pnl) for t in a.trades] == [
+        (t.entry, t.exit, t.exit_ts, t.pnl) for t in b.trades
+    ]
