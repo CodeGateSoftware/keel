@@ -1,0 +1,61 @@
+name: Installer smoke
+
+# Compiles packaging/keel.iss on a real Windows runner against a PLACEHOLDER bundle.
+#
+# WHY THIS EXISTS: the release workflow is manual-only and its desktop job runs AFTER the
+# release is published, so the first real Inno Setup compile of keel.iss would otherwise
+# be the release dispatch itself -- a script typo failing a release with the tag already
+# pushed. ISCC does not run what it packages, so a one-line placeholder keel.exe exercises
+# the whole SCRIPT (directives, relative paths, defines, output naming) for the price of
+# one cheap compile, with no freeze and no secrets.
+#
+# TRIGGERS. `workflow_dispatch` alone would have been the obvious choice, but a workflow
+# that does not exist on the default branch cannot be dispatched onto a branch at all
+# (GitHub registers workflow_dispatch targets from the default branch), so the first
+# compile of a NEW script would still be whatever release dispatched first -- the exact
+# failure this workflow exists to prevent. So it also runs on pull requests that touch
+# the script or this file, which is where a compile break is introduced in the first
+# place. The `paths` filter is what keeps that honest: the Windows runner is spent only
+# when the thing that can break it changed, not on every PR.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packaging/keel.iss
+      - .github/workflows/installer-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Compile the Inno Setup script
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Full path first, PATH second, never the other way round: the hosted image ships
+      # Inno Setup 6 at this path, and preferring it means a PATH change on the image
+      # cannot silently hand the build a different compiler version.
+      - name: Compile keel.iss against a placeholder bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\keel, out | Out-Null
+          Set-Content -Path dist\keel\keel.exe -Value "placeholder"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $iscc) {
+            "::error::ISCC.exe not found -- the Windows runner image no longer ships Inno Setup 6"
+            exit 1
+          }
+          & $iscc "/DKeelVersion=0.0.0-smoke" "/DKeelArch=x86_64" "packaging\keel.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Get-ChildItem out -Filter "*-setup.exe"
+          if (-not $setup) {
+            "::error::ISCC reported success but out/ holds no *-setup.exe -- the script's output naming drifted"
+            exit 1
+          }
+          $setup | ForEach-Object { "compiled $($_.Name) ($($_.Length) bytes)" }
