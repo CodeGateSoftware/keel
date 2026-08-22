@@ -61,13 +61,15 @@ class RsiMeanReversion(Rule):
         "fixed_rr": "reward:risk multiple for the 'fixed_rr' target method.",
         "trail_atr_mult": (
             "ratchet-only trailing stop this many ATRs below each bar's close, once the "
-            "trade is open (null = off, the default). Sim/backtest engines only -- live "
-            "stop management is issue #502."
+            "trade is open. Default off: measured WORSE than the static exit at the 120 bp "
+            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
         ),
         "be_roll_rr": (
-            "roll the stop to the entry once the trade has been up this many R (null = "
-            "off, the default). Sim/backtest engines only -- live stop management is "
-            "issue #502."
+            "roll the stop to the entry once the trade has been up this many R. Default "
+            "off: measured no-better than the static exit at the 120 bp fee "
+            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
+            "engines only -- live stop management is issue #502."
         ),
         "level_tolerance": (
             "how close two prices must be to count as one support/resistance level."

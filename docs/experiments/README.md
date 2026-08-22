@@ -18,6 +18,10 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-08
 
+- [`2026-08-22-trailing-vs-static-exits.md`](2026-08-22-trailing-vs-static-exits.md) — Does
+  the #442 ratchet-only exit policy (ATR trail / break-even roll) help `pullback_continuation`
+  or `rsi_meanrev` at the 120 bp fee? No — and the trailing arm is clearly worse; the knobs
+  ship default-OFF · driver `2026-08-22-trailing-vs-static-exits.py`
 - [`2026-08-22-optuna-parameter-study.md`](2026-08-22-optuna-parameter-study.md) — Optuna
   TPE parameter study (60 seeded trials per cell, 3 families × 3 products) producing tuning
   *candidates for the gauntlet, never auto-tuned lives* (#476) · driver
