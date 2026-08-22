@@ -166,6 +166,44 @@ def test_a_transport_failure_never_raises_into_the_caller():
     assert sent is False  # delivered=False, not an exception
 
 
+def test_an_unserializable_field_still_delivers_serialized_as_text():
+    """The emitter's delivery guarantee: an event field of ANY type must serialize
+    (`json.dumps(..., default=str)`), or the plain format would swallow a TypeError in the
+    broad except and the operator would get NOTHING. This is the emitter half of the fix for
+    the allowance event that carried a raw Decimal; the bridge half (real payloads of all
+    five events, both formats) is pinned in `tests/test_notifications.py`."""
+    from decimal import Decimal
+
+    sink = _Sink()
+    settings = NotificationSettings(events=frozenset({"allowance.nearing_exhaustion"}))
+    event = notification_event(
+        "allowance.nearing_exhaustion", "spend 850 of 1000", pct_used=Decimal("85.00")
+    )
+
+    sent = send_event("https://alerts.example/hook", event, settings, transport=sink)
+
+    assert sent is True
+    assert json.loads(sink.calls[0]["body"])["pct_used"] == "85.00"
+
+
+def test_a_base_exception_from_the_transport_propagates():
+    """`send_event` swallows `Exception`, not `BaseException`: a KeyboardInterrupt (Ctrl-C at
+    the cycle tail -- an operator stopping keel) must reach the operator's terminal, not be
+    quietly converted into 'delivered False'. The swallow is for delivery failures; an
+    interrupt is not one."""
+
+    class _Interrupting:
+        def __call__(self, url: str, body: bytes) -> None:
+            raise KeyboardInterrupt
+
+    settings = NotificationSettings(events=frozenset({"attestation.expiring"}))
+
+    with pytest.raises(KeyboardInterrupt):
+        send_event(
+            "https://alerts.example/hook", _expiry_event(), settings, transport=_Interrupting()
+        )
+
+
 def test_no_url_means_no_delivery_attempt_at_all():
     """Offline-first, same as `install_alerting(None)`: a deployment that never configured a
     webhook makes no network call, and has no code path that could start making one."""

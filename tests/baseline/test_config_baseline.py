@@ -115,7 +115,7 @@ def _canonical_scalar(value: object) -> object:
         return str(value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-    # Sets are SORTED, not str()'d -- `NotificationsConfig.events` is a frozenset (the first
+    # Sets are SORTED, not str()'d -- `NotificationSettings.events` is a frozenset (the first
     # set-valued section field), and `str(frozenset())` would compare against the parse's
     # `[]` forever. Same rule as `config_serialize._canonical`, for the same reason: an
     # unordered container must canonicalize identically on both sides or the comparison is

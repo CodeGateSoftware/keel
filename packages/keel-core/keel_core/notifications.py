@@ -71,8 +71,8 @@ class EventSpec:
 #: THE TAXONOMY (#444's five currently-silent events). Where each one's threshold comes from:
 #:
 #: * `attestation.expiring` -- doctor's `attest.withdrawals` WARN (<=2 of the 7 TTL days
-#:   remain) or FAIL (expired). Rail 17 fails CLOSED: an expired attestation silently vetoes
-#:   every entry, which is exactly the loop this event closes.
+#:   remain) or FAIL (expired or never attested). Rail 17 fails CLOSED: an expired
+#:   attestation silently vetoes every entry, which is exactly the loop this event closes.
 #: * `rail.armed` -- doctor's `rail.streak_halt` HALTED / `rail.drawdown` FAIL. The kill
 #:   switch is deliberately NOT here: it is engaged by an operator at a TTY, who knows.
 #: * `setup.unplaced` -- a cycle that detected an entry setup and could not place it.
@@ -211,7 +211,11 @@ def send_event(
     if not settings.opted_in(event.key) or not url:
         return False
     try:
-        payload = json.dumps(format_event(event, settings.format)).encode("utf-8")
+        # `default=str` is the delivery guarantee, not decoration: an event field of any
+        # type the bridge layer can build (a Decimal, say) must serialize, or the plain
+        # format would silently swallow a TypeError here and the operator would get
+        # nothing -- the failure mode is invisible from the trading loop.
+        payload = json.dumps(format_event(event, settings.format), default=str).encode("utf-8")
         (transport or post_json)(url, payload)
         return True
     except Exception:

@@ -843,18 +843,20 @@ doctor's own findings, so the alert and the diagnostic can never disagree):
 
 | Event key | Fires when | Why it is not a CRITICAL log |
 |---|---|---|
-| `attestation.expiring` | rail-17 withdrawal attestation has ≤2 of its 7 TTL days left (or has expired) | an expired attestation silently vetoes every entry — cycles keep running, nothing errors |
+| `attestation.expiring` | rail-17 withdrawal attestation has ≤2 of its 7 TTL days left (or has expired, or was never attested) | an expired attestation silently vetoes every entry — cycles keep running, nothing errors |
 | `rail.armed` | rail 16's consecutive-loss halt arms, or rail 11's drawdown reaches 20% | a halt is a correct state, not a fault; the kill switch is deliberately absent (you engaged it at a terminal — you know) |
 | `setup.unplaced` | a cycle detected an entry setup and could not place it | the veto is a WARNING; the rail-17 incident looked like a quiet week |
-| `allowance.nearing_exhaustion` | month-to-date BUY spend reaches 80% of the in-force rail-14 allowance | rail 14 only speaks when it vetoes, which is too late to re-tier |
+| `allowance.nearing_exhaustion` | month-to-date BUY spend reaches 80% of the in-force rail-14 allowance — or there is spend against an allowance of 0 (no subscription in force: lapsed or never attested) | rail 14 only speaks when it vetoes, which is too late to re-tier |
 | `feed.stale_open_position` | a product's feed is stale while a position is open in it | the stale product is skipped at INFO; an open position's exits ride on that stopped data |
 
 Payloads: `plain` is a flat JSON object (`event`, `severity`, `category`, `message`, plus the
 numbers — `pct_used`, days remaining in the message); `slack` is Slack-compatible
 `{"text": ...}` — accepted natively by Slack and Mattermost, and by Discord via a `/slack`
 webhook endpoint. Delivery is one attempt per event per cycle, fire-and-forget at the end of
-each agent cycle: a dead endpoint costs a notification, never a cycle, and a state that
-persists re-alerts on the next cycle anyway.
+each agent cycle: each opted-in event is one inline POST with a 5-second timeout at the
+cycle's tail, bounded by the events the cycle derived (one per taxonomy key, plus one per
+armed rail and one per stale product held open) — so a dead endpoint costs a notification,
+never a cycle, and a state that persists re-alerts on the next cycle anyway.
 
 **Notify-only, by design.** There is no remote control surface — no command, query or
 capability arrives through notifications, ever. Every capability-increasing action stays

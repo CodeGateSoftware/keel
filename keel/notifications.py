@@ -56,8 +56,9 @@ if TYPE_CHECKING:
 ALLOWANCE_NEARING_USED_PCT = Decimal("80")
 
 #: The doctor findings rail-17's event reads. Rail 14's `attest.subscription` is deliberately
-#: absent: a lapsed subscription falls back to the unsubscribed allowance, which the
-#: ALLOWANCE event already surfaces with numbers.
+#: absent: a lapsed (or never-attested) subscription surfaces through the ALLOWANCE event
+#: instead -- the unsubscribed allowance (0 by default) with month-to-date spend IS that
+#: event's zero-runway case, so a rail-14 finding here would double-notify the same fact.
 _ATTESTATION_FINDINGS = frozenset({"attest.withdrawals"})
 
 #: The doctor findings the rail-armed event reads. `rail.kill_switch` is deliberately absent:
@@ -126,23 +127,40 @@ def events_from_state(
                 )
             )
 
-    if allowance is not None and allowance > 0 and month_to_date_spend is not None:
-        pct_used = (month_to_date_spend * Decimal("100") / allowance).quantize(Decimal("0.01"))
-        if pct_used >= ALLOWANCE_NEARING_USED_PCT:
-            remaining = allowance - month_to_date_spend
-            exhausted = remaining <= 0
-            tail = "exhausted; the rail is vetoing BUYs" if exhausted else "nearing exhaustion"
+    if month_to_date_spend is not None and month_to_date_spend > 0 and allowance is not None:
+        if allowance == 0:
+            # Zero in-force allowance (the unsubscribed default) WITH month-to-date spend: a
+            # lapsed or never-attested subscription that was active this month. That IS the
+            # event's spirit -- zero runway left, the threshold passed in full -- so it fires
+            # rather than being silenced by the `allowance > 0` the pct math needs.
             events.append(
                 notification_event(
                     "allowance.nearing_exhaustion",
-                    f"month-to-date BUY spend {month_to_date_spend} of {allowance} "
-                    f"({pct_used}% used) -- the monthly allowance is {tail}",
+                    f"month-to-date BUY spend {month_to_date_spend} against an allowance of 0 "
+                    f"-- no subscription is in force (lapsed or never attested); rail 14 "
+                    f"vetoes further BUYs",
                     month_to_date_spend=str(month_to_date_spend),
-                    allowance=str(allowance),
-                    pct_used=pct_used,
-                    remaining=str(remaining),
+                    allowance="0",
+                    pct_used=str(Decimal("100")),
                 )
             )
+        else:
+            pct_used = (month_to_date_spend * Decimal("100") / allowance).quantize(Decimal("0.01"))
+            if pct_used >= ALLOWANCE_NEARING_USED_PCT:
+                remaining = allowance - month_to_date_spend
+                exhausted = remaining <= 0
+                tail = "exhausted; the rail is vetoing BUYs" if exhausted else "nearing exhaustion"
+                events.append(
+                    notification_event(
+                        "allowance.nearing_exhaustion",
+                        f"month-to-date BUY spend {month_to_date_spend} of {allowance} "
+                        f"({pct_used}% used) -- the monthly allowance is {tail}",
+                        month_to_date_spend=str(month_to_date_spend),
+                        allowance=str(allowance),
+                        pct_used=str(pct_used),
+                        remaining=str(remaining),
+                    )
+                )
 
     if unplaced_setups:
         shown = list(unplaced_setups)[:3]

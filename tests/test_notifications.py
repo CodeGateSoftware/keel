@@ -15,9 +15,11 @@ raises and never trades -- notify-only, per #444's scope.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
-from keel_core.notifications import NotificationSettings
+import pytest
+from keel_core.notifications import NotificationSettings, send_event
 
 from keel.commands.doctor import attestation_findings, rail_state_findings
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
@@ -140,7 +142,26 @@ def test_allowance_nearing_exhaustion_fires_at_the_threshold_with_the_pct():
 
     assert [e.key for e in events] == ["allowance.nearing_exhaustion"]
     assert "85" in events[0].message  # the pct used, in the human message
-    assert events[0].fields["pct_used"] == Decimal("85")
+    # A STRING, not the raw Decimal: json.dumps (the plain format's serializer) cannot
+    # encode a Decimal, and an unencodable field would swallow the whole delivery in
+    # `send_event`'s broad except -- the blocker this suite's round-trip class pins.
+    assert events[0].fields["pct_used"] == "85.00"
+
+
+def test_a_lapsed_subscription_with_activity_fires_and_a_quiet_one_does_not():
+    """Zero in-force allowance is the unsubscribed default; spend against it means a
+    subscription lapsed (or was never attested) mid-month. That IS the allowance event's
+    zero-runway case -- the old `allowance > 0` guard silently suppressed it, exactly the
+    gap the corrected comment on `_ATTESTATION_FINDINGS` used to paper over."""
+    lapsed = _state(month_to_date_spend=Decimal("25"), allowance=Decimal("0"))
+
+    assert [e.key for e in lapsed] == ["allowance.nearing_exhaustion"]
+    assert lapsed[0].fields["allowance"] == "0"
+    assert lapsed[0].fields["pct_used"] == "100"
+    assert "no subscription is in force" in lapsed[0].message
+
+    quiet = _state(month_to_date_spend=Decimal("0"), allowance=Decimal("0"))
+    assert quiet == []  # no spend, nothing to warn about
 
 
 def test_a_comfortable_or_unlimited_allowance_does_not_fire():
@@ -303,6 +324,88 @@ def test_notify_after_cycle_never_raises_into_the_trading_path():
 
     assert sent == 0
     assert calls == []
+
+
+def test_notify_after_cycle_lets_base_exceptions_through_to_the_operator():
+    """The broad `except Exception` swallows delivery failures, NOT Ctrl-C: an operator
+    stopping keel at the cycle tail must see the interrupt reach their terminal, not have it
+    quietly converted into 'zero delivered'. Pinned so a future `except BaseException`
+    "hardening" cannot eat it."""
+
+    def _interrupt(url: str, body: bytes) -> None:
+        raise KeyboardInterrupt
+
+    repo = _Repo(withdrawals_attested_at=NOW - 5 * DAY)
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    with pytest.raises(KeyboardInterrupt):
+        notify_after_cycle(
+            repo,
+            config,
+            _LoopResult(),
+            NOW,
+            url="https://alerts.example/hook",
+            transport=_interrupt,
+        )
+
+
+# -- every real event payload must survive delivery ---------------------------------------------
+
+
+class TestEveryTaxonomyEventSurvivesDelivery:
+    """The regression class for the blocker an adversarial review caught: the allowance event
+    carried `pct_used` as a raw Decimal, `send_event`'s PLAIN format `json.dumps`'d it with no
+    `default=`, and the TypeError was swallowed by the broad except -- delivered `False`, the
+    operator got nothing -- while the SLACK format kept working because its fields are
+    f-string'd into one text line. Format asymmetry like that is invisible to any test that
+    hand-builds a payload, so this class round-trips the REAL field payloads of ALL FIVE
+    taxonomy events -- built by `events_from_state` from crafted state, never hand-rolled --
+    through `send_event` in BOTH formats, asserting delivered `True` and exactly one POST
+    each. This is the test whose absence hid the bug."""
+
+    ALL_KEYS = {
+        "attestation.expiring",
+        "rail.armed",
+        "setup.unplaced",
+        "allowance.nearing_exhaustion",
+        "feed.stale_open_position",
+    }
+
+    @staticmethod
+    def _all_five_events():
+        return _state(
+            attestation=_attestation(NOW - 5 * DAY),  # rail 17: 2 of 7 days remain -> WARN
+            rails=_rails(streak_halt_until=NOW + DAY),  # rail 16's halt is armed
+            month_to_date_spend=Decimal("850"),
+            allowance=Decimal("1000"),  # 85% used -- the event that used to carry a Decimal
+            unplaced=(
+                UnplacedSetup(product="BTC-USD", rule="dca", reasons=("account_dd_breaker_total",)),
+            ),
+            stale=("ETH-USD",),
+            held=("ETH-USD",),  # stale feed under an open position
+        )
+
+    @pytest.mark.parametrize("fmt", ["plain", "slack"])
+    def test_every_real_event_payload_delivers_in_this_format(self, fmt):
+        events = self._all_five_events()
+        assert {e.key for e in events} == self.ALL_KEYS  # the crafted state is all five, really
+
+        for event in events:
+            calls: list[tuple[str, str]] = []
+            sent = send_event(
+                "https://alerts.example/hook",
+                event,
+                NotificationSettings(events=frozenset({event.key}), format=fmt),
+                transport=_recording_transport(calls),
+            )
+
+            assert sent is True, (event.key, fmt)
+            assert len(calls) == 1, (event.key, fmt)  # one POST per event, exactly
+            payload = json.loads(calls[0][1])  # parses: the delivered body IS JSON
+            if fmt == "plain":
+                assert payload["event"] == event.key
+            else:
+                assert event.key in payload["text"]
 
 
 def _config_with(settings: NotificationSettings) -> Config:

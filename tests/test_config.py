@@ -775,7 +775,7 @@ def test_paper_config_rejects_negative(write_config):
         load_config(write_config(cfg_text))
 
 
-# -- notifications: NotificationsConfig (#444 -- per-event opt-in, default off) --------------
+# -- notifications: NotificationSettings (#444 -- per-event opt-in, default off) ----------------
 
 
 def test_notifications_default_to_disabled(valid_config_path):
