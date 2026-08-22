@@ -58,6 +58,21 @@ jobs:
       - name: Set up Python
         run: uv python install   # version comes from .python-version; never pin it here twice
 
+      # #424: the 0.10.0 release failed five steps late because a version bump moved seven
+      # pyproject.toml files and not the eighth thing -- uv.lock. `uv sync` below silently
+      # re-locks a stale checkout, the stamp then records a dirty tree, and the failure only
+      # surfaces as "artifact reports a dirty tree", pointing at keel/version.py and the
+      # stamp step instead of the lockfile, after lint/types/tests/build have all run.
+      # `--check` re-resolves against the manifests and exits non-zero WITHOUT writing, so
+      # this must come before anything that can mutate the tree.
+      - name: The lockfile must already be current
+        run: |
+          set -euo pipefail
+          if ! uv lock --check; then
+            echo "::error::uv.lock is stale for this pyproject -- run 'uv lock' locally and commit the result with the version bump. (A stale lock is otherwise discovered five steps later as 'artifact reports a dirty tree'.)"
+            exit 1
+          fi
+
       - name: Sync dependencies
         run: uv sync --all-extras --dev
 
