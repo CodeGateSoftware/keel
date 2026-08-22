@@ -586,7 +586,7 @@ def test_build_update_lines_renders_the_armed_plan(tmp_path: Any) -> None:
     assert any("ARMED -- nothing has run yet." == t.strip() for t in texts)
     # current vs latest lead
     assert "0.6.0" in joined and "0.7.0" in joined
-    # the full plan: the four wheels, the Release dir, the DB backups NAMED, the venv
+    # the full plan: the production wheels, the Release dir, the DB backups NAMED, the venv
     for prefix in ("keel_core", "keel_trader"):
         assert prefix in joined
     assert "download to:" in joined and "Release" in joined

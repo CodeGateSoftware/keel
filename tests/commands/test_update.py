@@ -144,7 +144,7 @@ def _read_marker(path: Path) -> str:
 def _deployment(tmp_path: Path) -> Path:
     """A fake launch folder in the runbook's DEPLOYMENT layout: the own `.venv` the
     running package resolves from, two keel databases, an unrelated db, and a Release/
-    dir holding the PREVIOUS release's four wheels (the superseded set)."""
+    dir holding the PREVIOUS release's five wheels (the superseded set)."""
     _fake_venv_package(tmp_path)
     _write_db(tmp_path / "keel.db", "original-keel-db")
     _write_db(tmp_path / "keel-live.db", "original-live-db")
@@ -696,6 +696,12 @@ def test_run_update_verify_failure_is_loud_reinstalls_the_previous_wheels_best_e
     # additive-migration belief as an ASSUMPTION, never a guarantee
     assert any("assumption" in step.lower() for step in steps)
     assert any(".bak-before" in step for step in steps)
+    # the rollback names the possible MIXED set: the re-install covers only the
+    # superseded set, so a distribution outside it that this update newly installed
+    # (a wheel the previous release did not ship) is not removed and may remain at
+    # the target version -- `keel versions` confirms which set is in the venv
+    assert "superseded" in error
+    assert "mixed" in error
 
 
 def test_run_update_install_failure_says_the_venv_was_not_updated_and_never_rolls_back(
@@ -720,7 +726,8 @@ def test_run_update_install_failure_says_the_venv_was_not_updated_and_never_roll
     assert "half-updated" in error
     assert "keel versions" in error
     # the downloaded (possibly torn) wheels were removed from Release/ so they cannot
-    # poison a later rollback's superseded set; the previous four stay
+    # poison a later rollback's superseded set; the previous wheels stay -- every
+    # production wheel's superseded copy (five since #425, the set derived below)
     wheels = sorted(p.name for p in (launch / "Release").glob("*.whl"))
     assert wheels == sorted(
         f"{prefix}-0.6.0-py3-none-any.whl" for prefix in up.PRODUCTION_WHEEL_PREFIXES

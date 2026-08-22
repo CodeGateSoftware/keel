@@ -869,9 +869,12 @@ def run_update(
                 say(f"best-effort re-install FAILED: {reinstall_exc}")
         recovery = (
             "rolled back: the previous wheels were re-installed from Release/ "
-            "(best-effort); confirm with `keel versions` -- and if the old build "
-            "cannot open the migrated databases, restore from the .bak-before-* "
-            "backups beside them."
+            "(best-effort); the re-install covers only the superseded set, so a "
+            "distribution outside it that this update newly installed (a wheel "
+            "the previous release did not ship) may remain at "
+            f"{plan.target_version}, leaving the venv a MIXED set -- confirm with "
+            "`keel versions`; and if the old build cannot open the migrated "
+            "databases, restore from the .bak-before-* backups beside them."
             if rolled_back
             else "no previous wheels remained in Release/ to re-install -- the "
             ".bak-before-* backups beside the databases are the data recovery."

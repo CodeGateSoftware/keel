@@ -284,7 +284,7 @@ flags.
 
 **The manual fallback is unchanged.** The four commands at the top of this section still work
 and remain the documented procedure when uv is absent, the API is rate-limiting, or you simply
-prefer the hand run: `gh release download`, `uv pip install --python .venv` the four wheel
+prefer the hand run: `gh release download`, `uv pip install --python .venv` the five wheel
 paths, `keel versions`, `keel status`.
 
 ## Paper vs. live
@@ -533,7 +533,8 @@ Alpaca paper credentials); the steps, once you have them:
 2. **Install the adapter wheel.** The deployment must have `keel-broker-alpaca` installed —
    venue selection resolves `name: alpaca` through the `keel.brokers` entry points, and the
    error names what is installed when it is missing. The equities deployment's wheel list is
-   the usual four plus this one.
+   the five named production wheels — since #425 the adapter ships with the standard set, so
+   it is not an extra on top of it.
 
 3. **Migrate + seed + warm:**
 
