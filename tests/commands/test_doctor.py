@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from pathlib import Path
 
 from keel.commands.doctor import (
     AdmissibilityRow,
@@ -24,11 +25,15 @@ from keel.commands.doctor import (
     data_health_findings,
     doctor_exit_code,
     doctor_lines,
+    gather_findings,
     rail_state_findings,
     render_json,
     veto_findings,
 )
+from keel.config import load_config
+from keel.data.db import connect, migrate
 from keel.data.freshness import Freshness
+from keel.data.repository import Repository
 from keel.types import Granularity
 
 NOW = 1_784_500_000
@@ -428,3 +433,66 @@ def test_render_json_includes_new_finding_names() -> None:
     names = {row["name"] for row in parsed}
     assert "sizing.admissible" in names
     assert {"data.missing", "data.stale", "data.gaps"} <= names
+
+
+# -- gather_findings: the one seam the click command and the MCP doctor tool share (#477) --------
+
+
+def _seeded_repo(db_path: Path):
+    """connect + migrate + Repository -- the `_repo_at` pattern from tests/test_cli.py."""
+    conn = connect(str(db_path))
+    migrate(conn)
+    return Repository(conn)
+
+
+def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_config_path) -> None:
+    repo = _seeded_repo(tmp_path / "keel.db")
+    config = load_config(valid_config_path)
+    findings = gather_findings(repo, config, [], NOW)
+    # every check the command runs, by name: slice 1 (install, attestations, rails, allowance,
+    # vetoes) and slice 2 (data health, admissibility) -- the MCP tool inherits the same set,
+    # so an assistant and an operator cannot be shown two different accounts
+    assert {f.name for f in findings} == {
+        "install.identity",
+        "attest.subscription",
+        "attest.withdrawals",
+        "rail.kill_switch",
+        "rail.streak_halt",
+        "rail.drawdown",
+        "allowance.headroom",
+        "veto.recent",
+        "data.missing",
+        "data.stale",
+        "data.gaps",
+        "sizing.admissible",
+    }
+    # an unattested, empty deployment fails the run, exactly as the command does
+    assert doctor_exit_code(findings) == 1
+
+
+def test_gather_findings_performs_no_writes_whatsoever(tmp_path, valid_config_path) -> None:
+    repo = _seeded_repo(tmp_path / "keel.db")
+    conn = repo._conn  # noqa: SLF001 -- total_changes IS the read-only proof
+    config = load_config(valid_config_path)
+    before = conn.total_changes
+    gather_findings(repo, config, [], NOW)
+    assert conn.total_changes == before, "gather_findings wrote to the database"
+
+
+def test_gather_findings_reads_the_veto_lines_it_is_handed(tmp_path, valid_config_path) -> None:
+    repo = _seeded_repo(tmp_path / "keel.db")
+    config = load_config(valid_config_path)
+    noisy = [
+        json.dumps(
+            {
+                "ts": NOW - 3600,
+                "event": "executor.order_vetoed",
+                "violations": ["subscription_unattested: nothing attested"],
+            }
+        )
+        for _ in range(3)
+    ]
+    findings = gather_findings(repo, config, noisy, NOW)
+    (veto,) = [f for f in findings if f.name == "veto.recent"]
+    assert veto.status == "fail"
+    assert "3 of 3" in veto.detail

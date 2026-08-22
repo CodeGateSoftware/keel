@@ -663,34 +663,25 @@ def _admissibility_rows(
     return rows
 
 
-@click.command("doctor")
-@click.option("--json", "as_json", is_flag=True, help="emit findings as JSON")
-@click.option("--log", "log_path", default="logs/keel.log", show_default=True)
-@click.pass_context
-def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
-    """One command that answers 'is this deployment actually working' (#443)."""
+def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: int) -> list[Finding]:
+    """Every doctor check, over an ALREADY-OPEN repo and an ALREADY-LOADED config.
+
+    This is the seam `keel mcp`'s doctor tool shares with the click command (#477): one
+    gather, two front-ends, so a research assistant and an operator at a terminal cannot be
+    shown two different accounts of the same deployment. Repo reads only -- pinned by a test
+    that counts `sqlite3`'s own change counter around a call, because "the tool is read-only"
+    is a property of the gather, not of whoever happens to call it this time.
+
+    The caller owns opening: the command migrates on the way in, the MCP tool deliberately
+    does not (the `keel/web/server.py` rule -- a view must not take a schema write lock).
+    `log_lines` are the engine log's own lines, read by the caller so each front-end can
+    point at the file it was wired with.
+    """
     from keel import agent
-    from keel.commands._common import _load_cfg, _open_repo
+    from keel.commands import fetch
     from keel.commands._products import _default_sim_products
     from keel.execution import guards
 
-    try:
-        config = _load_cfg(ctx)
-        repo = _open_repo(ctx)
-    except click.ClickException:
-        startup: list[Finding] = [
-            Finding(
-                "install.identity",
-                FAIL,
-                "cannot load config/database",
-                "doctor needs the deployment's config and repo before any check can run",
-                "keel init  (fresh) or check the --config/--db path",
-            )
-        ]
-        _emit(startup, as_json)
-        raise SystemExit(1)
-
-    now_ts = int(__import__("time").time())
     findings: list[Finding] = []
 
     info = build_info()
@@ -730,9 +721,8 @@ def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
         ),
         mean_buy_notional=None,
     )
-    findings += veto_findings(_read_log_lines(log_path), since_ts=now_ts - 7 * 86_400)
+    findings += veto_findings(log_lines, since_ts=now_ts - 7 * 86_400)
 
-    from keel.commands import fetch
     from keel.data import freshness as freshness_mod
 
     products = _default_sim_products(config)
@@ -765,6 +755,36 @@ def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
         risk_pct=config.risk_pct,
         max_per_order_usd=config.caps.max_per_order_usd,
     )
+
+    return findings
+
+
+@click.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="emit findings as JSON")
+@click.option("--log", "log_path", default="logs/keel.log", show_default=True)
+@click.pass_context
+def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
+    """One command that answers 'is this deployment actually working' (#443)."""
+    from keel.commands._common import _load_cfg, _open_repo
+
+    try:
+        config = _load_cfg(ctx)
+        repo = _open_repo(ctx)
+    except click.ClickException:
+        startup: list[Finding] = [
+            Finding(
+                "install.identity",
+                FAIL,
+                "cannot load config/database",
+                "doctor needs the deployment's config and repo before any check can run",
+                "keel init  (fresh) or check the --config/--db path",
+            )
+        ]
+        _emit(startup, as_json)
+        raise SystemExit(1)
+
+    now_ts = int(__import__("time").time())
+    findings = gather_findings(repo, config, _read_log_lines(log_path), now_ts)
 
     _emit(findings, as_json)
     raise SystemExit(doctor_exit_code(findings))
