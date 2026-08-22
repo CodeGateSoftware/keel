@@ -16,6 +16,13 @@ Two disciplines make this worth running:
 The checks are pure functions over plain values and log lines, so they are testable
 without a database; the thin click command at the bottom is the only place that
 touches the repo, the config, and the log file.
+
+Slice 2 adds the two checks the issue names as remaining:
+
+* config-vs-reality admissibility -- does `risk_pct` sizing fit the profile's own
+  `caps.max_per_order_usd` at CURRENT ATR, product by product;
+* per-product data health -- staleness, gaps and cold caches per allowlisted
+  `(product, granularity)` series, with a closed market's staleness defused (FR-9).
 """
 
 from __future__ import annotations
@@ -29,10 +36,17 @@ from typing import Any
 import click
 from keel_core.telemetry import current_venue
 
+from keel.data.freshness import Freshness
+from keel.execution import sizing
+from keel.types import Granularity
 from keel.version import build_info, check_install
 
 #: Rail 17's TTL is the executor's constant; doctor only READS it (7 days).
 TTL_SEC = 7 * 86_400
+
+#: The window doctor judges data health (gaps, staleness) over -- the same 7-day horizon
+#: as the veto sweep, so every "recent" verdict in one run means the same thing.
+DOCTOR_WINDOW_SEC = 7 * 86_400
 
 OK = "ok"
 WARN = "warn"
@@ -317,6 +331,257 @@ def _fix_for_reason(reason: str) -> str:
     return "keel status  (then the operator runbook for the failing rail)"
 
 
+# -- admissibility at current ATR (#443 slice 2) ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdmissibilityRow:
+    """One allowlisted product's market reality: last close and ATR(14).
+
+    `atr` is None when there is too little candle data to compute one -- the verdict
+    for that product is `no_data`, not a number guessed from nothing.
+    """
+
+    product_id: str
+    price: Decimal
+    atr: Decimal | None
+
+
+#: The two stop conventions the shipped rule families size off: rsi_meanrev uses 1.5x
+#: ATR, turtle_breakout 2x. A wider stop (2x) risks less per unit, so it sizes FEWER
+#: units -- that end is the band's low edge, 1.5x the high edge.
+_STOP_ATR_MULTS = (Decimal("1.5"), Decimal("2"))
+
+#: Below this many candles an ATR(14) is noise seeded from a too-short window.
+_MIN_ATR_CANDLES = 30
+
+
+def _money(value: Decimal) -> str:
+    return f"${value.quantize(Decimal('0.01'), ROUND_HALF_UP)}"
+
+
+def admissibility_findings(
+    rows: list[AdmissibilityRow],
+    equity: Decimal,
+    risk_pct: Decimal,
+    max_per_order_usd: Decimal,
+) -> list[Finding]:
+    """Config vs reality: does `risk_pct` sizing fit the profile's own per-order cap at
+    CURRENT ATR?
+
+    The motivating failure this catches: a profile whose `risk_pct` and `caps` never
+    disagreed on paper, but whose products' volatility grew until every sized order
+    exceeded the cap and the rail vetoed everything. The check recomputes what the
+    executor would size (`sizing.size` at the live path's equity stand-in) across the
+    two stop conventions the shipped rules use, and compares the resulting notional
+    band to `caps.max_per_order_usd`.
+    """
+    convention = (
+        f"convention: equity = caps.max_exposure_usd ({_money(equity)}, the live-path "
+        "convention); ATR(14) on the finest configured granularity; stop band 1.5-2x ATR "
+        "(the 2x stop sizes smaller, 1.5x larger)"
+    )
+
+    bands: list[tuple[AdmissibilityRow, Decimal, Decimal]] = []
+    for row in rows:
+        if row.atr is None or row.atr <= 0:
+            continue
+        notionals = [
+            sizing.spend(
+                sizing.size(equity, risk_pct, row.price, row.price - mult * row.atr),
+                row.price,
+            )
+            for mult in _STOP_ATR_MULTS
+        ]
+        bands.append((row, min(notionals), max(notionals)))
+
+    no_data = [row for row in rows if row.atr is None or row.atr <= 0]
+    fits: list[tuple[AdmissibilityRow, Decimal, Decimal]] = []
+    cannot_fit: list[tuple[AdmissibilityRow, Decimal, Decimal]] = []
+    marginal: list[tuple[AdmissibilityRow, Decimal, Decimal]] = []
+    for band in bands:
+        _, low, high = band
+        if high <= max_per_order_usd:
+            fits.append(band)
+        elif low > max_per_order_usd:
+            cannot_fit.append(band)
+        else:
+            marginal.append(band)
+
+    if not bands:
+        return [
+            Finding(
+                "sizing.admissible",
+                WARN,
+                "no ATR data for any allowlisted product",
+                f"{convention}; fetch candles first, then re-run doctor",
+                "keel fetch",
+            )
+        ]
+
+    if cannot_fit and not fits and not marginal:
+        over = "; ".join(
+            f"{row.product_id}: {_money(low)}-{_money(high)}" for row, low, high in cannot_fit
+        )
+        return [
+            Finding(
+                "sizing.admissible",
+                FAIL,
+                "risk_pct sizing cannot fit max_per_order_usd on any allowlisted product",
+                f"every band exceeds the {_money(max_per_order_usd)} cap -- {over}. {convention}",
+                "lower risk_pct or raise caps.max_per_order_usd in the profile",
+            )
+        ]
+
+    if cannot_fit or marginal or no_data:
+        flagged = [
+            f"{row.product_id}: {_money(low)}-{_money(high)} exceeds cap "
+            f"{_money(max_per_order_usd)}"
+            for row, low, high in cannot_fit
+        ]
+        flagged += [
+            f"{row.product_id}: {_money(low)}-{_money(high)} straddles cap "
+            f"{_money(max_per_order_usd)}"
+            for row, low, high in marginal
+        ]
+        flagged += [f"{row.product_id}: no ATR data" for row in no_data]
+        fixes = []
+        if no_data:
+            fixes.append("keel fetch")
+        if cannot_fit or marginal:
+            fixes.append("lower risk_pct or raise caps.max_per_order_usd in the profile")
+        return [
+            Finding(
+                "sizing.admissible",
+                WARN,
+                f"{len(flagged)} of {len(rows)} allowlisted products do not clearly fit "
+                f"max_per_order_usd at current ATR",
+                f"{'; '.join(flagged)}. {convention}",
+                "; ".join(fixes),
+            )
+        ]
+
+    detail = "; ".join(f"{row.product_id}: {_money(low)}-{_money(high)}" for row, low, high in fits)
+    return [
+        Finding(
+            "sizing.admissible",
+            OK,
+            f"risk_pct sizing fits max_per_order_usd ({_money(max_per_order_usd)}) on "
+            f"{len(rows)}/{len(rows)} allowlisted products at current ATR",
+            f"{detail}. {convention}",
+            "-",
+        )
+    ]
+
+
+# -- per-product data health (#443 slice 2) -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SeriesHealth:
+    """One `(product, granularity)` series' cached-data health, plus the gap count the
+    freshness sweep could not explain (`unexplained_gaps`: holes the venue never
+    accounted for, repairable only by `keel fetch --repair-gaps`)."""
+
+    product: str
+    granularity: str
+    freshness: Freshness
+    unexplained_gaps: int
+
+
+def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
+    """Staleness, cold caches and gaps per allowlisted series, at doctor's 7-day window.
+
+    `market_closed` (FR-9) defuses staleness the same way `keel fetch` does: a closed
+    session-bound venue is not minting bars, so a behind series on a Saturday is the
+    expected state, not a fault. `missing` is never defused -- a closed venue still
+    serves history, so a cold cache is the pipeline's problem whatever the calendar says.
+    """
+    findings: list[Finding] = []
+
+    missing_rows = [s for s in series if s.freshness.missing]
+    if missing_rows:
+        pairs = ", ".join(f"{s.product} {s.granularity}" for s in missing_rows)
+        findings.append(
+            Finding(
+                "data.missing",
+                FAIL,
+                f"{len(missing_rows)} series have nothing cached",
+                f"cold cache: {pairs}",
+                "keel fetch",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "data.missing",
+                OK,
+                f"all {len(series)} series have candles",
+                f"{len(series)} (product, granularity) series carry cached candles",
+                "-",
+            )
+        )
+
+    judged = [s for s in series if not s.freshness.missing]
+    stale_open = [s for s in judged if s.freshness.stale and not s.freshness.market_closed]
+    defused = [s for s in judged if s.freshness.stale and s.freshness.market_closed]
+    if not series:
+        findings.append(Finding("data.stale", OK, "no series configured", "-", "-"))
+    elif stale_open and len(stale_open) == len(judged):
+        findings.append(
+            Finding(
+                "data.stale",
+                FAIL,
+                "the feed looks dead: every series is stale",
+                f"all {len(judged)} judged series are behind beyond the fetch tolerance",
+                "keel fetch",
+            )
+        )
+    elif stale_open:
+        behind = ", ".join(
+            f"{s.product} {s.granularity} {s.freshness.bars_behind} bars behind" for s in stale_open
+        )
+        findings.append(
+            Finding(
+                "data.stale",
+                WARN,
+                f"{len(stale_open)} of {len(judged)} series are stale",
+                behind,
+                "keel fetch",
+            )
+        )
+    else:
+        detail = f"{len(judged)} judged series are current within the fetch tolerance"
+        if defused:
+            detail += f"; market closed -- staleness defused on {len(defused)} series (FR-9)"
+        findings.append(Finding("data.stale", OK, "series current", detail, "-"))
+
+    gappy = [s for s in series if s.unexplained_gaps > 0]
+    if gappy:
+        counts = ", ".join(f"{s.product} {s.granularity}: {s.unexplained_gaps}" for s in gappy)
+        findings.append(
+            Finding(
+                "data.gaps",
+                WARN,
+                f"{len(gappy)} series have unexplained gaps",
+                counts,
+                "keel fetch --repair-gaps",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "data.gaps",
+                OK,
+                "no unexplained gaps",
+                "no unexplained gaps in the last 7 days",
+                "-",
+            )
+        )
+
+    return findings
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -365,13 +630,44 @@ def _read_log_lines(path: str) -> list[str]:
         return []
 
 
+def _admissibility_rows(
+    repo: Any,
+    products: list[str],
+    granularities: list[Granularity],
+    now_ts: int,
+) -> list[AdmissibilityRow]:
+    """Last close + ATR(14) per product, on the finest configured granularity (the series
+    the agent's entry gate itself polls). Too few candles for a meaningful ATR becomes
+    `atr=None` -- a `no_data` verdict, never a number invented to fill the row."""
+    from keel.analysis.indicators import atr as atr_indicator
+    from keel.data.history import GRANULARITY_SECONDS
+
+    if not granularities:
+        return []
+    finest = min(granularities, key=lambda g: GRANULARITY_SECONDS[g])
+    step = GRANULARITY_SECONDS[finest]
+    rows: list[AdmissibilityRow] = []
+    for product in products:
+        candles = repo.get_candles(product, finest, start_ts=now_ts - 200 * step)
+        if len(candles) < _MIN_ATR_CANDLES:
+            rows.append(AdmissibilityRow(product_id=product, price=Decimal("0"), atr=None))
+            continue
+        atr_val = atr_indicator(candles, period=14)[-1]
+        rows.append(
+            AdmissibilityRow(product_id=product, price=candles[-1].close, atr=Decimal(str(atr_val)))
+        )
+    return rows
+
+
 @click.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="emit findings as JSON")
 @click.option("--log", "log_path", default="logs/keel.log", show_default=True)
 @click.pass_context
 def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
     """One command that answers 'is this deployment actually working' (#443)."""
+    from keel import agent
     from keel.commands._common import _load_cfg, _open_repo
+    from keel.commands._products import _default_sim_products
     from keel.execution import guards
 
     try:
@@ -432,8 +728,41 @@ def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
     )
     findings += veto_findings(_read_log_lines(log_path), since_ts=now_ts - 7 * 86_400)
 
+    from keel.commands import fetch
+    from keel.data import freshness as freshness_mod
+
+    products = _default_sim_products(config)
+    granularities = list(config.market_data.granularities)
+    market_closed = agent.recorded_market_closed(repo, config, now_ts)
+    start_ts = now_ts - DOCTOR_WINDOW_SEC
+
+    findings += data_health_findings(
+        [
+            SeriesHealth(
+                product=row.product,
+                granularity=row.granularity.value,
+                freshness=row,
+                unexplained_gaps=unexplained,
+            )
+            for row, unexplained in fetch.assess_products(
+                repo,
+                products,
+                granularities,
+                now_ts,
+                start_ts,
+                freshness_mod.DEFAULT_TOLERANCE_BARS,
+                market_closed,
+            )
+        ]
+    )
+    findings += admissibility_findings(
+        rows=_admissibility_rows(repo, products, granularities, now_ts),
+        equity=config.caps.max_exposure_usd,
+        risk_pct=config.risk_pct,
+        max_per_order_usd=config.caps.max_per_order_usd,
+    )
+
     _emit(findings, as_json)
-    _ = config  # checks read the repo and the build, not the config, in this slice
     raise SystemExit(doctor_exit_code(findings))
 
 
