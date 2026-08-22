@@ -229,6 +229,27 @@ def _blind_coarse_reader_detect(candles_by_tf):
     )
 
 
+def _next_close_entry_detect(candles_by_tf):
+    """Fires at the max-close bar T but prices the entry off bar T+1's close -- a leak only
+    VISIBLE at the anchor that stops exactly at T: at any later anchor bar T+1 is closed and
+    the live view prices the same value the full run does, so a stride that skips T (and the
+    final bar) loses the only comparable anchor."""
+    from keel.strategy.rules.base import Setup
+
+    candles = candles_by_tf[Granularity.ONE_HOUR]
+    best_i = max(range(len(candles)), key=lambda i: candles[i].close)
+    nxt = candles[best_i + 1].close if best_i + 1 < len(candles) else candles[best_i].close
+    return Setup(
+        product_id="BTC-USD",
+        direction="long",
+        entry=nxt,
+        stop=nxt - Decimal(10),
+        target=nxt + Decimal(20),
+        context={},
+        ts=candles[best_i].ts,
+    )
+
+
 # -- lookahead_analysis -----------------------------------------------------------------------
 
 
@@ -374,6 +395,46 @@ def test_rule_that_never_fires_is_clean() -> None:
     )
     assert report.verdict == "clean"
     assert report.n_bars_checked == 70
+
+
+def test_off_grid_claimed_anchor_is_still_compared_under_a_stride() -> None:
+    """The full run's CLAIMED anchor joins the sampled set even when the stride lands off
+    it: `_next_close_entry_detect`'s leak is visible only at the anchor that stops exactly
+    at the claimed bar (bar 60 -- off the warmup-50/stride-7 grid, and not the final bar),
+    so a harness that skipped it would report the rule clean."""
+    candles = _peak_close_series()
+    report = lookahead_analysis(
+        _next_close_entry_detect,
+        {Granularity.ONE_HOUR: candles},
+        rule_id="off-grid",
+        warmup=50,
+        sample_step=7,
+    )
+    assert report.verdict == "lookahead_detected"
+    first = report.divergences[0]
+    assert first.bar_ts == candles[60].ts
+    assert first.field == "entry"
+    # The prefix ending at bar 60 cannot see bar 61's close; the full run prices off it.
+    assert Decimal(first.prefix_value) == Decimal(160)
+    assert Decimal(first.full_value) == Decimal(159)
+
+
+def test_claimed_anchor_below_warmup_is_not_added_to_the_walk() -> None:
+    """The claimed-anchor rule respects the warmup contract: a claim inside the warmup
+    region is not compared there (a divergence that early indicts the harness, not the
+    rule)."""
+    candles = _peak_close_series(n=120)
+    report = lookahead_analysis(
+        _next_close_entry_detect,
+        {Granularity.ONE_HOUR: candles},
+        rule_id="warmup-claim",
+        warmup=70,  # past the full run's claimed bar (60)
+        sample_step=7,
+    )
+    assert report.verdict == "clean"
+    # 70, 77, ..., 112, 119: the stride grid already contains the final bar, and the
+    # below-warmup claim (bar 60) joins neither.
+    assert report.n_bars_checked == 8
 
 
 # -- coverage notes -------------------------------------------------------------------------------

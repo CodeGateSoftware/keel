@@ -55,6 +55,14 @@ arrives is not thereby lookahead (an argmax anchor legitimately moves); only the
 bar both views agree on, and presence-versus-absence at the full run's claimed anchor, are
 evidence.
 
+**``Setup.context`` is NOT diffed** -- presence and ``entry``/``stop``/``target`` only. That
+is acceptable today because nothing downstream prices an order off ``context``: the
+backtester fills off entry/stop/target, and the evaluation engine never lifts ``context``
+verbatim at all -- ``engine.assemble_cts_context`` recomputes its own CTS context from the
+trading-timeframe candles and ``setup.entry``. The day something starts pricing off
+``context``, this silence becomes a hole; until then, diffing it would only add
+false positives (each rule's explainability dict churns on every non-priced field).
+
 **Coverage honesty:** when the dataset carries no granularity coarser than the anchor's,
 Axis B cannot run at all and a clean verdict speaks for the one time frame only -- the
 report then carries a ``notes`` line saying the axis was not run, and every renderer
@@ -90,9 +98,6 @@ __all__ = [
     "recursive_analysis",
     "render_lines",
 ]
-
-#: Divergence fields, in report order. ``setup_present`` covers present-in-one-view-only.
-_FIELDS: tuple[str, ...] = ("setup_present", "entry", "stop", "target")
 
 #: Default anchor-stride 1: every bar past warmup is checked (the diagnostic default);
 #: callers bounding cost pass a larger stride (the promotion gate samples to ~200 anchors).
@@ -291,10 +296,21 @@ def lookahead_analysis(
     # The final bar is ALWAYS an anchor when it lies past warmup: a last-bar-deciding rule is
     # only diffable against the full-series run there (prefix and full coincide), so a stride
     # that skipped it would silently drop the one anchor that shape of rule can fail at.
-    indices = sorted(
-        set(range(warmup, len(anchor_candles), sample_step))
-        | ({last_index} if last_index >= warmup else set())
-    )
+    indices = set(range(warmup, len(anchor_candles), sample_step))
+    if last_index >= warmup:
+        indices.add(last_index)
+    # ... and so is the full run's CLAIMED anchor: Axis A compares only at an anchor whose
+    # ts equals the claim, so a stride landing off the claim (and off the final bar -- e.g.
+    # an argmax interior bar under a cost-raising stride) would silently drop the one anchor
+    # THAT shape of rule can fail at. Not added below warmup: the walk's own contract skips
+    # the warmup region.
+    if full_setup is not None:
+        claimed_index = next(
+            (i for i, c in enumerate(anchor_candles) if c.ts == full_setup.ts), None
+        )
+        if claimed_index is not None and claimed_index >= warmup:
+            indices.add(claimed_index)
+    ordered_indices = sorted(indices)
 
     kept: list[LookaheadDivergence] = []
     seen: set[tuple[int, str, str, str]] = set()
@@ -316,7 +332,7 @@ def lookahead_analysis(
             if len(kept) < max_divergences:
                 kept.append(divergence)
 
-    for n in indices:
+    for n in ordered_indices:
         anchor = anchor_candles[n]
         anchor_close_ts = anchor.ts + anchor_step
         live = _live_view(candles_by_tf, anchor.ts, anchor_close_ts)
@@ -333,7 +349,7 @@ def lookahead_analysis(
 
     return LookaheadReport(
         rule_id=rule_id,
-        n_bars_checked=len(indices),
+        n_bars_checked=len(ordered_indices),
         divergences=tuple(kept),
         n_divergences=n_divergences,
         sample_step=sample_step,
