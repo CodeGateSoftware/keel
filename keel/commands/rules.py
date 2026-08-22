@@ -693,10 +693,14 @@ def rules_promote(
 ) -> None:
     """Re-run a rule's backtest and advance its lifecycle status if it clears the gate.
 
-    The gate is TWO things, and both must pass: the performance floors (G2 -- trades,
-    expectancy, R:R, win rate) and the overfitting check (G4 -- PBO/CSCV against the trial
-    matrix the rule's parameters were selected from, §78). Pass `--pbo-session` to supply the
-    second. **Omitting it does not promote**: a rule that clears four floors on one in-sample
+    The gate is THREE things, in the order they run, and all three must pass: the lookahead
+    analysis (first, fail-closed -- a rule whose decision at past bars changes when future
+    bars become visible is reading information it could not have had, so the backtest it
+    would be promoted on cannot be realized live, #440; and an analysis that cannot RUN is
+    not a pass either), then the performance floors (G2 -- trades, expectancy, R:R, win
+    rate), then the overfitting check (G4 -- PBO/CSCV against the trial matrix the rule's
+    parameters were selected from, §78). Pass `--pbo-session` to supply the third.
+    **Omitting it does not promote**: a rule that clears four floors on one in-sample
     parameter set is exactly what PBO exists to be suspicious of, so "nobody checked" is
     reported as a failing reason rather than quietly treated as fine (#247).
 
@@ -709,8 +713,9 @@ def rules_promote(
     stays 100; what changed is the unit of evaluation, with the operator's 2026-08-17
     agreement (see #338).
 
-    With `--force`, SKIPS the backtest/gate entirely and advances the rule one lifecycle step
-    directly. This exists for a low-frequency trend-follower (or any rule) whose backtest can
+    With `--force`, SKIPS the backtest and all three gate checks entirely and advances the
+    rule one lifecycle step directly -- the one documented bypass for the whole gauntlet.
+    This exists for a low-frequency trend-follower (or any rule) whose backtest can
     NEVER produce `min_trades` (default 100) trades -- without a bypass such a rule could never
     reach `paper` status, yet the whole point of a paper-forward is to accrue the out-of-sample
     trades the backtest can't. Use deliberately and audit the (loud) warning this prints.
