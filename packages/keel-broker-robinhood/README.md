@@ -311,12 +311,12 @@ stands** would degrade a safety property keel already has. Phase B must trip ove
    looks exactly like a fresh uuid4 from there. A placement retry is safe only where the
    `idempotency_key` is known, which is above the adapter, not inside the transport.
 
-Backoff is not throttling, and the aggregate rate is still unbounded. Per-call account caching
-keeps each public adapter method to a single `GET /accounts/`, but `get_fee_summary` is not a
-single-request method: its order-history sweep is 1 + N requests, bounded at 21 by
-`_MAX_PAGES`. Whatever calls it in Phase B should call it on a schedule, not per order. Since
-#410 the pre-flight sizing read is cached per symbol for the adapter's lifetime, so it adds one
-`GET /trading_pairs/` per symbol per process, not one per order.
+   Backoff is not throttling, and the aggregate rate is still unbounded. Per-call account caching
+   keeps each public adapter method to a single `GET /accounts/`, but `get_fee_summary` is not a
+   single-request method: its order-history sweep is 1 + N requests, bounded at 21 by
+   `_MAX_PAGES`. Whatever calls it in Phase B should call it on a schedule, not per order. Since
+   #410 the pre-flight sizing read is cached per symbol for the adapter's lifetime, so it adds one
+   `GET /trading_pairs/` per symbol per process, not one per order.
 
 5. **No candle source is composed.** Point 1 of "What does NOT work" means this adapter cannot
    be a venue's sole broker; Phase B has to decide how an engine pairs an execution venue that

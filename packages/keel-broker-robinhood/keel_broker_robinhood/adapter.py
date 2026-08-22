@@ -53,7 +53,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
@@ -896,7 +896,8 @@ class RobinhoodAdapter:
         """Place a live order. The returned `state` is read, not just the id.
 
         **#410: the size is pre-flighted against the venue's own per-pair rules before anything
-        is sent.** A BUY that is under `min_order_amount` (a QUOTE-currency minimum), off
+        is sent.** A BUY that is under `min_order_amount` (a QUOTE-currency minimum, against the
+        limit price -- a market buy carries no price to check it against), off
         `asset_increment`, or over `max_order_size` is refused here with a `reason` naming the
         bound, the requested value, and its unit -- an entry refusal strands nothing. A SELL is
         NEVER refused: it is rounded down to the increment and placed, because a check that
@@ -1245,16 +1246,19 @@ def _render_or_unknown(value: Decimal | None) -> str:
 def _floor_to_tick(size: Decimal, increment: Decimal) -> Decimal:
     """Round `size` DOWN to a whole multiple of `increment`, exactly, in `Decimal` arithmetic.
 
-    The exit path's only re-sizing step (#410). Quantizing to the increment's own exponent is
-    exact where a `float` round would smear the tick: BTC's increment is one satoshi, and a
-    binary rounding of `0.100000005` decides which satoshi the remainder belongs to by accident
-    of representation -- the wrong place to discover rounding, on the way out of a position.
-    `ROUND_FLOOR`, never half-even or half-up, so an exit can never be re-sized ABOVE the
-    holding it was sized from; and the result carries the increment's exponent by construction,
+    The exit path's only re-sizing step (#410). Dividing by the increment and multiplying the
+    whole tick count back is exact where a `float` round would smear the tick: BTC's increment
+    is one satoshi, and a binary rounding of `0.100000005` decides which satoshi the remainder
+    belongs to by accident of representation -- the wrong place to discover rounding, on the way
+    out of a position. It floors to a MULTIPLE of the increment, which `quantize` never did for
+    a non-power-of-ten one (`0.7` quantized to `0.5`'s exponent is still `0.7`, a size the
+    venue would refuse); truncating division of the positive sizes this is called with, never
+    half-even or half-up, so an exit can never be re-sized ABOVE the holding it was sized from;
+    and a whole tick count times the increment carries the increment's exponent by construction,
     which is why a satoshi-sized tick renders as a clean `0.10000000` rather than a `0.1` that
     no longer names its own precision.
     """
-    return size.quantize(increment, rounding=ROUND_FLOOR)
+    return (size // increment) * increment
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

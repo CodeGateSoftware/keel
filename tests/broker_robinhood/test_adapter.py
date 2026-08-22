@@ -230,6 +230,16 @@ class _RaisingRepollTransport(FakeTransport):
         raise RuntimeError("503 Server Error: Service Unavailable")
 
 
+class _RaisingBoundsTransport(FakeTransport):
+    """A transport whose `get_trading_pairs` raises the way a 5xx that survives the transport's
+    retry loop does -- the `except Exception` shape of the bounds read failing, as opposed to
+    the transport answering with no rows, which the plain `FakeTransport` already models."""
+
+    def get_trading_pairs(self, symbol: str | None = None) -> Any:
+        self._record("get_trading_pairs", symbol=symbol)
+        raise RuntimeError("503 Server Error: Service Unavailable")
+
+
 def _placed_with_state(state: str) -> dict[str, Any]:
     """An order-placement response carrying `state`, otherwise shaped like a real one."""
     placed = load_fixture("rh_order_open.json")
@@ -1976,6 +1986,31 @@ def test_place_order_rounds_an_off_increment_sell_down_to_the_venue_tick() -> No
     assert body["limit_order_config"]["asset_quantity"] == "0.10000000"
 
 
+def test_place_order_floors_to_a_multiple_of_the_increment_not_its_exponent() -> None:
+    """A non-power-of-ten increment is where flooring to the exponent and flooring to a MULTIPLE
+    come apart: `0.7` quantized to `0.5`'s exponent is still `0.7`, a size the venue would
+    refuse, while 0.7 BTC at a 0.5 increment is one whole tick plus a remainder -- and the exit
+    must keep the tick, not the remainder. The body, not just the result, shows `"0.5"`."""
+    row = dict(_pairs()["results"][0])
+    row["asset_increment"] = "0.5"
+    transport = FakeTransport(
+        placed=load_fixture("rh_order_open.json"), trading_pairs={"results": [row]}
+    )
+
+    result = RobinhoodAdapter(transport).place_order(
+        LimitGTC(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            base_size=Decimal("0.7"),
+            limit_price=Decimal("65000"),
+        )
+    )
+
+    assert result.success
+    body = transport.calls["create_order"]["body"]
+    assert body["limit_order_config"]["asset_quantity"] == "0.5"
+
+
 def test_place_order_places_a_below_one_tick_sell_as_given_not_a_zero_order() -> None:
     """Flooring half a satoshi to the tick yields zero, and `"asset_quantity": "0"` is not an
     order -- it is a malformed body this package would have invented. A size below one increment
@@ -2018,6 +2053,22 @@ def test_place_order_retries_the_sizing_read_after_a_failure_rather_than_caching
     stops checking, the always-passing rail this package refuses everywhere else. The failed read
     costs one request per attempt and degrades to placing as given, exactly as before the check
     existed."""
+    transport = _RaisingBoundsTransport(placed=load_fixture("rh_order_open.json"))
+    adapter = RobinhoodAdapter(transport)
+
+    first = adapter.place_order(_buy())
+    second = adapter.place_order(_buy())
+
+    assert first.success
+    assert second.success
+    assert transport.call_counts.get("get_trading_pairs", 0) == 2
+
+
+def test_place_order_retries_the_sizing_read_after_an_empty_answer_rather_than_caching_it() -> None:
+    """The bounds read's OTHER failure shape: the transport answers, but carries no rows. That
+    is the `if not rows` branch where `_RaisingBoundsTransport` above pins the `except` one, and
+    the same decision must hold -- an answer with no rows in it is not a usable read, so it is
+    not cached either, and the next placement reads again."""
     transport = FakeTransport(placed=load_fixture("rh_order_open.json"))
     adapter = RobinhoodAdapter(transport)
 
