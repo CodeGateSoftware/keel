@@ -177,11 +177,14 @@ list to its FIRST element, and `results[0]` is BILL-USD -- one of the 26 pairs t
 the field. A run across all four cursor pages was still a run that read one row. #230 fixed the
 probe to merge every element and restored the field.
 
-The consequence for the pre-flight sizing check proposed in #198: increment rounding, an upper
-bound **and** a lower bound can all be validated locally against this endpoint for the assets keel
-trades. The lower bound must be read as optional per pair -- absent means "the venue states none
-for this pair", and an undersized order there is still discoverable only as a rejection at
-placement.
+That pre-flight sizing check (proposed in #198, split out as #410) is now implemented in
+`RobinhoodAdapter.place_order`: increment rounding, an upper bound **and** a lower bound are all
+validated locally against this endpoint for the assets keel trades, with the asymmetry #410
+mandates -- a BUY that violates a bound is refused with a reason naming it; a SELL is never
+refused, and rounds down to `asset_increment` instead, because a refusal there can strand a
+position keel has decided to close. The lower bound is read as optional per pair -- absent means
+"the venue states none for this pair", and an undersized order there is still discoverable only
+as a rejection at placement.
 
 ### No sandbox
 
@@ -213,7 +216,9 @@ stamped with a single `timestamp`. The fixture now carries an observed crossed B
 `rh_best_bid_ask_uncrossed.json` an observed XLM-USD one, because either alone would state a rule
 the endpoint does not follow. That old fixture also invented `"next": null, "previous": null`,
 which this endpoint does not send. Anything reading this endpoint must tolerate a non-positive
-spread -- see `transport.get_best_bid_ask` and #413. **Two of the three order fixtures are now observed.** `scripts/robinhood_order_probe.py`
+spread -- `RobinhoodAdapter.best_bid_ask` encodes the decided contract: a crossed, locked, or
+unreadable row is refused (`None`), a coherent one passes through, and `estimated_price` remains
+the only pricing source. See `transport.get_best_bid_ask` and #413. **Two of the three order fixtures are now observed.** `scripts/robinhood_order_probe.py`
 placed one real BTC-USD limit buy on 2026-08-20 (#412) -- 0.0001 BTC at $36,352.78, 50% below
 the bid so that it could not fill -- polled it, and cancelled it. `rh_order_open.json` and
 `rh_order_canceled.json` are that order's own responses, with `account_number` replaced by the
@@ -306,10 +311,12 @@ stands** would degrade a safety property keel already has. Phase B must trip ove
    looks exactly like a fresh uuid4 from there. A placement retry is safe only where the
    `idempotency_key` is known, which is above the adapter, not inside the transport.
 
-   Backoff is not throttling, and the aggregate rate is still unbounded. Per-call account caching
-   keeps each public adapter method to a single `GET /accounts/`, but `get_fee_summary` is not a
-   single-request method: its order-history sweep is 1 + N requests, bounded at 21 by
-   `_MAX_PAGES`. Whatever calls it in Phase B should call it on a schedule, not per order.
+Backoff is not throttling, and the aggregate rate is still unbounded. Per-call account caching
+keeps each public adapter method to a single `GET /accounts/`, but `get_fee_summary` is not a
+single-request method: its order-history sweep is 1 + N requests, bounded at 21 by
+`_MAX_PAGES`. Whatever calls it in Phase B should call it on a schedule, not per order. Since
+#410 the pre-flight sizing read is cached per symbol for the adapter's lifetime, so it adds one
+`GET /trading_pairs/` per symbol per process, not one per order.
 
 5. **No candle source is composed.** Point 1 of "What does NOT work" means this adapter cannot
    be a venue's sole broker; Phase B has to decide how an engine pairs an execution venue that

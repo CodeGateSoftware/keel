@@ -28,7 +28,7 @@ between the quote and the fill is not an implementation detail when the differen
 the position. So this adapter is, for now, an EXIT and RESTING-ORDER venue: it can sell a
 holding at market, rest a take-profit limit, and rest a protective stop-limit.
 
-The other two gaps, stated once here and again in the package README:
+The other three gaps, stated once here and again in the package README:
 
 * **No candles.** The v2 API exposes `best_bid_ask` and `estimated_price` and nothing else --
   there is no OHLC, historical, or candles endpoint at all. `get_candles` raises `ValueError`
@@ -36,6 +36,13 @@ The other two gaps, stated once here and again in the package README:
   conformance suite's `_any_candles` helper catches `ValueError` per granularity and skips when
   none work. Robinhood is an EXECUTION venue as far as keel is concerned; bars come from
   elsewhere.
+* **`best_bid_ask` is not a book snapshot.** Its two legs are sampled independently and stamped
+  with one timestamp, so on the tightest pairs (BTC, ETH, DOGE) they arrive CROSSED -- `bid`
+  above `ask`, by under 1.4 bps, persistently (#413). The decided contract is refusal:
+  `best_bid_ask` below returns a pair only when the venue's own numbers order coherently and
+  `None` otherwise, and `estimated_price` remains the ONLY pricing source. Normalising the legs
+  into `lo`/`hi` was rejected -- it would launder two prices sampled at different times into a
+  snapshot neither vouches for.
 * **No sandbox.** Robinhood publishes no test environment. Every test against this adapter runs
   on a canned in-memory transport, and the conformance suite is the only end-to-end signal there
   will ever be short of real money.
@@ -44,9 +51,9 @@ The other two gaps, stated once here and again in the package README:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
@@ -66,7 +73,7 @@ from keel_broker_api.results import (
     Preview,
     SessionState,
 )
-from keel_core.types import Candle, Granularity
+from keel_core.types import Candle, Granularity, Side
 
 from keel_broker_robinhood.translate import (
     _render,
@@ -244,6 +251,10 @@ class RobinhoodAdapter:
 
     def __init__(self, transport: Transport | None = None) -> None:
         self._transport = transport
+        # Per-symbol sizing rules, fetched once and kept for this adapter's lifetime (#410). The
+        # same cache shape `RobinhoodTransport._account()` uses for the account number; see
+        # `_pair_rules` for why only successful reads are entered.
+        self._pair_rules_cache: dict[str, _PairRules] = {}
 
     def _require_transport(self) -> Transport:
         if self._transport is None:
@@ -289,6 +300,49 @@ class RobinhoodAdapter:
         bars. `FakeAdapter` uses the same signal for the granularities it does not carry.
         """
         raise ValueError(_NO_CANDLES)
+
+    def best_bid_ask(self, product_id: str) -> tuple[Decimal, Decimal] | None:
+        """The venue's own bid/ask for one symbol -- or `None`. **Never a crossed book.**
+
+        ⚠️ **#413's decided contract, encoded here before any consumer exists.** The endpoint
+        this reads (`GET /marketdata/best_bid_ask/`) reports `bid` ABOVE `ask` on the tightest
+        pairs, persistently: measured live on 2026-08-19, BTC-USD crossed on every one of three
+        samples ~2s apart, DOGE-USD on every sample, ETH-USD on two of three, and every crossing
+        was under 1.4 bps. The pairs that never crossed (XLM-USD, ADA-USD) are exactly the ones
+        whose real spread (2-5 bps) exceeds that -- so the two legs are SAMPLED INDEPENDENTLY
+        and then stamped with one `timestamp` the row does not earn. It is two near-simultaneous
+        prices, not a book snapshot.
+
+        Between the two dispositions the issue allowed, this method implements the refusal:
+        a row is returned only when the venue's own numbers order coherently (`bid < ask`),
+        and anything else -- crossed, LOCKED (`bid == ask`, the same absence of simultaneity
+        landed on an equal value), or unreadable -- answers `None`. Normalising (`lo = min(bid,
+        ask)`, `hi = max(...)`) was rejected: it would launder two independently sampled legs
+        into a snapshot neither leg vouches for, and `translate.to_price_side`'s BUY->`ask` /
+        SELL->`bid` mapping would then price BOTH directions off the optimistic side -- the
+        exact bias that mapping exists to prevent. **`estimated_price` therefore remains this
+        adapter's only pricing source** (it is self-consistent per side); a caller needing a
+        price must go through `preview_order`, not this method.
+
+        `None` is the EXPECTED answer on the most liquid pairs, not an error -- BTC-USD crosses
+        on nearly every sample, and that is the guard working. It is never a raise: a read path
+        that crashes on the venue's own shape would be a new failure this package invented. And
+        anything deriving a SPREAD from this endpoint must tolerate a non-positive spread rather
+        than treat it as a venue error -- which is what refusing to return the row at all
+        accomplishes.
+        """
+        symbol = to_symbol(product_id)
+        rows = _results(self._require_transport().get_best_bid_ask(symbol))
+        if not rows:
+            return None
+        row = rows[0]
+        bid = _positive_or_none(_decimal_or_none(_field(row, "bid")))
+        ask = _positive_or_none(_decimal_or_none(_field(row, "ask")))
+        if bid is None or ask is None:
+            return None
+        if bid >= ask:
+            return None
+        return (bid, ask)
 
     def get_balances(self) -> list[Balance]:
         """Return per-currency balances as domain types, never Robinhood's holding dicts.
@@ -340,36 +394,46 @@ class RobinhoodAdapter:
     def _pair_rules(self, product_id: str) -> _PairRules | None:
         """This pair's sizing bounds, or `None` when the venue did not usably state them.
 
-        **Not cached, deliberately.** This adapter holds no state but its transport, and a cached
-        bound is a bound that can go stale -- the venue can retune `min_order_amount` or delist a
-        pair between one preview and the next, and a preview that approved a spend against a
-        remembered ceiling would be asserting something it had not checked. The cost is one
-        request per `preview_order` call, which is a confirm-gate call made once per human
-        decision, not a loop. `get_fee_summary`'s docstring makes the same request-count argument
-        in the other direction, where the call IS in a sweep.
+        **Cached per symbol for this adapter's lifetime (#410).** `get_trading_pairs` costs a
+        request against a venue that allows 100/minute sustained, and since #410 the read sits
+        on the PLACEMENT path -- once per ORDER, not once per human decision -- so an uncached
+        read would spend a request per order forever. The cache trades staleness for that
+        budget, and the trade is sound here for a reason `_PairRules` already records: these are
+        venue-wide tunables (the `0.1` minimum is the same on all 63 pairs that carry it), not
+        per-order quotes, and a venue that retunes them under a running process still answers a
+        rejection honestly. **Only successful reads are cached** -- a failed one returns `None`
+        and retries on the next order, because caching the failure would leave a check that
+        reads as present and never fires, the always-passing rail #197 closed for `fees_usd`.
 
         **`symbol=` is passed so the venue filters, not this method.** The unfiltered endpoint
         returns all 89 pairs, and #230 is the standing lesson about picking a row out of that
         list: the probe that read `results[0]` got BILL-USD and concluded the venue publishes no
         minimum at all. Asking for one symbol makes `results[0]` the right row by construction.
 
-        `None` on any failure rather than a raise. This runs inside `preview_order`, which the
-        executor calls while unwinding a position, and `BrokerCapabilities`' docstring already
-        settles that a raise on the way out can trap a position. A missing bound means one fewer
-        check, reported in `Preview.errors`; it must never mean no preview.
+        `None` on any failure rather than a raise. This runs inside `preview_order` and, since
+        #410, `place_order` -- the executor calls both while unwinding a position, and
+        `BrokerCapabilities`' docstring already settles that a raise on the way out can trap a
+        position. A missing bound means one fewer check -- reported in `Preview.errors` on the
+        preview path, and "place it as given" on the placement path -- never a refused exit.
         """
+        symbol = to_symbol(product_id)
+        cached = self._pair_rules_cache.get(symbol)
+        if cached is not None:
+            return cached
         try:
-            rows = _results(self._require_transport().get_trading_pairs(to_symbol(product_id)))
+            rows = _results(self._require_transport().get_trading_pairs(symbol))
         except Exception:
             return None
         if not rows:
             return None
         row = rows[0]
-        return _PairRules(
+        rules = _PairRules(
             min_order_amount=_positive_or_none(_decimal_or_none(_field(row, "min_order_amount"))),
             asset_increment=_positive_or_none(_decimal_or_none(_field(row, "asset_increment"))),
             max_order_size=_positive_or_none(_decimal_or_none(_field(row, "max_order_size"))),
         )
+        self._pair_rules_cache[symbol] = rules
+        return rules
 
     def _fee_ratio(self, account: object) -> Decimal | None:
         """The account's fee ratio, or `None` when the venue did not report one.
@@ -548,19 +612,21 @@ class RobinhoodAdapter:
     ) -> list[str]:
         """What the venue's own bounds say about this order, as `Preview.errors` lines.
 
-        **Reported, never enforced, and that boundary is the whole design.** These are notes on a
-        preview a human is about to approve; nothing here refuses an order, and `place_order` does
-        not call this. Two reasons, and the second is the one that decides it:
+        **Reported, never enforced -- HERE.** These are notes on a preview a human is about to
+        approve; the gate is `place_order`'s pre-flight (#410), which enforces exactly these
+        bounds with the asymmetry that issue mandates. Two reasons the preview side stays
+        report-only, and the first is the one that decides it:
 
-        1. Every order this adapter can place is an exit or a protective leg -- entries are
-           `MarketIOCByQuote`, which this venue cannot express at all (see the module docstring).
-           A check that refuses on those paths can strand a position or leave one running without
-           its stop, which is strictly worse than the venue rejecting the order itself.
+        1. A preview must never refuse what a caller is only asking the price of, and must never
+           APPROVE what placement will refuse: it shows the same bounds, before the human signs,
+           so a placement refusal is never a surprise. Enforcement belongs to the one call that
+           actually moves money.
         2. **We do not know what this venue does with an off-increment or under-minimum order**,
-           because no order has ever been placed against it (#412). Refusing locally would be a
-           guess, and a guess that refuses an order the venue would have ACCEPTED is a new failure
-           this package invented. Reporting is right exactly while the venue's behaviour is
-           unobserved; #410 can revisit enforcement once #412 has watched a real rejection.
+           because no rejection has ever been observed against it (#412 placed one well-formed
+           order, and that is all). `place_order`'s refusal states keel's own disposition -- the
+           entry is not sent, the exit is rounded -- and deliberately does not assert the venue
+           would have rejected it; whether Robinhood rounds or refuses remains an open, recorded
+           question rather than a guess in a string.
 
         `quote_size <= 0` means the market path could not price this order, and the caller has
         already said so in its own error line. A minimum stated in quote currency cannot be
@@ -710,8 +776,133 @@ class RobinhoodAdapter:
             errors=errors,
         )
 
+    def _preflight(self, spec: OrderSpec, symbol: str) -> OrderSpec | PlaceResult:
+        """#410: check the size against the venue's own per-pair rules before anything is sent.
+
+        Returns the spec to place -- the caller's own, or an exit rounded to the tick -- or, for
+        an ENTRY that violates a bound, a failed `PlaceResult` whose `reason` names the bound,
+        the requested value, and the denomination. A `PlaceResult`, not a raise: `UnsupportedOrder`
+        is the port's refusal for an unsupported KIND (and the port forbids catching it to retry
+        with a different spec), while this is a refusal the caller reads like any other placement
+        failure -- `reason` and all -- on a path where an exception would be a new failure mode.
+
+        The asymmetry between the two sides is the whole design, and it is the issue's own
+        constraint: a pre-flight refusal is correct for an entry and DANGEROUS for an exit.
+        Refusing to sell a holding because it sits under the venue minimum strands a position
+        keel has decided to close; refusing to rest a protective stop below one increment of
+        size leaves a position running without the leg that protects it. Both exit shapes are
+        keel's normal use of this venue (see the module docstring), so the SELL path never
+        refuses -- it rounds DOWN to `asset_increment` and places, and every other bound is left
+        for the venue to answer, observably. The BUY path refuses: an entry that never existed
+        strands nothing, and a local refusal with the bound named is strictly more actionable
+        than the venue's rejection discovered at placement time.
+
+        `min_order_amount` is checked only where a price is already in hand -- a limit order's
+        own `limit_price`. It is QUOTE-denominated (`_PairRules`), so checking it needs a
+        notional, and manufacturing one for a market order would mean spending an
+        `estimated_price` request per placement to compare against an estimate -- the "estimate
+        that moves between the quote and the fill" this package refuses everywhere else.
+        """
+        rules = self._pair_rules(spec.product_id)
+        if rules is None:
+            # No bounds known: place it as given. A check that cannot run must degrade to the
+            # pre-check behaviour, never to a refusal -- this is the exit path's rule applied to
+            # the read failure itself (`_pair_rules` records why it returns `None`, not raises).
+            return spec
+        size = self._base_size(spec)
+        if spec.side is Side.SELL:
+            return self._exit_sized(spec, size, rules)
+        return self._entry_refusal_or_pass(spec, size, rules, symbol)
+
+    def _exit_sized(self, spec: OrderSpec, size: Decimal, rules: _PairRules) -> OrderSpec:
+        """The spec to place for a SELL: rounded DOWN to the tick, never refused.
+
+        Down, not to nearest: the exit was sized from a holding, and rounding up would sell more
+        than that holding -- a different order than the caller asked for, in the one direction
+        the venue cannot forgive. A size that floors to zero (less than one `asset_increment`)
+        is placed EXACTLY AS GIVEN: `"asset_quantity": "0"` is a malformed body this package
+        would have minted itself, while the unrounded order is a real question the venue answers
+        -- observably, which is all the never-refuse rule asks.
+        """
+        if rules.asset_increment is None:
+            return spec
+        if not isinstance(spec, MarketIOCByBase | LimitGTC | StopLimitGTC):
+            # Unreachable in practice -- `_reject_unsupported` has already refused the one kind
+            # without a base size by the time this runs -- but the narrowing is what lets
+            # `replace` typecheck, and raising rather than returning a placeholder matches
+            # `_base_size`'s precedent for the same impossible case.
+            raise UnsupportedOrder(f"robinhood cannot size order kind {spec.kind!r} in base units")
+        rounded = _floor_to_tick(size, rules.asset_increment)
+        if rounded == size or rounded <= 0:
+            return spec
+        return replace(spec, base_size=rounded)
+
+    def _entry_refusal_or_pass(
+        self, spec: OrderSpec, size: Decimal, rules: _PairRules, symbol: str
+    ) -> OrderSpec | PlaceResult:
+        """The BUY disposition: refuse with the bound, the value, and the unit -- or pass through.
+
+        Every reason names the bound violated, the requested value as sent, and what to do about
+        it. That is not courtesy, it is the check's entire value: an operator handed "order
+        rejected" goes to the venue's docs to discover which of three bounds fired and in which
+        of two denominations; an operator handed the bound and the number re-sizes locally and
+        never discovers anything at the venue.
+        """
+        if rules.max_order_size is not None and size > rules.max_order_size:
+            return PlaceResult(
+                success=False,
+                broker_order_id=None,
+                reason=(
+                    f"robinhood pre-flight refused this buy: base_size {_render(size)} exceeds "
+                    f"the venue's max_order_size {_render(rules.max_order_size)} for {symbol} "
+                    "(both in base units) -- split the order or lower the size"
+                ),
+            )
+        if rules.asset_increment is not None and size % rules.asset_increment != 0:
+            return PlaceResult(
+                success=False,
+                broker_order_id=None,
+                reason=(
+                    f"robinhood pre-flight refused this buy: base_size {_render(size)} is not a "
+                    f"multiple of the venue's asset_increment "
+                    f"{_render(rules.asset_increment)} for {symbol} -- size it to the tick (a "
+                    "sell is rounded down automatically; a buy is refused rather than silently "
+                    "re-sized)"
+                ),
+            )
+        # The limit price BOUNDS a buy's spend exactly, so it is the one notional that is neither
+        # an estimate nor an extra request. `min_order_amount` is QUOTE-denominated (`_PairRules`)
+        # and is simply not checked on the market path, where no price is in hand -- see
+        # `_preflight`'s docstring for why one is not manufactured.
+        limit_price = spec.limit_price if isinstance(spec, LimitGTC | StopLimitGTC) else None
+        if limit_price is not None and rules.min_order_amount is not None:
+            notional = size * limit_price
+            if notional < rules.min_order_amount:
+                return PlaceResult(
+                    success=False,
+                    broker_order_id=None,
+                    reason=(
+                        f"robinhood pre-flight refused this buy: notional {_render(notional)} "
+                        f"USD (base_size {_render(size)} x limit_price "
+                        f"{_render(limit_price)}) is below the venue's min_order_amount "
+                        f"{_render(rules.min_order_amount)} for {symbol}, which is a "
+                        "QUOTE-currency (USD) minimum, not a base-size minimum -- size the "
+                        f"order to at least {_render(rules.min_order_amount)} USD"
+                    ),
+                )
+        return spec
+
     def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         """Place a live order. The returned `state` is read, not just the id.
+
+        **#410: the size is pre-flighted against the venue's own per-pair rules before anything
+        is sent.** A BUY that is under `min_order_amount` (a QUOTE-currency minimum), off
+        `asset_increment`, or over `max_order_size` is refused here with a `reason` naming the
+        bound, the requested value, and its unit -- an entry refusal strands nothing. A SELL is
+        NEVER refused: it is rounded down to the increment and placed, because a check that
+        strands a position keel has decided to close is strictly worse than a venue rejection,
+        and a bounds read that fails places the order as given. See `_preflight` for the full
+        asymmetry and what it costs in requests (one read per symbol per process, cached).
 
         **`idempotency_key` is what makes a placement retry safe here** (#409). Without one the
         id is minted per ATTEMPT, which is the right default for the opposite hazard -- an id
@@ -739,7 +930,14 @@ class RobinhoodAdapter:
         where `to_port_status` maps the same unknown state to `PENDING` and keeps it observed.
         """
         self._reject_unsupported(spec)
-        body = to_order_body(spec, client_order_id=resolve_client_order_id(idempotency_key))
+        # The symbol is validated before the pre-flight so a bad one refuses exactly the way
+        # `preview_order` refuses it -- a preview must never approve what placement will not
+        # even attempt to size (see that method's ETH-USDC note).
+        symbol = to_symbol(spec.product_id)
+        sized = self._preflight(spec, symbol)
+        if isinstance(sized, PlaceResult):
+            return sized
+        body = to_order_body(sized, client_order_id=resolve_client_order_id(idempotency_key))
         response = self._require_transport().create_order(body)
 
         order_id = _field(response, "id")
@@ -1042,6 +1240,21 @@ def _render_or_unknown(value: Decimal | None) -> str:
     Same principle `_decimal_or_none` applies one layer down.
     """
     return _render(value) if value is not None else "unknown"
+
+
+def _floor_to_tick(size: Decimal, increment: Decimal) -> Decimal:
+    """Round `size` DOWN to a whole multiple of `increment`, exactly, in `Decimal` arithmetic.
+
+    The exit path's only re-sizing step (#410). Quantizing to the increment's own exponent is
+    exact where a `float` round would smear the tick: BTC's increment is one satoshi, and a
+    binary rounding of `0.100000005` decides which satoshi the remainder belongs to by accident
+    of representation -- the wrong place to discover rounding, on the way out of a position.
+    `ROUND_FLOOR`, never half-even or half-up, so an exit can never be re-sized ABOVE the
+    holding it was sized from; and the result carries the increment's exponent by construction,
+    which is why a satoshi-sized tick renders as a clean `0.10000000` rather than a `0.1` that
+    no longer names its own precision.
+    """
+    return size.quantize(increment, rounding=ROUND_FLOOR)
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

@@ -290,8 +290,7 @@ class RobinhoodTransport:
         account_number = _field(accounts[0], "account_number")
         if not account_number:
             raise RuntimeError(
-                "robinhood account resolution failed: the account row has no 'account_number' "
-                "field"
+                "robinhood account resolution failed: the account row has no 'account_number' field"
             )
         # `str(...)` here (not just a type hint) matters under mypy --strict: `_field` returns
         # `Any` by design, and letting that `Any` flow straight into a `-> str` return would be
@@ -510,15 +509,16 @@ class RobinhoodTransport:
         )
 
     def get_trading_pairs(self, symbol: str | None = None) -> Any:
-        """The venue's per-pair trading rules. **Deliberately not called by the adapter yet.**
+        """The venue's per-pair trading rules -- the input `place_order`'s pre-flight sizes
+        against (#410).
 
-        This method and `get_best_bid_ask` are the only two on this transport that `adapter.py`
-        never invokes, which is a fair thing to challenge in review, so the reason is written
-        down here rather than left to inference.
-
-        They exist because they are the inputs the obvious next feature needs: `asset_increment`,
-        `quote_increment`, and `max_order_size` are what would let this package round a size to
-        the venue's tick LOCALLY instead of discovering the violation as a rejection.
+        The adapter reads this through `RobinhoodAdapter._pair_rules`, which asks for ONE
+        symbol, caches the row per symbol for the adapter's lifetime (the same shape `_account()`
+        uses for the account number), and degrades to "place it anyway" on any failure -- the
+        disposition this docstring used to argue for as a follow-up, now designed and shipped:
+        a pre-flight that runs before every placement also runs before every EXIT, so it never
+        raises and never blocks one (see `_preflight` for the entry/exit asymmetry that makes
+        refusing safe for buys and unsafe for sells).
 
         ⚠️ **The rows are not all the same shape.** Every row carries `symbol`, `asset_code`,
         `quote_code`, `asset_increment`, `quote_increment`, `max_order_size`, `status` and
@@ -532,16 +532,6 @@ class RobinhoodTransport:
         `results[0]` only, and `results[0]` is BILL-USD, one of the 26 (#230). The pre-flight
         minimum-size check proposed in #198 therefore DOES have a lower-bound source for every
         asset keel trades -- with the caveat that it is per pair and may be missing.
-
-        That work is deliberately not done here, and the reason is the same principle
-        that shapes `cancel_order` and `_account`: a pre-flight check that runs before every
-        placement is also a check that runs before every EXIT, and one that raises -- or merely
-        blocks on an extra round trip during an outage -- can trap a position it was meant to
-        protect. Sizing validation must therefore be designed to degrade to "place it anyway"
-        rather than bolted on as a gate, and that design is a follow-up, not a nit fix.
-
-        They are exercised by the transport tests (endpoint path, signature, response shape), so
-        they are not untested code -- only uncalled code, on purpose, with a named successor.
         """
         params = {"symbol": symbol} if symbol is not None else None
         return self._paginate("/api/v2/crypto/trading/trading_pairs/", params=params)
@@ -565,11 +555,15 @@ class RobinhoodTransport:
         # not actually earn. Anything derived from this endpoint must tolerate a non-positive
         # spread rather than treat it as a venue error, and `translate.to_price_side`'s
         # BUY->`ask` / SELL->`bid` mapping INVERTS on a crossed row: both directions come out
-        # optimistic, which is the one outcome that mapping exists to prevent. Nothing calls this
-        # method today; #413 owns deciding the contract before anything does.
-        return self._paginate(
-            "/api/v2/crypto/marketdata/best_bid_ask/", params={"symbol": symbol}
-        )
+        # optimistic, which is the one outcome that mapping exists to prevent.
+        #
+        # The decided contract lives one layer up: `RobinhoodAdapter.best_bid_ask` returns a
+        # pair only when the venue's own numbers order coherently (`bid < ask`) and `None` for a
+        # crossed, locked, or unreadable row -- never a crossed book, never a raise. Normalising
+        # `lo = min(bid, ask)` / `hi = max(...)` here was rejected: it would launder two
+        # independently sampled legs into a snapshot neither vouches for. `estimated_price`
+        # remains this package's only pricing source.
+        return self._paginate("/api/v2/crypto/marketdata/best_bid_ask/", params={"symbol": symbol})
 
     def get_estimated_price(self, symbol: str, side: str, quantity: str) -> Any:
         # ⚠️ `trading`, NOT `marketdata`. This looks like a copy-paste error next to

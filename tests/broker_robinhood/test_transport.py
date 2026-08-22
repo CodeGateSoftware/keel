@@ -304,9 +304,7 @@ def _transport(**kwargs: Any) -> RobinhoodTransport:
     # seconds of genuine backoff -- and a suite that sleeps is a suite people stop running. The
     # tests that assert on the backoff itself pass their own recording sleep.
     kwargs.setdefault("sleep", lambda _seconds: None)
-    return RobinhoodTransport(
-        api_key="rh-api-key-1", private_key_b64=_TEST_SEED_B64, **kwargs
-    )
+    return RobinhoodTransport(api_key="rh-api-key-1", private_key_b64=_TEST_SEED_B64, **kwargs)
 
 
 def _path_of(url: str) -> str:
@@ -563,15 +561,13 @@ def test_get_orders_paginates_so_the_fee_sweep_never_sees_a_page_boundary(http: 
 
 
 def test_trading_pairs_and_best_bid_ask_surface_their_documented_fields(http: Any) -> None:
-    """The two reads the adapter does not call yet still have to return usable rows.
+    """The two reads behind #410 and #413 still have to return usable rows at the transport.
 
-    `get_trading_pairs` and `get_best_bid_ask` are implemented but uninvoked -- see
-    `get_trading_pairs`' docstring for why local tick validation is a follow-up rather than
-    something to bolt onto the exit path. Uncalled code with unasserted fixtures is how a method
-    quietly rots into something that no longer works by the time the feature needing it arrives,
-    so this pins the fields that feature will read: `asset_increment` (the rounding unit),
-    `max_order_size` (a bound a rejected order would violate), and the bid/ask legs a spread check
-    would compare.
+    `get_trading_pairs` now feeds `place_order`'s pre-flight (cached per symbol on the adapter)
+    and `get_best_bid_ask` feeds the adapter's coherence guard, which refuses a crossed row.
+    Both sit behind adapter-level parsing, so this pins the FIELDS that parsing reads at the
+    layer that owns them: `asset_increment` (the rounding unit), `max_order_size` (a bound a
+    refused order would violate), and the bid/ask legs the coherence guard orders.
 
     `min_order_amount` is asserted here again after #230. #217 F3 read it off `results[0]` --
     BILL-USD, one of the 26 pairs of 89 that lack the field -- and concluded the venue publishes no
@@ -693,9 +689,7 @@ _HOSTILE_NEXT_CURSORS: list[Any] = [
 
 
 @pytest.mark.parametrize("cursor", _HOSTILE_NEXT_CURSORS)
-def test_next_path_stops_cleanly_on_a_hostile_or_degenerate_cursor(
-    http: Any, cursor: Any
-) -> None:
+def test_next_path_stops_cleanly_on_a_hostile_or_degenerate_cursor(http: Any, cursor: Any) -> None:
     """Every one of these cursor shapes is something Robinhood's server -- or a bug in it --
     could hand back, and none of them may be allowed to crash `get_holdings`/`get_order` mid
     reconciliation or, worse, cause this transport to sign and send the account's live credentials

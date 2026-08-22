@@ -521,7 +521,8 @@ def test_preview_order_accepts_a_fee_exclusive_est_total_cost_unchanged() -> Non
     row["est_total_cost"] = Decimal(row["ask"]) * Decimal(row["quantity"])
     transport = FakeTransport(
         trading_pairs=_pairs(),
-        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price={"results": [row]},
     )
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
 
@@ -563,7 +564,8 @@ def test_preview_order_falls_back_to_price_times_quantity_without_a_total() -> N
     row = {k: v for k, v in fixture["results"][0].items() if k != "est_total_cost"}
     transport = FakeTransport(
         trading_pairs=_pairs(),
-        accounts=load_fixture("rh_accounts.json"), estimated_price={"results": [row]}
+        accounts=load_fixture("rh_accounts.json"),
+        estimated_price={"results": [row]},
     )
     spec = MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=_QUOTED_SIZE)
 
@@ -1697,7 +1699,6 @@ def _priced_transport(**kwargs: Any) -> Any:
     )
 
 
-
 def test_min_order_amount_is_measured_against_the_QUOTE_size_not_the_base_size() -> None:
     """The finding this whole check turns on, as an executable claim.
 
@@ -1855,16 +1856,14 @@ def test_place_order_refuses_a_buy_below_the_quote_minimum() -> None:
     """
     transport = _placing_transport()
 
-    result = RobinhoodAdapter(transport).place_order(
-        _buy(base_size=Decimal("0.00000001"))
-    )
+    result = RobinhoodAdapter(transport).place_order(_buy(base_size=Decimal("0.00000001")))
 
     assert result.success is False
     assert result.broker_order_id is None
     assert result.reason == (
-        "robinhood pre-flight refused this buy: notional 0.00065 USD (base_size 0.00000001 x "
-        "limit_price 65000) is below the venue's min_order_amount 0.1 for BTC-USD, which is a "
-        "QUOTE-currency (USD) minimum, not a base-size minimum -- size the order to at least "
+        "robinhood pre-flight refused this buy: notional 0.00065000 USD (base_size 0.00000001 "
+        "x limit_price 65000) is below the venue's min_order_amount 0.1 for BTC-USD, which is "
+        "a QUOTE-currency (USD) minimum, not a base-size minimum -- size the order to at least "
         "0.1 USD"
     )
     assert "create_order" not in transport.calls, "a refused entry must never reach the venue"
@@ -1876,9 +1875,7 @@ def test_place_order_refuses_an_off_increment_buy() -> None:
     this one was not."""
     transport = _placing_transport()
 
-    result = RobinhoodAdapter(transport).place_order(
-        _buy(base_size=Decimal("0.000000005"))
-    )
+    result = RobinhoodAdapter(transport).place_order(_buy(base_size=Decimal("0.000000005")))
 
     assert result.success is False
     assert result.reason == (
@@ -1913,9 +1910,7 @@ def test_place_order_places_a_buy_on_a_pair_that_carries_no_minimum() -> None:
         placed=load_fixture("rh_order_open.json"), trading_pairs={"results": [row]}
     )
 
-    result = RobinhoodAdapter(transport).place_order(
-        _buy(base_size=Decimal("0.00000001"))
-    )
+    result = RobinhoodAdapter(transport).place_order(_buy(base_size=Decimal("0.00000001")))
 
     assert result.success
     assert result.broker_order_id == load_fixture("rh_order_open.json")["id"]
@@ -1981,7 +1976,7 @@ def test_place_order_rounds_an_off_increment_sell_down_to_the_venue_tick() -> No
     assert body["limit_order_config"]["asset_quantity"] == "0.10000000"
 
 
-def test_place_order_places_a_below_one_tick_sell_as_given_rather_than_minting_a_zero_order() -> None:
+def test_place_order_places_a_below_one_tick_sell_as_given_not_a_zero_order() -> None:
     """Flooring half a satoshi to the tick yields zero, and `"asset_quantity": "0"` is not an
     order -- it is a malformed body this package would have invented. A size below one increment
     is placed exactly as given and the venue answers it; that keeps the never-refuse rule intact
