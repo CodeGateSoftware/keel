@@ -190,7 +190,7 @@ CONTEXT_HELP: dict[str, tuple[tuple[str, str], ...]] = {
             "the ARMED check",
             "the release check ran ONCE on entry (one public read of the GitHub "
             "releases API, no auth) and the plan is held -- repaints re-check nothing; "
-            "the view names current vs latest, the four production wheels, the "
+            "the view names current vs latest, the production wheels, the "
             "Release/ dir, the .bak-before-* backups and the RUNNING venv",
         ),
         (

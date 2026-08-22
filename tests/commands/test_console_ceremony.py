@@ -503,7 +503,7 @@ CEREMONY: dict[tuple[str, str], tuple[Cell, ...]] = {
         Cell(
             T,
             "the update view opens ARMED with the whole plan (current vs latest, the "
-            "four production wheels, the Release/ dir, the .bak-before-* database "
+            "production wheels, the Release/ dir, the .bak-before-* database "
             "backups, the RUNNING venv); Enter is NOT enough -- the run demands the "
             "CLI's OWN typed gate (`keel update`'s exact wording, which names the "
             "version, the launch folder and that the running binary is replaced), "

@@ -11,12 +11,13 @@ sizing, no rails. It automates the release procedure `docs/RELEASING.md` describ
 `docs/operator-runbook.md`'s "Deploying a new version" spells out, in the same order a
 human runs it, and it refuses to run anywhere that procedure would be wrong:
 
-* **The four production wheels only** -- `keel_core`, `keel_broker_api`,
-  `keel_broker_coinbase`, `keel_trader` (`PRODUCTION_WHEEL_PREFIXES`). RELEASING.md's
-  rule: the release also ships `keel_broker_fake` (a dev-only fake venue that
-  registers a `fake` entry point) and `keel_broker_robinhood` (an optional venue that
-  drags in an Ed25519 stack); a deployment must have neither, so they are never
-  selected, by prefix, never by `*.whl`.
+* **The five production wheels only** -- `keel_core`, `keel_broker_api`,
+  `keel_broker_coinbase`, `keel_broker_alpaca`, `keel_trader`
+  (`PRODUCTION_WHEEL_PREFIXES`). RELEASING.md's rule: the release also ships
+  `keel_broker_fake` (a dev-only fake venue that registers a `fake` entry point),
+  `keel_broker_robinhood` (an optional venue that drags in an Ed25519 stack) and
+  `keel_broker_kraken` (a stub whose every data method raises); a deployment must have
+  none of them, so they are never selected, by prefix, never by `*.whl`.
 * **Backups FIRST, as consistent SQLite snapshots** -- every `keel*.db` in the launch
   folder is copied to `<db>.bak-before-<version>-<ts>` (the runbook convention) through
   SQLite's own online-backup API (a plain file copy of a database with a live rollback
@@ -78,16 +79,28 @@ from keel.version import BuildInfo, build_info, installed_distributions
 #: thing a leak can use against the repo.
 GITHUB_LATEST_URL = "https://api.github.com/repos/CodeGateSoftware/keel/releases/latest"
 
-#: The four PRODUCTION wheels (RELEASING.md, "Release assets"): `keel_trader` is the
-#: CLI and the other three are what it depends on, pinned `==` to the same version.
-#: The release also ships `keel_broker_fake` (a dev-only fake venue that registers a
-#: `fake` entry point under `keel.brokers`) and `keel_broker_robinhood` (an optional
-#: venue dragging in an Ed25519 stack) -- a deployment must have NEITHER, so this set
-#: is hard-coded and the selection is by exact name, never `Release/*.whl`.
+#: The five PRODUCTION wheels (RELEASING.md, "Release assets"): `keel_trader` is the
+#: CLI and the rest is what it runs on, pinned `==` to the same version. `keel_broker_alpaca`
+#: joined the set in #425: the equities profile (`config.paper-equities.yaml`,
+#: `broker: name: alpaca`, #386) deploys it beside the four, and an update that moved the
+#: rest while leaving it behind failed the verify step (`keel versions`: PARTIAL INSTALL)
+#: and rolled the WHOLE deployment back -- every self-update on such a box failed. The set
+#: is still STATED BY NAME, not derived from the config or the installed set (#425's
+#: "awkward part"): naming keeps the plan knowable before anything reads a deployment's
+#: config, and the cost -- the alpaca adapter present on a Coinbase-only box -- is one
+#: unused module whose single dependency, `requests`, already rides every deployment
+#: transitively via the Coinbase SDK. The release also ships `keel_broker_fake` (a
+#: dev-only fake venue that registers a `fake` entry point under `keel.brokers`),
+#: `keel_broker_robinhood` (an optional venue dragging in an Ed25519 stack for an
+#: adapter nothing constructs) and `keel_broker_kraken` (a port-complete STUB, #313:
+#: every data/market method raises, so a deployment must never ride it) -- a deployment
+#: must have NONE of them, so this set stays hard-coded and the selection is by exact
+#: name, never `Release/*.whl`.
 PRODUCTION_WHEEL_PREFIXES: tuple[str, ...] = (
     "keel_core",
     "keel_broker_api",
     "keel_broker_coinbase",
+    "keel_broker_alpaca",
     "keel_trader",
 )
 
@@ -228,7 +241,8 @@ def is_newer_version(latest: str, current: str) -> bool | None:
 @dataclass(frozen=True)
 class UpdatePlan:
     """Everything an update WILL do, computed BEFORE anything runs: what is running,
-    what is latest, the four wheel asset names/URLs, the `Release/` dir under the
+    what is latest, the wheel asset names/URLs (`PRODUCTION_WHEEL_PREFIXES` -- five
+    since #425), the `Release/` dir under the
     launch folder, every `keel*.db` that will be backed up first, the RUNNING venv's
     python -- and whether an update is offered at all, with a refusal reason for
     every reason it is not. A pure value: `plan_update` builds it, both front-ends
@@ -262,8 +276,8 @@ def _launch_dir() -> Path:
 
 
 def _running_python() -> Path:
-    """The RUNNING venv's python (`sys.executable`) -- the venv the four wheels are
-    installed INTO. A seam for tests."""
+    """The RUNNING venv's python (`sys.executable`) -- the venv the production wheels
+    are installed INTO. A seam for tests."""
     import sys
 
     return Path(sys.executable)
@@ -329,7 +343,7 @@ def deployment_layout_refusal(launch_dir: Path, package_file: Path | None) -> st
 def _wheel_origin_refusal(package_file: Path) -> str | None:
     """`None` when the `keel-trader` distribution beside the running package (the
     site-packages dir two levels up from `keel/__init__.py`) was installed as a wheel;
-    a refusal reason otherwise. A deployment is the four release WHEELS: an editable
+    a refusal reason otherwise. A deployment is the release WHEELS: an editable
     install or a `pip install <source-dir>` has a `direct_url.json` whose `url` names a
     directory rather than a `.whl` -- updating that in place is not the runbook's
     procedure, so it is refused. No `direct_url.json` at all is an index install
@@ -355,16 +369,16 @@ def _wheel_origin_refusal(package_file: Path) -> str | None:
     return (
         f"the running keel-trader distribution was not installed from a wheel "
         f"(its direct_url origin is {url!r}, a source directory or an editable "
-        "install) -- a deployment is the four release wheels; re-deploy from the "
+        "install) -- a deployment is the release wheels; re-deploy from the "
         "release (docs/operator-runbook.md, 'Deploying a new version')."
     )
 
 
 def select_production_wheels(release: ReleaseInfo, version: str) -> tuple[ReleaseAsset, ...]:
-    """The FOUR production wheel assets for `version`, in `PRODUCTION_WHEEL_PREFIXES`
+    """The production wheel assets for `version`, in `PRODUCTION_WHEEL_PREFIXES`
     order, matched by exact `<prefix>-<version>-` name -- never `*.whl`, so the
-    fake/robinhood wheels can never ride along. PURE; raises `UpdateError` naming any
-    of the four the release does not carry."""
+    fake/robinhood/kraken wheels can never ride along. PURE; raises `UpdateError`
+    naming any of them the release does not carry."""
     selected: list[ReleaseAsset] = []
     missing: list[str] = []
     for prefix in PRODUCTION_WHEEL_PREFIXES:
@@ -390,9 +404,9 @@ def select_production_wheels(release: ReleaseInfo, version: str) -> tuple[Releas
     if missing:
         names = ", ".join(asset.name for asset in release.assets) or "no assets at all"
         raise UpdateError(
-            f"release {release.tag} does not carry the four production wheels "
+            f"release {release.tag} does not carry every production wheel "
             f"(missing: {', '.join(missing)}). Its assets: {names}. A release without "
-            "all four cannot be deployed -- see docs/RELEASING.md, 'Release assets'."
+            "all of them cannot be deployed -- see docs/RELEASING.md, 'Release assets'."
         )
     return tuple(selected)
 
@@ -444,7 +458,8 @@ def plan_update(
         reasons.append(
             "no keel distributions are installed in this environment -- a source "
             "checkout run from the repo (e.g. `uv run keel`). There is no install "
-            "here to update; a deployment is a venv installed from the four wheels."
+            "here to update; a deployment is a venv installed from the production "
+            "wheels."
         )
     layout_refusal = deployment_layout_refusal(launch, pkg_file)
     if layout_refusal is not None:
@@ -563,7 +578,7 @@ def _backup_file(src: Path, dest: Path) -> None:
 def _uv_install(venv_python: Path, wheels: Sequence[Path]) -> None:
     """Install the wheels BY PATH into the RUNNING venv with uv -- exactly the
     runbook's own command, `uv pip install --python <venv> --find-links <Release> <the
-    four paths>`. uv is a deployment dependency (the runbook says so); an absent uv is
+    wheel paths>`. uv is a deployment dependency (the runbook says so); an absent uv is
     an honest error naming the manual procedure, never a fallback to some other
     installer."""
     # `--find-links` points at the wheels' own directory, exactly as the runbook's
@@ -661,7 +676,7 @@ def _verify_versions(new_keel: Path, target_version: str) -> None:
 
 _MANUAL_RECOVERY = (
     "MANUAL RECOVERY: docs/operator-runbook.md, 'Deploying a new version' -- download "
-    "the four wheels, `uv pip install --python <venv>` them by path, then "
+    "the production wheels, `uv pip install --python <venv>` them by path, then "
     "`keel versions` and `keel status`. The .bak-before-* backups are untouched."
 )
 
@@ -685,7 +700,7 @@ def run_update(
     service function itself could be called by an operator's own code with their own
     gate; nothing keel ships calls it ungated). The order is: gate -> consistent
     SQLite-snapshot backups of every `keel*.db` (never overwriting an existing backup)
-    -> download the four wheels (verified non-empty, read bounded at 200 MiB) ->
+    -> download the production wheels (verified non-empty, read bounded at 200 MiB) ->
     install into the RUNNING venv -> migrate each database with the new build -> verify
     with the new build's `keel versions` -> only then delete the superseded wheels.
     Backups are never deleted. A failure is PHASE-TRUE about the venv's state: a
@@ -733,7 +748,7 @@ def run_update(
     say(f"updating {plan.launch_dir}: {plan.current_version} -> {plan.target_version}")
 
     # The superseded set, read BEFORE anything lands: the keel wheels already in
-    # Release/ that are not this release's four (the previous version's). They are
+    # Release/ that are not this release's (the previous version's). They are
     # the verify-failure recovery path, so they are deleted only on verified success.
     target_names = set(plan.wheel_names)
     superseded: list[Path] = (
@@ -793,9 +808,9 @@ def run_update(
         )
 
     new_keel = console_entry(plan.venv_python)
-    installed = False  # whether the four wheels FINISHED installing (uv returned success)
+    installed = False  # whether the wheels FINISHED installing (uv returned success)
     try:
-        say(f"installing the four wheels into the RUNNING venv ({plan.venv_python})")
+        say(f"installing the production wheels into the RUNNING venv ({plan.venv_python})")
         install_wheels(plan.venv_python, wheel_paths)
         installed = True
         for db_path in plan.db_paths:
@@ -854,9 +869,12 @@ def run_update(
                 say(f"best-effort re-install FAILED: {reinstall_exc}")
         recovery = (
             "rolled back: the previous wheels were re-installed from Release/ "
-            "(best-effort); confirm with `keel versions` -- and if the old build "
-            "cannot open the migrated databases, restore from the .bak-before-* "
-            "backups beside them."
+            "(best-effort); the re-install covers only the superseded set, so a "
+            "distribution outside it that this update newly installed (a wheel "
+            "the previous release did not ship) may remain at "
+            f"{plan.target_version}, leaving the venv a MIXED set -- confirm with "
+            "`keel versions`; and if the old build cannot open the migrated "
+            "databases, restore from the .bak-before-* backups beside them."
             if rolled_back
             else "no previous wheels remained in Release/ to re-install -- the "
             ".bak-before-* backups beside the databases are the data recovery."
@@ -961,7 +979,7 @@ def gate_detail(plan: UpdatePlan) -> str:
     REPLACED. The same words `keel update` asks and the console's update view asks.
     PURE."""
     return (
-        f"launch folder {plan.launch_dir}: download the four production wheels to "
+        f"launch folder {plan.launch_dir}: download the production wheels to "
         f"{plan.release_dir}, back up every keel database first "
         f"(.bak-before-{plan.latest_version}-<ts>, never deleted by the updater), "
         f"install them into the RUNNING venv ({plan.venv_python}) -- the binary this "
@@ -1060,7 +1078,7 @@ def update_cmd(ctx: click.Context, check: bool) -> None:
     """Check for a newer release and deploy it into this launch folder.
 
     The procedure docs/operator-runbook.md spells out by hand, automated and still
-    human-gated: download the four production wheels to Release/, back up every
+    human-gated: download the production wheels to Release/, back up every
     keel*.db first, install into the RUNNING venv with uv, migrate, verify with
     `keel versions`, and only then clean the superseded wheels. NEVER automatic: the
     full run demands a typed confirmation at a terminal. `--check` mutates nothing.
