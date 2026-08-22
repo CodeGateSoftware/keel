@@ -214,7 +214,10 @@ between install and verify) — are what `keel update` runs for you (issue #415)
 same tools, one service (`keel/commands/update.py`) behind two front-ends: the `keel update`
 CLI command and the Account menu's `update` entry in the TUI console (see "The TUI console"
 for the ceremony). `keel update --check` mutates nothing: it prints current vs latest and the
-whole plan.
+whole plan. All of this is for **venv deployments only** — a packaged (desktop) install never
+self-updates; it updates by downloading the new installer
+(docs/desktop-install.md, "How updates arrive"; decided in docs/decisions/0001-desktop-update-path.md),
+and `keel update` on a bundle says so instead of offering one.
 
 **What it does, in the manual procedure's own order.** It reads the latest release from the
 public GitHub API (no auth, no tokens — an unauthenticated read is rate-limited to 60/hour per

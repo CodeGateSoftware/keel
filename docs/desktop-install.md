@@ -78,6 +78,32 @@ The download is a `.zip`, and Windows marks files that came from the internet.
 > If you skipped step 2, you may see the SmartScreen prompt again on a later launch. Doing the
 > Unblock on the `.zip` first is what avoids that.
 
+## How updates arrive
+
+**The desktop app never updates itself.** This is deliberate, not a missing feature: keel is a
+program that can move real money, and a self-updater is a channel that must itself be secured.
+A new version arriving as a file **you** chose to download — from the same place as the first
+one — is the safer posture for a tool like this. The full reasoning is in
+[`docs/decisions/0001-desktop-update-path.md`](decisions/0001-desktop-update-path.md).
+
+So updating looks exactly like installing:
+
+1. Check what the latest release is — the app's update view (or `keel update --check`, if you
+   have a terminal) reports your version against the latest and links the download.
+2. Download the new `.dmg` (or `.zip`) from
+   [the releases page](https://github.com/CodeGateSoftware/keel/releases/latest).
+3. Verify it the same way you verified the first one — see
+   ["Please check what you downloaded first"](#please-check-what-you-downloaded-first) below.
+   The same rules apply to every download, not just the first.
+4. Run it and drag keel into place, replacing the old copy. Your config, database and
+   credentials are **not** touched: they live in a separate data folder the installer never
+   writes to, so an update keeps everything you set up.
+
+The check itself is read-only and only happens when you ask — keel never phones home on a
+schedule, and a network problem just means "could not check", never a scary error. If you run
+`keel update` on a packaged install it will tell you exactly this: that this install updates by
+downloading the next release, not by running a command.
+
 ## Please check what you downloaded first
 
 We would rather not simply ask you to click past a security warning. That warning exists for a
