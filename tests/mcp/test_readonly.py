@@ -276,20 +276,21 @@ def test_no_capability_row_is_referenced_from_the_server_package() -> None:
 
 
 def _constant_pragma(call: ast.Call) -> bool:
-    """True for `.execute("PRAGMA ...")` with a constant string literal.
+    """True ONLY for `.execute("PRAGMA query_only = ON")` (case/whitespace-insensitive).
 
     The ONE exemption from the write-deny scan, and it is narrower than the allowlist it
-    replaces: a PRAGMA is connection configuration, not row data, and no DML statement can be
-    spelled as one. It exists because the package must run `PRAGMA query_only = ON` -- the
-    engine-level read-only enforcement -- and that call is itself `.execute(...)`-shaped. A
-    dynamic (non-constant) argument does NOT qualify: `repo.execute(sql)` is still a write."""
+    replaces: the package must run `PRAGMA query_only = ON` -- the engine-level read-only
+    enforcement -- and that call is itself `.execute(...)`-shaped. The literal is pinned,
+    not the prefix: `PRAGMA query_only = OFF` would re-enable writes while still looking
+    like configuration, so anything but the exact ON statement stays caught. A dynamic
+    (non-constant) argument does NOT qualify: `repo.execute(sql)` is still a write."""
     if not call.args:
         return False
     first = call.args[0]
     return (
         isinstance(first, ast.Constant)
         and isinstance(first.value, str)
-        and first.value.strip().upper().startswith("PRAGMA")
+        and " ".join(first.value.upper().split()) == "PRAGMA QUERY_ONLY = ON"
     )
 
 
@@ -339,17 +340,32 @@ def test_the_write_scan_is_proven_false_capable() -> None:
         "    repo.arm_autonomy()\n"
         "    repo.execute('INSERT INTO orders (mode) VALUES (\\'live\\')')\n"
         "    repo.execute(sql)\n"
-        "    repo.execute('PRAGMA query_only = ON')\n"
+        "    repo.execute('PRAGMA query_only = OFF')\n"
+        "    repo.execute('PRAGMA writable_schema = ON')\n"
         "    return readonly([])\n"
     )
-    # the constant-PRAGMA execute is exempt (it is the read-only enforcement itself); the
-    # literal INSERT and the dynamic `sql` are both caught
+    # only the exact ON statement is exempt (it is the read-only enforcement itself); the
+    # literal INSERT, the dynamic `sql`, and the OFF/writable_schema pragmas are all caught
     assert sorted(set(_write_calls_in(snippet))) == [
         "arm_autonomy",
         "execute",
         "set_state",
         "upsert_candles",
     ]
+
+
+def test_the_pragma_exemption_admits_only_the_exact_on_statement() -> None:
+    def _pragma_call(literal: str) -> ast.Call:
+        tree = ast.parse(f"conn.execute({literal!r})")
+        assert isinstance(tree.body[0], ast.Expr)
+        assert isinstance(tree.body[0].value, ast.Call)
+        return tree.body[0].value
+
+    assert _constant_pragma(_pragma_call("PRAGMA query_only = ON"))
+    assert _constant_pragma(_pragma_call("pragma   query_only  =  on"))
+    assert not _constant_pragma(_pragma_call("PRAGMA query_only = OFF"))
+    assert not _constant_pragma(_pragma_call("PRAGMA writable_schema = ON"))
+    assert not _constant_pragma(_pragma_call("PRAGMA journal_mode = WAL"))
 
 
 # -- wall 4: no gate call sites -------------------------------------------------------------------
