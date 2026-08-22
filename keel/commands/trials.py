@@ -378,6 +378,11 @@ def trials_monte_carlo(
             )
         resampled = mc_mod.reshuffle(pnls, paths, seed)
     else:
+        if not resolved.candles:
+            raise click.ClickException(
+                f"no candles cached for {resolved.rule.product_id} "
+                f"{resolved.granularity.value} -- fetch first"
+            )
         candle_paths = mc_mod.moving_block_bootstrap(
             resolved.candles,
             block_len=block_len,
@@ -428,10 +433,15 @@ def trials_monte_carlo(
     fee_line = rules_mod._describe_fee(resolved.fee_pct, resolved.fee_source)
     click.echo(f"  backtest priced at {fee_line}")
 
+    # The id carries every knob two runs can differ by -- two resamples that differ only in
+    # --paths (or --block-len) are different experiments and must never collide on one row.
+    trial_id = f"mc-{rule}-{mode}-seed{seed}-p{paths}"
+    if mode == "candles":
+        trial_id += f"-b{block_len}"
     try:
         record = trials_ledger.append_trial(
             _ledger_path(ledger),
-            trial_id=f"mc-{rule}-{mode}-seed{seed}",
+            trial_id=trial_id,
             session=session,
             rule=resolved.row["kind"],
             params={

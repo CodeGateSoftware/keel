@@ -345,6 +345,32 @@ def test_monte_carlo_trades_mode_reports_a_non_degenerate_drawdown_distribution(
     assert summary["drawdown_percentile"] != Decimal("0.5")
 
 
+def test_monte_carlo_trial_id_carries_paths_and_block_len(tmp_path):
+    """Two runs differing only in --paths (or --block-len) are different experiments; the
+    id must say so, or the second append would collide with the first row."""
+    db = _mc_db(tmp_path)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(CliRunner(), db, ledger, "--mode", "trades", "--paths", "20", "--seed", "7")
+    assert result.exit_code == 0, result.output
+    assert trials_ledger.read_trials(ledger)[0].trial_id == "mc-1-trades-seed7-p20"
+
+    result = _invoke_mc(
+        CliRunner(),
+        db,
+        ledger,
+        "--mode",
+        "candles",
+        "--paths",
+        "5",
+        "--seed",
+        "11",
+        "--block-len",
+        "10",
+    )
+    assert result.exit_code == 0, result.output
+    assert trials_ledger.read_trials(ledger)[1].trial_id == "mc-1-candles-seed11-p5-b10"
+
+
 def test_monte_carlo_candles_mode_rebacktests_bootstrapped_paths(tmp_path):
     db = _mc_db(tmp_path)
     ledger = tmp_path / "trials.jsonl"
@@ -393,19 +419,55 @@ def test_monte_carlo_is_deterministic_under_a_fixed_seed(tmp_path):
     assert report_a == report_b
 
 
-def test_monte_carlo_refuses_when_no_closed_trades_and_writes_no_row(tmp_path):
+def _dca_db(tmp_path, *, candles: bool):
+    """A temp db holding one DCA rule; `candles=False` caches nothing at the granularity
+    the fallback chain resolves to (dca declares none -> ONE_HOUR, while the cache below is
+    ONE_DAY), `candles=True` caches the bars the rule will actually read."""
     conn = connect(str(tmp_path / "dca.db"))
     migrate(conn)
     repo = Repository(conn)
     repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 7}, now_ts=1_800_000_000)
-    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(30))
+    if candles:
+        repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(30))
     conn.close()
+    return tmp_path / "dca.db"
+
+
+def test_monte_carlo_refuses_when_no_closed_trades_and_writes_no_row(tmp_path):
+    db = _dca_db(tmp_path, candles=True)
     ledger = tmp_path / "trials.jsonl"
-    result = _invoke_mc(CliRunner(), tmp_path / "dca.db", ledger, "--seed", "3")
-    # DCA never exits: every trade is open, so there is nothing to resample -- a refusal,
-    # not a degenerate row.
+    result = _invoke_mc(CliRunner(), db, ledger, "--seed", "3")
+    # The mechanism: dca declares no granularity, the fallback chain resolves ONE_HOUR, and
+    # nothing is cached there -- so the observed backtest runs over ZERO candles and closes
+    # nothing. A refusal, not a degenerate row.
     assert result.exit_code != 0
     assert "no closed trades" in result.output
+    assert not ledger.exists()
+
+
+def test_monte_carlo_refuses_when_every_trade_is_genuinely_open(tmp_path):
+    """The honest all-open case: candles EXIST at the granularity the rule reads (pinned
+    with --granularity), dca enters on cadence and never exits on a signal, so every trade
+    in the observed backtest is still open at series end -- no realised P&L to resample."""
+    db = _dca_db(tmp_path, candles=True)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(
+        CliRunner(), db, ledger, "--seed", "3", "--granularity", "ONE_DAY"
+    )
+    assert result.exit_code != 0
+    assert "no closed trades" in result.output
+    assert not ledger.exists()
+
+
+def test_monte_carlo_candles_mode_refuses_cleanly_when_no_candles_are_cached(tmp_path):
+    """A rule resolving to an empty candle list is a refusal naming what to fetch -- parity
+    with trades mode's refusal, never a raw ValueError traceback out of the bootstrap."""
+    db = _dca_db(tmp_path, candles=True)  # ONE_DAY cached; the fallback resolves ONE_HOUR
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(CliRunner(), db, ledger, "--seed", "3", "--mode", "candles")
+    assert result.exit_code != 0
+    assert "no candles cached for BTC-USD ONE_HOUR" in result.output
+    assert "fetch first" in result.output
     assert not ledger.exists()
 
 

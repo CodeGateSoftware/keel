@@ -79,6 +79,13 @@ def test_reshuffle_different_seed_moves_at_least_one_path() -> None:
     assert reshuffle(_PNLS, 10, seed=1) != reshuffle(_PNLS, 10, seed=2)
 
 
+def test_reshuffle_paths_within_one_call_are_distinct() -> None:
+    """One RNG shared across the call draws DIFFERENT orderings; a per-path re-seed regression
+    would collapse every path to the first shuffle and the whole distribution with it."""
+    paths = reshuffle(_PNLS, 25, seed=7)
+    assert len({tuple(path) for path in paths}) > 1
+
+
 # -- equity curve / final equities / max drawdown / median ----------------------------------------
 
 
@@ -177,6 +184,14 @@ def test_bootstrap_is_deterministic_under_a_fixed_seed() -> None:
 def test_bootstrap_returns_n_paths_paths() -> None:
     paths = moving_block_bootstrap(_candles(8), block_len=3, n_paths=9, seed=5, step_sec=60)
     assert len(paths) == 9
+
+
+def test_bootstrap_paths_within_one_call_are_distinct() -> None:
+    """Same regression guard as the reshuffle pin: one RNG per call must draw differing block
+    starts, so non-trivial input yields at least two distinct paths -- never 20 copies of
+    the first draw."""
+    paths = moving_block_bootstrap(_candles(30), block_len=5, n_paths=20, seed=13, step_sec=3600)
+    assert len({tuple(path) for path in paths}) > 1
 
 
 def test_bootstrap_refuses_degenerate_arguments() -> None:
