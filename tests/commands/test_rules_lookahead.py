@@ -14,6 +14,8 @@ gate refuses a rule whose verdict is `lookahead_detected`. Pinned here:
 - `--recursive` maps each rule family to its own ATR exactly as the family computes it
   (turtle's bounded tail window, rsi's full history) or reports honestly that the family
   configures no recursive-suspect indicator (dca);
+- a detect that RAISES inside the promote gate's lookahead analysis is a graceful fail-closed
+  refusal, not a traceback;
 - `rules promote` refuses a leaky rule without mutating the row, and `--force` remains the
   documented bypass, exactly as it is for the rest of the gate.
 """
@@ -193,6 +195,30 @@ class _BlindCoarseHourlyRule(Rule):
             context={},
             ts=hourly[-1].ts,
         )
+
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
+        return False
+
+    def describe(self) -> dict:
+        return {"name": self.name, "params": self.params}
+
+
+class _ExplodingRule(Rule):
+    """A rule whose detect RAISES on early (short) views: the full series is fine, but the
+    walk's first live views are below the rule's own guard -- the shape that used to escape
+    `attempt_promotion` as a traceback."""
+
+    def __init__(self) -> None:
+        self.name = "exploding"
+        self.params: dict[str, Any] = {"product_id": "BTC-USD", "granularity": "ONE_DAY"}
+        self.product_id = "BTC-USD"
+        self.granularity = Granularity.ONE_DAY
+
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        candles = candles_by_tf[Granularity.ONE_DAY]
+        if len(candles) < 60:
+            raise ValueError(f"cannot decide on {len(candles)} bars")
+        return None
 
     def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         return False
@@ -462,6 +488,57 @@ def test_attempt_promotion_service_refuses_leaky_rules(monkeypatch) -> None:
     joined = "\n".join(err)
     assert "lookahead" in joined
     assert "keel rules lookahead 1" in joined
+    assert repo.get_rules()[0]["status"] == "candidate"
+
+
+def test_promote_refuses_gracefully_when_lookahead_analysis_raises(
+    tmp_path, valid_config_path, monkeypatch
+) -> None:
+    """A detect that RAISES on the walk's early views is a fail-closed refusal naming the
+    error -- never a traceback out of a promotion command, and never a silent pass."""
+    repo = _repo(tmp_path)
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily())
+    monkeypatch.setattr(agent, "_build_rule", lambda row: _ExplodingRule())
+
+    result = _invoke(tmp_path, valid_config_path, "rules", "promote", "1")
+
+    assert result.exit_code == 1, result.output
+    assert "lookahead analysis could not run" in result.output
+    assert "cannot decide on" in result.output  # the named error, not just the fact of one
+    # Graceful: the only exception that escaped the command is click's own SystemExit; a
+    # traceback escaping would leave the ORIGINAL error (a ValueError) as result.exception.
+    assert isinstance(result.exception, SystemExit)
+    # Fail-closed: nothing was written.
+    assert repo.get_rules()[0]["status"] == "candidate"
+
+
+def test_attempt_promotion_service_refuses_gracefully_on_a_raising_detect(
+    monkeypatch,
+) -> None:
+    """The service seam the console dispatches through fails closed the same way."""
+    from tests.commands.test_rules_services import _config
+
+    conn = connect(":memory:")
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily())
+    monkeypatch.setattr(agent, "_build_rule", lambda row: _ExplodingRule())
+
+    err: list[str] = []
+    try:
+        attempt_promotion(repo, _config(), 1, echo_err=err.append)
+        raise AssertionError("expected RulesRefused")
+    except RulesRefused:
+        pass
+    joined = "\n".join(err)
+    assert "lookahead analysis could not run" in joined
+    assert "cannot decide on" in joined
     assert repo.get_rules()[0]["status"] == "candidate"
 
 

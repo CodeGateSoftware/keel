@@ -816,15 +816,29 @@ def attempt_promotion(
     lookahead_granularity, lookahead_candles = _resolve_backtest_inputs(
         repo, rule, granularity_opt, echo_err
     )
-    lookahead = bias_mod.lookahead_analysis(
-        rule.detect,
-        _lookahead_views(repo, rule, lookahead_granularity, lookahead_candles),
-        rule_id=str(rule_id),
-        # Whole history sampled to at most ~200 anchors (~400 detect calls): seconds, not
-        # minutes, on the cached series a promotion re-backtests anyway.
-        sample_step=max(1, -(-len(lookahead_candles) // 200)),
-        warmup=_lookahead_warmup(rule),
-    )
+    try:
+        lookahead = bias_mod.lookahead_analysis(
+            rule.detect,
+            _lookahead_views(repo, rule, lookahead_granularity, lookahead_candles),
+            rule_id=str(rule_id),
+            # Whole history sampled to at most ~200 anchors (~400 detect calls): seconds, not
+            # minutes, on the cached series a promotion re-backtests anyway.
+            sample_step=max(1, -(-len(lookahead_candles) // 200)),
+            warmup=_lookahead_warmup(rule),
+        )
+    except RulesRefused:
+        raise
+    except Exception as exc:
+        # Fail-closed, gracefully: a detect that RAISES inside the harness (a poisoned view
+        # the rule's arithmetic cannot survive, say) is not a clean verdict, and a traceback
+        # escaping a promotion command is a posture the gate holds nowhere else. The operator
+        # gets the named error and the same nothing-was-promised refusal as every other
+        # failed check; `--force` remains the deliberate bypass.
+        echo_err(
+            f"Error: rule {rule_id} ({row['kind']}): lookahead analysis could not run: "
+            f"{exc!r}. An un-run check is not a pass, so nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: lookahead analysis could not run") from exc
     if lookahead.verdict == "lookahead_detected":
         echo_err(
             f"Error: rule {rule_id} ({row['kind']}) fails the lookahead check -- its "
