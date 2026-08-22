@@ -84,7 +84,7 @@ from keel.strategy.backtest import (
     _stop_exit_price,
     _touches,
 )
-from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
+from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
 from keel.strategy.rules.base import Rule, Setup, Signal
 from keel.types import Candle, Granularity
 
@@ -195,6 +195,11 @@ class _Held:
     #: ORIGINAL risk reference the closed trade's R-multiple divides by. Required, not
     #: defaulted: a silent 0 stop would be a stop that never triggers.
     stop: Decimal
+    #: The rule's stop-management policy, resolved ONCE here at open (`policy_for(rule)`)
+    #: rather than per bar in `_process_held` -- matching `strategy.backtest`'s
+    #: once-per-run resolution. A rule's params never mutate mid-run, and knob-less
+    #: rules share the `EXIT_POLICY_OFF` singleton either way.
+    policy: ExitPolicy
     mfe: Decimal = Decimal("0")
     mae: Decimal = Decimal("0")
 
@@ -481,7 +486,7 @@ def _process_held(
         # untouched, so only a trailing arm pays for the ATR read. The ATR window is
         # the RULE's own trading timeframe (ONE_HOUR for both knob-carrying families),
         # resolved the same way `strategy.backtest` resolves it.
-        policy = policy_for(h.rule)
+        policy = h.policy
         series = candles_by_tf.get(_rule_trading_tf(h.rule))
         h.stop = next_stop(
             policy,
@@ -719,6 +724,7 @@ def _process_rule_signals(
             cts_score=signal.cts_score,
             entry_technique=signal.entry_technique,
             stop=setup.stop,
+            policy=policy_for(rule),
         )
 
     return rule_signal_fired
