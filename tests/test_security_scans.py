@@ -34,7 +34,6 @@ import tomllib
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests._workflow_yaml import strict_load
 
@@ -94,7 +93,7 @@ def test_dependabot_watches_every_python_manifest_and_the_actions():
     assert path.is_file(), (
         ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
     )
-    config = yaml.safe_load(path.read_text())
+    config = strict_load(path.read_text(), source=str(path))
     assert config.get("version") == 2, "dependabot.yml must be the version-2 schema"
     entries = config.get("updates", [])
     pip_dirs = {e.get("directory") for e in entries if e.get("package-ecosystem") == "pip"}
@@ -121,7 +120,7 @@ def test_every_dependabot_entry_is_scheduled():
     assert path.is_file(), (
         ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
     )
-    entries = yaml.safe_load(path.read_text()).get("updates", [])
+    entries = strict_load(path.read_text(), source=str(path)).get("updates", [])
     unscheduled = [e for e in entries if not e.get("schedule", {}).get("interval")]
     assert not unscheduled, (
         f"these dependabot entries have no schedule interval: {unscheduled} -- an entry "

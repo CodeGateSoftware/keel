@@ -17,7 +17,7 @@ The decision: the floor is **3.11**, the lowest passing version; development sta
 rotting back into an untested claim. These tests pin all three halves of that decision -- the
 declared floor in every distribution, the binding-feature evidence that justifies it, and the
 CI leg that verifies it -- because each is a way the decision can silently come undone: a
-seventh distribution added with a different floor, the `assert_never` imports disappearing
+ninth distribution added with a different floor, the `assert_never` imports disappearing
 (which means the floor COULD drop and the recorded reason is stale), or the CI matrix losing
 its floor leg.
 """

@@ -254,6 +254,6 @@ The alternatives, and why they lost:
 Apache-2.0 permits a closed hosted fork; we accept that. The compliance engine's value is the
 audit trail it produces, which a hosted fork cannot hide.
 
-All six distributions cut from this repo (`keel-trader`, `keel-core`, and the four broker
+All eight distributions cut from this repo (`keel-trader`, `keel-core`, and the six broker
 packages) declare `license = "Apache-2.0"` in their `pyproject.toml`; `tests/test_licensing.py`
-fails the build if a seventh distribution appears without it.
+fails the build if a ninth distribution appears without it.
