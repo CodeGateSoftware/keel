@@ -784,3 +784,43 @@ def test_paper_config_rejects_negative(write_config):
     cfg_text = VALID_CONFIG_YAML + "\npaper:\n  starting_equity_usd: -1\n"
     with pytest.raises(ConfigError):
         load_config(write_config(cfg_text))
+
+
+# -- notifications: NotificationsConfig (#444 -- per-event opt-in, default off) --------------
+
+
+def test_notifications_default_to_disabled(valid_config_path):
+    """No `notifications:` block means nothing opted in -- the CRITICAL webhook and every
+    existing deployment behave exactly as before the section existed."""
+    cfg = load_config(valid_config_path)
+
+    assert cfg.notifications.events == frozenset()
+    assert cfg.notifications.format == "plain"
+
+
+def test_notifications_events_parse_from_yaml_and_unknown_keys_are_kept_harmless(write_config):
+    """Freqtrade's `notification_settings` shape: per-event booleans. A key the taxonomy
+    does not know is ignored rather than refused -- it opts into nothing, exactly like a
+    settings entry naming a retired event."""
+    cfg_text = (
+        VALID_CONFIG_YAML
+        + "\nnotifications:\n"
+        + "  format: slack\n"
+        + "  events:\n"
+        + "    attestation.expiring: true\n"
+        + "    rail.armed: true\n"
+        + "    setup.unplaced: false\n"
+        + "    not.a.real.event: true\n"
+    )
+    cfg = load_config(write_config(cfg_text))
+
+    assert cfg.notifications.events == frozenset(
+        {"attestation.expiring", "rail.armed", "not.a.real.event"}
+    )
+    assert cfg.notifications.format == "slack"
+
+
+def test_an_unknown_notification_format_is_refused_at_load(write_config):
+    cfg_text = VALID_CONFIG_YAML + "\nnotifications:\n  format: carrier-pigeon\n"
+    with pytest.raises(ConfigError, match="notifications.format"):
+        load_config(write_config(cfg_text))

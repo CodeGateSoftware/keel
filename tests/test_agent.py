@@ -3523,3 +3523,68 @@ def test_retry_after_a_blocked_cycle_does_not_duplicate_an_already_placed_exit(r
         f"the retry duplicated the exit -- expected exactly one SELL across both cycles, "
         f"got {len(sells)}: {sells!r}"
     )
+
+
+# -- post-cycle notifications (#444) ------------------------------------------------------------
+#
+# Notify-only, default-off: `run_once` derives events from the same seams doctor reads and
+# hands them to `keel_core.notifications` for delivery, AFTER the cycle's trading work is
+# done. These two tests pin the two contract halves -- disabled means ZERO transport calls,
+# and a warn-state cycle with the event opted in delivers exactly that event.
+
+
+class _NotifySink:
+    """Records what the notification transport would have POSTed (stands in for
+    `keel_core.notifications.post_json`, no network)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, url: str, body: bytes) -> None:
+        self.calls.append((url, body.decode("utf-8")))
+
+
+def _notify_config(events: frozenset[str]) -> Config:
+    from keel_core.notifications import NotificationSettings
+
+    return _config(notifications=NotificationSettings(events=events))
+
+
+def test_a_cycle_with_notifications_disabled_makes_zero_transport_calls(repo, monkeypatch):
+    """The default-off guarantee, at the loop level: the SAME warn state that would notify an
+    opted-in deployment produces no delivery attempt at all -- no URL resolution shortcut, no
+    half-open transport, nothing."""
+    sink = _NotifySink()
+    monkeypatch.setattr("keel_core.notifications.post_json", sink)
+    monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
+    # rail 17 at 5 of its 7 days: the warn state an opted-in deployment would be told about.
+    repo.set_state("withdrawals_attested_at", 90_000 - 5 * 86_400)
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _notify_config(frozenset()), now_ts=90_000)
+
+    assert sink.calls == []
+
+
+def test_a_warn_state_cycle_emits_exactly_the_opted_in_events(repo, monkeypatch):
+    """Opt in ONE event, craft exactly that warn state, and the cycle delivers it once --
+    with the event key in the payload -- while the healthy facts of the same cycle (the
+    placed DCA entry, the fresh feed, the ample allowance) notify nothing."""
+    import json
+
+    sink = _NotifySink()
+    monkeypatch.setattr("keel_core.notifications.post_json", sink)
+    monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
+    repo.set_state("withdrawals_attested_at", 90_000 - 5 * 86_400)  # 2 days remain -> WARN
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(
+        broker, repo, _notify_config(frozenset({"attestation.expiring"})), now_ts=90_000
+    )
+
+    assert result.enter_results[0].placed is True  # the cycle itself traded normally
+    assert len(sink.calls) == 1
+    assert sink.calls[0][0] == "https://alerts.example/hook"
+    assert json.loads(sink.calls[0][1])["event"] == "attestation.expiring"
