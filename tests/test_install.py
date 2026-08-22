@@ -204,6 +204,9 @@ def test_the_packaged_refusal_names_the_download_and_not_a_command() -> None:
     assert "uv" not in message.split()
     assert "site-packages" not in message
     assert "config" in message and "database" in message
+    # D6 (#439): the refusal also names the page that explains HOW updates arrive, so the
+    # sentence a desktop user reads is not a dead end.
+    assert "docs/desktop-install.md" in message
 
 
 def test_keel_update_refuses_a_packaged_install_and_says_why(
