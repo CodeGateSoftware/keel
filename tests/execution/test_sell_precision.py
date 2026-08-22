@@ -174,14 +174,27 @@ def test_lookup_fetches_and_returns_the_requested_increment() -> None:
     assert _base_increment_for(broker, repo, "XLM-USD", NOW) == Decimal("0.000001")
 
 
-def test_one_fetch_caches_every_product_not_just_the_one_asked_for() -> None:
-    """`list_products` returns ~900 products; re-fetching per allowlisted asset would be absurd."""
+def test_a_second_call_for_the_same_product_is_served_from_cache() -> None:
     repo, broker = _Repo(), _Broker(PRODUCTS)
     _base_increment_for(broker, repo, "XLM-USD", NOW)
     assert broker.calls == 1
 
-    assert _base_increment_for(broker, repo, "BTC-USD", NOW) == Decimal("0.00000001")
-    assert broker.calls == 1  # served from the cache the first call populated
+    assert _base_increment_for(broker, repo, "XLM-USD", NOW) == Decimal("0.000001")
+    assert broker.calls == 1  # no second venue call
+
+
+def test_a_miss_writes_exactly_one_row_not_one_per_product() -> None:
+    """The review finding this test exists for.
+
+    `set_state` commits per call, so caching all ~900 products would mean ~900 fsyncs inside the
+    order-placement path -- the most latency-sensitive moment in the engine -- to save a handful
+    of `list_products` calls per week. One row per miss is the right way round.
+    """
+    repo, broker = _Repo(), _Broker(PRODUCTS)
+    _base_increment_for(broker, repo, "XLM-USD", NOW)
+
+    assert repo.writes == 1
+    assert list(repo.state) == ["base_increment:XLM-USD"]
 
 
 def test_a_stale_entry_is_refetched() -> None:

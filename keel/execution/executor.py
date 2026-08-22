@@ -364,8 +364,12 @@ def _base_increment_for(
     (no broker in paper mode, a venue error, a malformed or absent field) returns `None`, and the
     exit proceeds exactly as it did before #516.
 
-    One `list_products` call returns every product, so a miss caches ALL of them rather than
-    re-fetching ~900 products once per allowlisted asset.
+    **Exactly ONE row is written per miss, deliberately, even though the response carries every
+    product.** `Repository.set_state` commits per call, so caching all ~900 would mean ~900
+    commits -- 900 fsyncs -- inside the order-placement path, which is the most latency-sensitive
+    moment in the engine. The alternative it buys is a handful of extra `list_products` calls:
+    one per allowlisted product per TTL, so roughly six a week at the current allowlist. Trading
+    900 disk syncs during an order to save six network calls a week is the wrong way round.
     """
     key = f"{BASE_INCREMENT_PREFIX}{product_id}"
     cached = repo.get_state(key)
@@ -385,21 +389,14 @@ def _base_increment_for(
         log_venue_failure(logger, "executor.base_increment_fetch_failed", product=product_id)
         return None
 
-    found: Decimal | None = None
     for product in products or []:
-        pid = product.get("product_id") if isinstance(product, dict) else None
-        if not isinstance(pid, str):
+        if not isinstance(product, dict) or product.get("product_id") != product_id:
             continue
         increment = _coerce_increment(product.get("base_increment"))
-        if increment is None:
-            continue
-        repo.set_state(
-            f"{BASE_INCREMENT_PREFIX}{pid}",
-            {"increment": str(increment), "fetched_at": now_ts},
-        )
-        if pid == product_id:
-            found = increment
-    return found
+        if increment is not None:
+            repo.set_state(key, {"increment": str(increment), "fetched_at": now_ts})
+        return increment
+    return None
 
 
 def _coerce_increment(raw: object) -> Decimal | None:
