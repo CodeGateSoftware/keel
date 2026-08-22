@@ -1972,6 +1972,58 @@ def test_paper_seed_excludes_accrued_but_unpurified_reward_income(repo, monkeypa
     assert repo.get_state("paper_cash_usdc") == Decimal("40000")
 
 
+def test_purified_paper_seed_logs_the_subtraction(repo, monkeypatch, caplog):
+    """Observability for #490: the purification subtraction must not be silent. The seed event
+    carries the mark-to-market read, the pending purification subtracted from it, and the final
+    seed -- the before/after an operator needs to see WHY a balance-derived seed is smaller than
+    the balance the broker reports."""
+    repo.upsert_transaction(_reward_income_tx("rx1", "2000"))
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    monkeypatch.setattr(agent, "_mark_to_market_equity", lambda *a, **k: Decimal("42000"))
+
+    with caplog.at_level(logging.INFO):
+        run_once(broker, repo, cfg, now_ts=90_000)
+
+    events = [
+        (r.getMessage(), getattr(r, _FIELDS_ATTR, {}))
+        for r in caplog.records
+        if r.getMessage() == "agent.paper_seed_purified"
+    ]
+    assert events == [
+        (
+            "agent.paper_seed_purified",
+            {"mark_to_market": "42000", "pending_purification": "2000", "seed": "40000"},
+        )
+    ]
+
+
+def test_a_seed_fully_consumed_by_pending_purification_warns(repo, monkeypatch, caplog):
+    """The clamp is the loudest case: pending purification at or above the mark-to-market read
+    floors `sizing_equity` at zero, and a `paper_cash_usdc` of 0 must arrive with a WARNING
+    that explains it, not read as a broken account."""
+    repo.upsert_transaction(_reward_income_tx("rx1", "2000"))
+    broker = FakeBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0")))
+    monkeypatch.setattr(agent, "_mark_to_market_equity", lambda *a, **k: Decimal("1500"))
+
+    with caplog.at_level(logging.WARNING):
+        run_once(broker, repo, cfg, now_ts=90_000)
+
+    assert repo.get_state("paper_cash_usdc") == Decimal("0")
+    clamps = [
+        (r.getMessage(), getattr(r, _FIELDS_ATTR, {}))
+        for r in caplog.records
+        if r.getMessage() == "agent.paper_seed_clamped_to_zero"
+    ]
+    assert clamps == [
+        (
+            "agent.paper_seed_clamped_to_zero",
+            {"mark_to_market": "1500", "pending_purification": "2000"},
+        )
+    ]
+
+
 def test_funded_paper_seed_is_the_configured_amount_not_purified(repo):
     """The other seed branch is a DELIBERATE operator-chosen funding amount, not a balance
     read -- it contains no reward accruals by construction, so purification does not apply to

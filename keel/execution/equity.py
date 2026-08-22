@@ -63,7 +63,11 @@ def pending_purification_usd(repo: Repository) -> Decimal:
     `keel purification` renders as "TOTAL OWED TO CHARITY". Only entries classified
     NON_COMPLIANT count: CLEAN trading activity is not owed, and `REVIEW` (unclassified) is
     deliberately excluded -- over-purifying would misstate a religious obligation as fact
-    (`compliance.purification.classify`'s own posture).
+    (`compliance.purification.classify`'s own posture). That exclusion cuts the other way for
+    the sizing base below: a reward-type string `classify` does not recognize stays in sizing
+    equity -- the safe direction for the fiqh report, the wrong direction for sizing -- and is
+    bounded only by observation (every Coinbase reward string seen to date matches a
+    `NON_COMPLIANT_MARKERS` entry).
 
     The report is CUMULATIVE over the imported ledger and carries no discharge record, so
     "pending" here means "everything the ledger shows as owed". For the sizing use below that

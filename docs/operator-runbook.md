@@ -59,6 +59,10 @@ This is not a trading decision the system can veto; it is an account setting onl
 > it measures what the account actually holds, and a breaker must trip on real value, not on a
 > post-obligation fiction. Discharging the owed amount (`keel purification` to see it) is still your
 > act; keep the imported transaction ledger current so the subtraction sees what actually accrued.
+> Note that no discharge is recorded — `total_owed_usd` is lifetime-cumulative (`keel purification`
+> renders the same cumulative report), so an amount already given away keeps subtracting from future
+> balance-derived seeds, which is the conservative direction; correcting or removing ledger rows is
+> the remedy.
 
 ### 2. Zakat estimate — **report-only, not blocking**
 

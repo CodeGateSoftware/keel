@@ -532,7 +532,27 @@ def _seed_paper_account_if_needed(
             # -- exactly the equity `_paper_enter` sizes from via `equity_override` -- and
             # riba compounds into position size (discussion #472). The FUNDED branch above
             # is an operator-chosen constant, not a balance read, and is purified by no one.
-            seed = equity_mod.sizing_equity(mtm, equity_mod.pending_purification_usd(repo))
+            pending = equity_mod.pending_purification_usd(repo)
+            seed = equity_mod.sizing_equity(mtm, pending)
+            # Observable, not silent: this is the one equity figure the system derives from a
+            # live balance read, so the subtraction's before/after belongs in the log beside
+            # the unavailable-read warning above.
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.paper_seed_purified",
+                mark_to_market=str(mtm),
+                pending_purification=str(pending),
+                seed=str(seed),
+            )
+            if mtm > 0 and seed == Decimal("0"):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "agent.paper_seed_clamped_to_zero",
+                    mark_to_market=str(mtm),
+                    pending_purification=str(pending),
+                )
         paper_trader.seed_cash(seed, now_ts)
 
 
