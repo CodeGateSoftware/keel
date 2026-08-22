@@ -551,7 +551,11 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
             )
         )
     else:
-        detail = f"{len(judged)} judged series are current within the fetch tolerance"
+        if judged:
+            verb = "is" if len(judged) == 1 else "are"
+            detail = f"{len(judged)} judged series {verb} current within the fetch tolerance"
+        else:
+            detail = "0 series to judge -- every series is missing"
         if defused:
             detail += f"; market closed -- staleness defused on {len(defused)} series (FR-9)"
         findings.append(Finding("data.stale", OK, "series current", detail, "-"))

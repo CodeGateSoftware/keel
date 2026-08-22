@@ -271,10 +271,47 @@ def test_all_rows_without_atr_warn_no_atr_data() -> None:
     assert finding.fix == "keel fetch"
 
 
+def test_zero_atr_row_is_no_data_not_a_zero_band() -> None:
+    # atr=0 is non-None but non-positive: no meaningful stop distance, so it takes the same
+    # no_data WARN path as atr=None -- never a band computed off a zero ATR.
+    zero = AdmissibilityRow(product_id="SOL-USD", price=Decimal("0"), atr=Decimal("0"))
+    (finding,) = admissibility_findings([BTC, zero], EQUITY, RISK, Decimal("1000"))
+    assert finding.status == "warn"
+    assert "SOL-USD: no ATR data" in finding.detail
+    assert "keel fetch" in finding.fix
+
+
 def test_band_arithmetic_is_pinned_exactly() -> None:
     (finding,) = admissibility_findings([BTC], EQUITY, RISK, Decimal("300"))
     assert "250.00" in finding.detail  # band low  = 2.0x ATR stop
     assert "333.33" in finding.detail  # band high = 1.5x ATR stop
+
+
+# Band-boundary contract, hand-computed the same way: equity 4800, risk_pct 0.01 -> a $48
+# budget; price 100, atr 20 -> stop band 60..70:
+#   mult 1.5 -> stop 70, qty 48/30 = 1.6 -> notional 160 (band high)
+#   mult 2   -> stop 60, qty 48/40 = 1.2 -> notional 120 (band low)
+_BAND_ROW = AdmissibilityRow(product_id="BTC-USD", price=Decimal("100"), atr=Decimal("20"))
+
+
+def test_band_high_landing_on_cap_fits() -> None:
+    # guards.py vetoes only when notional is STRICTLY greater than the cap, so a band whose
+    # high edge lands exactly on the cap fits -- doctor must not warn where the rail passes.
+    (finding,) = admissibility_findings(
+        [_BAND_ROW], Decimal("4800"), Decimal("0.01"), Decimal("160")
+    )
+    assert finding.status == "ok"
+    assert "160.00" in finding.detail
+
+
+def test_band_low_landing_on_cap_is_marginal_warn() -> None:
+    # the cap sits exactly on the band's low edge: 2x ATR fits, 1.5x does not -- marginal.
+    (finding,) = admissibility_findings(
+        [_BAND_ROW], Decimal("4800"), Decimal("0.01"), Decimal("120")
+    )
+    assert finding.status == "warn"
+    assert "BTC-USD" in finding.detail
+    assert "straddles" in finding.detail
 
 
 # -- per-product data health (#443 slice 2) ------------------------------------------------------
@@ -361,6 +398,20 @@ def test_empty_series_list_says_none_configured() -> None:
     (_missing, stale_f, _gaps) = data_health_findings([])
     assert stale_f.status == "ok"
     assert "no series configured" in stale_f.headline
+
+
+def test_stale_ok_wording_all_missing_and_singular_count() -> None:
+    # every series missing leaves nothing to judge: the OK detail must say that, not claim
+    # series are current; and a single judged series reads "is current", not "are current".
+    cold = _series(_fresh(n_candles=0, last_ts=None, missing=True, stale=True))
+    (_missing, all_missing, _gaps) = data_health_findings([cold])
+    assert all_missing.status == "ok"
+    assert "0 series to judge" in all_missing.detail
+    assert "every series is missing" in all_missing.detail
+
+    (_missing, single, _gaps) = data_health_findings([_series(_fresh())])
+    assert single.status == "ok"
+    assert "1 judged series is current" in single.detail
 
 
 def test_exit_code_fails_on_data_missing() -> None:
