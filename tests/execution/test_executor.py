@@ -30,7 +30,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution import guards
+from keel.execution import guards, sizing
 from keel.execution.executor import (
     CancelPending,
     CancelUnavailable,
@@ -2891,3 +2891,29 @@ class TestMaxSpreadEntryGate:
         assert broker.place_calls == []
         assert repo.get_orders() == []
         assert consulted == []
+
+
+def test_unserialisable_size_refuses_the_order_without_raising(repo, monkeypatch):
+    """#513: a size the venue's units cannot express refuses THIS order, and only this order.
+
+    `agent.run_once` does not wrap its `executor.execute` call, so an exception escaping here
+    would abort the whole cycle and skip every product after it -- turning one unserialisable
+    order into a silent outage. Refuse-and-log is what every other unknown in this engine does.
+
+    Reached by monkeypatching the increment lookup rather than by contriving a config: rails 1
+    and 18 already confine live orders to the allowlist and the configured settlement currency,
+    so an unknown quote currency cannot reach serialisation in practice. This path is
+    defence-in-depth, and it still must not be the thing that crashes.
+    """
+    monkeypatch.setattr(sizing, "quote_increment_for", lambda _product_id: None)
+    broker = FakeBroker()
+
+    result = execute(
+        _enter_signal(), broker, repo, _config(), mode="confirm", confirm_fn=_approve, now_ts=NOW_TS
+    )
+
+    assert result.placed is False
+    assert "size precision unavailable" in result.reason
+    assert broker.place_calls == []
+    assert broker.preview_calls == []
+    assert repo.get_orders() == []

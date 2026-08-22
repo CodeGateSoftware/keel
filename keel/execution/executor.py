@@ -526,7 +526,31 @@ def _run_order(
         )
 
     if order_configuration is None:
-        order_configuration = _order_configuration(intent)
+        # A size that cannot be expressed in the venue's units REFUSES THIS ORDER, and refuses
+        # only this order (#513). `agent.run_once` does not wrap its `executor.execute` call, so
+        # letting `SizePrecisionUnavailable` escape here would abort the whole cycle and skip
+        # every product after this one -- turning a single unserialisable order into a silent
+        # outage. Refuse-and-log is what every other unknown in this engine does; a raise here
+        # would be the one that behaves differently.
+        try:
+            order_configuration = _order_configuration(intent)
+        except SizePrecisionUnavailable as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor.size_precision_unavailable",
+                product=intent.product_id,
+                side=intent.side,
+                notional=str(intent.notional),
+                detail=str(exc),
+            )
+            return ExecutionResult(
+                placed=False,
+                order_id=None,
+                vetoed_by=[],
+                preview=None,
+                reason=f"size precision unavailable: {exc}",
+            )
     try:
         preview = broker.preview_order(intent.product_id, intent.side, order_configuration)
     except Exception:
@@ -934,7 +958,14 @@ def _warn_if_market_routing_overrides_entry(
     if order_configuration is None:
         # Same resolution `_run_order` performs: no explicit configuration means the default
         # routing, which today is always market.
-        order_configuration = _order_configuration(intent)
+        try:
+            order_configuration = _order_configuration(intent)
+        except SizePrecisionUnavailable:
+            # This function is a DIAGNOSTIC (it records how far the venue's book sat from the
+            # intent). An order whose size cannot be serialised has already been refused
+            # upstream, so there is nothing to measure and nothing to report -- and a diagnostic
+            # must never be the thing that raises out of the order path.
+            return
     config_type = next(iter(order_configuration), "")
     if not config_type.startswith("market_"):
         return
