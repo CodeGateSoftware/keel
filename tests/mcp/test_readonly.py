@@ -7,9 +7,13 @@ server is born inside the fence rather than moved into one later.
 
 Six walls, each mechanical:
 
-1. **The vocabulary.** Every tool NAME and DESCRIPTION is free of the write verbs below
-   (word-boundary matched, so a description has to actually use the word, not merely share
-   letters with it). The vocabulary is defined HERE, independently of `keel/capabilities.py`,
+1. **The vocabulary.** Every tool NAME and DESCRIPTION is free of the write verbs below,
+   matched word-boundary against NORMALIZED tokens: underscores are inserted at lower->Upper
+   camelCase boundaries and the text is split on hyphens/underscores/spaces (any
+   non-alphanumeric run), so "armAutonomy", "re-arm" and "arm_now" all expose the token "arm"
+   -- a description has to actually use the word, not merely share letters with it or glue it
+   to a neighbour with typography. The vocabulary is defined HERE, independently of
+   `keel/capabilities.py`,
    because the registry only inventories GATED mutators -- `keel subscription attest` and
    `keel rules promote --force` mutate with no gate at all, so a vocabulary derived from
    CAPABILITIES would bless words those commands use. It is then cross-checked AGAINST the
@@ -20,7 +24,10 @@ Six walls, each mechanical:
 3. **The write-deny scan.** An AST walk over every `keel/mcp/*.py` rejecting any method call
    whose attribute name starts with a write-ish prefix (`set_`, `upsert_`, `record_`,
    `arm`, `attest`, `execute`, ...). The allowlist is EMPTY and pinned empty: a read-only
-   server has no legitimate write call to allow.
+   server has no legitimate write call to allow. One narrow exemption, still not an allowlist
+   entry: `.execute("PRAGMA ...")` with a CONSTANT literal is connection configuration, not
+   DML -- it exists because the package must run `PRAGMA query_only = ON`, the engine-level
+   read-only enforcement, and no row write can be spelled as a PRAGMA.
 4. **No gate call sites.** `_require_interactive_confirmation` appears nowhere in the package.
    A server must never HOLD the ceremony gate -- the gate is for terminals, and its
    fail-closed property is precisely what a pipe-connected process must not borrow.
@@ -55,8 +62,9 @@ _DOCS = _ROOT / "docs" / "mcp-server.md"
 
 #: The write vocabulary. Independent of `keel/capabilities.py` on purpose (the registry covers
 #: only GATED mutators; unattested mutators like `keel subscription attest` would define it).
-#: Matched with word boundaries, so "orders" does not trip "order_create" and "attestation"
-#: does not trip "attest" -- a description has to use the exact word.
+#: Matched word-boundary against the TOKENS of the normalised text (see `_tokens`), so
+#: "orders" does not trip "order_create" and "attestation" does not trip "attest" -- a
+#: description has to use the exact word, however it is spelled together.
 FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
     "arm",
     "release",
@@ -77,7 +85,36 @@ FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
     "place",
 )
 
-_FORBIDDEN_WORD_RES = tuple(re.compile(rf"\b{re.escape(word)}\b") for word in FORBIDDEN_SUBSTRINGS)
+#: A lower->Upper boundary is where two words are glued without any separator a human would
+#: notice: "armAutonomy", "promoteForce", "reArm". Inserting an underscore there and then
+#: splitting on any non-alphanumeric run turns every typography -- camelCase, hyphens,
+#: underscores, spaces -- into the same flat token list.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _tokens(text: str) -> list[str]:
+    """The wall-1 normalizer: camelCase split + separator split, lowercased.
+
+    `_tokens("armAutonomy") == ["arm", "autonomy"]`, `_tokens("re-arm") == ["re", "arm"]`,
+    `_tokens("arm_now") == ["arm", "now"]` -- three spellings of one verb, one token list."""
+    spaced = _CAMEL_BOUNDARY.sub("_", text)
+    return [token.lower() for token in re.split(r"[^A-Za-z0-9]+", spaced) if token]
+
+
+def _forbidden_hits(text: str) -> list[str]:
+    """Which vocabulary words occur in `text`, word-boundary matched against every token.
+
+    A vocabulary word that is itself compound ("order_create") is matched as its own token
+    sequence, so "orderCreate" and "order-create" trip it exactly as "order_create" does."""
+    tokens = _tokens(text)
+    hits: list[str] = []
+    for word in FORBIDDEN_SUBSTRINGS:
+        parts = _tokens(word)
+        width = len(parts)
+        if any(tokens[i : i + width] == parts for i in range(len(tokens) - width + 1)):
+            hits.append(word)
+    return hits
+
 
 #: Mutating actions the #453 registry does NOT cover (no gate, so no row). The vocabulary must
 #: catch these too -- this is the whole reason it is not derived from CAPABILITIES.
@@ -119,14 +156,6 @@ FORBIDDEN_IMPORTS: tuple[str, ...] = ("keel.agent", "keel.execution")
 
 def _mcp_sources() -> list[Path]:
     return sorted(_MCP_DIR.glob("*.py"))
-
-
-def _forbidden_hits(text: str) -> list[str]:
-    return [
-        word
-        for word, pattern in zip(FORBIDDEN_SUBSTRINGS, _FORBIDDEN_WORD_RES)
-        if pattern.search(text)
-    ]
 
 
 # -- wall 1: the vocabulary ----------------------------------------------------------------------
@@ -172,6 +201,38 @@ def test_the_vocabulary_catches_the_unregistered_mutators() -> None:
         )
 
 
+def test_the_normalizer_catches_verbs_glued_by_typography() -> None:
+    """False-capable: the spellings word-boundary matching alone would MISS. camelCase,
+    hyphen, underscore -- a model reads all three as the verb, so the scan must too."""
+    assert _tokens("armAutonomy") == ["arm", "autonomy"]
+    assert _forbidden_hits("armAutonomy") == ["arm", "autonomy"]
+    assert _forbidden_hits("re-arm") == ["arm"]
+    assert _forbidden_hits("arm_now") == ["arm"]
+
+
+def test_a_hypothetical_tool_named_reArm_would_be_flagged() -> None:
+    """The wall is proven false-capable against the exact evasion it exists for: a tool whose
+    NAME glues the write verb into camelCase that plain word-boundary matching waves through."""
+    assert _forbidden_hits("reArm") == ["arm"]
+
+
+def test_a_hypothetical_description_containing_promoteForce_would_be_flagged() -> None:
+    description = "run promoteForce to push a candidate rule past the promotion gate"
+    assert _forbidden_hits(description) == ["promote"]
+
+
+def test_the_normalizer_still_ignores_words_that_merely_share_letters() -> None:
+    """The tightening must not become a false-positive machine: near-miss words stay legal."""
+    assert _forbidden_hits("orders") == []
+    assert _forbidden_hits("executor") == []
+    assert _forbidden_hits("attestation") == []
+    assert _forbidden_hits("veto_log") == []
+    assert _forbidden_hits("createdOrder") == []
+    # "createdOrder" is not "order_create": the tokens are ["created", "order"], and the
+    # vocabulary word's own sequence is ["order", "create"] -- sharing letters and even sharing
+    # a token is not using the word.
+
+
 def test_there_are_exactly_eight_tools() -> None:
     assert len(TOOLS) == 8
     assert len({tool.name for tool in TOOLS}) == 8
@@ -214,16 +275,38 @@ def test_no_capability_row_is_referenced_from_the_server_package() -> None:
 # -- wall 3: the AST write-deny scan --------------------------------------------------------------
 
 
+def _constant_pragma(call: ast.Call) -> bool:
+    """True for `.execute("PRAGMA ...")` with a constant string literal.
+
+    The ONE exemption from the write-deny scan, and it is narrower than the allowlist it
+    replaces: a PRAGMA is connection configuration, not row data, and no DML statement can be
+    spelled as one. It exists because the package must run `PRAGMA query_only = ON` -- the
+    engine-level read-only enforcement -- and that call is itself `.execute(...)`-shaped. A
+    dynamic (non-constant) argument does NOT qualify: `repo.execute(sql)` is still a write."""
+    if not call.args:
+        return False
+    first = call.args[0]
+    return (
+        isinstance(first, ast.Constant)
+        and isinstance(first.value, str)
+        and first.value.strip().upper().startswith("PRAGMA")
+    )
+
+
 def _write_calls_in(source: str) -> list[str]:
     """Every `<expr>.<attr>(...)` whose attribute starts with a write prefix, minus the
-    (empty) allowlist."""
+    (empty) allowlist and minus constant-PRAGMA `execute` calls (see `_constant_pragma`)."""
     tree = ast.parse(source)
     found: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         attr = node.func.attr
-        if attr.startswith(WRITE_CALL_PREFIXES) and attr not in WRITE_CALL_ALLOWLIST:
+        if (
+            attr.startswith(WRITE_CALL_PREFIXES)
+            and attr not in WRITE_CALL_ALLOWLIST
+            and not _constant_pragma(node)
+        ):
             found.append(attr)
     return found
 
@@ -250,13 +333,23 @@ def test_the_write_scan_is_proven_false_capable() -> None:
     snippet = (
         "def readonly(rows):\n"
         "    return rows\n"
-        "def dangerous(repo):\n"
+        "def dangerous(repo, sql):\n"
         "    repo.set_state('kill_switch', True)\n"
         "    repo.upsert_candles('BTC', 'ONE_HOUR', [])\n"
         "    repo.arm_autonomy()\n"
+        "    repo.execute('INSERT INTO orders (mode) VALUES (\\'live\\')')\n"
+        "    repo.execute(sql)\n"
+        "    repo.execute('PRAGMA query_only = ON')\n"
         "    return readonly([])\n"
     )
-    assert sorted(set(_write_calls_in(snippet))) == ["arm_autonomy", "set_state", "upsert_candles"]
+    # the constant-PRAGMA execute is exempt (it is the read-only enforcement itself); the
+    # literal INSERT and the dynamic `sql` are both caught
+    assert sorted(set(_write_calls_in(snippet))) == [
+        "arm_autonomy",
+        "execute",
+        "set_state",
+        "upsert_candles",
+    ]
 
 
 # -- wall 4: no gate call sites -------------------------------------------------------------------

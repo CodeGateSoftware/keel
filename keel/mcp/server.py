@@ -45,13 +45,30 @@ _METHOD_NOT_FOUND = -32601
 _INTERNAL_ERROR = -32603
 
 
-def _server_version() -> str:
-    """The distribution version and nothing else. `build_info()` shells out to git; the
-    handshake wants a string, and a subprocess per connection is not a price worth paying for
-    a commit hash the client cannot use. Falls back to `unknown`, never raises."""
-    from keel.version import _package_version
+#: The handshake's version, resolved ONCE per process. `build_info()` shells out to git, and
+#: `initialize` is answered for every connection -- paying that subprocess cost per handshake
+#: was the inconsistency (the doctor tool pays it on every call and is right to). Cached on
+#: first use so it is paid exactly once; `None` means "not resolved yet".
+_HANDSHAKE_VERSION: str | None = None
 
-    return _package_version()
+
+def _server_version() -> str:
+    """The running build's full version (`0.1.0+<commit>`), resolved once per process.
+
+    `build_info()` shells out to git, which is why the answer is cached in `_HANDSHAKE_VERSION`
+    rather than recomputed per `initialize`. Any failure falls back to the distribution version
+    alone -- the handshake wants a string, never an exception."""
+    global _HANDSHAKE_VERSION
+    if _HANDSHAKE_VERSION is None:
+        try:
+            from keel.version import build_info
+
+            _HANDSHAKE_VERSION = build_info().full_version
+        except Exception:  # a handshake must never die over a version string
+            from keel.version import _package_version
+
+            _HANDSHAKE_VERSION = _package_version()
+    return _HANDSHAKE_VERSION
 
 
 def _write_message(writer: IO[str], payload: dict[str, Any]) -> None:

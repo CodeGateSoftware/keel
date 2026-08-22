@@ -45,8 +45,14 @@ DEFAULT_LOG_PATH = "logs/keel.log"
 ORDERS_DEFAULT_LIMIT = 50
 ORDERS_MAX_LIMIT = 200
 VETO_DEFAULT_LIMIT = 100
+#: The same cap for the veto log. An UNBOUNDED `limit` here was a context-exhaustion vector:
+#: one call with `limit=10**9` would happily marshal a whole engine log into the response.
+VETO_MAX_LIMIT = 500
 TRIALS_DEFAULT_TAIL = 20
 TRIALS_MAX_TAIL = 100
+#: `verify_chain` reports one error PER broken row, and a corrupted ledger is broken from the
+#: damage onward -- a tool response is not the place to restate every one of them.
+TRIALS_MAX_CHAIN_ERRORS = 20
 
 #: The corpora `keel.commands.research_console.corpus_path` resolves -- repeated here only so
 #: the schema an MCP client sees can enumerate them.
@@ -108,7 +114,15 @@ def _open_readonly_repo(db_path: str) -> Any:
     """A Repository over a plain connection -- deliberately WITHOUT `migrate`, and only over a
     database that already exists. `sqlite3.connect` CREATES the file it cannot find, which
     would make the read-only server a writer the first time it was pointed at a typo; the
-    existence check turns that into a calm error instead."""
+    existence check turns that into a calm error instead.
+
+    Read-only is enforced at TWO layers. `connect()` runs `PRAGMA journal_mode = WAL`, which is
+    a FILE-level metadata side effect the `total_changes` pin cannot see: opening a
+    rollback-journal database flips it to WAL, exactly as the existing keel web surface does
+    when it connects the same way -- stated here rather than hidden. `PRAGMA query_only = ON`
+    then makes SQLite itself reject every subsequent write on THIS connection (row writes and
+    schema writes alike) at the engine level, so read-only does not depend on this package's
+    call discipline alone."""
     from keel.data.db import connect
     from keel.data.repository import Repository
 
@@ -117,7 +131,9 @@ def _open_readonly_repo(db_path: str) -> Any:
             f"no deployment database at {db_path} -- this surface only reads existing state; "
             "see `keel init`"
         )
-    return Repository(connect(db_path))
+    conn = connect(db_path)
+    conn.execute("PRAGMA query_only = ON")
+    return Repository(conn)
 
 
 def _log_lines(log_path: str) -> list[str]:
@@ -226,7 +242,7 @@ def build_tools(
 
         _db, _config, log = _deployment(db_path, config_path, log_path)
         since_ts = float(args.get("since_ts") or (time.time() - VETO_WINDOW_SEC))
-        limit = max(int(args.get("limit") or VETO_DEFAULT_LIMIT), 1)
+        limit = min(max(int(args.get("limit") or VETO_DEFAULT_LIMIT), 1), VETO_MAX_LIMIT)
         events: list[dict[str, Any]] = []
         try:
             with open(log, encoding="utf-8", errors="replace") as handle:  # noqa: SIM115
@@ -265,14 +281,31 @@ def build_tools(
 
     def _trials(args: dict[str, Any]) -> dict[str, Any]:
         tail = min(max(int(args.get("tail") or TRIALS_DEFAULT_TAIL), 1), TRIALS_MAX_TAIL)
-        path = Path(args.get("path") or trials_ledger.DEFAULT_LEDGER_PATH)
+        ledger = Path(trials_ledger.DEFAULT_LEDGER_PATH)
+        raw_path = args.get("path")
+        if raw_path is None:
+            path = ledger
+        else:
+            # The same confinement `reports` applies: a bare file name resolved inside the
+            # ledger's own directory, never a client-chosen filesystem path -- `path` arrives
+            # over a pipe from a model, and "/etc/passwd" must be refused, not read.
+            name = str(raw_path)
+            if name != Path(name).name or name in (".", ".."):
+                raise ValueError(
+                    f"path: {name!r} -- a bare file name beside the default ledger, not a path"
+                )
+            path = ledger.parent / name
         trials = trials_ledger.read_trials(path)
         rows, decisions = trials_ledger.trial_counts(trials)
+        chain_errors = trials_ledger.verify_chain(path)
+        if len(chain_errors) > TRIALS_MAX_CHAIN_ERRORS:
+            hidden = len(chain_errors) - TRIALS_MAX_CHAIN_ERRORS
+            chain_errors = chain_errors[:TRIALS_MAX_CHAIN_ERRORS] + [f"+{hidden} more chain errors"]
         return {
             "path": str(path),
             "rows": rows,
             "decisions": decisions,
-            "chain_errors": trials_ledger.verify_chain(path),
+            "chain_errors": chain_errors,
             "recent": [asdict(trial) for trial in trials[-tail:]],
         }
 
@@ -371,7 +404,12 @@ def build_tools(
                 "type": "object",
                 "properties": {
                     "since_ts": {"type": "number"},
-                    "limit": {"type": "integer", "minimum": 1, "default": VETO_DEFAULT_LIMIT},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": VETO_MAX_LIMIT,
+                        "default": VETO_DEFAULT_LIMIT,
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -391,12 +429,18 @@ def build_tools(
             name="trials",
             description=(
                 "The research trials ledger: row and decision counts, hash-chain verification "
-                "errors, and the most recent rows. Experiments only -- money has its own ledger."
+                "errors (the first 20, then a count of the rest), and the most recent rows. "
+                "Experiments only -- money has its own ledger."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "a bare file name beside the default ledger -- never a filesystem path"
+                        ),
+                    },
                     "tail": {
                         "type": "integer",
                         "minimum": 1,

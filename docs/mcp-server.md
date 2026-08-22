@@ -3,8 +3,10 @@
 A research assistant is the third reader the browser view and the TUI never reached: no
 window, no terminal, one JSON-RPC stream and a model on the other end of it. `keel mcp`
 serves that reader keel's state, logs and research record — and nothing it could act on.
-It cannot place, halt or release anything, and that is not a promise the docs make: it is a
-property `tests/mcp/test_readonly.py` enforces, written before the server existed.
+It cannot place, halt or release anything, and that claim is mechanically checked, not merely
+promised: `tests/mcp/test_readonly.py`, written before the server existed, pins it best-effort
+against naming and call-shape — honest about being a static scan, which cannot close dynamic
+dispatch.
 
 ## What it exposes
 
@@ -18,9 +20,9 @@ assistant and a terminal cannot be shown two different accounts of one deploymen
 | `capabilities` | The #453 capability inventory as rows: every action that widens what keel can do without asking again, and the gate covering it. Needs no database. |
 | `profiles` | The deployment's `config*.yaml` files as structured rows (allowlist, `risk_pct`, caps, DCA budget, granularities, auto-cycle interval). A file that will not load is listed with its error. |
 | `orders` | Rows from the orders audit log, filtered by mode/product/status, newest last, bounded by `limit` (default 50, max 200). |
-| `veto_log` | Parsed `executor.order_vetoed` events from the engine's JSONL log since a timestamp (default the last 24h), with each event's rail violations. |
+| `veto_log` | Parsed `executor.order_vetoed` events from the engine's JSONL log since a timestamp (default the last 24h), with each event's rail violations, bounded by `limit` (default 100, max 500). |
 | `purification` | The KB §65.9 income purification report: what is owed by asset, units from tainted sources, entries awaiting human classification. Report-only, like the CLI. |
-| `trials` | The research trials ledger: row and decision counts, hash-chain verification errors, the most recent rows. Experiments only — money has its own ledger. |
+| `trials` | The research trials ledger: row and decision counts, hash-chain verification errors (first 20, then a count), the most recent rows. An optional `path` is a bare file name beside the default ledger, never a filesystem path. Experiments only — money has its own ledger. |
 | `reports` | The research corpora: list documents under `docs/research`, the experiments corpus or the reports corpus, or read one bounded document (bare name, never a path). |
 
 Money fields arrive as strings — the repo's TEXT-money convention, so a number is never
@@ -70,10 +72,12 @@ Because the write surface does not exist, and a test — not a promise — says 
 born inside the fence rather than moved into one later. Six walls:
 
 1. **A write-verb vocabulary.** Every tool name and description is checked, word-boundary
-   matched, against `arm`, `release`, `resume`, `spend`, `attest`, `promote`, `update`,
-   `reset`, `record`, `withdraw`, `autonomy`, `kill`, `trade`, `execute`, `order_create`,
-   `submit`, `place`. A description is what a model reads before choosing a tool; it must not
-   advertise a write.
+   matched against normalized tokens (underscores inserted at lower→Upper camelCase
+   boundaries, then split on hyphens/underscores/spaces — so `armAutonomy`, `re-arm` and
+   `arm_now` all expose the token `arm`), against `arm`, `release`, `resume`, `spend`,
+   `attest`, `promote`, `update`, `reset`, `record`, `withdraw`, `autonomy`, `kill`, `trade`,
+   `execute`, `order_create`, `submit`, `place`. A description is what a model reads before
+   choosing a tool; it must not advertise a write.
 2. **A registry mapping.** No `keel/mcp/*.py` references any #453 capability row's
    `module.function` — the gated actions are unreachable by name, not merely uncalled. And
    the vocabulary is defined independently of the registry, then cross-checked against every
@@ -84,6 +88,9 @@ born inside the fence rather than moved into one later. Six walls:
    prefix (`set_`, `upsert_`, `record_`, `insert_`, `arm`, `attest`, `execute`, ...). The
    allowlist is **empty, and pinned empty** — a read-only server has no legitimate write call
    to allow, so adding one requires a written argument in review, not an accident in a diff.
+   One narrow exemption, not an allowlist entry: `.execute("PRAGMA ...")` with a constant
+   literal is connection configuration, never DML — it exists because the package must run
+   `PRAGMA query_only = ON`, the engine-level read-only enforcement itself.
 4. **No gate call sites.** `_require_interactive_confirmation` appears nowhere in the package.
    A server must never hold the ceremony gate: its fail-closed property is for terminals, and
    a pipe-connected process borrowing it is how a cron job would come to look like a human.
@@ -98,6 +105,10 @@ And the runtime shape matches: every tool opens its own database connection **wi
 `migrate`** (the `keel/web/server.py` rule — a read-only view must not take a schema write
 lock against a database the agent may be mid-cycle on), drops it when done, and **refuses to
 open a database that does not exist** rather than letting `sqlite3.connect` create one.
+Stated honestly, opening does carry one file-level side effect: connecting flips a
+rollback-journal database to WAL — identical to the existing keel web surface, which connects
+the same way — while `PRAGMA query_only = ON` on the connection makes row writes impossible
+at the engine level.
 Doctor's gather — the one seam shared with the CLI — is pinned read-only at the SQLite level
 by a test that counts `total_changes` around a call.
 
