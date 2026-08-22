@@ -806,3 +806,59 @@ Note the counter-intuitive mechanic behind those numbers: **a tighter stop produ
 position**, because `size = risk ÷ stop-distance` (`keel/execution/sizing.py::size`). That is how
 a 1% risk becomes a **30% position** — `risk_pct` bounds what you lose if the stop holds, not what
 you spend.
+
+## Alerts and notifications
+
+Two outbound channels, one URL, zero control surface.
+
+**The CRITICAL webhook (always on when configured).** keel escalates act-now conditions by
+logging CRITICAL — `reconcile.position_unprotected` is the sharpest — and
+`WebhookAlertHandler` (`keel_core/alerting.py`) POSTs each such record off the machine. The
+URL lives in `KEEL_ALERT_WEBHOOK` (environment, or the git-ignored `.env` — it is closer to a
+credential than to configuration, and `config.yaml` is committed). No URL configured means
+no handler attached at all: an offline install makes zero network calls. This channel is
+unchanged by the notification layer below and stays independent of it.
+
+**Opt-in event notifications (default OFF).** The events an operator most needs are silent
+precisely because they are not errors — rail 17's attestation nearing expiry fails CLOSED and
+quietly vetoed a real setup for weeks before anyone opened the TUI. The notification layer
+(#444) delivers those over the SAME generic webhook, per-event opt-in in Freqtrade's
+`notification_settings` shape:
+
+```yaml
+# config.yaml — nothing is sent until an event is opted in here AND
+# KEEL_ALERT_WEBHOOK is set. Both, always.
+notifications:
+  format: plain        # plain = generic JSON (default); slack = {"text": ...} chat payload
+  events:
+    attestation.expiring: true
+    rail.armed: true
+    setup.unplaced: true
+    allowance.nearing_exhaustion: true
+    feed.stale_open_position: true
+```
+
+The taxonomy (thresholds are the ones `keel doctor` computes — the notification layer reads
+doctor's own findings, so the alert and the diagnostic can never disagree):
+
+| Event key | Fires when | Why it is not a CRITICAL log |
+|---|---|---|
+| `attestation.expiring` | rail-17 withdrawal attestation has ≤2 of its 7 TTL days left (or has expired) | an expired attestation silently vetoes every entry — cycles keep running, nothing errors |
+| `rail.armed` | rail 16's consecutive-loss halt arms, or rail 11's drawdown reaches 20% | a halt is a correct state, not a fault; the kill switch is deliberately absent (you engaged it at a terminal — you know) |
+| `setup.unplaced` | a cycle detected an entry setup and could not place it | the veto is a WARNING; the rail-17 incident looked like a quiet week |
+| `allowance.nearing_exhaustion` | month-to-date BUY spend reaches 80% of the in-force rail-14 allowance | rail 14 only speaks when it vetoes, which is too late to re-tier |
+| `feed.stale_open_position` | a product's feed is stale while a position is open in it | the stale product is skipped at INFO; an open position's exits ride on that stopped data |
+
+Payloads: `plain` is a flat JSON object (`event`, `severity`, `category`, `message`, plus the
+numbers — `pct_used`, days remaining in the message); `slack` is Slack-compatible
+`{"text": ...}` — accepted natively by Slack and Mattermost, and by Discord via a `/slack`
+webhook endpoint. Delivery is one attempt per event per cycle, fire-and-forget at the end of
+each agent cycle: a dead endpoint costs a notification, never a cycle, and a state that
+persists re-alerts on the next cycle anyway.
+
+**Notify-only, by design.** There is no remote control surface — no command, query or
+capability arrives through notifications, ever. Every capability-increasing action stays
+TTY-gated (`keel capabilities` inventories them; #436), which is why this feature adds zero
+gate call sites: outbound messages cannot release a rail, arm autonomy, or place an order.
+The layer also writes nothing back — it reads the same repo keys `keel doctor` reads and
+sends; that is the whole of it.
