@@ -59,6 +59,33 @@ def test_every_distribution_declares_the_same_floor():
     )
 
 
+def test_mypy_checks_the_code_at_the_declared_floor():
+    """`[tool.mypy] python_version` must equal `requires-python`, so the floor and the
+    checker cannot drift.
+
+    mypy's `python_version` is the interpreter it SIMULATES while checking. Left higher than
+    the floor, it silently blesses syntax an interpreter the metadata invites would refuse at
+    import -- the same failure shape as `ruff format`'s `target-version` mismatch
+    (`tests/test_packaging.py`), one field over. Left lower, it flags 3.11-valid code the
+    shipped packages actually use, and someone "fixes" the code instead of the config.
+
+    Only the root `pyproject.toml` carries a `[tool.mypy]` section (every workspace member is
+    checked by that one config), so one comparison -- the checker's version against the floor
+    every distribution declares -- pins the whole workspace.
+    """
+    mypy = tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"]["mypy"]
+    checker = mypy["python_version"]
+    for name, data in _pyprojects().items():
+        requires = data["project"]["requires-python"]
+        assert requires.startswith(">="), (name, requires)
+        floor = requires[2:].strip()
+        assert checker == floor, (
+            f"{name} declares requires-python {requires!r} but mypy checks at "
+            f"python_version {checker!r} -- the floor and the checker have drifted; update "
+            "[tool.mypy] python_version in pyproject.toml to match requires-python"
+        )
+
+
 def test_the_binding_feature_that_sets_the_floor_still_exists():
     """The floor's REASON must stay true: `assert_never` (3.11+) must still be imported.
 
@@ -104,3 +131,27 @@ def test_the_floor_is_stated_where_a_contributor_reads_it():
     contributing = (_ROOT / "CONTRIBUTING.md").read_text()
     assert "3.11" in readme, "the README's setup section must state the 3.11 floor"
     assert "3.11" in contributing, "CONTRIBUTING.md must state the 3.11 floor"
+
+
+def test_mypy_checks_against_the_floor_it_promises():
+    """`[tool.mypy].python_version` must equal the floor `requires-python` promises.
+
+    The floor lives in two places that can drift apart: `requires-python = \">=3.11\"` in
+    every distribution and `[tool.mypy] python_version = \"3.11\"` in the root. Nothing fails
+    a build where they disagree -- mypy would happily check against 3.14 semantics while the
+    distributions promise 3.11, or vice versa, and the first victim is a contributor on the
+    floor version, who gets the checker's errors instead of the suite's. mypy must check
+    what the floor promises, so the two are pinned to each other here, where a drift is a
+    test failure instead of a silent mismatch (#316).
+    """
+    root = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    requires = root["project"]["requires-python"]
+    match = re.search(r"\s*(\d+)\.(\d+)", requires)
+    assert match, f"could not derive a Python minor version from requires-python {requires!r}"
+    floor_minor = f"{match.group(1)}.{match.group(2)}"
+    mypy_version = root["tool"]["mypy"]["python_version"]
+    assert mypy_version == floor_minor, (
+        f"mypy checks against python_version {mypy_version!r}, but the floor is {requires!r} "
+        f"(minor {floor_minor!r}); mypy must check what the floor promises -- set "
+        "[tool.mypy].python_version in the root pyproject.toml to match requires-python"
+    )

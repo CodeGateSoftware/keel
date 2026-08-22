@@ -50,8 +50,8 @@ jobs:
       # versions scanned. Unlike the Snyk export there, dev dependencies are INCLUDED
       # deliberately: this job gates nothing, so the wider advisory net costs nothing, and
       # a CVE in the dev toolchain is still something a contributor's machine runs. Extras
-      # are included for the same reason; the repo's own seven distributions are excluded
-      # because they are the code under scan, not third-party dependencies of it.
+          # are included for the same reason; the repo's own eight distributions are excluded
+          # because they are the code under scan, not third-party dependencies of it.
       - name: Export the locked dependency set
         run: >
           uv export --frozen --all-extras --no-hashes
@@ -62,6 +62,7 @@ jobs:
           --no-emit-package keel-broker-alpaca
           --no-emit-package keel-broker-fake
           --no-emit-package keel-broker-robinhood
+          --no-emit-package keel-broker-kraken
           > requirements.lock.txt
 
       - name: Audit the locked dependency set

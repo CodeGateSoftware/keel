@@ -15,7 +15,16 @@ rather than passing because a hand-maintained list was never told), the audit is
 `uv export --frozen` (the lock as committed, never a fresh resolve), and the secrets rule
 is the honest one: the always-on scan workflows reference no secrets at all, and the
 optional tier may reference `SONAR_TOKEN`/`SNYK_TOKEN` ONLY from jobs a preflight guards
--- so a missing token can never redden a scheduled run, only skip it with an explanation.
+-- so a missing prerequisite can never redden a scheduled run, only skip it with an
+explanation.
+
+And #402 taught where "configured" stops: the tokens were created on 2026-08-18, the
+preflight flipped to ready, both scans ran for the first time -- and both FAILED, because
+each needs ORG-level configuration no repository secret can carry (SonarQube Cloud's
+mandatory `sonar.organization`; the Snyk organization on the snyk.io side). Every push to
+`main` went red for reasons the repository could not fix, which is the exact permanently-
+red-main outcome this tier was designed never to produce. The guard is therefore pinned
+PER SCANNER and must measure the scan's real readiness, not merely token existence.
 """
 
 from __future__ import annotations
@@ -189,18 +198,28 @@ def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard()
     """code-quality.yml may name SONAR_TOKEN/SNYK_TOKEN -- but only guarded.
 
     The optional tier's design constraint (its own header documents it): a job that needs
-    a token must declare `needs: preflight` and run under `if: needs.preflight.outputs.
-    configured == 'true'`, so a missing token SKIPS with an explanation instead of
-    reddening every scheduled run. This test pins the guard structurally, per job, so a
-    future edit cannot detach a token-referencing job from its preflight.
+    a token must declare `needs: preflight` and run under the readiness guard FOR ITS OWN
+    scanner, so a missing prerequisite SKIPS with an explanation instead of reddening
+    every push to main. #402 is what happens when the guard is coarser than the failure:
+    one shared `configured` flag was true the moment both tokens existed, so both scan
+    jobs started running while only one of each pair's prerequisites was in place. This
+    test pins the guard structurally, per job, so a future edit cannot detach a
+    token-referencing job from its preflight -- nor re-merge the two scanners into one
+    all-or-nothing flag.
     """
     workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
     jobs = workflow.get("jobs", {})
     assert "preflight" in jobs, (
         f"{_OPTIONAL_TIER} must keep its preflight job -- it is what lets the optional "
-        "tier skip cleanly while the tokens do not exist"
+        "tier skip cleanly while its prerequisites are missing"
     )
-    guard = "needs.preflight.outputs.configured == 'true'"
+    outputs = jobs["preflight"].get("outputs", {})
+    for output in ("sonar_ready", "snyk_ready"):
+        assert output in outputs, (
+            f"preflight must declare a per-scanner `{output}` output -- a guard named in "
+            "a job's `if` but never produced skips that job FOREVER, silently"
+        )
+    token_to_guard = {"SONAR_TOKEN": "sonar_ready", "SNYK_TOKEN": "snyk_ready"}
     for name, job in jobs.items():
         serialized = str(job)
         referenced = [s for s in _FORBIDDEN_IN_BASELINE if f"secrets.{s}" in serialized]
@@ -210,10 +229,64 @@ def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard()
             f"{_OPTIONAL_TIER}'s job {name!r} references {referenced} but does not declare "
             "`needs: preflight` -- a token-referencing job must be guarded"
         )
-        assert job.get("if") == guard, (
-            f"{_OPTIONAL_TIER}'s job {name!r} references {referenced} but is not gated on "
-            f"`{guard}` -- without the guard a missing token reddens every scheduled run"
-        )
+        for token in referenced:
+            guard = f"needs.preflight.outputs.{token_to_guard[token]} == 'true'"
+            assert guard in str(job.get("if", "")), (
+                f"{_OPTIONAL_TIER}'s job {name!r} references {token} but is not gated on "
+                f"`{guard}` -- without its own guard a missing prerequisite for that "
+                "scanner reddens every push to main (#402)"
+            )
+
+
+def test_preflight_readiness_includes_the_org_level_config_not_just_the_tokens():
+    """The #402 lesson: a token proves the secret exists, not that the scan can run.
+
+    Both tokens were created on 2026-08-18; from that push onward every run of this
+    workflow on `main` failed -- SonarQube Cloud with "You must define the following
+    mandatory properties ... sonar.organization", Snyk with a server-side 422 -- because
+    the remaining prerequisites live OUTSIDE the repository: the `sonar.organization`
+    property (deliberately commented out in sonar-project.properties until the org owner
+    supplies the real key) and the Snyk organization that the scan must be filed under
+    (the `--org` the snyk monitor step has carried as a placeholder since the workflow
+    was written). A preflight that checks only token presence cannot see either one, so
+    this test pins that it checks both, and that each scan passes its org along when it
+    finally runs.
+    """
+    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    preflight_text = str(workflow["jobs"]["preflight"])
+    assert "sonar.organization" in preflight_text, (
+        "preflight must check sonar-project.properties carries an active "
+        "`sonar.organization` -- SonarQube Cloud rejects the scan without it (#402), and "
+        "a token-only check stays green while the scan cannot run"
+    )
+    assert "SNYK_ORG" in preflight_text, (
+        "preflight must check the SNYK_ORG repository variable -- the Snyk organization "
+        "is org-level configuration the repository cannot derive, and the 422 it causes "
+        "is invisible to a token-only check (#402)"
+    )
+    snyk_text = str(workflow["jobs"]["snyk"])
+    assert "SNYK_ORG" in snyk_text and "--org" in snyk_text, (
+        "the snyk job must pass the configured organization (`--org`) -- a placeholder "
+        "comment is not configuration; the scan must be filed under the real org"
+    )
+
+
+def test_preflight_still_fails_loudly_only_when_a_human_dispatched_it():
+    """The asymmetry that makes skipping honest: a human dispatch is refused loudly,
+    an automatic trigger skips with an explanation. Reversed, the workflow either
+    reddens every push to main while prerequisites are missing (#402, observed) or
+    silently ignores a direct request."""
+    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    steps = workflow["jobs"]["preflight"]["steps"]
+    run = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "workflow_dispatch" in run, (
+        "preflight must branch on the event type -- the skip-vs-fail decision is the "
+        "point of the preflight job"
+    )
+    assert "::error" in run and "exit 1" in run, (
+        "a dispatched run that cannot scan must FAIL with an annotation -- silently "
+        "doing nothing in response to a direct request is the worse outcome"
+    )
 
 
 def test_the_security_workflow_runs_on_a_schedule_not_only_on_push():

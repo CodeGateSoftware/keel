@@ -4,22 +4,34 @@ name: Code Quality
 #
 # NOTE (#291): the tokenless baseline now lives in `security.yml` -- Dependabot, a weekly
 # `pip-audit` over the exported lock, and CodeQL, all on GITHUB_TOKEN alone, always on.
-# This workflow is the OPTIONAL enhanced tier: SonarQube and Snyk run only if the two
-# secrets below are ever created, and its `preflight` skips them cleanly (never red) while
-# they are not. The two workflows disagree about nothing: baseline there, depth here.
-# ┌─ BEFORE THIS CAN RUN ─────────────────────────────────────────────────────────────────────────
-# │ Two repository secrets must exist. As of 2026-08-16, NEITHER DOES -- `gh secret list` is empty
-# │ at both repo and org level:
+# This workflow is the OPTIONAL enhanced tier: SonarQube and Snyk run only when everything
+# each scan needs is configured -- which is MORE than the tokens (see #402 below) -- and
+# the `preflight` skips whichever scan is not ready, cleanly (never red), until it is.
+# The two workflows disagree about nothing: baseline there, depth here.
+# ┌─ BEFORE EACH SCAN CAN RUN ───────────────────────────────────────────────────────────────────
+# │ The two repository secrets were created on 2026-08-18. From that moment every push to `main`
+# │ failed (#402): the old preflight treated "both tokens exist" as "both scans can run", the
+# │ scans started for real, and each died on a prerequisite that no repository secret carries:
 # │
-# │   SONAR_TOKEN  -- from SonarQube ("My Account" -> Security -> Generate Token)
-# │   SNYK_TOKEN   -- from Snyk (Account Settings -> Auth Token, or `snyk config get api`)
+# │   SONAR_TOKEN          -- exists. SonarQube Cloud still refuses the analysis with
+# │                            "You must define the following mandatory properties ...:
+# │                            sonar.organization" until `sonar.organization` is ACTIVE in
+# │                            `sonar-project.properties`. It is deliberately left commented
+# │                            out there until the org owner sets the real key, because a
+# │                            wrong key fails with a misleading "project not found".
+# │   sonar.organization   -- SonarCloud > organization settings; set it in
+# │                            `sonar-project.properties` at the repo root.
+# │   SNYK_TOKEN           -- exists. Snyk still rejects the scan server-side (422,
+# │                            SNYK-OS-PYTHON-0013) until the Snyk organization exists and is
+# │                            wired to this project -- org-level setup on snyk.io.
+# │   SNYK_ORG             -- a repository VARIABLE (Settings > Secrets and variables >
+# │                            Actions > Variables) holding the Snyk organization id; the
+# │                            scans pass it as `--org`. Declared a variable, not a secret,
+# │                            because an organization id is not sensitive.
 # │
-# │ Set both at https://github.com/CodeGateSoftware/keel/settings/secrets/actions.
-# │ `sonar-project.properties` at the repo root also carries a `sonar.projectKey` that must match
-# │ the project as it exists on the Sonar server, and a commented-out `sonar.organization` that
-# │ SonarQube Cloud requires -- read that file before the first run.
-# │
-# │ UNTIL THEY EXIST, this workflow does NOT fail the build. It skips both scans and explains
+# │ The preflight below checks every one of these per scanner, so `main` is green now and each
+# │ scan lights up THE MOMENT its own missing piece appears -- no coordinated flag day.
+# │ UNTIL THEN, this workflow does NOT fail the build. It skips what is not ready and explains
 # │ itself in the run summary -- unless a human DISPATCHED it, in which case it fails loudly,
 # │ because silently ignoring a direct request is worse. See `preflight` for the full argument.
 # └───────────────────────────────────────────────────────────────────────────────────────────────
@@ -59,74 +71,145 @@ permissions:
   contents: read
 
 jobs:
-  # Both scanners fail in unhelpful ways when their token is missing -- Sonar reports "You're not
-  # authorized. Please check the property sonar.token", and Snyk exits with a generic auth error
-  # from inside a container. Neither says "the repository secret does not exist", which is the
-  # actual cause and the only thing the reader needs to know. This job says it once, up front.
+  # Both scanners fail in unhelpful ways when something they need is missing -- Sonar reports
+  # "You must define the following mandatory properties ...: sonar.organization", and Snyk exits
+  # with a generic 422 from inside the CLI. Neither says which repository or organization setting
+  # is the actual cause and the only thing the reader needs to know. This job says it once, up
+  # front, PER SCANNER.
+  #
+  # #402 is why readiness is measured per scanner and beyond token presence. When the workflow
+  # was written no secret existed, so "are both tokens set?" was an honest readiness check and
+  # one shared `configured` flag was safe. The tokens appeared on 2026-08-18, the flag flipped
+  # true, both scans ran for the first time -- and both failed, because each still lacked an
+  # ORGANIZATION-level prerequisite (SonarCloud's mandatory `sonar.organization`; the Snyk
+  # organization the project must be filed under). Every push to `main` went red for reasons
+  # the repository could not fix: exactly the permanently-red-main this preflight exists to
+  # prevent. The check is now: per scanner, everything that scan actually needs.
   #
   # ⚠️ IT SAYS IT DIFFERENTLY DEPENDING ON WHO ASKED, and that asymmetry is the whole point:
   #
   #   workflow_dispatch  -> a human asked for a scan. If it cannot run, FAIL, loudly. Silently
   #                         doing nothing in response to a direct request is the worse outcome.
-  #   push / schedule    -> nobody asked; the trigger fired on its own. If the tokens are not
-  #                         configured, SKIP cleanly and say so in the run summary.
+  #   push / schedule    -> nobody asked; the trigger fired on its own. If a scan is not fully
+  #                         configured, SKIP it cleanly and say so in the run summary.
   #
-  # The second half exists because `push: [main]` was added in #272 when the repo went public and
-  # Actions minutes stopped being billed. Before that this workflow ran weekly, so an unconfigured
-  # repo produced one red X every Monday. On every merge, the same behaviour is a permanently red
-  # `main` that teaches the reader to ignore CI -- which costs more than the missing scan does.
-  # A skipped scan that announces itself is honest; a red X nobody reads is not.
+  # `push: [main]` was added in #272 when the repo went public and Actions minutes stopped being
+  # billed, and a skipped scan that announces itself is still the right behaviour there: a red X
+  # on every merge teaches the reader to ignore CI, which costs more than the missing scan does.
   #
   # `secrets` cannot be referenced from a job-level `if:`, which is why this is an OUTPUT consumed
-  # by the two scan jobs rather than a condition written directly on them.
+  # by the two scan jobs rather than a condition written directly on them. The outputs are
+  # SEPARATE (`sonar_ready`, `snyk_ready`) so each scan lights up the moment its own
+  # prerequisites are in place -- one shared flag would keep Snyk dark over a Sonar gap, and
+  # vice versa.
   preflight:
-    name: Check required secrets
+    name: Check each scan is actually configured
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      configured: ${{ steps.check.outputs.configured }}
+      sonar_ready: ${{ steps.check.outputs.sonar_ready }}
+      snyk_ready: ${{ steps.check.outputs.snyk_ready }}
     steps:
-      - name: Verify SONAR_TOKEN and SNYK_TOKEN are set
+      # The Sonar check reads `sonar-project.properties` from the repository. Default shallow
+      # clone is enough; nothing from the repo is executed here.
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Verify SonarQube and Snyk are each ready to run
         id: check
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_ORG: ${{ vars.SNYK_ORG }}
         run: |
           set -euo pipefail
-          MISSING=""
-          [ -n "${SONAR_TOKEN:-}" ] || MISSING="$MISSING SONAR_TOKEN"
-          [ -n "${SNYK_TOKEN:-}" ] || MISSING="$MISSING SNYK_TOKEN"
+          if [ ! -f sonar-project.properties ]; then
+            # If the grep below simply found nothing, the Sonar scan would be skipped FOREVER,
+            # on every event, with the workflow claiming to be "not configured yet". Fail
+            # loudly instead -- a missing file is a broken workflow, not a missing setting.
+            echo "::error::preflight cannot read sonar-project.properties -- is the checkout step gone?"
+            exit 1
+          fi
 
-          if [ -z "$MISSING" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "SONAR_TOKEN and SNYK_TOKEN are both present."
+          # Each scanner's list is measured against what THAT scan actually needs (#402).
+          SONAR_MISSING=""
+          SNYK_MISSING=""
+
+          [ -n "${SONAR_TOKEN:-}" ] || SONAR_MISSING="$SONAR_MISSING SONAR_TOKEN"
+          # SonarQube Cloud refuses the analysis without an active `sonar.organization`. It is
+          # commented out in sonar-project.properties until the org owner fills in the real
+          # key -- a wrong key fails with a misleading "project not found" -- so "the line is
+          # still commented" genuinely means "not ready", and the scan must not run.
+          grep -Eq '^[[:space:]]*sonar\.organization[[:space:]]*=' sonar-project.properties \
+            || SONAR_MISSING="$SONAR_MISSING sonar.organization"
+
+          [ -n "${SNYK_TOKEN:-}" ] || SNYK_MISSING="$SNYK_MISSING SNYK_TOKEN"
+          # The Snyk organization to file the project under, passed as `--org` below. A
+          # repository VARIABLE rather than a secret: an organization id is not sensitive,
+          # and the preflight needs to branch on it, which secrets cannot do from a job `if:`.
+          [ -n "${SNYK_ORG:-}" ] || SNYK_MISSING="$SNYK_MISSING SNYK_ORG"
+
+          if [ -z "$SONAR_MISSING" ]; then
+            echo "sonar_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sonar_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$SNYK_MISSING" ]; then
+            echo "snyk_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "snyk_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -z "$SONAR_MISSING" ] && [ -z "$SNYK_MISSING" ]; then
+            echo "SonarQube and Snyk are both fully configured."
             exit 0
           fi
 
-          echo "configured=false" >> "$GITHUB_OUTPUT"
-
+          MISSING="$SONAR_MISSING$SNYK_MISSING"
           {
             echo "### Code quality scans skipped"
             echo
-            echo "These repository secrets do not exist, so SonarQube and Snyk cannot run:"
-            echo
-            for s in $MISSING; do echo "- \`$s\`"; done
-            echo
-            echo "Add them at [Settings > Secrets > Actions](https://github.com/${{ github.repository }}/settings/secrets/actions):"
-            echo
-            echo "| secret | where to get it |"
-            echo "| --- | --- |"
-            echo "| \`SONAR_TOKEN\` | SonarQube: My Account > Security > Generate Token |"
-            echo "| \`SNYK_TOKEN\` | Snyk: Account Settings > Auth Token (or \`snyk config get api\`) |"
+            echo "Something these scans need is not configured, so the unready one(s) were"
+            echo "skipped. This is not a build failure."
+            if [ -n "$SONAR_MISSING" ]; then
+              echo
+              echo "**SonarQube scan** still needs:"
+              for s in $SONAR_MISSING; do
+                case "$s" in
+                  SONAR_TOKEN)
+                    echo "- \`SONAR_TOKEN\` -- repository secret. SonarQube: My Account > Security >"
+                    echo "  Generate Token; add it at [Settings > Secrets > Actions](https://github.com/${{ github.repository }}/settings/secrets/actions)" ;;
+                  sonar.organization)
+                    echo "- \`sonar.organization\` -- uncomment/set it in \`sonar-project.properties\`"
+                    echo "  to the SonarCloud organization key. SonarQube Cloud rejects the scan"
+                    echo "  without it, even with a valid token" ;;
+                esac
+              done
+            fi
+            if [ -n "$SNYK_MISSING" ]; then
+              echo
+              echo "**Snyk dependency scan** still needs:"
+              for s in $SNYK_MISSING; do
+                case "$s" in
+                  SNYK_TOKEN)
+                    echo "- \`SNYK_TOKEN\` -- repository secret. Snyk: Account Settings > Auth Token"
+                    echo "  (or \`snyk config get api\`); add it at [Settings > Secrets > Actions](https://github.com/${{ github.repository }}/settings/secrets/actions)" ;;
+                  SNYK_ORG)
+                    echo "- \`SNYK_ORG\` -- repository VARIABLE at [Settings > Secrets and variables > Actions](https://github.com/${{ github.repository }}/settings/variables/actions):"
+                    echo "  the Snyk organization id the project is filed under (the scans pass it"
+                    echo "  as \`--org\`). The Snyk organization itself is created on snyk.io" ;;
+                esac
+              done
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # A human asked for this scan. Refusing quietly would be worse than failing.
-            echo "::error title=Missing repository secrets::You dispatched this workflow, but it cannot run until these secrets exist:$MISSING"
+            echo "::error title=Scans not configured::You dispatched this workflow, but it cannot run until these exist:$MISSING"
             exit 1
           fi
 
-          echo "::notice title=Code quality scans skipped::Not configured yet -- missing:$MISSING. This is not a build failure; see the run summary."
+          echo "::notice title=Code quality scans skipped::Not fully configured yet -- missing:$MISSING. This is not a build failure; see the run summary."
 
   # ONE whole-repo scan, not the reference's per-module matrix. The reference fans out over a
   # Node monorepo whose modules each have their own package.json, tsconfig and test run, and it
@@ -139,7 +222,10 @@ jobs:
   sonarqube:
     name: SonarQube scan
     needs: preflight
-    if: needs.preflight.outputs.configured == 'true'
+    # Own readiness output, not a shared flag (#402): the token exists but SonarQube Cloud
+    # still refuses the scan until `sonar.organization` is set, and this job must stay dark
+    # until that appears -- while running the moment it does.
+    if: needs.preflight.outputs.sonar_ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -178,7 +264,10 @@ jobs:
   snyk:
     name: Snyk dependency scan
     needs: preflight
-    if: needs.preflight.outputs.configured == 'true'
+    # Own readiness output (#402): runs only when the token AND the Snyk organization
+    # (`SNYK_ORG`) are configured -- the organization is what the Snyk side was missing when
+    # every push to main failed with a server-side 422.
+    if: needs.preflight.outputs.snyk_ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -229,24 +318,25 @@ jobs:
         uses: snyk/actions/setup@v1
 
       # Fails the job on findings. Add `--severity-threshold=high` to only fail on high/critical.
+      # `--org` files the project under the SNYK_ORG organization -- the same variable the
+      # preflight gates this job on, so a scan that runs is always a scan that lands somewhere.
       - name: Snyk test
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk test --file=requirements.txt --package-manager=pip
+          SNYK_ORG: ${{ vars.SNYK_ORG }}
+        run: snyk test --org="$SNYK_ORG" --file=requirements.txt --package-manager=pip
 
       # Reports the current dependency tree to the Snyk dashboard so newly-published CVEs against
       # these exact pins raise an alert between weekly runs. `always()` so a failing `snyk test`
       # above still leaves the dashboard up to date -- the finding is the reason to record it.
+      # Same `--org` as the test: a monitor filed under a different organization than the one
+      # tested would split the project's history across two dashboards.
       - name: Snyk monitor
         if: always()
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        # PLACEHOLDER -- SET BEFORE FIRST USE, OR DELETE:
-        # Add `--org=<keel-snyk-org-id>` below to file this project under a specific Snyk
-        # organization. It is deliberately omitted rather than copied from the workflow this was
-        # modelled on, whose `--org` value belongs to an unrelated project; with no `--org`, Snyk
-        # uses the token's default organization, which is correct for a single-org account.
-        run: snyk monitor --file=requirements.txt --package-manager=pip --project-name=keel
+          SNYK_ORG: ${{ vars.SNYK_ORG }}
+        run: snyk monitor --org="$SNYK_ORG" --file=requirements.txt --package-manager=pip --project-name=keel
 
   # NO DOCKER SCAN JOB, on purpose. The reference workflow builds an image and runs
   # `snyk/actions/docker` against it. keel has no Dockerfile and ships no container -- it is

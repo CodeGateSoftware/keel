@@ -64,6 +64,55 @@ def _steps_text(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in job["steps"])
 
 
+@pytest.fixture(scope="module")
+def release_job(workflow: dict) -> dict:
+    return workflow["jobs"]["release"]
+
+
+# -- the release must fail on a stale lockfile where the mistake is made ------------------------
+
+
+def test_the_lockfile_is_checked_before_anything_can_mutate_it(
+    workflow: dict, release_job: dict
+) -> None:
+    """#424: the 0.10.0 release, and the error that pointed everywhere but at the cause.
+
+    A version bump touches seven pyproject.toml files; `uv.lock` is the eighth thing that
+    must move with them. When it does not, `uv sync` silently re-locks the checkout, the
+    release is stamped from a dirty tree, and the failure surfaces FIVE steps later as
+    "artifact reports a dirty tree" -- after lint, types, tests and a full build have all
+    run and passed, sending the reader to `keel/version.py` and the stamp step rather
+    than to the lockfile. The guard belongs before the first step that can mutate the
+    tree (`uv sync`), and its failure message must NAME the remedy.
+    """
+    steps = release_job["steps"]
+    names = [str(step.get("name", "")) for step in steps]
+    lock_step = next(
+        (i for i, s in enumerate(steps) if "uv lock --check" in str(s.get("run", ""))),
+        None,
+    )
+    assert lock_step is not None, (
+        "the release must run `uv lock --check` before it can spend minutes discovering "
+        "a stale lockfile as a dirty-tree error (#424)"
+    )
+    assert "set -euo pipefail" in str(steps[lock_step].get("run", "")), (
+        "the lock check must fail the step outright, not fall through to a later one"
+    )
+    run = str(steps[lock_step].get("run", ""))
+    assert "stale" in run and "uv lock" in run and "::error" in run, (
+        "the lock check's failure message must name the cause (stale uv.lock) and the "
+        "remedy (run `uv lock` locally and commit it with the version bump) -- the "
+        "misdirecting error is the reason this guard exists"
+    )
+    for later in ("Sync dependencies", "Test"):
+        at = names.index(later)
+        assert lock_step < at, (
+            f"the lock check must run before {later!r} -- `uv sync` is the step that "
+            "silently re-locks a stale checkout, and everything after it builds on a "
+            "tree the release did not intend to ship"
+        )
+
+
 # -- the thing that must not happen ------------------------------------------------------------
 
 

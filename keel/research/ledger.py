@@ -23,10 +23,21 @@ from pathlib import Path
 from typing import Any
 
 PROVENANCE = frozenset({"a_priori", "fitted"})
+#: `monte_carlo` (#441) is a resampling DIAGNOSTIC row -- same vocabulary discipline as the
+#: rest of the set: a row's kind says what kind of experiment produced it, so a bootstrap run
+#: is not silently filed as an ablation or a sweep node it never was.
 #: `walk_forward` (#445): one diagnostic row per fold of a rolling-origin validation of a
 #: GIVEN parameter set -- never a selection among sets, so always `diagnostic_only`.
 KINDS = frozenset(
-    {"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge", "walk_forward"}
+    {
+        "sweep_node",
+        "ablation",
+        "rule_retirement",
+        "asset_prune",
+        "threshold_nudge",
+        "monte_carlo",
+        "walk_forward",
+    }
 )
 DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
 

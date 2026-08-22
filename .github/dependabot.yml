@@ -65,6 +65,14 @@ updates:
       python-dependencies:
         patterns: ["*"]
 
+  - package-ecosystem: pip
+    directory: /packages/keel-broker-kraken
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
   # The scan and CI workflows pin their actions like any other dependency; unwatched,
   # they age into exactly the advisory-visibility problem #291 exists to close.
   - package-ecosystem: github-actions
