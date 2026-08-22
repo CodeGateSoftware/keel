@@ -13,6 +13,7 @@ members = [
     "keel-broker-api",
     "keel-broker-coinbase",
     "keel-broker-fake",
+    "keel-broker-kraken",
     "keel-broker-robinhood",
     "keel-core",
     "keel-trader",
@@ -704,6 +705,21 @@ requires-dist = [
 ]
 
 [[package]]
+name = "keel-broker-kraken"
+version = "0.11.0"
+source = { editable = "packages/keel-broker-kraken" }
+dependencies = [
+    { name = "keel-broker-api" },
+    { name = "keel-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "keel-broker-api", editable = "packages/keel-broker-api" },
+    { name = "keel-core", editable = "packages/keel-core" },
+]
+
+[[package]]
 name = "keel-broker-robinhood"
 version = "0.11.0"
 source = { editable = "packages/keel-broker-robinhood" }
@@ -754,6 +770,7 @@ dependencies = [
 dev = [
     { name = "keel-broker-alpaca" },
     { name = "keel-broker-fake" },
+    { name = "keel-broker-kraken" },
     { name = "keel-broker-robinhood" },
     { name = "mypy" },
     { name = "optuna" },
@@ -775,6 +792,7 @@ requires-dist = [
 dev = [
     { name = "keel-broker-alpaca", editable = "packages/keel-broker-alpaca" },
     { name = "keel-broker-fake", editable = "packages/keel-broker-fake" },
+    { name = "keel-broker-kraken", editable = "packages/keel-broker-kraken" },
     { name = "keel-broker-robinhood", editable = "packages/keel-broker-robinhood" },
     { name = "mypy", specifier = ">=1.18.0" },
     { name = "optuna", specifier = ">=4.5.0" },

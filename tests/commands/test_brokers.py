@@ -43,7 +43,9 @@ PAYLOAD_FIELDS = {
     "error",
 }
 
-_INSTALLED = {"alpaca", "coinbase", "fake", "robinhood"}
+#: `kraken` joined the set with its stub adapter (#313): port-complete, every data/market
+#: method raising `NotImplementedError`, so it registers but can serve nothing.
+_INSTALLED = {"alpaca", "coinbase", "fake", "kraken", "robinhood"}
 
 
 def _service_payload() -> list[dict[str, Any]]:

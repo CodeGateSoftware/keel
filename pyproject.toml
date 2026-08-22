@@ -56,6 +56,7 @@ keel-broker-api = { workspace = true }
 keel-broker-coinbase = { workspace = true }
 keel-broker-alpaca = { workspace = true }
 keel-broker-fake = { workspace = true }
+keel-broker-kraken = { workspace = true }
 keel-broker-robinhood = { workspace = true }
 
 [dependency-groups]
@@ -97,6 +98,12 @@ dev = [
     # in CI; a deployment that wants equities installs `keel-broker-alpaca` itself and
     # entry-point discovery picks it up. Nothing in `keel/` imports it.
     "keel-broker-alpaca",
+    # Dev-only like the venues above, and doubly so: Kraken is an optional venue whose
+    # adapter is a STUB (#313) -- port-complete, but every data/market method raises
+    # NotImplementedError, so it can never be selected by a deployment that expects data.
+    # It rides the dev group so the registry (`keel brokers list`) and the stub's own tests
+    # run in CI; there is no conformance suite for it yet because there is nothing to conform.
+    "keel-broker-kraken",
 ]
 
 # Ruff config lives in ruff.toml at the repo root. A ruff.toml takes precedence over
@@ -130,6 +137,7 @@ module = [
     "keel_broker_alpaca.*",
     "keel_broker_coinbase.*",
     "keel_broker_fake.*",
+    "keel_broker_kraken.*",
     "keel_broker_robinhood.*",
 ]
 disallow_any_generics = true
