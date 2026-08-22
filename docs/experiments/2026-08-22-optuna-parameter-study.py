@@ -308,6 +308,10 @@ def main() -> None:
     print("=" * 78)
     for family in FIXED_PARAMS:
         cells = [r for r in rows if r["family"] == family]
+        # The "winner" is the max-TRAIN-expectancy cell (the study's own objective). A
+        # non-max-train cell that PASSED while this max-train cell refused would therefore
+        # appear only in the JSONL artifact, never in a PROPOSE line -- the conservative
+        # direction: this selection can under-propose, never over-propose.
         winner = max(cells, key=lambda r: Decimal(r["best_train_expectancy"]))
         held_out = Decimal(winner["held_out_expectancy"])
         pbo = None if winner["pbo"] is None else Decimal(winner["pbo"])

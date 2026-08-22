@@ -211,9 +211,10 @@ class OverfittingGate:
     """The proposal gate: held-out sign + CSCV's PBO over the study's own trials.
 
     `passed` is exactly `held_out_positive AND pbo <= OVERFITTING_CEILING` (with `pbo is
-    None` — too few usable trial columns — counted as a failure: a certificate the study
-    could not produce is not a certificate). `failures` names each failing condition with
-    its number so the refusal line can quote them; it is empty iff `passed`.
+    None` — too few or too-short usable trial columns — counted as a failure: a
+    certificate the study could not produce is not a certificate). `failures` names each
+    failing condition with its number so the refusal line can quote them; it is empty iff
+    `passed`.
     """
 
     train_expectancy: Decimal
@@ -240,12 +241,22 @@ def evaluate_gate(
     trial. Columns with fewer than `MIN_TRADES_PER_COLUMN` closed trades are skipped rather
     than padded; `cscv.pbo` itself truncates any residual raggedness to the shortest
     column, dropping OLDEST rows, exactly as its docstring specifies. Fewer than 2 usable
-    columns means CSCV has no matrix, and the gate refuses rather than invent a number.
+    columns — or a shortest usable column with fewer than `s` trades, which could not be
+    cut into blocks at all — means CSCV has no matrix, and the gate refuses rather than
+    invent a number.
     """
     usable = [column for column in trial_columns if len(column) >= MIN_TRADES_PER_COLUMN]
     skipped = len(trial_columns) - len(usable)
     held_out_positive = test_result.expectancy > 0
-    pbo_value = cscv_pbo(usable, s=s).pbo if len(usable) >= 2 else None
+    # cscv cuts its s blocks from the SHORTEST usable column and raises if it cannot; a
+    # study that thin has no certificate either, so the gate says "unavailable" (refuse)
+    # rather than letting the ValueError escape. The `len(usable) >= 2` on the left
+    # short-circuits the `min` on the right, which would raise on an empty list.
+    pbo_value = (
+        cscv_pbo(usable, s=s).pbo
+        if len(usable) >= 2 and min(len(column) for column in usable) >= s
+        else None
+    )
 
     failures: list[str] = []
     if not held_out_positive:
@@ -253,7 +264,8 @@ def evaluate_gate(
     if pbo_value is None:
         failures.append(
             f"pbo unavailable ({len(usable)} of {len(trial_columns)} trials have >= "
-            f"{MIN_TRADES_PER_COLUMN} closed trades; CSCV needs >= 2 usable columns)"
+            f"{MIN_TRADES_PER_COLUMN} closed trades; CSCV needs >= 2 usable columns of "
+            f">= {s} trades)"
         )
     elif pbo_value > OVERFITTING_CEILING:
         failures.append(f"pbo {pbo_value} > {OVERFITTING_CEILING}")
@@ -388,7 +400,9 @@ def run_study(
     pinned: dict[str, object] = dict(fixed_params or {})
 
     def objective(trial: _Trial) -> float:
-        params = {**pinned, **params_from_trial(rule_kind, trial)}
+        # Searched first, pinned LAST: `**` unpacking keeps the later key, so a searched
+        # name colliding with a pin can never silently shadow it.
+        params = {**params_from_trial(rule_kind, trial), **pinned}
         result = evaluate_params(rule_kind, product_id, params, train, fee_pct, slippage_pct)
         trial.set_user_attr("params", params)
         trial.set_user_attr("train_expectancy", str(result.expectancy))

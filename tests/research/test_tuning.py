@@ -15,6 +15,7 @@ from __future__ import annotations
 import random
 import subprocess
 import sys
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -293,6 +294,23 @@ def test_gate_pbo_is_wired_to_cscv_and_noise_does_not_pass() -> None:
     assert gate.passed is (gate.pbo <= Decimal("0.5"))
 
 
+def test_gate_refuses_a_positive_held_out_window_when_pbo_exceeds_half() -> None:
+    """The pbo-only refusal, pinned on columns asserted to be over the ceiling FIRST.
+
+    The held-out window is positive, so the refusal can only come from the overfitting
+    term; asserting the COMPUTED pbo > 0.5 before checking the refusal keeps the test from
+    ever silently drifting into the pass region and vacuously "passing".
+    """
+    # The same seeded noise `test_cscv.py` calibrates as luck: pbo 43/70 = 0.6142...,
+    # deterministic in exact Decimal, comfortably over the ceiling.
+    columns = _noise_columns(n=12, t=256, seed=1234)
+    gate = tuning.evaluate_gate(_result(Decimal("0.05")), _result(Decimal("0.05")), columns)
+    assert gate.held_out_positive is True  # the held-out window is NOT the blocker
+    assert gate.pbo is not None and gate.pbo > Decimal("0.5")
+    assert gate.passed is False
+    assert any(failure.startswith(f"pbo {gate.pbo} >") for failure in gate.failures)
+
+
 def test_gate_passes_consistent_columns_with_a_positive_held_out_window() -> None:
     gate = tuning.evaluate_gate(
         _result(Decimal("0.05")),
@@ -321,6 +339,23 @@ def test_gate_skips_trials_with_too_few_trades_and_refuses_without_cscv_input() 
     assert starved.pbo is None
     assert starved.passed is False
     assert any("pbo unavailable" in failure for failure in starved.failures)
+
+
+def test_gate_treats_columns_too_short_for_the_blocks_as_pbo_unavailable() -> None:
+    """Columns too short to cut `s` blocks must REFUSE, not let `cscv.pbo` raise.
+
+    With the pinned defaults (10-trade floor, s=8) the trade floor already covers the
+    block count; the guard matters the moment a caller raises `pbo_blocks` (cscv's own
+    default is s=16) and the shortest usable column cannot supply the rows.
+    """
+    # 3 columns of 12 trades each: above the 10-trade floor (so "usable"), under s=16
+    # (so `truncate_to_blocks` would keep 0 rows and cscv would raise without the guard).
+    stubby = _consistent_columns([1.0, 2.0, 3.0], t=12)
+    gate = tuning.evaluate_gate(_result(Decimal("0.05")), _result(Decimal("0.05")), stubby, s=16)
+    assert gate.n_columns_used == 3
+    assert gate.pbo is None
+    assert gate.passed is False
+    assert any("pbo unavailable" in failure for failure in gate.failures)
 
 
 # -- 10. the refusal ---------------------------------------------------------------------------
@@ -353,7 +388,59 @@ def test_proposal_verdict_only_proposes_when_the_gate_passes() -> None:
     )
 
 
-# -- 11-12. determinism: the acceptance tests --------------------------------------------------
+# -- 11. the pinned kwargs must win the merge ---------------------------------------------------
+
+
+def test_run_study_fixed_params_shadow_a_colliding_searched_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed param beats a searched name on collision; the pin is what reaches the rule.
+
+    The searched side is fed by the table-backed fake suggestor producing an
+    `entry_lookback` that COLLIDES with the pin, `params_from_trial`/`evaluate_params` are
+    stubbed so the capture is exactly the kwargs each trial trades, and the assertion is
+    about those captured kwargs -- not about dict order by proxy.
+    """
+    searched = tuning.params_from_trial(
+        "turtle_breakout",
+        _TableSuggest(
+            ints={"entry_lookback": 20, "exit_lookback": 10, "target_rr": 3},
+            floats={"adx_threshold": 20.0, "atr_stop_mult": 1.5},
+        ),
+    )
+    assert searched["entry_lookback"] == 20  # the searched value the pin must beat
+    monkeypatch.setattr(tuning, "params_from_trial", lambda family, suggest: searched)
+
+    seen: list[dict[str, object]] = []
+
+    def fake_evaluate_params(
+        rule_kind: str,
+        product_id: str,
+        params: dict[str, object],
+        candles: Sequence[Candle],
+        fee_pct: Decimal,
+        slippage_pct: Decimal,
+    ) -> BacktestResult:
+        seen.append(dict(params))
+        return _result(Decimal("0.01"))
+
+    monkeypatch.setattr(tuning, "evaluate_params", fake_evaluate_params)
+
+    report = tuning.run_study(
+        "turtle_breakout",
+        "BTC-USD",
+        _trending_candles(50),
+        n_trials=1,
+        seed=1,
+        fixed_params={"granularity": "ONE_HOUR", "entry_lookback": 55},
+    )
+    assert seen, "the objective must have run"
+    assert all(row["entry_lookback"] == 55 for row in seen)  # the pin, not the search
+    assert all(row["granularity"] == "ONE_HOUR" for row in seen)
+    assert report.best_params["entry_lookback"] == 55  # the recorded winner carries the pin
+
+
+# -- 12-13. determinism: the acceptance tests ---------------------------------------------------
 
 
 def test_run_study_is_deterministic_under_a_fixed_seed() -> None:
@@ -370,12 +457,14 @@ def test_run_study_is_deterministic_under_a_fixed_seed() -> None:
 
     assert first.best_params == second.best_params
     assert first.best_train_expectancy == second.best_train_expectancy
-    assert first.held_out_result.expectancy == second.held_out_result.expectancy
+    # The WHOLE re-priced winner, not just its expectancy: n_trades, win_rate, drawdown,
+    # every Trade -- identical inputs must reproduce the identical held-out backtest.
+    assert first.held_out_result == second.held_out_result
+    assert first.held_out_result.n_trades == second.held_out_result.n_trades
     assert first.gate == second.gate
     assert len(first.trials) == len(second.trials) == 15
     assert [t.params for t in first.trials] == [t.params for t in second.trials]
     assert [t.train_expectancy for t in first.trials] == [t.train_expectancy for t in second.trials]
-    assert first.held_out_result.n_trades >= 0
 
 
 def test_run_study_different_seed_explores_a_different_sequence() -> None:
@@ -395,7 +484,7 @@ def test_run_study_different_seed_explores_a_different_sequence() -> None:
     assert [t.params for t in seed_a.trials] != [t.params for t in seed_b.trials]
 
 
-# -- 13-14. the optional dependency stays optional ----------------------------------------------
+# -- 14-15. the optional dependency stays optional ----------------------------------------------
 
 
 def test_importing_the_module_does_not_import_optuna() -> None:
