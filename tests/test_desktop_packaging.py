@@ -10,6 +10,7 @@ identity, or no templates.
 from __future__ import annotations
 
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from tests._workflow_yaml import strict_load
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOW = _ROOT / ".github" / "workflows" / "release.yml"
 _MACOS_SCRIPT = _ROOT / "packaging" / "macos_app.sh"
+_INNO_SCRIPT = _ROOT / "packaging" / "keel.iss"
+_SMOKE_WORKFLOW = _ROOT / ".github" / "workflows" / "installer-smoke.yml"
 
 
 @pytest.fixture(scope="module")
@@ -85,6 +88,33 @@ def test_the_lockfile_is_checked_before_anything_can_mutate_it(
             "silently re-locks a stale checkout, and everything after it builds on a "
             "tree the release did not intend to ship"
         )
+
+
+# -- the release must not lie about what the wheel requires -------------------------------------
+
+
+def test_the_verify_step_comment_states_the_real_python_floor() -> None:
+    """#438: the verify step's comment claimed the wheel carries `Requires-Python: >=3.14.4`
+    while every pyproject.toml declares `>=3.11` (pinned by tests/test_python_floor.py).
+
+    Harmless to the run -- the pinned interpreter is used either way -- but the comment was
+    the only place a reader could learn what the wheel demands, and the next person to build
+    packaging on top of it (the desktop job, the installer) would have built on a floor that
+    does not exist. The floor stated in the workflow is now DERIVED from the manifest, so it
+    cannot drift again."""
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    floor = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "requires-python"
+    ]
+    assert f"Requires-Python: {floor}" in text, (
+        f"the verify step's comment must state the wheel's real floor ({floor!r}, from "
+        "pyproject.toml) -- a stale floor is how the next packaging job gets built on a "
+        "requirement that does not exist"
+    )
+    assert "3.14.4'" not in text.replace(".python-version", ""), (
+        "the old false claim (`Requires-Python: >=3.14.4`) must be gone -- 3.14.4 is the "
+        "interpreter .python-version pins for the BUILD, not a floor the wheel enforces"
+    )
 
 
 # -- the thing that must not happen ------------------------------------------------------------
