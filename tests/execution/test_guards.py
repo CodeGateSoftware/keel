@@ -449,7 +449,39 @@ def test_a_partially_filled_sell_releases_only_its_observed_fill(repo):
     assert result.violations == []
 
 
-# -- rail 7: min-move / anti-scalping --------------------------------------------------------------
+def test_a_partially_filled_sell_still_vetoes_where_ordered_release_would_pass(repo):
+    """The veto side of the observed-fill release: same seeds with a tighter cap, where
+    counting the observed economics refuses (200 held + 50 intent = 250 > 220) while the
+    ordered-release wrong turn (0 + 50 = 50 <= 220) would wave the order through. Pinning
+    both directions is what makes "releases ONLY its observed fill" a property of the
+    code rather than of the docstring."""
+    config = _config(max_per_order_usd=Decimal("500"), max_per_asset_pct=Decimal("0.22"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.005"),  # 250 held, a prior day (keeps rail 3 out of the picture)
+        price=Decimal("50000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.005"),  # the bracket ordered the whole position
+        filled_qty=Decimal("0.001"),  # ...but only 50-worth has sold so far
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+        side=Side.SELL,
+    )
+    intent = _intent(notional=Decimal("50"))  # 200 + 50 = 250 > 220 per-asset limit
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert any("per_asset_concentration_cap" in v for v in result.violations)
+
+
+# -- rail 7: min-move / anti-scalping -------------------------------
 
 
 def test_rail7_min_move_anti_scalping_rejects_tight_stop(repo):
