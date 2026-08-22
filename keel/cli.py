@@ -152,6 +152,7 @@ from keel.commands.fetch import assess_products as _assess_products  # noqa: F40
 # window-bounded invariant THROUGH this module's name.
 from keel.commands.fetch import run_fetch
 from keel.commands.insights import insights_group
+from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
 from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
@@ -1333,6 +1334,17 @@ cli.add_command(tui_cmd)
 # construction (GET and HEAD are the only verbs it implements), and pinned by the same thinness
 # test as the console layer. Defined in `keel.commands.serve` over `keel.web`.
 cli.add_command(serve_cmd)
+
+
+# -- mcp (the read-only research-assistant surface over stdio) -----------------------------------
+
+# A research assistant is the third reader `keel serve` never reached: no browser, no terminal,
+# one JSON-RPC stream. `keel mcp` serves the eight read-only tools over stdio, defined in
+# `keel.commands.mcp` over `keel.mcp` and pinned by `tests/mcp/test_readonly.py` -- the
+# capability-mapping enforcement that proves the surface cannot place, halt or release
+# anything. Unlike every other command it prints no disclaimer: stdout IS the protocol, and a
+# footer would corrupt the stream; the read-only statement travels in serverInfo instead.
+cli.add_command(mcp_cmd)
 
 
 # -- capabilities (the audit surface for the TTY gate) -------------------------------------------
