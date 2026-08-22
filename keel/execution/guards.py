@@ -136,7 +136,20 @@ FEED_STALENESS_CYCLES = 3  # rail 12: 3 missed polling cycles = stale feed
 # the rail's key.
 DEFAULT_VENUE = "coinbase"
 
-_ACTIVE_ORDER_STATUSES = ("pending", "filled")
+#: The statuses whose rows carry OBSERVED fills, and therefore count at observed economics
+#: (#446): `filled` (terminal, fully observed) and `partially_filled` (the venue has begun
+#: executing it and the unfilled remainder still rests). Rail 8's basis, the exposure figure,
+#: and the spend totals all read this set, so a partial contributes `filled_quantity × the
+#: observed average price` everywhere -- never its ordered size (the remainder bought nothing)
+#: and never nothing (the fill is real, held inventory).
+_OBSERVED_FILL_STATUSES = ("filled", "partially_filled")
+
+#: The statuses whose BUY notional the spend rails (3/14) count (#446). A `pending` BUY has
+#: committed nothing yet but reserves its full ORDERED notional against the cap -- the
+#: conservative pre-#446 choice, kept deliberately: an order the venue may still fill in full
+#: must not buy its headroom back mid-flight. Filled and partial rows then count what was
+#: ACTUALLY spent, via `_order_notional`'s observed-economics preference.
+_ACTIVE_ORDER_STATUSES = ("pending", *_OBSERVED_FILL_STATUSES)
 
 
 @dataclass(frozen=True)
@@ -240,7 +253,21 @@ def _utc_day_bounds(ts: int) -> tuple[int, int]:
 
 
 def _order_notional(order: dict[str, Any]) -> Decimal:
-    qty = order.get("qty") or Decimal("0")
+    """Notional at OBSERVED economics (#446): `filled_quantity` at the observed average price,
+    falling back to the ordered size when the row carries no observed fill.
+
+    A partially-filled BUY spent `filled_quantity × average` -- that, and only that. Weighting
+    by the ordered size charges the figure for a remainder that bought nothing; skipping the
+    row entirely (the old `status="filled"`-only queries) blinds it to real, held inventory.
+    This is rail 8's basis arithmetic, applied to the exposure and spend rails too, so every
+    rail that asks "what did this order put into the account?" hears one answer.
+
+    The `filled_quantity or qty` fallback is not decoration: a `filled` market row only gets a
+    `filled_quantity` when the venue's post-fill status was observable, so estimate-only rows
+    (and rows older than the column, pre-v11) keep counting at their ordered size exactly as
+    they did before #446.
+    """
+    qty = order.get("filled_quantity") or order.get("qty") or Decimal("0")
     price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
     if price is None:
         return Decimal("0")
@@ -248,7 +275,8 @@ def _order_notional(order: dict[str, Any]) -> Decimal:
 
 
 def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
-    """Net at-risk notional per asset from filled live orders (BUY adds, SELL reduces).
+    """Net at-risk notional per asset from filled and partially-filled live orders (BUY adds,
+    SELL reduces), each at its observed economics (#446).
 
     ⚠️ **An unparseable `product_id` is handled by SIDE, and always logged at WARNING.** A
     malformed **BUY** is COUNTED, under whatever key `_asset` gives it; a malformed **SELL** is
@@ -278,9 +306,18 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
     written, and the live `orders` table held zero rows when rail 19 shipped -- but "impossible"
     is what the study said about a futures SELL passing every rail, and a futures SELL is
     exactly the shape this branch exists for.
+
+    BOTH sides count at observed economics (#446). A partially-filled BUY really holds its
+    `filled_quantity`, so it adds that much -- invisibility here was free headroom rails 4/5/6
+    never should have granted. A partially-filled SELL (a partly-executed exit bracket) really
+    sold its `filled_quantity`, so it releases that much and NO more: releasing the ordered
+    size would hand back cap the venue has not returned while the remainder still rests.
     """
     exposure: dict[str, Decimal] = {}
-    for order in repo.get_orders(mode="live", status="filled"):
+    rows: list[dict[str, Any]] = []
+    for status in _OBSERVED_FILL_STATUSES:
+        rows.extend(repo.get_orders(mode="live", status=status))
+    for order in rows:
         product_id = order["product_id"]
         side = order["side"]
         if parse_spot_product_id(product_id) is None:
@@ -308,7 +345,11 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
 
 
 def _daily_spend_usd(repo: Repository, now_ts: int) -> Decimal:
-    """Sum of today's (UTC) BUY notional across all products, from the orders audit log."""
+    """Sum of today's (UTC) BUY notional across all products, from the orders audit log.
+
+    A partially-filled BUY counts at `filled_quantity × average` -- what ACTUALLY left the
+    account (#446); a `pending` BUY still reserves its full ordered notional (see
+    `_ACTIVE_ORDER_STATUSES`)."""
     start, end = _utc_day_bounds(now_ts)
     total = Decimal("0")
     for order in repo.get_orders(mode="live"):
@@ -332,7 +373,8 @@ def _utc_month_bounds(ts: int) -> tuple[int, int]:
 
 def _monthly_buy_spend_usd(repo: Repository, now_ts: int) -> Decimal:
     """Sum of this (UTC) calendar month's BUY notional across all products, from the orders
-    audit log -- rail 14's month-to-date figure."""
+    audit log -- rail 14's month-to-date figure. Partial fills count what was actually
+    spent, exactly as the daily figure does (#446, `_order_notional`)."""
     start, end = _utc_month_bounds(now_ts)
     total = Decimal("0")
     for order in repo.get_orders(mode="live"):
@@ -474,15 +516,28 @@ def check(
 
     # 8. No averaging into losers (no martingale, §5.1). DCA is exempt — its whole design is
     #    to keep buying through drawdowns on a fixed small budget (§8/§12.1).
+    #
+    #    The basis is the position's average cost across FILLS, not across INTENTS (#446): a
+    #    partially-filled BUY contributes its `filled_quantity` at its observed average price,
+    #    never its ordered size. Counting the unfilled remainder would weight the basis toward
+    #    a price that bought nothing; skipping the row entirely (the old `status="filled"`-only
+    #    query) would leave the basis blind to real, held inventory.
     if is_buy and not intent.is_dca:
         buy_orders = [
             o
-            for o in repo.get_orders(mode="live", product_id=intent.product_id, status="filled")
-            if o["side"] == Side.BUY.value
+            for o in repo.get_orders(mode="live", product_id=intent.product_id)
+            if o["side"] == Side.BUY.value and o["status"] in _OBSERVED_FILL_STATUSES
         ]
-        total_qty = sum((o["qty"] for o in buy_orders), Decimal("0"))
+        total_qty = Decimal("0")
+        total_cost = Decimal("0")
+        for order in buy_orders:
+            qty = order.get("filled_quantity") or order["qty"] or Decimal("0")
+            price = (
+                order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
+            )
+            total_qty += qty
+            total_cost += qty * (price or Decimal("0"))
         if total_qty > 0:
-            total_cost = sum((_order_notional(o) for o in buy_orders), Decimal("0"))
             avg_cost = total_cost / total_qty
             if intent.entry < avg_cost:
                 violations.append(
@@ -557,8 +612,7 @@ def check(
             )
         elif balance <= 0:
             violations.append(
-                f"usdc_funding: available {required} balance {balance} is not "
-                "greater than 0"
+                f"usdc_funding: available {required} balance {balance} is not greater than 0"
             )
         elif balance < intent.notional:
             shortfall = intent.notional - balance
@@ -800,6 +854,4 @@ def check(
             violation=violation,
         )
 
-    return GuardResult(
-        ok=not violations, violations=violations, skipped_rails=list(skipped)
-    )
+    return GuardResult(ok=not violations, violations=violations, skipped_rails=list(skipped))

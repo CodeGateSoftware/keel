@@ -935,6 +935,63 @@ def test_roll_to_break_even_replaces_the_stop_leg(repo):
     assert repo.get_state("open_stop:BTC-USD") == Decimal("50000")
 
 
+def test_rolling_the_stop_cancels_a_PARTIALLY_FILLED_bracket_first(repo, caplog):
+    """The stop-roll half of the same #446 regression. `_roll_stop` cancelled the old bracket
+    only while its row read `pending`; a `partially_filled` row was left RESTING and the
+    replacement was placed anyway -- TWO brackets, each committing the whole position. (On
+    the real venue the replacement is instead REJECTED for insufficient funds -- the base is
+    locked by the old bracket -- and the roll lands in the naked-position CRITICAL below; the
+    permissive fake surfaces the sibling failure, the double bracket.)"""
+    broker = FakeBroker()
+    old_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    repo.update_order(
+        old_id,
+        status="partially_filled",
+        filled_quantity=Decimal("0.004"),
+        actual_fill=Decimal("48900"),
+        updated_at=NOW_TS + 1,
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        new_id = roll_to_break_even(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=old_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
+        )
+
+    assert new_id is not None and new_id != old_id
+    assert repo.get_order(old_id)["status"] == "canceled"
+    # NO DOUBLE BRACKET: exactly one non-terminal SELL rests after the roll -- the
+    # replacement. Pre-fix the unfetched old bracket stayed `partially_filled` beside it.
+    resting = [
+        o
+        for o in repo.get_orders(product_id="BTC-USD")
+        if o["side"] == Side.SELL.value and o["status"] in ("pending", "partially_filled")
+    ]
+    assert [o["id"] for o in resting] == [new_id]
+    # ...and the naked-position branch never fired: the replacement placed, so there was
+    # nothing to scream about.
+    assert "executor.position_unprotected" not in caplog.text
+    # Cancel BEFORE the replacement place, for the same base-locked reason as the rule exit.
+    assert broker.events == ["place", "cancel", "place"], broker.events
+
+
 def test_roll_to_break_even_never_widens_the_stop(repo):
     broker = FakeBroker()
     stop_id = place_bracket(
@@ -1192,6 +1249,106 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
     order = repo.get_order(result.order_id)
     assert order["status"] == "filled"
     assert order["fee"] == Decimal("0.30")
+
+
+# -- partially filled market entries (#446) -------------------------------------------------------
+
+
+class _PartiallyFillingBroker(FakeBroker):
+    """The venue's answer for a market IOC that only partly filled: the IOC cancelled the
+    remainder at the venue, `filled_size` is what actually executed, and `average_filled_price`
+    is the running average over those fills."""
+
+    def __init__(self, filled_size: Decimal, average_price: Decimal) -> None:
+        super().__init__()
+        self._observed = {
+            "order_id": "broker-order-1",
+            "product_id": "BTC-USD",
+            "side": "BUY",
+            "status": "FILLED",
+            "filled_size": filled_size,
+            "average_filled_price": average_price,
+            "total_fees": Decimal("0.18"),
+        }
+
+    def get_order(self, order_id: str) -> dict:
+        return dict(self._observed)
+
+
+def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, caplog):
+    """The entry-side half of #446. A market IOC entry that only partly filled still leaves a
+    row claiming the FULL ordered size was bought -- and `execute` then places the exit bracket
+    for that ordered size, i.e. for more than is held.
+
+    The bracket AMEND/cancel-and-replace policy is #502's (the port has no bracket kind), so
+    what this path owes today is DETECTION: record the observed filled quantity on the row and
+    warn loudly enough that a human sizes the bracket to reality. The bracket itself is still
+    placed for the ordered size -- detect-and-surface, not auto-resize."""
+    # The standard enter signal sizes to qty = 1 (equity 1,000,000 x risk 0.001 / the 1000
+    # entry-to-stop distance); the venue reports only 0.6 of it executed.
+    broker = _PartiallyFillingBroker(filled_size=Decimal("0.6"), average_price=Decimal("50010"))
+    signal = _enter_signal()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            signal, broker, repo, _config(), "autonomous", confirm_fn=None, now_ts=NOW_TS
+        )
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["status"] == "filled"  # terminal for an IOC, as before
+    assert order["qty"] == Decimal("1")  # the ordered size, unchanged
+    assert order["filled_quantity"] == Decimal("0.6")  # ...but the observed fill is recorded
+    assert order["actual_fill"] == Decimal("50010")
+    assert order["fee"] == Decimal("0.18")
+    assert "executor.entry_partially_filled" in caplog.text
+    # Detect-and-surface, NOT auto-resize: the bracket is still placed for the ORDERED size
+    # (resizing it is the amend-vs-replace decision #502 owns).
+    bracket = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
+    assert bracket["base_size"] == "1.000"
+
+
+def test_a_fully_filled_entry_records_the_filled_quantity_without_warning(repo, caplog):
+    """The negative control: `filled_quantity == qty` is the ordinary case and must not warn --
+    a warning on every entry trains the alert to be ignored."""
+    broker = _PartiallyFillingBroker(filled_size=Decimal("1"), average_price=Decimal("50010"))
+    signal = _enter_signal()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            signal, broker, repo, _config(), "autonomous", confirm_fn=None, now_ts=NOW_TS
+        )
+
+    order = repo.get_order(result.order_id)
+    assert order["filled_quantity"] == Decimal("1") == order["qty"]
+    assert "executor.entry_partially_filled" not in caplog.text
+
+
+def test_a_partially_filled_EXIT_records_the_fill_but_does_not_fire_the_entry_warning(repo, caplog):
+    """The warning is ENTRY-only (#446 review): its advice is about the ENTRY's exit bracket
+    being placed for the ordered size, and an immediately-filled market SELL exit rides the
+    same observed-economics upgrade. Firing entry wording there would send an operator to
+    resize a bracket this side never placed -- the exit-side over-booking is #502's to flag.
+
+    The OBSERVATION is still recorded whatever the side: `filled_quantity` is what actually
+    executed, and hiding it because the warning is entry-specific would re-create the
+    blindness #446 exists to end."""
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    # The venue's answer for a market SELL that only partly filled on a thin book: 0.006 of
+    # the 0.01 sold, IOC cancelled the remainder. (`_PartiallyFillingBroker`'s canned
+    # `side`/`status` fields are not read by this path -- only the fill figures are.)
+    broker = _PartiallyFillingBroker(filled_size=Decimal("0.006"), average_price=Decimal("49980"))
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(_exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    assert result.placed is True
+    order = repo.get_order(result.order_id)
+    assert order["status"] == "filled"  # terminal for an IOC, as before
+    assert order["qty"] == Decimal("0.01")  # the ordered size, unchanged
+    assert order["filled_quantity"] == Decimal("0.006")  # ...and the observed fill is recorded
+    assert order["actual_fill"] == Decimal("49980")
+    assert "executor.entry_partially_filled" not in caplog.text
 
 
 # -- a cancel that cannot actually reach the exchange must be LOUD ------------------------------
@@ -1704,6 +1861,52 @@ def test_an_exit_cancels_the_resting_bracket_before_selling(repo):
         bracket_id in [int(c) if str(c).isdigit() else c for c in broker.cancel_calls]
         or broker.cancel_calls
     ), "the resting bracket was never cancelled at the exchange"
+
+
+def test_an_exit_cancels_a_PARTIALLY_FILLED_bracket_before_selling(repo):
+    """The #446 regression, found in review: pre-#446 a partially-filled bracket stayed
+    `pending`, so this cancel-before-SELL sweep -- which queried `status="pending"` only --
+    still caught it. The distinct `partially_filled` state took the row OUT of that query,
+    and the exit then placed a full-position SELL against base currency the resting remainder
+    still commits: rejected on spot for insufficient funds, or filled with a live bracket
+    left able to sell inventory we no longer hold.
+
+    A partially-filled bracket is still a RESTING bracket -- its unfilled remainder is
+    working at the exchange exactly like a `pending` bracket's whole size -- so it must be
+    cancelled before the SELL, same as any other."""
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = FakeBroker()
+    bracket_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    # What reconciliation records once the venue has begun executing the bracket (#446): the
+    # distinct non-terminal state, the observed fill, the running average price.
+    repo.update_order(
+        bracket_id,
+        status="partially_filled",
+        filled_quantity=Decimal("0.004"),
+        actual_fill=Decimal("48900"),
+        updated_at=NOW_TS + 1,
+    )
+
+    result = execute(
+        _exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS + 10
+    )
+
+    assert result.placed is True
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    # CANCEL before the SELL, not merely at some point: the bracket's resting remainder still
+    # commits the base, so a SELL placed first is the base-locked rejection this sweep exists
+    # to prevent. (Pre-fix the sequence was ["place", "place"] -- no cancel ever issued.)
+    assert broker.events == ["place", "cancel", "place"], broker.events
 
 
 def test_an_exit_is_refused_when_the_resting_bracket_cannot_be_cancelled(repo):

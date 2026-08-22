@@ -46,7 +46,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 10
+    assert version == db.SCHEMA_VERSION == 11
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -224,5 +224,67 @@ def test_migration_to_v9_creates_the_screen_exceptions_table_EMPTY() -> None:
     assert cols >= {"asset", "criterion", "rationale", "granted_by", "granted_at"}
     (count,) = conn.execute("SELECT COUNT(*) FROM screen_exceptions").fetchone()
     assert count == 0
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
+
+
+def test_migration_to_v11_adds_orders_filled_quantity() -> None:
+    """The column reconciliation records the venue-observed fill on (#446). `qty` keeps meaning
+    the ORDERED size; `filled_quantity` is what the venue actually executed, NULL on every row
+    written before the column existed."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert "filled_quantity" in cols
+
+
+def test_an_existing_orders_table_gains_filled_quantity_by_ALTER() -> None:
+    """A `CREATE TABLE IF NOT EXISTS` addition is invisible to an already-stamped database
+    (the v8 lesson: `profile.autonomous_until` silently never appeared). The v11 step must
+    ALTER the live table, and existing rows must read back with `filled_quantity IS NULL` --
+    "not observed", not zero, so a partial-fill reader can tell them apart."""
+    conn = db.connect(":memory:")
+    # A v10 database: the `orders` table exactly as v10 shipped it (no `filled_quantity`).
+    conn.execute(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_type TEXT,
+            qty TEXT NOT NULL,
+            limit_price TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            fee TEXT,
+            expected_fill TEXT,
+            actual_fill TEXT,
+            raw_response TEXT,
+            confirmation TEXT,
+            rule_id INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO orders (mode, product_id, side, qty, status, created_at, updated_at)
+        VALUES ('live', 'BTC-USD', 'BUY', '0.01', 'filled', 1, 1)
+        """
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+    # v2's step reads `agent_state`; an empty one means "nothing to migrate", which is all it
+    # needs from this fixture.
+    conn.execute("CREATE TABLE agent_state (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+
+    db.migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert "filled_quantity" in cols
+    row = conn.execute("SELECT qty, status, filled_quantity FROM orders").fetchone()
+    assert row["filled_quantity"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert stamped == db.SCHEMA_VERSION

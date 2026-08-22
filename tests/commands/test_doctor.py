@@ -26,6 +26,7 @@ from keel.commands.doctor import (
     doctor_exit_code,
     doctor_lines,
     gather_findings,
+    partial_fill_findings,
     rail_state_findings,
     render_json,
     veto_findings,
@@ -450,8 +451,8 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
     config = load_config(valid_config_path)
     findings = gather_findings(repo, config, [], NOW)
     # every check the command runs, by name: slice 1 (install, attestations, rails, allowance,
-    # vetoes) and slice 2 (data health, admissibility) -- the MCP tool inherits the same set,
-    # so an assistant and an operator cannot be shown two different accounts
+    # vetoes, partial fills) and slice 2 (data health, admissibility) -- the MCP tool inherits
+    # the same set, so an assistant and an operator cannot be shown two different accounts
     assert {f.name for f in findings} == {
         "install.identity",
         "attest.subscription",
@@ -461,6 +462,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "rail.drawdown",
         "allowance.headroom",
         "veto.recent",
+        "fill.partial",
         "data.missing",
         "data.stale",
         "data.gaps",
@@ -496,3 +498,65 @@ def test_gather_findings_reads_the_veto_lines_it_is_handed(tmp_path, valid_confi
     (veto,) = [f for f in findings if f.name == "veto.recent"]
     assert veto.status == "fail"
     assert "3 of 3" in veto.detail
+
+
+# -- partial fills (#446) ------------------------------------------------------------------------
+
+
+def _live_order(
+    *,
+    product_id: str = "BTC-USD",
+    status: str = "filled",
+    qty: Decimal = Decimal("0.01"),
+    filled_quantity: Decimal | None = None,
+) -> dict:
+    """An `orders` row dict as `Repository._order_row_to_dict` hands it to doctor."""
+    return {
+        "id": 7,
+        "mode": "live",
+        "product_id": product_id,
+        "side": "BUY",
+        "order_type": "market",
+        "qty": qty,
+        "limit_price": None,
+        "status": status,
+        "filled_quantity": filled_quantity,
+        "actual_fill": Decimal("50000"),
+    }
+
+
+def test_no_partial_fills_is_ok() -> None:
+    (finding,) = partial_fill_findings(
+        [_live_order(filled_quantity=Decimal("0.01")), _live_order(filled_quantity=None)]
+    )
+    assert finding.name == "fill.partial"
+    assert finding.status == "ok"
+
+
+def test_a_partial_fill_warns_naming_the_order_and_both_sizes() -> None:
+    (finding,) = partial_fill_findings(
+        [_live_order(status="partially_filled", filled_quantity=Decimal("0.004"))]
+    )
+    assert finding.name == "fill.partial"
+    assert finding.status == "warn"
+    assert "BTC-USD" in finding.detail
+    assert "0.004" in finding.detail and "0.01" in finding.detail
+
+
+def test_the_partial_fill_finding_names_the_manual_remedy() -> None:
+    """Doctor's contract: every finding names the next step. The automated bracket resize is
+    #502's (no bracket kind on the port), so the fix must be the MANUAL one."""
+    (finding,) = partial_fill_findings(
+        [_live_order(status="partially_filled", filled_quantity=Decimal("0.004"))]
+    )
+    assert finding.fix.strip()
+    assert "#502" in finding.fix
+
+
+def test_paper_mode_rows_do_not_warn() -> None:
+    """Paper-mode fills must never reach a live-money diagnostic -- the same boundary
+    `held_products` and the exposure rails draw."""
+    row = _live_order(status="partially_filled", filled_quantity=Decimal("0.004"))
+    row["mode"] = "paper"
+    (finding,) = partial_fill_findings([row])
+    assert finding.status == "ok"

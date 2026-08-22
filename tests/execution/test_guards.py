@@ -150,6 +150,42 @@ def _seed_filled_order(
     )
 
 
+def _seed_partial_buy(
+    repo: Repository,
+    *,
+    ordered_qty: Decimal,
+    filled_qty: Decimal,
+    price: Decimal,
+    limit_price: Decimal,
+    created_at: int,
+    side: Side = Side.BUY,
+) -> None:
+    """A live order the venue has only partly executed, as reconciliation now records it
+    (#446): the ORDERED size stays in `qty`, the observed fill in `filled_quantity`, and the
+    status is the distinct non-terminal `partially_filled`. `side` defaults to BUY (the
+    entry case); the SELL case is a partially-executed exit bracket."""
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=side.value,
+            order_type="limit",
+            qty=ordered_qty,
+            limit_price=limit_price,
+            status="partially_filled",
+            fee=Decimal("0"),
+            expected_fill=limit_price,
+            actual_fill=price,  # the venue's running average across the fills so far
+            filled_quantity=filled_qty,
+            raw_response=None,
+            confirmation="auto",
+            rule_id=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
 # -- compliant baseline -------------------------------------------------------------------------
 
 
@@ -214,6 +250,46 @@ def test_rail3_per_day_cap_ignores_spend_from_a_prior_day(repo):
         created_at=NOW_TS - 1_000_000,  # a prior UTC day
     )
     intent = _intent(notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail3_counts_a_partially_filled_buy_at_what_was_actually_spent(repo):
+    """#446: a partially-filled BUY spent `filled_quantity × average` -- THAT is today's
+    spend, not nothing (the row was invisible to the old `("pending", "filled")` status set,
+    so the partial bought a day's headroom that was really spent)."""
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.0076"),  # ordered 380 -- deliberately over the cap too
+        filled_qty=Decimal("0.0056"),  # actually spent 280 of it
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("50"))  # 280 + 50 = 330 > 300 day cap
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"per_day_cap"}
+
+
+def test_rail3_does_not_reserve_the_unfilled_remainder_of_a_partial(repo):
+    """The other half of the same decision: the unfilled remainder bought nothing, so it must
+    not be reserved against the cap either. Counting the ORDERED size here (380 + 50 = 430)
+    would veto an intent the account can afford -- spend is what left the account."""
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.0076"),  # ordered 380
+        filled_qty=Decimal("0.002"),  # actually spent 100
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("50"))  # 100 + 50 = 150 <= 300
 
     result = check(intent, repo, _config(), NOW_TS)
 
@@ -295,7 +371,117 @@ def test_rail6_per_asset_concentration_cap_rejects_over_cap(repo):
     assert _keys(result) == {"per_asset_concentration_cap"}
 
 
-# -- rail 7: min-move / anti-scalping --------------------------------------------------------------
+def test_the_exposure_rails_count_a_partially_filled_buy_at_observed_economics(repo):
+    """#446: `_open_exposure_by_asset` read `status="filled"` only, so a partially-filled
+    BUY's REAL inventory -- 0.0015 held at the observed average, $75 -- was invisible to
+    rails 4/5/6. The venue sold us that base; the exposure figure must see it."""
+    config = _config(max_per_order_usd=Decimal("500"), max_per_asset_pct=Decimal("0.1"))
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.0025"),  # ordered 125
+        filled_qty=Decimal("0.0015"),  # actually held 75 at the observed average
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("50"))  # 75 + 50 = 125 > 100 per-asset limit
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"per_asset_concentration_cap"}
+
+
+def test_the_exposure_rails_do_not_count_the_unfilled_remainder(repo):
+    """Same seed shape, other direction: on the ORDERED size (125) the partial plus this
+    50-notional intent would trip the 100 cap; on the observed fill it is 50 held + 50 new
+    = 100 -- exactly at, not over, the cap, so a truthful figure lets the intent through."""
+    config = _config(max_per_order_usd=Decimal("500"), max_per_asset_pct=Decimal("0.1"))
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.0025"),  # ordered 125 -- would veto if counted
+        filled_qty=Decimal("0.001"),  # actually held 50
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("50"))  # 50 + 50 = 100 <= 100
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_a_partially_filled_sell_releases_only_its_observed_fill(repo):
+    """Both sides count at observed economics. A partially-executed exit bracket really sold
+    its `filled_quantity`, so the exposure genuinely fell by that much -- but by no more:
+    releasing the ORDERED size would hand back cap the venue has not returned (the remainder
+    is still resting and can still sell).
+
+    Held 250, partial SELL observed 50 -> exposure 200; +50 intent = 250, exactly at the
+    250 cap -> passes. Pre-#446 the partial SELL was invisible (exposure 250, +50 = 300 ->
+    vetoed); releasing the ordered 250 instead would leave exposure 0 and pass far too
+    easily -- this seed sits between those two wrong answers."""
+    config = _config(max_per_order_usd=Decimal("500"), max_per_asset_pct=Decimal("0.25"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.005"),  # 250 held, a prior day (keeps rail 3 out of the picture)
+        price=Decimal("50000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.005"),  # the bracket ordered the whole position
+        filled_qty=Decimal("0.001"),  # ...but only 50-worth has sold so far
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+        side=Side.SELL,
+    )
+    intent = _intent(notional=Decimal("50"))  # 200 + 50 = 250 <= 250 per-asset limit
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_a_partially_filled_sell_still_vetoes_where_ordered_release_would_pass(repo):
+    """The veto side of the observed-fill release: same seeds with a tighter cap, where
+    counting the observed economics refuses (200 held + 50 intent = 250 > 220) while the
+    ordered-release wrong turn (0 + 50 = 50 <= 220) would wave the order through. Pinning
+    both directions is what makes "releases ONLY its observed fill" a property of the
+    code rather than of the docstring."""
+    config = _config(max_per_order_usd=Decimal("500"), max_per_asset_pct=Decimal("0.22"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.005"),  # 250 held, a prior day (keeps rail 3 out of the picture)
+        price=Decimal("50000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.005"),  # the bracket ordered the whole position
+        filled_qty=Decimal("0.001"),  # ...but only 50-worth has sold so far
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+        side=Side.SELL,
+    )
+    intent = _intent(notional=Decimal("50"))  # 200 + 50 = 250 > 220 per-asset limit
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert any("per_asset_concentration_cap" in v for v in result.violations)
+
+
+# -- rail 7: min-move / anti-scalping -------------------------------
 
 
 def test_rail7_min_move_anti_scalping_rejects_tight_stop(repo):
@@ -357,6 +543,67 @@ def test_rail8_dca_exempt_from_averaging_into_losers(repo):
     )
 
     result = check(intent, repo, config, NOW_TS)
+
+    assert result.ok is True
+    assert result.violations == []
+
+
+def test_rail8_counts_a_partially_filled_entry_in_the_basis(repo):
+    """A partially-filled BUY has really bought `filled_quantity` at the observed average.
+    Excluding the row leaves the basis at the fully-filled tranche alone and lets a new entry
+    slip UNDER the true cost unnoticed -- the wrong-basis decision #446 names.
+
+    Basis on the FILLED quantities: (0.006*50000 + 0.002*50800) / 0.008 = 50200.
+    Excluding the partial (the old query, `status="filled"` only) gives 50000, so an entry
+    at 50100 discriminated nothing; here it must VETO."""
+    config = _config(max_exposure_usd=Decimal("1000000"), max_per_asset_pct=Decimal("1"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.006"),
+        price=Decimal("50000"),
+        created_at=NOW_TS - 2_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.01"),
+        filled_qty=Decimal("0.002"),
+        price=Decimal("50800"),
+        limit_price=Decimal("51000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+
+    result = check(_intent(entry=Decimal("50100"), stop=Decimal("49000")), repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"no_averaging_into_losers"}
+
+
+def test_rail8_uses_the_FILLED_size_not_the_ordered_size_of_a_partial(repo):
+    """Same history, the other direction: the unfilled remainder was never bought, so it must
+    not weight the basis. On the ORDERED sizes the basis would be
+    (0.006*50000 + 0.01*50800) / 0.016 = 50500, vetoing this 50300 entry; on the filled ones
+    it is 50200 and the entry -- ABOVE the true basis -- is not averaging into a loser."""
+    config = _config(max_exposure_usd=Decimal("1000000"), max_per_asset_pct=Decimal("1"))
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.006"),
+        price=Decimal("50000"),
+        created_at=NOW_TS - 2_000_000,
+    )
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.01"),
+        filled_qty=Decimal("0.002"),
+        price=Decimal("50800"),
+        limit_price=Decimal("51000"),
+        created_at=NOW_TS - 1_000_000,
+    )
+
+    result = check(_intent(entry=Decimal("50300"), stop=Decimal("49000")), repo, config, NOW_TS)
 
     assert result.ok is True
     assert result.violations == []
@@ -558,9 +805,7 @@ def test_rail13_usdc_funding_fails_closed_when_balance_is_unknown(repo):
 
 
 def test_rail13_usdc_funding_exempts_sell_even_with_no_balance(repo):
-    intent = _intent(
-        side=Side.SELL, stop=None, rule_kind="target_harvest", available_quote=None
-    )
+    intent = _intent(side=Side.SELL, stop=None, rule_kind="target_harvest", available_quote=None)
 
     result = check(intent, repo, _config(), NOW_TS)
 
@@ -627,6 +872,28 @@ def test_rail14_monthly_allowance_ignores_spend_from_a_prior_month(repo):
     assert result.violations == []
 
 
+def test_rail14_counts_a_partially_filled_buy_at_what_was_actually_spent(repo):
+    """The month-to-date figure is a SPEND figure, so the partial counts what left the
+    account (#446): `filled_quantity × average`, here 200 of a 300-ordered BUY. Invisible
+    (the old status set), the month looked 200 under-spent and this intent cleared a cap it
+    should not have."""
+    _attest(repo, free_volume_usd=Decimal("240"))
+    _seed_partial_buy(
+        repo,
+        ordered_qty=Decimal("0.006"),  # ordered 300
+        filled_qty=Decimal("0.004"),  # actually spent 200
+        price=Decimal("50000"),
+        limit_price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+    )
+    intent = _intent(notional=Decimal("50"))  # 200 + 50 = 250 > 240 allowance
+
+    result = check(intent, repo, _roomy_config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"monthly_subscription_allowance"}
+
+
 def test_rail14_updated_subscription_is_read_live_at_the_next_check(repo):
     """The allowance is read fresh from `repo.get_broker_subscription()` on every call -- no
     snapshot, no restart, no config edit needed for a re-attestation to take effect."""
@@ -685,9 +952,7 @@ def test_rail14_dca_is_bound_by_the_monthly_allowance(repo):
     """Unlike rails 8/11, DCA is NOT exempt from the subscription allowance -- DCA orders are
     exactly the recurring "subscription" spend the rail exists to cap."""
     _attest(repo, free_volume_usd=Decimal("500"))
-    intent = _intent(
-        notional=Decimal("600"), is_dca=True, rule_kind="dca", stop=None
-    )  # 600 > 500
+    intent = _intent(notional=Decimal("600"), is_dca=True, rule_kind="dca", stop=None)  # 600 > 500
 
     result = check(intent, repo, _roomy_config(), NOW_TS)
 
@@ -934,17 +1199,13 @@ def test_rail14_reads_pacing_from_the_record_not_config(repo: Repository) -> Non
     """even_daily paces the attested allowance across elapsed business days."""
     _attest(repo, free_volume_usd=Decimal("10000"), pacing="even_daily")
     result = guards.check(_intent(notional=Decimal("9000")), repo, _roomy_config(), NOW_TS)
-    violation = next(
-        v for v in result.violations if v.startswith("monthly_subscription_allowance")
-    )
+    violation = next(v for v in result.violations if v.startswith("monthly_subscription_allowance"))
     assert "even_daily pacing" in violation
 
 
 def test_rail14_does_not_gate_sells() -> None:
     """SELL produces quote currency; the rail exists to cap spend, so it must not fire."""
-    result = guards.check(
-        _intent(side=Side.SELL), _unattested_repo(), _roomy_config(), NOW_TS
-    )
+    result = guards.check(_intent(side=Side.SELL), _unattested_repo(), _roomy_config(), NOW_TS)
     assert "subscription_unattested" not in _keys(result)
     assert "monthly_subscription_allowance" not in _keys(result)
 
@@ -1023,7 +1284,6 @@ def test_rail16_violation_message_names_the_cause_and_the_override(repo: Reposit
     assert "consecutive" in violation
     assert "Exits" in violation
     assert "resume-entries" in violation
-
 
 
 # -- rail 17: withdrawal capability (§65.4 qabd) --------------------------------
@@ -1553,7 +1813,10 @@ def test_offline_still_honours_the_kill_switch(repo: Repository) -> None:
     """Killing the agent must stop paper too, or the kill-switch means less than it says."""
     repo.set_state("kill_switch", True)
     offline = check(
-        _intent(available_quote=None, withdrawals_enabled=None), repo, _config(), NOW_TS,
+        _intent(available_quote=None, withdrawals_enabled=None),
+        repo,
+        _config(),
+        NOW_TS,
         offline=True,
     )
     assert offline.ok is False

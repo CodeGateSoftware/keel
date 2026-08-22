@@ -13,6 +13,27 @@ It also upgrades two numbers from modelled to OBSERVED. The executor records `ac
 *expected* price and `fee` as the *previewed* commission, because at placement time those are the
 only figures available. `average_filled_price` and `total_fees` are what the exchange actually
 charged, so a reconciled exit carries real economics into `pnl_net` rather than an estimate.
+
+PARTIAL FILLS (#446) are a distinct, NON-terminal state here. When the venue reports an order
+with `0 < filled_size < ordered qty`, the row moves to `partially_filled` and carries the
+observed fill in `filled_quantity` (`qty` stays the ordered size -- a partial is two numbers,
+not one rewritten) with the venue's running average price in `actual_fill`. The venue reports
+that average already weighted across the fills so far, so each poll records the exact
+quantity-weighted average; the sweep keeps polling the row -- `partially_filled` never leaves
+the polling set -- until it goes terminal (full fill, or dead with the sold part booked).
+
+How often this fires, honestly: rarely, by construction. keel places market IOC orders on
+liquid spot pairs at risk-sized notional ($400-24k typical per `config.live.yaml`, sized at 1%
+equity risk), where a market IOC sweeps the top of a deep book and partial fills are the thin-book
+case, not the norm. No production frequency data exists to cite -- the state simply was not
+recorded before this change, which is the gap itself. That rarity changes the priority of
+auto-remediation, not the validity of recognizing the state.
+
+What is deliberately NOT done here: resizing or amending the bracket when a partially-filled
+entry leaves it oversized for what is held. The broker port has no bracket/OCO kind (#502); the
+live bracket bypasses it with a raw dict, and auto-cancelling live protective orders on the
+strength of a possibly-still-settling partial snapshot is strictly worse than a loud warning.
+This module records and surfaces; the amend-vs-cancel-and-replace policy is #502's.
 """
 
 from __future__ import annotations
@@ -36,11 +57,24 @@ logger = logging.getLogger(__name__)
 _FILLED = "FILLED"
 _DEAD = frozenset({"CANCELLED", "CANCELED", "EXPIRED", "FAILED"})
 
+#: The locally-recorded statuses the sweep keeps polling (#446). `pending` is "nothing observed
+#: yet"; `partially_filled` is "the venue has begun executing it" -- non-terminal, so it MUST
+#: stay in the polling set, or the state this module just wrote would take the order out of its
+#: own sweep and the remainder would never be observed. It is the SAME tuple executor treats as
+#: "a bracket is still resting" (`executor.RESTING_STATUSES`), aliased rather than restated so
+#: the sweep that observes partials and the cancel-before-place paths that clear them can never
+#: drift apart: a status one side stopped seeing would be a bracket nobody cancels, or a cancel
+#: for an order nobody watches.
+_POLLED_STATUSES = executor.RESTING_STATUSES
 
-def reconcile_open_orders(
-    broker: Any, repo: Repository, config: Config, now_ts: int
-) -> list[int]:
-    """Bring every locally-`pending` live order into agreement with the exchange.
+#: The distinct non-terminal partial-fill state (#446). A free-text column, not a constrained
+#: enum, so no migration was needed for the VALUE -- only for the `filled_quantity` column that
+#: carries the observed fill alongside it.
+_PARTIALLY_FILLED = "partially_filled"
+
+
+def reconcile_open_orders(broker: Any, repo: Repository, config: Config, now_ts: int) -> list[int]:
+    """Bring every locally-unterminated live order into agreement with the exchange.
 
     Returns the ids of orders whose state changed. Never raises for a single unreadable order:
     this runs at the top of every cycle, and one bad id must not blind the agent to every other
@@ -49,7 +83,7 @@ def reconcile_open_orders(
     """
     changed: list[int] = []
 
-    for row in repo.get_orders(mode="live", status="pending"):
+    for row in _polled_rows(repo):
         native_id = _native_order_id(row)
         if native_id is None:
             # Placed but with no id echoed back: we cannot ask about it, and guessing would be
@@ -100,9 +134,13 @@ def reconcile_open_orders(
             continue
 
         if status != _FILLED:
-            # Still resting -- including a PARTIAL fill, which has NOT closed the position.
-            # Recording a partial as a full exit would book P&L for size that never sold and
-            # release a position still partly held. Left for a later cycle.
+            # Still resting -- but possibly one the venue has BEGUN executing. A partial fill
+            # has not closed the position: recording it as a full exit would book P&L for size
+            # that never sold and release a position still partly held. It IS, however, its own
+            # non-terminal state with its own observed economics (#446) -- not a `pending` row
+            # indistinguishable from one the venue never touched.
+            if _record_partial_fill(repo, row, observed, now_ts):
+                changed.append(row["id"])
             continue
 
         _try_record_fill(broker, repo, config, row, observed, now_ts)
@@ -111,6 +149,72 @@ def reconcile_open_orders(
     return changed
 
 
+def _polled_rows(repo: Repository) -> list[dict[str, Any]]:
+    """The live rows this sweep owns: every status that is not terminal, oldest first."""
+    rows: list[dict[str, Any]] = []
+    for status in _POLLED_STATUSES:
+        rows.extend(repo.get_orders(mode="live", status=status))
+    return sorted(rows, key=lambda r: r["id"])
+
+
+def _record_partial_fill(
+    repo: Repository, row: dict[str, Any], observed: dict[str, Any], now_ts: int
+) -> bool:
+    """Record `0 < filled_size < ordered qty` as the distinct non-terminal `partially_filled`
+    state. Returns whether anything changed.
+
+    `qty` stays the ORDERED size and the observed fill goes in `filled_quantity` -- a partial is
+    two numbers, and rewriting `qty` would destroy the comparison that makes the state
+    recognizable. `actual_fill`/`fee` take the venue's running figures, which for
+    `average_filled_price` are already the quantity-weighted average across every fill so far.
+
+    Idempotent by observation: a resting partial that has not moved re-writes nothing and stays
+    quiet, because this sweep runs every cycle and a warning that fires nightly for an unchanged
+    order trains the operator to ignore the one that matters. A price the venue did not report
+    (its normalized 0) is left alone rather than recorded -- a zero would read downstream as a
+    free position in the rail-8 basis.
+    """
+    ordered = row["qty"] or Decimal("0")
+    filled = observed.get("filled_size") or Decimal("0")
+    if not (Decimal("0") < filled < ordered):
+        return False
+
+    average = observed.get("average_filled_price") or Decimal("0")
+    fees = observed.get("total_fees") or Decimal("0")
+    previously = row.get("filled_quantity")
+
+    fields: dict[str, Any] = {
+        "status": _PARTIALLY_FILLED,
+        "filled_quantity": filled,
+        "updated_at": now_ts,
+    }
+    if average > 0:
+        fields["actual_fill"] = average
+    if fees > 0:
+        fields["fee"] = fees
+
+    # An unchanged observation (same filled quantity on an already-partial row) is a no-op.
+    if previously is not None and previously == filled and row["status"] == _PARTIALLY_FILLED:
+        return False
+
+    repo.update_order(row["id"], **fields)
+    log_event(
+        logger,
+        logging.WARNING,
+        "reconcile.order_partially_filled",
+        order_id=row["id"],
+        product=row["product_id"],
+        filled=str(filled),
+        ordered=str(ordered),
+        remaining=str(ordered - filled),
+        average_price=str(average) if average > 0 else "unreported",
+        detail=(
+            "the venue has executed part of this order and the rest is still resting -- the "
+            "position basis now includes this fill; if this is an entry leg, check that its "
+            "bracket is not sized for more than is held (#502 tracks the resize policy)"
+        ),
+    )
+    return True
 
 
 def reconcile_unbracketed_positions(
@@ -120,15 +224,18 @@ def reconcile_unbracketed_positions(
 
     `_rebracket_or_escalate` below heals a bracket that WAS accepted and later died. It cannot
     reach a bracket that was never placed at all, because it is driven from
-    `reconcile_open_orders`, which iterates `status="pending"` rows: a broker rejection writes
-    `rejected` and a rails veto writes no row whatsoever (the insert happens after the guard
-    gate). Neither is `pending`, so before this pass nothing revisited the tranche and the
-    position stayed naked for a full cycle -- one per UTC day -- behind a WARNING (issue #195).
+    `reconcile_open_orders`, which iterates the non-terminal rows (`pending` and
+    `partially_filled`, `_POLLED_STATUSES`): a broker rejection writes `rejected` and a rails
+    veto writes no row whatsoever (the insert happens after the guard gate). Neither is polled,
+    so before this pass nothing revisited the tranche and the position stayed naked for a full
+    cycle -- one per UTC day -- behind a WARNING (issue #195).
 
     Driven from the `positions` ledger rather than from `orders`, because the ledger is the only
-    place that knows a tranche is HELD. A tranche is considered protected only while its bracket
-    is still `pending`; `filled` means the position is on its way out, and any other status means
-    nothing is resting at the exchange.
+    place that knows a tranche is HELD. A tranche is considered protected while its bracket is
+    still working at the exchange -- `pending`, `partially_filled` (the unfilled remainder still
+    rests, #446), or `filled` (the position is on its way out, and re-placing against it would
+    double-sell) -- see `_has_resting_bracket`; any other status means nothing is resting at the
+    exchange.
 
     A tranche with no recorded `unbracketed:` levels is skipped SILENTLY, not escalated. That is
     DCA's correct resting state -- it carries no stop by design -- and escalating it would fire a
@@ -212,12 +319,13 @@ def _has_resting_bracket(repo: Repository, position: dict[str, Any]) -> bool:
     order = repo.get_order(bracket_id)
     if order is None:
         return False
-    return str(order["status"]) in {"pending", "filled"}
+    # `partially_filled` is still RESTING (#446): the unfilled remainder is working at the
+    # exchange, so the tranche is protected -- treating it as gone would re-place a bracket
+    # against inventory the remainder already commits.
+    return str(order["status"]) in {"pending", "filled", _PARTIALLY_FILLED}
 
 
-def _escalate_unprotected_position(
-    position: dict[str, Any], qty: Decimal, why: str
-) -> None:
+def _escalate_unprotected_position(position: dict[str, Any], qty: Decimal, why: str) -> None:
     log_event(
         logger,
         logging.CRITICAL,
@@ -316,9 +424,7 @@ def _rebracket_or_escalate(
     )
 
 
-def _escalate_unprotected(
-    repo: Repository, row: dict[str, Any], qty: Decimal, why: str
-) -> None:
+def _escalate_unprotected(repo: Repository, row: dict[str, Any], qty: Decimal, why: str) -> None:
     log_event(
         logger,
         logging.CRITICAL,
@@ -396,6 +502,7 @@ def _record_fill(
         actual_fill=exit_fill,
         fee=fees,
         qty=filled_qty,
+        filled_quantity=filled_qty,
         updated_at=now_ts,
     )
     log_event(
