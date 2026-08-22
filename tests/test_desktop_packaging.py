@@ -13,46 +13,20 @@ import stat
 from pathlib import Path
 
 import pytest
-import yaml
+
+from tests._workflow_yaml import strict_load
 
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOW = _ROOT / ".github" / "workflows" / "release.yml"
 _MACOS_SCRIPT = _ROOT / "packaging" / "macos_app.sh"
 
 
-class _StrictLoader(yaml.SafeLoader):
-    """A SafeLoader that REFUSES duplicate mapping keys.
-
-    PyYAML's default behaviour is last-key-wins, which is how a workflow edit that
-    leaves a step's `shell:`/`run:` behind after rewriting it still parses, still
-    passes every test in this file -- and is then rejected by GitHub's STRICT parser
-    at dispatch time, disabling the workflow on main outright (v0.11.0's first
-    re-dispatch, exactly). GitHub is the authority; this loader matches it."""
-
-
-def _strict_load(text: str) -> dict:
-    errors: list[str] = []
-
-    def construct_mapping(loader: yaml.Loader, node: yaml.MappingNode, deep: bool = False) -> dict:
-        seen: set[str] = set()
-        for key_node, _ in node.value:
-            key = loader.construct_object(key_node, deep=deep)
-            if key in seen:
-                errors.append(f"duplicate key {key!r} at line {key_node.start_mark.line + 1}")
-            seen.add(key)
-        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
-
-    _StrictLoader.add_constructor(
-        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping
-    )
-    data = yaml.load(text, Loader=_StrictLoader)
-    assert not errors, "release.yml would be rejected by GitHub's parser: " + "; ".join(errors)
-    return data
-
-
 @pytest.fixture(scope="module")
 def workflow() -> dict:
-    return _strict_load(_WORKFLOW.read_text(encoding="utf-8"))
+    # The strict loader (duplicate keys REFUSED, like GitHub's parser) lives in
+    # tests/_workflow_yaml.py since test_security_scans.py needed the same discipline
+    # for code-quality.yml -- this file is where it was born (v0.11.0's re-dispatch).
+    return strict_load(_WORKFLOW.read_text(encoding="utf-8"), source="release.yml")
 
 
 @pytest.fixture(scope="module")

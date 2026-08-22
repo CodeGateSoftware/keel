@@ -33,7 +33,10 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
+
+from tests._workflow_yaml import strict_load
 
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _ROOT / ".github" / "workflows"
@@ -52,6 +55,18 @@ def _read(relative: str) -> str:
     """A repo file's text; empty until it exists, so a red run FAILS rather than errors."""
     path = _ROOT / relative
     return path.read_text() if path.is_file() else ""
+
+
+def _load_workflow(name: str) -> dict:
+    """A workflow parsed the way GitHub parses it: duplicate keys refused, not merged.
+
+    Every structural claim this file makes about code-quality.yml rides on PyYAML keeping
+    the key GitHub would keep. `yaml.safe_load`'s last-key-wins would let a duplicate-key
+    edit pass every pin here and then disable the workflow at dispatch time -- the exact
+    v0.11.0 release.yml incident class, whose discipline (born in
+    tests/test_desktop_packaging.py) tests/_workflow_yaml.py now shares.
+    """
+    return strict_load((_WORKFLOWS / name).read_text(encoding="utf-8"), source=name)
 
 
 def _pyprojects() -> dict[str, dict]:
@@ -194,6 +209,34 @@ def test_the_baseline_scans_reference_no_secrets_at_all():
         )
 
 
+def test_the_strict_loader_rejects_a_duplicate_key_workflow_text() -> None:
+    """Why every workflow parse here goes through `strict_load`, pinned on the loader itself.
+
+    PyYAML's `safe_load` resolves duplicate mapping keys last-key-wins, so a workflow edit
+    that leaves a stale `run:` beside the rewritten one parses fine, passes every pin in
+    this file -- and is refused by GitHub's STRICT parser only at dispatch, disabling the
+    workflow on main outright (v0.11.0's first re-dispatch of release.yml, exactly). This
+    is the same discipline tests/test_desktop_packaging.py applies to release.yml; here it
+    guards code-quality.yml, whose preflight structure the tests below pin key by key.
+    """
+    leaky = """
+on: push
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        uses: actions/checkout@v6
+"""
+    with pytest.raises(AssertionError, match="duplicate key 'uses'"):
+        strict_load(leaky, source="duplicate-key workflow text")
+    # And it is duplicate keys it refuses, not workflows: the same text with the stale
+    # line removed loads, so the loader cannot hide behind refusing everything.
+    cleaned = leaky.replace("        uses: actions/checkout@v6\n", "")
+    assert strict_load(cleaned, source="clean")["jobs"]
+
+
 def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard():
     """code-quality.yml may name SONAR_TOKEN/SNYK_TOKEN -- but only guarded.
 
@@ -207,7 +250,7 @@ def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard()
     token-referencing job from its preflight -- nor re-merge the two scanners into one
     all-or-nothing flag.
     """
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     jobs = workflow.get("jobs", {})
     assert "preflight" in jobs, (
         f"{_OPTIONAL_TIER} must keep its preflight job -- it is what lets the optional "
@@ -252,7 +295,7 @@ def test_preflight_readiness_includes_the_org_level_config_not_just_the_tokens()
     this test pins that it checks both, and that each scan passes its org along when it
     finally runs.
     """
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     preflight_text = str(workflow["jobs"]["preflight"])
     assert "sonar.organization" in preflight_text, (
         "preflight must check sonar-project.properties carries an active "
@@ -276,7 +319,7 @@ def test_preflight_still_fails_loudly_only_when_a_human_dispatched_it():
     an automatic trigger skips with an explanation. Reversed, the workflow either
     reddens every push to main while prerequisites are missing (#402, observed) or
     silently ignores a direct request."""
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     steps = workflow["jobs"]["preflight"]["steps"]
     run = "\n".join(str(step.get("run", "")) for step in steps)
     assert "workflow_dispatch" in run, (
