@@ -240,11 +240,13 @@ def packaged_update_refusal() -> str:
     The refusals `keel update` already produces are all correct and all useless to a desktop user:
     they talk about `site-packages` layouts and tell the reader to put `uv` on PATH. A packaged
     user has no venv and no `uv`, and never will -- so the honest message names the actual update
-    path, which is downloading the next signed installer (#439's option A)."""
+    path, which is downloading the next signed installer (#439's option A, decided in
+    docs/decisions/0001-desktop-update-path.md)."""
     return (
         "this is a packaged install, which updates by downloading the next release rather than "
-        f"from the command line. Get it from {RELEASES_URL} and run it -- it will keep your "
-        "config, database and credentials exactly as they are."
+        f"from the command line. Get it from {RELEASES_URL} and run it (docs/desktop-install.md, "
+        "'How updates arrive') -- it will keep your config, database and credentials exactly "
+        "as they are."
     )
 
 

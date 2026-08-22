@@ -17,6 +17,9 @@ Three surfaces, pinned here:
   best-effort reinstall of the previous wheels when they are still on disk.
 * **The relaunch closure** -- argv reconstruction (`build_relaunch_argv`) and the
   execv closure (`relaunch_tui`, execv itself faked).
+* **The packaged story (D6, #439)** -- a packaged install NEVER self-updates: the check
+  names the installer download, the plan's refusal stands alone in desktop vocabulary,
+  and an unreachable check is calm, never an error. The uv-venv path above is untouched.
 """
 
 from __future__ import annotations
@@ -258,7 +261,11 @@ def test_the_default_fetch_maps_a_rate_limit_to_an_honest_unauthenticated_hint(
 
     def _rate_limited(req: Any, timeout: Any = None) -> Any:
         raise urllib.error.HTTPError(
-            str(req.full_url), 403, "Forbidden", None, None  # type: ignore[arg-type]
+            str(req.full_url),
+            403,
+            "Forbidden",
+            None,
+            None,  # type: ignore[arg-type]
         )
 
     monkeypatch.setattr(up.urllib.request, "urlopen", _rate_limited)
@@ -656,9 +663,7 @@ def test_a_download_larger_than_the_guard_is_refused_not_streamed(
         def read(self, n: int = -1) -> bytes:
             return b"x" * (n + 1)  # always one byte MORE than the bound allows
 
-    monkeypatch.setattr(
-        up.urllib.request, "urlopen", lambda url, timeout=None: _HugeResponse()
-    )
+    monkeypatch.setattr(up.urllib.request, "urlopen", lambda url, timeout=None: _HugeResponse())
     with pytest.raises(up.UpdateError, match="200 MiB"):
         up._download_file("https://example/huge", tmp_path / "w.whl")
     assert not (tmp_path / "w.whl").exists()
@@ -824,7 +829,8 @@ def test_run_update_verify_failure_without_previous_wheels_says_manual_recovery(
 
 
 def test_the_default_install_runs_uv_with_the_venv_and_every_production_wheel_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     launch = _deployment(tmp_path)
     venv = launch / ".venv/bin/python"
@@ -835,8 +841,10 @@ def test_the_default_install_runs_uv_with_the_venv_and_every_production_wheel_pa
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(up.subprocess, "run", _run_uv)
-    up._uv_install(venv, [launch / "Release" / f"{p}-0.7.0-py3-none-any.whl"
-                          for p in up.PRODUCTION_WHEEL_PREFIXES])
+    up._uv_install(
+        venv,
+        [launch / "Release" / f"{p}-0.7.0-py3-none-any.whl" for p in up.PRODUCTION_WHEEL_PREFIXES],
+    )
     assert recorded == [
         [
             "uv",
@@ -848,14 +856,17 @@ def test_the_default_install_runs_uv_with_the_venv_and_every_production_wheel_pa
             # ==-pinned siblings resolve from Release/ (they are not on PyPI)
             "--find-links",
             str(launch / "Release"),
-            *[str(launch / "Release" / f"{p}-0.7.0-py3-none-any.whl")
-              for p in up.PRODUCTION_WHEEL_PREFIXES],
+            *[
+                str(launch / "Release" / f"{p}-0.7.0-py3-none-any.whl")
+                for p in up.PRODUCTION_WHEEL_PREFIXES
+            ],
         ]
     ]
 
 
 def test_an_absent_uv_is_an_honest_error_naming_the_manual_procedure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     def _no_uv(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         raise FileNotFoundError("uv")
@@ -984,8 +995,7 @@ def test_build_relaunch_argv_preserves_a_leading_subcommand_verbatim() -> None:
     ]
 
 
-def test_build_relaunch_argv_falls_back_to_the_tui_command_when_the_argv_does_not_name_it(
-) -> None:
+def test_build_relaunch_argv_falls_back_to_the_tui_command_when_the_argv_does_not_name_it() -> None:
     venv = Path("/deployment/.venv/bin/python")
     argv = up.build_relaunch_argv(venv, ["/deployment/keel-live"])
     assert argv[0] == "/deployment/.venv/bin/keel"
@@ -1113,16 +1123,13 @@ def test_render_result_lines_names_the_state_and_the_recovery(tmp_path: Path) ->
 def _cli_plan_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Point the CLI's plan at a fake release/deployment: no network, no install."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(up, "latest_release", lambda fetch=None: up.parse_release(
-        _release_json("0.7.0")))
+    monkeypatch.setattr(
+        up, "latest_release", lambda fetch=None: up.parse_release(_release_json("0.7.0"))
+    )
     monkeypatch.setattr(up, "build_info", lambda: _RELEASE_BUILD)
     monkeypatch.setattr(up, "installed_distributions", lambda: dict(_INSTALLED))
-    monkeypatch.setattr(
-        up, "_running_python", lambda: tmp_path / ".venv/bin/python"
-    )
-    monkeypatch.setattr(
-        up, "_running_package_file", lambda: _fake_venv_package(tmp_path)
-    )
+    monkeypatch.setattr(up, "_running_python", lambda: tmp_path / ".venv/bin/python")
+    monkeypatch.setattr(up, "_running_package_file", lambda: _fake_venv_package(tmp_path))
 
 
 def test_cli_check_prints_the_offer_and_mutates_nothing(
@@ -1148,8 +1155,11 @@ def test_cli_check_prints_the_dev_checkout_refusal(
     from keel.cli import cli
 
     _cli_plan_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(up, "build_info", lambda: BuildInfo(
-        version="0.6.0", commit="deadbeef", dirty=False, source="checkout"))
+    monkeypatch.setattr(
+        up,
+        "build_info",
+        lambda: BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="checkout"),
+    )
     result = CliRunner().invoke(cli, ["update", "--check"])
     assert result.exit_code == 0
     assert "checkout" in result.output.lower()
@@ -1201,3 +1211,183 @@ def test_cli_full_update_runs_the_service_and_prints_the_relaunch_instruction(
     assert ops.events
     # the CLI does NOT auto-relaunch -- it prints the instruction
     assert "keel tui" in result.output
+
+
+# -- the packaged story (D6, issue #439): the installer IS the update path ------------------------
+
+
+def _packaged_release(version: str = "0.7.0") -> up.ReleaseInfo:
+    return up.parse_release(_release_json(version))
+
+
+def test_packaged_check_lines_report_the_installer_not_the_venv() -> None:
+    """A newer release on a packaged install names the DESKTOP path -- the download URL
+    and docs/desktop-install.md -- and never a venv word: no `uv`, no `site-packages`, no
+    `not offered` (there is nothing being refused; there is a different update path)."""
+    build = BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="release")
+    lines = up.packaged_check_lines(build, _packaged_release("0.7.0"))
+    text = "\n".join(lines)
+    assert "current: 0.6.0" in text and "0.7.0" in text  # the same first line as the venv report
+    assert "a newer release exists: v0.7.0" in text
+    assert up.RELEASES_URL in text
+    assert "docs/desktop-install.md" in text
+    assert "uv" not in text.split()
+    assert "site-packages" not in text
+    assert "venv" not in text.split()
+
+
+def test_packaged_check_lines_at_the_latest_release_are_calm() -> None:
+    build = BuildInfo(version="0.7.0", commit="deadbeef", dirty=False, source="release")
+    text = "\n".join(up.packaged_check_lines(build, _packaged_release("0.7.0")))
+    assert "you are at the latest release" in text
+    assert "nothing to do" in text
+    assert "download" not in text  # nothing to push at a user with nothing to do
+
+
+def test_packaged_check_lines_refuse_to_guess_on_a_junk_tag() -> None:
+    build = BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="release")
+    release = up.ReleaseInfo(tag="not-semver", assets=())
+    text = "\n".join(up.packaged_check_lines(build, release))
+    assert "cannot compare" in text
+    assert up.RELEASES_URL in text  # the user still has a path: the releases page itself
+
+
+def test_the_packaged_plan_refusal_stands_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D6's standing rule, pinned at the plan: a packaged install's ONLY refusal is the
+    packaged one. Built against a layout that would otherwise pile venv refusals on (a
+    package file that cannot even be located): every extra reason would be true and
+    useless to someone whose update path is a download."""
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    plan = up.plan_update(
+        _packaged_release(),
+        build=BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="unknown"),
+        installed={},  # a frozen bundle reports no distributions
+        launch_dir=tmp_path,
+        venv_python=tmp_path / ".venv/bin/python",
+        package_file=None,  # and no locatable package file
+    )
+    assert not plan.offered
+    assert len(plan.refusal_reasons) == 1, plan.refusal_reasons
+    reason = plan.refusal_reasons[0]
+    assert up.RELEASES_URL in reason
+    assert "uv" not in reason.split()
+    assert "site-packages" not in reason
+
+
+def test_the_outside_launch_refusal_names_the_packaged_path(tmp_path: Path) -> None:
+    """A frozen bundle's package resolves from OUTSIDE any launch folder, so this is the
+    layout refusal a desktop user would meet; it must say how a packaged install updates
+    rather than only describing repo runs."""
+    outside = tmp_path.parent / "keel.app" / "Contents" / "Frameworks" / "keel" / "__init__.py"
+    reason = up.deployment_layout_refusal(tmp_path, outside)
+    assert reason is not None
+    assert "docs/desktop-install.md" in reason
+    assert "installer" in reason
+
+
+def test_absent_uv_names_the_desktop_path_beside_the_manual_procedure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The uv-missing failure must not read as 'install uv' to a desktop user: it names
+    the packaged path too. (A packaged install never reaches the install step -- the plan
+    refuses first -- but a message that CAN reach a user must not give impossible advice.)"""
+
+    def _no_uv(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("uv")
+
+    monkeypatch.setattr(up.subprocess, "run", _no_uv)
+    with pytest.raises(up.UpdateError) as excinfo:
+        up._uv_install(tmp_path / ".venv/bin/python", [tmp_path / "w.whl"])
+    message = str(excinfo.value)
+    assert "docs/desktop-install.md" in message
+
+
+def _packaged_cli_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    release_version: str = "0.7.0",
+    fail_fetch: str | None = None,
+) -> None:
+    """A packaged process whose latest-release read is faked: no network, no install."""
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(
+        up,
+        "build_info",
+        lambda: BuildInfo(version="0.6.0", commit="deadbeef", dirty=False, source="release"),
+    )
+    if fail_fetch is not None:
+
+        def _fail(fetch: Any = None) -> up.ReleaseInfo:
+            raise up.UpdateError(fail_fetch)
+
+        monkeypatch.setattr(up, "latest_release", _fail)
+    else:
+        monkeypatch.setattr(
+            up, "latest_release", lambda fetch=None: _packaged_release(release_version)
+        )
+
+
+def test_cli_packaged_check_reports_the_installer_path_and_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`keel update --check` on a packaged install IS the version check: the report names
+    the download and the desktop doc, and the venv machinery (plan, gate, run) never
+    runs -- a desktop user is never told to install uv."""
+    from keel.cli import cli
+
+    monkeypatch.chdir(tmp_path)
+    _packaged_cli_env(monkeypatch)
+
+    def _must_not_run(*_args: Any, **_kwargs: Any) -> up.UpdateResult:
+        raise AssertionError("run_update must not run on a packaged install")
+
+    monkeypatch.setattr(up, "run_update", _must_not_run)
+    result = CliRunner().invoke(cli, ["update", "--check"])
+    assert result.exit_code == 0, result.output
+    assert "a newer release exists: v0.7.0" in result.output
+    assert up.RELEASES_URL in result.output
+    assert "docs/desktop-install.md" in result.output
+    assert "uv" not in result.output.split()
+    assert "not offered" not in result.output.lower()
+    assert not (tmp_path / "Release").exists()
+
+
+def test_cli_packaged_update_without_check_is_the_same_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bare `keel update` on a packaged install cannot mean "run the installer for
+    me" (D6: there is no self-update), so it is the same read-only report -- exit 0, no
+    gate prompt, nothing run."""
+    from keel.cli import cli
+
+    monkeypatch.chdir(tmp_path)
+    _packaged_cli_env(monkeypatch)
+
+    def _must_not_run(*_args: Any, **_kwargs: Any) -> up.UpdateResult:
+        raise AssertionError("run_update must not run on a packaged install")
+
+    monkeypatch.setattr(up, "run_update", _must_not_run)
+    result = CliRunner().invoke(cli, ["update"])
+    assert result.exit_code == 0, result.output
+    assert "a newer release exists" in result.output
+    assert "yes" not in result.output.lower()  # no gate was asked
+
+
+def test_cli_packaged_network_failure_is_calm_and_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unreachable check is not an error state for a packaged install: exit 0, the
+    running version, and the releases URL -- the user can still act; keel never blocks
+    on, or fails over, a read it makes no promises about."""
+    from keel.cli import cli
+
+    monkeypatch.chdir(tmp_path)
+    _packaged_cli_env(monkeypatch, fail_fetch="could not reach the GitHub releases API: no route")
+    result = CliRunner().invoke(cli, ["update", "--check"])
+    assert result.exit_code == 0, result.output
+    assert "could not check" in result.output.lower()
+    assert "0.6.0" in result.output
+    assert up.RELEASES_URL in result.output
