@@ -463,7 +463,10 @@ def fetch(
     reprobe_absent: bool,
     tolerance_bars: int,
 ) -> None:
-    """Ensure cached candle history is current for every allowlisted product.
+    """One-shot: warm or refresh the cached candle history for every allowlisted product.
+
+    Runs once and exits; `keel monitor` is the standing poll loop. This command is the data
+    pipeline's warm/repair pass plus its verification mode:
 
     READ-ONLY with respect to money: this command fetches market data and writes candles. It
     places no orders, touches no rails and reads no credentials beyond the venue's public
@@ -1004,7 +1007,11 @@ cli.add_command(trials_group)
 def monitor(
     ctx: click.Context, loop: bool, interval_sec: float | None, max_cycles: int | None
 ) -> None:
-    """Poll fresh candles for every allowlisted product (read-only).
+    """The long-running loop that keeps the candle cache warm (read-only).
+
+    Each cycle records the venue session (FR-9), skips polling while the market is closed
+    (a shut venue mints no bars), and otherwise polls fresh candles for every allowlisted
+    product. Without --loop it runs exactly one cycle.
 
     The loop itself lives in `keel.commands.monitor.run_monitor` (issue #387 C1); this wrapper
     parses the options and echoes.

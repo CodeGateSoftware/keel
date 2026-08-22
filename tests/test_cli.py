@@ -409,6 +409,38 @@ def test_resume_disengages_when_confirmed(tmp_path, monkeypatch):
     assert repo.get_state("kill_switch") is False
 
 
+# -- fetch vs monitor: --help must state the two different jobs (#312) ------------------------
+
+
+def test_fetch_and_monitor_help_state_distinct_jobs():
+    """`keel fetch --help` and `keel monitor --help` once read as synonyms ("Ensure cached
+    candle history is current" vs "Poll fresh candles for every allowlisted product"). They
+    are different tools, and each --help must say which one it is: fetch is the ONE-SHOT
+    warm/refresh of the candle cache (with `--check` as its verification mode); monitor is
+    the LONG-RUNNING loop that keeps the cache warm, records the venue session (FR-9) and
+    skips polling while the market is closed. Each help must carry its own distinction and
+    must NOT carry the other's, which is exactly what a synonym-reading summary would do.
+
+    Whitespace is collapsed before matching so a phrase split by click's help wrapping still
+    asserts."""
+    runner = CliRunner()
+
+    fetch_help = " ".join(runner.invoke(cli, ["fetch", "--help"]).output.split())
+    monitor_help = " ".join(runner.invoke(cli, ["monitor", "--help"]).output.split())
+
+    # fetch: the one-shot warm/refresh, with --check verification semantics
+    assert "one-shot" in fetch_help.lower()
+    assert "--check" in fetch_help
+    assert "long-running" not in fetch_help.lower()
+    assert "keeps the candle cache warm" not in fetch_help.lower()
+
+    # monitor: the long-running loop, session-aware, closed-market skipping
+    assert "long-running" in monitor_help.lower()
+    assert "keeps the candle cache warm" in monitor_help.lower()
+    assert "market is closed" in monitor_help.lower()
+    assert "one-shot" not in monitor_help.lower()
+
+
 # -- monitor ----------------------------------------------------------------------------------
 
 
