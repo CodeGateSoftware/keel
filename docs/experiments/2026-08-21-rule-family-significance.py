@@ -65,6 +65,7 @@ import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor
 from decimal import Decimal
+from typing import NotRequired, TypedDict
 
 from keel.agent import build_rule_from_params
 from keel.research.significance import (
@@ -107,6 +108,36 @@ REGIMES: tuple[tuple[str, Decimal], ...] = (
 )
 
 
+class JsonlRow(TypedDict):
+    """One JSONL row in its plain shapes: every Decimal already stringified.
+
+    `outcomes` rides only the in-memory per-cell rows the pooled pass recomputes from; it
+    is stripped before the row is written, so pooled rows carry everything else and no
+    `outcomes`.
+    """
+
+    family: str
+    product: str
+    fee_regime: str
+    fee_pct: str
+    slippage_pct: str
+    bars: int
+    n_trades: int
+    wins: int
+    open_trades: int
+    win_rate: str
+    payoff_b: str
+    break_even: str
+    edge: str
+    n_effective: str
+    edge_z: str
+    p_value: float
+    edge_ci_low: str
+    detectable_edge: str
+    verdict: str
+    outcomes: NotRequired[list[tuple[str, str | None, str | None]]]
+
+
 def load_candles(db_path: str, product_id: str) -> list[Candle]:
     """Ascending ONE_HOUR candles for one product, read-only."""
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -145,7 +176,7 @@ def hourly_products(db_path: str, minimum_bars: int) -> list[tuple[str, int]]:
     return [(product_id, count) for product_id, count in rows]
 
 
-def _one(job: tuple[str, str, str, str]) -> dict[str, object]:
+def _one(job: tuple[str, str, str, str]) -> JsonlRow:
     """One (db, family, product, regime) cell: backtest, significance, JSONL row.
 
     Runs entirely inside a worker process. The db path travels IN the job because macOS
@@ -190,24 +221,24 @@ def _one(job: tuple[str, str, str, str]) -> dict[str, object]:
     }
 
 
-def _stat_from_row(row: dict[str, object]) -> FamilySignificance:
+def _stat_from_row(row: JsonlRow) -> FamilySignificance:
     """Rebuild the `FamilySignificance` a JSONL row carries, for pooled rendering."""
     return FamilySignificance(
-        family=str(row["family"]),
-        fee_regime=str(row["fee_regime"]),
-        fee_pct=Decimal(str(row["fee_pct"])),
-        n_trades=int(row["n_trades"]),
-        wins=int(row["wins"]),
-        win_rate=Decimal(str(row["win_rate"])),
-        payoff_b=Decimal(str(row["payoff_b"])),
-        break_even=Decimal(str(row["break_even"])),
-        edge=Decimal(str(row["edge"])),
-        n_effective=Decimal(str(row["n_effective"])),
-        edge_z=Decimal(str(row["edge_z"])),
-        p_value=float(row["p_value"]),
-        edge_ci_low=Decimal(str(row["edge_ci_low"])),
-        detectable_edge=Decimal(str(row["detectable_edge"])),
-        verdict=str(row["verdict"]),
+        family=row["family"],
+        fee_regime=row["fee_regime"],
+        fee_pct=Decimal(row["fee_pct"]),
+        n_trades=row["n_trades"],
+        wins=row["wins"],
+        win_rate=Decimal(row["win_rate"]),
+        payoff_b=Decimal(row["payoff_b"]),
+        break_even=Decimal(row["break_even"]),
+        edge=Decimal(row["edge"]),
+        n_effective=Decimal(row["n_effective"]),
+        edge_z=Decimal(row["edge_z"]),
+        p_value=row["p_value"],
+        edge_ci_low=Decimal(row["edge_ci_low"]),
+        detectable_edge=Decimal(row["detectable_edge"]),
+        verdict=row["verdict"],
     )
 
 
@@ -253,7 +284,7 @@ def main() -> None:
         for product_id, _ in products
         for regime, _ in REGIMES
     ]
-    rows: list[dict[str, object]] = []
+    rows: list[JsonlRow] = []
     t0 = time.perf_counter()
     with ProcessPoolExecutor(max_workers=args.workers) as ex, open(args.out, "w") as fh:
         for i, row in enumerate(ex.map(_one, jobs, chunksize=1), 1):
@@ -266,7 +297,7 @@ def main() -> None:
         # The pooled row per (family, regime): every product's outcome rows together, the
         # family-level answer at the largest honest n. #359's September review pools exactly
         # this way; the design effect is applied to the POOL, never per product.
-        pooled_rows: list[dict[str, object]] = []
+        pooled_rows: list[JsonlRow] = []
         for family in FAMILIES:
             for regime, _ in REGIMES:
                 outcomes: list[tuple[str, Decimal | None, Decimal | None]] = []
@@ -281,17 +312,24 @@ def main() -> None:
                             for o, p, r in row["outcomes"]
                         ]
                 stat = significance(family, regime, dict(REGIMES)[regime], outcomes)
-                pooled = {
+                pooled: JsonlRow = {
                     "family": stat.family,
                     "product": "POOLED",
                     "fee_regime": stat.fee_regime,
                     "fee_pct": str(stat.fee_pct),
                     "slippage_pct": str(SLIPPAGE_FLOOR_PCT),
-                    "bars": sum(int(r["bars"]) for r in rows if r["family"] == family),
+                    # Filter by regime TOO: `rows` carries each product once per fee
+                    # regime, so a family-only filter would count every product's bars
+                    # twice (once per regime) and double the pooled bar count.
+                    "bars": sum(
+                        r["bars"]
+                        for r in rows
+                        if r["family"] == family and r["fee_regime"] == regime
+                    ),
                     "n_trades": stat.n_trades,
                     "wins": stat.wins,
                     "open_trades": sum(
-                        int(r["open_trades"])
+                        r["open_trades"]
                         for r in rows
                         if r["family"] == family and r["fee_regime"] == regime
                     ),

@@ -121,6 +121,10 @@ def significance(
     fee has already been charged inside `pnl` by whoever produced the trades (the driver
     runs `backtest` twice, once per regime) -- this function prices nothing, it only reads.
 
+    `edge_ci_low` reuses the null standard error -- evaluated at the sample-estimated
+    break-even rather than at the observed win rate -- a score-style choice, immaterial at
+    these n_eff.
+
     Degenerate samples are answered, never smoothed over: no closed trades is
     "insufficient_n"; a family with no losses has break-even 0 and an edge the null cannot
     explain (reported as z = +infinity rather than a crash); a family with no wins has

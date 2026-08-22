@@ -15,7 +15,8 @@ job was to be able to say no, and it says no.**
 
 - **Reconstruction, not new simulation.** Each family runs through
   `keel.strategy.backtest.backtest` over every product's full cached ONE_HOUR history
-  (2021-07-18 to 2026-08-21 UTC; 30 products with >= 2,000 hourly bars, ~44k bars each):
+  (2021-07-18 to 2026-08-21 UTC; 30 products with >= 2,000 hourly bars, 5,902 to 44,623
+  bars each, median 43,869):
   next-bar-open market fills, 5 bp per-leg slippage in BOTH regimes, fee per leg as below.
   - `turtle_breakout`: the cross-verification §4 hourly profile (`entry_lookback 40,
     adx_period 14, adx_threshold 25, atr_period 20, atr_stop_mult 2, target_rr 6`,
@@ -70,8 +71,9 @@ Reading the table honestly, in two halves:
 ### The three per-cell flags — read, not celebrated
 
 3 of 180 cells came back `distinguishable`, all `turtle_breakout` inside the allowance, all
-thin-history/thin-liquidity assets: ZEC-USD (n=272, edge +7.3 pts, p=0.030), WLD-USD (n=58,
-+13.6 pts, p=0.038), PAXG-USD (n=74, +13.4 pts, p=0.045). Each z (1.70-1.88) is below even
+thin-liquidity assets: ZEC-USD (full 44,329-bar history — its thinness is trade count,
+n=272, not history; edge +7.3 pts, p=0.030), WLD-USD (n=58, +13.6 pts, p=0.038),
+PAXG-USD (n=74, +13.4 pts, p=0.045). Each z (1.70-1.88) is below even
 the 80%-power boundary of 2.49, all three p-values are marginal, and 180 comparisons at
 alpha 5% expect ~9 false positives under a global null — while the same regime's POOLED row
 is −2.8 points. WLD and TON are the exact assets the #259 slippage work documented as
