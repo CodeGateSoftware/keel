@@ -69,9 +69,13 @@ min_win_rate -- AND the overfitting gate (G4): a probability of backtest overfit
 (PBO) above its bound TOGETHER WITH a steeply negative degradation slope, a
 conjunction, not a bare PBO bound. Pooling is per parameter SET and covers only the
 sample-size axis -- the same parameter set's paper evidence may count toward min_trades
-across products -- and the G4/overfitting gate is NOT pooled. The DCA benchmark is not
-a floor of this gate; a simulate report is where a rule is measured against it.
-`keel insights` renders how far a rule sits from the gate.
+across products -- and the G4/overfitting gate is NOT pooled. A pooled count is not a
+count of independent observations: the signals herd (about 8 products fire the same UTC
+day) and the outcomes correlate (ICC 0.212), so n pooled trades carry n / DEFF ~ n / 2.58
+EFFECTIVE observations -- n = 100 pooled is n_eff ~ 39, an edge of 20 points or more
+(#427; keel/research/throughput.py, pinned by tests/research/test_throughput.py). The DCA
+benchmark is not a floor of this gate; a simulate report is where a rule is measured
+against it. `keel insights` renders how far a rule sits from the gate.
 
 Source: keel's own vocabulary -- keel/strategy/promotion.py and keel/research/cscv.py
 

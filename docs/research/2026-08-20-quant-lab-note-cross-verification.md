@@ -138,11 +138,35 @@ together. **A pooled sample of 100 carries roughly 39 independent observations.*
 |---|---|---|
 | 12.4 pts | 101 | 259 |
 | 7.5 pts | 275 | 708 |
-| 5 pts | 618 | 1,593 |
+| 5 pts | 619 | 1,593 |
 | — | 100 | **258** — what "n=100" is assumed to deliver |
 
 Caveats: DEFF is a **lower** bound (clusters are UTC days; these trades span many hours), the ICC is
 from backtest outcomes, and `k` scales with the pool size.
+
+### 4.1 Disposition of the correction (#427)
+
+The arithmetic above is now **executable**: `keel/research/throughput.py` encodes
+`design_effect()` = 2.57516, `n_eff()`, `required_n_eff(edge)` = 1.5464/edge², and
+`detectable_edge(n)`, and `keel/research/significance.py` applies the correction to per-family
+one-sided testing. `tests/research/test_throughput.py` pins every published value (n_eff(100) →
+39, `detectable_edge(39)` → 0.199, 5 pts → 619); the table above is that module's output, plus
+`required_n_eff(0.10)` = 155 → **399 pooled** for a 10-point edge.
+
+**Recommendation — reframe the 2026-09-30 review as descriptive, not pass/fail.** §5's break-even
+table is what fixes the edge worth powering for: inside the fee-free allowance `p_be` = 14.88%
+against a reconstructed 14.9% win rate, so the edge plausible *at the fee actually paid* is within
+0.6 points of zero; outside the allowance the rules are 14 points underwater and no detectable
+edge rescues them. A confirmatory test of the only regime worth trading therefore means powering
+for a small edge: 5 points needs n_eff ≈ 619 → **1,593 pooled trades** (~50 years at Basic hourly
+throughput after #426; ~13 years at DCA-sized notional — $50 per buy, `config.yaml`'s
+`dca.budget_usd`, gives 10 trades/month at the $500 allowance → 1,593/10 ≈ 159 months), and even
+the minimum honest floor — 258 pooled = n_eff 100, what "n=100" was assumed to deliver — detects
+only 12.4-point edges, which the reconstruction says do not exist. The review on its scheduled date should report forward outcome
+rates with n_eff-corrected intervals (`keel/research/significance.py`), rail-veto telemetry and
+accrual vs expectation, and state in the report: *"at this n_eff the review can only see an edge
+of X points or larger."* The schedule and any floor change remain the owner's call (#359, #353);
+this section is the correction of record, not a decision.
 
 ---
 
