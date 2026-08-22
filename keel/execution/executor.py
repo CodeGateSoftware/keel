@@ -233,6 +233,19 @@ def execute(
 # -- intent construction ---------------------------------------------------------------------
 
 
+#: The locally-recorded statuses in which an exit bracket is still RESTING at the exchange
+#: (#446). `pending` is "placed, nothing observed yet"; `partially_filled` is "the venue has
+#: begun executing it and the unfilled REMAINDER is still working". Both commit base currency
+#: that a replacement order would double-commit, so BOTH cancel-before-place sites below
+#: (`_clear_resting_bracket`, `_roll_stop`) must query both. Pre-#446 a partial stayed
+#: `pending`, which made a single-status query correct by accident; the distinct partial state
+#: reintroduced the two-status reality, and skipping either status leaves a live bracket
+#: beside a SELL for the same inventory (base-locked rejection, or an oversell after the fact).
+#: `execution.reconcile._POLLED_STATUSES` is this same tuple under its other name: the sweep
+#: that OBSERVES partials and the cancels that CLEAR them must never drift apart.
+RESTING_STATUSES = ("pending", "partially_filled")
+
+
 def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_ts: int) -> bool:
     """Cancel any resting exchange-side exit bracket for `product_id`. `False` if one could not
     be cleared, in which case the caller MUST NOT place its SELL.
@@ -243,13 +256,21 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
     the agent retries the same doomed sell every cycle while the position rides a stale stop. If
     it DID fill, the still-live bracket could later sell inventory we no longer hold.
 
+    A `partially_filled` bracket counts as resting here (#446): its unfilled remainder is
+    working at the exchange exactly like a `pending` bracket's whole size, so leaving it live
+    reproduces the same base-locked rejection (or post-fill oversell) this function exists to
+    prevent. Pre-#446 the partial case was caught only because a partial stayed `pending`.
+
     This lives in `execute` rather than in `agent._handle_exits` so every SELL path -- the rule
     exit today, `scale_out` or any future one -- gets it by construction rather than by each
     caller remembering. Failing closed (refuse the exit) is right: an uncancellable bracket means
     we do not know what the exchange will do with that inventory, and adding a second order to
     that uncertainty is strictly worse than waiting a cycle.
     """
-    for row in repo.get_orders(mode="live", product_id=product_id, status="pending"):
+    rows: list[dict[str, Any]] = []
+    for status in RESTING_STATUSES:
+        rows.extend(repo.get_orders(mode="live", product_id=product_id, status=status))
+    for row in sorted(rows, key=lambda r: r["id"]):
         if str(row["side"]).upper() != Side.SELL.value.upper():
             continue
         try:
@@ -707,6 +728,12 @@ def _record_observed_fill_quantity(
     order (the exit bracket placed next, the tranche the ledger opens) assumes it all filled.
     That mismatch is the oversized-bracket condition: a bracket able to sell more than is held.
 
+    The WARNING is entry-only: its advice is about the ENTRY's exit bracket being placed for
+    the ordered size, and an immediately-filled market SELL exit takes this same path. Firing
+    entry wording on an exit would point an operator at a bracket this side never places --
+    the exit-side over-booking is #502's to flag. The observation itself is recorded for
+    BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
+
     DELIBERATELY detect-and-surface only. Resizing the bracket means either amending a live
     native trigger-bracket or cancel-and-replace, and the broker port carries no bracket/OCO
     kind at all (#502) -- the live bracket already bypasses the port as a raw dict. Auto-cancelling
@@ -716,10 +743,16 @@ def _record_observed_fill_quantity(
     filled = observed.get("filled_size")
     if not filled or filled <= 0:
         return
-    ordered = intent.qty if intent is not None else (repo.get_order(order_id) or {}).get("qty")
+    row = repo.get_order(order_id) or {}
+    ordered = intent.qty if intent is not None else row.get("qty")
     if ordered is None or ordered <= 0:
         return
     repo.update_order(order_id, filled_quantity=filled, updated_at=now_ts)
+    side_value = (intent.side.value if intent is not None else row.get("side")) or ""
+    if side_value.upper() != Side.BUY.value:
+        # An exit partial stays silent (above); a side we cannot determine at all cannot
+        # claim to be an entry either, so it stays silent too.
+        return
     if filled < ordered:
         log_event(
             logger,
@@ -1458,7 +1491,11 @@ def _roll_stop(
     # stop; that is the trade-off the native bracket imposes, and the failure path below is why
     # it must never be silent.
     old_order = repo.get_order(old_stop_order_id)
-    if old_order is not None and old_order["status"] == "pending":
+    # BOTH resting statuses (#446): a `partially_filled` old bracket still commits its unfilled
+    # remainder at the venue, and placing the replacement without cancelling it is the same
+    # double-commit (or base-locked rejection) the cancel-first inversion exists to avoid.
+    # Pre-#446 this `== "pending"` test was correct only because a partial stayed `pending`.
+    if old_order is not None and old_order["status"] in RESTING_STATUSES:
         _cancel_at_exchange(broker, repo, old_order)
         repo.update_order(old_stop_order_id, status="canceled", updated_at=now_ts)
 

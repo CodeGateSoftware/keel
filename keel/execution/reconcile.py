@@ -60,8 +60,12 @@ _DEAD = frozenset({"CANCELLED", "CANCELED", "EXPIRED", "FAILED"})
 #: The locally-recorded statuses the sweep keeps polling (#446). `pending` is "nothing observed
 #: yet"; `partially_filled` is "the venue has begun executing it" -- non-terminal, so it MUST
 #: stay in the polling set, or the state this module just wrote would take the order out of its
-#: own sweep and the remainder would never be observed.
-_POLLED_STATUSES = ("pending", "partially_filled")
+#: own sweep and the remainder would never be observed. It is the SAME tuple executor treats as
+#: "a bracket is still resting" (`executor.RESTING_STATUSES`), aliased rather than restated so
+#: the sweep that observes partials and the cancel-before-place paths that clear them can never
+#: drift apart: a status one side stopped seeing would be a bracket nobody cancels, or a cancel
+#: for an order nobody watches.
+_POLLED_STATUSES = executor.RESTING_STATUSES
 
 #: The distinct non-terminal partial-fill state (#446). A free-text column, not a constrained
 #: enum, so no migration was needed for the VALUE -- only for the `filled_quantity` column that
@@ -69,9 +73,7 @@ _POLLED_STATUSES = ("pending", "partially_filled")
 _PARTIALLY_FILLED = "partially_filled"
 
 
-def reconcile_open_orders(
-    broker: Any, repo: Repository, config: Config, now_ts: int
-) -> list[int]:
+def reconcile_open_orders(broker: Any, repo: Repository, config: Config, now_ts: int) -> list[int]:
     """Bring every locally-unterminated live order into agreement with the exchange.
 
     Returns the ids of orders whose state changed. Never raises for a single unreadable order:
@@ -222,15 +224,18 @@ def reconcile_unbracketed_positions(
 
     `_rebracket_or_escalate` below heals a bracket that WAS accepted and later died. It cannot
     reach a bracket that was never placed at all, because it is driven from
-    `reconcile_open_orders`, which iterates `status="pending"` rows: a broker rejection writes
-    `rejected` and a rails veto writes no row whatsoever (the insert happens after the guard
-    gate). Neither is `pending`, so before this pass nothing revisited the tranche and the
-    position stayed naked for a full cycle -- one per UTC day -- behind a WARNING (issue #195).
+    `reconcile_open_orders`, which iterates the non-terminal rows (`pending` and
+    `partially_filled`, `_POLLED_STATUSES`): a broker rejection writes `rejected` and a rails
+    veto writes no row whatsoever (the insert happens after the guard gate). Neither is polled,
+    so before this pass nothing revisited the tranche and the position stayed naked for a full
+    cycle -- one per UTC day -- behind a WARNING (issue #195).
 
     Driven from the `positions` ledger rather than from `orders`, because the ledger is the only
-    place that knows a tranche is HELD. A tranche is considered protected only while its bracket
-    is still `pending`; `filled` means the position is on its way out, and any other status means
-    nothing is resting at the exchange.
+    place that knows a tranche is HELD. A tranche is considered protected while its bracket is
+    still working at the exchange -- `pending`, `partially_filled` (the unfilled remainder still
+    rests, #446), or `filled` (the position is on its way out, and re-placing against it would
+    double-sell) -- see `_has_resting_bracket`; any other status means nothing is resting at the
+    exchange.
 
     A tranche with no recorded `unbracketed:` levels is skipped SILENTLY, not escalated. That is
     DCA's correct resting state -- it carries no stop by design -- and escalating it would fire a
@@ -320,9 +325,7 @@ def _has_resting_bracket(repo: Repository, position: dict[str, Any]) -> bool:
     return str(order["status"]) in {"pending", "filled", _PARTIALLY_FILLED}
 
 
-def _escalate_unprotected_position(
-    position: dict[str, Any], qty: Decimal, why: str
-) -> None:
+def _escalate_unprotected_position(position: dict[str, Any], qty: Decimal, why: str) -> None:
     log_event(
         logger,
         logging.CRITICAL,
@@ -421,9 +424,7 @@ def _rebracket_or_escalate(
     )
 
 
-def _escalate_unprotected(
-    repo: Repository, row: dict[str, Any], qty: Decimal, why: str
-) -> None:
+def _escalate_unprotected(repo: Repository, row: dict[str, Any], qty: Decimal, why: str) -> None:
     log_event(
         logger,
         logging.CRITICAL,
