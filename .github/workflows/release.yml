@@ -340,7 +340,7 @@ jobs:
         with:
           ref: v${{ inputs.version }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -456,17 +456,17 @@ jobs:
       # pattern would hand one of the two legs a glob that matches nothing.
       - name: Attest build provenance (macOS)
         if: runner.os == 'macOS'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: out/*.dmg
       - name: Attest build provenance (Windows)
         if: runner.os == 'Windows'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: out/*.zip
 
       - name: Upload the artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: keel-${{ inputs.version }}-${{ runner.os }}-${{ matrix.arch }}
           path: out/*
