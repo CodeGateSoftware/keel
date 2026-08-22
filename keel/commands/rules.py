@@ -39,14 +39,17 @@ from keel_core.config import ConfigError
 from keel_core.telemetry import log_event
 
 from keel import agent
+from keel.analysis import indicators
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
 from keel.commands._products import parse_products_option
+from keel.data.history import GRANULARITY_SECONDS
 from keel.data.repository import Repository
 
 # Rail 1's OWN key function, imported rather than re-derived: `rules add`'s allowlist note is a
 # preview of what rail 1 will say about the product, and a note that disagreed with the rail it
 # is quoting would be worse than no note at all.
 from keel.execution.guards import _asset as _asset_of
+from keel.research import bias as bias_mod
 from keel.research import cscv as cscv_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
@@ -405,6 +408,213 @@ def run_rule_backtest(
     )
 
 
+# -- lookahead / recursive-bias diagnostics (issue #440, C1a) ---------------------------------
+#
+# The seam `keel.research.bias` replays is the backtester's own (detect over a growing
+# prefix), and the saved-rule path into it is the SAME one `rules backtest` resolves through:
+# `resolve_rule_backtest` reads the row, rebuilds the rule and fetches its cached candles.
+# The rule families' own bar-count params raise the harness's warmup floor past their
+# indicator warmup region, and the coarser series cached beside the rule's timeframe (when
+# one is) activates the higher-timeframe poison axis -- the engine-veto leak check.
+
+#: Constructor params that count BARS for the rule's indicators. The lookahead walk skips
+#: the first max(DEFAULT_WARMUP, these) bars: below them a rule's detect returns warmup
+#: noise (or None), and a divergence there indicts the harness, not the rule.
+_PERIOD_HINT_KEYS: tuple[str, ...] = (
+    "atr_period",
+    "adx_period",
+    "rsi_period",
+    "entry_lookback",
+    "exit_lookback",
+    "lookback_days",
+)
+
+#: The recursive check reads each family's own ATR through this params key (turtle's stop is
+#: `atr_period`/`atr_stop_mult`, rsi's is `atr_period`/`atr_mult`). Families without it
+#: (dca, pullback_continuation in v1) get an honest "nothing configured to check" line
+#: rather than a silently skipped flag.
+_ATR_PERIOD_KEY = "atr_period"
+
+
+def _lookahead_warmup(rule: Any) -> int:
+    """max(bias.DEFAULT_WARMUP, the rule's own longest bar-count param) -- the walk starts
+    past the rule's indicator warmup, read off its persisted params rather than a second,
+    per-kind table that would drift the first time a rule gained a lookback knob."""
+    params: dict[str, Any] = getattr(rule, "params", None) or {}
+    hints = [
+        value
+        for key, value in params.items()
+        if key in _PERIOD_HINT_KEYS and isinstance(value, int) and not isinstance(value, bool)
+    ]
+    ema_periods = params.get("ema_periods")
+    if isinstance(ema_periods, (tuple, list)) and ema_periods:
+        try:
+            hints.append(max(int(period) for period in ema_periods))
+        except (TypeError, ValueError):
+            pass  # a non-numeric element is the add-flow's refusal, not this walk's problem
+    return max([bias_mod.DEFAULT_WARMUP, *hints])
+
+
+def _next_coarser(granularity: Granularity) -> Granularity | None:
+    """The next granularity coarser than `granularity`, or `None` at the top of the table."""
+    coarser = [g for g in Granularity if GRANULARITY_SECONDS[g] > GRANULARITY_SECONDS[granularity]]
+    return min(coarser, key=lambda g: GRANULARITY_SECONDS[g]) if coarser else None
+
+
+def _lookahead_views(
+    repo: Repository, rule: Any, granularity: Granularity, candles: list[Candle]
+) -> dict[Granularity, list[Candle]]:
+    """The multi-timeframe dataset the lookahead harness walks for `rule`: its own resolved
+    granularity's cached candles, plus the NEXT COARSER granularity's when the deployment
+    caches one -- without a coarser series there is nothing for the higher-TF poison axis
+    (the engine-veto leak) to test, exactly as the engine's bias gate is a no-op then."""
+    views: dict[Granularity, list[Candle]] = {granularity: candles}
+    coarser = _next_coarser(granularity)
+    if coarser is not None:
+        coarse_candles = repo.get_candles(rule.product_id, coarser)
+        if coarse_candles:
+            views[coarser] = coarse_candles
+    return views
+
+
+def _recursive_periods(rule: Any) -> list[int]:
+    """The ATR periods the rule family configures, per its params -- today each ATR-stopped
+    family (turtle, rsi) has exactly one, its own `atr_period`; a family without any gets an
+    honest "nothing to check" line rather than a silently skipped flag."""
+    params: dict[str, Any] = getattr(rule, "params", None) or {}
+    period = params.get(_ATR_PERIOD_KEY)
+    if isinstance(period, int) and not isinstance(period, bool):
+        return [period]
+    return []
+
+
+def _atr_last(candles: list[Candle], period: int) -> float:
+    """`analysis.indicators.atr(candles, period)[-1]` -- the indicator value the rule's own
+    stop is sized from."""
+    return indicators.atr(candles, period)[-1]
+
+
+def _atr_indicator(period: int) -> Callable[[list[Candle]], float]:
+    """`_atr_last` bound to one period, as the growing-prefix callable `recursive_analysis`
+    samples."""
+
+    def indicator(candles: list[Candle]) -> float:
+        return _atr_last(candles, period)
+
+    return indicator
+
+
+@rules_group.command("lookahead")
+@click.argument("rule_id", type=int)
+@click.option(
+    "--granularity", default=None, help="Override the candle granularity (default: the rule's own)."
+)
+@click.option(
+    "--sample-step",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Anchor stride: the harness runs ~2 detect calls per sampled bar past warmup, so 1 "
+    "checks every bar and costs correspondingly; raise it on long histories.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    default=False,
+    help="Also run the recursive warmup-drift check on the rule's own ATR (the atr_period "
+    "families); a family without one is reported honestly as having nothing to check.",
+)
+@click.pass_context
+@with_disclaimer
+def rules_lookahead(
+    ctx: click.Context, rule_id: int, granularity: str | None, sample_step: int, recursive: bool
+) -> None:
+    """Diagnose a stored rule for lookahead bias (read-only; issue #440).
+
+    Re-runs the rule's detect at every past bar against the data a live engine would have
+    had there, and reports WHICH bars' decisions change once future bars are visible --
+    PBO says nothing about this: a single-config rule can be catastrophically lookahead-
+    biased and pass every overfitting check. Exits 1 on LOOKAHEAD DETECTED (a diagnostic
+    that fails loud, like `keel doctor`); a recursive-drift verdict is printed but is not
+    by itself an exit-1 condition.
+
+    The same analysis gates `keel rules promote`: a rule that fails here is refused there.
+    """
+    try:
+        _outcome, report = run_rule_lookahead(
+            _open_repo(ctx),
+            _optional_cfg(ctx),
+            rule_id,
+            granularity_opt=granularity,
+            sample_step=sample_step,
+            recursive=recursive,
+            echo=click.echo,
+            echo_err=lambda message: click.echo(message, err=True),
+        )
+    except RulesRefused:
+        ctx.exit(1)
+        raise  # unreachable: ctx.exit raises SystemExit
+    if report is not None and report.verdict == "lookahead_detected":
+        ctx.exit(1)
+
+
+def run_rule_lookahead(
+    repo: Repository,
+    config: Any | None,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    sample_step: int = 1,
+    recursive: bool = False,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> tuple[RulesOutcome, bias_mod.LookaheadReport]:
+    """THE `rules lookahead` service: resolve the saved rule exactly as `rules backtest`
+    does, run the truncation-diff (and, when asked, the rule's own ATR recursive check) over
+    its cached candles, and echo `bias.render_lines` -- one implementation for the CLI and
+    the strategy console. Returns the report beside the outcome so the caller can key its
+    exit code off the verdict."""
+    resolved = resolve_rule_backtest(
+        repo, config, rule_id, granularity_opt=granularity_opt, echo_err=echo_err
+    )
+    sink, recorded = _line_sink(echo)
+
+    report = bias_mod.lookahead_analysis(
+        resolved.rule.detect,
+        _lookahead_views(repo, resolved.rule, resolved.granularity, resolved.candles),
+        rule_id=str(rule_id),
+        sample_step=sample_step,
+        warmup=_lookahead_warmup(resolved.rule),
+    )
+    for line in bias_mod.render_lines(report):
+        sink(line)
+
+    if recursive:
+        periods = _recursive_periods(resolved.rule)
+        if not periods:
+            sink(
+                f"recursive: no recursive-suspect indicator configured for "
+                f"{resolved.row['kind']} (no {_ATR_PERIOD_KEY} param) -- nothing to check"
+            )
+        for period in periods:
+            recursive_report = bias_mod.recursive_analysis(
+                resolved.candles,
+                indicator_fn=_atr_indicator(period),
+                # 4 x period: the same work-window multiple the ATR-stopped rules themselves
+                # feed their indicators -- past it, drift is the indicator's, not warmup's.
+                min_warmup=4 * period,
+                rule_id=str(rule_id),
+                indicator_name=f"atr({period})[-1]",
+            )
+            for line in bias_mod.render_lines(recursive_report):
+                sink(line)
+
+    return (
+        RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=resolved.row["status"]),
+        report,
+    )
+
+
 @rules_group.command("promote")
 @click.argument("rule_id", type=int)
 @click.option(
@@ -552,6 +762,39 @@ def attempt_promotion(
     if callable(config):
         config = config()
     rule = agent._build_rule(row)
+
+    # The lookahead gate (issue #440, C1a): a rule whose at-bar decision changes when future
+    # bars are visible reads information it could not have had, and is not promotable -- wired
+    # into the existing gauntlet the same way as its other checks: on the gated path only
+    # (`--force` returned above, and remains the documented bypass for it too), fail-closed,
+    # with the divergences and the command that reproduces them. Silent on the clean path,
+    # so a passing promotion's output is unchanged.
+    lookahead_granularity, lookahead_candles = _resolve_backtest_inputs(
+        repo, rule, granularity_opt, echo_err
+    )
+    lookahead = bias_mod.lookahead_analysis(
+        rule.detect,
+        _lookahead_views(repo, rule, lookahead_granularity, lookahead_candles),
+        rule_id=str(rule_id),
+        # Whole history sampled to at most ~200 anchors (~400 detect calls): seconds, not
+        # minutes, on the cached series a promotion re-backtests anyway.
+        sample_step=max(1, -(-len(lookahead_candles) // 200)),
+        warmup=_lookahead_warmup(rule),
+    )
+    if lookahead.verdict == "lookahead_detected":
+        echo_err(
+            f"Error: rule {rule_id} ({row['kind']}) fails the lookahead check -- its "
+            "decision at past bars changes when future bars become visible, so the "
+            "backtest it would be promoted on cannot be realized live. Nothing was promoted."
+        )
+        for line in bias_mod.render_lines(lookahead):
+            echo_err(f"  {line}")
+        echo_err(
+            f"Fix the rule (see `keel rules lookahead {rule_id}` for the full report), or "
+            "use --force deliberately to bypass this and every other gate."
+        )
+        raise RulesRefused(f"rule {rule_id} fails the lookahead check")
+
     fee_pct, fee_source = _backtest_fee(config)
     stats = _backtest_rule(repo, rule, granularity_opt, fee_pct, echo_err)
     sink(f"rule {rule_id} ({row['kind']}): gate priced at {_describe_fee(fee_pct, fee_source)}")
