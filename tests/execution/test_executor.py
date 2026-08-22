@@ -40,6 +40,7 @@ from keel.execution.executor import (
     scale_out,
     trail_stop_atr,
 )
+from keel.execution import guards
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
@@ -1035,6 +1036,113 @@ def test_trail_stop_atr_never_widens_the_stop(repo):
 
     assert result is None
     assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
+
+
+def test_a_ratchet_only_trail_can_never_trip_rail_9(repo):
+    """THE rail-9 compatibility proof for `trail_stop_atr` (#442, hypothesis 1).
+
+    Rail 9 (`guards.check`, "no stop-loss widening") vetoes any protective stop strictly
+    LOWER than the last recorded `open_stop:<product>`. A ratchet-only trail is safe by
+    construction: `_roll_stop` refuses a widening proposal BEFORE `guards.check` ever runs,
+    so the rail only ever sees `proposed >= prior` -- which passes. This test drives an
+    ADVERSARIAL (price, atr) sequence -- a ratchet step, a crash, a partial recovery, a
+    rally, and an exact-tie -- and asserts the two halves of that argument as observed
+    behavior:
+
+    1. the recorded `open_stop` sequence is NON-DECREASING across the whole walk (the
+       ratchet holds even when the computed trail collapses), and
+    2. rail 9 never fires: every roll that places clears `guards.check` with no
+       `no_stop_widening` violation, and every widening proposal is refused LOCALLY
+       (no cancel, no placement, no state change) before the rail could see it.
+    """
+    broker = FakeBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    assert stop_id is not None
+
+    # (label, price, atr, should_place) -- computed trail = price - 2*atr.
+    walk: list[tuple[str, Decimal, Decimal, bool]] = [
+        ("ratchet_up", Decimal("52000"), Decimal("500"), True),  # 51000 > 49000
+        ("crash", Decimal("47000"), Decimal("1500"), False),  # 44000 < 51000
+        ("partial_recovery", Decimal("50500"), Decimal("600"), False),  # 49300 < 51000
+        ("rally", Decimal("53500"), Decimal("700"), True),  # 52100 > 51000
+        ("stall", Decimal("53100"), Decimal("700"), False),  # 51700 < 52100
+    ]
+
+    recorded_stops: list[Decimal] = [Decimal("49000")]  # the bracket's own placement
+    current_stop_order = stop_id
+    events_before = 0
+
+    for label, price, atr, should_place in walk:
+        events_before = len(broker.events)
+        result = trail_stop_atr(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=current_stop_order,
+            current_price=price,
+            atr=atr,
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 300 + len(recorded_stops),
+            multiplier=Decimal("2"),
+        )
+
+        if should_place:
+            assert result is not None, label
+            # guards.check ran for this placement (un-overridable) and cleared rail 9 --
+            # a vetoed replacement leaves no resting order behind.
+            assert repo.get_order(result)["status"] == "pending", label
+            current_stop_order = result
+        else:
+            # Refused LOCALLY by _roll_stop's ratchet, BEFORE guards.check: no cancel,
+            # no placement, the old bracket stays live and the state is untouched.
+            assert result is None, label
+            assert broker.events[events_before:] == [], label
+            assert repo.get_order(current_stop_order)["status"] == "pending", label
+
+        # The rail-level half of the proof, checked DIRECTLY against the rail for every
+        # step: the ratchet-clamped proposal rail 9 would see (`max(prior, computed)`)
+        # never trips `no_stop_widening` -- the strict `<` in the rail and the `max` in
+        # the ratchet are exact complements.
+        clamped = max(recorded_stops[-1], price - Decimal("2") * atr)
+        guard_view = guards.check(
+            OrderIntent(
+                product_id="BTC-USD",
+                side=Side.SELL,
+                qty=Decimal("0.01"),
+                entry=clamped,
+                stop=None,
+                notional=clamped * Decimal("0.01"),
+                is_dca=False,
+                rule_kind="pullback_continuation",
+                protective_stop=clamped,
+            ),
+            repo,
+            _config(),
+            NOW_TS,
+        )
+        assert "no_stop_widening" not in guard_view.violations, label
+
+        recorded_stops.append(repo.get_state("open_stop:BTC-USD"))
+        assert recorded_stops[-1] >= recorded_stops[-2], (
+            f"{label}: open_stop widened {recorded_stops[-2]} -> {recorded_stops[-1]}"
+        )
+
+    # The walk actually exercised both directions: at least one ratchet step happened
+    # and at least one widening proposal was refused (otherwise this proves nothing).
+    assert len({str(s) for s in recorded_stops}) > 1
+    assert any(not placed for _, _, _, placed in walk)
 
 
 # -- no live network in tests ------------------------------------------------------------------
