@@ -49,6 +49,21 @@ This is not a trading decision the system can veto; it is an account setting onl
 > honest manual step, because it turns an open risk into a false assurance. If Coinbase ever exposes the
 > state, promote this to a startup assertion and remove it from here.
 
+> **The sizing-equity purification invariant (#490, discussion #472).** Rewards that slipped through
+> anyway do not silently compound: any equity base that position sizing derives from a **live balance
+> read** is reduced by pending purification — `mark_to_market − build_report(transactions).
+> total_owed_usd` (`keel/execution/equity.py::sizing_equity`). Today that is the paper account's
+> balance-derived seed (`paper.starting_equity_usd == 0`), which then sizes every paper fill; the live
+> path sizes off `caps.max_exposure_usd` and DCA off `dca.budget_usd`, both operator constants immune
+> by construction. Note the boundary: the **drawdown/HWM rail-11 equity is deliberately NOT purified** —
+> it measures what the account actually holds, and a breaker must trip on real value, not on a
+> post-obligation fiction. Discharging the owed amount (`keel purification` to see it) is still your
+> act; keep the imported transaction ledger current so the subtraction sees what actually accrued.
+> Note that no discharge is recorded — `total_owed_usd` is lifetime-cumulative (`keel purification`
+> renders the same cumulative report), so an amount already given away keeps subtracting from future
+> balance-derived seeds, which is the conservative direction; correcting or removing ledger rows is
+> the remedy.
+
 ### 2. Zakat estimate — **report-only, not blocking**
 
 A zakat estimate (~2.5% of holdings' market value per lunar year) is a **positive** obligation, unlike

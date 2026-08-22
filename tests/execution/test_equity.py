@@ -175,3 +175,66 @@ def test_an_undeclared_equity_jump_is_warned_about_but_never_auto_adjusted(caplo
     assert "equity.unexplained_jump" in caplog.text
     # ...and the drawdown is still computed the conservative way, unadjusted
     assert repo.get_state("drawdown_total_pct") == Decimal("0.6")
+
+
+# -- sizing equity vs pending purification (#490) ----------------------------------------------
+
+
+def _reward_tx(coinbase_id: str, total: str, tx_type: str = "Reward Income") -> dict[str, object]:
+    """A transactions-table row of the shape `Repository.upsert_transaction` writes -- the same
+    shape `keel data import` produces from a Coinbase export, which is where reward income
+    enters the repo (USDC Rewards accrue inside the trading account and reach the ledger, not
+    the config)."""
+    return {
+        "coinbase_id": coinbase_id,
+        "source": "coinbase",
+        "type": tx_type,
+        "asset": "USDC",
+        "ts": 1_700_000_000,
+        "qty": Decimal("1"),
+        "price": Decimal("1"),
+        "subtotal": Decimal(total),
+        "total": Decimal(total),
+        "fees": Decimal("0"),
+    }
+
+
+def test_sizing_equity_subtracts_pending_purification() -> None:
+    """The #490 invariant: `sizing_equity == mark_to_market - pending_purification`. Interest
+    left sitting in the balance would inflate the equity the sizing formula reads from
+    (discussion #472) -- riba compounding into position size."""
+    assert equity.sizing_equity(Decimal("42000"), Decimal("2000")) == Decimal("40000")
+
+
+def test_sizing_equity_with_nothing_pending_is_the_mark_to_market() -> None:
+    """A clean ledger (or a path with no reward accruals) must be unchanged -- purification
+    subtracts only what actually accrued, never a default haircut."""
+    assert equity.sizing_equity(Decimal("42000"), Decimal("0")) == Decimal("42000")
+
+
+def test_sizing_equity_floors_at_zero_rather_than_going_negative() -> None:
+    """Pending purification can exceed the mark-to-market read (a reward-heavy ledger against a
+    mostly-withdrawn account). A negative equity base would size a NEGATIVE position; zero is
+    the floor -- and `sizing.size` off zero risks zero, which is the correct no-trade answer."""
+    assert equity.sizing_equity(Decimal("1500"), Decimal("2000")) == Decimal("0")
+
+
+def test_pending_purification_usd_counts_only_non_compliant_income() -> None:
+    """The purification input is `build_report(...).total_owed_usd` over the repo's imported
+    transactions: non-compliant credits count, CLEAN trading activity does not, and `REVIEW`
+    (unclassified) does not either -- over-purifying would misstate a religious obligation as
+    fact (see `purification.classify`)."""
+    repo = _repo()
+    repo.upsert_transaction(_reward_tx("rx1", "2.50"))
+    repo.upsert_transaction(_reward_tx("rx2", "1.25", tx_type="Incentives Rewards Payout"))
+    repo.upsert_transaction(_reward_tx("cl1", "9999", tx_type="Buy"))
+    repo.upsert_transaction(_reward_tx("rv1", "777", tx_type="Advanced Trade Fill"))
+
+    assert equity.pending_purification_usd(repo) == Decimal("3.75")
+
+
+def test_pending_purification_usd_is_zero_on_a_clean_ledger() -> None:
+    repo = _repo()
+    repo.upsert_transaction(_reward_tx("cl1", "500", tx_type="Buy"))
+
+    assert equity.pending_purification_usd(repo) == Decimal("0")

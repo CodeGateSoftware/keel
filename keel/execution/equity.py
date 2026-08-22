@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from keel_core.telemetry import log_event
 
+from keel.compliance.purification import build_report
 from keel.data.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,46 @@ def mark_positions(
             continue
         total += qty * mark
     return total
+
+
+def pending_purification_usd(repo: Repository) -> Decimal:
+    """Accrued-but-unpurified non-compliant income, in USD, from the repo's own ledger (#490).
+
+    `build_report(repo.get_transactions()).total_owed_usd` -- the same figure
+    `keel purification` renders as "TOTAL OWED TO CHARITY". Only entries classified
+    NON_COMPLIANT count: CLEAN trading activity is not owed, and `REVIEW` (unclassified) is
+    deliberately excluded -- over-purifying would misstate a religious obligation as fact
+    (`compliance.purification.classify`'s own posture). That exclusion cuts the other way for
+    the sizing base below: a reward-type string `classify` does not recognize stays in sizing
+    equity -- the safe direction for the fiqh report, the wrong direction for sizing -- and is
+    bounded only by observation (every Coinbase reward string seen to date matches a
+    `NON_COMPLIANT_MARKERS` entry).
+
+    The report is CUMULATIVE over the imported ledger and carries no discharge record, so
+    "pending" here means "everything the ledger shows as owed". For the sizing use below that
+    is the conservative direction: the equity base can only come out smaller, never larger.
+
+    Zero on a clean or empty ledger -- never a default haircut.
+    """
+    return build_report(repo.get_transactions()).total_owed_usd
+
+
+def sizing_equity(mark_to_market: Decimal, pending_purification: Decimal) -> Decimal:
+    """The equity base position sizing reads: mark-to-market minus pending purification (#490).
+
+    Discussion #472's invariant, stated as code: "interest left sitting in the balance would
+    inflate the equity the sizing formula reads from" -- riba compounding into position size,
+    a correctness bug independent of the fiqh point (KB §65.9: non-compliant income is given
+    away, never recognised as trading capital). Every path that derives sizing equity from a
+    LIVE balance read must go through this helper; config-constant sizing inputs
+    (`caps.max_exposure_usd`, `dca.budget_usd`, a funded `paper.starting_equity_usd`) are
+    immune by construction and pass through unchanged.
+
+    Floored at zero: pending purification can exceed the mark-to-market read (a reward-heavy
+    ledger against a mostly-withdrawn account), and a negative equity base would size a
+    negative position -- zero risks zero, the correct no-trade answer.
+    """
+    return max(mark_to_market - pending_purification, Decimal("0"))
 
 
 def record_external_flow(repo: Repository, *, amount: Decimal) -> None:

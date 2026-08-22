@@ -496,7 +496,9 @@ def _seed_paper_account_if_needed(
       rehearsal. Real broker mark-to-market equity is NOT read for the seed in this case; the
       funded amount is the source of truth, so a funded paper-forward can seed with no broker
       equity read at all.
-    - `starting_equity_usd == 0` (the default): seed from real broker mark-to-market equity; if
+    - `starting_equity_usd == 0` (the default): seed from real broker mark-to-market equity
+      LESS pending purification (#490 -- the seed is sizing equity, so accrued-but-unpurified
+      reward income inside the balance read is subtracted via `equity.sizing_equity`); if
       that read fails, log `agent.paper_seed_unavailable` and leave the account unseeded this
       cycle (no bogus 0 denominator).
     """
@@ -516,12 +518,41 @@ def _seed_paper_account_if_needed(
         if funding > 0:
             seed = funding
         else:
-            seed = _mark_to_market_equity(
+            mtm = _mark_to_market_equity(
                 repo, broker, products, price_by_product, config.quote_currency
             )
-            if seed is None:
+            if mtm is None:
                 log_event(logger, logging.WARNING, "agent.paper_seed_unavailable")
                 return
+            # #490: a balance-derived seed is SIZING equity, so it must exclude
+            # accrued-but-unpurified reward income. `_mark_to_market_equity` sums broker
+            # balances at face value, and USDC Rewards accrue INSIDE the trading account
+            # (runbook item 1 -- they cannot be switched off via the Advanced Trade API), so
+            # the raw read includes them; left in, the tainted seed becomes `paper_cash_usdc`
+            # -- exactly the equity `_paper_enter` sizes from via `equity_override` -- and
+            # riba compounds into position size (discussion #472). The FUNDED branch above
+            # is an operator-chosen constant, not a balance read, and is purified by no one.
+            pending = equity_mod.pending_purification_usd(repo)
+            seed = equity_mod.sizing_equity(mtm, pending)
+            # Observable, not silent: this is the one equity figure the system derives from a
+            # live balance read, so the subtraction's before/after belongs in the log beside
+            # the unavailable-read warning above.
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.paper_seed_purified",
+                mark_to_market=str(mtm),
+                pending_purification=str(pending),
+                seed=str(seed),
+            )
+            if mtm > 0 and seed == Decimal("0"):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "agent.paper_seed_clamped_to_zero",
+                    mark_to_market=str(mtm),
+                    pending_purification=str(pending),
+                )
         paper_trader.seed_cash(seed, now_ts)
 
 

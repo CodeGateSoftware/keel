@@ -663,6 +663,97 @@ def test_build_intent_uses_equity_override(repo):
     )
 
 
+def test_live_sizing_equity_is_the_config_constant_immune_to_reward_accruals(repo):
+    """#490: the live path's sizing-equity stand-in is `config.caps.max_exposure_usd` (see the
+    module docstring) -- a config constant, not a balance read -- so accrued-but-unpurified
+    reward income cannot inflate live sizing through `_build_intent`. Pinned so the invariant
+    cannot silently regress: a repo full of reward income must leave the sized qty exactly
+    `sizing.size(max_exposure_usd, ...)`. If this ever fails because sizing moved to a live
+    balance read, the #490 purification exclusion must move with it."""
+    from keel.execution import executor, sizing
+
+    repo.upsert_transaction(
+        {
+            "coinbase_id": "rx1",
+            "source": "coinbase",
+            "type": "Reward Income",
+            "asset": "USDC",
+            "ts": 1_700_000_000,
+            "qty": Decimal("1"),
+            "price": Decimal("1"),
+            "subtotal": Decimal("999999"),
+            "total": Decimal("999999"),
+            "fees": Decimal("0"),
+        }
+    )
+    signal = _enter_signal()
+    config = _config()
+
+    intent = executor._build_intent(signal, None, repo, config, now_ts=NOW_TS)
+
+    assert intent.qty == sizing.size(
+        config.caps.max_exposure_usd, config.risk_pct, signal.setup.entry, signal.setup.stop
+    )
+
+
+def test_live_execute_sizing_is_immune_to_reward_income_through_the_public_entry(repo):
+    """#490 live-path pin at the layer that matters. The `_build_intent` pin above proves the
+    HELPER reads `config.caps.max_exposure_usd`, but nothing in it would catch someone wiring a
+    balance-derived `equity_override` into the live path. This drives the PUBLIC entry --
+    `execute(...)`, no `equity_override` -- with reward income in both places it can reach
+    sizing: a broker whose balances are inflated by accrued reward income, and a repo whose
+    transactions ledger carries the matching reward rows. The sized qty/notional must be
+    IDENTICAL to a run with no reward income anywhere: live sizing reads a config constant,
+    immune by construction. If this ever fails because live sizing moved to a balance read, the
+    #490 purification subtraction must move with it (`equity.sizing_equity`)."""
+    from keel.execution import sizing
+
+    signal = _enter_signal()
+    config = _config()
+
+    clean_broker = FakeBroker(usdc_balance=Decimal("1000000"))
+    clean = execute(signal, clean_broker, repo, config, mode="autonomous", now_ts=NOW_TS)
+    assert clean.placed is True, clean.vetoed_by
+
+    # Reward income everywhere: accrued INSIDE the trading account (both balance legs read high
+    # by the accrued rewards) and recorded in the imported ledger the purification report reads.
+    # A balance-derived equity base would size off the inflated read; the config cap cannot.
+    repo.upsert_transaction(
+        {
+            "coinbase_id": "rx1",
+            "source": "coinbase",
+            "type": "Reward Income",
+            "asset": "USDC",
+            "ts": 1_700_000_000,
+            "qty": Decimal("1"),
+            "price": Decimal("1"),
+            "subtotal": Decimal("999999"),
+            "total": Decimal("999999"),
+            "fees": Decimal("0"),
+        }
+    )
+    reward_broker = FakeBroker(balances={"USD": Decimal("1999999"), "USDC": Decimal("1999999")})
+    reward = execute(signal, reward_broker, repo, config, mode="autonomous", now_ts=NOW_TS + 1)
+    assert reward.placed is True, reward.vetoed_by
+
+    expected = sizing.size(
+        config.caps.max_exposure_usd, config.risk_pct, signal.setup.entry, signal.setup.stop
+    )
+    clean_order = repo.get_order(clean.order_id)
+    reward_order = repo.get_order(reward.order_id)
+    assert reward_order["qty"] == clean_order["qty"] == expected
+    assert (
+        reward_order["qty"] * reward_order["expected_fill"]
+        == clean_order["qty"] * clean_order["expected_fill"]
+        == expected * signal.setup.entry
+    )
+    # The order actually sent to the venue is identical -- same sized base_size.
+    assert (
+        reward_broker.place_calls[0]["order_configuration"]
+        == clean_broker.place_calls[0]["order_configuration"]
+    )
+
+
 # -- DCA sizing --------------------------------------------------------------------------------
 
 
