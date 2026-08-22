@@ -132,24 +132,17 @@ def trials_verify(ledger: Path | None) -> None:
 @_LEDGER_OPTION
 @click.option("--sharpe", required=True, type=float, help="Observed ANNUALISED Sharpe.")
 @click.option(
-    "--trades-per-year",
-    default=6.0,
-    show_default=True,
-    type=float,
+    "--trades-per-year", default=6.0, show_default=True, type=float,
     help="Realised trade frequency, used to express MinBTL in trades.",
 )
 @click.option(
-    "--rho",
-    default=None,
-    type=float,
+    "--rho", default=None, type=float,
     help="Assumed correlation between trials (§78.2). Omit to report an assumption BAND.",
 )
 @click.option("--skew", default=0.0, show_default=True, type=float)
 @click.option("--kurtosis", default=3.0, show_default=True, type=float, help="Non-excess.")
 @click.option(
-    "--trial-sharpe-variance",
-    default=None,
-    type=float,
+    "--trial-sharpe-variance", default=None, type=float,
     help="V[{SR_n}] across trials. Omit if the ledger cannot supply it -- DSR is then skipped "
     "rather than computed from a guess.",
 )
@@ -188,7 +181,9 @@ def trials_deflate(
         emax = deflate_mod.expected_max_sharpe(effective)
         years = deflate_mod.min_backtest_length_years(effective, sharpe)
         trades = deflate_mod.min_trades(effective, sharpe, trades_per_year)
-        click.echo(f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}")
+        click.echo(
+            f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}"
+        )
 
     if trial_sharpe_variance is None:
         click.echo(
@@ -201,11 +196,9 @@ def trials_deflate(
     n_hat = deflate_mod.implied_independent_trials(rho if rho is not None else 0.0, n_decisions)
     effective = max(2, int(round(n_hat)))
     sr0 = deflate_mod.sharpe_rejection_threshold(effective, trial_sharpe_variance)
-    observations = (
-        int(round(trades_per_year * deflate_mod.min_backtest_length_years(effective, sharpe)))
-        if sharpe > 0
-        else 0
-    )
+    observations = int(round(trades_per_year * deflate_mod.min_backtest_length_years(
+        effective, sharpe
+    ))) if sharpe > 0 else 0
     dsr = deflate_mod.deflated_sharpe(sharpe, sr0, max(2, observations), skew, kurtosis)
     click.echo(f"\nSR_0 (rejection bar)      : {sr0:.4f}")
     click.echo(f"DSR                       : {dsr:.4f}")
