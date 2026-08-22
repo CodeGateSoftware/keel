@@ -26,8 +26,18 @@ PROVENANCE = frozenset({"a_priori", "fitted"})
 #: `monte_carlo` (#441) is a resampling DIAGNOSTIC row -- same vocabulary discipline as the
 #: rest of the set: a row's kind says what kind of experiment produced it, so a bootstrap run
 #: is not silently filed as an ablation or a sweep node it never was.
+#: `walk_forward` (#445): one diagnostic row per fold of a rolling-origin validation of a
+#: GIVEN parameter set -- never a selection among sets, so always `diagnostic_only`.
 KINDS = frozenset(
-    {"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge", "monte_carlo"}
+    {
+        "sweep_node",
+        "ablation",
+        "rule_retirement",
+        "asset_prune",
+        "threshold_nudge",
+        "monte_carlo",
+        "walk_forward",
+    }
 )
 DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
 
@@ -76,7 +86,15 @@ def _decode_summary(raw: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in (raw or {}).items():
         # `trade_count` is a plain int; every other summary field is money/ratio -> Decimal.
-        out[key] = value if isinstance(value, int) else Decimal(value)
+        # None passes through untouched (#445): a null summary value (a not-computable
+        # degradation, written before the walk-forward writer began OMITTING Nones) used to
+        # raise Decimal(None) here, and one such row made every later read_trials/
+        # verify_chain of the append-only chain raise forever. A reader must degrade this
+        # row's value to None, never brick the ledger's read-back.
+        if value is None or isinstance(value, int):
+            out[key] = value
+        else:
+            out[key] = Decimal(value)
     return out
 
 

@@ -6,11 +6,13 @@ That is why it was the first group extracted out of the monolithic `keel/cli.py`
 none of the network/DB seams the other commands do, so moving it here cannot change any
 monkeypatch target the CLI tests rely on.
 
-ONE exception (#441): `trials monte-carlo` reads the DB (and, when one loads, `config.yaml`)
-to rebuild a stored rule and its candles -- it is a measurement over a backtest, not a
-ledger-file operation. It still writes only to the ledger, never to the db, and it resolves
-the rule through the exact `rules backtest` seam (`keel.commands.rules.resolve_rule_backtest`)
-so its observed run is the run an operator can reproduce by hand.
+TWO exceptions, both measurement over backtests rather than ledger-file operations:
+`trials monte-carlo` (#441) resamples one observed run, and `trials walk-forward` (#445)
+validates one given rule across rolling-origin folds. Each reads the DB (and, when one
+loads, `config.yaml`) to rebuild a stored rule and its candles, writes only to the ledger
+-- never to the db -- and resolves the rule through the exact `rules backtest` seam
+(`keel.commands.rules.resolve_rule_backtest`) so the observed run, and every fold, is the
+run an operator can reproduce by hand.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
 from keel.research import montecarlo as mc_mod
+from keel.research import walkforward as wf_mod
 from keel.strategy import backtest as backtest_mod
 
 
@@ -243,7 +246,7 @@ def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
 
 # -- monte-carlo resampling (#441) ----------------------------------------------------------------
 #
-# The one `trials` subcommand that touches the db (see the module docstring). Everything it
+# The first `trials` subcommand that touches the db (see the module docstring). Everything it
 # does is measurement: resolve the stored rule exactly as `rules backtest` does, run the
 # observed backtest once, resample (trade reshuffle or moving-block candle bootstrap), then
 # print the report and append ONE diagnostic_only ledger row. It never writes to the db, never
@@ -467,3 +470,168 @@ def trials_monte_carlo(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"recorded {record.trial_id} (diagnostic_only) hash={record.row_hash[:12]}")
+
+
+# -- walk-forward validation (#445) ----------------------------------------------------------------
+#
+# The second `trials` subcommand that touches the db (see the module docstring), and unlike
+# the resampling one it is DETERMINISTIC end to end: there is no --seed option because
+# nothing samples. Everything it does is measurement of a GIVEN rule: resolve the stored
+# rule exactly as `rules backtest` does (through the same granularity default chain as
+# `trials monte-carlo`), split its candles into rolling-origin folds, run the engine's
+# backtest per fold, print the stability report, append ONE diagnostic_only ledger row
+# PER FOLD. It never writes to the db, never changes a rule's status, and never feeds any
+# gate -- and it must never name a fold, window or parameter set to favour, which is the
+# whole design of `keel.research.walkforward` (the Strathern rail, spec §6).
+
+
+@trials_group.command("walk-forward")
+@_LEDGER_OPTION
+@click.option("--rule", required=True, type=int, help="Stored rule id to validate.")
+@click.option(
+    "--train-bars",
+    required=True,
+    type=click.IntRange(min=1),
+    help="Train window length in bars.",
+)
+@click.option(
+    "--test-bars",
+    required=True,
+    type=click.IntRange(min=1),
+    help="Test window length in bars.",
+)
+@click.option(
+    "--step-bars",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Advance of both windows per fold (default: --test-bars, non-overlapping tests).",
+)
+@click.option(
+    "--granularity",
+    default=None,
+    help="Candle granularity (default: the rule's own, else ONE_HOUR).",
+)
+@click.option(
+    "--session",
+    default="walk-forward",
+    show_default=True,
+    help="Ledger session label for the per-fold rows.",
+)
+@click.pass_context
+def trials_walk_forward(
+    ctx: click.Context,
+    ledger: Path | None,
+    rule: int,
+    train_bars: int,
+    test_bars: int,
+    step_bars: int | None,
+    granularity: str | None,
+    session: str,
+) -> None:
+    """Validate ONE stored rule across rolling-origin folds (#445).
+
+    Stability, not selection: this reports per-fold out-of-sample metrics and a
+    degradation trend for the GIVEN rule. There is no seed option (nothing samples)
+    and no fold, window or parameter set is ever named as preferable -- a
+    walk-forward that reported a winning window would reintroduce the ranking the
+    Strathern rail forbids.
+    """
+    repo = _open_repo(ctx)
+    config = rules_mod._optional_cfg(ctx)
+    try:
+        resolved = _resolve_with_granularity_fallback(repo, config, rule, granularity)
+    except rules_mod.RulesRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not resolved.candles:
+        raise click.ClickException(
+            f"no candles cached for {resolved.rule.product_id} "
+            f"{resolved.granularity.value} -- fetch first"
+        )
+
+    try:
+        folds_bounds = wf_mod.folds(
+            len(resolved.candles),
+            train_bars=train_bars,
+            test_bars=test_bars,
+            step_bars=step_bars,
+        )
+        report = wf_mod.walk_forward(
+            resolved.rule,
+            resolved.candles,
+            folds_bounds=folds_bounds,
+            fee_pct=resolved.fee_pct,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    for line in wf_mod.render_lines(report):
+        click.echo(line)
+    click.echo()
+    click.echo(
+        f"  folds priced at {rules_mod._describe_fee(resolved.fee_pct, resolved.fee_source)}"
+    )
+
+    # ONE ledger row PER FOLD (issue #445), each carrying its own bounds in params and its
+    # own TEST per-trade P&L, so the run is auditable fold by fold -- and no summary row:
+    # a summary row would be one more place a reader might look for a scoreboard.
+    effective_step = step_bars if step_bars is not None else test_bars
+    for fold in report.fold_metrics:
+        try:
+            record = trials_ledger.append_trial(
+                _ledger_path(ledger),
+                trial_id=(
+                    f"wf-{rule}-tr{train_bars}-te{test_bars}-st{effective_step}-f{fold.fold_index}"
+                ),
+                session=session,
+                rule=resolved.row["kind"],
+                params={
+                    "train_bars": train_bars,
+                    "test_bars": test_bars,
+                    "step_bars": effective_step,
+                    "train_start": fold.train_start,
+                    "train_end": fold.train_end,
+                    "test_start": fold.test_start,
+                    "test_end": fold.test_end,
+                    "granularity": resolved.granularity.value,
+                    "fee_pct": str(resolved.fee_pct),
+                    "rule_params": resolved.row.get("params") or {},
+                },
+                provenance="a_priori",
+                kind="walk_forward",
+                decision="diagnostic_only",
+                # A fold whose test window closed zero trades has an empty series by
+                # construction; the schema's word for "no P&L series on this row" is
+                # series_missing, so the fold stays ledgered (visible in M) instead of
+                # being silently dropped.
+                per_trade_pnl=list(fold.test_trade_pnl),
+                series_missing=not fold.test_trade_pnl,
+                # Never a JSON null in a summary (#445): the ledger reader Decimals every
+                # non-int summary value, and Decimal(None) raises -- ONE null row (a
+                # single-fold run's not-computable degradation) would make every later
+                # read of this append-only ledger crash forever. Not-computable values
+                # (degradation with fewer than two measuring folds, a median with no
+                # measuring fold) are OMITTED here, never nulled; the reader additionally
+                # passes any null through untouched so a hypothetical bad row degrades
+                # gracefully instead of bricking the chain.
+                summary={
+                    key: value
+                    for key, value in {
+                        "n_folds": report.n_folds,
+                        "n_folds_test_positive": report.n_folds_test_positive,
+                        "n_folds_with_test_trades": report.n_folds_with_test_trades,
+                        "median_test_expectancy": report.median_test_expectancy,
+                        "degradation": report.degradation,
+                        "train_n_trades": fold.train_n_trades,
+                        "train_expectancy": fold.train_expectancy,
+                        "test_n_trades": fold.test_n_trades,
+                        "test_expectancy": fold.test_expectancy,
+                        "test_win_rate": fold.test_win_rate,
+                        "test_max_drawdown": fold.test_max_drawdown,
+                    }.items()
+                    if value is not None
+                },
+            )
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"recorded {record.trial_id} (diagnostic_only) hash={record.row_hash[:12]}")
