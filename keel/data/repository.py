@@ -46,13 +46,24 @@ _ORDER_COLUMNS = (
     "fee",
     "expected_fill",
     "actual_fill",
+    # The venue-observed fill (#446): `qty` is the ORDERED size, this is what actually
+    # executed. NULL on rows written before the column existed -- "not observed", so readers
+    # fall back to `qty`, the behaviour those rows always had.
+    "filled_quantity",
     "raw_response",
     "confirmation",
     "rule_id",
     "created_at",
     "updated_at",
 )
-_ORDER_MONEY_FIELDS = ("qty", "limit_price", "fee", "expected_fill", "actual_fill")
+_ORDER_MONEY_FIELDS = (
+    "qty",
+    "limit_price",
+    "fee",
+    "expected_fill",
+    "actual_fill",
+    "filled_quantity",
+)
 
 _SIGNAL_COLUMNS = ("rule_id", "product_id", "ts", "indicators", "cts_score", "fired")
 

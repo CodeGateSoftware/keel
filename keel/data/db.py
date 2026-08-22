@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -54,6 +54,10 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         fee TEXT,
         expected_fill TEXT,
         actual_fill TEXT,
+        -- What the venue has actually executed on this order (#446). `qty` stays the ORDERED
+        -- size; this is the observed fill, so a partial is two numbers, not one rewritten.
+        -- NULL on every row written before v11: "not observed", not zero.
+        filled_quantity TEXT,
         raw_response TEXT,
         confirmation TEXT,
         rule_id INTEGER,
@@ -449,6 +453,25 @@ def _migrate_v10_instrument_attestations(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v11_orders_filled_quantity(conn: sqlite3.Connection) -> None:
+    """v11 adds `orders.filled_quantity` -- the venue-observed fill quantity (#446).
+
+    A partial fill is two numbers, not one: the ORDERED size (`qty`) and what the venue has
+    actually executed. Rewriting `qty` on a partial would destroy the second half of the
+    comparison (`filled < ordered`) that makes the state recognizable at all.
+
+    Idempotent by the v8 pattern (`PRAGMA table_info` guard) rather than the v9/v10 no-op
+    pattern: a database already stamped at v10 got its `orders` table from v10's DDL, which has
+    no such column, and `CREATE TABLE IF NOT EXISTS` never adds one -- the exact way v8's
+    `profile.autonomous_until` went missing. There is deliberately NO backfill: the honest
+    value for every pre-v11 row is NULL, "not observed", which readers treat as "use `qty`" --
+    the behaviour those rows had before the column existed.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "filled_quantity" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN filled_quantity TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -459,6 +482,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_v8_autonomy_expiry,
     9: _migrate_v9_screen_exceptions,
     10: _migrate_v10_instrument_attestations,
+    11: _migrate_v11_orders_filled_quantity,
 }
 
 

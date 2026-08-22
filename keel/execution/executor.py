@@ -689,7 +689,54 @@ def _upgrade_to_observed_economics(
     if not fill or fill <= 0:
         return
     repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
+    _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
     _log_intent_divergence(order_id, intent, fill)
+
+
+def _record_observed_fill_quantity(
+    repo: Repository,
+    order_id: int,
+    observed: dict[str, Any],
+    intent: OrderIntent | None,
+    now_ts: int,
+) -> None:
+    """Record the venue-observed `filled_size` on an immediately-filled order (#446).
+
+    A market IOC that only partly filled has its remainder cancelled at the venue, so this
+    observation IS final -- but `qty` still says the ordered size, and everything sized from the
+    order (the exit bracket placed next, the tranche the ledger opens) assumes it all filled.
+    That mismatch is the oversized-bracket condition: a bracket able to sell more than is held.
+
+    DELIBERATELY detect-and-surface only. Resizing the bracket means either amending a live
+    native trigger-bracket or cancel-and-replace, and the broker port carries no bracket/OCO
+    kind at all (#502) -- the live bracket already bypasses the port as a raw dict. Auto-cancelling
+    a protective order on the strength of a snapshot that may still be settling is a wrong
+    auto-action on live money; a loud warning is the safe half, and it is what this does.
+    """
+    filled = observed.get("filled_size")
+    if not filled or filled <= 0:
+        return
+    ordered = intent.qty if intent is not None else (repo.get_order(order_id) or {}).get("qty")
+    if ordered is None or ordered <= 0:
+        return
+    repo.update_order(order_id, filled_quantity=filled, updated_at=now_ts)
+    if filled < ordered:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.entry_partially_filled",
+            order_id=order_id,
+            product=intent.product_id if intent is not None else None,
+            filled=str(filled),
+            ordered=str(ordered),
+            shortfall=str(ordered - filled),
+            detail=(
+                "the venue executed only part of this order -- its bracket is placed for the "
+                "ordered size and may be rejected or oversized for what is actually held. "
+                "Cancel and re-place the bracket at the filled size, or verify the remainder "
+                "at the venue; the automated resize policy is #502"
+            ),
+        )
 
 
 def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: Any) -> None:
