@@ -539,3 +539,24 @@ def test_cli_refusals_write_no_rows(tmp_path):
     assert no_candles.exit_code != 0
     assert "no candles" in no_candles.output
     assert not ledger.exists() or trials_ledger.read_trials(ledger) == []
+
+
+def test_cli_single_fold_run_reads_back_and_never_bricks_the_ledger(tmp_path):
+    """THE #445 BLOCKER, end to end: folds(80, train_bars=60, test_bars=20) yields exactly
+    ONE fold, so degradation is None by design. The writer must OMIT the key (never write
+    a JSON null -- one null row made every later read of the append-only ledger raise
+    Decimal(None) forever) and the ledger must read back and verify afterwards."""
+    db = _wf_db(tmp_path, candles=True)  # 96 bars: one fold at [0,80), start 20 won't fit
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "60", "--test-bars", "20")
+    assert result.exit_code == 0, result.output
+    assert "degradation not computable" in result.output
+
+    rows = trials_ledger.read_trials(ledger)  # read-back succeeds -- the pre-fix writer's
+    # null degradation bricked exactly here
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.summary["n_folds"] == 1
+    assert "degradation" not in row.summary  # omitted, never nulled
+    assert "null" not in ledger.read_text(encoding="utf-8")
+    assert trials_ledger.verify_chain(ledger) == []

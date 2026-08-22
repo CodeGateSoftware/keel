@@ -140,3 +140,31 @@ def test_trial_counts_splits_m_from_decision_count(tmp_path):
     m, n_decisions = ledger.trial_counts(ledger.read_trials(path))
     assert m == 3
     assert n_decisions == 2
+
+
+def test_summary_null_value_decodes_without_raising(tmp_path):
+    """#445: a summary value written as JSON null must not brick the ledger's READ-BACK.
+
+    `_decode_summary` Decimals every non-int summary value, and Decimal(None) raises -- so
+    ONE row carrying a null (a not-computable degradation, as a single-fold walk-forward
+    run wrote before the CLI began omitting Nones) made every later read_trials/
+    verify_chain of the append-only chain raise forever. The reader now passes null through
+    untouched: the row reads back with None, rows after it still read, and the chain still
+    verifies (null re-encodes to null, so the recomputed hash is unchanged)."""
+    path = tmp_path / "trials.jsonl"
+    bad = _append(
+        path,
+        "wf-single-fold",
+        provenance="a_priori",
+        kind="walk_forward",
+        decision="diagnostic_only",
+        summary={"n_folds": 1, "degradation": None},
+    )
+    assert bad.row_hash  # the write succeeds; the incident was always on read-back
+    _append(path, "t-after")
+    rows = ledger.read_trials(path)  # must not raise
+    assert len(rows) == 2
+    assert rows[0].summary["degradation"] is None
+    assert rows[0].summary["n_folds"] == 1  # ints (and Decimals) still decode as before
+    assert rows[1].summary["expectancy"] == Decimal("610")
+    assert ledger.verify_chain(path) == []

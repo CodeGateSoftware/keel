@@ -606,17 +606,29 @@ def trials_walk_forward(
                 # being silently dropped.
                 per_trade_pnl=list(fold.test_trade_pnl),
                 series_missing=not fold.test_trade_pnl,
+                # Never a JSON null in a summary (#445): the ledger reader Decimals every
+                # non-int summary value, and Decimal(None) raises -- ONE null row (a
+                # single-fold run's not-computable degradation) would make every later
+                # read of this append-only ledger crash forever. Not-computable values
+                # (degradation with fewer than two measuring folds, a median with no
+                # measuring fold) are OMITTED here, never nulled; the reader additionally
+                # passes any null through untouched so a hypothetical bad row degrades
+                # gracefully instead of bricking the chain.
                 summary={
-                    "n_folds": report.n_folds,
-                    "n_folds_test_positive": report.n_folds_test_positive,
-                    "median_test_expectancy": report.median_test_expectancy,
-                    "degradation": report.degradation,
-                    "train_n_trades": fold.train_n_trades,
-                    "train_expectancy": fold.train_expectancy,
-                    "test_n_trades": fold.test_n_trades,
-                    "test_expectancy": fold.test_expectancy,
-                    "test_win_rate": fold.test_win_rate,
-                    "test_max_drawdown": fold.test_max_drawdown,
+                    key: value
+                    for key, value in {
+                        "n_folds": report.n_folds,
+                        "n_folds_test_positive": report.n_folds_test_positive,
+                        "median_test_expectancy": report.median_test_expectancy,
+                        "degradation": report.degradation,
+                        "train_n_trades": fold.train_n_trades,
+                        "train_expectancy": fold.train_expectancy,
+                        "test_n_trades": fold.test_n_trades,
+                        "test_expectancy": fold.test_expectancy,
+                        "test_win_rate": fold.test_win_rate,
+                        "test_max_drawdown": fold.test_max_drawdown,
+                    }.items()
+                    if value is not None
                 },
             )
         except ValueError as exc:

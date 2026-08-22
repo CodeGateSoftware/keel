@@ -86,7 +86,15 @@ def _decode_summary(raw: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in (raw or {}).items():
         # `trade_count` is a plain int; every other summary field is money/ratio -> Decimal.
-        out[key] = value if isinstance(value, int) else Decimal(value)
+        # None passes through untouched (#445): a null summary value (a not-computable
+        # degradation, written before the walk-forward writer began OMITTING Nones) used to
+        # raise Decimal(None) here, and one such row made every later read_trials/
+        # verify_chain of the append-only chain raise forever. A reader must degrade this
+        # row's value to None, never brick the ledger's read-back.
+        if value is None or isinstance(value, int):
+            out[key] = value
+        else:
+            out[key] = Decimal(value)
     return out
 
 
