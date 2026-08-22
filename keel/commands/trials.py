@@ -5,6 +5,12 @@ neither the broker, the repository, nor `config.yaml`, operating only on a ledge
 That is why it was the first group extracted out of the monolithic `keel/cli.py` -- it shares
 none of the network/DB seams the other commands do, so moving it here cannot change any
 monkeypatch target the CLI tests rely on.
+
+ONE exception (#441): `trials monte-carlo` reads the DB (and, when one loads, `config.yaml`)
+to rebuild a stored rule and its candles -- it is a measurement over a backtest, not a
+ledger-file operation. It still writes only to the ledger, never to the db, and it resolves
+the rule through the exact `rules backtest` seam (`keel.commands.rules.resolve_rule_backtest`)
+so its observed run is the run an operator can reproduce by hand.
 """
 
 from __future__ import annotations
@@ -12,13 +18,20 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import click
 
+from keel.commands import rules as rules_mod
+from keel.commands._common import _open_repo
+from keel.data.history import GRANULARITY_SECONDS
+from keel.data.repository import Repository
 from keel.research import cscv as cscv_mod
 from keel.research import deflate as deflate_mod
 from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
+from keel.research import montecarlo as mc_mod
+from keel.strategy import backtest as backtest_mod
 
 
 @click.group("trials")
@@ -119,17 +132,24 @@ def trials_verify(ledger: Path | None) -> None:
 @_LEDGER_OPTION
 @click.option("--sharpe", required=True, type=float, help="Observed ANNUALISED Sharpe.")
 @click.option(
-    "--trades-per-year", default=6.0, show_default=True, type=float,
+    "--trades-per-year",
+    default=6.0,
+    show_default=True,
+    type=float,
     help="Realised trade frequency, used to express MinBTL in trades.",
 )
 @click.option(
-    "--rho", default=None, type=float,
+    "--rho",
+    default=None,
+    type=float,
     help="Assumed correlation between trials (§78.2). Omit to report an assumption BAND.",
 )
 @click.option("--skew", default=0.0, show_default=True, type=float)
 @click.option("--kurtosis", default=3.0, show_default=True, type=float, help="Non-excess.")
 @click.option(
-    "--trial-sharpe-variance", default=None, type=float,
+    "--trial-sharpe-variance",
+    default=None,
+    type=float,
     help="V[{SR_n}] across trials. Omit if the ledger cannot supply it -- DSR is then skipped "
     "rather than computed from a guess.",
 )
@@ -168,9 +188,7 @@ def trials_deflate(
         emax = deflate_mod.expected_max_sharpe(effective)
         years = deflate_mod.min_backtest_length_years(effective, sharpe)
         trades = deflate_mod.min_trades(effective, sharpe, trades_per_year)
-        click.echo(
-            f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}"
-        )
+        click.echo(f"  {assumed:>5.2f} {n_hat:>8.1f} {emax:>8.3f} {years:>10.1f} {trades:>14.0f}")
 
     if trial_sharpe_variance is None:
         click.echo(
@@ -183,9 +201,11 @@ def trials_deflate(
     n_hat = deflate_mod.implied_independent_trials(rho if rho is not None else 0.0, n_decisions)
     effective = max(2, int(round(n_hat)))
     sr0 = deflate_mod.sharpe_rejection_threshold(effective, trial_sharpe_variance)
-    observations = int(round(trades_per_year * deflate_mod.min_backtest_length_years(
-        effective, sharpe
-    ))) if sharpe > 0 else 0
+    observations = (
+        int(round(trades_per_year * deflate_mod.min_backtest_length_years(effective, sharpe)))
+        if sharpe > 0
+        else 0
+    )
     dsr = deflate_mod.deflated_sharpe(sharpe, sr0, max(2, observations), skew, kurtosis)
     click.echo(f"\nSR_0 (rejection bar)      : {sr0:.4f}")
     click.echo(f"DSR                       : {dsr:.4f}")
@@ -226,3 +246,200 @@ def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
         "PBO with a flat, positive OOS scatter is the GOOD outcome -- a broad plateau of "
         "near-identical configurations produces high PBO by construction."
     )
+
+
+# -- monte-carlo resampling (#441) ----------------------------------------------------------------
+#
+# The one `trials` subcommand that touches the db (see the module docstring). Everything it
+# does is measurement: resolve the stored rule exactly as `rules backtest` does, run the
+# observed backtest once, resample (trade reshuffle or moving-block candle bootstrap), then
+# print the report and append ONE diagnostic_only ledger row. It never writes to the db, never
+# changes a rule's status, and never feeds any gate -- the percentile is evidence about path
+# luck, and "measurement, not gating" is the whole point of the module it fronts.
+
+#: The equity baseline resampled finals are read against: cumulative P&L from zero, matching
+#: the backtest engine's fixed 1-unit notional (there is no account balance to compound).
+_MC_START = Decimal(0)
+
+
+def _closed_pnls(result: backtest_mod.BacktestResult) -> list[Decimal]:
+    """The observed run's realised per-trade P&L (fee and slippage already inside it).
+
+    Open trades carry no pnl and no outcome yet -- excluding them is not a choice, it is the
+    only well-defined reading. A closed trade without a pnl would be a data error and is
+    named rather than coerced (same invariant `stats.summarize` states).
+    """
+    pnls: list[Decimal] = []
+    for trade in result.trades:
+        if trade.outcome == "open":
+            continue
+        if trade.pnl is None:
+            raise click.ClickException(
+                f"a {trade.outcome!r} trade reached the resample without a pnl -- only an "
+                "open trade may omit realised P&L"
+            )
+        pnls.append(trade.pnl)
+    return pnls
+
+
+def _resolve_with_granularity_fallback(
+    repo: Repository, config: Any | None, rule_id: int, granularity_opt: str | None
+) -> rules_mod.ResolvedBacktest:
+    """`resolve_rule_backtest` with the #441 granularity default chain: an explicit
+    `--granularity` wins, then the rule's own, and a rule that declares neither falls back to
+    ONE_HOUR (the engine's own trading-timeframe default) instead of refusing -- resampling a
+    series the rule itself reads hourly is the null that matches how it trades."""
+    try:
+        return rules_mod.resolve_rule_backtest(
+            repo, config, rule_id, granularity_opt=granularity_opt
+        )
+    except rules_mod.RulesRefused as exc:
+        if granularity_opt is None and "no granularity" in str(exc):
+            return rules_mod.resolve_rule_backtest(
+                repo, config, rule_id, granularity_opt="ONE_HOUR"
+            )
+        raise
+
+
+@trials_group.command("monte-carlo")
+@_LEDGER_OPTION
+@click.option("--rule", required=True, type=int, help="Stored rule id to resample.")
+@click.option(
+    "--mode",
+    type=click.Choice(["trades", "candles"]),
+    default="trades",
+    show_default=True,
+    help="trades: same trades reshuffled (ordering luck). candles: moving-block bootstrap of "
+    "the rule's own candles, re-backtested per path (the null that keeps local structure).",
+)
+@click.option(
+    "--paths",
+    type=click.IntRange(1, 2000),
+    default=200,
+    show_default=True,
+    help="Number of resampled paths (capped: each candles-mode path is a full backtest).",
+)
+@click.option(
+    "--seed",
+    required=True,
+    type=int,
+    help="Seed for the resampling RNG -- required, because determinism is the point.",
+)
+@click.option(
+    "--block-len",
+    type=click.IntRange(min=1),
+    default=24,
+    show_default=True,
+    help="Moving-block length in bars (candles mode only).",
+)
+@click.option(
+    "--granularity",
+    default=None,
+    help="Candle granularity (default: the rule's own, else ONE_HOUR).",
+)
+@click.option(
+    "--session",
+    default="monte-carlo",
+    show_default=True,
+    help="Ledger session label for the diagnostic row.",
+)
+@click.pass_context
+def trials_monte_carlo(
+    ctx: click.Context,
+    ledger: Path | None,
+    rule: int,
+    mode: str,
+    paths: int,
+    seed: int,
+    block_len: int,
+    granularity: str | None,
+    session: str,
+) -> None:
+    """Is this rule's equity curve an outlier under resampling? (#441)
+
+    Measurement, not gating: the percentile is evidence about path luck and nothing else.
+    """
+    repo = _open_repo(ctx)
+    config = rules_mod._optional_cfg(ctx)
+    try:
+        resolved = _resolve_with_granularity_fallback(repo, config, rule, granularity)
+    except rules_mod.RulesRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    # The observed run: the exact `rules backtest` execution seam, at the fee the resolution
+    # derived, so the number below is the number an operator can reproduce by hand.
+    observed = rules_mod.backtest_resolved(resolved)
+    pnls = _closed_pnls(observed)
+
+    if mode == "trades":
+        if not pnls:
+            raise click.ClickException(
+                "no closed trades in the observed backtest -- nothing to reshuffle"
+            )
+        finals = mc_mod.final_equities(mc_mod.reshuffle(pnls, paths, seed), _MC_START)
+    else:
+        candle_paths = mc_mod.moving_block_bootstrap(
+            resolved.candles,
+            block_len=block_len,
+            n_paths=paths,
+            seed=seed,
+            step_sec=GRANULARITY_SECONDS[resolved.granularity],
+        )
+        path_pnls: list[list[Decimal]] = []
+        for candle_path in candle_paths:
+            # Same fee as the observed run, so a percentile difference is path luck, not a
+            # pricing difference between the observed and resampled worlds.
+            replay = backtest_mod.backtest(resolved.rule, candle_path, fee_pct=resolved.fee_pct)
+            path_pnls.append(_closed_pnls(replay))
+        finals = mc_mod.final_equities(path_pnls, _MC_START)
+
+    observed_final = mc_mod.equity_curve(pnls, _MC_START)[-1]
+    report = mc_mod.MonteCarloReport(
+        mode=mode,
+        n_paths=paths,
+        seed=seed,
+        start=_MC_START,
+        n_trades=len(pnls),
+        observed_final=observed_final,
+        distribution_min=min(finals),
+        distribution_median=mc_mod.median(finals),
+        distribution_max=max(finals),
+        percentile=mc_mod.percentile_of(observed_final, finals),
+        block_len=block_len if mode == "candles" else None,
+    )
+    for line in report.render_lines():
+        click.echo(line)
+    fee_line = rules_mod._describe_fee(resolved.fee_pct, resolved.fee_source)
+    click.echo(f"  backtest priced at {fee_line}")
+
+    try:
+        record = trials_ledger.append_trial(
+            _ledger_path(ledger),
+            trial_id=f"mc-{rule}-{mode}-seed{seed}",
+            session=session,
+            rule=resolved.row["kind"],
+            params={
+                "mode": mode,
+                "paths": paths,
+                "seed": seed,
+                "block_len": block_len if mode == "candles" else None,
+                "granularity": resolved.granularity.value,
+                "fee_pct": str(resolved.fee_pct),
+            },
+            provenance="a_priori",
+            kind="monte_carlo",
+            decision="diagnostic_only",
+            per_trade_pnl=pnls,
+            summary={
+                "observed_final": observed_final,
+                "distribution_min": report.distribution_min,
+                "distribution_median": report.distribution_median,
+                "distribution_max": report.distribution_max,
+                "percentile": report.percentile,
+                "n_trades": len(pnls),
+                "n_paths": paths,
+            },
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"recorded {record.trial_id} (diagnostic_only) hash={record.row_hash[:12]}")

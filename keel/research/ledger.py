@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import Any
 
 PROVENANCE = frozenset({"a_priori", "fitted"})
-KINDS = frozenset({"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge"})
+#: `monte_carlo` (#441) is a resampling DIAGNOSTIC row -- same vocabulary discipline as the
+#: rest of the set: a row's kind says what kind of experiment produced it, so a bootstrap run
+#: is not silently filed as an ablation or a sweep node it never was.
+KINDS = frozenset(
+    {"sweep_node", "ablation", "rule_retirement", "asset_prune", "threshold_nudge", "monte_carlo"}
+)
 DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
 
 #: A CSCV column is a diagnostic, not a decision (spec §4.4) -- it does not count toward N.

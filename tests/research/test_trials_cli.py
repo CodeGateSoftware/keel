@@ -1,4 +1,5 @@
-"""CLI surface for the trials ledger (spec §4.5) -- the scratchpad recording path."""
+"""CLI surface for the trials ledger (spec §4.5) -- the scratchpad recording path, plus the
+`trials monte-carlo` resampling front-end (#441)."""
 
 from __future__ import annotations
 
@@ -7,22 +8,34 @@ from decimal import Decimal
 from click.testing import CliRunner
 
 from keel.cli import cli
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
+from keel.types import Candle, Granularity
 
 
 def _record(runner, path, trial_id, decision="selected"):
     return runner.invoke(
         cli,
         [
-            "trials", "record",
-            "--ledger", str(path),
-            "--trial-id", trial_id,
-            "--session", "s1",
-            "--rule", "turtle_breakout",
-            "--params", '{"entry": 40}',
-            "--provenance", "fitted",
-            "--kind", "sweep_node",
-            "--decision", decision,
+            "trials",
+            "record",
+            "--ledger",
+            str(path),
+            "--trial-id",
+            trial_id,
+            "--session",
+            "s1",
+            "--rule",
+            "turtle_breakout",
+            "--params",
+            '{"entry": 40}',
+            "--provenance",
+            "fitted",
+            "--kind",
+            "sweep_node",
+            "--decision",
+            decision,
             "--series-missing",
         ],
     )
@@ -67,10 +80,25 @@ def test_record_rejects_bad_enum(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "trials", "record", "--ledger", str(path), "--trial-id", "t1",
-            "--session", "s", "--rule", "r", "--params", "{}",
-            "--provenance", "vibes", "--kind", "sweep_node",
-            "--decision", "selected", "--series-missing",
+            "trials",
+            "record",
+            "--ledger",
+            str(path),
+            "--trial-id",
+            "t1",
+            "--session",
+            "s",
+            "--rule",
+            "r",
+            "--params",
+            "{}",
+            "--provenance",
+            "vibes",
+            "--kind",
+            "sweep_node",
+            "--decision",
+            "selected",
+            "--series-missing",
         ],
     )
     assert result.exit_code != 0
@@ -134,9 +162,7 @@ def test_deflate_reports_a_band_and_refuses_to_invent_DSR(tmp_path):
     for i in range(5):
         _record(runner, path, f"t{i}")
 
-    result = runner.invoke(
-        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
-    )
+    result = runner.invoke(cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"])
     assert result.exit_code == 0, result.output
     # A band, not a single number, because rho is not measured here.
     assert "0.00" in result.output and "0.90" in result.output
@@ -152,8 +178,18 @@ def test_deflate_computes_dsr_when_the_variance_is_supplied_explicitly(tmp_path)
 
     result = runner.invoke(
         cli,
-        ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4",
-         "--rho", "0.5", "--trial-sharpe-variance", "0.05"],
+        [
+            "trials",
+            "deflate",
+            "--ledger",
+            str(path),
+            "--sharpe",
+            "0.4",
+            "--rho",
+            "0.5",
+            "--trial-sharpe-variance",
+            "0.05",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert "SR_0" in result.output
@@ -165,7 +201,160 @@ def test_deflate_refuses_on_too_few_decision_trials(tmp_path):
     runner = CliRunner()
     path = tmp_path / "trials.jsonl"
     _record(runner, path, "only-one")
-    result = runner.invoke(
-        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
+    result = runner.invoke(cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"])
+    assert result.exit_code != 0
+
+
+# -- trials monte-carlo (#441): is the equity curve an outlier? -----------------------------------
+
+
+def _mc_candles(n: int, *, start: int = 1_700_000_000) -> list[Candle]:
+    """`n` daily bars with a deterministic oscillation, so a turtle rule both enters and gets
+    stopped out -- a backtest that CLOSES trades is the minimum the resample needs."""
+    base = Decimal("100")
+    candles = []
+    for i in range(n):
+        wiggle = Decimal(i % 7) * Decimal("2") + Decimal("1")
+        candles.append(
+            Candle(
+                ts=start + i * 86400,
+                open=base + wiggle,
+                high=base + wiggle + Decimal(i % 3),
+                low=base - wiggle - Decimal(i % 5),
+                close=base + (wiggle if i % 2 else -wiggle),
+                volume=Decimal("10"),
+            )
+        )
+    return candles
+
+
+def _mc_db(tmp_path):
+    """A temp db holding one turtle rule (small lookbacks) and its daily candles."""
+    conn = connect(str(tmp_path / "mc.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": "BTC-USD", "entry_lookback": 5, "exit_lookback": 3, "atr_stop_mult": "1"},
+        status="candidate",
+        now_ts=1_800_000_000,
     )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(60))
+    conn.close()
+    return tmp_path / "mc.db"
+
+
+def _invoke_mc(runner, db, ledger, *extra):
+    """One `trials monte-carlo` invocation against a real (if tiny) db; `--config` points at a
+    path that does not exist so the fee degrades to the library default instead of loading
+    whatever deployment config happens to surround the test run."""
+    return runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db),
+            "--config",
+            str(db.parent / "missing.yaml"),
+            "trials",
+            "monte-carlo",
+            "--rule",
+            "1",
+            "--ledger",
+            str(ledger),
+            *extra,
+        ],
+    )
+
+
+def test_monte_carlo_help_pins_the_seed_and_the_two_modes():
+    result = CliRunner().invoke(cli, ["trials", "monte-carlo", "--help"])
+    assert result.exit_code == 0
+    for needle in (
+        "--seed",
+        "--mode",
+        "--paths",
+        "--block-len",
+        "--granularity",
+        "trades",
+        "candles",
+    ):
+        assert needle in result.output
+
+
+def test_monte_carlo_trades_mode_appends_exactly_one_diagnostic_row(tmp_path):
+    db = _mc_db(tmp_path)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(CliRunner(), db, ledger, "--mode", "trades", "--paths", "20", "--seed", "7")
+    assert result.exit_code == 0, result.output
+    assert "percentile" in result.output
+    assert "path luck" in result.output
+    assert "fee_pct" in result.output  # every printed number travels with its fee
+    assert "recorded" in result.output
+
+    rows = trials_ledger.read_trials(ledger)
+    assert len(rows) == 1  # ONE row, never one per path
+    row = rows[0]
+    assert row.decision == "diagnostic_only"  # measurement, never a gate input
+    assert row.provenance == "a_priori"
+    assert row.kind == "monte_carlo"
+    assert row.per_trade_pnl  # the observed per-trade P&L rode along
+    assert row.summary["n_paths"] == 20
+    assert trials_ledger.verify_chain(ledger) == []
+
+
+def test_monte_carlo_candles_mode_rebacktests_bootstrapped_paths(tmp_path):
+    db = _mc_db(tmp_path)
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(
+        CliRunner(),
+        db,
+        ledger,
+        "--mode",
+        "candles",
+        "--paths",
+        "5",
+        "--seed",
+        "11",
+        "--block-len",
+        "10",
+    )
+    assert result.exit_code == 0, result.output
+    assert "candles mode" in result.output
+    assert "block_len=10" in result.output
+    rows = trials_ledger.read_trials(ledger)
+    assert len(rows) == 1 and rows[0].kind == "monte_carlo"
+    assert trials_ledger.verify_chain(ledger) == []
+
+
+def test_monte_carlo_is_deterministic_under_a_fixed_seed(tmp_path):
+    db = _mc_db(tmp_path)
+    out_a = _invoke_mc(CliRunner(), db, tmp_path / "a.jsonl", "--seed", "7", "--paths", "12")
+    out_b = _invoke_mc(CliRunner(), db, tmp_path / "b.jsonl", "--seed", "7", "--paths", "12")
+    assert out_a.exit_code == 0 and out_b.exit_code == 0
+    # The rendered report reproduces line-for-line; only the ledger row's timestamp (and so
+    # its hash) legitimately differs between the two runs.
+    report_a = [line for line in out_a.output.splitlines() if "recorded" not in line]
+    report_b = [line for line in out_b.output.splitlines() if "recorded" not in line]
+    assert report_a == report_b
+
+
+def test_monte_carlo_refuses_when_no_closed_trades_and_writes_no_row(tmp_path):
+    conn = connect(str(tmp_path / "dca.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 7}, now_ts=1_800_000_000)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _mc_candles(30))
+    conn.close()
+    ledger = tmp_path / "trials.jsonl"
+    result = _invoke_mc(CliRunner(), tmp_path / "dca.db", ledger, "--seed", "3")
+    # DCA never exits: every trade is open, so there is nothing to resample -- a refusal,
+    # not a degenerate row.
+    assert result.exit_code != 0
+    assert "no closed trades" in result.output
+    assert not ledger.exists()
+
+
+def test_monte_carlo_caps_paths_at_2000(tmp_path):
+    db = _mc_db(tmp_path)
+    result = _invoke_mc(CliRunner(), db, tmp_path / "t.jsonl", "--paths", "2001", "--seed", "1")
     assert result.exit_code != 0
