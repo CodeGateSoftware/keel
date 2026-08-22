@@ -18,7 +18,7 @@ commit hash (`+` is the semver / PEP 440 build-metadata separator). The version 
 this". A build reporting `(DIRTY)` or `[checkout]` corresponds to no commit and **must not be run
 against live funds**; `keel --version` warns loudly when so.
 
-It answers for the `keel-trader` distribution **only**, though, and keel installs as six of them.
+It answers for the `keel-trader` distribution **only**, though, and keel installs as eight of them.
 `keel versions` reports every one and exits non-zero if they disagree — that is the check a
 deployment runs (README, "Deploying a new version"), and the release workflow runs it too against
 the wheels it just built.

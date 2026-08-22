@@ -12,7 +12,7 @@ The reasoning lives in `CONTRIBUTING.md` rather than only in a merged PR, so the
 challengeable in place instead of implicit.
 
 These tests are a repo-hygiene check like `test_packaging.py`'s: they read the source tree, and
-they exist because the failure mode is silent. A licence that drifts (a seventh distribution
+they exist because the failure mode is silent. A licence that drifts (a ninth distribution
 added without the field, an appendix left filled with placeholders) produces a repo that looks
 open and is not, which is worse than one that admits it is closed.
 """
@@ -85,11 +85,11 @@ def test_the_appendix_names_the_copyright_holder_and_no_placeholders_survive():
 
 @pytest.mark.parametrize("name", sorted(_pyprojects()))
 def test_every_distribution_declares_the_same_spdx_licence(name):
-    """All six distributions must carry `license = "Apache-2.0"` (PEP 639 SPDX form).
+    """All eight distributions must carry `license = "Apache-2.0"` (PEP 639 SPDX form).
 
     The string form is deliberate: the deprecated table form (`{ text = ... }`) lands in wheel
     metadata as a free-text `License:` field, while the SPDX expression becomes
-    `License-Expression:`, which is what license-scanning tooling reads. A seventh distribution
+    `License-Expression:`, which is what license-scanning tooling reads. A ninth distribution
     added without the field ships as all-rights-reserved metadata beside permissively-licensed
     siblings -- the same mixed-signal failure the version pins in `test_packaging.py` guard
     against, one directory over.

@@ -9,7 +9,7 @@ the manifests, a weekly `pip-audit` reads the exact locked set the app ships wit
 CodeQL (Python) reads the source -- and `code-quality.yml` stays the OPTIONAL enhanced
 tier (SonarQube + Snyk) for if those tokens are ever created.
 
-This file pins that split. The manifest lists are DERIVED FROM THE FILESYSTEM (a seventh
+This file pins that split. The manifest lists are DERIVED FROM THE FILESYSTEM (a new
 distribution under packages/ that Dependabot and the export do not know about fails here,
 rather than passing because a hand-maintained list was never told), the audit is pinned to
 `uv export --frozen` (the lock as committed, never a fresh resolve), and the secrets rule
@@ -33,7 +33,9 @@ import re
 import tomllib
 from pathlib import Path
 
-import yaml
+import pytest
+
+from tests._workflow_yaml import strict_load
 
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _ROOT / ".github" / "workflows"
@@ -54,6 +56,18 @@ def _read(relative: str) -> str:
     return path.read_text() if path.is_file() else ""
 
 
+def _load_workflow(name: str) -> dict:
+    """A workflow parsed the way GitHub parses it: duplicate keys refused, not merged.
+
+    Every structural claim this file makes about code-quality.yml rides on PyYAML keeping
+    the key GitHub would keep. `yaml.safe_load`'s last-key-wins would let a duplicate-key
+    edit pass every pin here and then disable the workflow at dispatch time -- the exact
+    v0.11.0 release.yml incident class, whose discipline (born in
+    tests/test_desktop_packaging.py) tests/_workflow_yaml.py now shares.
+    """
+    return strict_load((_WORKFLOWS / name).read_text(encoding="utf-8"), source=name)
+
+
 def _pyprojects() -> dict[str, dict]:
     """The workspace's manifests, keyed by directory -- the shape Dependabot must watch.
 
@@ -70,16 +84,16 @@ def _pyprojects() -> dict[str, dict]:
 def test_dependabot_watches_every_python_manifest_and_the_actions():
     """Every manifest the filesystem declares -- nothing updates silently.
 
-    The workspace is six distributions today, and Dependabot's `pip` ecosystem works per
+    The workspace is eight distributions today, and Dependabot's `pip` ecosystem works per
     manifest directory: an unlisted directory gets no update PRs, ever. The expected set
-    is DERIVED from packages/*/pyproject.toml, so adding a seventh distribution without
+    is DERIVED from packages/*/pyproject.toml, so adding another distribution without
     telling Dependabot fails here instead of shipping a blind spot.
     """
     path = _ROOT / ".github" / "dependabot.yml"
     assert path.is_file(), (
         ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
     )
-    config = yaml.safe_load(path.read_text())
+    config = strict_load(path.read_text(), source=str(path))
     assert config.get("version") == 2, "dependabot.yml must be the version-2 schema"
     entries = config.get("updates", [])
     pip_dirs = {e.get("directory") for e in entries if e.get("package-ecosystem") == "pip"}
@@ -106,7 +120,7 @@ def test_every_dependabot_entry_is_scheduled():
     assert path.is_file(), (
         ".github/dependabot.yml must exist -- updates unwatched are updates unseen"
     )
-    entries = yaml.safe_load(path.read_text()).get("updates", [])
+    entries = strict_load(path.read_text(), source=str(path)).get("updates", [])
     unscheduled = [e for e in entries if not e.get("schedule", {}).get("interval")]
     assert not unscheduled, (
         f"these dependabot entries have no schedule interval: {unscheduled} -- an entry "
@@ -194,6 +208,34 @@ def test_the_baseline_scans_reference_no_secrets_at_all():
         )
 
 
+def test_the_strict_loader_rejects_a_duplicate_key_workflow_text() -> None:
+    """Why every workflow parse here goes through `strict_load`, pinned on the loader itself.
+
+    PyYAML's `safe_load` resolves duplicate mapping keys last-key-wins, so a workflow edit
+    that leaves a stale `run:` beside the rewritten one parses fine, passes every pin in
+    this file -- and is refused by GitHub's STRICT parser only at dispatch, disabling the
+    workflow on main outright (v0.11.0's first re-dispatch of release.yml, exactly). This
+    is the same discipline tests/test_desktop_packaging.py applies to release.yml; here it
+    guards code-quality.yml, whose preflight structure the tests below pin key by key.
+    """
+    leaky = """
+on: push
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        uses: actions/checkout@v6
+"""
+    with pytest.raises(AssertionError, match="duplicate key 'uses'"):
+        strict_load(leaky, source="duplicate-key workflow text")
+    # And it is duplicate keys it refuses, not workflows: the same text with the stale
+    # line removed loads, so the loader cannot hide behind refusing everything.
+    cleaned = leaky.replace("        uses: actions/checkout@v6\n", "")
+    assert strict_load(cleaned, source="clean")["jobs"]
+
+
 def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard():
     """code-quality.yml may name SONAR_TOKEN/SNYK_TOKEN -- but only guarded.
 
@@ -207,7 +249,7 @@ def test_the_optional_tier_only_asks_for_its_tokens_behind_the_preflight_guard()
     token-referencing job from its preflight -- nor re-merge the two scanners into one
     all-or-nothing flag.
     """
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     jobs = workflow.get("jobs", {})
     assert "preflight" in jobs, (
         f"{_OPTIONAL_TIER} must keep its preflight job -- it is what lets the optional "
@@ -252,7 +294,7 @@ def test_preflight_readiness_includes_the_org_level_config_not_just_the_tokens()
     this test pins that it checks both, and that each scan passes its org along when it
     finally runs.
     """
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     preflight_text = str(workflow["jobs"]["preflight"])
     assert "sonar.organization" in preflight_text, (
         "preflight must check sonar-project.properties carries an active "
@@ -271,12 +313,55 @@ def test_preflight_readiness_includes_the_org_level_config_not_just_the_tokens()
     )
 
 
+def test_preflights_sonar_readiness_requires_a_value_not_just_an_uncommented_line() -> None:
+    """A blank `sonar.organization=` is not readiness -- it is #402 one edit later.
+
+    The readiness grep once accepted any uncommented `sonar.organization=` line, value or
+    none. But SonarCloud's "You must define the following mandatory properties ...:
+    sonar.organization" refusal fires for an EMPTY value exactly as for a missing one, so
+    that grep would flip `sonar_ready` to true the moment someone uncommented the line
+    without filling the key in -- and every push to `main` would go red again, the exact
+    permanently-red outcome the preflight exists to prevent. The pattern is extracted from
+    the workflow itself and pinned twice: as text (the non-blank tail must be there) and
+    as behaviour (translated to Python's re, on the exact lines SonarCloud does not
+    distinguish between).
+    """
+    workflow = _load_workflow(_OPTIONAL_TIER)
+    script = "\n".join(str(step.get("run", "")) for step in workflow["jobs"]["preflight"]["steps"])
+    grep_line = next(
+        (line for line in script.splitlines() if "grep -Eq" in line and "sonar" in line),
+        None,
+    )
+    assert grep_line is not None, (
+        "preflight must keep grep-ing sonar-project.properties for `sonar.organization` -- "
+        "an org-level check no repository secret can carry (#402)"
+    )
+    match = re.search(r"grep -Eq '([^']+)'", grep_line)
+    assert match is not None, "the readiness check's pattern must stay a quoted `grep -Eq` argument"
+    posix_ere = match.group(1)
+    # The non-blank requirement itself: something other than whitespace must follow the `=`.
+    assert "=[[:space:]]*[^[:space:]]" in posix_ere, (
+        f"the readiness pattern {posix_ere!r} must require a non-whitespace VALUE after "
+        "`sonar.organization=` -- an uncommented-but-empty key still trips SonarCloud's "
+        "mandatory-property refusal, so accepting it as ready reddens main again (#402)"
+    )
+    # Behaviour, on the lines the refusal does not distinguish between.
+    python_pattern = posix_ere.replace("[^[:space:]]", "[^ \\t]").replace("[[:space:]]", "[ \\t]")
+    ready = re.compile(python_pattern).search
+    assert ready("sonar.organization=x"), "a set key is ready"
+    assert ready("sonar.organization = codegate"), "whitespace around the = is still a set key"
+    assert not ready("sonar.organization="), "uncommented but EMPTY is not ready"
+    assert not ready("sonar.organization=   "), "only whitespace after the = is not ready"
+    assert not ready("#sonar.organization=x"), "a still-commented line is not ready"
+    assert not ready(""), "nothing set at all is not ready"
+
+
 def test_preflight_still_fails_loudly_only_when_a_human_dispatched_it():
     """The asymmetry that makes skipping honest: a human dispatch is refused loudly,
     an automatic trigger skips with an explanation. Reversed, the workflow either
     reddens every push to main while prerequisites are missing (#402, observed) or
     silently ignores a direct request."""
-    workflow = yaml.safe_load((_WORKFLOWS / _OPTIONAL_TIER).read_text())
+    workflow = _load_workflow(_OPTIONAL_TIER)
     steps = workflow["jobs"]["preflight"]["steps"]
     run = "\n".join(str(step.get("run", "")) for step in steps)
     assert "workflow_dispatch" in run, (

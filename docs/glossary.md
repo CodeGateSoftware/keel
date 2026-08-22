@@ -63,9 +63,11 @@ Source: docs/fiqh-basis.md -- "## What is attested versus what is computed"
 ## promotion gate
 
 The thresholds a candidate rule must clear on out-of-sample evidence before `rules
-promote` moves it toward live: the four performance floors -- min_trades (a minimum
-number of trades), min_expectancy, min_rr (a minimum realised reward:risk ratio) and
-min_win_rate -- AND the overfitting gate (G4): a probability of backtest overfitting
+promote` moves it toward live: the lookahead gate first (truncation-diff analysis must
+find the rule clean of future-reading before anything else is even measured), then the
+four performance floors -- min_trades (a minimum number of trades), min_expectancy,
+min_rr (a minimum realised reward:risk ratio) and min_win_rate -- AND the overfitting
+gate (G4): a probability of backtest overfitting
 (PBO) above its bound TOGETHER WITH a steeply negative degradation slope, a
 conjunction, not a bare PBO bound. Pooling is per parameter SET and covers only the
 sample-size axis -- the same parameter set's paper evidence may count toward min_trades

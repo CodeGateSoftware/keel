@@ -1,6 +1,6 @@
 """The workspace's own dependency metadata: one version, pinned everywhere.
 
-keel ships as six distributions cut from this repo in a single build, so "which version" is one
+keel ships as eight distributions cut from this repo in a single build, so "which version" is one
 answer, not six. Left unpinned, a `keel-core` requirement is satisfied by whatever `keel-core` is
 already installed, and installing the new `keel_trader` wheel upgrades nothing else -- which is
 how `~/keel` came to run `keel-trader 0.5.7` against `keel-core 0.5.5` across two releases with
@@ -41,7 +41,7 @@ def _requirement_name(spec: str) -> str:
 
 
 def test_every_workspace_package_carries_the_same_version():
-    """Six distributions, one release. A version that moved alone is a packaging bug."""
+    """Eight distributions, one release. A version that moved alone is a packaging bug."""
     versions = {name: data["project"]["version"] for name, data in _pyprojects().items()}
     assert len(set(versions.values())) == 1, f"workspace versions disagree: {versions}"
 
