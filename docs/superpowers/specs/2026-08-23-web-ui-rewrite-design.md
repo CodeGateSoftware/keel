@@ -302,8 +302,20 @@ technology.
 
 1. **The TUI is deleted — in W7, not W0.** ~9,400 lines (`tui.py` 5,063 + 4,369 of tests) go, which
    answers #525's "`keel/commands/` is larger than the engine it drives" directly. keel is a
-   local-first, double-clickable application; optimising for headless SSH is a distraction, and
-   `windows-curses` is unmaintained.
+   local-first, double-clickable application, and `windows-curses` is unmaintained.
+
+   **"But SSH" is not a reason, and keel's own documentation says so three ways.** There is no
+   server deployment profile — the four profiles are *trading* profiles (live, paper, paper-hourly,
+   paper-equities), not topologies. A headless live cycle already **fails closed**, because confirm
+   mode "waits for a typed `y` at a terminal" (`docs/operator-runbook.md:365`). And the project is
+   explicit that no remote surface exists at all: *"Notify-only, by design. There is no remote
+   control surface — no command, query or capability arrives through notifications, ever"*
+   (`docs/operator-runbook.md:864`).
+
+   Even granting a headless host, `ssh -L 8765:127.0.0.1:8765 host` forwards the **web** UI to a
+   local browser — full interface, encrypted by SSH, still a secure context because it is localhost
+   at the reading end, and no curses anywhere. That is better than the TUI on every axis, and
+   `keel status` covers the rest from a plain shell.
 
    **The ordering is the whole decision.** `tui.py` imports from `keel.commands.activity`,
    `admission` and `status` — it is a front-end *over* the shared report builders, not their owner —
