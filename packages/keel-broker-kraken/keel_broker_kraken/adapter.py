@@ -47,6 +47,11 @@ _STUB_MESSAGE = "kraken adapter is a stub — #313"
 
 _CAPABILITIES = BrokerCapabilities(
     venue="kraken",
+    # Empty for the stub reason above, but the venue fact is worth recording before anyone
+    # fills this in: Kraken's `AddOrder` has no two-sided bracket. `close[ordertype]` attaches
+    # ONE conditional close (a stop-loss or a take-profit, not both) that is triggered by the
+    # primary order's execution and is an independent order thereafter -- an OTO, not an OCO.
+    # So `bracket_gtc` will still not be declarable here once the rest of the stub is written.
     supported_orders=frozenset(),
     supports_native_preview=False,
     synthesizes_preview=False,

@@ -26,6 +26,7 @@ from decimal import Decimal
 from typing import Any, assert_never
 
 from keel_broker_api.orders import (
+    BracketGTC,
     LimitGTC,
     MarketIOCByBase,
     MarketIOCByQuote,
@@ -198,6 +199,20 @@ def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
                 "limit_price": _render(spec.limit_price),
                 "extended_hours": False,
             }
+        case BracketGTC():
+            # Alpaca's `order_class=bracket` is real, but only for EQUITIES -- and this adapter
+            # serves equities, so the honest reason this raises is that nobody has written and
+            # tested the translation yet, NOT that the venue cannot. `_reject_unsupported`
+            # already refused this kind from the capability declaration; this is the second gate,
+            # placed exactly where the `MarketIOCByQuote` precedent in the Robinhood sibling sits,
+            # so a bug that routes a bracket past the first one still cannot put a body on the
+            # wire. Whoever implements it: `take_profit.limit_price` + `stop_loss.stop_price` on
+            # one `POST /v2/orders`, and delete this case rather than widening it.
+            raise UnsupportedOrder(
+                "alpaca's bracket order class is not translated by this adapter yet; "
+                "the venue supports it for equities, but an untested translation on the "
+                "live-money path would place a protective order nobody has seen accepted"
+            )
         case _:
             assert_never(spec)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import assert_never
 
 from keel_broker_api.orders import (
+    BracketGTC,
     LimitGTC,
     MarketIOCByBase,
     MarketIOCByQuote,
@@ -39,6 +40,21 @@ def to_order_configuration(spec: OrderSpec) -> dict[str, dict[str, str]]:
                     "stop_price": str(spec.stop_price),
                     "limit_price": str(spec.limit_price),
                     "stop_direction": _stop_direction(spec),
+                }
+            }
+        case BracketGTC():
+            # Byte-for-byte what `keel.execution.executor._bracket_order_configuration` has been
+            # sending on the live path -- same three keys, same order, and notably NO
+            # `stop_direction`, which the stop-limit config above does require. That asymmetry is
+            # Coinbase's, not an omission: a bracket's two prices already say which way each side
+            # triggers. Parity with the shipped, venue-ACCEPTED dict is the contract here, so this
+            # case must not be "improved"; the port's job is to reach the same wire shape through
+            # a typed spec. `tests/broker_coinbase/test_translate.py` pins the two together.
+            return {
+                "trigger_bracket_gtc": {
+                    "base_size": str(spec.base_size),
+                    "limit_price": str(spec.take_profit_price),
+                    "stop_trigger_price": str(spec.stop_trigger_price),
                 }
             }
         case _:

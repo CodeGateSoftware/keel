@@ -31,6 +31,7 @@ from keel_core.types import Granularity, Side
 from keel_broker_api.capabilities import ASSET_CLASSES, BrokerCapabilities
 from keel_broker_api.orders import (
     ORDER_KINDS,
+    BracketGTC,
     LimitGTC,
     MarketIOCByBase,
     MarketIOCByQuote,
@@ -73,6 +74,16 @@ _SPEC_BY_KIND: dict[str, OrderSpec] = {
         base_size=Decimal("0.1"),
         stop_price=Decimal("60000"),
         limit_price=Decimal("59900"),
+    ),
+    # A SELL exit bracket on a long: stop below, target above. `BracketGTC.__post_init__`
+    # refuses any other arrangement, so this entry cannot silently rot into a shape no adapter
+    # would be right to accept.
+    "bracket_gtc": BracketGTC(
+        product_id=_PRODUCT,
+        side=Side.SELL,
+        base_size=Decimal("0.1"),
+        take_profit_price=Decimal("70000"),
+        stop_trigger_price=Decimal("60000"),
     ),
 }
 
@@ -248,6 +259,34 @@ class BrokerConformanceTests:
         for kind in sorted(undeclared):
             with pytest.raises(UnsupportedOrder):
                 broker.place_order(_SPEC_BY_KIND[kind])
+
+    def test_the_bracket_declaration_cannot_lie_in_either_direction(self) -> None:
+        """`bracket_gtc` gets its own case because it is the kind whose two answers diverge most.
+
+        The generic pair above (`..._is_actually_accepted` / `..._is_refused`) already sweeps
+        every kind an adapter declares and every kind it does not. This restates the contract for
+        the bracket specifically, at the one place an adapter author adding a venue will read it,
+        because a bracket is the only kind where a venue's *inability* is the common case rather
+        than the exception: exactly one of the venues keel targets today has a native single-order
+        bracket, and the other three would have to synthesise one out of two legs to say yes.
+
+        Synthesis is what this test forbids. An adapter that declared `bracket_gtc` and quietly
+        placed a stop and a target as two independent orders would be committing the position
+        twice and re-opening the client-side pairing race the native bracket exists to close --
+        and it would look, from the port, exactly like an adapter that did the right thing. So
+        the declaration is the whole promise: say yes and the suite makes you place it; say
+        nothing and the suite makes you refuse it out loud, with `UnsupportedOrder` rather than a
+        substituted order type.
+        """
+        broker = self.broker()
+        spec = _SPEC_BY_KIND["bracket_gtc"]
+
+        if "bracket_gtc" in broker.capabilities().supported_orders:
+            assert isinstance(broker.place_order(spec), PlaceResult)
+            return
+
+        with pytest.raises(UnsupportedOrder):
+            broker.place_order(spec)
 
     # --- capabilities cannot lie about preview --------------------------------------------
 

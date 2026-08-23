@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any, assert_never
 
 from keel_broker_api.orders import (
+    BracketGTC,
     LimitGTC,
     MarketIOCByBase,
     MarketIOCByQuote,
@@ -198,6 +199,19 @@ def to_order_body(spec: OrderSpec, *, client_order_id: str) -> dict[str, Any]:
                     "time_in_force": TIME_IN_FORCE,
                 },
             }
+        case BracketGTC():
+            # The VENUE has no bracket. Robinhood's crypto order types are market, limit,
+            # stop_loss and stop_limit -- every one a single trigger; none carries a take-profit
+            # and a stop together. The only way to answer this spec would be to place two
+            # independent legs and pair them client-side, which re-creates the unobserved-fill
+            # race (and the 2x inventory commitment) that `BracketGTC` exists to eliminate.
+            # Refusing is the correct translation, not a gap: a caller asking for one order that
+            # the venue arbitrates must not silently receive two that keel arbitrates.
+            raise UnsupportedOrder(
+                "robinhood's crypto API has no bracket/OCO order type; synthesizing one from a "
+                "separate stop and target would commit the position twice and put the "
+                "stop-vs-target race back on the client, which is what a bracket removes"
+            )
         case _:
             assert_never(spec)
 
