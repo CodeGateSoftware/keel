@@ -183,12 +183,35 @@ declares itself *"the only writer of `src/content/engine-docs/`"* and exits non-
 document disappears. **keel's `docs/` is the source; the website is the mirror.** Deleting `docs/`
 from keel would fail the website build, loudly, by design.
 
-What ships instead: the **application code** stops carrying documentation prose. Glossary and help
-deep-link to `https://keeltrading.com/{lang}/docs/{slug}`, which yields en/fr/ar for free — the
-manifest already carries all three, and keel's in-app copy is English-only. A one-line definition
-stays inline (the manifest provides one per document, in three languages) so losing the network
-degrades to terse rather than blank. Outbound links are navigation and are unaffected by
-`connect-src`.
+What ships instead: **nothing is fetched, embedded, bundled or cached. The app links out.** A
+documentation reference opens `https://keeltrading.com/en/docs/{slug}/#{anchor}` in a new tab
+(`target="_blank" rel="noopener"`), landing directly on the term.
+
+**This works today with no new infrastructure**, verified against the built site:
+
+- `docs/glossary.md` writes each term as a `## term` heading — an explicit rule stated in the file
+  itself: *"Each entry is a `## term` heading, a definition, and a `Source:` line."*
+- Astro already emits the IDs. `dist/en/docs/glossary/index.html` contains `id="rail"`,
+  `id="attestation"`, `id="instrument-attestation"`, `id="kill-switch"`, `id="qabd"`, `id="riba"`.
+- `src/pages/en/docs/[slug].astro` renders every pinned document at a stable path.
+
+So the anchor contract is: **kebab-case the `## term` heading.** The only maintenance burden is that
+renaming a heading upstream breaks a deep link — acceptable, and cheaply covered by a test asserting
+that every anchor the app emits exists in the corresponding source document.
+
+Outbound links are navigation, not fetches, and are therefore unaffected by `connect-src 'self'`.
+
+**Consequences.** The `/glossary` route, `render_glossary()`, and the web layer's use of
+`load_glossary()`/`parse_glossary()` are all deleted rather than ported — a link needs no renderer.
+`help_console.py`'s glossary reader stays for the TUI, which cannot open an anchor and instead prints
+the URL; the shipped-wheel empty state is the same bug there and gets the same fix.
+
+**Offline is not hedged.** No inline fallback definitions, no cached snapshot. An operator running a
+trading engine has network by definition, and per §2 of the reference philosophy the least technology
+that does the job is the correct amount.
+
+Links default to `/en/`. The site also builds `fr` and `ar`; switching the prefix is a one-line
+change if the interface is ever localised, and is not worth anticipating now.
 
 ## 6. Accessibility, as an acceptance criterion
 
@@ -241,7 +264,9 @@ technology.
 3. **No build step**, per §4.3 — including no source maps.
 4. **Money as strings**, per §4.2.
 5. **Mobile phones are out of scope**, per §3.
-6. **`docs/` stays in keel**, per §5.
+6. **`docs/` stays in keel**, per §5 — it is the source the website mirrors.
+7. **Documentation is linked, never embedded.** Nothing fetched, bundled or cached; the app opens
+   `keeltrading.com/en/docs/{slug}/#{anchor}` in a new tab. No offline fallback (§5).
 
 ## 9. Non-goals
 
@@ -260,7 +285,7 @@ technology.
 | W3 | Client shell | Nav, status view, responsive CSS, palette fixes and the contrast test (§6) |
 | W4 | Remaining views | The other seven routes, SVG charts, SSE live updates |
 | W5 | PWA | Manifest, icons, service worker — **shell only, never data** (§11) |
-| W6 | Documentation | Glossary and help to keeltrading.com; inline one-liners |
+| W6 | Documentation | Deep links to keeltrading.com; delete `/glossary` and `render_glossary()`; anchor-existence test |
 | W7 | Removal | Delete `render.py`'s HTML generation and retire the HTML routes |
 
 ## 11. Risks
@@ -277,11 +302,17 @@ technology.
   ships a PyInstaller bundle containing `.pyc`, not readable `.py`. Under this philosophy the
   `curl | bash` wheel installer (#479) is the *more* aligned channel. Worth deciding consciously
   rather than by default; the web UI is fully auditable in-browser under either.
-- **Version skew:** the website pins `main` while an operator runs a tagged release.
+- **Version skew, and it is now the main residual risk of linking out.** The website pins `main`
+  while an operator runs a tagged release, so a deep link can land on documentation describing
+  behaviour their build does not have. Cheapest mitigation is for the docs pages to state which ref
+  they were built from; pinning the site to the latest tag instead of `main` is the fuller fix and
+  is a website decision, not this one.
+- **A renamed heading breaks a deep link silently.** Covered by the anchor-existence test in §5.
 
 ## 12. Open questions
 
 1. Do the manifest, icons and service worker ship in the wheel, or only in the desktop bundle?
-2. Should the installer bundle a rendered documentation snapshot for offline use, at the cost of a
-   build-time dependency on the website's output — or link out only?
-3. §11's distribution tension: is the signed bundle still the primary channel?
+2. §11's distribution tension: is the signed bundle still the primary channel?
+
+*Resolved during design:* whether to bundle a rendered documentation snapshot for offline use —
+**no.** Link out only (§5, decision 7).
