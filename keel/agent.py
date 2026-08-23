@@ -320,8 +320,15 @@ def _open_tranche(
     order: dict[str, Any] | None,
     result: ExecutionResult,
     now_ts: int,
+    initial_stop: Decimal | None = None,
 ) -> None:
     """Record the newly opened tranche in the `positions` ledger and point it at its bracket.
+
+    `initial_stop` is the stop this tranche was SIZED against (#520). It is recorded at OPEN and
+    never rewritten, because that is the whole point: `open_stop:<product_id>` already tracks the
+    current, ratcheting stop, and the break-even threshold needs the ORIGINAL per-unit risk.
+    `None` is legitimate and means unknown -- DCA carries no stop by design -- and readers must
+    disable the break-even arm for such a tranche rather than substitute the current stop.
 
     The ledger is what a later exit attributes P&L against, so a tranche whose entry price or qty
     could not be read is NOT recorded: `record_closed_trade` already refuses to guess a missing
@@ -366,6 +373,7 @@ def _open_tranche(
         # Nothing else preserves it: the exit's order row knows only its own fee.
         entry_fee=order["fee"] or Decimal("0"),
         entry_fill=entry_fill,
+        initial_stop=initial_stop,
     )
     if result.bracket_order_id is not None:
         repo.set_position_bracket(position_id, result.bracket_order_id)
@@ -1640,7 +1648,19 @@ def run_once(
                         f"position_rule:{product_id}",
                         {"rule_name": signal.rule_name, "opened_at": now_ts},
                     )
-                    _open_tranche(repo, product_id, signal.rule_name, order, result, now_ts)
+                    _open_tranche(
+                        repo,
+                        product_id,
+                        signal.rule_name,
+                        order,
+                        result,
+                        now_ts,
+                        # #520: the stop the position was SIZED against, captured at open
+                        # because nothing else preserves it -- `open_stop:<product>` starts
+                        # here and then ratchets away from it. `None` for DCA, which has no
+                        # stop by design.
+                        initial_stop=signal.setup.stop if signal.setup is not None else None,
+                    )
 
         cycle_result = LoopResult(
             ts=now_ts,

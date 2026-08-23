@@ -455,9 +455,7 @@ class Repository:
     def list_broker_subscriptions(self) -> list[BrokerSubscription]:
         """Every attested subscription, ordered by venue -- what `keel subscription show`
         renders."""
-        rows = self._conn.execute(
-            "SELECT * FROM broker_subscriptions ORDER BY venue"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM broker_subscriptions ORDER BY venue").fetchall()
         return [_subscription_from_row(row) for row in rows]
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
@@ -529,15 +527,24 @@ class Repository:
         qty: Decimal,
         entry_fill: Decimal,
         entry_fee: Decimal,
+        initial_stop: Decimal | None = None,
         bracket_order_id: int | None = None,
     ) -> int:
-        """Record a newly opened tranche and return its id."""
+        """Record a newly opened tranche and return its id.
+
+        `initial_stop` is the stop this tranche was SIZED against (#520) -- the original
+        per-unit risk the break-even threshold is computed from. `None` is a legitimate value
+        and means "unknown", not "zero": DCA has no stop by design, and every tranche opened
+        before v12 predates the column. Readers must disable the break-even arm for such a
+        tranche rather than substitute the current stop, which is a different policy (see
+        `db._migrate_v12_positions_initial_stop`).
+        """
         cursor = self._conn.execute(
             """
             INSERT INTO positions
                 (product_id, rule_name, opened_at, qty, entry_fill, entry_fee,
-                 bracket_order_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+                 initial_stop, bracket_order_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
             """,
             (
                 product_id,
@@ -546,6 +553,7 @@ class Repository:
                 _dec_to_text(qty),
                 _dec_to_text(entry_fill),
                 _dec_to_text(entry_fee),
+                None if initial_stop is None else _dec_to_text(initial_stop),
                 bracket_order_id,
             ),
         )
@@ -607,6 +615,12 @@ class Repository:
         d = dict(row)
         for field in ("qty", "entry_fill", "entry_fee"):
             d[field] = _text_to_dec(d[field])
+        # `initial_stop` (#520) decodes the same way but is NULLABLE, and the distinction is
+        # load-bearing: `None` means "nobody recorded it" -- DCA, or a tranche predating v12 --
+        # and the break-even arm must switch OFF for it rather than substitute a value.
+        # `_text_to_dec` is not asked to invent a zero.
+        raw_initial_stop = d.get("initial_stop")
+        d["initial_stop"] = None if raw_initial_stop is None else _text_to_dec(raw_initial_stop)
         return d
 
     # -- profile (the user's own settings) ------------------------------------

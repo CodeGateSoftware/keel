@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -84,6 +84,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         qty               TEXT    NOT NULL,
         entry_fill        TEXT    NOT NULL,
         entry_fee         TEXT    NOT NULL,
+        initial_stop      TEXT,
         bracket_order_id  INTEGER,
         status            TEXT    NOT NULL DEFAULT 'open',
         FOREIGN KEY (bracket_order_id) REFERENCES orders(id)
@@ -472,6 +473,35 @@ def _migrate_v11_orders_filled_quantity(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE orders ADD COLUMN filled_quantity TEXT")
 
 
+def _migrate_v12_positions_initial_stop(conn: sqlite3.Connection) -> None:
+    """v12 adds `positions.initial_stop` -- the stop the tranche was SIZED against (#520).
+
+    The break-even arm of `exit_policy.next_stop` computes its threshold from the trade's
+    ORIGINAL per-unit risk: `entry + be_roll_rr * (entry - initial_stop)`. Live state carries
+    `entry_fill` (this ledger) and `open_stop:<product_id>` (the CURRENT, already-ratcheted stop)
+    and nothing else -- so the number the threshold is most sensitive to was simply absent.
+
+    Substituting the current stop is not an approximation, it is a DIFFERENT POLICY: the current
+    stop rises on every ratchet, shrinking `(entry - stop)` so the threshold creeps toward entry
+    and the arm fires earlier each time, drifting further from the measured policy the longer a
+    trade runs. Live and sim would then encode two different break-even rules while appearing to
+    share `exit_policy`'s functions -- the exact failure sharing them was meant to prevent.
+
+    Idempotent by the v8/v11 `PRAGMA table_info` guard: a database already stamped at v11 got
+    `positions` from v4's DDL, which has no such column, and `CREATE TABLE IF NOT EXISTS` never
+    adds one.
+
+    **NO BACKFILL, deliberately.** The honest value for every pre-v12 tranche is NULL -- nobody
+    recorded it — and readers must treat NULL as "unknown" and disable the break-even arm for
+    that tranche rather than guess. Inventing a value here would fabricate the one input the
+    policy is most sensitive to. The trailing arm is unaffected: it needs no original risk, so an
+    old tranche keeps trailing and simply never break-even-rolls.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+    if "initial_stop" not in columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN initial_stop TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -483,6 +513,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: _migrate_v9_screen_exceptions,
     10: _migrate_v10_instrument_attestations,
     11: _migrate_v11_orders_filled_quantity,
+    12: _migrate_v12_positions_initial_stop,
 }
 
 
