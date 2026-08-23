@@ -87,6 +87,12 @@ _CAPABILITIES = BrokerCapabilities(
     # market orders (`market_ioc_quote`), fractional-qty market orders (`market_ioc_base`),
     # GTC limits, and GTC stop-limits. The port has no bracket/OCO or stop-market kind to
     # declare or refuse -- see the module docstring's "Bracket" note.
+    # `bracket_gtc` is NOT declared, and the reason is "not built here yet", not "the venue
+    # cannot": Alpaca's `order_class=bracket` (`take_profit.limit_price` + `stop_loss.stop_price`
+    # on one POST /v2/orders) is real, and this adapter serves EQUITIES, which is exactly the
+    # asset class it is available for -- Alpaca's order-class reference restricts crypto to
+    # `simple` but allows equities `bracket`/`oco`/`oto`. Undeclared means `_reject_unsupported`
+    # refuses it, which is the honest answer until someone writes and tests the translation.
     supported_orders=frozenset(
         {"market_ioc_quote", "market_ioc_base", "limit_gtc", "stop_limit_gtc"}
     ),

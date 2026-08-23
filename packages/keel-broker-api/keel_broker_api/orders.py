@@ -89,14 +89,83 @@ class StopLimitGTC:
         _require_positive("limit_price", self.limit_price)
 
 
-OrderSpec = MarketIOCByQuote | MarketIOCByBase | LimitGTC | StopLimitGTC
+@dataclass(frozen=True)
+class BracketGTC:
+    """Native exit bracket: ONE order carrying both protective prices, good until cancelled.
+
+    The VENUE owns the race between the stop and the target, and that is the whole reason the
+    kind exists. The alternative keel shipped first was two independent SELL legs paired
+    client-side: a fill we failed to observe left the sibling live and able to sell an
+    already-closed position, and because both legs were sized at the full quantity a 1x position
+    was committed 2x. Neither failure mode exists when there is only one order and no sibling to
+    cancel.
+
+    ⚠️ This is an **exit** that closes an EXISTING position -- not an entry-plus-exits parent
+    order, which several venues also call a bracket. keel enters with a market IOC and protects
+    the position afterwards, so a kind that could carry an entry price would describe a shape no
+    keel path produces. Making it expressible would only give a future caller a way to ask for
+    something the engine has no code to mean.
+
+    There is deliberately **no `stop_direction` field**. The direction is a function of `side`
+    and is derived at translation time, exactly as `StopLimitGTC`'s is: a SELL bracket protects a
+    long, so its stop triggers on the way down. A field would make a SELL bracket that triggers
+    UPWARD representable -- nonsense the venue would refuse, or worse, honour -- and refusing to
+    represent nonsense is what this sum type is for.
+
+    The price names are **keel's, not Coinbase's**. Coinbase spells the take-profit `limit_price`;
+    adopting that here would make a second venue's translation start from Coinbase's vocabulary
+    rather than the port's, and would put a field named `limit_price` on two different order kinds
+    where it means two different things (`LimitGTC.limit_price` is the price of the whole order;
+    this one is the profitable half of a pair). `take_profit_price` says which exit it is.
+    """
+
+    kind: ClassVar[str] = "bracket_gtc"
+    initial_status: ClassVar[str] = "open"
+
+    product_id: str
+    side: Side
+    base_size: Decimal
+    take_profit_price: Decimal
+    stop_trigger_price: Decimal
+
+    def __post_init__(self) -> None:
+        _require_positive("base_size", self.base_size)
+        _require_positive("take_profit_price", self.take_profit_price)
+        _require_positive("stop_trigger_price", self.stop_trigger_price)
+        # An inverted OR EQUAL pair is not a bracket. Equal is the subtler half and the reason
+        # this is `>=` rather than `>`: two equal prices read as a perfectly ordinary pair of
+        # numbers, and what they describe is a stop and a target racing at the same price, where
+        # whichever side the venue happens to evaluate first decides whether the position took a
+        # profit or a loss. That is a coin flip wearing a protective order's name. Both halves
+        # are refused here, at construction, where the caller's own numbers are still in scope --
+        # not at the venue, where the position is already open and unprotected.
+        if self.side is Side.SELL and self.stop_trigger_price >= self.take_profit_price:
+            raise ValueError(
+                f"a SELL bracket exits a long: stop_trigger_price ({self.stop_trigger_price}) "
+                f"must be below take_profit_price ({self.take_profit_price})"
+            )
+        if self.side is Side.BUY and self.stop_trigger_price <= self.take_profit_price:
+            raise ValueError(
+                f"a BUY bracket exits a short: stop_trigger_price ({self.stop_trigger_price}) "
+                f"must be above take_profit_price ({self.take_profit_price})"
+            )
+
+
+OrderSpec = MarketIOCByQuote | MarketIOCByBase | LimitGTC | StopLimitGTC | BracketGTC
 
 ORDER_KINDS: frozenset[str] = frozenset(
-    {MarketIOCByQuote.kind, MarketIOCByBase.kind, LimitGTC.kind, StopLimitGTC.kind}
+    {
+        MarketIOCByQuote.kind,
+        MarketIOCByBase.kind,
+        LimitGTC.kind,
+        StopLimitGTC.kind,
+        BracketGTC.kind,
+    }
 )
 
 __all__ = [
     "ORDER_KINDS",
+    "BracketGTC",
     "LimitGTC",
     "MarketIOCByBase",
     "MarketIOCByQuote",

@@ -39,8 +39,11 @@ from keel_broker_coinbase.transport import Transport, _field
 
 _CAPABILITIES = BrokerCapabilities(
     venue="coinbase",
+    # `bracket_gtc` is declared because Coinbase Advanced Trade natively serves it:
+    # `order_configuration.trigger_bracket_gtc` is one order carrying both exits, and the venue
+    # disables the losing side when the other fills. It is the only venue keel targets that does.
     supported_orders=frozenset(
-        {"market_ioc_quote", "market_ioc_base", "limit_gtc", "stop_limit_gtc"}
+        {"market_ioc_quote", "market_ioc_base", "limit_gtc", "stop_limit_gtc", "bracket_gtc"}
     ),
     supports_native_preview=True,
     synthesizes_preview=False,

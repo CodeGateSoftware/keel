@@ -51,6 +51,11 @@ MAX_CANDLES_PER_CALL = 50
 
 _CAPABILITIES = BrokerCapabilities(
     venue="fake",
+    # `bracket_gtc` is undeclared deliberately, and here the answer is neither "the venue can"
+    # nor "the venue cannot" -- there is no venue. This fake stands in for the venues that REFUSE
+    # a bracket, which is three of the four real adapters; something has to exercise the refusing
+    # half of the conformance contract, and a fake that supported every kind would exercise
+    # nothing. Its `place_order` raises `UnsupportedOrder` for anything not listed here.
     supported_orders=frozenset({"market_ioc_base", "limit_gtc", "stop_limit_gtc"}),
     supports_native_preview=False,
     synthesizes_preview=False,

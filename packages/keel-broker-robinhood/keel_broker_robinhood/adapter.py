@@ -98,6 +98,12 @@ _CAPABILITIES = BrokerCapabilities(
     # rejected -- so "immediate or cancel" describes what Robinhood's market order already does.
     # There is no resting-market-order variant to be confused with. The port kind that WOULD be a
     # lie is the quote-sized one, and it is not declared.
+    # `bracket_gtc` is absent because the VENUE has no such order. The crypto trading API's
+    # order types are market, limit, stop_loss and stop_limit -- each a single trigger, with no
+    # bracket/OCO type carrying a take-profit and a stop in one order. Declaring it would mean
+    # synthesising one from two legs, which is precisely the client-side pairing race (and the
+    # 2x inventory commitment) the native bracket exists to remove. This absence is a venue fact
+    # and will not change until Robinhood ships the order type.
     supported_orders=frozenset({"market_ioc_base", "limit_gtc", "stop_limit_gtc"}),
     # No preview endpoint exists on this API, so every Preview this adapter returns must label
     # itself `synthetic=True`.
