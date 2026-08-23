@@ -194,6 +194,16 @@ class OrderIntent:
     # on the anti-scalping floor. Two rails, two different questions, two fields.
     protective_stop: Decimal | None = None
 
+    # #516: the venue's finest acceptable `base_size` for this product. NOT a rail input -- no
+    # rail reads it -- but it rides here for the same reason `available_quote` does: it is venue
+    # state the executor fetches and hands in, so `_order_configuration` can stay a pure function
+    # of the intent with no broker access.
+    #
+    # `None` means UNKNOWN, and unknown here does NOT refuse -- unlike every other unknown in
+    # this engine. See `_order_configuration`: refusing a SELL strands a position that wanted to
+    # exit, which is worse than the imprecision being fixed.
+    base_increment: Decimal | None = None
+
 
 #: Rails whose inputs describe the LIVE ACCOUNT and therefore cannot be evaluated offline:
 #: rail 13 needs a broker-fetched quote balance, rail 17 needs the account's real withdrawal

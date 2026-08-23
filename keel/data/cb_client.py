@@ -195,6 +195,12 @@ class CoinbaseClient:
                     "is_disabled": bool(fields.get("is_disabled")),
                     "view_only": bool(fields.get("view_only")),
                     "quote_24h_volume": fields.get("approximate_quote_24h_volume"),
+                    # #516. The venue has always sent these; this projection dropped them, which
+                    # is why `_order_configuration` had nothing to quantize a SELL against and
+                    # emitted `str(Decimal)` -- the defect #513 fixed for the BUY half only.
+                    # Kept as the venue's own strings; the caller decides what is a Decimal.
+                    "base_increment": fields.get("base_increment"),
+                    "quote_increment": fields.get("quote_increment"),
                 }
             )
         return out
