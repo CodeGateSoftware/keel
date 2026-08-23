@@ -24,9 +24,11 @@ modules — no framework, no bundler, no transpile, no minification, no source m
 third-party JavaScript. Two things make that last claim achievable rather than aspirational: keel's
 cryptography lives in Python and the OS keychain, never in the browser (so youperiod's three
 dependencies have no analogue here), and **money crosses the wire as pre-formatted strings**, so the
-client never performs arithmetic and never needs a decimal library. The one part of the original ask
-that cannot be built is installing the app *from* keeltrading.com — that is an origin problem, not a
-preference, and §3 records why.
+client never performs arithmetic and never needs a decimal library. The curses TUI is deleted at the
+end of the sequence — another ~9,400 lines, answering #525 — but only once the browser reaches
+parity, because its tests are the specification of what is being ported. The one part of the original
+ask that cannot be built is installing the app *from* keeltrading.com — that is an origin problem,
+not a preference, and §3 records why.
 
 ---
 
@@ -128,6 +130,17 @@ to multiply — `{"notional": "500.00", "notional_display": "$500.00"}`. Every f
 computed by the Python that holds the rails. This is what lets `test_console_thinness.py` extend to
 the API layer, and it is what makes §4.3's zero-dependency claim possible.
 
+**Sorting is server-side.** Tables sort by query parameter; Python orders with `Decimal`. On loopback
+the round trip is sub-millisecond, so there is nothing to optimise and no client arithmetic to audit.
+
+*Rejected: an integer companion field scaled to cents.* Precision here is **per-product** —
+`base_increment` varies by instrument, which is precisely what #514 and #517 were about — so a fixed
+100× scale silently truncates anything finer than a cent, and a 1e8 scale caps a USD notional near
+$90M against `Number.MAX_SAFE_INTEGER`. If instant client-side re-sort is ever wanted, the field is
+named `sort`, is a plain JSON number, and is documented as **ordering only — never displayed, never
+summed**: float imprecision is harmless for comparison and fatal for display, and the name must not
+let anyone confuse the two.
+
 ### 4.3 The client
 
 Plain ES modules, served as authored. **No framework, no bundler, no transpile, no minification, no
@@ -158,13 +171,34 @@ The server's principal job, as in the reference.
   history to any origin but the local process. Browser-enforced, one header, verifiable in seconds.
   This is a stronger claim than keel can make today and should be documented as a feature.
 - `X-Content-Type-Options: nosniff`; Subresource Integrity on any inline `<script>`.
-- Loopback bind and the session token are retained unchanged.
+- **`Referrer-Policy: no-referrer`.** New in this design because the app now links out (§5). The
+  session token rides in the URL (`/?token=…`) until the cookie exchange; modern browsers already
+  send origin-only cross-origin, so the exposure is small, but one header closes it outright.
+
+**What already exists, and must not be re-invented.** `keel/web/security.py` documents five layers:
+loopback binding; **`Host` header validation** against DNS rebinding; a session token exchanged for a
+`SameSite=Strict`, `HttpOnly` cookie (`Strict` not `Lax`, deliberately, so a link on a hostile page
+cannot arrive authenticated); a closed action set; and an **HMAC-derived CSRF token** on every write,
+described there as *"the layer that does not depend on the browser being current."* Comparisons use
+`secrets.compare_digest`.
+
+**Added as a third CSRF layer**, since `SameSite` has had parser bypasses: require a custom request
+header (`X-Keel-Client: 1`) on every `POST /api/*`, which forces a CORS preflight a hostile origin
+cannot satisfy — an HTML form POST, which is *not* preflighted, is the attack this closes. Pair it
+with a **`Sec-Fetch-Site: same-origin`** check, which page JavaScript cannot forge.
 
 ### 4.5 The capability asymmetry
 
 **The client hiding a button is not a gate.** Capability-increasing actions are refused by the API,
 keyed to the session token, with D3's human gate (#436) in front. The client may be fully read and
 modified by its user and still cannot arm a rule, attest an asset, or enable autonomy.
+
+This is **already implemented and test-enforced**, and the rewrite must preserve it rather than
+rebuild it: the whole write surface routes through `keel.commands.setup.ACTIONS`, every member
+`MECHANICAL`, idempotent and non-destructive, and a test asserts that set is **disjoint from the
+eleven capability-increasing actions in `keel/capabilities.py`.** As `security.py` puts it, "no POST
+at all" would have been satisfied by a server that could not set anything up; this is satisfied only
+by one that cannot arm, release or spend anything.
 
 ## 5. Documentation
 
@@ -213,6 +247,17 @@ that does the job is the correct amount.
 Links default to `/en/`. The site also builds `fr` and `ar`; switching the prefix is a one-line
 change if the interface is ever localised, and is not worth anticipating now.
 
+**Version skew is made visible, not eliminated.** `GET /api/config` exposes the running version — it
+is needed for §4.4's cache key regardless — and outbound links carry it as `?v=0.11.2`. The docs page
+shows a banner when that does not match the ref it was built from.
+
+*Rejected: per-version documentation paths.* `keeltrading.com/en/docs/v0.11.0/glossary#qabd` **404s
+today.** The site builds `dist/en/docs/glossary/` and the manifest pins `ref: "main"`; there is no
+versioned tree. Creating one is work in the *other* repository plus a retention policy, multiplied
+across three languages and the sitemap. A query parameter and a banner cost one small website change
+and no new routes, and they surface the mismatch rather than hiding it behind a link that silently
+describes different software.
+
 ## 6. Accessibility, as an acceptance criterion
 
 Measured against the current palette (`render.py:41-49`). **Text contrast is already good** — every
@@ -255,10 +300,25 @@ technology.
 
 ## 8. Decisions recorded
 
-1. **The TUI is kept.** It is the only surface that works over SSH on a headless host, and deletion
-   is a one-way door. The cost is two front-ends. *This decision is cheap to reverse later and
-   expensive to reverse early; #525's concern about `keel/commands/` being larger than the engine is
-   better addressed on its own terms.*
+1. **The TUI is deleted — in W7, not W0.** ~9,400 lines (`tui.py` 5,063 + 4,369 of tests) go, which
+   answers #525's "`keel/commands/` is larger than the engine it drives" directly. keel is a
+   local-first, double-clickable application; optimising for headless SSH is a distraction, and
+   `windows-curses` is unmaintained.
+
+   **The ordering is the whole decision.** `tui.py` imports from `keel.commands.activity`,
+   `admission` and `status` — it is a front-end *over* the shared report builders, not their owner —
+   so deletion never touches what the web UI reads. But D2 (#435) requires parity with the TUI's read
+   surface before the write surface widens, and deleting at W0 would leave W1–W4 with no working
+   console at all. The 4,369 test lines are also the **specification of what is being ported**: they
+   record what each screen shows and when. They are retired once the new UI passes equivalents, not
+   before.
+
+   **A second gate on W7:** deleting the TUI makes the browser the only interactive surface, so
+   anything an operator could previously only reach through it must be reachable through the browser
+   *or* deliberately CLI-only first. D3 (#436) exists precisely so capability-increasing actions have
+   a GUI gate rather than a bypass; W7 must confirm coverage rather than assume it, or a
+   non-technical user — the whole point of §8.9's double-click path — ends up stranded at a step that
+   needs a terminal.
 2. **Zero third-party JavaScript**, per §4.3. Any future exception requires the reference's bar:
    justified because getting it wrong ourselves would undermine keel's principles.
 3. **No build step**, per §4.3 — including no source maps.
@@ -267,6 +327,10 @@ technology.
 6. **`docs/` stays in keel**, per §5 — it is the source the website mirrors.
 7. **Documentation is linked, never embedded.** Nothing fetched, bundled or cached; the app opens
    `keeltrading.com/en/docs/{slug}/#{anchor}` in a new tab. No offline fallback (§5).
+8. **Sorting is server-side**, per §4.2. No scaled-integer companion fields.
+9. **The signed desktop bundle is the primary channel**, and the static assets ship in it — a W2
+   acceptance criterion, not a §11 risk. The end state is double-click, no terminal command.
+10. **The browser is the window.** `webbrowser.open` as it works today; no embedded webview.
 
 ## 9. Non-goals
 
@@ -275,44 +339,57 @@ technology.
 - Encrypting the database at rest behind a passphrase (§2).
 - Replacing SQLite as the store of record.
 - Widening what the browser may *do*; §4.5's asymmetry is preserved exactly.
+- **An embedded native window** (pywebview or similar). It buys a title bar and costs a dependency,
+  three platform backends, and the devtools that make §4.3's view-source claim checkable by the
+  user. `serve.py` already opens the default browser with no dependency at all; a double-click still
+  produces a window, it simply happens to be a browser.
 
 ## 10. Phases
 
 | # | phase | content |
 |---|---|---|
-| W1 | JSON API | Serialise the existing reports; money-as-strings rule and its test; extend `test_console_thinness.py` to the API layer |
-| W2 | Static serving + headers | §4.4 in full, SRI, asset packaging into the wheel and the bundle |
+| W1 | JSON API | Serialise the existing reports; money-as-strings rule and its test; **server-side sort**; `GET /api/config` (version); extend `test_console_thinness.py` to the API layer |
+| W2 | Static serving + headers | §4.4 in full — CSP, `Referrer-Policy`, `X-Keel-Client` preflight, `Sec-Fetch-Site`, SRI. **Static assets listed in `pyproject.toml` `artifacts` and in the bundle manifest — an acceptance criterion, and the double-click path works end to end** |
 | W3 | Client shell | Nav, status view, responsive CSS, palette fixes and the contrast test (§6) |
 | W4 | Remaining views | The other seven routes, SVG charts, SSE live updates |
-| W5 | PWA | Manifest, icons, service worker — **shell only, never data** (§11) |
-| W6 | Documentation | Deep links to keeltrading.com; delete `/glossary` and `render_glossary()`; anchor-existence test |
-| W7 | Removal | Delete `render.py`'s HTML generation and retire the HTML routes |
+| W5 | PWA | Manifest, icons, service worker. **Routing is explicit: `CacheFirst` for the static shell (`index.html`, `.js`, `.css`), `NetworkOnly` for `/api/*`, no exceptions. The cache name is keyed to the build version**, so an upgraded engine cannot be met by a stale shell |
+| W6 | Documentation | Deep links to keeltrading.com carrying `?v=`; delete `/glossary` and `render_glossary()`; anchor-existence test |
+| W7 | Removal | Delete `render.py`'s HTML generation, retire the HTML routes, **and delete `tui.py` with its tests** (§8.1) — after parity, never before |
 
 ## 11. Risks
 
 - **A service worker caching data would be actively dangerous** — opening the app to last week's
-  equity styled as current is worse than an error. Cache the shell only; when the engine is not
-  running, render *"keel isn't running"*, never a stale figure.
+  equity styled as current is worse than an error. Mitigated by W5's routing rules; when the engine
+  is not running the UI fails visibly with *"keel isn't running"*, never a cached balance.
 - **Deleting `render.py` breaks the existing thinness pins.** W1 must land the API pins before W7
   removes the HTML ones.
-- **The signed bundle must include the static assets**; `pyproject.toml`'s `artifacts` list currently
-  covers only the YAML template.
+- **Deleting the TUI removes the reference implementation.** W7 only, and only once the new UI passes
+  equivalents of what `tests/commands/test_tui.py` asserts (§8.1). Deleting early would discard the
+  specification of the thing being built.
+- **`pyproject.toml`'s `artifacts` currently covers only the YAML template**, so the static assets
+  would be absent from the wheel and the bundle. Promoted to a W2 acceptance criterion.
 - **A no-build client has no compile-time safety net** by default; mitigated by `tsc --noEmit` (§4.3).
-- **Distribution tension.** §4 of the reference philosophy prizes view-source auditability, but D5
-  ships a PyInstaller bundle containing `.pyc`, not readable `.py`. Under this philosophy the
-  `curl | bash` wheel installer (#479) is the *more* aligned channel. Worth deciding consciously
-  rather than by default; the web UI is fully auditable in-browser under either.
-- **Version skew, and it is now the main residual risk of linking out.** The website pins `main`
-  while an operator runs a tagged release, so a deep link can land on documentation describing
-  behaviour their build does not have. Cheapest mitigation is for the docs pages to state which ref
-  they were built from; pinning the site to the latest tag instead of `main` is the fuller fix and
-  is a website decision, not this one.
+- **The auditability claim must stay scoped.** The bundle is the primary channel (§8.9), and
+  PyInstaller ships `.pyc`, not readable `.py` — so the *engine* is not view-source inside it. The
+  honest statement is: the **UI** is fully auditable in the browser on any device; the **engine** is
+  auditable on GitHub and from the wheel, which the `curl | bash` installer (#479) still delivers as
+  readable source. Do not let marketing collapse the two.
+- **Version skew is surfaced, not solved** (§5). A `?v=` parameter and a banner make a mismatch
+  visible; only pinning the website to the latest tag instead of `main` would remove it, and that is
+  a keeltrading.com decision.
 - **A renamed heading breaks a deep link silently.** Covered by the anchor-existence test in §5.
 
 ## 12. Open questions
 
-1. Do the manifest, icons and service worker ship in the wheel, or only in the desktop bundle?
-2. §11's distribution tension: is the signed bundle still the primary channel?
+1. Do the manifest, icons and service worker ship in the wheel as well, or only in the desktop
+   bundle? (The static assets themselves ship in both — §8.9.)
+2. Will keeltrading.com take the `?v=` banner (§5), and does it want to pin to the latest tag rather
+   than `main`?
 
-*Resolved during design:* whether to bundle a rendered documentation snapshot for offline use —
-**no.** Link out only (§5, decision 7).
+*Resolved during design:*
+
+- Bundling a rendered documentation snapshot for offline use — **no.** Link out only (§5, decision 7).
+- Whether the signed bundle is the primary channel — **yes** (§8.9), with §11's scoping caveat.
+- Whether to keep the TUI — **no**, deleted in W7 (§8.1).
+- Client-side sorting via scaled integers — **no**, sorting is server-side (§4.2).
+- An embedded native window — **no** (§9).
