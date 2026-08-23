@@ -144,3 +144,83 @@ If keel ever has the budget, signing is a small change on our side — the relea
 already built to accept it, on both platforms — and this page will be replaced by a sentence
 saying the builds are signed. Until then, we would rather tell you the truth about what you are
 downloading than say nothing and let your computer deliver the news.
+
+That "already built" is now literal. The release workflow carries the signing steps for both
+platforms, each gated on its own credentials: when they are absent the build ships exactly as
+described above and the workflow log carries a notice saying which secrets would turn signing
+on. Paying for the certificates is the whole activation — there is no code left to write. The
+checklist for whoever makes that purchase is below.
+
+## For the maintainer: turning signing on (a purchase, then ten minutes of GitHub settings)
+
+Nothing in this section changes any code. The desktop job already references a `signing`
+environment and already runs the macOS and Windows signing steps when — and only when — that
+environment holds the credentials. A release dispatched before the secrets exist ships
+unsigned, with a `::notice` in the run naming exactly what was skipped and why; a release
+dispatched after ships signed. That is the entire switch.
+
+### What to buy
+
+**macOS — Apple Developer Program, $99/yr.** Notarisation requires a *Developer ID
+Application* certificate, and there is no cheaper tier that Gatekeeper honours (the table at
+the top of this page is the whole market). You need two things from that membership:
+
+- the **Developer ID Application certificate**, exported from Keychain Access together with
+  its private key as a `.p12`;
+- an **App Store Connect API key** (appstoreconnect.apple.com → Users and Access →
+  Integrating/Keys, Account Holder or Admin), which is what `notarytool` authenticates with
+  from CI — it gives you a Key ID, an Issuer ID, and a one-time-download `.p8` file.
+
+**Windows — one of:**
+
+- an **OV code-signing certificate** as a `.pfx`, ~$70–500/yr depending on the CA (SSL.com,
+  Certum, Sectigo and friends), or
+- **Azure Trusted Signing**, $9.99/mo (~$120/yr). It may be restricted to US/Canada signing
+  identities — verify your identity qualifies before budgeting for it.
+
+Do **not** pay extra for EV. Since 2024 an EV certificate no longer buys an instant
+SmartScreen pass — reputation accrues from download volume over time regardless of certificate
+class, so EV costs more for the same warning.
+
+### The ten minutes of GitHub settings
+
+1. **Create the environment.** Repository *Settings → Environments → New environment*, name
+   it exactly `signing` — the workflow references it by name, and a typo means the job runs
+   against an unprotected no-op environment (harmless while there are no secrets, silent
+   once there are).
+2. **Add required reviewers** (yourself is fine) on that environment. This is the protection
+   that makes the whole design safe: a dispatch pauses for approval before any leg can see
+   the certificates, and the secrets are invisible to every other workflow — pull requests
+   included — because environment secrets are only handed to jobs that declare the
+   environment.
+3. **Add the environment secrets.** macOS needs all five (the leg skips with its notice
+   until then — a signed-but-un-notarised app is the worst state on macOS, so the gate is
+   all-or-nothing):
+
+   | secret | what it holds |
+   |---|---|
+   | `MACOS_CERT_P12_BASE64` | the Developer ID Application `.p12`, base64-encoded (`base64 -i cert.p12 \| pbcopy`) |
+   | `MACOS_CERT_PASSWORD` | that `.p12`'s export password |
+   | `APP_STORE_CONNECT_KEY_ID` | the Key ID of the App Store Connect API key |
+   | `APP_STORE_CONNECT_ISSUER_ID` | the Issuer ID from the same page |
+   | `APP_STORE_CONNECT_KEY_CONTENT` | the contents of the `.p8` private key |
+
+   Windows needs both:
+
+   | secret | what it holds |
+   |---|---|
+   | `WINDOWS_CERT_PFX_BASE64` | the OV certificate `.pfx`, base64-encoded |
+   | `WINDOWS_CERT_PASSWORD` | that `.pfx`'s password |
+
+4. **Dispatch the next release normally.** The signing steps run; the skip notices are gone.
+   The ephemeral-keychain import, `codesign --options runtime`, `notarytool submit --wait`,
+   `stapler`, the signed re-cut of the DMG, and `signtool` with an RFC 3161 timestamp are
+   already in `.github/workflows/release.yml`, between packaging and the checksum step (so
+   the sums cover the signed bytes).
+
+One manual step remains, deliberately: **the release-notes wording and this page still say
+"not code-signed" and must be updated in the same change.** The notes are composed in the
+release job, which cannot see the `signing` environment's secrets — least privilege is why it
+cannot know the desktop legs will sign — so there is nothing for it to auto-detect. Forgetting
+this step errs in the safe direction: the notes warn about a warning that no longer appears.
+Fix it anyway, and this page becomes the one sentence it always promised to be.

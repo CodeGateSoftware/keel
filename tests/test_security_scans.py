@@ -189,22 +189,54 @@ def _code_lines(text: str) -> str:
     return "\n".join(re.split(r"(^|\s)#", line)[0] for line in text.split("\n"))
 
 
+#: Workflows allowed to reference secrets beyond GITHUB_TOKEN, and EXACTLY which ones
+#: (#438). `release.yml` is manual-only (workflow_dispatch) and its desktop job's signing
+#: steps are the #402 pattern: fully implemented, gated per secret on the protected
+#: `signing` environment, and paired with notice steps that fire INSTEAD when a secret is
+#: absent -- a skip that names what to add, never a red run. The gates themselves are
+#: pinned in tests/test_desktop_packaging.py; this table only bounds which names may ever
+#: appear, so a new secret reference here is a decision, not an accident.
+_GATED_SIGNING_SECRETS: dict[str, frozenset[str]] = {
+    "release.yml": frozenset(
+        {
+            "MACOS_CERT_P12_BASE64",
+            "MACOS_CERT_PASSWORD",
+            "APP_STORE_CONNECT_KEY_ID",
+            "APP_STORE_CONNECT_ISSUER_ID",
+            "APP_STORE_CONNECT_KEY_CONTENT",
+            "WINDOWS_CERT_PFX_BASE64",
+            "WINDOWS_CERT_PASSWORD",
+        }
+    ),
+}
+
+
 def test_the_baseline_scans_reference_no_secrets_at_all():
     """The always-on workflows run on GITHUB_TOKEN alone -- no wishlist tokens, none.
 
     The baseline is what makes the scans real: `security.yml` and `ci.yml` must reference
     no secret whatsoever, or they would be scans that run only for a hypothetical
     maintainer with hypothetical tokens -- the gap #291 exists to close, restated as YAML.
+
+    The ONE exception is the gated signing tier (#438, table above): secrets that exist
+    only on the `signing` environment, referenced by steps that skip with a notice when
+    they are missing. An always-on workflow must still reference NOTHING beyond
+    GITHUB_TOKEN -- a per-PR job that needed a certificate would fail for every
+    contributor without it.
     """
     for path in sorted(_WORKFLOWS.glob("*.yml")):
         if path.name == _OPTIONAL_TIER:
             continue
         executable = _code_lines(path.read_text())
+        allowed = _GATED_SIGNING_SECRETS.get(path.name, frozenset()) | {"GITHUB_TOKEN"}
         referenced = sorted(set(re.findall(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", executable)))
-        assert not referenced or referenced == ["GITHUB_TOKEN"], (
+        assert not referenced or set(referenced) <= allowed, (
             f"{path.name} references secrets {referenced} -- a workflow that always runs "
             "must run on GITHUB_TOKEN alone, or it fails for every contributor without "
-            "the missing tokens"
+            "the missing tokens. (Beyond GITHUB_TOKEN, only the gated signing tier in "
+            f"{sorted(_GATED_SIGNING_SECRETS)} may reference secrets, and only those it "
+            "declares -- extend the table deliberately, with the gate that skips without "
+            "them.)"
         )
 
 

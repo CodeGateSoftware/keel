@@ -10,6 +10,7 @@ identity, or no templates.
 from __future__ import annotations
 
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from tests._workflow_yaml import strict_load
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOW = _ROOT / ".github" / "workflows" / "release.yml"
 _MACOS_SCRIPT = _ROOT / "packaging" / "macos_app.sh"
+_INNO_SCRIPT = _ROOT / "packaging" / "keel.iss"
+_SMOKE_WORKFLOW = _ROOT / ".github" / "workflows" / "installer-smoke.yml"
 
 
 @pytest.fixture(scope="module")
@@ -87,6 +90,33 @@ def test_the_lockfile_is_checked_before_anything_can_mutate_it(
         )
 
 
+# -- the release must not lie about what the wheel requires -------------------------------------
+
+
+def test_the_verify_step_comment_states_the_real_python_floor() -> None:
+    """#438: the verify step's comment claimed the wheel carries `Requires-Python: >=3.14.4`
+    while every pyproject.toml declares `>=3.11` (pinned by tests/test_python_floor.py).
+
+    Harmless to the run -- the pinned interpreter is used either way -- but the comment was
+    the only place a reader could learn what the wheel demands, and the next person to build
+    packaging on top of it (the desktop job, the installer) would have built on a floor that
+    does not exist. The floor stated in the workflow is now DERIVED from the manifest, so it
+    cannot drift again."""
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    floor = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "requires-python"
+    ]
+    assert f"Requires-Python: {floor}" in text, (
+        f"the verify step's comment must state the wheel's real floor ({floor!r}, from "
+        "pyproject.toml) -- a stale floor is how the next packaging job gets built on a "
+        "requirement that does not exist"
+    )
+    assert "3.14.4'" not in text.replace(".python-version", ""), (
+        "the old false claim (`Requires-Python: >=3.14.4`) must be gone -- 3.14.4 is the "
+        "interpreter .python-version pins for the BUILD, not a floor the wheel enforces"
+    )
+
+
 # -- the thing that must not happen ------------------------------------------------------------
 
 
@@ -128,10 +158,13 @@ def test_every_artifact_carries_provenance_and_checksums(desktop_job: dict) -> N
     # Subjects are per-OS FILES-ONLY globs: `out/*` would hand the action the unzipped
     # keel.app/ and dmg-stage/ directories macOS packaging leaves beside the .dmg, and a
     # shared `*.dmg *.zip` pattern would hand each leg one glob matching nothing.
+    # Windows carries BOTH its deliverables (the zip and the setup.exe) in one
+    # space-separated subject-path -- multi-subject attestation, supported since Dec 2024 --
+    # because both are attached to the release, so both must be verifiable.
     subjects = {s["with"]["subject-path"] for s in attest}
-    assert subjects == {"out/*.dmg", "out/*.zip"}
+    assert subjects == {"out/*.dmg", "out/*.zip out/*-setup.exe"}
     macos = next(s for s in attest if s["with"]["subject-path"] == "out/*.dmg")
-    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip")
+    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip out/*-setup.exe")
     assert str(macos.get("if", "")).strip() == "runner.os == 'macOS'"
     assert str(windows.get("if", "")).strip() == "runner.os == 'Windows'"
     assert "SHA256SUMS-" in _steps_text(desktop_job)
@@ -262,6 +295,226 @@ def test_the_script_runs_no_signing_command() -> None:
         assert not offenders, f"{command} is invoked: {offenders}"
 
 
+# -- the Windows installer ---------------------------------------------------------------------
+
+
+def test_the_inno_script_installs_per_user_without_an_admin_prompt() -> None:
+    """#438's Windows deliverable: one setup.exe installing per-user to
+    %LOCALAPPDATA%\\Programs\\keel, so the first thing a non-technical user is asked for is
+    not an administrator password. `PrivilegesRequired=lowest` is the directive that keeps
+    the UAC dialog away; `{localappdata}` is the per-user location Windows itself uses for
+    per-user application installs."""
+    text = _INNO_SCRIPT.read_text(encoding="utf-8")
+    assert "PrivilegesRequired=lowest" in text
+    assert "DefaultDirName={localappdata}\\Programs\\keel" in text
+
+
+def test_the_installer_touches_the_program_and_never_the_deployment() -> None:
+    """#438's two locations, kept separate by the installer: the PROGRAM (the frozen binary
+    and its bundled runtime) is replaced wholesale; the DEPLOYMENT (config.yaml, keel*.db,
+    .env, logs/) is never written, moved, or uninstalled. "config.yaml is never overwritten
+    by an installer" and "no database is ever replaced, moved, or migrated by the installer"
+    are the issue's hard rules -- an operator's allowlist and caps are hand-edited and
+    irreplaceable, and keel has no down-migrations."""
+    # Comment lines are excluded, as with the macOS script: the .iss EXPLAINS in prose
+    # why there is no [UninstallDelete] section, and a test that forbade the words would
+    # forbid documenting them.
+    code = [
+        line
+        for line in _INNO_SCRIPT.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith(";")
+    ]
+    assert not any("[UninstallDelete]" in line for line in code), (
+        "an [UninstallDelete] section is how an installer starts deleting things it was "
+        "never pointed at -- the deployment must survive an uninstall"
+    )
+    for forbidden in ("config.yaml", "keel.db", ".env", "logs"):
+        assert not any(forbidden in line for line in code), (
+            f"the installer must never name the deployment's {forbidden} -- the program "
+            "directory is all it owns"
+        )
+    # The only directory it creates is the program directory.
+    assert 'DestDir: "{app}"' in "\n".join(code)
+
+
+def test_the_workflow_builds_the_setup_exe_beside_the_zip(desktop_job: dict) -> None:
+    """The zip is the no-install route and stays; the setup.exe is the installer #438
+    specified. BOTH are attached to the release, so both must be built on the Windows leg
+    and covered by the same files-only checksum/upload globs (which they are by
+    construction -- those steps glob every file in out/)."""
+    text = _steps_text(desktop_job)
+    assert "keel.iss" in text, "the Windows leg must compile packaging/keel.iss"
+    assert "ISCC" in text, "the Windows leg must invoke the Inno Setup compiler"
+    assert "7z a -tzip" in text, "the zip must stay -- it is the no-install route"
+    assert "-setup.exe" in "\n".join(
+        str(s.get("with", {}).get("subject-path", "")) for s in desktop_job["steps"]
+    ), "the setup.exe must be an attestation subject -- it is attached to the release"
+
+
+def test_the_inno_script_is_smoke_compiled_before_any_release_needs_it() -> None:
+    """The release workflow is manual-only and its desktop job runs AFTER the release is
+    published, so without this the first real ISCC compile of keel.iss would be a release
+    dispatch -- a script typo failing a release with the tag already pushed. The smoke
+    workflow compiles the same script against a placeholder bundle on a Windows runner.
+
+    It must trigger on PRs touching the script (that is where a compile break is
+    introduced, and a workflow not yet on the default branch cannot be dispatched onto a
+    branch at all), but ONLY those -- the `paths` filter is what keeps a Windows runner
+    from being spent on every PR."""
+    assert _SMOKE_WORKFLOW.is_file()
+    smoke = strict_load(_SMOKE_WORKFLOW.read_text(encoding="utf-8"), source="installer-smoke.yml")
+    triggers = smoke[True]  # PyYAML parses the bare `on` key as boolean True
+    assert "workflow_dispatch" in triggers, "a human must always be able to ask for a compile"
+    assert set(triggers["pull_request"]["paths"]) == {
+        "packaging/keel.iss",
+        ".github/workflows/installer-smoke.yml",
+    }, (
+        "the PR trigger must fire ONLY when the compile can have broken -- the .iss or "
+        "the workflow itself -- or every PR pays for a Windows runner"
+    )
+    run = "\n".join(
+        str(step.get("run", "")) for job in smoke["jobs"].values() for step in job["steps"]
+    )
+    assert "keel.iss" in run and "ISCC" in run, "the smoke must compile the real script"
+    assert "placeholder" in run.lower(), (
+        "the smoke must not need a freeze -- ISCC packages files, it does not run them, "
+        "so a placeholder keel.exe exercises the whole script for one cheap compile"
+    )
+
+
+# -- signing: implemented, gated on the certificates, honest about skipping ---------------------
+#
+# #438's delta on the "ship unsigned" decision: the signing work is REAL -- codesign with
+# the hardened runtime, notarytool --wait, stapler, signtool with an RFC 3161 timestamp --
+# but each leg runs only when that leg's credentials exist on the `signing` environment.
+# Missing credentials must SKIP WITH A NOTICE that names every secret and what it costs
+# (#402's discipline: a missing prerequisite is announced, never a red release), and the
+# checks below exist so the gate can never be detached from the step it guards.
+
+_MACOS_SIGNING_SECRETS = (
+    "MACOS_CERT_P12_BASE64",
+    "MACOS_CERT_PASSWORD",
+    "APP_STORE_CONNECT_KEY_ID",
+    "APP_STORE_CONNECT_ISSUER_ID",
+    "APP_STORE_CONNECT_KEY_CONTENT",
+)
+_WINDOWS_SIGNING_SECRETS = ("WINDOWS_CERT_PFX_BASE64", "WINDOWS_CERT_PASSWORD")
+
+
+def _step(job: dict, name: str) -> dict:
+    step = next((s for s in job["steps"] if str(s.get("name", "")) == name), None)
+    assert step is not None, f"release.yml's desktop job must keep a step named {name!r}"
+    return step
+
+
+def test_the_signing_secrets_live_on_a_protected_environment(desktop_job: dict) -> None:
+    """#438: the certificates must be ENVIRONMENT secrets, not repository ones -- a
+    repository secret is handed to every same-repo PR build, while an environment secret
+    stops at the environment's reviewers. Until the environment exists the reference is
+    inert (GitHub treats a missing environment as unprotected) and the signing steps skip
+    honestly, which is why this can be declared unconditionally."""
+    assert desktop_job["environment"] == "signing", (
+        "the desktop job must reference the `signing` environment -- that is the only "
+        "thing that stands between a certificate secret and every PR build"
+    )
+
+
+def test_macos_signing_runs_only_when_every_apple_credential_exists(desktop_job: dict) -> None:
+    """All FIVE or none: a signed-but-un-notarised app is the worst state on macOS (it
+    still trips Gatekeeper, and now looks like it tried not to), so the gate is the whole
+    Apple set -- the Developer ID Application .p12 to sign, and the App Store Connect API
+    key trio notarytool needs. #402's lesson is measured per component, not by one token."""
+    condition = str(_step(desktop_job, "Sign, notarise and staple (macOS)").get("if", ""))
+    assert "runner.os == 'macOS'" in condition
+    for secret in _MACOS_SIGNING_SECRETS:
+        assert f"secrets.{secret} != ''" in condition, (
+            f"the macOS sign step must require {secret} -- a partial credential set must "
+            "skip, not half-sign"
+        )
+
+
+def test_windows_signing_runs_only_when_the_certificate_exists(desktop_job: dict) -> None:
+    condition = str(_step(desktop_job, "Sign the installer (Windows)").get("if", ""))
+    assert "runner.os == 'Windows'" in condition
+    for secret in _WINDOWS_SIGNING_SECRETS:
+        assert f"secrets.{secret} != ''" in condition
+
+
+def test_each_skip_notice_names_every_missing_secret_and_the_price_of_fixing_it(
+    desktop_job: dict,
+) -> None:
+    """The honest skip: each notice fires on the exact COMPLEMENT of its sign step's gate,
+    and says what to buy, which secrets to create, and where the checklist is -- so a
+    reader of a green run learns signing was SKIPPED, never believes it happened, and
+    knows the purchase that would turn it on (#438's signing table, restated as text)."""
+    cases = [
+        ("Notice: macOS signing skipped", _MACOS_SIGNING_SECRETS, "$99"),
+        ("Notice: Windows signing skipped", _WINDOWS_SIGNING_SECRETS, "SmartScreen"),
+    ]
+    for name, secrets, product in cases:
+        notice = _step(desktop_job, name)
+        condition = str(notice.get("if", ""))
+        run = str(notice.get("run", ""))
+        assert "::notice" in run, f"{name} must be a ::notice, not a log line"
+        assert "docs/desktop-install.md" in run
+        assert product in run.replace("\\", ""), (
+            f"{name} must name the paid product that unlocks signing -- the reader is "
+            "being asked to accept an unsigned binary, and the price is the context"
+        )
+        for secret in secrets:
+            assert f"secrets.{secret} == ''" in condition, (
+                f"{name} must fire when {secret} is missing -- every gap in the gate "
+                "needs its explanation"
+            )
+            assert secret in run, (
+                f"{name} must NAME {secret} -- a notice that says only 'not configured' "
+                "has already been failed by code-quality.yml's preflight prose (#402)"
+            )
+
+
+def test_signing_happens_between_packaging_and_the_checksums(desktop_job: dict) -> None:
+    """The sums must cover the SIGNED bytes: checksumming first and signing after would
+    publish hashes that prove nothing about what the user downloads. Signing must also
+    come after packaging, because the steps sign out/keel.app and out/*-setup.exe."""
+    names = [str(s.get("name", "")) for s in desktop_job["steps"]]
+    package_at = names.index("Package (macOS)")
+    installer_at = names.index("Build the installer (Windows)")
+    sign_at = names.index("Sign, notarise and staple (macOS)")
+    win_sign_at = names.index("Sign the installer (Windows)")
+    checksums_at = names.index("Checksums")
+    assert package_at < sign_at and installer_at < win_sign_at < checksums_at
+    assert sign_at < checksums_at
+
+
+def test_the_macos_leg_uses_the_hardened_runtime_and_waits_for_notarisation(
+    desktop_job: dict,
+) -> None:
+    """`--options runtime` is REQUIRED for notarisation (an app signed without the
+    hardened runtime is rejected server-side, after the upload); `--wait` is what makes a
+    Rejected submission FAIL the step instead of returning an id; stapling is what lets a
+    machine that never queries Apple verify the ticket. And the certificate must live in
+    an EPHEMERAL keychain that is deleted after -- imported into the login keychain it
+    would outlive the step until the job ends."""
+    run = str(_step(desktop_job, "Sign, notarise and staple (macOS)").get("run", ""))
+    assert "--options runtime" in run
+    assert "notarytool" in run and "--wait" in run
+    assert "stapler staple" in run
+    assert "security create-keychain" in run
+    assert "security delete-keychain" in run
+
+
+def test_the_windows_leg_timestamps_its_signature_and_verifies_it(
+    desktop_job: dict,
+) -> None:
+    """An untimestamped signature dies with the certificate -- /tr (RFC 3161) is what
+    makes it outlive the cert's expiry -- and an unverified signature is a hope, so the
+    step must signtool-verify /pa against the machine's default policy afterwards."""
+    run = str(_step(desktop_job, "Sign the installer (Windows)").get("run", ""))
+    assert "signtool" in run
+    assert "/tr http" in run and "/td SHA256" in run and "/fd SHA256" in run
+    assert "verify" in run
+
+
 # -- what the person downloading it is told ----------------------------------------------------
 
 _INSTALL_DOC = _ROOT / "docs" / "desktop-install.md"
@@ -354,3 +607,30 @@ def test_the_release_notes_point_at_the_full_explanation() -> None:
     text = _WORKFLOW.read_text(encoding="utf-8")
     assert "docs/desktop-install.md" in text
     assert "cannot currently afford" in text
+
+
+def test_the_install_note_carries_the_operator_activation_checklist() -> None:
+    """#438 made activation a PURCHASE, not a code change -- and the skip notices in the
+    workflow point at this page. So the page must hold the complete shopping list: every
+    secret name the gates check, the product that sells it, the price from #438's signing
+    table, the `signing` environment by name, and the one manual step (release-notes
+    wording) whose forgetting errs safe. A checklist missing a name would send the
+    operator to GitHub with an incomplete list and a second dispatch they did not expect."""
+    text = _INSTALL_DOC.read_text(encoding="utf-8")
+    for secret in (*_MACOS_SIGNING_SECRETS, *_WINDOWS_SIGNING_SECRETS):
+        assert secret in text, f"the activation checklist must name {secret}"
+    assert "Environments" in text and "`signing`" in text, (
+        "the checklist must say WHERE the secrets go -- an environment secret in the wrong "
+        "place is a repository secret, visible to every same-repo PR build"
+    )
+    # The prices from #438's signing table, restated where the decision is made.
+    assert "$99" in text and "$9.99" in text and "SmartScreen" in text
+    assert "EV" in text, (
+        "the checklist must warn EV is not worth extra -- no instant SmartScreen pass since 2024"
+    )
+    # The honest asymmetry: the notes wording cannot auto-detect signing, and the failure
+    # mode of forgetting it must be stated (and must be the safe direction).
+    assert "safe direction" in text
+    assert "notarised" in text or "un-notarised" in text, (
+        "the checklist must explain WHY the macOS gate is all five secrets or none"
+    )
