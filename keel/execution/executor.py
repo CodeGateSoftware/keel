@@ -1658,6 +1658,13 @@ def _roll_stop(
     last-recorded `open_stop:<product_id>` -- ratchet-only, mirroring rail 9's invariant for
     entries. The replacement order still runs through `guards.check` (allowlist/caps/kill-switch/
     etc. -- every order, no exceptions) before it is placed.
+
+    **The cancel-then-place window is not atomic and cannot be made so** (see the comment at the
+    cancel below). What it CAN be is recoverable: an `unbracketed:<product_id>` record is written
+    before the venue is touched and cleared only once the replacement rests, so a process that
+    dies anywhere in between leaves levels the next cycle's sweep re-places from. Before #519 that
+    record did not exist here and one crash window was not merely unprotected but SILENT --
+    indistinguishable from a DCA tranche, which legitimately carries no stop.
     """
     prior_stop = repo.get_state(f"open_stop:{product_id}")
     if prior_stop is not None and new_stop < prior_stop:
@@ -1681,6 +1688,29 @@ def _roll_stop(
             reason="no open_target recorded -- cannot re-place the bracket",
         )
         return None
+
+    # THE CRASH LEDGER, written BEFORE the venue is touched (#519).
+    #
+    # Everything below this line can die mid-flight, and until this record existed one of those
+    # deaths was SILENT. `_run_order` marks the old bracket `canceled` locally and then places the
+    # replacement; a process that dies in between left no resting bracket, no `unbracketed:`
+    # record, and therefore nothing for `reconcile_unbracketed_positions` to act on -- it took the
+    # skip branch that exists for DCA and the position stayed naked with no CRITICAL, looking
+    # exactly like a holding that carries no stop by design.
+    #
+    # Writing the intent first turns every one of those deaths into a state the existing sweep
+    # already converges: next cycle it finds no resting bracket, finds these levels, and re-places
+    # from them. The record is deliberately the SAME key `place_bracket` uses rather than a new
+    # `roll_intent:` one -- the sweep, its ledger-sized qty, its escalation and its
+    # clear-on-success semantics are written and tested once, and a second key would mean a second
+    # healer to keep correct.
+    #
+    # A record left behind by an aborted roll is harmless: the sweep skips any product whose
+    # bracket is still resting, and the levels it holds are ratchet-consistent either way.
+    repo.set_state(
+        f"{UNBRACKETED_PREFIX}{product_id}",
+        {"stop": new_stop, "target": target, "qty": qty},
+    )
 
     # CANCEL FIRST, then place. This inverts the old two-leg order of operations, and it has to:
     # the resting native bracket already commits the whole position, so placing a replacement
@@ -1724,8 +1754,13 @@ def _roll_stop(
         ),
     )
     if not result.placed:
-        # The old bracket is already cancelled, so the position is NAKED right now. There is no
-        # silent recovery: the caller must retry or close the position. Never downgrade this.
+        # The old bracket is already cancelled, so the position is NAKED right now. The
+        # `unbracketed:` record written before the cancel is DELIBERATELY LEFT STANDING: it is
+        # what `reconcile_unbracketed_positions` re-places from on the next cycle (#519).
+        #
+        # The CRITICAL stays regardless. Automatic recovery next cycle is not a reason to
+        # downgrade an alert about a position that is unprotected RIGHT NOW -- the deployment
+        # cycles once per UTC day, so "next cycle" can be up to a day away. Never downgrade this.
         log_event(
             logger,
             logging.CRITICAL,
@@ -1736,13 +1771,18 @@ def _roll_stop(
             cancelled_order_id=old_stop_order_id,
             detail=(
                 "the previous bracket was cancelled and its replacement was REJECTED -- this "
-                "position currently has no protective stop at the exchange"
+                "position currently has no protective stop at the exchange. The unbracketed "
+                "record is retained so the next cycle's sweep re-places it."
             ),
         )
         return None
 
     repo.set_state(f"open_stop:{product_id}", new_stop)
     repo.set_state(f"open_target:{product_id}", target)
+    # The replacement is resting, so the crash ledger has served its purpose. Clearing it matches
+    # `place_bracket`'s own success path; leaving it would have the sweep re-place a bracket that
+    # already exists on the next cycle.
+    repo.set_state(f"{UNBRACKETED_PREFIX}{product_id}", None)
     log_event(
         logger,
         logging.INFO,

@@ -30,7 +30,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution import guards, sizing
+from keel.execution import executor, guards, sizing
 from keel.execution.executor import (
     CancelPending,
     CancelUnavailable,
@@ -2917,3 +2917,135 @@ def test_unserialisable_size_refuses_the_order_without_raising(repo, monkeypatch
     assert broker.place_calls == []
     assert broker.preview_calls == []
     assert repo.get_orders() == []
+
+
+def test_a_roll_writes_its_crash_ledger_before_touching_the_venue(repo, monkeypatch):
+    """#519: the window between cancel and replace must never be SILENT.
+
+    Before this, `_roll_stop` cancelled the old bracket and then placed the replacement without
+    ever writing an `unbracketed:` record -- `place_bracket` writes one only on a refused
+    PLACEMENT. A process dying in between left no resting bracket and no intent, so
+    `reconcile_unbracketed_positions` took the branch that exists for DCA and skipped the position
+    SILENTLY. Naked, and indistinguishable from a tranche that carries no stop by design.
+
+    Asserted by observing the state at the moment of the cancel, which is the crash point.
+    """
+    broker = FakeBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    # place_bracket clears its own record on success -- so we start from nothing to find.
+    assert not repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+
+    seen: dict = {}
+    real_cancel = executor._cancel_at_exchange
+
+    def _spy(*args, **kwargs):
+        # The crash point: the old bracket is about to stop resting.
+        seen["intent"] = repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+        return real_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_cancel_at_exchange", _spy)
+
+    roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("50000"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert seen["intent"], "no crash ledger existed at the cancel -- the sweep would skip silently"
+    assert seen["intent"]["stop"] == Decimal("50000")
+    assert seen["intent"]["target"] == Decimal("53000")
+
+
+def test_a_successful_roll_clears_its_crash_ledger(repo):
+    """Left standing, the sweep would re-place a bracket that already rests."""
+    broker = FakeBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    new_id = roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("50000"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert new_id is not None
+    assert not repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+
+
+def test_a_failed_roll_RETAINS_its_crash_ledger_for_the_sweep(repo, caplog):
+    """The naked case. The record is what the next cycle re-places from, so it must survive --
+    and the CRITICAL must survive with it: the deployment cycles once per UTC day, so "the sweep
+    will fix it" can be a day away. Recovery is not a reason to downgrade the alert."""
+
+    class _RejectingBroker(FakeBroker):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.calls = 0
+
+        def place_order(self, product_id, side, order_configuration):
+            self.calls += 1
+            if self.calls > 1:  # the original bracket places; the replacement fails
+                return {"success": False, "error": "INSUFFICIENT_FUND"}
+            return super().place_order(product_id, side, order_configuration)
+
+    broker = _RejectingBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        result = roll_to_break_even(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=stop_id,
+            entry_price=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
+        )
+
+    assert result is None
+    intent = repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+    assert intent, "a naked position with no ledger is the exact #519 hole"
+    assert intent["stop"] == Decimal("50000")
+    assert any("position_unprotected" in r.message for r in caplog.records)
