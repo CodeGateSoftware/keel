@@ -81,11 +81,23 @@ def _request(
     cookie: str | None = None,
     host: str | None = None,
     form: dict[str, str] | None = None,
+    client_header: str | None = "1",
+    sec_fetch_site: str | None = None,
 ) -> tuple[int, dict[str, str], str]:
+    """`client_header` defaults to `"1"` and is only sent on `POST`: every pre-existing POST test
+    in this module goes through here without knowing #535's `X-Keel-Client` layer exists, and
+    `"1"` is what a real browser's `fetch` wrapper will always send (per the design spec's
+    `api.js`), so the happy-path tests stay a faithful stand-in for that client without editing
+    each one. Tests of the new layer itself pass `client_header=None` (omitted entirely) or an
+    explicit wrong value, and `sec_fetch_site=...` to exercise that half of the check."""
     conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
     headers = {"Host": host if host is not None else f"{cfg.host}:{cfg.port}"}
     if cookie:
         headers["Cookie"] = cookie
+    if method == "POST" and client_header is not None:
+        headers["X-Keel-Client"] = client_header
+    if sec_fetch_site is not None:
+        headers["Sec-Fetch-Site"] = sec_fetch_site
     body = None
     if form is not None:
         body = urlencode(form)
@@ -401,6 +413,115 @@ def test_the_csrf_token_is_not_the_session_token(
     assert csrf_token(running.token) in body
 
 
+# -- the client header (#535's third CSRF layer) -----------------------------------------------
+#
+# `SameSite=Strict` and the HMAC CSRF token both assume a hostile cross-origin write is
+# PREFLIGHTED -- but a plain `<form method=post>` is not, in any browser, ever. A custom request
+# header forces the preflight a form cannot trigger; a hostile origin's script could still try to
+# add the header, but doing so makes the request cross-origin-with-a-custom-header, which is
+# exactly the shape CORS preflights and which this server never answers with a matching
+# `Access-Control-Allow-*` (there is no CORS configuration at all -- see server.py's module
+# docstring). `Sec-Fetch-Site` is the second half: it cannot be set by page JavaScript at all, so
+# a wrong value (not merely a missing one -- older browsers omit the header) is real evidence of
+# a cross-origin request and is refused; a missing value is not evidence of anything.
+
+
+def test_a_write_without_the_client_header_is_refused(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        client_header=None,
+    )
+    assert status == 403
+    assert not Path(empty_machine.config_path).exists()
+
+
+@pytest.mark.parametrize("value", ["0", "true", "yes", "2", ""])
+def test_a_wrong_client_header_value_is_refused(
+    empty_machine: web_server.ServeConfig, value: str
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        client_header=value,
+    )
+    assert status == 403, value
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_a_write_missing_sec_fetch_site_is_accepted(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """Older browsers never send `Sec-Fetch-Site` at all; its absence must not be a refusal, or
+    every one of them would be locked out of the one write surface that exists."""
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        sec_fetch_site=None,
+    )
+    assert status == 303
+
+
+def test_a_write_with_sec_fetch_site_same_origin_is_accepted(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        sec_fetch_site="same-origin",
+    )
+    assert status == 303
+
+
+@pytest.mark.parametrize("value", ["cross-site", "same-site", "none"])
+def test_a_write_with_a_wrong_sec_fetch_site_is_refused(
+    empty_machine: web_server.ServeConfig, value: str
+) -> None:
+    """Page JavaScript cannot forge this header -- the browser sets it. A value present and
+    wrong is therefore real evidence of a cross-origin request, unlike a missing one."""
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": _csrf(empty_machine)},
+        sec_fetch_site=value,
+    )
+    assert status == 403, value
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_the_client_header_check_runs_before_the_csrf_check(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """Admission (host, cookie), then this layer, then CSRF -- so a probe cannot distinguish
+    "wrong CSRF" from "missing client header" by anything other than both being 403, and the
+    cheaper check runs first."""
+    status, _headers, _body = _request(
+        empty_machine,
+        "/setup/config",
+        method="POST",
+        cookie=_session(empty_machine),
+        form={"csrf": "not-the-token"},
+        client_header=None,
+    )
+    assert status == 403
+
+
 # -- the actions themselves, over the wire ------------------------------------------------------
 
 
@@ -622,6 +743,136 @@ def test_head_returns_the_headers_without_a_body(running: web_server.ServeConfig
     assert status == 200
     assert body == ""
     assert int(headers["Content-Length"]) > 0
+
+
+# -- static assets (#535) -------------------------------------------------------------------
+#
+# `keel/web/static/index.html` is the one placeholder asset the package ships (#536's real
+# client does not exist yet). These drive it over the real wire -- a real bound server, a real
+# `Path` on disk -- for the same reason `tests/web/test_staticfiles.py`'s module docstring
+# gives: the properties worth pinning are properties of the served bytes, not of a resolver
+# called directly.
+
+
+def test_a_shipped_static_asset_is_served(running: web_server.ServeConfig) -> None:
+    status, headers, body = _request(running, "/static/index.html", cookie=_session(running))
+    assert status == 200
+    assert headers["Content-Type"] == "text/html; charset=utf-8"
+    assert "keel" in body.lower()
+
+
+def test_static_assets_are_behind_the_same_admission_as_every_other_page(
+    running: web_server.ServeConfig,
+) -> None:
+    """Never weakened: a static file is not exempted from the loopback-plus-session model just
+    because it holds no secrets today. The same guard that protects `/rules` protects this."""
+    status, _headers, _body = _request(running, "/static/index.html")  # no cookie
+    assert status == 403
+
+
+def test_a_missing_static_asset_is_a_404(running: web_server.ServeConfig) -> None:
+    status, _headers, _body = _request(
+        running, "/static/does-not-exist.html", cookie=_session(running)
+    )
+    assert status == 404
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/static/../keel/web/security.py",
+        "/static/../../pyproject.toml",
+        "/static/%2e%2e/%2e%2e/pyproject.toml",
+        "/static//etc/passwd",
+        "/static/..%2f..%2fpyproject.toml",
+    ],
+)
+def test_directory_traversal_through_the_wire_is_refused(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    """The unit-level payloads live in `tests/web/test_staticfiles.py`; these are the same shape
+    of attack sent as an actual HTTP request line, over a real socket, to prove nothing between
+    the wire and the resolver -- URL parsing, `http.server`'s own request handling -- reopens
+    what the resolver closes."""
+    status, _headers, body = _request(running, path, cookie=_session(running))
+    assert status == 404, (path, body[:200])
+
+
+def test_a_static_html_response_carries_the_new_header_set(
+    running: web_server.ServeConfig,
+) -> None:
+    """The full set from #535, on the one content type the design spec puts it on."""
+    status, headers, _body = _request(running, "/static/index.html", cookie=_session(running))
+    assert status == 200
+    csp = headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "connect-src 'self'" in csp
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert "Strict-Transport-Security" not in headers
+
+
+def test_a_non_html_static_asset_carries_no_csp(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per the design spec: CSP is invalid and discouraged on anything but `text/html`. A CSS or
+    JS asset still gets `nosniff` and `Referrer-Policy` -- those are meaningful on any content
+    type -- but no `Content-Security-Policy` header at all."""
+    from keel.web import staticfiles
+
+    (tmp_path / "style.css").write_text("body { color: black; }")
+    monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
+
+    status, headers, _body = _request(running, "/static/style.css", cookie=_session(running))
+    assert status == 200
+    assert headers["Content-Type"] == "text/css; charset=utf-8"
+    assert "Content-Security-Policy" not in headers
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert "Strict-Transport-Security" not in headers
+
+
+def test_an_unrecognised_static_extension_is_refused(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file with no entry in the Content-Type table is refused rather than guessed at -- see
+    `staticfiles.content_type_for`'s docstring."""
+    from keel.web import staticfiles
+
+    (tmp_path / "payload.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
+
+    status, _headers, _body = _request(
+        running, "/static/payload.exe", cookie=_session(running)
+    )
+    assert status == 404
+
+
+def test_a_static_file_removed_between_resolve_and_read_is_a_500_not_a_hang(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`resolve_static_asset` proves the file existed at check time; a `read_bytes()` failure
+    afterwards (deleted, permission change) must land as a clean page, matching the guarantee
+    `test_a_broken_page_does_not_take_the_server_down` already pins for rendered routes."""
+    from keel.web import staticfiles
+
+    target = tmp_path / "flaky.html"
+    target.write_text("<html></html>")
+    monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
+
+    real_resolve = staticfiles.resolve_static_asset
+
+    def _resolve_then_delete(root: Path, url_path: str) -> Path | None:
+        resolved = real_resolve(root, url_path)
+        if resolved is not None:
+            resolved.unlink()
+        return resolved
+
+    monkeypatch.setattr(staticfiles, "resolve_static_asset", _resolve_then_delete)
+
+    status, _headers, body = _request(running, "/static/flaky.html", cookie=_session(running))
+    assert status == 500
+    assert "OSError" in body or "FileNotFoundError" in body
 
 
 def test_the_activity_scope_comes_from_the_query_and_hostile_input_collapses_safely(

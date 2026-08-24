@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
-from keel.web import render
+from keel.web import render, staticfiles
 from keel.web.security import (
     SESSION_COOKIE,
     HostPolicy,
@@ -365,6 +365,51 @@ _SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: The header set for `/static/*` (#535), separate from `_SECURITY_HEADERS` above because the
+#: two routes need different values for the SAME header, not merely an additional one.
+#: `_SECURITY_HEADERS`'s `default-src 'none'` is correct for the rendered pages -- they ship no
+#: script, no style file, no image, nothing to permit -- but #536's client is exactly the thing
+#: `'none'` forbids: its own JS, its own CSS, its own icons, all same-origin. `'self'` is the
+#: tightest policy that still allows that, and `connect-src 'self'` on top of it is the specific
+#: guarantee the design spec asks for: the interface is provably incapable of sending positions,
+#: equity or trade history anywhere but this local process, checkable in the response headers
+#: rather than merely promised.
+#:
+#: `Referrer-Policy` and `X-Content-Type-Options` are unconditional -- both are meaningful (and
+#: harmless) on any content type. CSP is NOT: RFC-wise it is a response header with no defined
+#: meaning outside a browsing context, so it is applied only where the content type is
+#: `text/html` (see `_static_headers` below), matching the design spec's "CSP belongs on
+#: `text/html` responses only; it is invalid and discouraged on other content types."
+_STATIC_BASE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+)
+
+# `Strict-Transport-Security` is deliberately absent from both header sets above, on every
+# response this server ever sends -- recorded here so nobody adds it back reading only the
+# acceptance checklist. `keel serve` binds loopback HTTP by design
+# (`docs/superpowers/specs/2026-08-23-web-ui-rewrite-design.md`'s secure-context argument:
+# `http://127.0.0.1` is a secure context by specification, so the service worker, manifest and
+# browser install all work with no TLS decision required). HSTS exists to upgrade a site that
+# COULD be intercepted on the way to a plaintext connection; there is no "on the way" here, and
+# pinning `max-age` on loopback would only ever matter if this process later bound a
+# non-loopback address (an operator's own choice, already warned about loudly in `serve()`
+# below) -- at which point a stale HSTS pin from an earlier loopback run would be actively
+# wrong: forcing HTTPS at an address that was never issued a certificate.
+
+
+def _static_headers(content_type: str) -> tuple[tuple[str, str], ...]:
+    """`_STATIC_BASE_HEADERS` plus CSP, but ONLY when `content_type` is `text/html` -- see the
+    comment on `_STATIC_BASE_HEADERS` for why the other static content types get no CSP at all,
+    not a looser one."""
+    if content_type.startswith("text/html"):
+        return (
+            ("Content-Security-Policy", "default-src 'self'; connect-src 'self'"),
+            *_STATIC_BASE_HEADERS,
+        )
+    return _STATIC_BASE_HEADERS
+
+
 class KeelHandler(BaseHTTPRequestHandler):
     """GET and HEAD. No other verb is implemented, so no other verb reaches keel."""
 
@@ -443,6 +488,70 @@ class KeelHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _client_header_ok(self) -> bool:
+        """The third CSRF layer (#535), checked only for `POST` -- `SameSite=Strict` plus the
+        HMAC CSRF token already assume a hostile write is PREFLIGHTED, and both `SameSite`
+        parsing and CSRF-token exfiltration have had real bypasses over the years. A plain HTML
+        `<form method=post>` is never preflighted, in any browser, which is exactly the gap: a
+        custom header (`X-Keel-Client: 1`) forces the preflight a form cannot trigger, and this
+        server answers no `Access-Control-*` header to any origin (there is no CORS
+        configuration at all), so a hostile origin's preflight cannot succeed either.
+
+        `Sec-Fetch-Site` is checked second and differently: page JavaScript can set an arbitrary
+        `X-Keel-Client` value, but it cannot set or override `Sec-Fetch-Site` -- the browser
+        supplies it. So a WRONG value here is treated as real evidence of a cross-origin request
+        and refused, while a MISSING value is not: the header is a Fetch Metadata addition
+        (Safari shipped it later than Chrome/Firefox), and refusing every browser that predates
+        it would turn a defence-in-depth layer into an availability bug for exactly the users
+        who most need every OTHER layer to hold."""
+        if self.headers.get("X-Keel-Client") != "1":
+            self._refuse(
+                403,
+                "Refused",
+                "This request is missing the header keel's own client always sends. A plain "
+                "HTML form cannot add it, which is the point.",
+            )
+            return False
+        sec_fetch_site = self.headers.get("Sec-Fetch-Site")
+        if sec_fetch_site is not None and sec_fetch_site != "same-origin":
+            self._refuse(
+                403,
+                "Refused",
+                "This request's Sec-Fetch-Site header says it did not originate on this page.",
+            )
+            return False
+        return True
+
+    def _serve_static(self, url_path: str) -> None:
+        """One file under `staticfiles.STATIC_PREFIX` (#535), or the same 404 an unmapped
+        `ROUTES` path gets -- containment and the Content-Type table are `staticfiles`'s job
+        (`tests/web/test_staticfiles.py` pins the resolver in isolation); this method's only
+        responsibility is refusing anything it returns `None` for, uniformly, so a missing
+        static file and a missing page look identical to a client probing the server."""
+        resolved = staticfiles.resolve_static_asset(staticfiles.STATIC_ROOT, url_path)
+        content_type = staticfiles.content_type_for(resolved) if resolved is not None else None
+        if resolved is None or content_type is None:
+            self._refuse(404, "No such page", f"Nothing is served at {url_path}.")
+            return
+
+        try:
+            # A second filesystem race between `resolve_static_asset`'s existence check and this
+            # read (the file removed, a permission change) must be a clean 500 like any other
+            # broken page (`test_a_broken_page_does_not_take_the_server_down`'s guarantee),
+            # never an uncaught exception that leaves the connection hanging.
+            payload = resolved.read_bytes()
+        except OSError as exc:
+            self._refuse(500, "That file could not be read", f"{type(exc).__name__}: {exc}")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        for name, value in _static_headers(content_type):
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
     # -- the request --
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib's naming, not ours
         self.do_GET()
@@ -450,13 +559,16 @@ class KeelHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib's naming, not ours
         """The ENTIRE write surface (#437). Read `keel/web/__init__.py` before extending it.
 
-        Four refusals before anything is performed, and then a lookup in a closed set. There is
+        Five refusals before anything is performed, and then a lookup in a closed set. There is
         no dynamic dispatch here, no getattr on a user-supplied name, and no path that reaches
         keel other than `keel.commands.setup.ACTIONS` -- which contains three idempotent,
         non-destructive, `MECHANICAL` steps and cannot contain anything else without failing a
         test."""
         parsed = urlsplit(self.path)
         if not self._admitted():
+            return
+
+        if not self._client_header_ok():
             return
 
         if not parsed.path.startswith(SETUP_ACTION_PREFIX):
@@ -546,6 +658,15 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
 
         if not self._admitted():
+            return
+
+        if parsed.path.startswith(staticfiles.STATIC_PREFIX):
+            # Same admission as every rendered page (never weakened): a static asset is not
+            # exempted from the loopback-plus-session model just because it holds no secrets
+            # today. #536's client is what actually reads these, and it authenticates the same
+            # way any other fetch from this origin does -- the session cookie already on the
+            # request.
+            self._serve_static(parsed.path)
             return
 
         handler = ROUTES.get(parsed.path)

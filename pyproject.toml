@@ -44,8 +44,22 @@ module-root = ""
 # `keel_trader/` from the distribution name.
 module-name = "keel"
 # Ship the default config template inside the wheel so `keel init-config` can write it out on a
-# fresh install (the wheel otherwise contains only .py files).
-artifacts = ["keel/templates/*.yaml"]
+# fresh install, and (#535) the web UI's static assets so `keel serve` has something to serve
+# from an installed wheel rather than a checkout.
+#
+# ⚠️ Measured against the pinned uv_build (`uv_build>=0.10.4,<0.13.0`, resolving to 0.11.31 as
+# of #535): this key has NO observable effect. `artifacts` does not appear in uv_build's
+# documented `[tool.uv.build-backend]` schema (`module-root`, `module-name`, `namespace`, `data`,
+# `source-include`, `source-exclude`, `wheel-exclude`, `default-excludes`), and removing this
+# line entirely, or replacing its value with garbage, still ships both the templates and
+# `keel/web/static/**` in a rebuilt wheel with no warning either way -- uv_build's actual default
+# is "the whole module tree except `default-excludes`" (`__pycache__`, `*.pyc`, `*.pyo`), not
+# "importable source only". `tests/test_packaging.py::test_static_assets_survive_being_built_
+# into_a_wheel` therefore checks the built wheel directly rather than trusting this line, and
+# would catch it if a future uv_build (or a `wheel-exclude` added here later) narrowed that
+# default. Left in place as a statement of intent and because it is the field this project's
+# prior art used for the same purpose -- but it is not, today, load-bearing.
+artifacts = ["keel/templates/*.yaml", "keel/web/static/**"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
