@@ -91,18 +91,22 @@ def _console_module_paths() -> list[str]:
     return sorted(set(paths))
 
 
-#: Rule 5's one entry-scoped exception, in the same shape as every other allowance here:
+#: Rule 5's entry-scoped exceptions, in the same shape as every other allowance here:
 #: (module stem, imported module).
 #:
 #: Rule 5 bans `urllib` by ROOT, which is the right coarseness for a rule about network egress --
 #: `urllib.request.urlopen` is the thing it exists to stop. But `urllib.parse` performs no I/O at
 #: all: it is string manipulation, and it is how `keel/web/server.py` splits a request path from
-#: its query string. The alternative was hand-rolling percent-decoding on attacker-influenced
-#: input, which is a strictly worse trade than one named, scoped allowance.
+#: its query string, and (#535) how `keel/web/staticfiles.py` decodes one static-asset path
+#: segment before checking it stays inside the static root. The alternative in both cases was
+#: hand-rolling percent-decoding on attacker-influenced input, which is a strictly worse trade
+#: than one named, scoped allowance.
 #:
-#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in the same
-#: file still fails, and `urllib.parse` anywhere else still fails.
-RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({("server", "urllib.parse")})
+#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in either file
+#: still fails, and `urllib.parse` anywhere else still fails.
+RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {("server", "urllib.parse"), ("staticfiles", "urllib.parse")}
+)
 
 
 #: The SERIALISER: the module turning the frozen reports into the browser's JSON (#533). It is

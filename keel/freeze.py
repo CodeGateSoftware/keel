@@ -1,6 +1,6 @@
 """What a frozen bundle has to be told, because PyInstaller cannot work it out (#438).
 
-Four things break when keel is frozen, and three of them break SILENTLY. That is what makes this
+Five things break when keel is frozen, and four of them break SILENTLY. That is what makes this
 module worth having rather than a handful of flags in a build script: every one of these was found
 by building a bundle and running it, and every one of them produced a binary that started
 cleanly and was wrong.
@@ -23,6 +23,15 @@ zero and starts raising `ModuleNotFoundError` instead -- which is at least loud.
 **4. The config templates are package DATA.** `init-config` reads them through
 `importlib.resources`; without them a first run cannot write a config at all.
 
+**5. The web UI's static assets are package DATA too (#535).** `keel/web/staticfiles.py` finds
+them with `Path(__file__).parent / "static"` rather than `importlib.resources` -- a plain
+filesystem lookup relative to the module's OWN frozen location, which resolves correctly only if
+PyInstaller actually copied `keel/web/static/` alongside the frozen `staticfiles.py`. Without
+this, `keel serve` binds and every rendered page loads (they carry no static reference), so the
+bundle looks healthy right up until #536's client -- or anyone hitting `/static/*` today -- gets
+a 404 with no terminal to diagnose it from, on the exact double-click path #535 exists to make
+work.
+
 Everything here is computed from the build environment rather than hardcoded. A hardcoded list is
 the same failure one release later: adding a fifth adapter and forgetting to add it here would
 produce exactly the silent `0 adapter(s)` bundle that (2) describes.
@@ -34,6 +43,15 @@ from keel.version import DEV_ONLY_DISTRIBUTIONS, installed_distributions
 
 #: The package holding `config.yaml` / `config.live.yaml`, read via `importlib.resources`.
 TEMPLATE_PACKAGE = "keel.templates"
+
+#: The package holding the web UI's static assets (#535), read via a plain filesystem path
+#: (`keel/web/staticfiles.py`'s `STATIC_ROOT`), not `importlib.resources` -- so unlike
+#: `TEMPLATE_PACKAGE` this name never needs to reach `hidden_imports()`: nothing anywhere calls
+#: `importlib.import_module` or `importlib.resources.files` on it by string. It still has to
+#: reach `collect_data` below, because that is the step that copies the directory into the
+#: bundle at all; naming it here is what stops that copy from being forgotten the way the
+#: config templates already were once (see the module docstring's point 5).
+STATIC_PACKAGE = "keel.web.static"
 
 
 def _module_of(distribution: str) -> str:
@@ -98,5 +116,5 @@ def freeze_inputs() -> dict[str, tuple[str, ...]]:
     return {
         "hiddenimports": hidden_imports(),
         "copy_metadata": metadata_distributions(),
-        "collect_data": (TEMPLATE_PACKAGE,),
+        "collect_data": (TEMPLATE_PACKAGE, STATIC_PACKAGE),
     }

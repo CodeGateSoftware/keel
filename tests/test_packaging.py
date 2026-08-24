@@ -75,6 +75,77 @@ def test_the_dev_only_fake_venue_is_not_a_runtime_dependency_of_anything():
         assert "keel-broker-fake" not in deps, f"{name} must not depend on keel-broker-fake"
 
 
+# -- what actually survives packaging, not what the source tree merely holds --------------------
+
+
+@pytest.mark.slow
+def test_static_assets_survive_being_built_into_a_wheel(tmp_path: Path) -> None:
+    """Whether `keel/web/static/` ships is a fact about the BUILT wheel, never about the source
+    tree, and only inspecting a real build can state it (#535).
+
+    Asserting the source tree holds these files (a bare `Path.exists`) would prove nothing: they
+    are on disk in every checkout regardless of what the packaging step does with them.
+    `pyproject.toml`'s `artifacts` glob states the intent to ship them, but -- measured directly,
+    see the comment beside that glob -- it turns out to have no effect on the currently pinned
+    `uv_build`, which already ships the whole module tree by default. That measurement is exactly
+    why this test builds a REAL wheel with the project's own build backend (`uv build`, the same
+    command `release.yml` runs) and inspects the zip it actually produces, rather than trusting
+    either the glob or the source tree: it is a regression guard against uv_build narrowing that
+    default, or a future `wheel-exclude` catching these files, not a check on the glob's syntax.
+
+    `slow`: it shells out to a real `uv build`. Still runs in CI (`ci.yml`/`release.yml` pass no
+    `-m` filter); `pytest -q -m "not slow"` skips it locally.
+    """
+    import subprocess
+    import zipfile
+
+    out_dir = tmp_path / "dist"
+    subprocess.run(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--package",
+            "keel-trader",
+            "--out-dir",
+            str(out_dir),
+            "--no-build-logs",
+        ],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    wheels = sorted(out_dir.glob("keel_trader-*.whl"))
+    assert wheels, f"`uv build` produced no wheel in {out_dir}"
+
+    with zipfile.ZipFile(wheels[0]) as archive:
+        shipped = set(archive.namelist())
+
+    static_dir = _ROOT / "keel" / "web" / "static"
+    on_disk = sorted(
+        p.relative_to(_ROOT).as_posix()
+        for p in static_dir.rglob("*")
+        # Filesystem cruft a contributor's OS or editor drops in unasked for (macOS's
+        # `.DS_Store` foremost -- `.gitignore` already excludes it, and so, empirically, does
+        # uv_build) is not a static asset, and comparing it against the wheel would fail this
+        # test for a reason that has nothing to do with packaging. Any dotfile is excluded on
+        # the same reasoning: nothing under `keel/web/static/` is meant to be one.
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(static_dir).parts)
+    )
+    assert on_disk, (
+        f"no files under {static_dir} on disk -- this test would prove nothing about packaging"
+    )
+    for source in on_disk:
+        assert source in shipped, (
+            f"{source} exists in the source tree but is absent from the built wheel "
+            f"({wheels[0].name}) -- keel/web/static is no longer surviving packaging, whatever "
+            "the reason (uv_build's default module-tree inclusion narrowed, a wheel-exclude "
+            "pattern now catches it, or the file moved outside the module root)"
+        )
+
+
 #: The flag that identifies a strict override. `strict = true` cannot be used in a per-module
 #: section -- mypy applies it GLOBALLY whatever `module` the section names -- so the strict
 #: packages spell the bundle out flag by flag instead, and this is the one that best marks the
