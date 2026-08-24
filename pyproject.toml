@@ -230,3 +230,12 @@ exclude_also = [
     "raise NotImplementedError",
     "@overload",
 ]
+
+# `ci.yml` and `release.yml` both run a plain `pytest -q` with no `-m` filter, so registering a
+# marker here changes nothing about what CI runs -- it exists to give a contributor working
+# offline, or iterating quickly, an opt OUT (`pytest -q -m "not slow"`) for the one test that
+# shells out to a real `uv build` (tests/test_packaging.py) rather than exercising pure Python.
+[tool.pytest.ini_options]
+markers = [
+    "slow: shells out to a real subprocess (e.g. `uv build`) instead of pure Python; still runs in CI, skip locally with -m 'not slow'",
+]

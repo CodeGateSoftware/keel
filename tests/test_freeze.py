@@ -21,6 +21,7 @@ from pathlib import Path
 
 from keel.freeze import (
     EXCLUDED_MODULES,
+    STATIC_PACKAGE,
     TEMPLATE_PACKAGE,
     broker_modules,
     freeze_inputs,
@@ -78,6 +79,18 @@ def test_the_config_templates_are_collected() -> None:
     inputs = freeze_inputs()
     assert TEMPLATE_PACKAGE in inputs["collect_data"]
     assert TEMPLATE_PACKAGE in inputs["hiddenimports"]
+
+
+def test_the_web_ui_static_assets_are_collected() -> None:
+    """(#535) `keel/web/staticfiles.py` finds its assets with `Path(__file__).parent / "static"`
+    -- a filesystem lookup relative to the frozen module's OWN location -- so `/static/*` (and
+    every request #536's client makes for its own shell) 404s in the desktop bundle unless
+    PyInstaller actually copies `keel/web/static/` in. Not asserted against `hiddenimports`,
+    unlike the templates above: nothing calls `importlib.import_module` or
+    `importlib.resources.files` on `STATIC_PACKAGE` by string, so there is nothing for PyInstaller
+    to fail to statically discover -- only `collect_data`, the copy step, applies here."""
+    inputs = freeze_inputs()
+    assert STATIC_PACKAGE in inputs["collect_data"]
 
 
 def test_the_inputs_are_computed_and_not_hardcoded() -> None:

@@ -83,13 +83,18 @@ def _request(
     form: dict[str, str] | None = None,
     client_header: str | None = "1",
     sec_fetch_site: str | None = None,
+    origin: str | None = None,
 ) -> tuple[int, dict[str, str], str]:
-    """`client_header` defaults to `"1"` and is only sent on `POST`: every pre-existing POST test
-    in this module goes through here without knowing #535's `X-Keel-Client` layer exists, and
-    `"1"` is what a real browser's `fetch` wrapper will always send (per the design spec's
-    `api.js`), so the happy-path tests stay a faithful stand-in for that client without editing
-    each one. Tests of the new layer itself pass `client_header=None` (omitted entirely) or an
-    explicit wrong value, and `sec_fetch_site=...` to exercise that half of the check."""
+    """`client_header` defaults to `"1"` and is only sent on `POST`: it is only CHECKED on
+    `API_PREFIX` (`/api/*`), so a default of `"1"` on every POST test in this module is
+    harmless everywhere else -- ignored by `/setup/*` -- and is what a real `fetch()` client
+    would send anyway (per the design spec's `api.js`). Tests of the layer itself pass
+    `client_header=None` (omitted entirely) or an explicit wrong value against an `/api/*` path.
+
+    `sec_fetch_site` and `origin` are both unset by default; pass them to reproduce what a real
+    browser sends for a same-origin form submission -- see
+    `test_a_browser_form_post_succeeds_without_the_api_client_header`, which is the test this
+    parameter pair exists for."""
     conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
     headers = {"Host": host if host is not None else f"{cfg.host}:{cfg.port}"}
     if cookie:
@@ -98,6 +103,8 @@ def _request(
         headers["X-Keel-Client"] = client_header
     if sec_fetch_site is not None:
         headers["Sec-Fetch-Site"] = sec_fetch_site
+    if origin is not None:
+        headers["Origin"] = origin
     body = None
     if form is not None:
         body = urlencode(form)
@@ -413,48 +420,13 @@ def test_the_csrf_token_is_not_the_session_token(
     assert csrf_token(running.token) in body
 
 
-# -- the client header (#535's third CSRF layer) -----------------------------------------------
+# -- Sec-Fetch-Site (#535), checked on every POST -- /setup/* included --------------------------
 #
-# `SameSite=Strict` and the HMAC CSRF token both assume a hostile cross-origin write is
-# PREFLIGHTED -- but a plain `<form method=post>` is not, in any browser, ever. A custom request
-# header forces the preflight a form cannot trigger; a hostile origin's script could still try to
-# add the header, but doing so makes the request cross-origin-with-a-custom-header, which is
-# exactly the shape CORS preflights and which this server never answers with a matching
-# `Access-Control-Allow-*` (there is no CORS configuration at all -- see server.py's module
-# docstring). `Sec-Fetch-Site` is the second half: it cannot be set by page JavaScript at all, so
-# a wrong value (not merely a missing one -- older browsers omit the header) is real evidence of
-# a cross-origin request and is refused; a missing value is not evidence of anything.
-
-
-def test_a_write_without_the_client_header_is_refused(
-    empty_machine: web_server.ServeConfig,
-) -> None:
-    status, _headers, _body = _request(
-        empty_machine,
-        "/setup/config",
-        method="POST",
-        cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
-        client_header=None,
-    )
-    assert status == 403
-    assert not Path(empty_machine.config_path).exists()
-
-
-@pytest.mark.parametrize("value", ["0", "true", "yes", "2", ""])
-def test_a_wrong_client_header_value_is_refused(
-    empty_machine: web_server.ServeConfig, value: str
-) -> None:
-    status, _headers, _body = _request(
-        empty_machine,
-        "/setup/config",
-        method="POST",
-        cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
-        client_header=value,
-    )
-    assert status == 403, value
-    assert not Path(empty_machine.config_path).exists()
+# Unlike X-Keel-Client (below), a real browser form POST DOES carry Sec-Fetch-Site: it is Fetch
+# Metadata, set by the browser itself on every request the page initiates -- forms included --
+# and page JavaScript can neither set nor override it. That makes it load-bearing on /setup/*,
+# the write surface the shipped, script-free UI actually uses, unlike a custom header (see the
+# section after the next one), which that UI has no way to attach at all.
 
 
 def test_a_write_missing_sec_fetch_site_is_accepted(
@@ -505,21 +477,104 @@ def test_a_write_with_a_wrong_sec_fetch_site_is_refused(
     assert not Path(empty_machine.config_path).exists()
 
 
-def test_the_client_header_check_runs_before_the_csrf_check(
+# -- the browser form the shipped UI actually submits --------------------------------------------
+
+
+def test_a_browser_form_post_succeeds_without_the_api_client_header(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    """Admission (host, cookie), then this layer, then CSRF -- so a probe cannot distinguish
-    "wrong CSRF" from "missing client header" by anything other than both being 403, and the
-    cheaper check runs first."""
-    status, _headers, _body = _request(
+    """THE regression this file exists to catch, and the reason X-Keel-Client below is scoped to
+    `/api/*` rather than every POST. `render.py`'s `_action_form` emits `<form method="post"
+    action="/setup/{key}">`, and `_SECURITY_HEADERS` ships `default-src 'none'` with no
+    `script-src` at all -- there is no code path by which that form can attach a custom request
+    header. An earlier version of #535 checked `X-Keel-Client` over EVERY POST, which made this
+    request -- exactly what a real browser sends for the shipped UI's only write action -- a
+    403. Every setup action (create config, create database, seed rules, capture credentials)
+    would have been unreachable, with no terminal to fall back to on the desktop bundle.
+
+    This sends what a real browser sends for that form: the session cookie, the CSRF token
+    (`render.py` embeds it as a hidden input), `Origin` (browsers attach it to POST even for a
+    same-origin submission), and `Sec-Fetch-Site: same-origin` (Fetch Metadata, forged by
+    nothing real). Deliberately NOT `X-Keel-Client` -- the point being pinned is that nothing
+    in the shipped client ever sends it."""
+    status, headers, _body = _request(
         empty_machine,
         "/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": "not-the-token"},
+        form={"csrf": _csrf(empty_machine)},
+        client_header=None,
+        sec_fetch_site="same-origin",
+        origin=f"http://{empty_machine.host}:{empty_machine.port}",
+    )
+    assert status == 303
+    assert headers["Location"] == "/setup?ran=config"
+
+    from keel.commands.setup import inspect
+
+    state = inspect(empty_machine.config_path, empty_machine.db_path)
+    item = next(s for s in state.states if s.step.key == "config")
+    assert item.done is True
+
+
+# -- the client header (#535's third CSRF layer), scoped to API_PREFIX only ---------------------
+#
+# A custom request header is only obtainable from a `fetch()` client -- an HTML
+# `<form method=post>` cannot set one, which the section above pins directly. The shipped UI's
+# write surface IS such a form, so this check does not apply to it; #536's client will speak
+# `fetch()` over `/api/*`, which is where the check actually runs. `SameSite=Strict` and the HMAC
+# CSRF token both assume a hostile cross-origin write is PREFLIGHTED -- true for `fetch()`, never
+# true for a form -- so a custom header closes that gap specifically where a `fetch()` client
+# exists to carry it. A hostile origin's script could still try to add the header itself, but
+# doing so makes the request cross-origin-with-a-custom-header, which is exactly the shape CORS
+# preflights, and this server answers no `Access-Control-Allow-*` to any origin (there is no CORS
+# configuration at all -- see server.py's module docstring), so a hostile preflight cannot
+# succeed either.
+
+
+def test_an_api_write_without_the_client_header_is_refused(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/api/whatever",
+        method="POST",
+        cookie=_session(empty_machine),
         client_header=None,
     )
     assert status == 403
+
+
+@pytest.mark.parametrize("value", ["0", "true", "yes", "2", ""])
+def test_an_api_write_with_a_wrong_client_header_value_is_refused(
+    empty_machine: web_server.ServeConfig, value: str
+) -> None:
+    status, _headers, _body = _request(
+        empty_machine,
+        "/api/whatever",
+        method="POST",
+        cookie=_session(empty_machine),
+        client_header=value,
+    )
+    assert status == 403, value
+
+
+def test_an_api_write_with_the_client_header_reaches_the_404_not_the_403(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """No `/api/*` write surface exists yet (#533/#534); this pins that a CORRECT header clears
+    the client-header gate and lands on the same "no such action" 404 every unmapped path gets --
+    proving the check is a gate on a real path, not a black hole that also swallows valid
+    requests once one exists."""
+    status, _headers, body = _request(
+        empty_machine,
+        "/api/whatever",
+        method="POST",
+        cookie=_session(empty_machine),
+        client_header="1",
+    )
+    assert status == 404
+    assert "No such action" in body
 
 
 # -- the actions themselves, over the wire ------------------------------------------------------
@@ -801,22 +856,49 @@ def test_directory_traversal_through_the_wire_is_refused(
 def test_a_static_html_response_carries_the_new_header_set(
     running: web_server.ServeConfig,
 ) -> None:
-    """The full set from #535, on the one content type the design spec puts it on."""
+    """The full set from #535, on `text/html`. `form-action`, `base-uri` and `frame-ancestors`
+    do NOT inherit from `default-src` under CSP3 -- each defaults to "anywhere" unless named --
+    so all three are asserted individually, not just `default-src`/`connect-src`."""
     status, headers, _body = _request(running, "/static/index.html", cookie=_session(running))
     assert status == 200
     csp = headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp
     assert "connect-src 'self'" in csp
+    assert "form-action 'self'" in csp
+    assert "base-uri 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert headers["X-Frame-Options"] == "DENY"
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["Referrer-Policy"] == "no-referrer"
+    assert "no-store" in headers["Cache-Control"]
     assert "Strict-Transport-Security" not in headers
 
 
-def test_a_non_html_static_asset_carries_no_csp(
+def test_a_static_svg_response_also_carries_the_csp(
     running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Per the design spec: CSP is invalid and discouraged on anything but `text/html`. A CSS or
-    JS asset still gets `nosniff` and `Referrer-Policy` -- those are meaningful on any content
+    """SVG is active content: a same-origin `.svg` opened directly (not `<img>`-embedded, which
+    does not execute it) runs any inline `<script>` it contains in keel's own origin. Without CSP
+    on this content type too, that script runs with no policy at all."""
+    from keel.web import staticfiles
+
+    (tmp_path / "icon.svg").write_text("<svg></svg>")
+    monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
+
+    status, headers, _body = _request(running, "/static/icon.svg", cookie=_session(running))
+    assert status == 200
+    assert headers["Content-Type"] == "image/svg+xml"
+    csp = headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_a_non_html_non_svg_static_asset_carries_no_csp(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per the design spec: CSP is invalid and discouraged on anything but `text/html` (and, per
+    #535's review, `image/svg+xml` -- see the test above). A CSS or JS asset still gets
+    `nosniff`, `X-Frame-Options` and `Referrer-Policy` -- those are meaningful on any content
     type -- but no `Content-Security-Policy` header at all."""
     from keel.web import staticfiles
 
@@ -827,8 +909,10 @@ def test_a_non_html_static_asset_carries_no_csp(
     assert status == 200
     assert headers["Content-Type"] == "text/css; charset=utf-8"
     assert "Content-Security-Policy" not in headers
+    assert headers["X-Frame-Options"] == "DENY"
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["Referrer-Policy"] == "no-referrer"
+    assert "no-store" in headers["Cache-Control"]
     assert "Strict-Transport-Security" not in headers
 
 
