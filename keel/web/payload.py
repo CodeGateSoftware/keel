@@ -87,6 +87,7 @@ never appear at all: counts, timestamps and open-ended log fields all cross as s
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
@@ -199,18 +200,35 @@ def _decimalise(value: Decimal | float | None) -> Decimal | None:
     return candidate if candidate.is_finite() else None
 
 
-def _magnitude(value: Decimal, places: int) -> tuple[bool, str]:
-    """`(is_negative, unsigned_grouped_text)`.
+def _magnitude(value: Decimal, places: int) -> str:
+    """The unsigned, grouped, human-readable text for `value`.
 
-    The sign is taken off the FORMATTED string rather than off the number (`abs()`, `-value`),
-    because this layer does no arithmetic on money at all -- Rule 3 of the thinness pin, and the
-    property that makes "the browser never sees a computed figure" checkable rather than merely
-    likely. Note the sign here is the sign of the *rendered* text: a value that rounds to zero at
-    `places` still renders "0.00". The `state` a caller attaches is derived from the exact
-    `Decimal` instead, so a `-0.001` P&L is still labelled a loss.
+    The sign is stripped here and decided elsewhere -- by `_is_negative` below, from the exact
+    `Decimal` -- so that ONE reading of the sign feeds both the displayed glyph and the `state`.
+
+    The first draft read the sign off this formatted string instead, and the two readings could
+    disagree: `format(Decimal("-0.00"), ",.2f")` is `"-0.00"`, so the display said `−$0.00` while
+    `state` said `neutral`, because `Decimal("-0.00") == 0`. A client styling by `state` and
+    showing `display` would then have printed a minus sign in a neutral colour -- a small thing,
+    but Rule 3's whole premise is that the two never disagree, and a premise with one exception
+    is not a premise.
+
+    Stripping rather than negating is still deliberate: `abs()`/`-value` would be arithmetic on
+    money in this layer, which Rule 3 of the thinness pin forbids outright.
     """
-    text = format(value, f",.{places}f")
-    return text.startswith("-"), text.lstrip("-")
+    return format(value, f",.{places}f").lstrip("-")
+
+
+def _is_negative(value: Decimal) -> bool:
+    """THE reading of a money value's sign, for both the glyph and the state.
+
+    A comparison, not arithmetic. Negative zero is NOT negative here -- `Decimal("-0.00") == 0` --
+    which is the whole point of having one reading: a value that is not negative never displays a
+    minus. A value that IS negative but rounds to `0.00` at the requested precision still shows
+    its minus, and (when the field is a gain/loss) still reads `bad`; the two agree, which is what
+    matters.
+    """
+    return value < 0
 
 
 def _trim(text: str) -> str:
@@ -232,8 +250,41 @@ def _sign_state(value: Decimal) -> str:
     return NEUTRAL
 
 
-def stringify(value: Any) -> str:
-    """Any open-ended value, as a JSON string.
+#: How deep `stringify` will follow a nested structure before giving up.
+#:
+#: Log fields are shallow by construction -- each one is a `log_event` kwarg -- so six levels is
+#: already generous. The cap exists so that the depth of a value parsed from a line keel did not
+#: write cannot decide how deep this process recurses: `json.loads` cannot build a cycle, but it
+#: can build a thousand nested lists, and a `RecursionError` while rendering a log line would take
+#: down the whole response for a row nobody needed.
+_MAX_NESTING = 6
+
+#: What a value too deep to render shows as. A marker, not the raw structure: this layer's job is
+#: to hand the client something it can display, and "there is more here than we will render" is a
+#: displayable fact where a truncated Python repr is not.
+_TOO_DEEP = "(nested)"
+
+
+def _normalise(value: Any, depth: int = 0) -> Any:
+    """A JSON-safe mirror of `value` with every SCALAR already rendered as a string.
+
+    Structure is kept (a list stays a list, an object stays an object) so the shape a log line
+    recorded survives; only the leaves change. Because every leaf is already a string by the time
+    `json.dumps` sees it, no encoder is needed -- which matters more than it looks: the encoder a
+    hurried author reaches for is `default=float`, and that single keyword is the whole contract
+    dying quietly. Rule 6d of `test_console_thinness.py` fails the build on it.
+    """
+    if depth >= _MAX_NESTING:
+        return _TOO_DEEP
+    if isinstance(value, Mapping):
+        return {str(key): _normalise(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalise(item, depth + 1) for item in value]
+    return stringify(value, _depth=depth)
+
+
+def stringify(value: Any, *, _depth: int = 0) -> str:
+    """Any open-ended value, as ONE display string.
 
     Used for the two places keel's own reports carry values of unconstrained type:
     `ActivityEvent.fields` (every `log_event` call site invents its own kwargs, and the parser
@@ -244,6 +295,20 @@ def stringify(value: Any) -> str:
 
     Booleans render as `"true"`/`"false"` rather than Python's `"True"`/`"False"`: the reader is
     JavaScript.
+
+    **A nested value crosses as JSON text, never as a Python repr.** `ActivityEvent.fields` is
+    parsed out of the engine's own log lines, so a value can be a list or an object, and the
+    obvious `str(value)` produced `"{'a': 1, 'b': None}"` -- single quotes, `None`, `True`: text
+    no client can parse and none should display. Worse, `str([1e+50])` is `"[1e+50]"`, which puts
+    scientific notation on the wire through a path no money field touches, so none of the Decimal
+    care taken elsewhere in this file would have caught it. The structure is normalised leaf by
+    leaf through this same function first, so the numbers inside a nested value are rendered by
+    exactly the rules the top-level ones are, and only then dumped as JSON.
+
+    Flattened to a string rather than kept as a nested object because of Rule 2: an open-ended
+    structure handed to the client is a structure the CLIENT has to decide how to format, and
+    deciding how to format is what this layer exists to do instead. The activity view places one
+    string per field.
     """
     if value is None:
         return ""
@@ -253,7 +318,16 @@ def stringify(value: Any) -> str:
         return _plain(value) if value.is_finite() else str(value)
     if isinstance(value, float):
         decimalised = _decimalise(value)
+        # A non-finite float has no decimal form at all; `str` gives "nan"/"inf", which is at
+        # least a word rather than a number a client would try to read as one.
         return _plain(decimalised) if decimalised is not None else str(value)
+    if isinstance(value, (Mapping, list, tuple)):
+        if _depth >= _MAX_NESTING:
+            return _TOO_DEEP
+        # Plain `json.dumps`: `_normalise` has already turned every leaf into a string, so there
+        # is nothing left for an encoder to convert. `ensure_ascii=False` because the payload is
+        # UTF-8 and a product id or rule name has no business becoming an escape sequence.
+        return json.dumps(_normalise(value, _depth), ensure_ascii=False)
     return str(value)
 
 
@@ -312,7 +386,7 @@ def money(
     figure = _decimalise(value)
     if figure is None:
         return absent()
-    negative, magnitude = _magnitude(figure, places)
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
     if signed and figure != 0:
         glyph = DOWN if negative else UP
         sign = MINUS if negative else "+"
@@ -336,7 +410,7 @@ def quantity(value: Decimal | None, *, unit: str = "", places: int = 8) -> Field
     figure = _decimalise(value)
     if figure is None:
         return absent()
-    negative, magnitude = _magnitude(figure, places)
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
     trimmed = _trim(magnitude)
     display = f"{MINUS}{trimmed}" if negative else trimmed
     if unit:
@@ -359,7 +433,7 @@ def percent(
     figure = _decimalise(value)
     if figure is None:
         return absent()
-    negative, magnitude = _magnitude(figure, places)
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
     if signed and figure != 0:
         glyph = DOWN if negative else UP
         sign = MINUS if negative else "+"
@@ -391,7 +465,7 @@ def ratio(
     figure = _decimalise(value)
     if figure is None:
         return absent()
-    negative, magnitude = _magnitude(figure, places)
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
     if signed and figure != 0:
         glyph = DOWN if negative else UP
         sign = MINUS if negative else "+"
@@ -832,15 +906,23 @@ _OUTCOME_STATES: Mapping[str, str] = {"win": GOOD, "loss": BAD, "dca": NEUTRAL, 
 def journal_payload(report: JournalReport) -> dict[str, Any]:
     """`build_journal_report`'s `JournalReport`, as JSON.
 
-    `total_count` is the full filtered count BEFORE `--limit` truncated `entries`; both cross, so
-    a client showing "50 of 812" needs no subtraction to know it is looking at a page.
+    `total_count` is the full filtered count BEFORE `--limit` truncated `entries`, and
+    `shown_count` is how many survived; both cross, so a client showing "50 of 812" needs no
+    subtraction to know it is looking at a page.
+
+    `shown_count` is READ from the report, never measured here. It shipped in the first draft as
+    `count(len(report.entries))`, which is a figure `JournalReport` did not hold -- numerically
+    harmless, since a list length is exact, but a breach of the rule this module claims to keep,
+    and one whose guard passed only by coincidence (the fixture happened to set
+    `total_count == len(entries)`). It is now a property of the report, and Rule 6e of
+    `test_console_thinness.py` bans `len()` here so the shortcut cannot be taken again.
     """
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
         "mode": report.mode,
         "total_count": count(report.total_count),
-        "shown_count": count(len(report.entries)),
+        "shown_count": count(report.shown_count),
         # The query echoed back. Open-ended by shape (`limit` and `since_ts` are ints), so it
         # crosses as strings -- see `stringify`.
         "filters": {str(key): stringify(value) for key, value in sorted(report.filters.items())},

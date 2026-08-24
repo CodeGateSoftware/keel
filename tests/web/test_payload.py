@@ -215,7 +215,12 @@ def _journal_report(**overrides: Any) -> JournalReport:
                 outcome="dca",
             ),
         ],
-        total_count=2,
+        # Deliberately NOT `len(entries)`. `total_count` is the pre-`--limit` count, so a real
+        # report almost always has more of them than it carries entries -- and while these two
+        # were equal, `test_the_serialiser_computes_nothing...` passed over a `shown_count` the
+        # serialiser had measured with `len()` rather than read, because `Decimal(2)` happened to
+        # be on the report already. A guard that passes on a coincidence is not a guard.
+        total_count=812,
         filters={
             "rule": None,
             "asset": None,
@@ -249,7 +254,15 @@ def _activity_feed(**overrides: Any) -> ActivityFeed:
                 level="INFO",
                 event="cycle_start",
                 cycle_id="c-1",
-                fields={"products": 1, "budget_usd": Decimal("50.00"), "dry_run": True},
+                fields={
+                    "products": 1,
+                    "budget_usd": Decimal("50.00"),
+                    "dry_run": True,
+                    # Structured values: a log line is parsed JSON, so a field can be a list or
+                    # an object. `str()` would render these as Python reprs.
+                    "symbols": ["BTC-USD", "ETH-USD"],
+                    "limits": {"max": 1e50, "min": None, "on": False},
+                },
             ),
         ),
         events_dropped=3,
@@ -407,6 +420,23 @@ def test_scientific_notation_never_reaches_the_wire() -> None:
     assert payload.money(Decimal("1E-9"), places=9)["display"] == "$0.000000001"
 
 
+def test_scientific_notation_cannot_reach_the_wire_through_an_open_ended_field_either() -> None:
+    """The same hazard by the other road.
+
+    The test above only feeds Decimals through NAMED report fields, so it can say nothing about
+    `ActivityEvent.fields` and `JournalReport.filters` -- the two places a value of unconstrained
+    type crosses. Those took a `str(value)` fallback in the first draft, and `str(1e+50)` is
+    `"1e+50"`: an exponent on the wire that every `Decimal` precaution in the module was
+    irrelevant to, because no `Decimal` was involved.
+    """
+    hazards = [1e50, 1e-30, Decimal("5E+1"), [1e50], {"deep": [{"deeper": 1e-30}]}]
+
+    for value in hazards:
+        rendered = payload.stringify(value)
+        assert "e+" not in rendered and "e-" not in rendered, (value, rendered)
+        assert "E+" not in rendered and "E-" not in rendered, (value, rendered)
+
+
 # -- Rule 2: the serialiser computes nothing ------------------------------------------------------
 
 
@@ -443,6 +473,19 @@ def _report_figures(node: Any, seen: set[int] | None = None) -> set[Decimal]:
         out = set()
         for name in fields:
             out |= _report_figures(getattr(node, name), seen)
+        # PROPERTIES count as figures the report returns, exactly as fields do. A frozen report
+        # here derives some of its readings from its own data rather than storing them --
+        # `ActivityCycle.is_quiet`/`.key` and `JournalReport.shown_count` are the established
+        # pattern -- and a stored duplicate of a derived reading is state that can drift out of
+        # agreement with what it describes. What matters for this guard is that the REPORT vouches
+        # for the figure, not which side of a `@property` it was written on.
+        for name, attribute in vars(type(node)).items():
+            if not isinstance(attribute, property):
+                continue
+            try:
+                out |= _report_figures(getattr(node, name), seen)
+            except Exception:  # pragma: no cover - a property that raises is not a figure
+                continue
         return out
     return set()
 
@@ -545,6 +588,75 @@ def test_state_survives_without_colour() -> None:
 
     assert entries[0]["pnl"]["display"] == "▼ −$12.34"
     assert entries[1]["pnl"]["display"] == "▲ +$41.00"
+
+
+def test_the_displayed_sign_and_the_state_never_disagree() -> None:
+    """Rule 3's premise, checked rather than assumed: if `display` shows a minus, `state` must not
+    be calling the same value neutral.
+
+    It failed on negative zero. `format(Decimal("-0.00"), ",.2f")` is `"-0.00"`, so a sign read
+    off the formatted TEXT said negative while `state`, read off the exact value, said neutral --
+    `Decimal("-0.00") == 0`. A client styling by `state` and showing `display` printed a minus
+    sign in a neutral colour. There is now one reading of the sign, `_is_negative`, feeding both.
+
+    A value that is genuinely negative but rounds to zero at the display precision keeps its
+    minus, and keeps `bad` alongside it. That is not a disagreement: it is a small loss, honestly
+    labelled and honestly styled.
+    """
+    cases = [
+        Decimal("-0.00"),
+        Decimal("0.00"),
+        Decimal("-0.001"),
+        Decimal("-12.34"),
+        Decimal("41.00"),
+        Decimal("0E-8"),
+    ]
+
+    for value in cases:
+        field = payload.money(value, signed=True)
+        shows_negative = payload.MINUS in field["display"] or payload.DOWN in field["display"]
+        assert shows_negative == (field["state"] == "bad"), (value, field)
+
+        unsigned = payload.money(value)
+        assert (payload.MINUS in unsigned["display"]) == (value < 0), (value, unsigned)
+
+
+def test_negative_zero_is_not_negative_anywhere_it_is_rendered() -> None:
+    """`Decimal("-0.00")` is zero, and every builder that renders a sign must agree."""
+    assert payload.money(Decimal("-0.00"))["display"] == "$0.00"
+    assert payload.money(Decimal("-0.00"), signed=True)["state"] == "neutral"
+    assert payload.percent(Decimal("-0.00"))["display"] == "0.00%"
+    assert payload.ratio(Decimal("-0.00"))["display"] == "0.00"
+    assert payload.quantity(Decimal("-0.00"))["display"] == "0"
+    # ...and the exact value still crosses untouched: nothing was normalised away to achieve it.
+    assert payload.money(Decimal("-0.00"))["value"] == "-0.00"
+
+
+def test_a_loss_too_small_to_show_keeps_its_sign_and_its_judgement() -> None:
+    """The other side of the same rule. `-0.001` at two places renders `0.00`, and suppressing the
+    minus there would report a loss as a break-even. It shows, and `state` agrees."""
+    field = payload.money(Decimal("-0.001"), signed=True)
+
+    assert field["display"] == "▼ −$0.00"
+    assert field["state"] == "bad"
+    assert field["value"] == "-0.001"
+
+
+def test_shown_count_is_read_from_the_report_not_measured_here() -> None:
+    """The count of rows a journal page carries is `JournalReport.shown_count`, a reading the
+    report makes about itself -- not `len(entries)` measured by the serialiser.
+
+    The distinction is invisible in the number (a list length is exact) and that is exactly the
+    problem: the runtime "computes nothing" guard compares FIGURES, so it cannot tell a measured
+    length from a read one when they coincide. Rule 6e of `test_console_thinness.py` bans `len()`
+    in the serialiser for that reason, and this pins the pair a client needs to say "2 of 812"
+    without subtracting anything.
+    """
+    built = payload.journal_payload(_journal_report())
+
+    assert built["total_count"]["value"] == "812"
+    assert built["total_count"]["display"] == "812"
+    assert built["shown_count"]["value"] == "2"
 
 
 def test_every_field_carries_all_three_keys_always() -> None:
@@ -684,7 +796,49 @@ def test_the_activity_feed_stringifies_the_open_ended_event_fields() -> None:
     known field: they cross as strings."""
     event = payload.activity_payload(_activity_feed())["cycles"][0]["events"][0]
 
-    assert event["fields"] == {"products": "1", "budget_usd": "50.00", "dry_run": "true"}
+    assert event["fields"]["products"] == "1"
+    assert event["fields"]["budget_usd"] == "50.00"
+    assert event["fields"]["dry_run"] == "true"
+
+
+def test_a_nested_log_field_crosses_as_json_never_as_a_python_repr() -> None:
+    """A log line is parsed JSON, so a field's value can be a list or an object.
+
+    The first draft fell through to `str(value)` for those, which produced `"{'a': 1, 'b': None}"`
+    -- single quotes, `None`, `True`. No JSON number leaks out of that (it is one string), so the
+    recursive number-walker stayed green while the payload carried text no client can parse and
+    none should display. Rule 2 says values arrive presentation-ready, and a Python repr is not.
+
+    The numbers INSIDE a nested value go through the same rendering as a top-level one, which is
+    the half that actually bites: `str([1e+50])` is `"[1e+50]"` -- scientific notation reaching
+    the wire through a path no money field touches, so every `Decimal` precaution in the module
+    would have been irrelevant to it.
+    """
+    fields = payload.activity_payload(_activity_feed())["cycles"][0]["events"][0]["fields"]
+
+    assert fields["symbols"] == '["BTC-USD", "ETH-USD"]'
+    assert fields["limits"] == (
+        '{"max": "100000000000000000000000000000000000000000000000000",'
+        ' "min": "", "on": "false"}'
+    )
+    assert "1e+50" not in fields["limits"]
+    assert "'" not in fields["limits"] and "None" not in fields["limits"]
+
+
+def test_a_pathologically_nested_log_field_cannot_recurse_the_response_to_death() -> None:
+    """Depth in a log line is attacker-adjacent input: `json.loads` cannot build a cycle, but it
+    can build a thousand nested lists, and a `RecursionError` while rendering one field would take
+    down a whole response for a row nobody needed. Log fields are shallow by construction -- each
+    is a `log_event` kwarg -- so the cap costs nothing real and the depth of the input never
+    decides how deep this process goes."""
+    deep: Any = "bottom"
+    for _ in range(200):
+        deep = [deep]
+
+    rendered = payload.stringify(deep)
+
+    assert "(nested)" in rendered
+    assert "bottom" not in rendered
 
 
 def test_the_journal_filters_cross_as_strings_too() -> None:

@@ -46,15 +46,17 @@ layer, and one (#533) scoped to the JSON serialiser:
 * **Rule 6 -- the serialisation contract** (issue #533), scoped to the module that turns the
   frozen reports into the browser's JSON (`SERIALISER_STEMS`). That module is the one place in
   this layer whose output is a machine-readable MONEY contract rather than a screen, so it
-  carries one extra pin over the four ways the `Decimal`-only guarantee dies at that boundary:
+  carries one extra pin over the five ways the `Decimal`-only guarantee dies at that boundary:
   `Decimal.normalize()` (which renders `Decimal("50")` as `Decimal("5E+1")` -- a form that has
   reached the wire in this codebase before and broken real orders), `float()` on anything but a
-  timestamp, `round()`, and `json.dumps(..., default=float)`, which is one keyword and looks like
-  a helpful fix for the `TypeError` a `Decimal` raises. Rules 1-5 already cover the serialiser as
-  a member of `keel/web/`; this covers what is specific to it. The runtime half of the same
-  contract -- a recursive walk over the real payload asserting that no JSON number appears
-  anywhere in it -- lives in `tests/web/test_payload.py`. An AST rule and a walk over the output
-  fail for different reasons and neither subsumes the other, which is why both exist.
+  timestamp, `round()`, `json.dumps(..., default=float)` (one keyword, and it looks like a
+  helpful fix for the `TypeError` a `Decimal` raises), and `len()` -- the quiet way a serialiser
+  starts producing counts of its own instead of reading ones the report holds. Rules 1-5 already
+  cover the serialiser as a member of `keel/web/`; this covers what is specific to it. The
+  runtime half of the same contract -- a recursive walk over the real payload asserting that no
+  JSON number appears anywhere in it -- lives in `tests/web/test_payload.py`. An AST rule and a
+  walk over the output fail for different reasons and neither subsumes the other, which is why
+  both exist.
 
 The allowlists are deliberately entry-scoped (module + enclosing function + callee), so
 an allowance cannot leak to a new call site: the same callee at a different place, or a
@@ -536,7 +538,8 @@ def _rule6_findings(
 
         # 6d -- json.dumps(..., default=float). `json.dumps` raises a TypeError on a Decimal,
         # and `default=float` is the one-keyword fix that silently converts every money value in
-        # the payload to a double. The serialiser returns plain types and dumps nothing itself.
+        # the payload to a double. A PLAIN `json.dumps` is fine and is used: the serialiser
+        # normalises every leaf to a string first, so it needs no encoder.
         if name in ("json.dumps", "json.dump"):
             for keyword in node.keywords:
                 if keyword.arg in ("default", "cls"):
@@ -546,6 +549,21 @@ def _rule6_findings(
                         f"{node.lineno}) -- a custom encoder is how every Decimal in the "
                         "payload becomes a double in one keyword",
                     )
+
+        # 6e -- len(). A count on the wire must be one the REPORT holds, and `len()` is how a
+        # serialiser quietly starts producing its own. The first draft of `journal_payload`
+        # shipped `count(len(report.entries))`; it is numerically exact, which is precisely why
+        # the runtime "computes nothing" guard could not be relied on to catch it -- that guard
+        # compares figures, and a list length can coincide with one the report already holds.
+        # An AST ban does not care about the coincidence. `JournalReport.shown_count` is where
+        # that figure belongs, and any future count needs the same treatment upstream (or an
+        # entry-scoped allowance here, in RULE6_FLOAT_ALLOWLIST's shape, with its reasoning).
+        if name == "len":
+            found.add(
+                "rule6_serialisation",
+                f"{stem}:{owner}: calls len() (line {node.lineno}) -- a count on the wire "
+                "must be one the report already holds; add it to the report builder",
+            )
     return found
 
 
@@ -621,12 +639,13 @@ def test_rule_6_is_proven_false_capable() -> None:
         "import json\n"
         "def _gmt(ts, fmt):\n"
         "    return float(ts)\n"
-        "def bad(price, payload):\n"
+        "def bad(price, payload, rows):\n"
         "    a = price.normalize()\n"
         "    b = float(price)\n"
         "    c = round(price, 2)\n"
         "    d = json.dumps(payload, default=float)\n"
-        "    return a, b, c, d\n"
+        "    e = len(rows)\n"
+        "    return a, b, c, d, e\n"
     )
     tree = ast.parse(snippet)
     owners = _enclosing_functions(tree)
@@ -635,11 +654,12 @@ def test_rule_6_is_proven_false_capable() -> None:
         "rule6_serialisation", []
     )
 
-    assert len(messages) == 4, messages
+    assert len(messages) == 5, messages
     assert any(".normalize()" in m for m in messages)
     assert any("float(price)" in m for m in messages)
     assert any("round()" in m for m in messages)
     assert any("default=" in m for m in messages)
+    assert any("len()" in m for m in messages)
     assert not any(":_gmt:" in m for m in messages), messages
 
 

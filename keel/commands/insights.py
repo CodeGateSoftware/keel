@@ -90,6 +90,23 @@ class JournalReport:
     """The full filtered (closed) entry count BEFORE `--limit` truncates for display."""
     filters: dict[str, Any]
 
+    @property
+    def shown_count(self) -> int:
+        """How many entries this report actually carries, after `--limit` truncated.
+
+        A derived reading rather than a stored field, for the reason `ActivityCycle.key` and
+        `.is_quiet` are: a second field holding `len(self.entries)` is state that can drift out of
+        agreement with the list it describes, and there is nothing to gain by letting it.
+
+        It lives HERE rather than in a front-end because `total_count` alone does not answer "am I
+        looking at a page"; the pair does, and the pair is the report's statement about itself.
+        Every renderer -- the CLI's lines, the HTML, `keel/web/payload.py`'s JSON -- reads it
+        instead of measuring the list again, so none of them can disagree about how many rows the
+        same report held. `asdict()` does not include properties, so `--json`'s shape is
+        unchanged.
+        """
+        return len(self.entries)
+
 
 @dataclass(frozen=True)
 class GateDistance:
