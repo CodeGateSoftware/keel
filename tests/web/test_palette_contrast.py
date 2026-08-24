@@ -36,7 +36,7 @@ _AA_UI_BOUNDARY_MIN = 3.0
 
 #: Minimum acceptable `|luminance(good) - luminance(bad)|`, pinned per theme rather than
 #: globally, because a single shared floor cannot do both jobs at once: the light theme's fixed
-#: delta (measured 0.0681) is much smaller than the dark theme's (measured 0.2382), since light
+#: delta (measured 0.0319) is much smaller than the dark theme's (measured 0.2382), since light
 #: mode keeps both colours near the dark end of the scale to hold AAA against a near-white
 #: background, while dark mode has the whole upper half of the scale to spread them across.
 #: A shared floor high enough to catch a regressed DARK pair would reject a compliant LIGHT
@@ -49,10 +49,52 @@ _AA_UI_BOUNDARY_MIN = 3.0
 #: `test_no_text_pair_grade_drops_below_its_pinned_floor` exists separately below -- an earlier
 #: draft of this fix hit 0.0663/0.1984, clearing tighter floors than these, while moving `good`
 #: and `bad` the wrong way and losing three AAA grades in the process.
-_MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.06, "dark": 0.2}
+#:
+#: The light floor drops from 0.06 to 0.025 in a later revision, because 0.06 was reached by
+#: `--bad: #4d1711` (luminance 0.0223), which is AAA against `--bg`/`--card` and far from
+#: `--good` but sits almost on top of `--fg` (`#1c1b19`, luminance 0.0110) -- see
+#: `_MIN_SIGNAL_FG_RATIO` below, added for exactly that regression. `--good` (0.0904) already
+#: occupies nearly the only luminance band that is both AAA-against-`--bg` and clearly separated
+#: from `--fg`; there is no second such value far enough from `--good` to also hit a 0.06 delta.
+#: `--bad` settles at `#7b2915` (luminance 0.0585, delta 0.0319 from `--good`) as the best
+#: available balance of the three constraints at once (AAA, good/bad separation, fg
+#: separation) -- still 29x the original 0.0011 collision, no longer a second collision of its
+#: own.
+_MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.025, "dark": 0.2}
+
+#: Minimum acceptable contrast between a signal token (`good`, `bad`, `warn`) and `--fg`,
+#: pinned per theme. This is a DIFFERENT collision from the one `_MIN_GOOD_BAD_LUMINANCE_DELTA`
+#: guards: that one is good-vs-bad; this one is either-of-them-vs-the-body-text-colour every
+#: unhighlighted table cell renders in. A signal token that drifts too close to `--fg` is
+#: indistinguishable from a neutral cell in greyscale, on e-ink, or for a red-green
+#: colour-deficient reader -- discovered when a draft of the good/bad fix picked
+#: `--bad: #4d1711` (light), which cleared AAA against `--bg`/`--card` and a healthy delta from
+#: `--good`, but landed at 1.19:1 against `--fg` (`#1c1b19`), down from `#96322a`'s original
+#: 2.28:1. The floors below are NOT the pre-#532 values themselves -- `--good` (0.0904) already
+#: sits at nearly the only luminance simultaneously AAA-against-`--bg` and far from `--fg`
+#: (0.0110), which is why the original `--bad` (0.0893) read as 2.28:1 against `--fg` in the
+#: first place: it was almost exactly as close to `--good` as it is far from `--fg`, i.e. the
+#: same coincidence that caused the bug this issue fixes. There is no light `--bad` that is
+#: simultaneously AAA, well-separated from `--good`, AND as far from `--fg` as the original
+#: was. The floors instead sit with margin under what THIS palette actually reaches -- light
+#: 1.7 (measured minimum 1.78, at `--bad`), dark 1.4 (measured minimum 1.45, at `--good`,
+#: see render.py's dark `:root` comment) -- high enough to reject the 1.19:1 regression that
+#: prompted this test, low enough to admit the corrected palette.
+_MIN_SIGNAL_FG_RATIO = {"light": 1.7, "dark": 1.4}
+
+_SIGNAL_TOKENS = ("good", "bad", "warn")
 
 _HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
 _VAR_RE = re.compile(r"--([a-z-]+):\s*(#[0-9a-fA-F]{6})")
+
+#: `_STYLE`'s own comments document rejected hex values in exactly the form a real declaration
+#: takes -- `` `--bad: #96322a` `` inside a `/* ... */` block, prose around it notwithstanding
+#: -- so `_VAR_RE` must never see comment text, only real declarations. It parses correctly
+#: today only because none of the current comments happen to spell a rejected value with a
+#: colon directly after the token name; that is luck, not a guarantee, and `dict.__setitem__`
+#: via a dict comprehension keeps whichever match comes LAST, so a future comment written this
+#: way would poison the parse silently rather than raising.
+_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 #: Every token render.py's stylesheet declares text or UI-boundary colour with, in both themes.
 _EXPECTED_TOKENS = {
@@ -87,6 +129,12 @@ def _contrast_ratio(hex_a: str, hex_b: str) -> float:
 def _theme_palette(css: str, *, dark: bool) -> dict[str, str]:
     """The `--token: #hex;` declarations for one theme, keyed by token name (no `--`).
 
+    `/* ... */` comments are stripped FIRST, over the whole stylesheet, before either block is
+    located or `_VAR_RE` runs over it -- `_STYLE`'s comments live inside the `:root` braces and
+    document rejected hex values in prose, so leaving them in place risks `_VAR_RE` matching a
+    rejected value quoted in a comment instead of the real declaration (see `_COMMENT_RE`'s own
+    note above).
+
     Light mode is the first bare `:root { ... }` block -- matching `:root\\s*{` skips the
     adjacent `:root:not([data-theme="light"]) { color-scheme: light dark; }` rule, which has
     a `:not(...)` between `:root` and `{` and so never matches. Dark mode is the `:root:not(
@@ -94,6 +142,7 @@ def _theme_palette(css: str, *, dark: bool) -> dict[str, str]:
     that selector specifically (rather than "the second `:root` block") is what keeps this
     parser from silently reading the wrong block if a rule is inserted between them later.
     """
+    css = _COMMENT_RE.sub("", css)
     if dark:
         dark_css = css[css.index("@media") :]
         block = re.search(r':root:not\(\[data-theme="light"\]\)\s*\{([^}]*)\}', dark_css)
@@ -167,6 +216,42 @@ def test_good_and_bad_differ_in_luminance_not_only_hue() -> None:
             f"{theme_name} good/bad luminance delta is {delta:.4f}, below the {floor} floor "
             "-- profit and loss are distinguishable by hue alone again"
         )
+
+
+def test_signal_tokens_stay_distinguishable_from_fg() -> None:
+    """A second, DIFFERENT collision from the good/bad one above: `good`, `bad` and `warn` are
+    the only colours rendered over `--fg` (every unhighlighted table cell), so a signal token
+    that drifts too close to `--fg` reads the same as ordinary text -- a loss that looks like
+    a neutral row -- once colour is removed (greyscale, e-ink, a red-green colour-deficient
+    reader). Caught in review: a draft of the good/bad separation fix picked light
+    `--bad: #4d1711`, which passed every OTHER test in this file (AAA against `--bg`/`--card`,
+    a healthy delta from `--good`) while landing at 1.19:1 against `--fg` -- effectively a
+    second version of the exact bug #532 exists to fix, just against a different token. See
+    `_MIN_SIGNAL_FG_RATIO` for why its floors are informed by, but not equal to, the pre-#532
+    ratios."""
+    for theme_name, palette in zip(("light", "dark"), _load_themes()):
+        floor = _MIN_SIGNAL_FG_RATIO[theme_name]
+        for token in _SIGNAL_TOKENS:
+            ratio = _contrast_ratio(palette[token], palette["fg"])
+            assert ratio >= floor, (
+                f"{theme_name} --{token} on --fg is {ratio:.2f}:1, below the {floor}:1 floor "
+                "-- a signal colour is becoming indistinguishable from ordinary body text"
+            )
+
+
+def test_comment_text_does_not_poison_the_parsed_palette() -> None:
+    """Proves `_theme_palette`'s comment-stripping fix (`_COMMENT_RE`) actually works: a
+    synthetic stylesheet with a comment that quotes a rejected value in exactly the
+    `` `--bad: #hex` `` shape a real rejected-alternative note would use must not leak that
+    value into the parsed palette -- the real declaration on the line below must win."""
+    css = """
+    :root {
+      /* REJECTED: --bad: #000000 would be the wrong choice here. */
+      --bg: #fbfaf8; --fg: #1c1b19; --bad: #7b2915; --good: #1f5f4f;
+    }
+    """
+    palette = _theme_palette(css, dark=False)
+    assert palette["bad"] == "#7b2915"
 
 
 def test_accent_is_not_good() -> None:
