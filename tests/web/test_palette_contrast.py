@@ -248,13 +248,14 @@ def _grade(ratio: float) -> str:
 #: #532 and #532 does not touch them -- this table is not a claim that AA is good enough for
 #: the palette in general, only a record of what each pair actually reaches today.
 #:
-#: The one AA entry #532 itself introduces is dark `--accent` on `--card` (was AAA at 7.83:1,
-#: back when `--accent` was byte-identical to `--good`): splitting the token to fix the
-#: hyperlink/gain collision cost this one grade, because the pairing that actually renders --
-#: button text, `color: var(--card)` on `background: var(--accent)` -- needs `--accent` to read
-#: as blue, and darkening it further into AAA-on-card territory pushes its hue toward `--bad`'s
-#: red-brown register instead. Accepted deliberately; see the dark `:root` block's comment in
-#: render.py for the fuller trade-off.
+#: Every entry is AAA except `muted` and `warn` (pre-existing AA, untouched by #532). An earlier
+#: draft pinned dark `--accent`/`--card` at AA (`#7aa8e0`, 6.92:1), on the reasoning that
+#: reaching AAA meant darkening `--accent` toward `--bad`'s hue -- which repeated the same
+#: directional error the `good`/`bad` fix exists to correct: in dark mode, darkening moves
+#: TOWARD the background and only loses contrast, it does not shift hue. `--accent` had the
+#: same headroom `--good` did; LIGHTENING it to `#86b1e5` reaches AAA on both surfaces (8.22:1
+#: `--bg`, 7.68:1 `--card`) with the blue hue intact, so there is no exception left to record
+#: here.
 _GRADE_FLOOR: dict[str, dict[str, dict[str, str]]] = {
     "light": {
         "bg": {
@@ -269,7 +270,7 @@ _GRADE_FLOOR: dict[str, dict[str, dict[str, str]]] = {
             "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AAA", "bad": "AA", "good": "AAA",
         },
         "card": {
-            "fg": "AAA", "muted": "AA", "accent": "AA", "warn": "AAA", "bad": "AA", "good": "AAA",
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AAA", "bad": "AA", "good": "AAA",
         },
     },
 }
@@ -291,9 +292,10 @@ def test_no_text_pair_grade_drops_below_its_pinned_floor() -> None:
 
     This test pins the GRADE, not just the ratio, for every text pair in `_GRADE_FLOOR` and
     fails if a future edit -- including a well-intentioned separation fix like #532's own first
-    draft -- lowers one without updating the floor and stating why, the same way the dark
-    `--accent`/`--card` entry above already does for the one grade this issue's accepted fix
-    deliberately spends.
+    draft, or a later one that repeats the same directional mistake for a third token
+    (`--accent` was darkened toward dark mode's background before it was correctly lightened
+    away from it) -- lowers a grade without updating the floor and stating why. Every entry is
+    pinned at AAA except `muted` and `warn`, pre-existing AA choices this issue does not touch.
     """
     light, dark = _load_themes()
     for theme_name, palette in (("light", light), ("dark", dark)):

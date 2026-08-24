@@ -93,16 +93,25 @@ _STYLE = """
        draft rejected above, for the same reason: `--bad` is already sitting on the AA floor it
        cannot afford to spend, while `--good` has AAA headroom to give.
 
-       `--accent` gets its own blue, `#7aa8e0`, distinct from `--good` (green) and `--bad`
-       (salmon) as in light mode: 7.41:1 on `--bg` (AAA). On `--card` it is 6.92:1 -- AA, not
-       AAA, the one grade this split does spend, because the pairing that actually renders is
-       button text (`color: var(--card)` on `background: var(--accent)`), and pushing `--accent`
-       further into AAA-on-card territory pushes its hue out of blue and toward `--bad`'s
-       red-brown register. Accepted deliberately, recorded as the `dark`/`card`/`accent` entry
-       in `_GRADE_FLOOR` in tests/web/test_palette_contrast.py, rather than left to be
-       rediscovered as a silent regression. */
+       `--accent` gets its own blue, distinct from `--good` (green) and `--bad` (salmon) as
+       in light mode -- separated from `--good` by HUE, not luminance (their luminance delta is
+       0.125, and that is fine: only `--good`/`--bad` need a luminance floor, because that pair
+       is what a red-green colour-deficient reader cannot otherwise tell apart; blue-against-
+       green carries no such risk, so no luminance floor is pinned between `--accent` and
+       `--good`). `#7aa8e0` was tried first and clears AAA on `--bg` (7.41:1) but only AA on
+       `--card` (6.92:1) -- the pairing that actually renders as button text
+       (`color: var(--card)` on `background: var(--accent)`).
+
+       REJECTED: darkening `#7aa8e0` further to try to reach AAA on `--card`. This repeats the
+       exact mistake the `--good`/`--bad` fix above exists to avoid: dark mode's background is
+       dark, so darkening a colour moves it TOWARD the background and loses contrast, not
+       toward some other hue -- darkening a blue keeps it blue, it just gets less readable.
+       `--accent` has headroom to spend the same way `--good` did: LIGHTENING it moves away
+       from `--bg` and gains contrast on both surfaces at once. `#86b1e5` -- lighter, still
+       unmistakably blue -- reaches 8.22:1 on `--bg` and 7.68:1 on `--card`, AAA on both, with
+       zero grades spent anywhere in either theme. */
     --bg: #16150f; --fg: #ecead5; --muted: #9a968a; --line: #2f2d25;
-    --card: #1d1c15; --accent: #7aa8e0; --warn: #d9a441; --bad: #e07a6a; --good: #83d3b2;
+    --card: #1d1c15; --accent: #86b1e5; --warn: #d9a441; --bad: #e07a6a; --good: #83d3b2;
     --control-line: #706d66;
   }
 }
