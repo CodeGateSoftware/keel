@@ -39,14 +39,38 @@ NAV: tuple[tuple[str, str], ...] = (
 
 _STYLE = """
 :root {
+  /* #532: `--good` and `--bad` were `#1f5f4f`/`#96322a`, luminances 0.0904/0.0893 -- a 1.01:1
+     ratio, i.e. profit and loss were told apart by hue alone (WCAG 1.4.1). `--good` moves to
+     `#237e38`, luminance 0.1556, an 0.0663 delta from `--bad` (still `#96322a`, unchanged --
+     it already carried the whole page's contrast headroom at 7.22:1 on `--bg`). `--accent`
+     was also byte-identical to the old `--good` in both themes, so a link and a gain rendered
+     alike; it now gets its own value, `#1d5f8a`, a blue distinct in hue from both. All three
+     still clear 4.5:1 (AA, normal text) against `--bg` (4.89 / 7.22 / 6.59) and `--card`
+     (5.11 / 7.54 / 6.87) -- see tests/web/test_palette_contrast.py, which recomputes these
+     from this block rather than trusting the comment. */
   --bg: #fbfaf8; --fg: #1c1b19; --muted: #6b6862; --line: #e3dfd8;
-  --card: #ffffff; --accent: #1f5f4f; --warn: #8a5a00; --bad: #96322a; --good: #1f5f4f;
+  --card: #ffffff; --accent: #1d5f8a; --warn: #8a5a00; --bad: #96322a; --good: #237e38;
+  /* #532: `.field input, .field select` puts the control's background on `--bg` (the page
+     background), so `--line` at 1.27:1 was the only thing marking a form control's boundary --
+     below WCAG 1.4.11's 3:1 floor for non-text UI components. Raising `--line` itself was
+     rejected: `--line` also draws table rules, the footer border and card edges, which SC
+     1.4.11 explicitly exempts as decorative, and raising it would have widened all of those
+     for no accessibility gain. `--control-line`, `#84817c` here (3.72:1 on `--bg`), is scoped
+     to interactive control boundaries only. */
+  --control-line: #84817c;
 }
 :root:not([data-theme="light"]) { color-scheme: light dark; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    /* Same fix, dark values. `--bad` moves this time (`#e07a6a` -> `#d85f4c`, luminance 0.3081
+       -> 0.2331) because dark mode's original delta, 0.1234 (a 1.34:1 ratio), was already the
+       better-off theme but still thin; `--good` (`#6fbf9f`) needed no change -- it already sat
+       at the luminance ceiling the new `--bad` moves toward. Delta is now 0.1984. `--accent`
+       gets `#7aa8e0`, distinct from `--good` as in light mode. Both still clear AA on `--bg`
+       (4.93 / 8.39 / 7.41) and `--card` (4.61 / 7.83 / 6.92). */
     --bg: #16150f; --fg: #ecead5; --muted: #9a968a; --line: #2f2d25;
-    --card: #1d1c15; --accent: #6fbf9f; --warn: #d9a441; --bad: #e07a6a; --good: #6fbf9f;
+    --card: #1d1c15; --accent: #7aa8e0; --warn: #d9a441; --bad: #d85f4c; --good: #6fbf9f;
+    --control-line: #706d66;
   }
 }
 * { box-sizing: border-box; }
@@ -94,7 +118,7 @@ form { margin: 0.5rem 0 0; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.6rem 0; max-width: 26rem; }
 .field span { font-size: 0.8rem; color: var(--muted); }
 .field input, .field select { font: inherit; padding: 0.4rem 0.6rem; border-radius: 7px;
-  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  border: 1px solid var(--control-line); background: var(--bg); color: var(--fg); }
 .field em { font-style: normal; font-size: 0.78rem; color: var(--muted); }
 button { font: inherit; font-weight: 550; padding: 0.35rem 0.9rem; border-radius: 7px;
   border: 1px solid var(--accent); background: var(--accent); color: var(--card);
