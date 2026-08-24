@@ -3,7 +3,7 @@ name = "keel-broker-coinbase"
 version = "0.11.2"
 description = "Coinbase Advanced Trade adapter for keel"
 license = "Apache-2.0"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 # Siblings pinned `==` (see the root `pyproject.toml`); the third-party SDK is not, because it
 # has its own release cycle and is not cut from this repo.
 dependencies = ["keel-core==0.11.2", "keel-broker-api==0.11.2", "coinbase-advanced-py>=1.8.4"]

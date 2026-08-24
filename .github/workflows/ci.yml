@@ -43,19 +43,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Two legs, the two ends of `requires-python = ">=3.11"` (#283):
-    #   - "3.11" is the FLOOR, stated explicitly because nothing else states it: the suite
-    #     passing there is what keeps the declared floor a measured claim instead of a hope.
-    #     3.10 fails collection on `typing.assert_never` (3.11+), which is the one concrete
-    #     feature binding the floor.
-    #   - "3.14" is the leg local development actually runs (`.python-version` pins 3.14.4);
-    #     it is named here by major only, since the matrix needs SOME explicit version and
-    #     "whatever .python-version says" is not addressable per-leg.
-    # Both legs stay inside THIS job so the required status context remains `test` -- the
-    # matrix fans out the context, it does not rename it, so every leg gates the merge.
+    # ONE leg, because the floor and the development interpreter are now the same version.
+    #
+    # This was two legs -- "3.11" and "3.14" -- the two ends of the `>=3.11` floor #283 chose.
+    # With `requires-python = ">=3.14"` there is no span left to test across: the floor leg and
+    # the development leg would be the same interpreter, and a matrix of one is a matrix that
+    # costs a second checkout to prove nothing.
+    #
+    # It stays a matrix rather than a bare `python-version:` deliberately. When a second
+    # supported version arrives -- 3.15, or a floor drop -- adding it here is one list entry,
+    # and the required status context stays `test` either way, because the matrix fans the
+    # context out without renaming it. Collapsing to a scalar would make that a workflow edit.
+    #
+    # "3.14" is named by major.minor only; `.python-version` pins the exact patch (3.14.4) for
+    # local work, and "whatever .python-version says" is not addressable per-leg.
     strategy:
       matrix:
-        python: ["3.11", "3.14"]
+        python: ["3.14"]
     steps:
       - uses: actions/checkout@v7
 

@@ -121,11 +121,20 @@ source, is written up in [`docs/fiqh-basis.md`](docs/fiqh-basis.md).
 
 ## Development setup and the gates a PR must pass
 
-Python **3.11+** is the floor, and it is measured, not aspirational (#283): the full suite
-passes identically on 3.11–3.14, and the one feature binding the floor is 3.11's
-`typing.assert_never` (3.10 fails collection on it). The repo itself develops on 3.14
-(`.python-version`; `uv python install 3.14`), and CI runs the whole gate on 3.11 too, so the
-floor cannot silently rot.
+Python **3.14+** is the floor, and it is a policy floor, not a measured one — the distinction
+matters if you are about to argue with it. The suite passes identically on 3.11–3.14; nothing
+here needs 3.14. The floor was 3.11 for exactly that reason (#283), and went up because keel now
+ships a signed desktop bundle and an installer that bootstrap their own interpreter, so an end
+user's system Python is no longer what keel runs on. The floor now reaches contributors and
+packagers rather than everyone who installs.
+
+It also buys two things that were blocked at 3.11: `ruff` can target `py314` (under the old
+floor `ruff format` could emit PEP 758 syntax that 3.11–3.13 cannot parse), and the `numpy.*`
+mypy override is gone. `uv python install 3.14` if you do not have it; `.python-version` pins
+the exact patch. CI runs the whole gate on 3.14, so the floor cannot silently rot.
+
+If the floor blocks you, say so in an issue — "a contributor was actually blocked" is the
+argument that would lower it again, and there is no feature standing in the way.
 Then:
 
 ```bash

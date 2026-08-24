@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/CodeGateSoftware/keel/main/scripts/
 You do not have to trust that line blind: the script is
 [`scripts/install.sh`](../scripts/install.sh) in this repository, written to be read — every step
 prints what it is about to do before it does it, it runs no privileged commands, and it verifies
-itself with `keel versions` before claiming success. It needs a terminal and Python 3.11 or
+itself with `keel versions` before claiming success. It needs a terminal and Python 3.14 or
 later. To build from a source checkout instead, see the README's **"Try it in five minutes"**.
 
 Both are exactly the friction the desktop app exists to remove, so this is not the recommendation

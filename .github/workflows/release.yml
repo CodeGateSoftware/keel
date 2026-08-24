@@ -112,8 +112,8 @@ jobs:
         run: |
           set -euo pipefail
           # Must be the PINNED interpreter, not the runner's default `python`. The wheel
-          # accepts `Requires-Python: >=3.11` (every pyproject.toml in the workspace says
-          # so, pinned by tests/test_python_floor.py), so a default-python venv would
+          # accepts `Requires-Python: >=3.14` (every pyproject.toml in the workspace says
+          # so, pinned by tests/test_python_floor.py), so a default-python venv could still
           # INSTALL -- and verify the artifact on an interpreter nobody tested or shipped:
           # the release is built and typed against .python-version, and the verify step
           # must exercise that same one. --seed provides the pip that the install below

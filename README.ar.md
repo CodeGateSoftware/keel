@@ -50,7 +50,7 @@ Platform (CDP) مجانيًّا للقراءة فقط** — تُجلَب بيا�
 
 ```bash
 git clone https://github.com/CodeGateSoftware/keel.git && cd keel
-uv sync --all-extras --dev        # أي Python من 3.11 فما فوق (المستودع يُطوَّر على 3.14)
+uv sync --all-extras --dev        # Python 3.14 فما فوق (`.python-version` يثبّت الإصدار الدقيق)
 cp .env.example .env              # ضع مفتاح وسرّ CDP فيه — لبيانات السوق فقط
 uv run keel rules seed            # سجّل عائلات القواعد كمرشّحات
 uv run keel fetch                 # اجلب تاريخ الشموع للقائمة المسموحة الافتراضية
