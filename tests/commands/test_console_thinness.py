@@ -5,7 +5,8 @@ WHAT IT FORBIDS, precisely. The presentation layer is the console shell
 (`keel/commands/console.py`), the live loop (`keel/commands/tui.py`), every console sub-menu
 module (`keel/commands/*console*.py`), and -- since #435 -- every module of the local web UI
 (`keel/web/*.py`). Those files render and dispatch; all behavior must come from the services
-the CLI calls. The pin is an AST scan enforcing five rules:
+the CLI calls. The pin is an AST scan enforcing six rules -- five that hold across the whole
+layer, and one (#533) scoped to the JSON serialiser:
 
 * **Rule 1 -- no compute-module imports.** Nothing may be imported from the compute
   trees -- `keel.strategy.*` (sizing/backtest/promotion math), `keel.execution.guards` /
@@ -42,6 +43,20 @@ the CLI calls. The pin is an AST scan enforcing five rules:
   (`keel.commands.update`), which this pin does not scan -- so the rule needs no
   allowance at all, and a console module that inlines any of that orchestration fails
   here rather than shipping a second, unpinned place that replaces the running binary.
+* **Rule 6 -- the serialisation contract** (issue #533), scoped to the module that turns the
+  frozen reports into the browser's JSON (`SERIALISER_STEMS`). That module is the one place in
+  this layer whose output is a machine-readable MONEY contract rather than a screen, so it
+  carries one extra pin over the five ways the `Decimal`-only guarantee dies at that boundary:
+  `Decimal.normalize()` (which renders `Decimal("50")` as `Decimal("5E+1")` -- a form that has
+  reached the wire in this codebase before and broken real orders), `float()` on anything but a
+  timestamp, `round()`, `json.dumps(..., default=float)` (one keyword, and it looks like a
+  helpful fix for the `TypeError` a `Decimal` raises), and `len()` -- the quiet way a serialiser
+  starts producing counts of its own instead of reading ones the report holds. Rules 1-5 already
+  cover the serialiser as a member of `keel/web/`; this covers what is specific to it. The
+  runtime half of the same contract -- a recursive walk over the real payload asserting that no
+  JSON number appears anywhere in it -- lives in `tests/web/test_payload.py`. An AST rule and a
+  walk over the output fail for different reasons and neither subsumes the other, which is why
+  both exist.
 
 The allowlists are deliberately entry-scoped (module + enclosing function + callee), so
 an allowance cannot leak to a new call site: the same callee at a different place, or a
@@ -63,7 +78,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 #: The PRESENTATION layer: the console shell, the live loop, every sub-menu module -- and, since
 #: #435, every module of the local web UI (`keel/web/`).
 #:
-#: The web UI is scanned by the same five rules rather than a parallel pin of its own, because it
+#: The web UI is scanned by the same rules rather than a parallel pin of its own, because it
 #: is the same kind of thing: a second front-end over `keel/commands/*`. A separate pin would have
 #: drifted -- two files stating the same architecture, diverging one allowance at a time -- and
 #: the failure it is guarding against is identical in both. `keel/commands/serve.py` is NOT
@@ -88,6 +103,29 @@ def _console_module_paths() -> list[str]:
 #: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in the same
 #: file still fails, and `urllib.parse` anywhere else still fails.
 RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({("server", "urllib.parse")})
+
+
+#: The SERIALISER: the module turning the frozen reports into the browser's JSON (#533). It is
+#: already inside the scanned set (it lives under `keel/web/`), so Rules 1-5 apply to it as they
+#: do to every other module of this layer. Rule 6 below is the extra, narrower pin it needs,
+#: because it is the one module in the layer whose OUTPUT is a machine-readable money contract
+#: rather than a screen.
+SERIALISER_STEMS: frozenset[str] = frozenset({"payload"})
+
+
+#: Rule 6b's entry-scoped allowance, in the same (module, enclosing function, argument) shape as
+#: every other allowance here.
+#:
+#: `float()` is banned in the serialiser because it is the one call that turns a `Decimal` into
+#: the IEEE-754 double the whole contract exists to keep off the wire. It is allowed on a
+#: TIMESTAMP, which is not money: `time.gmtime` takes a float and nothing else, and a UTC instant
+#: has no cent to lose. Scoped to the argument NAME, so `float(price)` at the same call site
+#: still fails.
+RULE6_FLOAT_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("payload", "_gmt", "ts"),
+    }
+)
 
 
 #: The compute trees -- where sizing/backtest/gate/screening/reporting math lives. The
@@ -430,6 +468,102 @@ def findings() -> dict[str, list[str]]:
                         "console layer never shells out, opens a socket or replaces "
                         "its own process; that is keel.commands.update's job",
                     )
+
+        # Rule 6 (#533): the serialisation contract, in the ONE module whose output is a
+        # machine-readable money contract rather than a screen.
+        if stem in SERIALISER_STEMS:
+            for key, messages in _rule6_findings(stem, tree, aliases, owners).items():
+                for message in messages:
+                    found.add(key, message)
+    return found
+
+
+def _argument_identifier(node: ast.expr) -> str:
+    """The last identifier of a call argument -- `ts` for `ts`, `x.ts` and `self.x.ts`.
+
+    Used only to scope Rule 6b's allowance to the ARGUMENT, so `float(ts)` can be allowed at a
+    site where `float(price)` still fails."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return "<expr>"
+
+
+def _rule6_findings(
+    stem: str, tree: ast.Module, aliases: dict[str, str], owners: dict[ast.AST, str]
+) -> dict[str, list[str]]:
+    """The four ways the `Decimal`-only guarantee dies at the JSON boundary, as an AST scan.
+
+    Written as its own function rather than inline in the fixture so the positive control below
+    can run it over a synthetic module and prove it is capable of finding anything at all."""
+    found = _Findings()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        owner = owners.get(node, "<module>")
+        name = _dotted_call_name(node.func, aliases)
+        short = name.rsplit(".", 1)[-1] if name else None
+
+        # 6a -- normalize(). THE hazard: `Decimal("50").normalize()` is `Decimal("5E+1")`, and
+        # "5E+1" on the wire is fifty read as five, or as nothing. Matched on the ATTRIBUTE, not
+        # on a resolved dotted name, because the receiver is a value and never resolves.
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "normalize":
+            found.add(
+                "rule6_serialisation",
+                f"{stem}:{owner}: calls .normalize() (line {node.lineno}) -- it renders "
+                'Decimal("50") as Decimal("5E+1"); format(value, "f") is the only rendering '
+                "that cannot emit an exponent",
+            )
+
+        # 6b -- float(), the one call that turns a Decimal into the IEEE-754 double this whole
+        # contract exists to keep off the wire. Allowed on a timestamp, entry-scoped.
+        if short == "float" and name == "float":
+            argument = _argument_identifier(node.args[0]) if node.args else "<none>"
+            if (stem, owner, argument) not in RULE6_FLOAT_ALLOWLIST:
+                found.add(
+                    "rule6_serialisation",
+                    f"{stem}:{owner}: calls float({argument}) (line {node.lineno}) -- money "
+                    "crosses the wire as a string; only a timestamp may become a float here",
+                )
+
+        # 6c -- round(), which both computes and (on a float) reintroduces binary rounding.
+        # Rounding for DISPLAY is done with a format spec, which leaves the wire value exact.
+        if name == "round":
+            found.add(
+                "rule6_serialisation",
+                f"{stem}:{owner}: calls round() (line {node.lineno}) -- display rounding "
+                "belongs in a format spec, which leaves the wire value exact",
+            )
+
+        # 6d -- json.dumps(..., default=float). `json.dumps` raises a TypeError on a Decimal,
+        # and `default=float` is the one-keyword fix that silently converts every money value in
+        # the payload to a double. A PLAIN `json.dumps` is fine and is used: the serialiser
+        # normalises every leaf to a string first, so it needs no encoder.
+        if name in ("json.dumps", "json.dump"):
+            for keyword in node.keywords:
+                if keyword.arg in ("default", "cls"):
+                    found.add(
+                        "rule6_serialisation",
+                        f"{stem}:{owner}: json.dumps(..., {keyword.arg}=...) (line "
+                        f"{node.lineno}) -- a custom encoder is how every Decimal in the "
+                        "payload becomes a double in one keyword",
+                    )
+
+        # 6e -- len(). A count on the wire must be one the REPORT holds, and `len()` is how a
+        # serialiser quietly starts producing its own. The first draft of `journal_payload`
+        # shipped `count(len(report.entries))`; it is numerically exact, which is precisely why
+        # the runtime "computes nothing" guard could not be relied on to catch it -- that guard
+        # compares figures, and a list length can coincide with one the report already holds.
+        # An AST ban does not care about the coincidence. `JournalReport.shown_count` is where
+        # that figure belongs, and any future count needs the same treatment upstream (or an
+        # entry-scoped allowance here, in RULE6_FLOAT_ALLOWLIST's shape, with its reasoning).
+        if name == "len":
+            found.add(
+                "rule6_serialisation",
+                f"{stem}:{owner}: calls len() (line {node.lineno}) -- a count on the wire "
+                "must be one the report already holds; add it to the report builder",
+            )
     return found
 
 
@@ -476,6 +610,59 @@ def test_rule_5_no_process_or_network_orchestration_in_the_console_layer(
     assert not findings.get("rule5_orchestration"), findings["rule5_orchestration"]
 
 
+def test_rule_6_the_serialisation_contract_holds_in_the_serialiser(
+    findings: dict[str, list[str]],
+) -> None:
+    """Issue #533's rule: the module that writes keel's JSON never converts a money value to a
+    binary float, never rounds one, never renders one through `normalize()`, and never installs a
+    `json` encoder that would do any of those for it.
+
+    All four are the same failure with different spellings -- a `Decimal` arriving in a browser as
+    an IEEE-754 double -- and all four are SILENT, which is why they are pinned mechanically
+    rather than left to review. `tests/web/test_payload.py` pins the same contract from the other
+    end, by walking the rendered payload.
+    """
+    assert not findings.get("rule6_serialisation"), findings["rule6_serialisation"]
+
+
+def test_rule_6_is_proven_false_capable() -> None:
+    """Rule 6's own positive control, run over a synthetic module that commits all four sins.
+
+    Without this, a typo in an attribute name or a resolver that never matches would leave Rule 6
+    green over a serialiser doing exactly what it forbids -- and Rule 6 guards a contract seven
+    downstream issues inherit, so a vacuously-green version of it is worse than none.
+
+    The allowed shape is included too: `float(ts)` inside `_gmt` must NOT be flagged, or the rule
+    is a blanket ban wearing an allowlist.
+    """
+    snippet = (
+        "import json\n"
+        "def _gmt(ts, fmt):\n"
+        "    return float(ts)\n"
+        "def bad(price, payload, rows):\n"
+        "    a = price.normalize()\n"
+        "    b = float(price)\n"
+        "    c = round(price, 2)\n"
+        "    d = json.dumps(payload, default=float)\n"
+        "    e = len(rows)\n"
+        "    return a, b, c, d, e\n"
+    )
+    tree = ast.parse(snippet)
+    owners = _enclosing_functions(tree)
+
+    messages = _rule6_findings("payload", tree, _collect_aliases(tree), owners).get(
+        "rule6_serialisation", []
+    )
+
+    assert len(messages) == 5, messages
+    assert any(".normalize()" in m for m in messages)
+    assert any("float(price)" in m for m in messages)
+    assert any("round()" in m for m in messages)
+    assert any("default=" in m for m in messages)
+    assert any("len()" in m for m in messages)
+    assert not any(":_gmt:" in m for m in messages), messages
+
+
 def test_rule_5_is_proven_false_capable() -> None:
     """The detector's own positive control: a synthetic module that shells out and
     execv's is flagged (an AST scan that silently matched nothing would make Rule 5
@@ -505,6 +692,10 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     # Named explicitly so that deleting or renaming a web module fails HERE, loudly, rather than
     # quietly shrinking the scanned set and leaving the rules green over less code.
     assert {"render", "security", "server"} <= stems
+    # #533: the JSON serialiser joins them. Named here for the same reason and with an extra one:
+    # Rule 6 is scoped BY STEM, so a serialiser renamed out of `SERIALISER_STEMS` would keep
+    # passing Rules 1-5 while silently losing the money-contract pin entirely.
+    assert SERIALISER_STEMS <= stems
     assert any(os.path.join("keel", "web") in path for path in paths)
     assert {
         "compliance_console",
