@@ -320,7 +320,7 @@ def test_ruffs_target_version_does_not_exceed_the_python_floor():
         except (OverflowError, OSError, ValueError):
 
     into PEP 758's unparenthesised form -- which is a SyntaxError on 3.11, 3.12 and 3.13, all of
-    which `requires-python = ">=3.11"` promises to support. The wheel still builds and still
+    which the `>=3.11` floor of the day promised to support. The wheel still builds and still
     installs; it fails at import, on the interpreters the metadata invited. A formatter that can
     silently emit syntax the package cannot run is worse than no formatter, and the mismatch is
     invisible unless something pins it.

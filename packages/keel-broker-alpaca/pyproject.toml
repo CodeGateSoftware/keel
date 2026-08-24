@@ -3,7 +3,7 @@ name = "keel-broker-alpaca"
 version = "0.11.2"
 description = "Alpaca Trading API adapter for keel (US equities, cash account)"
 license = "Apache-2.0"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 # Siblings pinned `==` (see the root `pyproject.toml`); `requests` matches the
 # `keel-broker-robinhood` transport convention -- raw REST over an injected transport,
 # deliberately NO `alpaca-py` SDK: Alpaca's Trading + Market Data APIs are plain

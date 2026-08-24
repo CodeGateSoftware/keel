@@ -25,7 +25,8 @@ the last box, in the order given, and never before.
   the document as a plan, not a claim (#318/#289).
 - [x] **The Arabic entry point** — `README.ar.md` with the switcher, terminology exact,
   scope stated (#319/#290).
-- [x] **CI green on `main`** — both matrix legs (3.11, 3.14; the legs came in #301), and
+- [x] **CI green on `main`** — the matrix leg (3.14; two legs, 3.11 and 3.14, came in #301 and
+      collapsed to one when the floor rose to 3.14), and
   the merge gate (`test` context) has been the required context since #268.
 - [x] **The code-quality scans actually configured** — tokenless and always on
   (#320): Dependabot over every manifest, a weekly `pip-audit` over the exported lock,

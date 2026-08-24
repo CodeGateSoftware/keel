@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -108,14 +109,27 @@ def test_no_credentials_or_auth(script: str) -> None:
 
 
 def test_the_python_floor_is_checked_and_stated(script: str) -> None:
-    """The interpreter's own `version_info` must be compared against (3, 11) -- the
-    floor every distribution declares (tests/test_python_floor.py) -- and the failure
-    must NAME the floor, because a bare 'wrong python' sends the user nowhere."""
-    assert re.search(r"sys\.version_info >= \(3, ?11\)", script), (
-        "the >= 3.11 check via sys.version_info is gone -- the installer would happily "
-        "build a venv keel refuses to run in"
+    """The interpreter's own `version_info` must be compared against the floor every
+    distribution declares, and the failure must NAME it -- a bare 'wrong python' sends the
+    user nowhere.
+
+    The floor is DERIVED from `requires-python` rather than written here, because this is the
+    one place it is stated in shell rather than in metadata, and shell is not resolved by pip.
+    Hardcoded, a raised floor leaves the installer building a venv keel then refuses to run in,
+    and the mismatch surfaces as an import error after a successful-looking install.
+    """
+    root = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    requires = root["project"]["requires-python"]
+    assert requires.startswith(">="), requires
+    floor = requires[2:].strip()
+    major, minor = (int(part) for part in floor.split("."))
+
+    assert re.search(rf"sys\.version_info >= \({major}, ?{minor}\)", script), (
+        f"the >= {floor} check via sys.version_info is gone or has drifted from "
+        f"requires-python ({requires!r}) -- the installer would build a venv keel refuses "
+        "to run in"
     )
-    assert "3.11" in script, "the failure message must state the floor"
+    assert floor in script, "the failure message must state the floor"
 
 
 # -- the wheels: exactly the five, never by name from an index -----------------------------------

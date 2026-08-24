@@ -7,7 +7,7 @@ readme = "README.md"
 authors = [
     { name = "CodeGate Software" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "click>=8.4.2",
     # pyyaml/python-dotenv are deliberately NOT listed here: nothing under `keel/` imports
@@ -124,7 +124,7 @@ dev = [
 # [tool.ruff] here, so keeping a copy in both places would leave silently-dead settings.
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 files = ["packages", "keel", "tests"]
 # Implied by `--strict`, but mypy rejects it in a per-module section ("Per-module sections
 # should only specify per-module flags"), so it is stated here rather than in the broker block
@@ -192,18 +192,6 @@ ignore_missing_imports = true
 module = ["keel_core.*"]
 ignore_errors = true
 
-# numpy rides in with optuna (the #476 research extra, dev group only) and is reached only
-# by the ONE lazy `import optuna` inside keel/research/tuning.py's runner -- nothing under
-# keel/ imports numpy itself. numpy's bundled stubs use PEP 695 `type` statements, which
-# this run's python_version=3.11 floor cannot parse, so the transitive crawl is silenced
-# here rather than by raising the floor every package in this workspace pins.
-[[tool.mypy.overrides]]
-module = ["numpy.*"]
-follow_imports = "skip"
-# `follow_imports` alone ignores .pyi files by design; numpy ships BUNDLED STUBS whose
-# PEP 695 `type` statements cannot parse under the python_version=3.11 floor above, so the
-# skip must reach the stubs too.
-follow_imports_for_stubs = true
 
 # Coverage is measured only when `--cov` is passed (see the pytest-cov note in [dependency-groups]).
 # This section exists so that a bare `--cov` -- with no value -- measures the right thing instead of

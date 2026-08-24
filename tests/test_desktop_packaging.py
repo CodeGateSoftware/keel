@@ -95,7 +95,7 @@ def test_the_lockfile_is_checked_before_anything_can_mutate_it(
 
 def test_the_verify_step_comment_states_the_real_python_floor() -> None:
     """#438: the verify step's comment claimed the wheel carries `Requires-Python: >=3.14.4`
-    while every pyproject.toml declares `>=3.11` (pinned by tests/test_python_floor.py).
+    while every pyproject.toml declares `>=3.14` (pinned by tests/test_python_floor.py).
 
     Harmless to the run -- the pinned interpreter is used either way -- but the comment was
     the only place a reader could learn what the wheel demands, and the next person to build

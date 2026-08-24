@@ -62,18 +62,23 @@ command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PA
 
 # -- step 2/7: Python, with the floor stated ------------------------------------------------------
 
-# keel requires Python 3.11+ (tests/test_python_floor.py); the check is the interpreter's
+# keel requires Python 3.14+ (tests/test_python_floor.py); the check is the interpreter's
 # own version_info, not a parsed string, and the failure names the floor and what to do.
-say "step 2/7: finding Python >= 3.11"
+#
+# The candidate list keeps `python3` first and then names 3.14 explicitly: on a machine where
+# `python3` is an older system Python, the loop must still find a newer one installed alongside
+# it rather than stopping at the first interpreter it can execute. Versions below the floor are
+# no longer listed -- naming them would only produce a candidate the check must then reject.
+say "step 2/7: finding Python >= 3.14"
 PY=""
-for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+for candidate in python3 python3.14; do
   command -v "$candidate" >/dev/null 2>&1 || continue
-  if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/dev/null; then
     PY="$(command -v "$candidate")"
     break
   fi
 done
-[ -n "$PY" ] || die "no Python >= 3.11 found on PATH -- keel requires 3.11 or later. Check
+[ -n "$PY" ] || die "no Python >= 3.14 found on PATH -- keel requires 3.14 or later. Check
                      'python3 --version', install a newer Python, and re-run this script."
 say "  ok: ${PY} ($("$PY" -c 'import platform; print(platform.python_version())'))"
 
