@@ -21,8 +21,10 @@ from keel.cli import cli
 from keel.commands.insights import (
     AccountSummary,
     InsightsReport,
+    JournalEntry,
     RuleTrackRecord,
     build_account_summary,
+    build_equity_curve,
     build_gate_distance,
     build_insights_report,
     build_journal_report,
@@ -727,3 +729,139 @@ def test_insights_journal_command_json_is_valid_no_prose(tmp_path, valid_config_
     assert "entries" in payload
     assert "total_count" in payload
     assert "filters" in payload
+
+
+# -- the equity curve (#537) ---------------------------------------------------------------------
+#
+# `build_equity_curve` exists because the browser's chart needed coordinates and the client is not
+# allowed to compute them -- `keel/web/static/js/chart.js` is scanned for arithmetic exactly as
+# `render.js` is. So the scaling decision lives here, and these tests are what make that decision
+# checkable rather than merely relocated.
+
+
+def _entry(pnl: Decimal | None, *, closed_at: int = NOW_TS) -> JournalEntry:
+    """One closed journal row carrying `pnl`. Only `pnl_net` and the identifiers matter here."""
+    return JournalEntry(
+        closed_at=closed_at,
+        opened_at=closed_at - 3600,
+        rule_name="turtle_breakout",
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("50000.00"),
+        exit_fill=Decimal("50100.00"),
+        pnl_net=pnl,
+        fees=Decimal("0.10"),
+        r_multiple=None,
+        is_dca=False,
+        outcome="win",
+    )
+
+
+def test_the_curve_is_cumulative_and_exact() -> None:
+    """The running total is the point of the chart, and it is `Decimal` end to end.
+
+    The fixtures are chosen so a `float` implementation would visibly disagree: `0.1 + 0.2` is
+    `0.30000000000000004` in IEEE-754, and the third point below would come out one ulp away from
+    `Decimal("0.30")`. The assertion is on equality with an exact `Decimal`, so a future rewrite
+    that reached for `float` fails here rather than in a cent nobody checks."""
+    curve = build_equity_curve([_entry(Decimal("0.1")), _entry(Decimal("0.2"))])
+
+    assert [point.cumulative for point in curve.points] == [Decimal("0.1"), Decimal("0.3")]
+    # The premise, asserted rather than assumed: these operands really do disagree in binary.
+    assert 0.1 + 0.2 != float(Decimal("0.3"))
+
+
+def test_the_axis_always_contains_zero() -> None:
+    """The scaling judgement, pinned.
+
+    A curve that only ever lost money still has zero on its axis, so the picture shows which side
+    of break-even it is on. Without this a run of small losses is normalised to fill the box and
+    reads as a collapse -- which is the whole reason the axis is chosen in Python and not in a
+    browser."""
+    curve = build_equity_curve([_entry(Decimal("-1.00")), _entry(Decimal("-2.00"))])
+
+    assert curve.high == Decimal("0")
+    assert curve.low == Decimal("-3.00")
+    # And the baseline is where zero is: the top of the box, since nothing ever went above it.
+    assert curve.baseline_y == Decimal("0.00")
+
+    winners = build_equity_curve([_entry(Decimal("5.00"))])
+    assert winners.low == Decimal("0")
+    assert winners.baseline_y == curve.height
+
+
+def test_a_row_with_no_recorded_net_is_skipped_never_counted_as_zero() -> None:
+    """`None` is not `0`, and folding it in would draw a flat segment asserting a break-even trade.
+
+    The same collapse of "not recorded" into "recorded as zero" that `payload.ABSENT`'s note
+    traces to #198's always-passing fee rail. The skipped row still appears in the journal table
+    beside the chart, so the omission is visible."""
+    curve = build_equity_curve([_entry(Decimal("4.00")), _entry(None), _entry(Decimal("1.00"))])
+
+    assert curve.point_count == 2
+    assert [point.cumulative for point in curve.points] == [Decimal("4.00"), Decimal("5.00")]
+
+
+def test_an_empty_journal_has_no_curve_rather_than_a_flat_one() -> None:
+    """`points == []`, never a synthetic line at zero.
+
+    A flat line at zero is what a run of break-even trades looks like, and a deployment with no
+    closed trades has not broken even -- it has no track record. The two must not render alike."""
+    curve = build_equity_curve([])
+
+    assert curve.points == []
+    assert curve.point_count == 0
+    assert curve.low == curve.high == Decimal("0")
+
+
+def test_a_curve_of_break_even_trades_sits_on_the_baseline() -> None:
+    """Every trade zero: there is no range to normalise against, so the line is where zero is.
+
+    Drawn mid-box rather than at the top or the bottom, and the baseline goes with it, so the
+    curve and the zero line agree. A division by the zero span is the bug this branch exists to
+    avoid, and it would be a `ZeroDivisionError` on the endpoint rather than a bad picture."""
+    curve = build_equity_curve([_entry(Decimal("0")), _entry(Decimal("0"))])
+
+    assert {point.y for point in curve.points} == {curve.baseline_y}
+    assert curve.baseline_y == (curve.height / 2).quantize(Decimal("0.01"))
+
+
+def test_every_coordinate_stays_inside_the_box() -> None:
+    """The invariant `chart.js` relies on, since it does no arithmetic of its own.
+
+    A coordinate outside the `viewBox` does not raise anywhere -- it draws off the edge of the
+    chart, silently, which is exactly the class of failure the browser cannot report."""
+    curve = build_equity_curve(
+        [_entry(Decimal("120.00")), _entry(Decimal("-400.00")), _entry(Decimal("35.50"))]
+    )
+
+    for point in curve.points:
+        assert Decimal("0") <= point.x <= curve.width, point
+        assert Decimal("0") <= point.y <= curve.height, point
+    assert Decimal("0") <= curve.baseline_y <= curve.height
+
+
+def test_a_single_point_is_centred_rather_than_pinned_to_the_left_edge() -> None:
+    """One trade drawn hard against the left edge reads as a line that has been cut off -- a claim
+    about missing data. Centred, it reads as the one observation it is."""
+    curve = build_equity_curve([_entry(Decimal("7.00"))])
+
+    assert curve.point_count == 1
+    assert curve.points[0].x == (curve.width / 2).quantize(Decimal("0.01"))
+
+
+def test_the_horizontal_axis_is_trade_order_not_calendar_time() -> None:
+    """Spacing by `closed_at` would give a quiet week the same visual weight as fifty trades.
+
+    Asserted with two trades a year apart and one a second later: even spacing means the axis is
+    counting trades, which is what `keel insights journal` reads as too."""
+    curve = build_equity_curve(
+        [
+            _entry(Decimal("1.00"), closed_at=NOW_TS),
+            _entry(Decimal("1.00"), closed_at=NOW_TS + 31_536_000),
+            _entry(Decimal("1.00"), closed_at=NOW_TS + 31_536_001),
+        ]
+    )
+
+    xs = [point.x for point in curve.points]
+    assert xs == [Decimal("0.00"), (curve.width / 2).quantize(Decimal("0.01")), curve.width]

@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
-from keel.web import api, render, staticfiles
+from keel.web import api, events, render, staticfiles
 from keel.web.security import (
     SESSION_COOKIE,
     HostPolicy,
@@ -313,6 +313,18 @@ SETUP_ACTION_PREFIX = "/setup/"
 #: 404 every unmapped path gets, because there is still no JSON write surface and this issue added
 #: none.
 API_PREFIX = "/api/"
+
+#: The one path under `API_PREFIX` that is a STREAM rather than a document (#537).
+#:
+#: It is not in `api.API_ROUTES` because it does not have that table's shape: every entry there
+#: maps to `(status, document)` through `api.respond`, and an `EventSource` connection is a
+#: response that never finishes. Bolting a "this one streams" flag onto `ApiRoute` would have put
+#: a branch into the one function whose uniformity is the reason #536's `fetch` wrapper needs no
+#: per-endpoint branch of its own.
+#:
+#: It is still a GET, still behind `_admitted()`, and still answers no POST -- `do_POST` refuses
+#: everything under `API_PREFIX` before it ever looks at a path.
+EVENTS_PATH = "/api/events"
 
 
 def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
@@ -641,6 +653,46 @@ class KeelHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _serve_events(self) -> None:
+        """The `EventSource` stream (#537), for as long as the browser holds the connection.
+
+        **`Connection: close` and no `Content-Length`.** This handler speaks HTTP/1.1, where a
+        response with neither a length nor chunked framing has to be delimited by the connection
+        ending -- and keep-alive is what would otherwise be assumed. The alternative is chunked
+        transfer-encoding, hand-framed on top of `wfile`; it buys the ability to reuse a socket
+        that this endpoint holds open for ten minutes anyway, which is nothing, in exchange for a
+        second framing layer to get wrong.
+
+        **Every write is flushed.** A buffered `wfile` is a stream that arrives in bursts when the
+        buffer happens to fill, which for frames this small means "never" -- the page would show
+        nothing at all and the failure would look exactly like a server that is not sending.
+
+        **A HEAD gets the headers and no body.** `do_HEAD` delegates to `do_GET` here as it does
+        everywhere else, and a HEAD that opened a ten-minute stream would be a way to hold a
+        thread without ever reading from it.
+
+        **A disconnect is not an error.** The browser closing the tab, navigating away, or being
+        killed all surface as a broken pipe on the next write; that is the normal end of a
+        subscription and it is caught and dropped rather than logged as a failure or allowed to
+        reach `BaseHTTPRequestHandler`'s 500 path, which would try to write a body to a socket
+        that is already gone.
+        """
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", events.CONTENT_TYPE)
+        self.send_header("Connection", "close")
+        for name, value in _API_HEADERS:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        try:
+            for chunk in events.stream(self.cfg):
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _serve_static(self, url_path: str) -> None:
         """One file under `staticfiles.STATIC_PREFIX` (#535), or the same 404 an unmapped
         `ROUTES` path gets -- containment and the Content-Type table are `staticfiles`'s job
@@ -800,6 +852,13 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
 
         if not self._admitted():
+            return
+
+        if parsed.path == EVENTS_PATH:
+            # Live updates (#537). Checked BEFORE the `API_PREFIX` branch below, because that
+            # branch ends in `api.respond`, which would answer this path with the 404 it gives
+            # every name absent from its table -- correctly, since this endpoint is not in it.
+            self._serve_events()
             return
 
         if parsed.path.startswith(API_PREFIX):

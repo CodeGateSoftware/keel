@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -106,6 +107,212 @@ class JournalReport:
         unchanged.
         """
         return len(self.entries)
+
+
+# -- the equity curve (#537) --------------------------------------------------------------------
+#
+# The browser's one chart. It lives HERE, in the report layer, rather than in `keel/web/` -- and
+# the coordinates live here too, which is the part that looks misplaced and is not.
+#
+# **Scaling a chart is a judgement about the data, not a drawing detail.** Where the vertical
+# axis starts decides what the picture says: a curve plotted between its own min and max makes a
+# $3 wobble look like a collapse, and one plotted from zero does not. keel already refuses to let
+# a front-end decide whether a number is good (`keel/web/payload.py`'s closed `state`
+# vocabulary); letting one decide the axis it is drawn against would be the same delegation
+# wearing different clothes. So `_BASELINE` below is included in the range unconditionally, in
+# Python, where a `Decimal` is in scope and a test can read it.
+#
+# The second reason is arithmetic. Normalising a series means subtracting, dividing and comparing
+# it, and the client is the one place in this system where those operations happen in IEEE-754
+# doubles over values that were exact `Decimal`s a moment earlier. `keel/web/static/js/chart.js`
+# consequently contains no arithmetic at all and `tests/web/test_client_assets.py` scans it for
+# the absence, exactly as it scans `render.js` -- which is only possible because the numbers it
+# draws with arrive finished.
+#
+# What it would take to move: a chart with a zoom or a pan control. That is interaction over a
+# range the server did not choose, and at that point the range becomes a client concern and this
+# builder becomes a service the client re-asks with new bounds. Nothing here is that today.
+
+#: The coordinate box the curve is expressed in, and the reason it is not pixels.
+#:
+#: An SVG `viewBox` is unitless: the browser scales it to whatever width the card ends up, so
+#: these numbers are a fixed internal grid and never a size on screen. 1000x300 rather than
+#: 100x100 because the coordinates are QUANTIZED to 2dp below, and a taller grid means the
+#: rounding is a smaller fraction of a pixel at any realistic rendered size.
+PLOT_WIDTH = Decimal("1000")
+PLOT_HEIGHT = Decimal("300")
+
+#: The value the vertical axis always contains. Zero, because the figure plotted is CUMULATIVE
+#: NET P&L -- the line between "this rule has made money" and "this rule has lost money" -- and a
+#: curve drawn without it on the canvas cannot show which side of it you are on.
+_BASELINE = Decimal("0")
+
+#: Coordinate precision. Two decimal places on a 1000-wide grid is a hundred-thousandth of the
+#: width: far finer than any display, and short enough that a 50-point `points` attribute stays
+#: readable in view-source, which is the whole argument for this interface.
+_COORD = Decimal("0.01")
+
+
+@dataclass(frozen=True)
+class EquityPoint:
+    """One closed trade's contribution to the curve, and where it is drawn.
+
+    `pnl` and `cumulative` are the exact figures; `x` and `y` are the plot coordinates in the
+    `PLOT_WIDTH` x `PLOT_HEIGHT` box. `y` grows DOWNWARD, because SVG's does: emitting a
+    mathematical y here and flipping it in the browser would be one subtraction, performed on the
+    one side of the wire that is not allowed to perform any.
+    """
+
+    index: int
+    closed_at: int | None
+    product_id: str
+    rule_name: str | None
+    pnl: Decimal
+    cumulative: Decimal
+    x: Decimal
+    y: Decimal
+
+
+@dataclass(frozen=True)
+class EquityCurve:
+    """The cumulative net-P&L curve over a journal's closed trades, ready to draw.
+
+    `low`/`high` are the axis bounds actually used, `_BASELINE` included -- so they are the range
+    a reader should be told about, not merely the extremes of the data. `baseline_y` is where
+    zero sits in the box, which is what lets the chart draw the one gridline that carries meaning.
+
+    Empty is a real answer and is not an error: a deployment with no closed trades has no curve,
+    and `points == []` is how that is said. There is no synthetic flat line at zero, because a
+    flat line at zero is what a run of break-even trades looks like and the two must not be
+    confused.
+    """
+
+    points: list[EquityPoint]
+    low: Decimal
+    high: Decimal
+    baseline_y: Decimal
+    width: Decimal
+    height: Decimal
+
+    @property
+    def point_count(self) -> int:
+        """How many points the curve holds.
+
+        A derived reading rather than a stored field, for the reason `JournalReport.shown_count`
+        is: a second field holding `len(self.points)` is state that can drift from the list it
+        describes. It exists at all because `keel/web/payload.py` may not call `len()` -- Rule 6e
+        of `tests/commands/test_console_thinness.py` bans it there, so every count on the wire is
+        one a report already holds.
+        """
+        return len(self.points)
+
+
+def _plot_y(value: Decimal, *, low: Decimal, span: Decimal) -> Decimal:
+    """`value` mapped into `0..PLOT_HEIGHT`, with the top of the box being `low + span`."""
+    fraction = (value - low) / span
+    return (PLOT_HEIGHT - PLOT_HEIGHT * fraction).quantize(_COORD)
+
+
+def build_equity_curve(entries: Sequence[JournalEntry]) -> EquityCurve:
+    """The cumulative net-P&L curve over `entries`, oldest first.
+
+    **Rows with no recorded net are SKIPPED, never counted as zero.** `JournalEntry.pnl_net` is
+    `None` when the ledger has no net for that trade, and folding a `None` into a running total as
+    `0` would draw a flat segment that asserts "this trade broke even" -- the same collapse of
+    "not recorded" into "recorded as zero" that `keel/web/payload.py`'s `ABSENT` note traces back
+    to #198's always-passing fee rail. A skipped row still appears in the journal table beside the
+    chart with its own dash, so the omission is visible rather than silent.
+
+    **The horizontal axis is trade ORDER, not time.** Spacing points by `closed_at` would give a
+    long quiet week the same visual weight as fifty trades, which is a statement about the
+    calendar and not about the track record; `keel insights journal` reads the same way, oldest
+    first. It also means a row whose `closed_at` is unusable still has a position on the axis.
+
+    Callers pass the entries they are displaying, so the curve and the table beneath it can never
+    disagree about which trades they describe.
+    """
+    running = _BASELINE
+    plotted: list[tuple[JournalEntry, Decimal, Decimal]] = []
+    for entry in entries:
+        net = entry.pnl_net
+        if net is None:
+            continue
+        running = running + net
+        plotted.append((entry, net, running))
+
+    if not plotted:
+        return EquityCurve(
+            points=[],
+            low=_BASELINE,
+            high=_BASELINE,
+            baseline_y=PLOT_HEIGHT,
+            width=PLOT_WIDTH,
+            height=PLOT_HEIGHT,
+        )
+
+    totals = [total for _entry, _net, total in plotted]
+    low = min([*totals, _BASELINE])
+    high = max([*totals, _BASELINE])
+    span = high - low
+    if span == _BASELINE:
+        # Every trade broke even, so the curve is a horizontal line and there is no range to
+        # normalise against. Drawn on the baseline rather than at the top or the bottom of the
+        # box: the figure IS zero, and zero is where the baseline is.
+        middle = (PLOT_HEIGHT / 2).quantize(_COORD)
+        return EquityCurve(
+            points=[
+                EquityPoint(
+                    index=index,
+                    closed_at=entry.closed_at,
+                    product_id=entry.product_id,
+                    rule_name=entry.rule_name,
+                    pnl=net,
+                    cumulative=total,
+                    x=_plot_x(index, len(plotted)),
+                    y=middle,
+                )
+                for index, (entry, net, total) in enumerate(plotted)
+            ],
+            low=low,
+            high=high,
+            baseline_y=middle,
+            width=PLOT_WIDTH,
+            height=PLOT_HEIGHT,
+        )
+
+    points = [
+        EquityPoint(
+            index=index,
+            closed_at=entry.closed_at,
+            product_id=entry.product_id,
+            rule_name=entry.rule_name,
+            pnl=net,
+            cumulative=total,
+            x=_plot_x(index, len(plotted)),
+            y=_plot_y(total, low=low, span=span),
+        )
+        for index, (entry, net, total) in enumerate(plotted)
+    ]
+    return EquityCurve(
+        points=points,
+        low=low,
+        high=high,
+        baseline_y=_plot_y(_BASELINE, low=low, span=span),
+        width=PLOT_WIDTH,
+        height=PLOT_HEIGHT,
+    )
+
+
+def _plot_x(index: int, total: int) -> Decimal:
+    """The horizontal position of point `index` of `total`, in `0..PLOT_WIDTH`.
+
+    A single point is CENTRED rather than placed at `x=0`. One trade drawn hard against the left
+    edge reads as the beginning of a line that has been cut off, which is a claim about missing
+    data; centred, it reads as the one observation it is.
+    """
+    if total == 1:
+        return (PLOT_WIDTH / 2).quantize(_COORD)
+    return (PLOT_WIDTH * Decimal(index) / Decimal(total - 1)).quantize(_COORD)
 
 
 @dataclass(frozen=True)

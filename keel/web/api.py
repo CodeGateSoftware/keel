@@ -216,7 +216,18 @@ def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
 
 
 def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    from keel.commands.insights import build_journal_report
+    """The trade journal, and the equity curve drawn from the SAME entries.
+
+    `build_equity_curve` is called on `report.entries` -- not on the ledger, and not on a second
+    read -- so the chart and the table under it describe one list of trades. A curve built from
+    its own query could disagree with the rows beside it after a `?limit=`, and a chart that
+    disagrees with the table below it is worse than no chart.
+
+    The curve is NOT part of `route.collection`, so `?sort=` reorders `entries` and leaves the
+    curve alone. That is deliberate: the curve's horizontal axis is trade order, and a curve
+    redrawn in `pnl` order would be a cumulative total of a sequence that never happened.
+    """
+    from keel.commands.insights import build_equity_curve, build_journal_report
 
     limit = _journal_limit(query)
     repo = open_repo(cfg.db_path)
@@ -226,7 +237,7 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
         )
     finally:
         close_repo(repo)
-    return payload.journal_payload(report)
+    return payload.journal_payload(report, curve=build_equity_curve(report.entries))
 
 
 def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:

@@ -179,7 +179,7 @@ h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; }
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
-.kv .v { font-size: 1.05rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.kv .v { font-size: 1.05rem; font-variant-numeric: tabular-nums; }
 
 .tablewrap {
   overflow-x: auto;
@@ -220,6 +220,31 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 1
 .empty { color: var(--muted); padding: 1.5rem 0; }
 .note { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0 0; }
 
+/* ── the prose that holds machine strings ─────────────────────────────────────────────────────
+ *
+ * A file path, a dotted call site, a product id: unbreakable runs with no space in them, and by
+ * default they set the MINIMUM width of the block that holds them. Outside a scroller that
+ * minimum becomes the document's, which is how a page whose tables all scroll correctly still
+ * ends up scrolling sideways.
+ *
+ * Found by driving a real browser at 360px, not by reading: `/activity` overflowed by 194px on
+ * the log path in its subheading and `/gates` by 123px on
+ * `keel.commands._common._require_interactive_confirmation` in a `<code>`. Every table on both
+ * pages was already scrolling inside itself; the offending elements were two paragraphs.
+ *
+ * `anywhere` rather than `break-word`, and the difference is exactly this case: only `anywhere`
+ * makes the break count towards `min-content`, so only `anywhere` stops the long word forcing its
+ * ancestors wide in the first place. `break-word` wraps the text and leaves the page broken.
+ */
+.sub,
+.note,
+.kv .v,
+code,
+.paramlist dd,
+.stopped .detail {
+  overflow-wrap: anywhere;
+}
+
 /* ── the engine banner ────────────────────────────────────────────────────────────────────────
  *
  * The one region that is `aria-live` (see `index.html`), so it is also the one region styled to
@@ -251,11 +276,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 1
 .stopped { max-width: 44rem; }
 .stopped h1 { margin-bottom: 0.5rem; }
 .stopped p { margin: 0 0 0.7rem; }
-.stopped .detail {
-  color: var(--muted);
-  font-size: 0.88rem;
-  overflow-wrap: anywhere;
-}
+.stopped .detail { color: var(--muted); font-size: 0.88rem; }
 
 button {
   font: inherit;
@@ -271,6 +292,177 @@ button {
 }
 button:hover { filter: brightness(1.08); }
 button[disabled] { opacity: 0.6; cursor: default; }
+
+/* ── sortable headers and the scope switch (#537) ─────────────────────────────────────────────
+ *
+ * Both are `<button>`s styled to look like the text they replace, and that direction matters: the
+ * alternative is a click handler on the `<th>` or the `<span>`, which looks identical and is
+ * unreachable by keyboard, invisible to assistive technology, and not activated by Enter. A
+ * button styled down keeps every affordance and loses only the chrome.
+ *
+ * They deliberately do NOT inherit the filled `button` rule above: that one is for an action that
+ * changes something, and neither of these does -- they re-ask the server for the same rows in a
+ * different order or a different window. A row of filled buttons across a table head would also
+ * read as the most important thing on the page, which a sort control is not.
+ */
+button.sortkey,
+button.scopekey {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  min-height: 24px;
+}
+button.sortkey {
+  color: var(--muted);
+  font-weight: 550;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+button.sortkey:hover { color: var(--fg); }
+th[aria-sort="ascending"] button.sortkey,
+th[aria-sort="descending"] button.sortkey { color: var(--fg); }
+button.sortkey .mark { color: var(--accent); }
+
+.scopes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.9rem;
+  align-items: baseline;
+  margin: 0 0 1rem;
+}
+.scopes .k {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+button.scopekey { color: var(--accent); text-decoration: underline; }
+/* The scope that is on. `aria-current` is both the assistive signal and the CSS hook, so what a
+ * reader hears and what a reader sees come from one attribute and cannot drift apart -- the same
+ * pairing `header a[aria-current="page"]` uses for the nav. */
+button.scopekey[aria-current="true"] {
+  color: var(--fg);
+  font-weight: 650;
+  text-decoration: none;
+  border-bottom: 2px solid var(--accent);
+}
+
+/* ── disclosures ──────────────────────────────────────────────────────────────────────────────
+ *
+ * `<details>` for a cycle's events, a rule's promotion gate, an adapter's full declaration and a
+ * rule's parameters. Native, so keyboard operation, the reader's announcement and find-in-page
+ * all come for free -- see `render.js`'s `disclosure` note.
+ *
+ * `cursor: pointer` and nothing else on the summary: no custom marker, because the browser's own
+ * triangle is the affordance every user already recognises and replacing it is how a disclosure
+ * stops looking like one.
+ */
+details {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.6rem 1.1rem;
+  margin: 0 0 0.6rem;
+}
+details > summary {
+  cursor: pointer;
+  font-weight: 550;
+  padding: 0.15rem 0;
+  min-height: 24px;
+}
+details[open] > summary { margin-bottom: 0.7rem; }
+details .card { border: none; padding: 0; margin: 0 0 0.6rem; background: none; }
+
+.paramlist { margin: 0; }
+.paramlist dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.paramlist dd { margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+
+/* ── the setup checklist ──────────────────────────────────────────────────────────────────────
+ *
+ * A card per step rather than a table row, which is where this parts company with the rendered
+ * page. A step is a title, a state, a kind, a reason, a command and sometimes a list of inputs --
+ * that is a block of prose, and forcing it into a `<td>` is what makes the rendered page's third
+ * column a paragraph wearing a cell.
+ */
+.step .stephead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.7rem;
+  align-items: baseline;
+  margin-bottom: 0.35rem;
+}
+.action { margin: 0.6rem 0 0; }
+.action .inputs { margin: 0.3rem 0; padding-left: 1.2rem; }
+.action .choices { margin: 0.2rem 0; padding-left: 1.2rem; color: var(--muted); }
+a.runlink { color: var(--accent); }
+
+pre.joblines {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  margin: 0.5rem 0 0;
+  /* The transcript of a command, wrapped the way a terminal wraps it: long lines scroll inside
+   * this box rather than widening the page, which is the same rule every table here follows. */
+  white-space: pre;
+}
+
+/* ── the equity curve ─────────────────────────────────────────────────────────────────────────
+ *
+ * The SVG's `viewBox` is a fixed 1000x300 internal grid (`insights.PLOT_WIDTH`/`PLOT_HEIGHT`) and
+ * `preserveAspectRatio="none"` lets it stretch to whatever the card ends up being, so the chart
+ * is responsive with no resize listener, no `ResizeObserver` and no redraw. The height below is
+ * the only place a real size is decided.
+ *
+ * `vector-effect: non-scaling-stroke` is what makes that stretching survivable: without it the
+ * horizontal squash that fits 1000 units into ~600 pixels squashes the stroke with it, and the
+ * line renders visibly thinner than the baseline it crosses.
+ *
+ * The line is `--accent` and NOT `--good`: #532 split those two apart precisely because they were
+ * byte-identical and "a link and a gain currently render alike". Colouring the curve by whether
+ * it ends up would also be this stylesheet making the judgement `state` exists to carry -- and
+ * the figure that carries it, `curve.net`, is in the caption underneath in words.
+ */
+.chart {
+  margin: 0 0 1rem;
+  padding: 0.9rem 1.1rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.chart svg.curve {
+  display: block;
+  width: 100%;
+  height: 14rem;
+  overflow: visible;
+}
+.chart .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.chart .baseline {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+  vector-effect: non-scaling-stroke;
+}
+.chart .dot { fill: var(--accent); opacity: 0.55; }
+.chart figcaption { margin: 0.6rem 0 0; }
 
 footer {
   border-top: 1px solid var(--line);

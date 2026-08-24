@@ -109,11 +109,69 @@ const HEADERS = { "X-Keel-Client": "1", Accept: "application/json" };
 /**
  * A `Field` for a state this client had to mint because no server document carried one.
  *
+ * Exported since #537: `live.js` mints one too, for a dropped `EventSource`, and it must be the
+ * same word (`ENGINE_STATES` has two and no third) and the same judgement (`bad`, because a
+ * server that has stopped answering is a state in which something IS broken) as the two this
+ * module mints. Two spellings of "keel isn't running" is the sort of divergence nobody notices
+ * until the banner says one thing on a poll and another on a tick.
+ *
  * @param {string} display
  * @returns {Field}
  */
-function stopped(display) {
+export function stopped(display) {
   return { value: "stopped", display: display, state: "bad" };
+}
+
+/**
+ * A parsed `/api/*` document, as a `Reading`.
+ *
+ * Split out of `read` at #537 so it has exactly one caller more: `live.js`, which receives the
+ * same envelope over the event stream and must read it identically. **The alternative was to let
+ * `live.js` pick `engine` and `data` off the tick itself**, which is two lines and would have
+ * meant two places deciding what a keel document means -- and they would have disagreed the first
+ * time a key was added, in the direction where the stream renders a banner the fetch path would
+ * have rejected.
+ *
+ * `ok` is passed in rather than read off a status here, because the stream has no status: a frame
+ * that arrived is a frame the server chose to send, and there is no 4xx over SSE.
+ *
+ * @param {any} document_  a parsed JSON body.
+ * @param {boolean} ok     whether the transport called this a success.
+ * @param {string} status  the HTTP status as text, for the error a refusal needs.
+ * @returns {Reading}
+ */
+export function readingFrom(document_, ok, status) {
+  const as_of = typeof document_.as_of === "string" ? document_.as_of : "";
+
+  if (!ok) {
+    // Case 3. The error document carries no `engine`, so one is minted -- and `"stopped"` is the
+    // right word for it despite the server being plainly up. `payload.ENGINE_STATES`'s own
+    // comment settles this: a third word for "the report raised" was drafted and dropped because
+    // "the CLIENT behaviour required by a stopped engine and by an unbuildable report is
+    // identical -- show no figures, say why". This is the client that comment is about.
+    const error = /** @type {ApiError} */ (
+      document_.error || { status: status, title: "Refused", detail: "" }
+    );
+    return { as_of: as_of, engine: stopped(error.title), data: null, error: error, sort: null };
+  }
+
+  // Cases 1 and 2. `engine` is validated rather than trusted: this page is served from the same
+  // process as the API, so a mismatch should be impossible -- but a page cached by a browser
+  // across an engine upgrade is exactly the skew the spec's service-worker cache key (#538)
+  // exists to prevent one layer up, and "impossible" is not a reason to render `undefined`.
+  const engine = isField(document_.engine)
+    ? document_.engine
+    : stopped("keel's answer carried no engine state");
+
+  return {
+    as_of: as_of,
+    engine: engine,
+    // `?? null`, never `|| null`: `data` may legitimately be `0`, `""` or `false` for some future
+    // endpoint, and `||` would rewrite all three into "nothing to render".
+    data: document_.data ?? null,
+    error: null,
+    sort: document_.sort ?? null,
+  };
 }
 
 /**
@@ -181,37 +239,7 @@ export async function read(endpoint, params) {
     };
   }
 
-  const as_of = typeof document_.as_of === "string" ? document_.as_of : "";
-
-  if (!response.ok) {
-    // Case 3. The error document carries no `engine`, so one is minted -- and `"stopped"` is the
-    // right word for it despite the server being plainly up. `payload.ENGINE_STATES`'s own
-    // comment settles this: a third word for "the report raised" was drafted and dropped because
-    // "the CLIENT behaviour required by a stopped engine and by an unbuildable report is
-    // identical -- show no figures, say why". This is the client that comment is about.
-    const error = /** @type {ApiError} */ (
-      document_.error || { status: String(response.status), title: "Refused", detail: "" }
-    );
-    return { as_of: as_of, engine: stopped(error.title), data: null, error: error, sort: null };
-  }
-
-  // Cases 1 and 2. `engine` is validated rather than trusted: this page is served from the same
-  // process as the API, so a mismatch should be impossible -- but a page cached by a browser
-  // across an engine upgrade is exactly the skew the spec's service-worker cache key (#538)
-  // exists to prevent one layer up, and "impossible" is not a reason to render `undefined`.
-  const engine = isField(document_.engine)
-    ? document_.engine
-    : stopped("keel's answer carried no engine state");
-
-  return {
-    as_of: as_of,
-    engine: engine,
-    // `?? null`, never `|| null`: `data` may legitimately be `0`, `""` or `false` for some future
-    // endpoint, and `||` would rewrite all three into "nothing to render".
-    data: document_.data ?? null,
-    error: null,
-    sort: document_.sort ?? null,
-  };
+  return readingFrom(document_, response.ok, String(response.status));
 }
 
 /**
