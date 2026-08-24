@@ -1,14 +1,20 @@
-"""The loopback HTTP server behind `keel serve` -- routing, one bounded read per page, no writes.
+"""The loopback HTTP server behind `keel serve` -- routing, one bounded read per response.
 
-**Why the standard library and not a web framework.** This surface is six read-only pages served
-to one person on one machine. FastAPI/uvicorn would bring a dependency subtree (pydantic,
-starlette, anyio, h11, ...) into a wheel that today depends on `click` and its own workspace
-siblings -- and D5 has to freeze that tree into a signed, notarised app bundle, where every
-dynamic import is a hook to write and every megabyte is download the user waits through. It would
-also enlarge the supply-chain surface of a project whose proposition is auditability, to buy
-routing for six paths and a templating engine used zero times. `http.server` is the smaller,
-more honest answer here, and it is genuinely the wrong answer the moment this serves more than
-one local user -- at which point the framework, not this module, is the thing to reach for.
+Four surfaces, and the split is the whole of this module's job: the rendered HTML pages in
+`ROUTES`, the static assets under `staticfiles.STATIC_PREFIX` (#535), the JSON read API under
+`API_PREFIX` (#534, routed by `keel/web/api.py`), and the one closed write surface under
+`SETUP_ACTION_PREFIX` (#437). Each gets its own header set, because they need different values for
+the SAME header rather than merely different extra ones.
+
+**Why the standard library and not a web framework.** This surface is a handful of read-only pages
+and endpoints served to one person on one machine. FastAPI/uvicorn would bring a dependency
+subtree (pydantic, starlette, anyio, h11, ...) into a wheel that today depends on `click` and its
+own workspace siblings -- and D5 has to freeze that tree into a signed, notarised app bundle, where
+every dynamic import is a hook to write and every megabyte is download the user waits through. It
+would also enlarge the supply-chain surface of a project whose proposition is auditability, to buy
+routing for a couple of dozen paths and a templating engine used zero times. `http.server` is the
+smaller, more honest answer here, and it is genuinely the wrong answer the moment this serves more
+than one local user -- at which point the framework, not this module, is the thing to reach for.
 
 **The write surface is a closed set, and that is a better guarantee than the one it replaced.**
 This handler used to implement `do_GET`/`do_HEAD` and nothing else, so a POST died in the stdlib.
@@ -35,6 +41,7 @@ than a long-lived reader that could sit inside someone else's transaction.
 from __future__ import annotations
 
 import functools
+import json
 import socket
 import sys
 import time
@@ -45,7 +52,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
-from keel.web import render, staticfiles
+from keel.web import api, render, staticfiles
 from keel.web.security import (
     SESSION_COOKIE,
     HostPolicy,
@@ -83,7 +90,18 @@ class ServeConfig:
     token: str
     db_path: str
     config_path: str
+    #: The build identity as one human line, for the page footer: `keel 0.1.0+9f2c1a [checkout]`.
     build: str = ""
+    #: The same build as STRUCTURE -- a `keel.version.BuildInfo`, or `None` where one could not be
+    #: resolved. `/api/config` needs the version and the commit as separate fields (#538 keys a
+    #: service-worker cache to one, #539 puts the other in a `?v=`), and parsing them back out of
+    #: `build` would be a display string being read as data.
+    #:
+    #: Resolved ONCE by `serve_cmd`, never per request: `keel.version.build_info()` shells out to
+    #: git twice, and an endpoint a service worker polls must not fork a subprocess to answer.
+    #: `Any` rather than the real type for the same reason `api.load_config` returns `Any` -- this
+    #: module names service objects loosely so that importing `keel/web/` stays cheap.
+    build_info: Any = None
 
     @property
     def host_policy(self) -> HostPolicy:
@@ -99,21 +117,12 @@ class ServeConfig:
 # Each of these is a thin adapter over `keel/commands/*`. Nothing below computes anything: the
 # service layer returns a frozen report and `keel/web/render.py` turns it into HTML. That is the
 # seam `tests/commands/test_console_thinness.py` pins, now extended over this package.
-
-
-def _open_repo(db_path: str) -> Any:
-    """A plain connection -- deliberately WITHOUT `migrate`.
-
-    Every CLI command migrates on the way in, which is right for a command: it runs once, and a
-    schema behind the code is a thing to fix rather than to fail on. It is wrong here. These
-    pages auto-reload every 15 seconds, so migrating per request would have a view that calls
-    itself read-only take a write lock on the deployment database four times a minute -- against
-    a database the agent may be mid-cycle on. `ensure_schema` does it ONCE, at bind time, before
-    anything is served."""
-    from keel.data.db import connect
-    from keel.data.repository import Repository
-
-    return Repository(connect(db_path))
+#
+# `open_repo`, `load_config`, `deployment_state` and `close_repo` moved to `keel/web/api.py` when
+# the JSON endpoints arrived (#534), unchanged and with their reasoning intact. Both front-ends
+# read keel through them, and a copy in each file would be two places deciding whether a view may
+# migrate a live database. The dependency runs one way -- this module imports `api`, `api` imports
+# nothing from this one at runtime -- so there is no cycle to reason about.
 
 
 def ensure_schema(db_path: str) -> None:
@@ -141,22 +150,6 @@ def ensure_schema(db_path: str) -> None:
         conn.close()
 
 
-def _load_config(config_path: str) -> Any:
-    """`load_config` only -- deliberately NOT `_common._load_cfg`, which also calls
-    `configure_logging` and `bind_venue`. Those are process-entry side effects; re-applying them
-    on every page load would have the web UI quietly reconfiguring the running deployment's
-    logging."""
-    from keel.config import load_config
-
-    return load_config(config_path)
-
-
-def _deployment_state(cfg: ServeConfig) -> Any:
-    from keel.commands.setup import inspect
-
-    return inspect(cfg.config_path, cfg.db_path)
-
-
 def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
     from keel.commands import jobs
     from keel.commands.setup import ACTIONS, NOT_AUTOMATED_YET
@@ -165,7 +158,7 @@ def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str,
     return (
         "Setup",
         render.render_setup(
-            _deployment_state(cfg),
+            api.deployment_state(cfg),
             actions=ACTIONS,
             not_automated=NOT_AUTOMATED_YET,
             csrf=csrf_token(cfg.token),
@@ -196,7 +189,7 @@ def needs_database(
 
     @functools.wraps(page)
     def guarded(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-        if not _deployment_state(cfg).has_usable_database:
+        if not api.deployment_state(cfg).has_usable_database:
             # The full setup page, not a bare checklist: someone who lands here has nothing set
             # up, and the actions are the reason they are being shown this instead of a 500.
             return page_setup(cfg, query)
@@ -208,12 +201,12 @@ def needs_database(
 def page_status(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
     from keel.commands.status import gather_status
 
-    repo = _open_repo(cfg.db_path)
+    repo = api.open_repo(cfg.db_path)
     try:
-        config = _load_config(cfg.config_path)
+        config = api.load_config(cfg.config_path)
         report = gather_status(repo, config, now_ts=int(time.time()))
     finally:
-        _close(repo)
+        api.close_repo(repo)
     return "Status", render.render_status(report), _REFRESH_SEC
 
 
@@ -227,7 +220,7 @@ def page_activity(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, s
     )
 
     scope = normalise_scope((query.get("scope") or [""])[0])
-    config = _load_config(cfg.config_path)
+    config = api.load_config(cfg.config_path)
     path = resolve_log_path(config)
     window = read_log_window(path)
     feed = feed_from_lines(window.lines, source=str(path), truncated=window.truncated)
@@ -252,24 +245,24 @@ def page_insights(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, 
     from keel.commands.insights import build_insights_report, build_journal_report
     from keel.commands.status import gather_status
 
-    repo = _open_repo(cfg.db_path)
+    repo = api.open_repo(cfg.db_path)
     try:
-        config = _load_config(cfg.config_path)
+        config = api.load_config(cfg.config_path)
         now_ts = int(time.time())
         status_report = gather_status(repo, config, now_ts=now_ts)
         insights = build_insights_report(repo, config, status_report, now_ts)
         journal = build_journal_report(repo, status_report, now_ts, limit=_JOURNAL_LIMIT)
     finally:
-        _close(repo)
+        api.close_repo(repo)
     return "Insights", render.render_insights(insights, journal), None
 
 
 def page_rules(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    repo = _open_repo(cfg.db_path)
+    repo = api.open_repo(cfg.db_path)
     try:
         rows = repo.get_rules(None)
     finally:
-        _close(repo)
+        api.close_repo(repo)
     return "Rules", render.render_rules(rows), None
 
 
@@ -313,10 +306,12 @@ ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, 
 #: is no other way into this handler, and no other verb.
 SETUP_ACTION_PREFIX = "/setup/"
 
-#: Reserved for #533/#534's JSON API and #536's fetch()-based client -- nothing is mapped under
-#: it yet, so a POST here is a 404 like any other unmapped path. Named now because #535's third
-#: CSRF layer (`X-Keel-Client`, checked in `_client_header_ok`) is scoped to it specifically: see
-#: that method's docstring for why it must NOT also gate `SETUP_ACTION_PREFIX`.
+#: The JSON API (#534). `GET` under this prefix routes through `keel/web/api.py`'s own table --
+#: reads only, one bounded read per endpoint. `POST` under it is unchanged from #535: it clears
+#: `_api_client_header_ok` (the third CSRF layer, scoped to this prefix specifically -- see that
+#: method's docstring for why it must NOT also gate `SETUP_ACTION_PREFIX`) and then meets the same
+#: 404 every unmapped path gets, because there is still no JSON write surface and this issue added
+#: none.
 API_PREFIX = "/api/"
 
 
@@ -334,15 +329,6 @@ def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
         return None
     values = {field.name: form.get(field.name, "") for field in action.inputs}
     return action.run(Path(cfg.config_path), Path(cfg.db_path), values)
-
-
-def _close(repo: Any) -> None:
-    conn = getattr(repo, "conn", None)
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:  # pragma: no cover - a close that fails leaks nothing that matters
-            pass
 
 
 # -- the handler -------------------------------------------------------------------------------
@@ -440,6 +426,34 @@ _CSP_CONTENT_TYPES: tuple[str, ...] = ("text/html", "image/svg+xml")
 # wrong: forcing HTTPS at an address that was never issued a certificate.
 
 
+#: The header set for `/api/*` (#534). The same three unconditional headers the static route
+#: sends, plus the `no-store` that matters more here than anywhere else on this server.
+#:
+#: **`Cache-Control: no-store` is the layer BELOW the service worker's promise.** The design spec
+#: routes `/api/*` as `NetworkOnly`, "no exceptions", because "opening the app to last week's
+#: equity styled as current is worse than an error" -- but a service worker is a thing that may
+#: not be installed, may have been unregistered, or may be a version behind. `no-store` on the
+#: response means the browser's ordinary HTTP cache cannot hold an account balance either, whether
+#: or not any worker is in the picture.
+#:
+#: **No CSP, deliberately**, for the reason `_STATIC_BASE_HEADERS` already records: CSP is a
+#: response header with no defined meaning outside a browsing context, and `application/json` is
+#: not one. `nosniff` is what carries the weight for this content type instead -- a JSON body a
+#: browser is free to sniff as HTML is a stored-XSS primitive wearing a `Content-Type`.
+_API_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Cache-Control", "no-store, max-age=0"),
+)
+
+#: What every `/api/*` response is labelled. `charset=utf-8` explicitly, even though JSON's
+#: default encoding is UTF-8 by RFC 8259: the payload carries `—`, `▲`, `▼` and `−` (#532's
+#: non-colour gain/loss signal), and a client that guessed Latin-1 would render the whole contract
+#: as mojibake.
+_JSON_CONTENT_TYPE = "application/json; charset=utf-8"
+
+
 def _static_headers(content_type: str) -> tuple[tuple[str, str], ...]:
     """`_STATIC_BASE_HEADERS` plus CSP, but ONLY when `content_type` is one of
     `_CSP_CONTENT_TYPES` -- see the comments on `_STATIC_BASE_HEADERS` and `_CSP_CONTENT_TYPES`
@@ -492,7 +506,52 @@ class KeelHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(payload)
 
+    def _send_json(self, code: int, document: dict[str, Any]) -> None:
+        """One JSON response, with its own headers.
+
+        Writes them itself rather than going through `_send` for the same reason `_serve_static`
+        does: `_send` puts `_SECURITY_HEADERS` on every response, and one of those is a CSP that
+        has no meaning on `application/json` (see `_API_HEADERS`). Sharing the method would have
+        meant a parameter with a default, and a default on a shared sender is how a header set
+        silently changes for a route nobody was thinking about.
+
+        A plain `json.dumps`: `keel/web/payload.py` normalises every leaf to a string before it
+        gets here, so there is nothing for an encoder to convert -- and the encoder a hurried
+        author reaches for is `default=float`, which is the whole money contract dying in one
+        keyword. Rule 6d of `test_console_thinness.py` fails the build on it in the serialiser;
+        there is no `default=` here for the same reason.
+
+        `ensure_ascii=False` because the payload is UTF-8 and the glyphs carrying #532's
+        non-colour gain/loss signal have no business becoming escape sequences.
+        """
+        body = json.dumps(document, ensure_ascii=False)
+        payload = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", _JSON_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(payload)))
+        for name, value in _API_HEADERS:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
     def _refuse(self, code: int, heading: str, detail: str) -> None:
+        """A refusal, in the media type the caller asked for by the path it used.
+
+        **Path-scoped, not method-scoped, and not content-negotiated.** An HTML error page handed
+        to a `fetch()` client's `res.json()` is a parse error in the client, which is a strictly
+        worse diagnostic than the 403 it is hiding -- so everything under `API_PREFIX` refuses in
+        JSON, including the POST that still 404s there. The GATE in front of that POST
+        (`_api_client_header_ok`) is untouched by this: same trigger, same status, same ordering;
+        only the body's media type follows the path.
+
+        `Accept`-based negotiation was the alternative and it is worse here: a client that forgets
+        the header would get HTML from a JSON endpoint, and the one thing this server can be
+        certain about is which path was requested.
+        """
+        if urlsplit(self.path).path.startswith(API_PREFIX):
+            self._send_json(code, api.refusal_document(code, heading, detail))
+            return
         self._send(
             code,
             render.page(
@@ -733,6 +792,20 @@ class KeelHandler(BaseHTTPRequestHandler):
         if not self._admitted():
             return
 
+        if parsed.path.startswith(API_PREFIX):
+            # The JSON API (#534). Reads only: `api.respond` maps a path to one bounded read and
+            # returns `(status, document)` -- it never raises, so a broken report becomes a stated
+            # 500 with a JSON body rather than an HTML error page a `fetch()` client cannot parse,
+            # and never an empty payload that a view would render as zeros.
+            #
+            # Same admission as every rendered page, checked above and never weakened: an API is
+            # not exempt from the loopback-plus-session model for being machine-readable. What it
+            # does NOT additionally require is `X-Keel-Client` -- that header gates POSTs, and its
+            # docstring explains why a GET is not the gap it closes.
+            code, document = api.respond(self.cfg, parsed.path, query)
+            self._send_json(code, document)
+            return
+
         if parsed.path.startswith(staticfiles.STATIC_PREFIX):
             # Same admission as every rendered page (never weakened): a static asset is not
             # exempted from the loopback-plus-session model just because it holds no secrets
@@ -807,6 +880,7 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         db_path=cfg.db_path,
         config_path=cfg.config_path,
         build=cfg.build,
+        build_info=cfg.build_info,
     )
     server.RequestHandlerClass.cfg = running  # type: ignore[attr-defined]
 

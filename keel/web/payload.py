@@ -78,6 +78,18 @@ another route, and #532's styling table needs a word for every field it touches.
 would mean accepting that branch on the client, which is the thing this contract exists to
 remove.
 
+WHAT #534 ADDED, AND WHY IT IS HERE RATHER THAN IN THE ROUTING LAYER. Three things: the
+`envelope`/`error_envelope` pair that wraps every `GET /api/*` response, the `engine_state` word
+that lets a client say "keel isn't running" instead of rendering a blank view, and `order_rows`,
+the server-side sort. All three touch the WIRE VOCABULARY -- the closed `state` words, the
+no-exponent guarantee that makes `Field.value` re-parseable, the rule that a number crosses as a
+string -- and a second file holding half of that vocabulary is how the two halves drift. The
+routing layer's job is deciding WHICH rows and WHICH column from a query string; the ordering
+itself sits next to the `_plain` that wrote the strings being ordered.
+
+Note what `order_rows` does NOT do: it does not add the numeric `sort` companion field described
+above. It re-parses `Field.value`, which is exactly what that value is for.
+
 WHAT IS *NOT* A FIELD. Identifiers and enum words -- `product_id`, `rule_name`, `mode`,
 `as_of` -- cross as bare JSON strings. They carry no precision hazard, no rounding decision and
 no judgement, and wrapping them would be ceremony rather than contract. Bare JSON *numbers*
@@ -89,7 +101,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -1024,4 +1036,519 @@ def activity_payload(feed: ActivityFeed) -> dict[str, Any]:
             else None
         ),
         "cycles": [_cycle_payload(c) for c in feed.cycles],
+    }
+
+
+# -- the envelope (#534) -------------------------------------------------------------------------
+#
+# Every `GET /api/*` success is wrapped in the same four keys, so #536's single `fetch` wrapper
+# needs no per-endpoint branch and no knowledge of which endpoints can report a dead engine.
+
+
+#: The closed `engine` vocabulary. Two words, and deliberately not three.
+#:
+#: A third word for "the report raised" was drafted and dropped. The CLIENT behaviour required by
+#: a stopped engine and by an unbuildable report is identical -- show no figures, say why -- so a
+#: third word would force every view to write three branches to get two behaviours, and the
+#: difference between the two is already carried by the HTTP status and by `error.detail`. Add one
+#: the day a client would DO something different with it.
+ENGINE_STATES: frozenset[str] = frozenset({"running", "stopped"})
+
+RUNNING = "running"
+STOPPED = "stopped"
+
+#: What `engine: "stopped"` says when the caller has nothing more specific. The wording has to be
+#: true both for a machine with no deployment on it and for one whose report could not be built,
+#: because those are the two ways this value is reached.
+_STOPPED_DISPLAY = "keel isn't running here — there is no deployment to read"
+_RUNNING_DISPLAY = "keel is set up on this machine"
+
+
+def engine_state(*, running: bool, detail: str = "") -> Field:
+    """Whether there is a keel deployment behind this response, as a judged field.
+
+    **What this does NOT answer, on purpose: "did the agent run recently".** That question needs a
+    THRESHOLD -- how many hours of silence is too many -- and this file holds no thresholds by
+    design (`_freshness_payload` refuses the same temptation and says so). The evidence for it is
+    already on the wire in two places a client can render without arithmetic: `data_freshness`
+    carries each product's candle age in the CLI's own words, and the activity feed carries
+    `last_cycle_before_scope`, which exists precisely so an empty view can say *when keel last
+    ran*. The day a report builder holds an agent heartbeat WITH its staleness verdict, this
+    vocabulary gains a third word and the verdict is copied here, never computed here.
+
+    `warn` rather than `bad` for a stopped engine: on the commonest path to this value nothing is
+    broken at all -- it is a first run, and the correct next action is the setup checklist, not an
+    incident. A caller that knows better passes its own `detail`.
+    """
+    if running:
+        return {"value": RUNNING, "display": _RUNNING_DISPLAY, "state": GOOD}
+    return {"value": STOPPED, "display": detail or _STOPPED_DISPLAY, "state": WARN}
+
+
+def envelope(
+    now_ts: float | int | None,
+    *,
+    running: bool,
+    data: dict[str, Any] | None,
+    detail: str = "",
+    sort: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One `GET /api/*` success.
+
+    `data` is `null` -- never `{}` -- when the endpoint could not be answered because there is no
+    deployment. An empty object is a payload in which every figure is missing, and a view handed
+    one renders zeros; `null` cannot be rendered by accident, which is the whole requirement.
+
+    The key set is CONSTANT across every endpoint and every state, `sort` included on endpoints
+    that sort nothing. A client that has to test whether a key is present is branching on payload
+    SHAPE, which Rule 3 rejects for `state` and which is rejected here for the same reason.
+
+    `as_of` is the instant this response was built, and it is present even when `data` is not --
+    that pairing is the requirement: a client showing "keel isn't running" should be able to say
+    since when it was looking.
+    """
+    return {
+        "as_of": iso(now_ts),
+        "engine": engine_state(running=running, detail=detail),
+        "data": data,
+        "sort": sort,
+    }
+
+
+def error_envelope(
+    now_ts: float | int | None, *, status: int, title: str, detail: str
+) -> dict[str, Any]:
+    """One `GET /api/*` refusal or failure.
+
+    **The discriminator between this document and `envelope` is the HTTP STATUS, deliberately, and
+    not a field.** A uniform envelope with a nullable `error` was the first shape and it does not
+    survive contact with admission: most refusals happen BEFORE the session cookie is checked, and
+    filling in `engine` there would mean an unauthenticated request reading the deployment state
+    off disk. `res.ok` is a check every `fetch` client already makes.
+
+    `status` crosses as a STRING like every other number here. It would survive JSON's number type
+    intact, and that is exactly the argument `count` refuses: a payload with "only a few" numbers
+    in it needs a per-field rule about which ones, and that rule is what rots.
+
+    `data` is present and `null` so that a client reading `.data` on any response gets a value
+    rather than `undefined` -- the key set stays constant across the two documents for the same
+    reason it stays constant across endpoints.
+    """
+    return {
+        "as_of": iso(now_ts),
+        "data": None,
+        "error": {"status": str(status), "title": title, "detail": detail},
+    }
+
+
+# -- ordering (#534) -----------------------------------------------------------------------------
+#
+# Server-side sort, ordered with `Decimal`. The spec's own words: "On loopback the round trip is
+# sub-millisecond, so there is nothing to optimise and no client arithmetic to audit."
+
+
+def _cell_text(row: Mapping[str, Any], column: str) -> str:
+    """The exact, ungrouped text a row carries in `column`, or `""` for nothing to order by.
+
+    Reads `Field.value` for a field and the string itself for a bare identifier, which is exactly
+    what `Field.value` is documented to be: "machine input (exact, ungrouped, `Decimal`-parseable
+    for figures and ISO-8601 for instants)". A list, an object or a `None` yields `""` and sorts
+    with the absent rows -- an endpoint should not be declaring such a column sortable, and the
+    routing layer refuses a column it does not declare, but a total function here means a mistake
+    there costs an ordering rather than a 500.
+    """
+    cell = row.get(column)
+    if isinstance(cell, Mapping):
+        raw = cell.get("value", "")
+        return raw if isinstance(raw, str) else ""
+    if isinstance(cell, str):
+        return cell
+    return ""
+
+
+def _finite_decimal(text: str) -> Decimal | None:
+    """`text` as a finite `Decimal`, or `None` for anything that cannot be ordered as a number.
+
+    Non-finite is `None` on purpose, and it is not hypothetical: `stringify` renders a
+    `Decimal("NaN")` sentinel as `"NaN"`, and `Decimal("NaN")` PARSES. Ordering by it would make
+    the result depend on the comparison order the sort happened to use, because NaN compares false
+    to everything including itself -- so a column containing one is ordered as text instead, as a
+    whole column, and the ordering stays deterministic.
+    """
+    if not text:
+        return None
+    try:
+        candidate = Decimal(text)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return candidate if candidate.is_finite() else None
+
+
+def _ordering_key(pair: tuple[Any, Mapping[str, Any]]) -> Any:
+    """The first element of a (key, row) pair.
+
+    Sorting is keyed on this rather than on the pair, because the second element is a `dict` and
+    comparing two of them raises the moment two keys tie -- which is exactly the case a
+    tie-breaking sort reaches."""
+    return pair[0]
+
+
+def order_rows(
+    rows: Sequence[Mapping[str, Any]], *, column: str, descending: bool = False
+) -> list[Mapping[str, Any]]:
+    """`rows` ordered by `column`, with `Decimal` wherever the column is numeric.
+
+    **Why `Decimal` and not `float`, with the number in it.** Two ERC-20 quantities one wei apart
+    -- `0.100000000000000001` and `0.100000000000000002`, both legal at an 18-decimal base
+    increment -- map to the SAME IEEE-754 double, because adjacent doubles near 0.1 are about
+    1.4e-17 apart. A float-keyed sort cannot separate them, so their order becomes whatever order
+    they arrived in; `Decimal` orders them. The same collapse takes the last cent of a large
+    notional. `tests/web/test_api.py` asserts that disagreement directly, before the endpoint test
+    relies on it, so the endpoint test cannot be green for the trivial reason that sorting sorts.
+
+    **The SERIALISED rows are sorted, not the source dataclasses.** The alternative -- ordering
+    `report.open_positions` before serialising -- needs a map from every payload key back to the
+    report attribute it came from, held in a second file, and that map rots the first time a key
+    is renamed here. Sorting the output means `?sort=qty` names exactly the field the client can
+    see in the response, and `_plain` guarantees `value` re-parses to the `Decimal` it was written
+    from, for any input, so the round trip loses nothing.
+
+    **Numeric or text is decided per COLUMN, never per row.** A per-row decision would put a
+    `Decimal` and a `str` in one comparison, which raises, and a per-row fallback would make the
+    order depend on which values happened to look like numbers. So: numeric only when every
+    present value parses finite, text otherwise. Instants land in the text branch and are still
+    chronological, because `moment().value` is fixed-width ISO-8601 UTC.
+
+    **An absent value sorts last in BOTH directions.** `None` means "not recorded" and `0` means
+    "recorded as zero"; collapsing the first into the second is the shape of the always-passing fee
+    rail (#198). Giving an absent cell a numeric key would make it the largest thing in a
+    descending sort, which is that same collapse wearing a different hat.
+    """
+    present: list[tuple[str, Mapping[str, Any]]] = []
+    missing: list[Mapping[str, Any]] = []
+    for row in rows:
+        text = _cell_text(row, column)
+        if text:
+            present.append((text, row))
+        else:
+            missing.append(row)
+
+    figures = [_finite_decimal(text) for text, _row in present]
+    keyed: list[tuple[Any, Mapping[str, Any]]]
+    if all(figure is not None for figure in figures):
+        keyed = [(figure, row) for figure, (_text, row) in zip(figures, present, strict=True)]
+    else:
+        keyed = [(text.casefold(), row) for text, row in present]
+
+    # `list.sort` is stable in both directions, so rows that tie keep the order the report built
+    # them in -- which for `open_positions` is FIFO, the attribution order a later exit uses, and
+    # therefore an order that must not be scrambled by a display sort.
+    keyed.sort(key=_ordering_key, reverse=descending)
+    return [row for _key, row in keyed] + missing
+
+
+# -- config (#534) -------------------------------------------------------------------------------
+
+
+def config_payload(build: Any, *, describe: str = "") -> dict[str, Any]:
+    """The running build, for the two consumers that need it by name.
+
+    `version` is what #539 carries as `?v=` on a documentation link, so version skew between the
+    engine and the docs is visible rather than silent. `build` is `full_version` -- the version
+    bound to the commit -- and is what #538 keys its service-worker cache name to, because a
+    version alone is ambiguous (many commits share one between bumps) and a cache key that does
+    not move when the code does is exactly how an upgraded engine gets met by a stale shell
+    holding an older contract.
+
+    `build` arrives already RESOLVED, from `ServeConfig`, rather than being looked up here.
+    `keel.version.build_info()` shells out to git twice, and an endpoint a service worker polls
+    must not fork a subprocess to answer. `None` -- no package metadata and no git, the same
+    environment in which the page footer is already empty -- reports absent rather than inventing
+    a version: a cache key of `""` still keys a cache, whereas a wrong version in a `?v=` link
+    would send a reader to documentation for a build that does not exist.
+    """
+    return {
+        "version": str(getattr(build, "version", "") or ""),
+        "build": str(getattr(build, "full_version", "") or ""),
+        "commit": str(getattr(build, "commit", "") or ""),
+        "source": str(getattr(build, "source", "") or ""),
+        "describe": describe,
+        # keel's central honesty signal, and the one judgement this payload carries: `False` means
+        # the running code corresponds to no commit (a dirty tree, or no idea), and `keel.version`
+        # treats saying so as more important than looking tidy.
+        "reproducible": flag(
+            None if build is None else bool(getattr(build, "is_reproducible", False)),
+            on="reproducible",
+            off="NOT reproducible — this build corresponds to no commit",
+            on_state=GOOD,
+            off_state=WARN,
+        ),
+    }
+
+
+# -- setup (#534) --------------------------------------------------------------------------------
+
+#: `StepKind`, judged -- and the judgement is "can a machine do this for you", never "is something
+#: wrong". `judgement` warns because a human must decide it and keel must never decide it for
+#: them; `off_venue` warns because keel can neither perform nor VERIFY it, and `render.py`'s own
+#: note is the reason: "a green check that verifies nothing turns an open risk into a false
+#: assurance".
+_STEP_KIND_STATES: Mapping[str, str] = {
+    "mechanical": NEUTRAL,
+    "operator_input": NEUTRAL,
+    "judgement": WARN,
+    "off_venue": WARN,
+}
+
+#: `JobStatus.state`, judged.
+_JOB_STATES: Mapping[str, str] = {"running": WARN, "done": GOOD, "failed": BAD}
+
+
+def _step_payload(item: Any) -> dict[str, Any]:
+    """One checklist step.
+
+    `done` is three-valued and stays three-valued: `None` means "could not be determined", which is
+    NOT `False`. An unreadable database is not an unseeded one, and reporting it as incomplete
+    would send an operator to re-run a step that may already be done -- `StepState.done`'s own
+    comment. `flag(None)` renders it absent, so the browser shows a dash where the CLI shows
+    `[?]`, and neither claims to know."""
+    return {
+        "key": item.step.key,
+        "title": item.step.title,
+        "kind": label(
+            item.step.kind.value, state=_STEP_KIND_STATES.get(item.step.kind.value, NEUTRAL)
+        ),
+        "stage": item.step.stage.value,
+        "why": item.step.why,
+        "how": item.step.how,
+        "done": flag(item.done, on="done", off="outstanding", on_state=GOOD, off_state=WARN),
+        "detail": item.detail,
+    }
+
+
+def _action_input_payload(field: Any) -> dict[str, Any]:
+    return {
+        "name": field.name,
+        "label": field.label,
+        "hint": field.hint,
+        # `secret=True` is the difference between a `password` input and a `text` one, and between
+        # a form that can be submitted safely and one that leaks its own contents into browser
+        # history. The client is told the answer rather than deriving it from the field's name.
+        "secret": flag(field.secret, on="never echoed back", off="shown as typed"),
+        # A closed set of answers, rendered with NOTHING pre-selected: an action that could fill in
+        # a field the operator left blank is one that could record something they never supplied.
+        "choices": list(field.choices),
+    }
+
+
+def _action_payload(action: Any) -> dict[str, Any]:
+    return {
+        "key": action.key,
+        "title": action.title,
+        "detail": action.detail,
+        "needs_input": flag(
+            action.needs_input, on="needs your input", off="keel can do this unaided"
+        ),
+        "inputs": [_action_input_payload(field) for field in action.inputs],
+    }
+
+
+def _job_payload(job: Any) -> dict[str, Any]:
+    """A background setup job (`keel.commands.jobs`), as JSON.
+
+    `int(job.elapsed_sec)` is the one integer conversion in this file outside `_gmt`, and it is on
+    SECONDS, which have no cent to lose -- the same argument Rule 6b's timestamp allowance makes.
+    `duration` takes whole seconds because `_human_age`, the CLI's own phrasing, does. A failure
+    stays in the payload rather than being cleared: the whole point of running something in the
+    background is that nobody was watching when it broke."""
+    return {
+        "key": job.key,
+        "state": label(job.state, state=_JOB_STATES.get(job.state, NEUTRAL)),
+        "started_at": moment(job.started_ts),
+        "finished_at": moment(job.finished_ts),
+        "elapsed": duration(int(job.elapsed_sec)),
+        "running": flag(job.is_running, on="running", off="finished"),
+        "error": job.error or "",
+        # Newest last, unscrolled, exactly as the CLI prints them: an operator who has run `keel
+        # fetch` in a terminal should recognise what they are looking at rather than have to learn
+        # a second vocabulary for the same thing.
+        "lines": list(job.lines),
+    }
+
+
+def setup_payload(
+    state: Any,
+    *,
+    actions: Sequence[Any] = (),
+    not_automated: Mapping[str, str] | None = None,
+    job: Any = None,
+) -> dict[str, Any]:
+    """`keel.commands.setup.inspect`'s `DeploymentState`, as JSON.
+
+    **No CSRF token, and that is the point rather than an omission.** `render_setup` takes one
+    because it emits `<form method=post>`; this issue ships reads only, and minting a live write
+    credential into a GET response would put it into every cached copy, every proxy log and every
+    paste of "here is what the API returned". The token is `csrf_token(session)` and it stays where
+    the write is.
+
+    `actions` and `not_automated` are read from `keel.commands.setup`'s own closed registries and
+    copied, never filtered here: an action appears only where the registry carries one, which is
+    what stops "attest this asset" appearing because somebody edited a front-end.
+    """
+    from keel.commands.setup import Stage
+
+    return {
+        "root": str(state.root),
+        "config_path": str(state.config_path),
+        "db_path": str(state.db_path),
+        "is_new": flag(
+            state.is_new,
+            on="nothing set up here yet",
+            off="a deployment exists here",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "has_usable_database": flag(
+            state.has_usable_database,
+            on="readable",
+            off="no schema here yet",
+            on_state=GOOD,
+            off_state=WARN,
+        ),
+        # `ready_for(LIVE)` is deliberately absent: `OFF_VENUE` steps can never be OBSERVED, so the
+        # answer would be a permanent `False` that says nothing about the deployment. The honest
+        # last word on going live belongs to the operator who checked the venue dashboard.
+        "ready_for_paper": flag(
+            state.ready_for(Stage.PAPER),
+            on="ready to run in paper",
+            off="not yet ready for paper",
+            on_state=GOOD,
+            off_state=WARN,
+        ),
+        "next_step": state.next_step.step.key if state.next_step is not None else "",
+        "steps": [_step_payload(item) for item in state.states],
+        "actions": [_action_payload(action) for action in actions],
+        # Mechanical steps deliberately NOT offered as one-click actions, and why. Carried as data
+        # rather than omitted silently, so a gap is visible to the next person rather than looking
+        # like an oversight -- and empty is a fine value.
+        "not_automated": [
+            {"key": key, "why": why} for key, why in sorted((not_automated or {}).items())
+        ],
+        "job": _job_payload(job) if job is not None else None,
+    }
+
+
+# -- rules (#534) --------------------------------------------------------------------------------
+
+
+def _rule_row_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        # An identifier, so a bare string -- and one that still sorts numerically, because
+        # `order_rows` reads a column as `Decimal` when every value in it parses as one.
+        "id": str(row.get("id", "")),
+        "kind": str(row.get("kind") or ""),
+        "status": label(str(row.get("status") or "")),
+        "created_at": moment(row.get("created_at")),
+        "promoted_at": moment(row.get("promoted_at")),
+        "demoted_at": moment(row.get("demoted_at")),
+        # Operator-supplied and open-ended (any rule kind may invent its own), so they cross as
+        # strings for the same reason `ActivityEvent.fields` does.
+        "params": {
+            str(key): stringify(value) for key, value in sorted((row.get("params") or {}).items())
+        },
+    }
+
+
+def rules_payload(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """`Repository.get_rules(None)`'s rows, as JSON.
+
+    Read-only, and the page it mirrors says so out loud: promotion happens in the CLI, behind the
+    TTY gate, and nothing this API serves can change a rule's status."""
+    return {"rules": [_rule_row_payload(row) for row in rows]}
+
+
+# -- venues (#534) -------------------------------------------------------------------------------
+
+
+def _venue_payload(info: Any) -> dict[str, Any]:
+    """One installed adapter's DECLARED capabilities.
+
+    What the adapter says it can do, never an inference about the operator's keys: a row here is
+    not a claim that the venue is configured or reachable (#233). An adapter that failed to
+    construct still gets a row, with the failure judged `bad` -- a missing row would read as "not
+    installed", which is a different fact and a worse one to be wrong about."""
+    return {
+        "name": info.name,
+        "venue": info.venue,
+        "deployment": info.deployment,
+        "asset_classes": list(info.asset_classes),
+        "supported_orders": list(info.supported_orders),
+        "quote_currencies": list(info.quote_currencies),
+        "supported_data_feeds": list(info.supported_data_feeds),
+        "declared_endpoints": list(info.declared_endpoints),
+        "package_version": info.package_version or "",
+        "preview": info.preview,
+        "session_bound": flag(info.session_bound, on="session-bound", off="stateless"),
+        "supports_fee_summary": flag(
+            info.supports_fee_summary, on="fee summary", off="no fee summary"
+        ),
+        # Not `absent()` when there is no error: absent means "not recorded", and "constructed
+        # cleanly" is a positive observation. Spelling it out is the same choice
+        # `_subscription_payload` makes for an unlimited cap.
+        "error": (
+            label(info.error, state=BAD)
+            if info.error
+            else label("none", display="constructed cleanly", state=GOOD)
+        ),
+    }
+
+
+def venues_payload(infos: Sequence[Any]) -> dict[str, Any]:
+    """`keel.commands.brokers.list_installed_brokers`'s rows, as JSON."""
+    return {"venues": [_venue_payload(info) for info in infos]}
+
+
+# -- gates (#534) --------------------------------------------------------------------------------
+
+
+def _capability_payload(capability: Any) -> dict[str, Any]:
+    return {
+        "surface": capability.surface,
+        "invocation": capability.invocation,
+        "increases": capability.increases,
+        "call_site": f"{capability.module}.{capability.function}",
+        "mirrors": (
+            f"{capability.mirrors[0]}.{capability.mirrors[1]}" if capability.mirrors else ""
+        ),
+    }
+
+
+def gates_payload(gates: Sequence[Any], capabilities: Sequence[Any]) -> dict[str, Any]:
+    """`keel/capabilities.py`'s declaration, as JSON.
+
+    A pure declaration -- no config, no database, no network. It describes the BINARY that is
+    answering, which is why this endpoint has data to serve on a machine with no deployment on it.
+
+    **No `count` of covered actions**, unlike the HTML page's `esc(len(covered))`. Rule 6e of
+    `test_console_thinness.py` bans `len()` in this module, because a count on the wire must be one
+    the report already holds -- and `Gate` holds none. Unlike `JournalReport.shown_count` there is
+    no report builder to add it to either, `keel/capabilities.py` being a declaration rather than a
+    report. A client renders `actions.length`, which is a list length in the language that owns the
+    list, not a figure this layer invented.
+    """
+    return {
+        "gates": [
+            {
+                "name": gate.name,
+                "evidence": gate.evidence,
+                "fails_closed_against": gate.fails_closed_against,
+                "implementation": gate.implementation,
+                "actions": [
+                    _capability_payload(capability)
+                    for capability in capabilities
+                    if capability.gate == gate.name
+                ],
+            }
+            for gate in gates
+        ]
     }

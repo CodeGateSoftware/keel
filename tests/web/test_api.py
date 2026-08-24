@@ -1,0 +1,873 @@
+"""The JSON API (#534), over a real bound server.
+
+Driven against an actual `ThreadingHTTPServer` rather than a hand-built handler for the same
+reason `tests/web/test_server.py` is: the properties worth pinning here -- that a read needs no
+write header, that a refusal is still JSON, that `Cache-Control: no-store` reaches the wire on
+every `/api/*` response -- are properties of the BYTES, and a test against a handler object could
+pass while the served response said otherwise.
+
+**This module deliberately does not reuse `tests/web/test_server.py`'s `_request`.** That helper
+defaults `client_header="1"` on every POST, which is right for the module it lives in and wrong
+here: the central question below is whether a *GET* is answered by a client that sends no custom
+header at all (a `curl`, an address bar, a service worker's `NetworkOnly` fetch), so the helper
+these tests need is one that sends nothing it was not asked to send. Sharing the other one would
+have meant a default quietly answering the question the test is asking -- see `_get`'s docstring.
+
+Five things are pinned, and each exists because a downstream issue (#536-#540) consumes it:
+
+* **Every HTML read has a JSON counterpart**, `/glossary` excepted -- it becomes an outbound link
+  in #539 and its renderer is deleted in #540, so an `/api/glossary` would be a surface built to
+  be removed.
+* **`GET /api/config` returns the running version**, because #538 keys a service-worker cache to
+  it and #539 carries it as `?v=` on documentation links.
+* **Sorting is a query parameter ordered with `Decimal`**, with the float-collision case that
+  makes the choice of `Decimal` load-bearing rather than decorative.
+* **A stopped engine is a stated fact, not an empty payload** -- `engine.value == "stopped"` with
+  `data: null`, at HTTP 200, so a client renders "keel isn't running" instead of a blank view.
+* **The write surface did not move.** `POST /api/*` still 404s behind the `X-Keel-Client` gate,
+  and this issue adds no route to it.
+"""
+
+from __future__ import annotations
+
+import ast
+import http.client
+import json
+import sqlite3
+import threading
+from collections.abc import Iterator
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from keel.data.db import connect, migrate
+from keel.web import api as web_api
+from keel.web import payload
+from keel.web import server as web_server
+from keel.web.security import SESSION_COOKIE, csrf_token, new_session_token
+from tests.conftest import VALID_CONFIG_YAML
+
+#: Every read the HTML routes perform, as its JSON counterpart. `/glossary` is absent on purpose
+#: and `test_the_glossary_has_no_api_counterpart` states that absence as an assertion, so deleting
+#: it here later cannot silently mean "we forgot".
+API_ROUTES = (
+    "/api/config",
+    "/api/status",
+    "/api/setup",
+    "/api/activity",
+    "/api/insights",
+    "/api/journal",
+    "/api/rules",
+    "/api/venues",
+    "/api/gates",
+)
+
+
+# -- a real server ------------------------------------------------------------------------------
+
+
+def _bind(db_path: str, config_path: str, **extra: Any) -> Iterator[web_server.ServeConfig]:
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+        **extra,
+    )
+    server = web_server.build_server(cfg)
+    bound = web_server.ServeConfig(
+        host=cfg.host,
+        port=int(server.server_address[1]),
+        token=cfg.token,
+        db_path=db_path,
+        config_path=config_path,
+        **extra,
+    )
+    server.RequestHandlerClass.cfg = bound  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield bound
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def deployment(tmp_path: Path) -> tuple[str, str]:
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    conn.close()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    return str(db_path), str(config_path)
+
+
+@pytest.fixture
+def running(deployment: tuple[str, str]) -> Iterator[web_server.ServeConfig]:
+    db_path, config_path = deployment
+    yield from _bind(db_path, config_path)
+
+
+@pytest.fixture
+def empty_machine(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
+    """Nothing set up at all -- no config, no database. The first-run state, and the one an API
+    client must be told about in words rather than left to infer from an empty list."""
+    yield from _bind(str(tmp_path / "keel.db"), str(tmp_path / "config.yaml"))
+
+
+def _get(
+    cfg: web_server.ServeConfig,
+    path: str,
+    *,
+    method: str = "GET",
+    cookie: str | None = None,
+    host: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], str]:
+    """A request that sends NOTHING it was not asked to send.
+
+    No `X-Keel-Client`, no `Sec-Fetch-Site`, no `Origin` unless a test names them. That is the
+    whole point of not sharing `test_server.py`'s helper: a default header here would answer
+    `test_a_read_needs_no_client_header` on the test's behalf, and the shipped consumers of this
+    API include a `curl` and a browser address bar, neither of which sends one."""
+    conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
+    sent = {"Host": host if host is not None else f"{cfg.host}:{cfg.port}"}
+    if cookie:
+        sent["Cookie"] = cookie
+    sent.update(headers or {})
+    try:
+        conn.request(method, path, headers=sent)
+        response = conn.getresponse()
+        body = response.read().decode("utf-8", "replace")
+        return response.status, dict(response.getheaders()), body
+    finally:
+        conn.close()
+
+
+def _session(cfg: web_server.ServeConfig) -> str:
+    return f"{SESSION_COOKIE}={cfg.token}"
+
+
+def _json(cfg: web_server.ServeConfig, path: str) -> tuple[int, dict[str, str], Any]:
+    status, headers, body = _get(cfg, path, cookie=_session(cfg))
+    return status, headers, json.loads(body)
+
+
+# -- seeding ------------------------------------------------------------------------------------
+
+
+def _seed_positions(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> None:
+    """Open tranches, written straight into the table `gather_status` reads.
+
+    `qty` and `entry_fill` are TEXT columns holding exact decimal strings, which is what makes the
+    float-collision case below reachable end to end rather than only in a unit test: the value the
+    API sorts is the value the ledger stored, character for character."""
+    conn = sqlite3.connect(db_path)
+    try:
+        for index, (product_id, qty, entry_fill) in enumerate(rows):
+            conn.execute(
+                "INSERT INTO positions (product_id, rule_name, opened_at, qty, entry_fill, "
+                "entry_fee, status) VALUES (?, ?, ?, ?, ?, ?, 'open')",
+                (product_id, f"rule-{index}", 1_700_000_000 + index, qty, entry_fill, "0"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_rules(db_path: str, kinds: tuple[str, ...]) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        for index, kind in enumerate(kinds):
+            conn.execute(
+                "INSERT INTO rules (kind, params, status, created_at) VALUES (?, ?, ?, ?)",
+                (kind, json.dumps({"product_id": "BTC-USD"}), "candidate", 1_700_000_000 + index),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -- every read is available as JSON --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", API_ROUTES)
+def test_every_route_answers_json_with_the_envelope(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    """The uniform half of the contract: one shape, so #536's single `fetch` wrapper needs no
+    per-endpoint branch. `as_of` and `engine` are present on EVERY success, including the three
+    endpoints that describe the binary rather than the deployment -- a client that had to know
+    which endpoints carry the liveness word would be branching on payload shape, which is the
+    thing `payload.py`'s Rule 3 exists to remove."""
+    status, headers, document = _json(running, path)
+
+    assert status == 200, (path, document)
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert set(document) >= {"as_of", "engine", "data"}
+    assert document["as_of"].endswith("Z")
+    assert document["engine"]["value"] in payload.ENGINE_STATES
+    assert document["data"] is not None
+
+
+def test_the_glossary_has_no_api_counterpart(running: web_server.ServeConfig) -> None:
+    """Stated as an assertion rather than left as an omission. `/glossary` becomes an outbound
+    keeltrading.com link in #539 and `render_glossary` is deleted in #540, so an `/api/glossary`
+    would be a surface built in order to be removed -- and a client written against it would
+    break on the release that removes it."""
+    status, headers, document = _json(running, "/api/glossary")
+
+    assert status == 404
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert document["error"]["status"] == "404"
+
+
+def test_the_api_routes_cover_every_html_route_that_reads(
+    running: web_server.ServeConfig,
+) -> None:
+    """The pin that keeps the two surfaces in step. Read off both route tables, so an HTML route
+    added without a JSON counterpart fails here rather than being noticed when a client cannot
+    render it."""
+    html = set(web_server.ROUTES) - {"/glossary"}
+    covered = {web_api.HTML_ROUTE_FOR[name] for name in web_api.API_ROUTES}
+
+    assert html <= covered, html - covered
+
+
+# -- /api/config ----------------------------------------------------------------------------------
+
+
+def test_config_returns_the_running_version(deployment: tuple[str, str]) -> None:
+    """#538 keys a service-worker cache name to `build`, and #539 carries `version` as `?v=` on
+    every documentation link. Both consumers need the value to be the RUNNING build's, resolved
+    once at start-up rather than re-derived per request -- `keel.version.build_info()` shells out
+    to git, and a service worker polling an endpoint that forks a subprocess is a bad trade."""
+    db_path, config_path = deployment
+    fake = _FakeBuild()
+    for cfg in _bind(db_path, config_path, build="keel 9.9.9+abc [checkout]", build_info=fake):
+        status, _headers, document = _json(cfg, "/api/config")
+
+        assert status == 200
+        assert document["data"]["version"] == "9.9.9"
+        assert document["data"]["build"] == "9.9.9+abc123456789"
+        assert document["data"]["source"] == "checkout"
+        assert document["data"]["describe"] == "keel 9.9.9+abc [checkout]"
+        assert document["data"]["reproducible"]["value"] == "true"
+
+
+def test_config_survives_a_build_it_could_not_resolve(running: web_server.ServeConfig) -> None:
+    """An environment with no package metadata and no git is not an error worth a 500 for: the
+    footer already degrades to an empty string there (`serve.py::_build_line`), and a cache key
+    of `"unknown"` still keys a cache. Reported as absent rather than invented."""
+    status, _headers, document = _json(running, "/api/config")
+
+    assert status == 200
+    assert document["data"]["version"] == ""
+    assert document["data"]["reproducible"]["state"] == "unknown"
+
+
+class _FakeBuild:
+    """A resolved `keel.version.BuildInfo`, without shelling out to git in a test."""
+
+    version = "9.9.9"
+    commit = "abc123456789"
+    dirty = False
+    source = "checkout"
+    full_version = "9.9.9+abc123456789"
+    is_reproducible = True
+
+
+# -- money crosses the wire as a string ------------------------------------------------------------
+
+
+def _walk(node: Any, path: str = "$") -> list[tuple[str, Any]]:
+    if isinstance(node, dict):
+        out: list[tuple[str, Any]] = []
+        for key, value in node.items():
+            out.extend(_walk(value, f"{path}.{key}"))
+        return out
+    if isinstance(node, list):
+        out = []
+        for index, value in enumerate(node):
+            out.extend(_walk(value, f"{path}[{index}]"))
+        return out
+    return [(path, node)]
+
+
+def _json_numbers(document: Any) -> list[str]:
+    """`bool` first and deliberately: Python's `bool` is a subclass of `int`, so an `isinstance`
+    test alone would flag every JSON `true`. Duplicated from `test_payload.py` rather than
+    imported so that weakening one guard cannot weaken the other."""
+    return [
+        path
+        for path, leaf in _walk(document)
+        if not isinstance(leaf, bool) and isinstance(leaf, (int, float))
+    ]
+
+
+@pytest.mark.parametrize("path", API_ROUTES)
+def test_no_wire_value_from_any_endpoint_is_ever_a_json_number(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    """#533's rule, asserted over the bytes each ENDPOINT actually serves rather than over the
+    serialiser's return value. The two are not the same statement: the envelope, the sort echo and
+    every refusal body are written by the routing layer, and a plain `int` in any of them is a
+    double in a browser exactly as a mis-serialised price would be."""
+    db_path = running.db_path
+    _seed_positions(db_path, (("BTC-USD", "0.01", "50000"),))
+    _seed_rules(db_path, ("breakout",))
+
+    _status, _headers, document = _json(running, path)
+
+    assert _json_numbers(document) == [], path
+
+
+def test_the_number_walker_is_proven_false_capable() -> None:
+    """The guard's positive control. A walker that matched nothing would make every parametrised
+    case above green over a payload full of doubles."""
+    assert _json_numbers({"a": [{"b": 0.1}], "ok": True, "text": "1"}) == ["$.a[0].b"]
+
+
+def test_even_a_refusal_carries_no_json_number(running: web_server.ServeConfig) -> None:
+    """The HTTP status crosses as `"404"`, not `404`. It would survive JSON's number type intact,
+    and it still goes as a string: a payload with "only a few" numbers in it needs a per-field rule
+    about which ones, and that rule is what rots -- `payload.count`'s docstring makes the same
+    argument for a trade count."""
+    _status, _headers, document = _json(running, "/api/nope")
+
+    assert _json_numbers(document) == []
+
+
+# -- server-side sort ------------------------------------------------------------------------------
+
+
+def test_sorting_is_a_query_parameter(running: web_server.ServeConfig) -> None:
+    _seed_rules(running.db_path, ("momentum", "breakout", "reversal"))
+
+    _status, _headers, ascending = _json(running, "/api/rules?sort=kind")
+    _status, _headers, descending = _json(running, "/api/rules?sort=kind&dir=desc")
+
+    assert [row["kind"] for row in ascending["data"]["rules"]] == [
+        "breakout",
+        "momentum",
+        "reversal",
+    ]
+    assert [row["kind"] for row in descending["data"]["rules"]] == [
+        "reversal",
+        "momentum",
+        "breakout",
+    ]
+
+
+def test_the_sort_is_echoed_so_a_client_needs_no_hardcoded_column_list(
+    running: web_server.ServeConfig,
+) -> None:
+    """#537 renders sortable headers. It reads the column list off the response rather than
+    holding a copy, so a column added here reaches the interface without a second edit -- and a
+    column removed here cannot leave a header that sorts by nothing."""
+    _status, _headers, document = _json(running, "/api/rules?sort=kind&dir=desc")
+
+    assert document["sort"]["column"] == "kind"
+    assert document["sort"]["direction"] == "desc"
+    assert "kind" in document["sort"]["columns"]
+
+
+def test_an_unknown_sort_column_is_refused_not_ignored(running: web_server.ServeConfig) -> None:
+    """Silently ignoring an unknown column is how a client ships a sort that does nothing and
+    nobody notices for a release. The refusal names the columns that do exist, so the fix is in
+    the response."""
+    status, _headers, document = _json(running, "/api/rules?sort=expectancy")
+
+    assert status == 400
+    assert "expectancy" in document["error"]["detail"]
+    assert "kind" in document["error"]["detail"]
+
+
+def test_an_unknown_sort_direction_is_refused(running: web_server.ServeConfig) -> None:
+    status, _headers, document = _json(running, "/api/rules?sort=kind&dir=sideways")
+
+    assert status == 400
+    assert "sideways" in document["error"]["detail"]
+
+
+def test_an_endpoint_with_nothing_to_sort_says_so(running: web_server.ServeConfig) -> None:
+    """`/api/setup`'s steps are in runbook order -- the order IS the information, since a checklist
+    sorted by title is a checklist you cannot work down -- so it declares no sortable columns, and
+    a `?sort=` against it is refused rather than quietly obeyed."""
+    status, _headers, refused = _json(running, "/api/setup?sort=title")
+    _status, _headers, plain = _json(running, "/api/setup")
+
+    assert status == 400
+    assert "no sortable table" in refused["error"]["detail"]
+    # And the successful response says the same thing in the shape a client reads: `sort` is
+    # `null`, not an object with an empty column list, so "this endpoint does not sort" and "this
+    # endpoint sorts but you have not asked it to" stay distinguishable.
+    assert plain["sort"] is None
+
+
+def test_an_endpoint_that_sorts_echoes_its_columns_before_anything_is_sorted(
+    running: web_server.ServeConfig,
+) -> None:
+    """The other half of the distinction above."""
+    _status, _headers, document = _json(running, "/api/rules")
+
+    assert document["sort"] == {
+        "column": "",
+        "direction": "asc",
+        "columns": list(web_api.API_ROUTES["/api/rules"].sortable),
+    }
+
+
+def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
+    running: web_server.ServeConfig,
+) -> None:
+    """The guard against the one way a hand-written column list rots: a key renamed in
+    `payload.py` leaves a `sortable` entry that names nothing, and `?sort=` by it would be accepted
+    and then order every row identically -- an accepted request that silently does nothing, which
+    is exactly what refusing an unknown column exists to prevent.
+
+    Checked over the two endpoints this test can seed rows into. A collection with no rows proves
+    nothing here, which is why the seeding is not optional."""
+    _seed_positions(running.db_path, (("BTC-USD", "0.01", "50000"),))
+    _seed_rules(running.db_path, ("breakout",))
+
+    for path, collection in (("/api/status", "open_positions"), ("/api/rules", "rules")):
+        _status, _headers, document = _json(running, path)
+        rows = document["data"][collection]
+
+        assert rows, path
+        for row in rows:
+            missing = set(web_api.API_ROUTES[path].sortable) - set(row)
+            assert not missing, (path, missing)
+
+
+# -- Decimal ordering, and the case where a float would differ -------------------------------------
+
+#: Three quantities in the ledger's own text form. The first two differ by 1e-18 -- one wei, the
+#: base increment of any 18-decimal ERC-20 -- and `float()` maps BOTH to the same IEEE-754 double,
+#: because at 0.1 the gap between adjacent doubles is about 1.4e-17.
+WEI_APART = (
+    "0.100000000000000002",
+    "0.100000000000000001",
+    "0.099000000000000000",
+)
+
+
+def test_float_and_decimal_orderings_of_the_same_column_genuinely_differ() -> None:
+    """The premise of the test below, asserted rather than assumed.
+
+    If `float` and `Decimal` agreed on these three strings, the endpoint test would be green for
+    no reason -- it would prove only that sorting sorts. So this states the disagreement first:
+    the two finest values are DISTINCT as `Decimal` and EQUAL as `float`, which means a float-keyed
+    sort cannot separate them and leaves them in whatever order they arrived in."""
+    finer, coarser = Decimal(WEI_APART[1]), Decimal(WEI_APART[0])
+
+    assert finer < coarser
+    assert float(WEI_APART[1]) == float(WEI_APART[0])
+    # Ascending by float keeps the input order of the tied pair; ascending by Decimal swaps it.
+    assert sorted(WEI_APART, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
+    assert sorted(WEI_APART, key=Decimal) == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
+
+
+def test_the_endpoint_orders_with_decimal_not_float(running: web_server.ServeConfig) -> None:
+    """The end-to-end half: the same three quantities through the real table, the real report
+    builder, the real serialiser and the real sort.
+
+    A float-keyed implementation would answer `[0.099, ...002, ...001]` here -- the tied pair left
+    in insertion order, because the comparison cannot tell them apart. `Decimal` answers
+    `[0.099, ...001, ...002]`. The difference is one wei on one row, which is exactly the size of
+    error that survives review and shows up in a reconciliation."""
+    _seed_positions(
+        running.db_path, tuple((f"TKN{i}-USD", qty, "50000") for i, qty in enumerate(WEI_APART))
+    )
+
+    _status, _headers, unsorted = _json(running, "/api/status")
+    _status, _headers, document = _json(running, "/api/status?sort=qty")
+
+    as_built = [row["qty"]["value"] for row in unsorted["data"]["open_positions"]]
+    ordered = [row["qty"]["value"] for row in document["data"]["open_positions"]]
+
+    assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
+    # The comparison that makes this test say something: the SAME rows, in the order the report
+    # built them, keyed by `float` instead. Python's sort is stable, so the tied pair keeps its
+    # arrival order and the answer differs from the one above by one row.
+    assert sorted(as_built, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
+    assert ordered != sorted(as_built, key=float)
+
+
+def test_a_missing_figure_sorts_last_in_both_directions() -> None:
+    """A row with no recorded value is not a row with a zero -- that collapse is the shape of the
+    always-passing fee rail (#198), and `payload.absent` exists to keep the two apart. So an absent
+    cell trails the ordered rows whichever way they run, rather than heading a descending sort by
+    being the largest thing in it."""
+    rows = [
+        {"id": "a", "n": payload.money(Decimal("2"))},
+        {"id": "b", "n": payload.absent()},
+        {"id": "c", "n": payload.money(Decimal("1"))},
+    ]
+
+    ascending = payload.order_rows(rows, column="n", descending=False)
+    descending = payload.order_rows(rows, column="n", descending=True)
+
+    assert [row["id"] for row in ascending] == ["c", "a", "b"]
+    assert [row["id"] for row in descending] == ["a", "c", "b"]
+
+
+def test_a_column_that_is_not_numeric_orders_as_text() -> None:
+    """One column, one ordering. A column whose values do not ALL parse as finite `Decimal`s is
+    ordered as text -- deciding per ROW would put a `Decimal` and a `str` in the same comparison,
+    which raises, and falling back per row would make the order depend on which values happened to
+    look like numbers."""
+    rows = [
+        {"outcome": payload.label("win")},
+        {"outcome": payload.label("dca")},
+        {"outcome": payload.label("loss")},
+    ]
+
+    ordered = payload.order_rows(rows, column="outcome", descending=False)
+
+    assert [row["outcome"]["value"] for row in ordered] == ["dca", "loss", "win"]
+
+
+def test_an_instant_orders_chronologically_through_its_iso_string() -> None:
+    """`moment().value` is ISO-8601 UTC with a fixed width, so lexicographic order IS chronological
+    order and no date parsing happens in the sort. This is the reason `moment` puts ISO in `value`
+    rather than epoch seconds -- `payload.moment`'s docstring records the other."""
+    rows = [
+        {"at": payload.moment(1_700_000_100)},
+        {"at": payload.moment(1_700_000_000)},
+        {"at": payload.moment(1_700_000_200)},
+    ]
+
+    ordered = payload.order_rows(rows, column="at", descending=True)
+
+    assert [row["at"]["value"] for row in ordered] == [
+        "2023-11-14T22:16:40Z",
+        "2023-11-14T22:15:00Z",
+        "2023-11-14T22:13:20Z",
+    ]
+
+
+def test_a_non_finite_value_does_not_drag_a_column_into_numeric_ordering() -> None:
+    """`Decimal("NaN")` and `Decimal("Infinity")` both PARSE, and both are unorderable against a
+    real figure -- `NaN` compares false to everything, which would make the sort's output depend on
+    the comparison order the algorithm happened to use. Non-finite means "not a number this column
+    can be ordered by", so the column falls to text ordering as a whole."""
+    rows = [
+        {"n": {"value": "Infinity", "display": "inf", "state": "unknown"}},
+        {"n": {"value": "2", "display": "2", "state": "neutral"}},
+    ]
+
+    ordered = payload.order_rows(rows, column="n", descending=False)
+
+    assert [row["n"]["value"] for row in ordered] == ["2", "Infinity"]
+
+
+# -- the engine's state is a fact, not an inference ------------------------------------------------
+
+
+def test_a_stopped_engine_says_so_rather_than_answering_an_empty_payload(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """THE requirement the service worker enforces from the other side (#538): a client must be
+    able to say "keel isn't running" rather than render a blank view or, worse, a stale figure.
+
+    `data` is `null` and not `{}`: an empty object is a payload with every figure missing, and a
+    view given one renders zeros. `null` cannot be rendered by accident."""
+    status, _headers, document = _json(empty_machine, "/api/status")
+
+    assert status == 200
+    assert document["engine"]["value"] == "stopped"
+    assert document["data"] is None
+    assert document["as_of"].endswith("Z")
+    assert document["engine"]["display"]
+    assert document["engine"]["state"] in {"warn", "bad"}
+
+
+def test_a_stopped_engine_is_a_200_not_an_error(empty_machine: web_server.ServeConfig) -> None:
+    """Reported at 200 on purpose. A 4xx/5xx is what #538's service worker and #536's `fetch`
+    wrapper both read as "the server is unreachable", which would put a first-run user in an
+    outage state when their actual position is that they have not set anything up yet -- and the
+    two need different words on screen."""
+    status, _headers, _document = _json(empty_machine, "/api/status")
+
+    assert status == 200
+
+
+def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """`/api/config`, `/api/venues` and `/api/gates` read no deployment at all -- they describe the
+    binary that is answering -- so they carry data even with nothing set up. They still report
+    `engine`, because a client showing the "keel isn't running" banner should not have to fetch a
+    different endpoint to know whether to show it."""
+    for path in ("/api/config", "/api/venues", "/api/gates"):
+        status, _headers, document = _json(empty_machine, path)
+
+        assert status == 200, path
+        assert document["engine"]["value"] == "stopped", path
+        assert document["data"] is not None, path
+
+
+def test_setup_is_answerable_with_nothing_set_up(empty_machine: web_server.ServeConfig) -> None:
+    """The one deployment-reading endpoint that must work when there is no deployment: it is the
+    checklist that says how to make one. `needs_database`'s HTML counterpart serves this same page
+    for the same reason."""
+    status, _headers, document = _json(empty_machine, "/api/setup")
+
+    assert status == 200
+    assert document["engine"]["value"] == "stopped"
+    assert document["data"]["is_new"]["value"] == "true"
+    assert document["data"]["steps"]
+    assert document["data"]["actions"]
+
+
+def test_setup_carries_no_csrf_token(empty_machine: web_server.ServeConfig) -> None:
+    """`render_setup` takes a `csrf` argument; this payload does not, and that is deliberate. A
+    CSRF token authorises a WRITE, this issue ships reads only, and minting one into a read
+    response would put a live write credential into every cached and logged copy of a GET.
+
+    Asserted against the token's VALUE and against the key names, not against the substring
+    `"csrf"` in the whole document: the payload echoes `config_path` and `db_path`, and a
+    deployment living in a directory whose name happens to contain those four letters would fail a
+    substring check for a reason that has nothing to do with the contract."""
+    _status, _headers, document = _json(empty_machine, "/api/setup")
+
+    assert csrf_token(empty_machine.token) not in json.dumps(document)
+    assert not [path for path, _leaf in _walk(document) if "csrf" in path.lower()]
+
+
+def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken read is a 500 with a JSON body, never an HTML error page a `fetch()` client would
+    fail to parse and never a 200 with empty data. `engine` reads `stopped` alongside it: from a
+    client's point of view a report that cannot be built and an engine that is not there require
+    the SAME behaviour -- show no figures -- and the difference is already carried by the status
+    code and `error.detail`."""
+    monkeypatch.setattr(
+        web_api, "_status_report", _raise, raising=True
+    )
+
+    status, headers, document = _json(running, "/api/status")
+
+    assert status == 500
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert document["data"] is None
+    assert "RuntimeError" in document["error"]["detail"]
+
+
+def _raise(*_args: Any, **_kwargs: Any) -> Any:
+    raise RuntimeError("the ledger is on fire")
+
+
+# -- headers and caching ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", API_ROUTES)
+def test_no_api_response_may_be_cached(running: web_server.ServeConfig, path: str) -> None:
+    """The design spec's service-worker table says `/api/*` is `NetworkOnly`, no exceptions,
+    because "opening the app to last week's equity styled as current is worse than an error". This
+    is the layer BELOW that promise: a `no-store` on the response means the HTTP cache cannot hold
+    a balance either, whether or not a service worker is installed."""
+    _status, headers, _document = _json(running, path)
+
+    assert headers["Cache-Control"] == "no-store, max-age=0"
+
+
+@pytest.mark.parametrize("path", API_ROUTES)
+def test_json_is_served_with_nosniff_and_no_csp(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    """`nosniff` matters more here than on the HTML: a JSON body a browser is free to sniff as
+    HTML is a stored-XSS primitive wearing a `Content-Type`. CSP is absent for the reason
+    `_static_headers` already records -- it is a response header with no defined meaning outside a
+    browsing context, and `application/json` is not one."""
+    _status, headers, _document = _json(running, path)
+
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["X-Frame-Options"] == "DENY"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert "Content-Security-Policy" not in headers
+
+
+def test_head_returns_the_headers_and_no_body(running: web_server.ServeConfig) -> None:
+    status, headers, body = _get(
+        running, "/api/status", method="HEAD", cookie=_session(running)
+    )
+
+    assert status == 200
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert body == ""
+
+
+# -- admission -------------------------------------------------------------------------------------
+
+
+def test_a_read_needs_no_client_header(running: web_server.ServeConfig) -> None:
+    """`X-Keel-Client` gates `POST /api/*` and deliberately not `GET`.
+
+    The header buys one thing: it forces a CORS preflight a hostile origin cannot satisfy, closing
+    the plain-form-POST gap that `SameSite=Strict` and the HMAC token both assume shut. A GET is
+    not that gap -- a cross-origin read cannot see this response at all without CORS headers this
+    server never sends, and `SameSite=Strict` denies the cookie to the cross-site request in the
+    first place, so the read is refused at admission before any of this matters.
+
+    Requiring it anyway would cost the thing §4 of the design philosophy is about: `curl
+    http://127.0.0.1:8765/api/status` and a browser address bar are how an operator checks that
+    the interface is telling the truth, and neither can set a header. Reverse this the day a GET
+    can change something."""
+    status, _headers, document = _json(running, "/api/status")
+
+    assert status == 200
+    assert document["data"] is not None
+
+
+def test_a_read_without_the_session_cookie_is_refused_in_json(
+    running: web_server.ServeConfig,
+) -> None:
+    """Same admission as every rendered page -- never weakened for being an API -- but the refusal
+    speaks the caller's language. An HTML error page handed to `res.json()` is a parse error in
+    the client, which is a worse diagnostic than the 403 it is hiding."""
+    status, headers, body = _get(running, "/api/status")
+
+    assert status == 403
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert json.loads(body)["error"]["status"] == "403"
+
+
+def test_a_read_from_a_foreign_host_header_is_refused_in_json(
+    running: web_server.ServeConfig,
+) -> None:
+    """DNS rebinding lands here exactly as it does for a page: the packet arrived on loopback, so
+    the bind check passed, and only the header tells the truth about who the browser thinks it is
+    talking to."""
+    status, headers, body = _get(
+        running, "/api/status", cookie=_session(running), host="keel.example.com"
+    )
+
+    assert status == 403
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert "Refused" in json.loads(body)["error"]["title"]
+
+
+def test_an_html_route_still_refuses_in_html(running: web_server.ServeConfig) -> None:
+    """The other half of the same statement: making `/api/*` speak JSON did not make the rendered
+    pages speak it. A person who opens the URL without the token still gets a readable page."""
+    status, headers, body = _get(running, "/insights")
+
+    assert status == 403
+    assert headers["Content-Type"].startswith("text/html")
+    assert "<h1>" in body
+
+
+# -- the write surface did not move ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", API_ROUTES)
+def test_no_api_route_answers_a_post(running: web_server.ServeConfig, path: str) -> None:
+    """This issue ships READS. Every route added here is a 404 for a POST -- reached only after
+    the `X-Keel-Client` gate, which is unchanged -- so nothing below widened what the browser may
+    do."""
+    status, _headers, body = _get(
+        running,
+        path,
+        method="POST",
+        cookie=_session(running),
+        headers={"X-Keel-Client": "1", "Content-Length": "0"},
+    )
+
+    assert status == 404, path
+    assert json.loads(body)["error"]["status"] == "404"
+
+
+def test_the_client_header_gate_still_guards_every_api_post(
+    running: web_server.ServeConfig,
+) -> None:
+    """#535's third CSRF layer, still in front of `/api/*` writes and still refusing before the
+    404 -- unchanged by this issue, and asserted here as well as in `test_server.py` because the
+    route table under that prefix is no longer empty."""
+    status, _headers, _body = _get(
+        running, "/api/status", method="POST", cookie=_session(running),
+        headers={"Content-Length": "0"},
+    )
+
+    assert status == 403
+
+
+def test_the_handler_still_declares_exactly_three_verbs() -> None:
+    verbs = {
+        name
+        for klass in web_server.KeelHandler.__mro__
+        for name in vars(klass)
+        if name.startswith("do_")
+    }
+    assert verbs == {"do_GET", "do_HEAD", "do_POST"}
+
+
+# -- the routing layer computes nothing ------------------------------------------------------------
+
+
+def test_the_api_module_is_inside_the_thinness_scan() -> None:
+    """`test_console_thinness.py` globs `keel/web/*.py`, so the API layer is covered by Rules 1-5
+    by construction rather than by anyone remembering to list it. Asserted here, from this side,
+    because that file names its web modules explicitly for exactly this reason and a module that
+    dropped out of the glob would leave the rules green over less code."""
+    from tests.commands.test_console_thinness import _console_module_paths
+
+    stems = {Path(p).stem for p in _console_module_paths()}
+
+    assert "api" in stems
+
+
+def test_rule_6_holds_in_the_api_layer_too() -> None:
+    """Rule 6 is scoped by stem to the serialiser, which is right -- it is the module whose output
+    is the money contract. But the routing layer sits directly on top of that output and re-parses
+    it to sort, so the same five spellings of "a Decimal became a double" are reachable there:
+    `float(row["value"])` as a sort key is the whole failure in one expression.
+
+    Run here, over `keel/web/api.py`, rather than by adding a stem to `SERIALISER_STEMS`: the pin
+    in that file is #533's contract and it stays as it was written, while this states the extra
+    thing #534 needs. If the API layer ever needs an allowance, it gets one HERE, named."""
+    from tests.commands.test_console_thinness import (
+        _collect_aliases,
+        _enclosing_functions,
+        _rule6_findings,
+    )
+
+    source = Path(web_api.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    findings = _rule6_findings("api", tree, _collect_aliases(tree), _enclosing_functions(tree))
+
+    assert findings.get("rule6_serialisation", []) == []
+
+
+def test_the_routing_layer_formats_nothing() -> None:
+    """Every displayable string in an API response was written by `payload.py`.
+
+    Checked by shape rather than by reading: a `format(...)` call or an f-string carrying a format
+    spec in the routing layer is how a second money renderer starts, and the second one is never
+    the one with `_plain`'s no-exponent guarantee in it."""
+    tree = ast.parse(Path(web_api.__file__).read_text(encoding="utf-8"))
+    formatting = [
+        node.lineno
+        for node in ast.walk(tree)
+        if _is_format_call(node)
+        or (isinstance(node, ast.FormattedValue) and node.format_spec is not None)
+    ]
+
+    assert formatting == []
+
+
+def _is_format_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "format"
+    )

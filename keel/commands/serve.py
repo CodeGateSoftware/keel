@@ -15,6 +15,7 @@ package that reads a database and returns strings, which is what makes it cheap 
 from __future__ import annotations
 
 import webbrowser
+from typing import Any
 
 import click
 
@@ -57,13 +58,19 @@ def serve_cmd(ctx: click.Context, host: str, port: int, open_browser: bool) -> N
     readable by anyone who can reach the port, with a cleartext token as the only obstacle.
     """
     obj = ctx.obj or {}
+    # Resolved ONCE, here, and carried on the config in both its forms. `build_info()` shells out
+    # to git twice, and `/api/config` is polled by a service worker (#538) -- an endpoint that
+    # forks a subprocess to answer "which build is this" would make the cheapest question on the
+    # server the most expensive one.
+    build = _build_info()
     cfg = ServeConfig(
         host=host,
         port=port,
         token=new_session_token(),
         db_path=obj.get("db_path") or default_db_path(),
         config_path=obj.get("config_path") or default_config_path(),
-        build=_build_line(),
+        build=_build_line(build),
+        build_info=build,
     )
 
     if open_browser:
@@ -78,12 +85,24 @@ def serve_cmd(ctx: click.Context, host: str, port: int, open_browser: bool) -> N
     ctx.exit(serve(cfg, echo=click.echo))
 
 
-def _build_line() -> str:
-    """The build identity in the page footer, so a screenshot of the UI says which build produced
-    it. Best-effort: a footer is not worth failing a server start over."""
+def _build_info() -> Any:
+    """The running build, resolved once, or `None`.
+
+    Best-effort: a build identity is not worth failing a server start over, and `None` is a state
+    the consumers already handle -- the footer renders empty and `/api/config` reports the version
+    absent rather than inventing one. Split out of `_build_line` when `/api/config` (#534) needed
+    the same object as STRUCTURE rather than as a sentence, so the two can never describe different
+    builds: parsing `describe()`'s output back into fields would be a display string being read as
+    data."""
     try:
         from keel.version import build_info
 
-        return build_info().describe()
+        return build_info()
     except Exception:  # pragma: no cover - metadata absent in odd environments
-        return ""
+        return None
+
+
+def _build_line(build: Any) -> str:
+    """The build identity in the page footer, so a screenshot of the UI says which build produced
+    it."""
+    return "" if build is None else str(build.describe())
