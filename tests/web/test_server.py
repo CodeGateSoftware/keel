@@ -4,6 +4,14 @@ These drive an actual `ThreadingHTTPServer` on an ephemeral port with a real dat
 config, because the properties worth pinning here -- that a write verb never reaches keel, that
 the token is required, that the token never appears in a log line -- are properties of the wire,
 and a test against a hand-built handler object could pass while the served bytes said otherwise.
+
+The `deployment` and `running` fixtures moved to `tests/web/conftest.py` when #536 added a second
+module that drives the same server. They are unchanged -- same names, same bodies -- and pytest
+discovers a conftest fixture for every module in this directory, so every test below requests
+exactly what it requested before. The move happened because the alternative was importing a
+fixture from one test module into another, which shadows the import with the parameter of every
+test that uses it (ruff F811) and makes the fixture's home a test file rather than the place
+pytest looks.
 """
 
 from __future__ import annotations
@@ -16,10 +24,8 @@ from urllib.parse import urlencode
 
 import pytest
 
-from keel.data.db import connect, migrate
 from keel.web import server as web_server
 from keel.web.security import SESSION_COOKIE, new_session_token
-from tests.conftest import VALID_CONFIG_YAML
 
 ROUTES = (
     "/",
@@ -31,46 +37,6 @@ ROUTES = (
     "/gates",
     "/glossary",
 )
-
-
-@pytest.fixture
-def deployment(tmp_path: Path) -> tuple[str, str]:
-    db_path = tmp_path / "keel.db"
-    conn = connect(str(db_path))
-    migrate(conn)
-    conn.close()
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(VALID_CONFIG_YAML)
-    return str(db_path), str(config_path)
-
-
-@pytest.fixture
-def running(deployment: tuple[str, str]) -> Iterator[web_server.ServeConfig]:
-    db_path, config_path = deployment
-    cfg = web_server.ServeConfig(
-        host="127.0.0.1",
-        port=0,
-        token=new_session_token(),
-        db_path=db_path,
-        config_path=config_path,
-    )
-    server = web_server.build_server(cfg)
-    bound = web_server.ServeConfig(
-        host=cfg.host,
-        port=int(server.server_address[1]),
-        token=cfg.token,
-        db_path=db_path,
-        config_path=config_path,
-    )
-    server.RequestHandlerClass.cfg = bound  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield bound
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
 
 
 def _request(

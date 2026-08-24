@@ -2,16 +2,111 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>keel</title>
+<!--
+  keel's client shell (#536). The first JavaScript this project ships.
+
+  ── WHERE THIS IS SERVED FROM, AND WHY IT IS NOT `/` YET ────────────────────────────────────
+  Under `/static/`, alongside the assets it loads. `/` and the seven paths beside it are still
+  owned by `keel/web/server.py`'s `ROUTES` table and rendered in Python; the design spec's build
+  order removes those at step 7 (#540), not here. Serving this at `/` today would mean deleting
+  a working page to install a shell with one view in it.
+
+  At #540 this file moves to `/`, every `/static/` prefix below becomes `/`, and
+  `staticfiles.CLIENT_ROUTES` stops needing a prefix at all. `tests/web/test_client_assets.py`
+  pins that the prefix is spelled the same in all three places that spell it, so that move is a
+  mechanical edit rather than a hunt.
+
+  ── WHY THE SHELL IS MARKUP AND ONLY THE VIEW IS BUILT BY SCRIPT ────────────────────────────
+  The header, the nav, the landmarks and the footer are HTML here rather than nodes `main.js`
+  creates. Three reasons, in order of weight:
+
+    1. `<noscript>` below can only say something useful if there is a page for it to say it on.
+       A shell built entirely by script degrades to a blank white document.
+    2. It is the project's own argument for choosing the web at all (§4 of the spec's
+       Philosophy): the structure of the page is readable in view-source without running
+       anything.
+    3. The nav is a fixed list of seven links. Building a fixed list at runtime buys nothing and
+       costs the keyboard path before the module has loaded.
+
+  ── NO INLINE SCRIPT AND NO INLINE STYLE, AND THAT IS ENFORCED ──────────────────────────────
+  `keel/web/server.py`'s `_STATIC_CSP` is `default-src 'self'` with NO `'unsafe-inline'`, so an
+  inline `<style>` or `<script>` block here would be silently refused by the browser rather than
+  caught in review. Everything is a same-origin file. `<base href>` is impossible for the same
+  reason -- `base-uri 'none'` -- which is why the hrefs below are absolute rather than relative
+  to a declared base.
+-->
+<link rel="stylesheet" href="/static/css/keel.css">
+<script type="module" src="/static/js/main.js"></script>
 </head>
 <body>
-<!--
-  Placeholder for #536's client, which does not exist yet. This file exists so that #535's
-  static-serving capability -- directory containment, Content-Type-by-extension, the header set
-  -- is exercised end to end by a real request rather than only by unit tests against a
-  synthetic root. Nothing here is wired up as a page a user is meant to reach: the rendered
-  routes in `keel/web/server.py`'s `ROUTES` table still own navigation until #536 lands.
--->
-<p>keel's static asset serving is live. The client that uses it (#536) is not built yet.</p>
+
+<a class="skip" href="#view">Skip to content</a>
+
+<header>
+  <span class="brand">keel</span>
+  <nav aria-label="Views">
+    <ul>
+      <li><a href="/static/status">Status</a></li>
+      <li><a href="/static/setup">Setup</a></li>
+      <li><a href="/static/activity">Activity</a></li>
+      <li><a href="/static/insights">Insights</a></li>
+      <li><a href="/static/rules">Rules</a></li>
+      <li><a href="/static/venues">Venues</a></li>
+      <li><a href="/static/gates">Gates</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main id="view" tabindex="-1">
+
+  <noscript>
+    <div class="card">
+      <h1>This page needs JavaScript</h1>
+      <p>
+        keel's client is plain ES modules with no bundler and no fallback renderer, so with
+        scripting off there is nothing here to read.
+      </p>
+      <p>
+        The server-rendered pages need no scripting at all and show the same data:
+        <a href="/">open the status page</a>.
+      </p>
+    </div>
+  </noscript>
+
+  <!--
+    THE ONE LIVE REGION ON THE PAGE, and the restraint is the point.
+
+    `role="status"` (an implicit `aria-live="polite"`, spelled out anyway because the implicit
+    value is a thing readers have to know rather than see) with `aria-atomic="true"`, so a
+    screen reader hears the whole banner as one sentence when it changes rather than the single
+    word that differs.
+
+    It is scoped to the ENGINE BANNER and not to `#content`, deliberately. This dashboard
+    re-reads itself every 15 seconds; a live region around the data would re-announce every
+    table on the page twice a minute, which is not an accessibility feature but a denial of
+    service against anyone using a screen reader. What genuinely changes MEANING underneath a
+    reader is whether keel is running and when the figures were read -- one short sentence,
+    which is exactly what this element holds. The rest of the page changes bytes, and a reader
+    who wants it re-read can re-read it.
+
+    Empty in the markup: it is filled by `render.js` on the first response. An `aria-live`
+    region must exist in the DOM BEFORE the content it announces is inserted, which is why it is
+    here as an empty element rather than created alongside the banner.
+  -->
+  <div id="engine" class="engine" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <div id="content" aria-busy="true">
+    <p class="empty">Reading keel&hellip;</p>
+  </div>
+
+</main>
+
+<footer>
+  <span>keel &middot; served from this machine only</span>
+  <span id="build" class="muted"></span>
+</footer>
+
 </body>
 </html>
