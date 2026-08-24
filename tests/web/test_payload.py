@@ -31,11 +31,14 @@ produce it.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from keel.capabilities import CAPABILITIES, GATES
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
 from keel.commands.insights import (
     AccountSummary,
@@ -45,6 +48,8 @@ from keel.commands.insights import (
     JournalReport,
     RuleTrackRecord,
 )
+from keel.commands.jobs import JobStatus
+from keel.commands.setup import ACTIONS, STEPS, DeploymentState, StepState
 from keel.commands.status import (
     AutonomyStatus,
     MarketSessionStatus,
@@ -287,15 +292,105 @@ def _activity_feed(**overrides: Any) -> ActivityFeed:
     return ActivityFeed(**base)
 
 
+def _deployment_state() -> DeploymentState:
+    """A half-built deployment: one step done, one outstanding, one that could not be determined.
+
+    All three `done` values on purpose. `None` is NOT `False` -- an unreadable database is not an
+    unseeded one -- and a fixture carrying only booleans would let the three-valued field be
+    quietly collapsed into two without any guard here noticing."""
+    observed = (True, False, None)
+    return DeploymentState(
+        root=Path("/tmp/keel"),
+        config_path=Path("/tmp/keel/config.yaml"),
+        db_path=Path("/tmp/keel/keel.db"),
+        states=tuple(
+            StepState(step=step, done=observed[index % 3], detail=f"observed {step.key}")
+            for index, step in enumerate(STEPS)
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _BrokerInfo:
+    """The `BrokerInfo` shape `venues_payload` reads, without importing an adapter into a
+    serialisation test. Two rows are built from it below: one healthy, one that failed to
+    construct -- the second is a row rather than an omission, because a missing row would read as
+    "not installed", which is a different fact and a worse one to be wrong about."""
+
+    name: str = "coinbase"
+    venue: str = "coinbase"
+    deployment: str = "spot"
+    session_bound: bool = False
+    quote_currencies: tuple[str, ...] = ("USD",)
+    asset_classes: tuple[str, ...] = ("crypto",)
+    supported_orders: tuple[str, ...] = ("market", "limit")
+    preview: str = "spot, USD quotes"
+    supports_fee_summary: bool = True
+    declared_endpoints: tuple[str, ...] = ("https://api.coinbase.com",)
+    supported_data_feeds: tuple[str, ...] = ("candles",)
+    package_version: str | None = "0.1.0"
+    error: str | None = None
+
+
 def _every_payload() -> dict[str, Any]:
-    """All four payload builders at once. The guards below run over the whole surface, because a
-    contract that holds for `status` and leaks on `journal` is not a contract."""
+    """Every payload builder at once. The guards below run over the whole surface, because a
+    contract that holds for `status` and leaks on `journal` is not a contract.
+
+    #534 added five entries here -- the endpoints behind `/api/config`, `/api/setup`, `/api/rules`,
+    `/api/venues` and `/api/gates` -- and that is the point of the helper being shared: a new
+    serialiser joins the money-as-strings walk, the `state`-vocabulary check and the
+    no-custom-encoder check by being listed once, rather than by its author remembering three
+    separate guards. `gates` reads the REAL `keel/capabilities.py` registry rather than a fixture,
+    because that module is a declaration with no external inputs and a fixture of it would be a
+    second copy to drift."""
     return {
         "status": payload.status_payload(_status_report()),
         "insights": payload.insights_payload(_insights_report()),
         "journal": payload.journal_payload(_journal_report()),
         "activity": payload.activity_payload(_activity_feed()),
+        "config": payload.config_payload(_build_info(), describe="keel 0.1.0+abc [checkout]"),
+        "setup": payload.setup_payload(
+            _deployment_state(),
+            actions=ACTIONS,
+            not_automated={"market_data": "runs for minutes; see keel fetch"},
+            job=JobStatus(
+                key="market_data",
+                state="failed",
+                started_ts=NOW_TS - 90,
+                finished_ts=NOW_TS,
+                lines=("fetching BTC-USD",),
+                error="RuntimeError: no credential",
+            ),
+        ),
+        "rules": payload.rules_payload(
+            [
+                {
+                    "id": 1,
+                    "kind": "breakout",
+                    "status": "candidate",
+                    "created_at": NOW_TS,
+                    "promoted_at": None,
+                    "demoted_at": None,
+                    "params": {"product_id": "BTC-USD", "lookback": 20, "risk": Decimal("0.01")},
+                }
+            ]
+        ),
+        "venues": payload.venues_payload(
+            [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")]
+        ),
+        "gates": payload.gates_payload(GATES, CAPABILITIES),
     }
+
+
+class _build_info:  # noqa: N801 - a stand-in for `keel.version.BuildInfo`, not a public type
+    """A resolved build, without shelling out to git in a serialisation test."""
+
+    version = "0.1.0"
+    commit = "abc123456789"
+    dirty = False
+    source = "checkout"
+    full_version = "0.1.0+abc123456789"
+    is_reproducible = True
 
 
 # -- recursive walkers ---------------------------------------------------------------------------
