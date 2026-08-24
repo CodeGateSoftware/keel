@@ -36,16 +36,20 @@ _AA_UI_BOUNDARY_MIN = 3.0
 
 #: Minimum acceptable `|luminance(good) - luminance(bad)|`, pinned per theme rather than
 #: globally, because a single shared floor cannot do both jobs at once: the light theme's fixed
-#: (measured 0.0663) is much smaller than the dark theme's (measured 0.1984), since light mode
-#: keeps both colours near the dark end of the scale to hold 4.5:1 against a near-white
+#: delta (measured 0.0681) is much smaller than the dark theme's (measured 0.2382), since light
+#: mode keeps both colours near the dark end of the scale to hold AAA against a near-white
 #: background, while dark mode has the whole upper half of the scale to spread them across.
 #: A shared floor high enough to catch a regressed DARK pair would reject a compliant LIGHT
 #: pair; a shared floor low enough to admit the light pair would not catch a reverted dark pair
 #: (its original delta, 0.1234, would still pass a lenient shared floor). The values below sit
 #: with headroom under each theme's actual measured delta and, checked against the ORIGINAL
 #: palette this issue reports (light delta 0.0011, dark delta 0.1234), both floors reject it --
-#: which is the property this pin exists to guarantee: reverting #532 fails this test.
-_MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.05, "dark": 0.15}
+#: which is the property this pin exists to guarantee: reverting #532 fails this test. Note
+#: what this floor does NOT guarantee: it only measures separation, not direction, which is why
+#: `test_no_text_pair_grade_drops_below_its_pinned_floor` exists separately below -- an earlier
+#: draft of this fix hit 0.0663/0.1984, clearing tighter floors than these, while moving `good`
+#: and `bad` the wrong way and losing three AAA grades in the process.
+_MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.06, "dark": 0.2}
 
 _HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
 _VAR_RE = re.compile(r"--([a-z-]+):\s*(#[0-9a-fA-F]{6})")
@@ -152,7 +156,10 @@ def test_good_and_bad_differ_in_luminance_not_only_hue() -> None:
     """The core of #532: light mode's `#1f5f4f` (good) and `#96322a` (bad) had luminances
     0.0904 and 0.0893 -- a delta of 0.0011, a 1.01:1 ratio -- so profit and loss were
     distinguished by hue alone (WCAG 1.4.1). Reject any pair whose luminance separation falls
-    back under the measured-and-margined floor in `_MIN_GOOD_BAD_LUMINANCE_DELTA`."""
+    back under the measured-and-margined floor in `_MIN_GOOD_BAD_LUMINANCE_DELTA`. This test
+    only checks separation, not which colour moved to create it -- see
+    `test_no_text_pair_grade_drops_below_its_pinned_floor` for the direction check that
+    separation alone cannot express."""
     for theme_name, palette in zip(("light", "dark"), _load_themes()):
         delta = abs(_relative_luminance(palette["good"]) - _relative_luminance(palette["bad"]))
         floor = _MIN_GOOD_BAD_LUMINANCE_DELTA[theme_name]
@@ -211,3 +218,90 @@ def test_field_input_border_uses_the_control_line_token_not_line() -> None:
     assert field_rule is not None
     assert "var(--control-line)" in field_rule.group(0)
     assert "var(--line)" not in field_rule.group(0)
+
+
+#: WCAG 2.x AAA, normal-size text (SC 1.4.6): 7:1. AA (`_AA_TEXT_MIN`, 4.5:1) is the WCAG floor
+#: this whole page must clear; AAA is this palette's actual working standard in practice --
+#: every text pair reached it before #532 except `--muted` and `--warn`, both pre-existing AA
+#: design choices this issue never touched. The distinction matters because "still >= 4.5:1"
+#: and "did not lose a grade it already had" are different properties: an early draft of this
+#: fix's good/bad separation passed every ratio test above while quietly dropping `--good` and
+#: `--accent` from AAA to AA in light mode and `--bad` further into AA in dark mode. Grades,
+#: not just ratios, are what `_GRADE_FLOOR` below pins.
+_AAA_TEXT_MIN = 7.0
+
+_GRADE_RANK = {"FAIL": 0, "AA": 1, "AAA": 2}
+
+
+def _grade(ratio: float) -> str:
+    if ratio >= _AAA_TEXT_MIN:
+        return "AAA"
+    if ratio >= _AA_TEXT_MIN:
+        return "AA"
+    return "FAIL"
+
+
+#: The WCAG grade every text-foreground/surface pair reaches as of this commit -- the floor a
+#: future edit may raise but must not lower without a stated reason and an updated entry here,
+#: the same standard CONTRIBUTING.md's documentation section asks of a comment that overturns a
+#: prior decision. `muted` and `warn` are pinned at AA because that is what they were before
+#: #532 and #532 does not touch them -- this table is not a claim that AA is good enough for
+#: the palette in general, only a record of what each pair actually reaches today.
+#:
+#: The one AA entry #532 itself introduces is dark `--accent` on `--card` (was AAA at 7.83:1,
+#: back when `--accent` was byte-identical to `--good`): splitting the token to fix the
+#: hyperlink/gain collision cost this one grade, because the pairing that actually renders --
+#: button text, `color: var(--card)` on `background: var(--accent)` -- needs `--accent` to read
+#: as blue, and darkening it further into AAA-on-card territory pushes its hue toward `--bad`'s
+#: red-brown register instead. Accepted deliberately; see the dark `:root` block's comment in
+#: render.py for the fuller trade-off.
+_GRADE_FLOOR: dict[str, dict[str, dict[str, str]]] = {
+    "light": {
+        "bg": {
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AAA", "good": "AAA",
+        },
+        "card": {
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AAA", "good": "AAA",
+        },
+    },
+    "dark": {
+        "bg": {
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AAA", "bad": "AA", "good": "AAA",
+        },
+        "card": {
+            "fg": "AAA", "muted": "AA", "accent": "AA", "warn": "AAA", "bad": "AA", "good": "AAA",
+        },
+    },
+}
+
+
+def test_no_text_pair_grade_drops_below_its_pinned_floor() -> None:
+    """Regression guard for the mistake an earlier draft of #532 made: it fixed the good/bad
+    luminance collision by DARKENING light `--good` and LIGHTENING dark `--bad` -- moving both
+    colours TOWARD their own background instead of away from it. That passed every ratio test
+    in this file, because all of the thresholds above are floors, not exact pins, and the draft
+    cleared every one of them -- while quietly dropping three AAA grades to AA (light `--good`
+    7.17:1 -> 4.89:1, light `--accent` 7.17:1 -> 6.59:1, dark `--bad` 6.24:1 -> 4.93:1) that a
+    "does it still clear 4.5:1" check cannot see, because 4.89 and 7.17 both clear it.
+
+    The rule the accepted fix follows instead: on any background, moving a colour toward the
+    background loses contrast while moving it away gains contrast, so when two colours need
+    separating, move whichever one has AAA headroom to spend -- separation and contrast both
+    improve in the same move, instead of trading one for the other.
+
+    This test pins the GRADE, not just the ratio, for every text pair in `_GRADE_FLOOR` and
+    fails if a future edit -- including a well-intentioned separation fix like #532's own first
+    draft -- lowers one without updating the floor and stating why, the same way the dark
+    `--accent`/`--card` entry above already does for the one grade this issue's accepted fix
+    deliberately spends.
+    """
+    light, dark = _load_themes()
+    for theme_name, palette in (("light", light), ("dark", dark)):
+        for surface in ("bg", "card"):
+            for token, floor in _GRADE_FLOOR[theme_name][surface].items():
+                ratio = _contrast_ratio(palette[token], palette[surface])
+                actual = _grade(ratio)
+                assert _GRADE_RANK[actual] >= _GRADE_RANK[floor], (
+                    f"{theme_name} --{token} on --{surface} is {ratio:.2f}:1 ({actual}), "
+                    f"below its pinned floor of {floor}"
+                )
