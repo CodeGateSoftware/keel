@@ -335,9 +335,23 @@ declares itself "the only writer of `src/content/engine-docs/`", exiting non-zer
 document disappears. Deleting `docs/` from keel would fail the website build, loudly, by design.
 
 What changes is that the **application code** stops carrying documentation prose — which also fixes a
-bug already in every release. `pyproject.toml` ships `artifacts = ["keel/templates/*.yaml"]` and no
-`docs/`, so as `keel/commands/help_console.py:138-146` notes in its own docstring, "an installed
-deployment has no docs/ checkout, and the help screen renders that notice as its empty state."
+bug already in every release. As `keel/commands/help_console.py:138-146` notes in its own docstring,
+"an installed deployment has no docs/ checkout, and the help screen renders that notice as its empty
+state."
+
+**The reason is structural, and stronger than a packaging oversight.** `uv_build` packages the module
+root — `keel/` — and everything under it: 140 entries, the `.py` files plus
+`keel/templates/*.yaml`. `docs/` lives at the *repository* root, outside that tree, so no wheel can
+carry it.
+
+`pyproject.toml`'s `artifacts = ["keel/templates/*.yaml"]` is **inert on the pinned backend**
+(`uv_build>=0.10.4,<0.13.0`), which was measured rather than assumed: building with that list and
+building with `artifacts = []` produce wheels whose contents are identical, both including the two
+YAML templates. The adjacent source comment — "the wheel otherwise contains only .py files" — is
+therefore wrong, and so was an earlier draft of this section that repeated it.
+
+The consequence is that the empty glossary cannot be fixed by adding a glob. Linking out is not the
+cheaper option here; it is the only one that reaches an installed deployment.
 
 **Offline is not hedged.** No inline fallback definitions, no cached snapshot. An operator running a
 trading engine has network by definition, and the least technology that does the job is the correct
@@ -396,7 +410,9 @@ removed, and parity must be reached before the TUI is deleted.
 1. **JSON API** — serialise the existing reports; the money-as-strings rule and its test;
    server-side sort; `GET /api/config`; extend `test_console_thinness.py` to the API layer.
 2. **Static serving and headers** — the full header set, SRI, and the static assets listed in
-   `pyproject.toml`'s `artifacts` and the bundle manifest, so the double-click path works end to end.
+   the bundle manifest, so the double-click path works end to end. Assert this against a **built
+   wheel**, not against files on disk: `pyproject.toml`'s `artifacts` key is inert on the pinned
+   `uv_build` (measured — see § Documentation), so a glob there proves nothing either way.
 3. **Client shell** — router, status view, responsive CSS, the palette fixes and the contrast test.
 4. **Remaining views** — the other seven routes, SVG charts, `EventSource` updates.
 5. **PWA** — manifest, icons, service worker with the routing above.
