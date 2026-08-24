@@ -39,14 +39,107 @@ NAV: tuple[tuple[str, str], ...] = (
 
 _STYLE = """
 :root {
+  /* #532: `--good` and `--bad` were `#1f5f4f`/`#96322a`, luminances 0.0904/0.0893 -- a 1.01:1
+     ratio, i.e. profit and loss were told apart by hue alone (WCAG 1.4.1). The direction of
+     the fix matters: on a light background, moving a colour DOWN in luminance moves it AWAY
+     from the background (more contrast) while moving it UP moves it toward the background
+     (less contrast) -- so separating two dark colours by moving one of them lighter buys
+     separation by SPENDING contrast, while moving one of them darker buys separation and
+     contrast in the same move. `--bad` had contrast to spend (7.22:1 on `--bg`, comfortably
+     past the 7:1 AAA line); `--good` did not (7.17:1, already barely AAA), so `--bad` is the
+     one that moves. `--good` stays `#1f5f4f`, untouched, still 7.17:1 / 7.48:1 AAA.
+
+     REJECTED: lightening `--good` toward `--bg` instead of darkening `--bad` away from it. An
+     earlier draft of this fix did exactly that (`--good` -> `#237e38`) and reached a 0.0663
+     separation, but paid for it by moving `--good` DOWN to 4.89:1 -- AA, not AAA, a grade this
+     palette did not need to spend since `--bad` had the same separation available for free.
+     Caught by review, not by the contrast-ratio tests below: every ratio in the rejected draft
+     still cleared its WCAG floor, because "still passes AA" and "did not lose a grade it
+     already had" are different properties, and only the latter is what this repo's
+     documentation standard would call a decision made in the wrong direction. See
+     `test_no_text_pair_grade_drops_below_its_pinned_floor` in
+     tests/web/test_palette_contrast.py, added specifically because ratio-floor tests alone
+     could not have caught this mistake.
+
+     REJECTED, second time: darkening `--bad` all the way to `#4d1711` (luminance 0.0223).
+     That cleared AAA against `--bg`/`--card` (13.92:1 / 14.52:1) and a 0.0681 delta from
+     `--good`, but traded one photometric collision for another: `#4d1711` sits almost on top
+     of `--fg` (`#1c1b19`, luminance 0.0110) -- 1.19:1 against it, down from the original
+     `#96322a`'s 2.28:1. Every unhighlighted number in the same table renders in `--fg`, so in
+     greyscale, on e-ink, or for a red-green colour-deficient reader, that draft made a LOSS
+     indistinguishable from a neutral cell, which is the same shape of bug #532 exists to fix,
+     just moved to a different pair of tokens. `--bg` (0.9566) and `--fg` (0.0110) sit at
+     opposite ends of the luminance scale, and `--good` (0.0904) already occupies nearly the
+     only luminance band that is simultaneously AAA-against-`--bg` and clearly separated from
+     `--fg` -- there is no second, equally dark value that fits both properties AND stays far
+     from `--good`. `--bad` settles at `#7b2915` (luminance 0.0585): AAA on both surfaces
+     (9.28:1 `--bg` / 9.68:1 `--card`), 1.78:1 against `--fg` (real separation, clearly past
+     the 1.19:1 collision, short of `#96322a`'s coincidental 2.28:1 -- which is coincidental
+     precisely because `#96322a` sat almost on top of `--good`, the bug this whole fix exists
+     to remove), and a 0.0319 delta from `--good` -- smaller than `#4d1711`'s 0.0681 but 29x
+     the original 0.0011, and no longer a second collision. tests/web/test_palette_contrast.py
+     pins a floor against BOTH regressions now: `_MIN_GOOD_BAD_LUMINANCE_DELTA` for good/bad,
+     `_MIN_SIGNAL_FG_RATIO` for every signal token against `--fg`.
+
+     `--accent` was also byte-identical to `--good` in both themes, so a link and a gain
+     rendered the same colour; it gets its own blue, `#1a5578`, dark enough to clear AAA too
+     (7.70:1 `--bg` / 8.03:1 `--card`) rather than settle for AA now that it no longer has to
+     equal `--good`. */
   --bg: #fbfaf8; --fg: #1c1b19; --muted: #6b6862; --line: #e3dfd8;
-  --card: #ffffff; --accent: #1f5f4f; --warn: #8a5a00; --bad: #96322a; --good: #1f5f4f;
+  --card: #ffffff; --accent: #1a5578; --warn: #8a5a00; --bad: #7b2915; --good: #1f5f4f;
+  /* #532: `.field input, .field select` puts the control's background on `--bg` (the page
+     background), so `--line` at 1.27:1 was the only thing marking a form control's boundary --
+     below WCAG 1.4.11's 3:1 floor for non-text UI components. Raising `--line` itself was
+     rejected: `--line` also draws table rules, the footer border and card edges, which SC
+     1.4.11 explicitly exempts as decorative, and raising it would have widened all of those
+     for no accessibility gain. `--control-line`, `#84817c` here (3.72:1 on `--bg`), is scoped
+     to interactive control boundaries only. */
+  --control-line: #84817c;
 }
 :root:not([data-theme="light"]) { color-scheme: light dark; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    /* Mirror image of the light-mode fix, and the direction flips with the background: dark
+       mode's background is dark, so moving a colour UP in luminance is the move away from it.
+       `--good` (`#6fbf9f`) had contrast to spend, 8.39:1 on `--bg`, past AAA with room; `--bad`
+       (`#e07a6a`) did not -- 6.24:1, already only AA -- so `--good` is the one that moves this
+       time: `#6fbf9f` -> `#83d3b2`, luminance 0.4314 -> 0.5463, now 10.39:1 on `--bg` / 9.70:1
+       on `--card` (AAA, up from AAA). Delta from `--bad` is 0.2382 (was 0.1234). `--bad` stays
+       `#e07a6a`, untouched, still 6.24:1 / 5.83:1 AA.
+
+       REJECTED: darkening `--bad` toward `--bg` instead -- the dark-mode mirror of the light
+       draft rejected above, for the same reason: `--bad` is already sitting on the AA floor it
+       cannot afford to spend, while `--good` has AAA headroom to give.
+
+       Lightening `--good` has one side effect, milder than light mode's `--bad`/`--fg` mistake
+       above but the same shape: `--good` is now closer to `--fg` (`#ecead5`), so `--good` on
+       `--fg` drops from 1.80:1 (at `#6fbf9f`) to 1.45:1 (at `#83d3b2`). Left as-is rather than
+       re-picked, because 1.45:1 is real, visible separation -- nothing like light mode's
+       1.19:1, which was nearly a collision -- and `_MIN_SIGNAL_FG_RATIO["dark"]` in
+       tests/web/test_palette_contrast.py pins 1.4 (a small margin under the measured 1.45) as
+       the floor going forward, so a future change that pushes it lower fails the build instead
+       of drifting.
+
+       `--accent` gets its own blue, distinct from `--good` (green) and `--bad` (salmon) as
+       in light mode -- separated from `--good` by HUE, not luminance (their luminance delta is
+       0.125, and that is fine: only `--good`/`--bad` need a luminance floor, because that pair
+       is what a red-green colour-deficient reader cannot otherwise tell apart; blue-against-
+       green carries no such risk, so no luminance floor is pinned between `--accent` and
+       `--good`). `#7aa8e0` was tried first and clears AAA on `--bg` (7.41:1) but only AA on
+       `--card` (6.92:1) -- the pairing that actually renders as button text
+       (`color: var(--card)` on `background: var(--accent)`).
+
+       REJECTED: darkening `#7aa8e0` further to try to reach AAA on `--card`. This repeats the
+       exact mistake the `--good`/`--bad` fix above exists to avoid: dark mode's background is
+       dark, so darkening a colour moves it TOWARD the background and loses contrast, not
+       toward some other hue -- darkening a blue keeps it blue, it just gets less readable.
+       `--accent` has headroom to spend the same way `--good` did: LIGHTENING it moves away
+       from `--bg` and gains contrast on both surfaces at once. `#86b1e5` -- lighter, still
+       unmistakably blue -- reaches 8.22:1 on `--bg` and 7.68:1 on `--card`, AAA on both, with
+       zero grades spent anywhere in either theme. */
     --bg: #16150f; --fg: #ecead5; --muted: #9a968a; --line: #2f2d25;
-    --card: #1d1c15; --accent: #6fbf9f; --warn: #d9a441; --bad: #e07a6a; --good: #6fbf9f;
+    --card: #1d1c15; --accent: #86b1e5; --warn: #d9a441; --bad: #e07a6a; --good: #83d3b2;
+    --control-line: #706d66;
   }
 }
 * { box-sizing: border-box; }
@@ -94,7 +187,7 @@ form { margin: 0.5rem 0 0; }
 .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.6rem 0; max-width: 26rem; }
 .field span { font-size: 0.8rem; color: var(--muted); }
 .field input, .field select { font: inherit; padding: 0.4rem 0.6rem; border-radius: 7px;
-  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  border: 1px solid var(--control-line); background: var(--bg); color: var(--fg); }
 .field em { font-style: normal; font-size: 0.78rem; color: var(--muted); }
 button { font: inherit; font-weight: 550; padding: 0.35rem 0.9rem; border-radius: 7px;
   border: 1px solid var(--accent); background: var(--accent); color: var(--card);
@@ -151,6 +244,28 @@ def pct(value: Decimal | float | None, *, places: int = 2) -> str:
     if value is None:
         return "--"
     return f"{value:.{places}f}%"
+
+
+def pnl_cell(value: Decimal | None) -> str:
+    """The journal's P&L cell: a glyph, the signed amount, and a colour class -- in that order
+    of how much of the meaning each one carries alone.
+
+    #532: colour alone failed WCAG 1.4.1 -- `--good`/`--bad` were once photometrically
+    identical in light mode (1.01:1), and even corrected they are separated by luminance a
+    red-green colour-deficient reader may still not resolve reliably by hue. `money()` already
+    prints the sign (`-12.34`, never `12.34` with an implied minus), so the SIGN survived colour
+    removal already; the GLYPH is what this function adds, because a sign is one character a
+    skimmed table row can miss where `▲`/`▼` at the start of the cell cannot. Strip every
+    colour from the page (greyscale, e-ink, `prefers-contrast`) and `▲ 120.00` / `▼ 45.00`
+    still read as gain and loss; strip the glyph instead and only the minus sign is left to
+    carry it, which is exactly the "distinguished by one easily-missed detail" state #532 was
+    filed to fix for colour."""
+    if value is None:
+        # "--", never "0.00": a trade with no recorded net is not a break-even trade.
+        return "--"
+    tone = "good" if value >= 0 else "bad"
+    glyph = "▲" if tone == "good" else "▼"
+    return f'<span class="{tone}">{glyph} {esc(money(value))}</span>'
 
 
 def kv(key: str, value: str, *, tone: str = "") -> str:
@@ -500,12 +615,6 @@ def render_insights(report: Any, journal: Any) -> str:
     )
     journal_rows = []
     for entry in journal.entries:
-        if entry.pnl_net is None:
-            # "--", never "0.00": a trade with no recorded net is not a break-even trade.
-            pnl_cell = "--"
-        else:
-            tone = "good" if entry.pnl_net >= 0 else "bad"
-            pnl_cell = f'<span class="{tone}">{esc(money(entry.pnl_net))}</span>'
         journal_rows.append(
             (
                 esc(utc(entry.closed_at, fmt="%Y-%m-%d %H:%M")),
@@ -514,7 +623,7 @@ def render_insights(report: Any, journal: Any) -> str:
                 esc(money(entry.qty, places=8)),
                 esc(money(entry.entry_fill)),
                 esc(money(entry.exit_fill)),
-                pnl_cell,
+                pnl_cell(entry.pnl_net),
                 esc(money(entry.fees, places=4)),
                 esc(entry.outcome),
             )
