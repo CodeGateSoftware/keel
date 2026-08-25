@@ -332,12 +332,13 @@ def test_the_client_registers_the_worker_only_after_a_successful_config_read() -
     leave the installed worker alone: it is the thing letting the operator read the page.
     """
     main = (_STATIC / "js" / "main.js").read_text(encoding="utf-8")
-    assert "registerWorker(reading.data)" in main, (
+    config_block = main[main.index('void read("config")') :]
+    assert "registerWorker(config)" in config_block, (
         "the worker is not registered from the config read"
     )
     assert re.search(
         r"const build = \(config && \(config\.build \|\| config\.version\)\) \|\| \"\";", main
-    )
+    ), "registerWorker no longer derives the build from the config document"
     assert "if (!build) return;" in main, "a failed config read must register nothing"
 
 

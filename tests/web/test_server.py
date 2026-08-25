@@ -35,7 +35,6 @@ ROUTES = (
     "/rules",
     "/venues",
     "/gates",
-    "/glossary",
 )
 
 
@@ -969,10 +968,19 @@ def test_the_printed_url_is_the_one_that_carries_the_token(
 
 def test_the_nav_and_the_routing_table_agree() -> None:
     """A page with no nav entry is unreachable; a nav entry with no page is a 404 the user is
-    invited to click. Neither is caught by testing either side alone."""
+    invited to click. Neither is caught by testing either side alone.
+
+    **The nav has one entry that is deliberately not a route (#539).** `Docs` links out to
+    keeltrading.com, because `docs/` has never shipped inside a wheel and the page that used to
+    render it was empty in every installed deployment. It is separated here by its scheme rather
+    than by its label, so a second outbound entry needs no edit and an internal entry that loses
+    its route still fails."""
     from keel.web import render
 
-    assert {href for href, _label in render.NAV} == set(web_server.ROUTES)
+    internal = {href for href, _label in render.NAV if not href.startswith("https://")}
+    outbound = {href for href, _label in render.NAV if href.startswith("https://")}
+    assert internal == set(web_server.ROUTES)
+    assert outbound == {render.DOCS_URL}, "an unexpected outbound nav entry"
     assert set(ROUTES) == set(web_server.ROUTES), "this test module's list drifted from the server"
 
 

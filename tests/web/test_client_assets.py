@@ -52,17 +52,16 @@ _CSS = _STATIC / "css" / "keel.css"
 #: appearing under `js/` without a test author noticing fails `test_the_client_ships_exactly_the_
 #: declared_modules` rather than shipping unexamined.
 #:
-#: `chart.js` and `live.js` arrived at #537, which is what the previous revision of this line
-#: predicted ("a fifth module is a design decision (#537 adds `chart`, `live`, `docs`, `sw`) and
-#: should arrive with the list updated, not silently"). `docs` (#539) is still to come, and its
-#: absence here is what will make it arrive the same way.
+#: `chart.js` and `live.js` arrived at #537 and `docs.js` at #539, which is what the first
+#: revision of this line predicted ("a fifth module is a design decision (#537 adds `chart`,
+#: `live`, `docs`, `sw`) and should arrive with the list updated, not silently").
 #:
 #: **`sw` arrived at #538 and is deliberately NOT in this list**, because it is not under `js/`:
 #: a service worker's scope is its own directory, so `js/sw.js` would be scoped to `/static/js/`
 #: and could not answer a navigation to `/static/insights`. It sits at the static root instead,
 #: and `tests/web/test_pwa.py::test_the_worker_is_served_from_the_scope_it_must_control` asserts
 #: that placement rather than leaving it to whoever next reads the spec's file list.
-_MODULES = ("main.js", "api.js", "render.js", "chart.js", "live.js", "format.js")
+_MODULES = ("main.js", "api.js", "render.js", "chart.js", "live.js", "format.js", "docs.js")
 
 #: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
 #:
@@ -567,8 +566,30 @@ def test_the_client_loads_nothing_from_a_third_party_origin() -> None:
     a browser. This asserts we never ship the attempt, so the header is never the only thing
     standing between the page and an external request."""
     html = _markup_only(_INDEX.read_text(encoding="utf-8"))
-    remote = re.findall(r'(?:src|href)="((?:https?:)?//[^"]*)"', html)
+
+    # **`<a href>` is navigation, not a load, and #539 makes that distinction load-bearing.** The
+    # documentation link opens keeltrading.com in a new tab; nothing is fetched into this page,
+    # nothing is bundled and nothing is cached, so `default-src 'self'` is untouched by it (the
+    # spec: "Outbound links are navigation, not connections"). Every OTHER way a URL can appear in
+    # this markup is a subresource, and those stay same-origin: `src` on a script or an image,
+    # and `href` on a `<link>` -- the stylesheet, the manifest and the icons.
+    #
+    # The check is narrowed rather than dropped. An earlier spelling of this test matched `href`
+    # anywhere, which would now pass only by listing the docs URL as an exception -- and an
+    # exception list is what turns a rule into a habit of adding to a list.
+    loads = re.findall(r'<(?:script|img|iframe|source|embed)\b[^>]*\bsrc="([^"]*)"', html)
+    loads += re.findall(r'<link\b[^>]*\bhref="([^"]*)"', html)
+    remote = [url for url in loads if url.startswith(("http://", "https://", "//"))]
     assert remote == [], f"index.html loads from another origin: {remote}"
+
+    # And what IS allowed outbound is exactly one link, to the documentation, opened safely.
+    anchors = re.findall(r"<a\b[^>]*>", html)
+    outbound = [tag for tag in anchors if re.search(r'href="(?:https?:)?//', tag)]
+    assert len(outbound) == 1, f"expected one outbound link, found {len(outbound)}: {outbound}"
+    assert 'href="https://keeltrading.com/en/docs/"' in outbound[0], outbound[0]
+    # `noopener` is the one that matters: a tab opened without it holds a `window.opener` handle
+    # back to a trading console on a token-bearing origin.
+    assert 'rel="noopener noreferrer"' in outbound[0], outbound[0]
 
     css = _CSS.read_text(encoding="utf-8")
     assert "@import" not in css, "a stylesheet that imports another can import a remote one"

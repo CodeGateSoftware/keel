@@ -11,7 +11,6 @@ from __future__ import annotations
 from decimal import Decimal
 
 from keel.commands.brokers import BrokerInfo
-from keel.commands.help_console import GlossaryTerm
 from keel.web import render
 
 XSS = '<script>alert("x")</script>'
@@ -70,20 +69,13 @@ def test_a_failed_adapter_row_shows_the_error_and_not_the_placeholders() -> None
     assert "WIRED" not in html
 
 
-def test_a_fiqh_term_that_fiqh_basis_does_not_state_says_so() -> None:
-    """`stated=False` means fiqh-basis does not define the term and the glossary entry says that
-    rather than substituting a help-authored summary. Losing that marker in a new front-end would
-    turn a disclaimed gap into an apparent citation."""
-    term = GlossaryTerm(
-        term="something",
-        definition="fiqh-basis does not state this.",
-        source="",
-        citation=None,
-        fiqh=True,
-        stated=False,
-    )
-    html = render.render_glossary([term])
-    assert "not stated in fiqh-basis" in html
+# `test_a_fiqh_term_that_fiqh_basis_does_not_state_says_so` lived here and went with
+# `render_glossary` at #539. The property it protected did NOT go: the "not stated" disclaimer is
+# written into the definition text in `docs/glossary.md` itself -- which is why
+# `help_console.parse_glossary` can DERIVE `stated` from it (`stated = "not stated" not in
+# source.lower()`), and why `tests/commands/test_help_console.py` asserts it on the gharar entry.
+# A reader following the deep link lands on that prose. What was deleted is a renderer for a file
+# no installed deployment has ever had.
 
 
 def test_utc_is_used_and_a_broken_timestamp_does_not_raise() -> None:

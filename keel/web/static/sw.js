@@ -70,6 +70,7 @@ const PRECACHE = [
   `${BASE}css/keel.css`,
   `${BASE}js/api.js`,
   `${BASE}js/chart.js`,
+  `${BASE}js/docs.js`,
   `${BASE}js/format.js`,
   `${BASE}js/live.js`,
   `${BASE}js/main.js`,

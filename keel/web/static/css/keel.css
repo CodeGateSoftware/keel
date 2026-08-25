@@ -181,6 +181,22 @@ h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; }
 }
 .kv .v { font-size: 1.05rem; font-variant-numeric: tabular-nums; }
 
+/* #539: a label that names a documented term links out to its definition.
+   `--muted`, NOT `--accent`: the label is the quietest text on the card and a link colour there
+   would pull the eye off the figure beside it, which is the thing the operator came to read. The
+   dotted underline is what marks it as a link -- and it is an underline rather than colour alone,
+   because #532's whole finding was that this palette had been separating meanings by hue.
+   `text-decoration-thickness` is set because a dotted border-bottom would sit below the descenders
+   and read as a divider instead. */
+.kv .k .doclink {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: 1px;
+}
+.kv .k .doclink:hover,
+.kv .k .doclink:focus-visible { color: var(--fg); text-decoration-style: solid; }
+
 .tablewrap {
   overflow-x: auto;
   /* A scrollable region must be reachable by keyboard. `tabindex="0"` on the wrapper (set in

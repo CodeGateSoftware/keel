@@ -24,8 +24,20 @@ import time
 from collections.abc import Iterable, Sequence
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
+
+#: The published documentation root. Spelled here and in `static/js/docs.js`, and
+#: `tests/web/test_doc_links.py` pins that the two agree.
+DOCS_URL = "https://keeltrading.com/en/docs/"
 
 #: Nav order, and the labels. `/` first because the status page is the answer to "is it alive".
+#:
+#: **The eighth entry is an OUTBOUND link, and used to be a page (#539).** `/glossary` rendered
+#: `docs/glossary.md` read from the working directory -- which no installed deployment has, since
+#: `docs/` sits at the repository root, outside the `keel/` module `uv_build` packages. Every
+#: install therefore rendered an empty glossary, and `help_console.load_glossary`'s docstring said
+#: so. It is a link now, for the same reason the client's is: linking is the only form of this
+#: that reaches an installed deployment at all.
 NAV: tuple[tuple[str, str], ...] = (
     ("/", "Status"),
     ("/setup", "Setup"),
@@ -34,7 +46,7 @@ NAV: tuple[tuple[str, str], ...] = (
     ("/rules", "Rules"),
     ("/venues", "Venues"),
     ("/gates", "Gates"),
-    ("/glossary", "Glossary"),
+    (DOCS_URL, "Docs"),
 )
 
 _STYLE = """
@@ -304,6 +316,7 @@ def page(
     path: str,
     body: str,
     build: str = "",
+    version: str = "",
     refresh_sec: int | None = None,
 ) -> str:
     """The document shell. `refresh_sec` emits a `<meta http-equiv="refresh">` -- a zero-JS
@@ -313,7 +326,29 @@ def page(
     nav_items = []
     for href, label in NAV:
         on = ' class="on"' if href == path else ""
-        nav_items.append(f'<a href="{esc(href)}"{on}>{esc(label)}</a>')
+        # An outbound entry is navigation, not a subresource, so `default-src 'none'` does not
+        # reach it. `noopener` still does matter: a new tab opened without it holds a
+        # `window.opener` handle back to a trading console on a token-bearing origin.
+        #
+        # `?v=` carries the running build, exactly as `static/js/docs.js` does for the client:
+        # the site pins `main` while an operator runs a tagged release, so a linked page can
+        # describe behaviour their build does not have. That skew is made VISIBLE rather than
+        # solved -- the build ends up in the URL bar of the page they are reading. `quote`, not
+        # an f-string, because a full version is `0.11.2+c1634a3fa17f` and a raw `+` in a query
+        # string decodes to a space.
+        #
+        # `version`, NOT `build`, and the two are different strings: `build` is the footer's
+        # human-readable LINE -- `keel 0.11.2+c1634a3fa17f (DIRTY) [checkout]` -- and the first
+        # spelling of this used it, putting that whole sentence percent-encoded into the query.
+        # Caught by looking at the rendered href, not by a test: both forms are non-empty
+        # strings and every assertion about "the link carries a version" passed.
+        away = ""
+        target = href
+        if href.startswith("https://"):
+            away = ' target="_blank" rel="noopener noreferrer"'
+            if version:
+                target = href + "?v=" + quote(version, safe="")
+        nav_items.append(f'<a href="{esc(target)}"{on}{away}>{esc(label)}</a>')
     nav = "".join(nav_items)
     meta_refresh = (
         f'<meta http-equiv="refresh" content="{int(refresh_sec)}">' if refresh_sec else ""
@@ -944,35 +979,6 @@ def render_gates(gates: Sequence[Any], capabilities: Sequence[Any]) -> str:
                 (("surface", False), ("action", False), ("grants", False), ("call site", False)),
                 rows,
             )
-        )
-    return "".join(parts)
-
-
-def render_glossary(terms: Sequence[Any]) -> str:
-    parts = [
-        '<h1>Glossary</h1><p class="sub">keel\'s vocabulary, and the fiqh terms it anchors to</p>',
-        '<dl class="terms">',
-    ]
-    for term in terms:
-        marker = ' <span class="pill">fiqh</span>' if term.fiqh else ""
-        if term.fiqh and not term.stated:
-            marker = ' <span class="pill warn">not stated in fiqh-basis</span>'
-        parts.append(f"<dt>{esc(term.term)}{marker}</dt>")
-        parts.append(f"<dd>{esc(term.definition)}</dd>")
-        source = term.citation or term.source
-        if source:
-            parts.append(f'<dd class="src">{esc(source)}</dd>')
-    parts.append("</dl>")
-    if not terms:
-        # The normal state of an INSTALLED deployment, not a bug: `docs/glossary.md` is read from
-        # the working directory, and a deployment folder is a config, a database and an .env --
-        # there is no docs checkout beside them. The TUI's help screen shows the same empty state
-        # for the same reason. Packaging the docs inside the artifact is D5's business (#438);
-        # until then this says which file is missing rather than implying the glossary is empty.
-        parts.append(
-            '<p class="empty">No glossary here. keel reads <code>docs/glossary.md</code> from '
-            "the folder it is run in, and an installed deployment has no docs checkout beside "
-            "its config and database.</p>"
         )
     return "".join(parts)
 

@@ -280,17 +280,11 @@ def page_gates(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, st
     return "Gates", render.render_gates(GATES, CAPABILITIES), None
 
 
-def page_glossary(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands.help_console import load_glossary
-
-    return "Glossary", render.render_glossary(load_glossary()), None
-
-
 ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]]] = {
     # First-run detection (#437): every page that reads the database serves the checklist when
     # there is no database to read, rather than a 500 whose real cause is that the user has not
-    # set anything up yet. `/venues`, `/gates` and `/glossary` are not wrapped -- none of them
-    # touches the deployment, and all three are useful before one exists.
+    # set anything up yet. `/venues` and `/gates` are not wrapped -- neither touches the
+    # deployment, and both are useful before one exists.
     "/": needs_database(page_status),
     "/setup": page_setup,
     "/activity": needs_database(page_activity),
@@ -298,7 +292,6 @@ ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, 
     "/rules": needs_database(page_rules),
     "/venues": page_venues,
     "/gates": page_gates,
-    "/glossary": page_glossary,
 }
 
 
@@ -466,6 +459,22 @@ _API_HEADERS: tuple[tuple[str, str], ...] = (
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 
+def _docs_version(cfg: ServeConfig) -> str:
+    """The build the nav's documentation link should report, or `""`.
+
+    Read off `build_info` rather than off `cfg.build`, because those are different strings and
+    only one of them is a version: `cfg.build` is the footer's human-readable LINE
+    (`keel 0.11.2+c1634a3fa17f (DIRTY) [checkout]`), and putting it in a query string produced
+    `?v=keel%200.11.2%2B...%20%28DIRTY%29%20%5Bcheckout%5D`. This is the same field `/api/config`
+    hands the client for the same purpose (`payload.config_document`'s `"build"`), so both
+    front-ends report the identical string while both exist.
+
+    `""` when there is no build info at all -- an unversioned link is honest, and a link claiming
+    `?v=unknown` is not.
+    """
+    return str(getattr(cfg.build_info, "full_version", "") or "")
+
+
 def _static_headers(content_type: str) -> tuple[tuple[str, str], ...]:
     """`_STATIC_BASE_HEADERS` plus CSP, but ONLY when `content_type` is one of
     `_CSP_CONTENT_TYPES` -- see the comments on `_STATIC_BASE_HEADERS` and `_CSP_CONTENT_TYPES`
@@ -571,6 +580,7 @@ class KeelHandler(BaseHTTPRequestHandler):
                 path="",
                 body=render.render_message(heading, detail),
                 build=self.cfg.build,
+                version=_docs_version(self.cfg),
             ),
         )
 
@@ -906,6 +916,7 @@ class KeelHandler(BaseHTTPRequestHandler):
                 path=parsed.path,
                 body=body,
                 build=self.cfg.build,
+                version=_docs_version(self.cfg),
                 refresh_sec=refresh,
             ),
         )
