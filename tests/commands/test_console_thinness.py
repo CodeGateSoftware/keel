@@ -102,10 +102,17 @@ def _console_module_paths() -> list[str]:
 #: hand-rolling percent-decoding on attacker-influenced input, which is a strictly worse trade
 #: than one named, scoped allowance.
 #:
-#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in either file
+#: `render` joined them at #539, for the same reason in the other direction: it BUILDS a query
+#: string rather than splitting one. The nav's documentation link carries `?v=<build>`, a full
+#: version is `0.11.2+c1634a3fa17f`, and a raw `+` in a query string decodes to a space -- so the
+#: choice was `quote(build, safe="")` or a hand-rolled encoder for "the characters a version
+#: string might contain", which is a guess about an alphabet rather than a rule about one.
+#: (`render` is deleted at #540 and this entry goes with it.)
+#:
+#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in any of them
 #: still fails, and `urllib.parse` anywhere else still fails.
 RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
-    {("server", "urllib.parse"), ("staticfiles", "urllib.parse")}
+    {("server", "urllib.parse"), ("staticfiles", "urllib.parse"), ("render", "urllib.parse")}
 )
 
 

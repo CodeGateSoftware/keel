@@ -34,6 +34,7 @@
  */
 
 import { read } from "./api.js";
+import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
 import {
   activityView,
@@ -127,6 +128,8 @@ const engineNode = must("engine");
 const contentNode = must("content");
 /** @type {HTMLElement} */
 const buildNode = must("build");
+/** The header's outbound documentation link (#539); its href gains `?v=` once the build is known. */
+const docsNode = /** @type {HTMLAnchorElement} */ (must("docs-link"));
 
 /**
  * An element that `index.html` guarantees. Throwing beats rendering half a page: the two files
@@ -585,13 +588,60 @@ if (window.location.pathname !== pathFor(booted)) {
 }
 
 /**
- * The footer's build line, read once.
+ * Register the service worker (#538), keyed to the build that just answered.
+ *
+ * **After `/api/config`, never before, and that ordering is the whole design.** The worker's
+ * cache name comes from the build string, so registering before the build is known would install
+ * a worker under a name that has to be corrected on the next load -- two registrations, two
+ * caches, for one deployment. Waiting costs one round trip against a local socket.
+ *
+ * **A failed read registers nothing, deliberately.** With `keel serve` stopped this promise
+ * resolves with `data: null`, and the right response is to leave whatever worker is already
+ * installed exactly as it is: it is the one serving the shell that is letting the operator read
+ * this page at all. Re-registering it under `unknown` would swap a correct cache for an empty
+ * one at the precise moment the network cannot refill it.
+ *
+ * **`encodeURIComponent`, because the build string contains `+`.** `keel.version` produces
+ * `0.11.2+88fb17bcab15`, and a raw `+` in a query string decodes to a SPACE -- the worker would
+ * read a different build than the one that is running, and the cache key would silently stop
+ * tracking the binary it is supposed to track.
+ *
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+function registerWorker(config) {
+  if (!("serviceWorker" in navigator)) return;
+  const build = (config && (config.build || config.version)) || "";
+  if (!build) return;
+  // Errors are swallowed on purpose and the app carries on: every failure mode here -- an
+  // unsupported browser, a user profile with workers disabled, a private window -- costs the
+  // offline shell and nothing else. A dashboard that refused to render because it could not
+  // install an optional cache would be trading a working page for a nicety.
+  void navigator.serviceWorker
+    .register(`${BASE}sw.js?v=${encodeURIComponent(build)}`, { scope: BASE })
+    .catch(() => {});
+}
+
+/**
+ * The build, read once, and the three things that depend on it.
  *
  * Once, not per poll: `/api/config` describes the binary that is answering, and that cannot
  * change without the process restarting -- at which point the session token is new, every fetch
  * is a 403, and the banner says so. A version string re-read four times a minute would be four
  * times a minute spent confirming a constant.
+ *
+ * **The first view is painted from INSIDE this callback (#539), and that ordering is deliberate.**
+ * Every documentation link carries `?v=<build>` (`docs.rememberVersion`), and a link built before
+ * the build is known would carry no version until the next poll -- fifteen seconds of links that
+ * quietly do not say which build the reader is running, on exactly the first screen they see.
+ * `/api/config` is the one endpoint that opens no database, so this costs a single round trip on
+ * a loopback socket, and it cannot hang the app: `api.read` resolves with a stopped reading
+ * rather than rejecting, so `show` runs even with nothing listening on the port.
  */
-void read("config").then((reading) => buildLine(buildNode, reading.data));
-
-show(booted, false);
+void read("config").then((reading) => {
+  const config = reading.data;
+  rememberVersion((config && (config.build || config.version)) || "");
+  docsNode.href = indexUrl();
+  buildLine(buildNode, config);
+  registerWorker(config);
+  show(booted, false);
+});
