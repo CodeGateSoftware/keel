@@ -15,8 +15,9 @@ Three surfaces, pinned here:
   superseded wheels are deleted ONLY after a verified success, backups are NEVER
   deleted, a failed verify is LOUD with the real state + the manual recovery, and the
   best-effort reinstall of the previous wheels when they are still on disk.
-* **The relaunch closure** -- argv reconstruction (`build_relaunch_argv`) and the
-  execv closure (`relaunch_tui`, execv itself faked).
+* **The relaunch closure** -- deleted at #541 with its only caller, the console's update
+  view. `keel/commands/update.py` records why in place, including that its fallback built
+  `[keel, "tui"]`, a command that no longer exists.
 * **The packaged story (D6, #439)** -- a packaged install NEVER self-updates: the check
   names the installer download, the plan's refusal stands alone in desktop vocabulary,
   and an unreachable check is calm, never an error. The uv-venv path above is untouched.
@@ -946,93 +947,6 @@ def test_the_default_verify_demands_every_production_distribution_at_the_target(
 # -- the relaunch: argv reconstruction and the execv closure ---------------------------------------
 
 
-def test_build_relaunch_argv_replaces_the_entry_and_keeps_the_tui_args() -> None:
-    venv = Path("/deployment/.venv/bin/python")
-    argv = up.build_relaunch_argv(
-        venv, ["/deployment/.venv/bin/keel", "tui", "--config", "config.live-sandbox.yaml"]
-    )
-    assert argv == [
-        "/deployment/.venv/bin/keel",
-        "tui",
-        "--config",
-        "config.live-sandbox.yaml",
-    ]
-
-
-def test_build_relaunch_argv_preserves_flags_before_the_subcommand_verbatim() -> None:
-    """A deployment wrapper execs `keel --config X --db Y tui`: argv[0] is the WRAPPER,
-    not the subcommand -- the arguments after argv[0] must be carried VERBATIM, byte
-    for byte, no reordering and no prepending. (The old fallback prepended `tui` here,
-    producing `keel tui --config X --db Y tui` and a click usage error on every
-    relaunch of a wrapped deployment.)"""
-    venv = Path("/deployment/.venv/bin/python")
-    original = [
-        "/deployment/keel-live",
-        "--config",
-        "config.live-sandbox.yaml",
-        "--db",
-        "keel-live.db",
-        "tui",
-    ]
-    assert up.build_relaunch_argv(venv, original) == [
-        "/deployment/.venv/bin/keel",
-        "--config",
-        "config.live-sandbox.yaml",
-        "--db",
-        "keel-live.db",
-        "tui",
-    ]
-
-
-def test_build_relaunch_argv_preserves_a_leading_subcommand_verbatim() -> None:
-    venv = Path("/deployment/.venv/bin/python")
-    original = ["/deployment/.venv/bin/keel", "tui", "--interval", "5"]
-    assert up.build_relaunch_argv(venv, original) == [
-        "/deployment/.venv/bin/keel",
-        "tui",
-        "--interval",
-        "5",
-    ]
-
-
-def test_build_relaunch_argv_falls_back_to_the_tui_command_when_the_argv_does_not_name_it() -> None:
-    venv = Path("/deployment/.venv/bin/python")
-    argv = up.build_relaunch_argv(venv, ["/deployment/keel-live"])
-    assert argv[0] == "/deployment/.venv/bin/keel"
-    assert argv[1] == "tui"
-
-
-def test_relaunch_tui_execvs_the_new_console_entry(tmp_path: Path) -> None:
-    venv = tmp_path / ".venv/bin/python"
-    recorded: list[tuple[str, list[str]]] = []
-
-    def _fake_execv(path: str, argv: list[str]) -> None:
-        recorded.append((path, argv))
-
-    relaunch = up.relaunch_tui(venv, [str(venv.parent / "keel"), "tui"], execv=_fake_execv)
-    with pytest.raises(up.UpdateError, match="relaunch"):
-        relaunch()  # a real execv never returns; the fake does, and the closure says so
-    assert recorded == [(str(venv.parent / "keel"), [str(venv.parent / "keel"), "tui"])]
-
-
-def test_relaunch_tui_maps_an_execv_oserror_to_the_manual_instruction(tmp_path: Path) -> None:
-    """An execv that RAISES (permissions, a missing interpreter) surfaces as the
-    service's honest UpdateError naming the manual `keel tui` -- never a bare OSError
-    for a front-end to crash on."""
-
-    def _raising_execv(path: str, argv: list[str]) -> None:
-        raise OSError(13, "permission denied")
-
-    relaunch = up.relaunch_tui(
-        tmp_path / ".venv/bin/python",
-        ["/old/keel", "tui"],
-        execv=_raising_execv,
-    )
-    with pytest.raises(up.UpdateError, match="keel tui") as excinfo:
-        relaunch()
-    assert "permission denied" in str(excinfo.value)
-
-
 # -- the gate: ONE wording, both front-ends --------------------------------------------------------
 
 
@@ -1187,7 +1101,7 @@ def test_cli_full_update_gate_refusal_writes_nothing(
     assert not list(tmp_path.glob("*.bak-before-*"))
 
 
-def test_cli_full_update_runs_the_service_and_prints_the_relaunch_instruction(
+def test_cli_full_update_runs_the_service_and_prints_the_restart_instruction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from keel.cli import cli
@@ -1209,8 +1123,11 @@ def test_cli_full_update_runs_the_service_and_prints_the_relaunch_instruction(
     assert result.exit_code == 0, result.output
     # the whole procedure ran against the fake seams
     assert ops.events
-    # the CLI does NOT auto-relaunch -- it prints the instruction
-    assert "keel tui" in result.output
+    # The CLI does NOT auto-relaunch -- it prints the instruction. It named `keel tui` until
+    # #541 deleted that command; the long-running process an operator now has to restart is
+    # `keel serve`.
+    assert "keel serve" in result.output
+    assert "tui" not in result.output
 
 
 # -- the packaged story (D6, issue #439): the installer IS the update path ------------------------

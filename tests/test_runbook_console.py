@@ -1,11 +1,16 @@
-"""Content pins for the operator runbook's TUI-console section (issue #392 C6; PRD §5
-C6 -- "docs (runbook TUI section)"): the section must exist where an operator looks for
-it, and must carry the console's actual contracts -- the menu tree over the C1
-services, the profile switching + LIVE guard, the session banner, the typed-confirmation
-contract, the ARMED/blocking surfaces, the Venues browser, the help system, and the
-safety design notes. The same style as the other runbook pins
-(`tests/test_paper_equities_profile.py` et al.): the runbook is procedure, and a
-procedure that drifts from the code is worse than none."""
+"""Content pins for the operator runbook's console section (originally issue #392 C6).
+
+**This file pinned the TUI console until #541, and the subject changed rather than the job.**
+The old pins required the runbook to carry the curses dashboard's actual contracts -- the menu
+tree, profile switching and the LIVE guard, the session banner, the typed-confirmation contract,
+the ARMED surfaces, the Venues browser, the help system. That console is deleted, so pinning its
+documentation would pin a description of nothing.
+
+What has not changed is why the file exists: **the runbook is procedure, and a procedure that
+drifts from the code is worse than none.** The console an operator opens today is a browser, so
+these pins are about that section -- including the two facts most expensive to get wrong, which
+are what the browser CANNOT do and where a headless operator goes instead.
+"""
 
 from __future__ import annotations
 
@@ -15,223 +20,81 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNBOOK = REPO_ROOT / "docs" / "operator-runbook.md"
 
+SECTION_HEADING = "## The operator console, in a browser"
+
 
 def _section() -> str:
     text = RUNBOOK.read_text(encoding="utf-8")
-    match = re.search(r"^## The TUI console\n(.*)", text, flags=re.S | re.M)
-    assert match, "the runbook has no '## The TUI console' section"
-    # up to the next top-level (##) heading: the section's own text
+    match = re.search(rf"^{re.escape(SECTION_HEADING)}\n(.*)", text, flags=re.S | re.M)
+    assert match, f"the runbook has no '{SECTION_HEADING}' section"
     rest = match.group(1)
     next_section = re.search(r"^## ", rest, flags=re.M)
     body = rest[: next_section.start()] if next_section else rest
-    # The runbook wraps at ~95 columns: squash whitespace so a phrase pinned across a
-    # line break still reads as the phrase.
+    # The runbook wraps at ~95 columns: squash whitespace so a phrase pinned across a line break
+    # still reads as the phrase.
     return " ".join(body.split())
 
 
-def test_the_runbook_has_a_tui_console_section() -> None:
-    """The section exists, by its name, in Part 2 (after the deployment profiles,
-    before the money settings)."""
-    assert "## The TUI console" in RUNBOOK.read_text(encoding="utf-8")
+def test_the_runbook_has_a_console_section() -> None:
+    """The section exists, by its name, where the TUI section used to be."""
+    assert SECTION_HEADING in RUNBOOK.read_text(encoding="utf-8")
 
 
 def test_the_section_says_what_the_console_is_and_that_it_is_thin() -> None:
+    """Thinness is the property that lets one set of services answer both front-ends, and it is
+    pinned by a test -- so the runbook says so rather than implying it."""
+    section = _section().lower()
+    assert "keel serve" in section
+    assert "service layer" in section
+    assert "test_console_thinness" in section
+
+
+def test_the_section_names_every_view() -> None:
+    """Seven views, named. An operator looking for one should find it here rather than by
+    clicking around."""
     section = _section()
-    lowered = section.lower()
-    assert "keel tui" in lowered
-    assert "menu" in lowered
-    # thin by construction: the same services the CLI calls, pinned by a test
-    assert "same services" in lowered
-    assert "thin" in lowered
-    assert "no business logic" in lowered or "renders and dispatches" in lowered
+    for view in ("Status", "Setup", "Activity", "Insights", "Rules", "Venues", "Gates"):
+        assert view in section, view
 
 
-def test_the_section_documents_profile_switching_and_the_live_guard() -> None:
+def test_the_section_documents_the_one_time_token() -> None:
+    """The single most confusing thing about this server on first contact: the URL carries a
+    token, it is new every run, and it is never written to disk."""
+    section = _section().lower()
+    assert "token" in section
+    assert "loopback" in section
+    assert "never written to disk" in section
+
+
+def test_the_section_says_what_the_browser_cannot_do() -> None:
+    """**The safety fact, and the reason this test is the sharpest one here.**
+
+    Every capability-increasing action is a CLI command behind a typed confirmation at a
+    terminal; the browser can perform none of them. An operator who believes otherwise will go
+    looking in the wrong place for the button that arms autonomy, and -- worse -- an operator who
+    believes the browser CAN do it may leave the page open thinking it is a control surface.
+    """
+    section = _section().lower()
+    assert "capability-increasing" in section
+    assert "keel capabilities" in section
+    assert "typed confirmation" in section or "typed" in section
+    # The claim must be about the SERVER, not about what the page happens to draw: "a client that
+    # hides a button is not a gate" is the design spec's own sentence.
+    assert "server implements no verb" in section
+
+
+def test_the_section_answers_the_headless_case() -> None:
+    """"But SSH" is the first objection to deleting a terminal UI, and the runbook must answer it
+    where an operator will be standing when they ask."""
     section = _section()
-    lowered = section.lower()
-    assert "profile" in lowered
-    assert "config+db" in section or "config + db" in lowered or "pair" in lowered
-    assert "live" in lowered
-    assert "confirm" in lowered
-    # the running agent keeps its own pair: the switch rebinds the CONSOLE only
-    assert "running agent" in lowered or "its own pair" in lowered
-    # direct binding via the CLI flags remains the wrapper's documented path
-    assert "--config" in section
+    assert "ssh -L 8765:127.0.0.1:8765" in section
+    assert "secure context" in section.lower()
 
 
-def test_the_section_documents_the_session_banner() -> None:
+def test_the_section_is_honest_about_what_was_deleted() -> None:
+    """The TUI existed for years and operators will look for it. The section says plainly that it
+    is gone, and why -- not silently omits it."""
     section = _section().lower()
-    assert "banner" in section
-    assert "session" in section
-    assert "clock unavailable" in section
-
-
-def test_the_section_documents_the_typed_contracts() -> None:
-    section = _section().lower()
-    assert "typed" in section
-    # never pre-filled
-    assert "pre-filled" in section
-    # the SIX CLI-own typed prompts run in-console; the two the console adds (attest's
-    # asset code, promote --force's typed yes) are stated as STRICTER than the CLI --
-    # never as identical to it, because the CLI's own gates for those two do not exist
-    assert "the cli's own typed prompt" in section
-    assert "stricter" in section
-    for action in ("resume", "attest", "kill"):
-        assert action in section
-    # kill's one-key contract stated as its own
-    assert "one key" in section or "one-key" in section
-
-
-def test_the_section_documents_the_armed_views_and_ctrl_c() -> None:
-    section = _section().lower()
-    assert "armed" in section
-    assert "enter" in section
-    assert "ctrl-c" in section or "ctrl+c" in section or "control-c" in section
-    # the code's own disclosure wording: Ctrl-C exits gracefully, discards held results,
-    # and the in-flight run does NOT complete (the handlers catch Exception only, so the
-    # interrupt propagates out of the run) -- pinned so "it does not abort a run in
-    # flight" cannot come back
-    assert "does not complete" in section
-    assert "gracefully" in section
-
-
-def test_the_section_documents_the_venues_browser_and_brokers_list() -> None:
-    section = _section().lower()
-    assert "venues" in section
-    assert "keel brokers list" in section
-
-
-def test_the_section_documents_the_help_and_glossary_system() -> None:
-    section = _section().lower()
-    assert "glossary" in section
-    assert "?" in _section()
-
-
-def test_the_section_documents_the_safety_design_notes() -> None:
-    section = _section().lower()
-    # cursor resets: a remembered row is a loaded one
-    assert "cursor" in section
-    assert "reset" in section
-    # the audit table's existence: the ceremony classes are pinned by tests
-    assert "audit" in section or "ceremony" in section
-
-
-def test_the_section_documents_the_account_menu() -> None:
-    section = _section().lower()
-    assert "account" in section
-    assert "pnl" in section
-    assert "versions" in section
-
-
-def test_the_section_is_honest_about_scope() -> None:
-    """The runbook's voice: state the limits, don't sell. The console runs no loop of
-    its own and the typed gates cannot be automated -- the same warnings the command
-    surface carries."""
-    section = _section().lower()
-    assert "does not" in section or "doesn't" in section or "never" in section
-    assert "loop" in section  # the console is not a scheduler
-
-
-# -- the Self-update subsection (issue #415) -------------------------------------------------------
-
-
-def _self_update_section() -> str:
-    text = RUNBOOK.read_text(encoding="utf-8")
-    match = re.search(r"^### Self-update.*?\n(.*)", text, flags=re.S | re.M)
-    assert match, "the runbook has no '### Self-update' subsection"
-    rest = match.group(1)
-    next_section = re.search(r"^#{2,3} ", rest, flags=re.M)
-    body = rest[: next_section.start()] if next_section else rest
-    return " ".join(body.split())
-
-
-def test_the_runbook_has_a_self_update_subsection_under_deploying() -> None:
-    """The subsection lives under 'Deploying a new version' -- the manual procedure it
-    automates -- and cross-links the console section for the ceremony."""
-    text = RUNBOOK.read_text(encoding="utf-8")
-    deploy = re.search(r"^## Deploying a new version\n(.*?)(?=^## )", text, flags=re.S | re.M)
-    assert deploy, "no '## Deploying a new version' section"
-    assert "### Self-update" in deploy.group(1)
-    assert "The TUI console" in _self_update_section()
-
-
-def test_the_self_update_section_states_what_it_does() -> None:
-    section = _self_update_section()
-    lowered = section.lower()
-    # the FIVE production wheels, by path (#425: alpaca rides with the four, or an
-    # equities deployment cannot self-update); the fake/robinhood/kraken exclusion
-    # travels with it
-    for prefix in (
-        "keel_core",
-        "keel_broker_api",
-        "keel_broker_coinbase",
-        "keel_broker_alpaca",
-        "keel_trader",
-    ):
-        assert prefix in section, prefix
-    assert "release/" in lowered
-    assert "back" in lowered and ".bak-before-" in section  # backups FIRST, named
-    assert "migrate" in lowered
-    assert "keel versions" in lowered  # the verify
-    assert "superseded" in lowered or "old wheels" in lowered
-
-
-def test_the_self_update_section_states_the_typed_gate_and_never_automatic() -> None:
-    section = _self_update_section().lower()
-    assert "typed" in section
-    assert "never" in section and ("automatic" in section or "auto-update" in section)
-
-
-def test_the_self_update_section_is_honest_about_what_the_gate_guarantees() -> None:
-    """The typed-gate claim names what keel SHIPS (both front-ends hand it the same
-    gate; the gate fails closed off a TTY, so a scheduled job cannot confirm) without
-    the old absolutism -- the service API is callable by an operator's own code, and
-    the CLI can be driven with scripted input on a real TTY; the section says so."""
-    section = _self_update_section().lower()
-    assert "front-ends" in section
-    assert "fails closed" in section
-    assert "operator's own code" in section
-    assert "can ever" not in section  # "no script can ever ..." absolutism removed
-
-
-def test_the_self_update_section_counts_the_per_db_migrate_the_four_commands_skip() -> None:
-    """The four commands do not migrate; the updater does -- the section must say so
-    instead of claiming the four commands are the whole of it."""
-    section = _self_update_section()
-    assert "plus the per-database" in section
-
-
-def test_the_self_update_section_states_uv_is_a_deployment_dependency() -> None:
-    section = _self_update_section().lower()
-    assert "uv" in section
-    assert "dependency" in section or "required" in section
-
-
-def test_the_self_update_section_keeps_the_manual_fallback() -> None:
-    section = _self_update_section().lower()
-    assert "manual" in section
-    # the manual fallback IS the four commands above -- the docs stay true
-    assert "gh release download" in section or "uv pip install" in section
-
-
-def test_the_self_update_section_states_the_dev_checkout_refusal() -> None:
-    section = _self_update_section().lower()
-    assert "checkout" in section or "source" in section
-    assert "refus" in section
-
-
-def test_the_self_update_section_states_backups_are_never_deleted() -> None:
-    section = _self_update_section().lower()
-    assert "backup" in section
-    assert "never deleted" in section or "not deleted" in section or "never be deleted" in (
-        section
-    )
-
-
-def test_the_self_update_section_states_the_relaunch_split() -> None:
-    """The TUI relaunches itself (execv); the CLI prints the command and does NOT
-    auto-relaunch -- one honest rule, stated."""
-    section = _self_update_section().lower()
-    assert "relaunch" in section
-    assert "execv" in section or "replaces itself" in section
-    assert "cli" in section and ("prints" in section or "does not" in section)
+    assert "keel tui" in section
+    assert "curses" in section
+    assert "#541" in section

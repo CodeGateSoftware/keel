@@ -85,10 +85,17 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 #: scanned: it is the command that binds the socket and launches a browser, which is service work
 #: and is exactly what Rule 5 says belongs outside this layer.
 def _console_module_paths() -> list[str]:
-    paths = [os.path.join(REPO_ROOT, "keel", "commands", name) for name in ("console.py", "tui.py")]
-    paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "commands", "*console*.py"))))
-    paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py"))))
-    return sorted(set(paths))
+    """Every front-end module these rules hold over.
+
+    **This used to be two globs and is now one (#541).** `keel/commands/console.py`, `tui.py` and
+    the seven `*console*.py` modules were deleted with the TUI -- they were reachable only from
+    inside it -- so what remains is the front-end that replaced them. The glob over `keel/web/`
+    was always here; it is the whole file set now.
+
+    A glob that silently matched nothing would make every rule below vacuously green, which is
+    what `test_the_scan_actually_scanned_the_console_layer` exists to prevent, and why that test
+    names modules explicitly rather than counting them."""
+    return sorted(set(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py"))))
 
 
 #: Rule 5's entry-scoped exceptions, in the same shape as every other allowance here:
@@ -698,7 +705,14 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     vacuously green."""
     paths = _console_module_paths()
     stems = {os.path.splitext(os.path.basename(p))[0] for p in paths}
-    assert {"console", "tui"} <= stems
+    # `{"console", "tui"}` was asserted here until #541 deleted both, along with the seven
+    # `*console*` modules this pin was originally written for. The rules did not go with them:
+    # they hold over `keel/web/`, which is the front-end that replaced the console layer and has
+    # been inside this file set since #435.
+    assert "tui" not in stems and "console" not in stems, (
+        "the console layer is back; if that is deliberate it needs its glob restored above, "
+        "because these rules would otherwise not be applied to it"
+    )
     # #435: the web UI is a front-end over the same services and is pinned by the same rules.
     # Named explicitly so that deleting or renaming a web module fails HERE, loudly, rather than
     # quietly shrinking the scanned set and leaving the rules green over less code.
@@ -721,15 +735,12 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     # passing Rules 1-5 while silently losing the money-contract pin entirely.
     assert SERIALISER_STEMS <= stems
     assert any(os.path.join("keel", "web") in path for path in paths)
-    assert {
-        "compliance_console",
-        "strategy_console",
-        "research_console",
-        "trading_console",
-        "data_console",
-        "help_console",
-        "account_console",
-    } <= stems
+    # The seven `*console*` modules were named here, one per line, so that deleting one would
+    # fail HERE rather than quietly shrink the scanned set. #541 deleted all seven at once, and
+    # this is where that had to be acknowledged -- which is the mechanism working, not failing.
+    # They are asserted ABSENT now for the same reason `render` is: a module reappearing under a
+    # name these rules no longer glob would be unpinned code wearing a familiar filename.
+    assert not [stem for stem in stems if stem.endswith("_console")], sorted(stems)
 
 
 def test_every_allowance_names_a_real_callee() -> None:

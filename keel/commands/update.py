@@ -74,7 +74,6 @@ import urllib.request
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
 import click
 
@@ -932,65 +931,22 @@ def run_update(
     )
 
 
-# -- the relaunch: execv the new build's console ---------------------------------------------------
-
-
-def build_relaunch_argv(venv_python: Path, original_argv: Sequence[str]) -> list[str]:
-    """The argv a relaunch execv's: the NEW venv's `keel` console entry carrying the
-    original invocation's arguments. PURE.
-
-    `original_argv` is the running process's `sys.argv`. argv[0] -- the OLD binary's
-    path, possibly a wrapper -- is REPLACED by the new entry, and EVERY argument after
-    it is kept VERBATIM: no reordering, no prepending, ever. Deployment wrappers exec
-    `keel --config X --db Y tui`, so argv[0] is the wrapper and the subcommand sits
-    AFTER the flags -- click parses that identically on the relaunched process, and
-    any reconstruction of our own (the old fallback prepended `tui`, producing a
-    duplicate subcommand and a usage error) breaks exactly those wrappers. Only when
-    the original argv is genuinely unavailable -- the bare-wrapper case, an argv with
-    NO arguments at all -- is `[keel, 'tui']` constructed, so a relaunch always opens
-    the operator console, never a bare interpreter."""
-    new_keel = console_entry(venv_python)
-    args = [str(arg) for arg in original_argv[1:]]
-    if not args:
-        return [str(new_keel), "tui"]
-    return [str(new_keel), *args]
-
-
-def relaunch_tui(
-    venv_python: Path,
-    original_argv: Sequence[str],
-    *,
-    execv: Callable[[str, list[str]], NoReturn] | None = None,
-) -> Callable[[], NoReturn]:
-    """Build (do not run) the relaunch closure: execv the new build's `keel` entry
-    with the reconstructed TUI argv. PURE -- it returns the closure; the CLI/TUI
-    decide to call it (only the TUI does; the CLI prints the command instead).
-
-    The CALLER must have restored the terminal first -- the TUI runs the closure from
-    inside its curses suspend dance, after `endwin`. `execv` replaces the process, so
-    the closure does not return; an `OSError` from it (permissions, a missing
-    interpreter) is wrapped into the same honest `UpdateError` as a returning execv --
-    naming the manual `keel tui` start -- so no front-end ever crashes on a bare
-    OSError, and a failed relaunch can be rendered instead of losing the run's state."""
-    new_keel = console_entry(venv_python)
-    argv = build_relaunch_argv(venv_python, original_argv)
-
-    def _relaunch() -> NoReturn:
-        try:
-            if execv is not None:
-                execv(str(new_keel), argv)
-            else:
-                os.execv(str(new_keel), argv)
-        except OSError as exc:
-            raise UpdateError(
-                f"relaunch failed ({exc}): execv could not start the new build -- "
-                f"start the console by hand: `{new_keel} tui`"
-            ) from exc
-        raise UpdateError(
-            f"relaunch failed: execv returned -- start the console by hand: `{new_keel} tui`"
-        )
-
-    return _relaunch
+# -- the relaunch, and why there is no longer one --------------------------------------------------
+#
+# `build_relaunch_argv` and `relaunch_tui` stood here until #541. They existed for ONE caller --
+# the console's Account-menu update view, which had to replace its own process because a
+# long-running curses front-end keeps the build it started with. The console is deleted, the
+# dashboard with it, and nothing else ever called them: an `execv` reachable from no code path is
+# a loaded gun in a drawer.
+#
+# Their fallback was also, by this commit, wrong: with no argv naming a subcommand they built
+# `[keel, "tui"]`, which is now a command that does not exist. A relaunch that execs into
+# `Error: No such command 'tui'` is worse than no relaunch, because it happens after the new build
+# is already installed.
+#
+# `keel serve` needs no equivalent. It is a server an operator stops and starts, and the browser
+# tab reconnects to whatever is listening; the CLI path always printed the command rather than
+# relaunching anything, and that is now the only path.
 
 
 # -- the typed gate: ONE wording, both front-ends --------------------------------------------------
@@ -1187,9 +1143,9 @@ def update_cmd(ctx: click.Context, check: bool) -> None:
         click.echo(line)
     if result.ok:
         click.echo(
-            "the TUI keeps the build it started with until you relaunch it: run "
-            "`keel tui` (or your deployment wrapper) to start the new build -- this "
-            "command does not relaunch it for you."
+            "a long-running process keeps the build it started with: stop and restart "
+            "`keel serve` (or your deployment wrapper) to pick up the new build -- this "
+            "command does not restart anything for you."
         )
         return
     ctx.exit(1)

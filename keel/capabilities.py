@@ -14,10 +14,24 @@ second place to get the safety model wrong; this one is a declaration checked ag
 `tests/test_capabilities.py`, which fails in BOTH directions -- an undeclared gate call site fails,
 and a declared entry whose gate has disappeared fails.
 
-**Why one entry per call site and not per action.** `autonomy on` appears twice, because the CLI
-and the TUI each gate it in their own front-end, and an auditor asking "can the TUI arm autonomy
-without a terminal?" needs to see the TUI's own row. Rows that mirror a CLI action carry
-`mirrors`, so the duplication reads as deliberate rather than as an inventory that double-counts.
+**One entry per call site, and since #541 there is one call site per action.** `autonomy on` used
+to appear twice -- the CLI and the TUI each gated it in their own front-end -- and four of the
+eleven rows were a TUI or console form of a CLI action, carrying `mirrors` so the duplication read
+as deliberate. #541 deleted the TUI and the console layer that was reachable only from inside it,
+and those four rows went with their call sites. `mirrors` stays on the dataclass: it describes a
+shape this registry must be able to express the moment a second front-end gates anything again.
+
+**What that leaves is worth stating plainly: every capability increase in this build is a CLI
+command run by a person at a terminal.** The browser can perform none of them. That is not a
+property of what the client draws -- "a client that hides a button is not a gate" -- it is a
+property of the server, which implements no verb that would reach one.
+
+**And one bypass is deliberately absent, as it always was.** `keel rules promote --force` skips
+the backtest and every gate check, and it is not here, because this registry is an inventory of
+GATE CALL SITES and that flag has none: `keel/commands/rules.py` records the reasoning -- "the
+CLI's `--force` is a flag the operator already typed at a terminal". The console's retry flow DID
+run a typed gate before calling with `force=True`, which is why a force-promote row existed at
+all; it described the console's ceremony, not the CLI's flag, and it went with the console.
 
 **The gate vocabulary is a tuple of one today.** `TTY` is the whole model: a human at a terminal,
 evidenced by `sys.stdin.isatty()`, with no env-var or flag seam because any such seam would be
@@ -161,46 +175,8 @@ CAPABILITIES: tuple[Capability, ...] = (
             "other one at once, which is why it is gated identically"
         ),
     ),
-    Capability(
-        module="keel.commands.tui",
-        function="_confirm_arm_autonomy",
-        surface="tui",
-        invocation="the dashboard's autonomy action",
-        increases="the same as `keel autonomy on`, reached from the live dashboard",
-        mirrors=("keel.commands.autonomy", "autonomy_on_gate"),
-    ),
-    Capability(
-        module="keel.commands.trading_console",
-        function="_clis_typed_gate",
-        surface="console",
-        invocation="the Trading menu's halt-release actions",
-        increases=(
-            "the same halt releases the CLI offers, reached from the console -- the wording and "
-            "the gate are imported from their one home so the two front-ends cannot drift into "
-            "two ceremonies for one bypass"
-        ),
-        mirrors=("keel.cli", "resume"),
-    ),
-    Capability(
-        module="keel.commands.compliance_console",
-        function="clis_typed_withdrawals_gate",
-        surface="console",
-        invocation="the Compliance menu's withdrawal attestation",
-        increases="the same as `keel withdrawals attest --enabled`, reached from the console",
-        mirrors=("keel.commands.withdrawals", "withdrawals_attest"),
-    ),
-    Capability(
-        module="keel.commands.strategy_console",
-        function="clis_typed_promote_force_gate",
-        surface="console",
-        invocation="the Strategy menu's force-promote",
-        increases=(
-            "a rule is promoted BYPASSING the backtest and promotion gate -- the console's form "
-            "of `keel rules promote --force`"
-        ),
-        mirrors=None,
-    ),
 )
+
 
 
 def gate_named(name: str) -> Gate:
