@@ -116,6 +116,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
     from keel.commands.insights import (
         AccountSummary,
+        EquityCurve,
+        EquityPoint,
         GateDistance,
         InsightsReport,
         JournalEntry,
@@ -915,8 +917,85 @@ def _journal_entry_payload(entry: JournalEntry) -> dict[str, Any]:
 _OUTCOME_STATES: Mapping[str, str] = {"win": GOOD, "loss": BAD, "dca": NEUTRAL, "open": NEUTRAL}
 
 
-def journal_payload(report: JournalReport) -> dict[str, Any]:
+def _equity_point_payload(point: EquityPoint) -> dict[str, Any]:
+    """One point of the curve: where to draw it, and what it says.
+
+    `x` and `y` are BARE STRINGS, not `Field`s, and that is the one place in this module where a
+    figure crosses with no `display` beside it. They are not values a human reads -- there is
+    nothing to format, no judgement to carry and no unit -- they are positions inside an SVG
+    `viewBox`, decided by `keel.commands.insights.build_equity_curve` where a `Decimal` is in
+    scope and where the choice of axis can be tested. `_plain` still renders them, so a
+    coordinate cannot reach the wire in exponent notation any more than a price can.
+
+    Everything a reader is actually TOLD -- the instant, the trade's net, the running total --
+    arrives as a `Field`, and those are what the chart's text equivalent is built from.
+    """
+    return {
+        "x": _plain(point.x),
+        "y": _plain(point.y),
+        "at": moment(point.closed_at),
+        "product_id": point.product_id,
+        "rule_name": point.rule_name or "",
+        "pnl": money(point.pnl, signed=True),
+        "cumulative": money(point.cumulative, signed=True),
+    }
+
+
+def equity_curve_payload(curve: EquityCurve) -> dict[str, Any]:
+    """`build_equity_curve`'s `EquityCurve`, as JSON.
+
+    **`reading` is the chart's text equivalent, and it is written HERE rather than in the browser
+    for the same reason every other sentence on this wire is.** A chart is data made visible, so a
+    reader who cannot see it has to be told the same thing in words. Assembling that sentence in
+    JavaScript would mean the client deciding what a curve says -- a judgement -- and doing it
+    from figures `render.js` is not allowed to read. It is a `label` rather than a bare string
+    because it carries the curve's verdict in its `state`, taken from the CLOSING figure, so the
+    spoken summary and the last point can never disagree about whether this is a profitable track
+    record.
+
+    Both text equivalents ship, and neither is a fallback for the other: the sentence is what a
+    screen reader hears from the chart's `aria-label`, and the per-point rows are what someone
+    reads when they want the numbers rather than the shape.
+
+    `net` is the LAST point's cumulative rather than a sum computed here -- `build_equity_curve`
+    already ran the running total, and re-adding it in this module would be a second arithmetic
+    of the same figure in the one place that is not allowed to hold one.
+    """
+    net = money(curve.points[-1].cumulative, signed=True) if curve.points else absent()
+    low, high = money(curve.low), money(curve.high)
+    trades = count(curve.point_count)
+    if curve.points:
+        reading = (
+            f"Cumulative net profit and loss over {trades['display']} closed trades, "
+            f"ending at {net['display']}, ranging from {low['display']} to {high['display']}."
+        )
+    else:
+        # Not "the curve is flat", and not an empty string. A deployment with no closed trades has
+        # no track record at all, and which of those two a reader is looking at is the entire
+        # difference between an empty chart and a broken one.
+        reading = "No closed trades yet, so there is no curve to draw."
+    return {
+        "width": _plain(curve.width),
+        "height": _plain(curve.height),
+        "baseline_y": _plain(curve.baseline_y),
+        "point_count": trades,
+        "low": low,
+        "high": high,
+        "net": net,
+        "reading": label("curve", display=reading, state=net["state"]),
+        "points": [_equity_point_payload(point) for point in curve.points],
+    }
+
+
+def journal_payload(report: JournalReport, *, curve: EquityCurve) -> dict[str, Any]:
     """`build_journal_report`'s `JournalReport`, as JSON.
+
+    `curve` is passed in rather than built here, and the direction is the point: `keel/web/api.py`
+    calls `build_equity_curve` on the entries THIS report carries, so the chart and the table
+    beneath it are two views of one list and cannot come to describe different trades. It is a
+    REQUIRED keyword, never a defaulted one -- a default would let every existing caller keep
+    working while quietly serving a journal with no chart, which is the shape of a suite that is
+    green because it stopped asking the question.
 
     `total_count` is the full filtered count BEFORE `--limit` truncated `entries`, and
     `shown_count` is how many survived; both cross, so a client showing "50 of 812" needs no
@@ -939,6 +1018,7 @@ def journal_payload(report: JournalReport) -> dict[str, Any]:
         # crosses as strings -- see `stringify`.
         "filters": {str(key): stringify(value) for key, value in sorted(report.filters.items())},
         "entries": [_journal_entry_payload(e) for e in report.entries],
+        "curve": equity_curve_payload(curve),
     }
 
 
@@ -988,6 +1068,28 @@ def _cycle_payload(cycle: ActivityCycle) -> dict[str, Any]:
     }
 
 
+#: What each non-`ok` `ActivityFeed.status` means, in the words `render.py::render_activity`
+#: already uses. Copied verbatim rather than paraphrased: two front-ends offering an operator two
+#: different accounts of the same state is worse than either account alone, and `missing` in
+#: particular has to keep the second sentence -- "it also happens when keel is run from a
+#: directory that is not the deployment folder" -- because that is the actual cause most of the
+#: time and it is not guessable from the word.
+#:
+#: `ok` is absent, and `.get(..., "")` is what that means: a healthy log needs no paragraph.
+_FEED_STATUS_NOTES: Mapping[str, str] = {
+    "missing": (
+        "No log file yet. This is normal before the first cycle -- it also happens when keel is "
+        "run from a directory that is not the deployment folder."
+    ),
+    "empty": "The log exists but the window held no records.",
+    "unparseable": "Lines were read, but none of them was a JSON record.",
+    "oversized": (
+        "The bounded tail read landed inside a single record, so nothing whole survived it."
+    ),
+    "unreadable": "The log could not be read.",
+}
+
+
 def activity_payload(feed: ActivityFeed) -> dict[str, Any]:
     """`build_activity_feed`'s `ActivityFeed`, as JSON.
 
@@ -1014,6 +1116,16 @@ def activity_payload(feed: ActivityFeed) -> dict[str, Any]:
             on_state=NEUTRAL,
             off_state=WARN,
         ),
+        # The prose for a non-`ok` status, chosen HERE rather than in the client.
+        #
+        # `render.py::render_activity` keeps the same table and picks from it with
+        # `explain.get(feed.status, "")`, which is a lookup keyed on the raw status WORD -- and a
+        # browser client cannot do that: `tests/web/test_client_assets.py::
+        # test_render_never_judges_a_value_itself` forbids `render.js` from reading `Field.value`
+        # at all, because a client that branches on a value is a client re-deriving a judgement.
+        # Prose selected by a state word is exactly that branch, so the selection crosses the wire
+        # already made. It is `""` for `ok`, which is not a state anyone needs a paragraph about.
+        "status_note": _FEED_STATUS_NOTES.get(feed.status, ""),
         "lines_read": count(feed.lines_read),
         # Lines read but unusable -- a crash's half-written JSON, a record with no timestamp.
         # Surfaced rather than swallowed: silently discarding input is how a feed comes to
@@ -1300,6 +1412,35 @@ _STEP_KIND_STATES: Mapping[str, str] = {
     "off_venue": WARN,
 }
 
+#: What each kind of step means for the operator -- what keel may do, what it may only collect,
+#: and what it cannot touch at all. `render.py::_STEP_KIND_NOTE`'s wording, carrying #437's whole
+#: argument, moved onto the wire so a browser client places it rather than holding a fourth copy.
+#:
+#: **`operator_input` is here and is NOT in `render.py`'s table.** That table has three entries
+#: against `StepKind`'s four, and the missing one is the kind of the real `credentials` step -- so
+#: `_STEP_KIND_NOTE.get(kind, "")` renders that step with an EMPTY note today, silently dropping
+#: the one line that says what a wizard may and may not do on the step where it matters most. It
+#: is the same shape as #548's five: a lookup that misses, defaulted, with nothing raised. Found
+#: while porting `/setup` to the client (#537), and fixed here rather than in `render.py` because
+#: #540 deletes that function; the browser gets the fourth note, the rendered page keeps its gap
+#: until it goes.
+_STEP_KIND_NOTES: Mapping[str, str] = {
+    "mechanical": "keel can do this for you.",
+    "operator_input": (
+        "keel needs something only you have -- a credential, a path, a value from the venue. It "
+        "records what you supply and asks for nothing it does not need."
+    ),
+    "judgement": (
+        "Yours to decide. keel can record it; it must never choose it for you, and an "
+        "attestation without a cited source is refused exactly like a missing one."
+    ),
+    "off_venue": (
+        "Happens in the venue's own dashboard, and keel cannot verify it -- the venue's API "
+        "does not expose it. Never shown as done here, because a green check that verifies "
+        "nothing turns an open risk into a false assurance."
+    ),
+}
+
 #: `JobStatus.state`, judged.
 _JOB_STATES: Mapping[str, str] = {"running": WARN, "done": GOOD, "failed": BAD}
 
@@ -1318,6 +1459,9 @@ def _step_payload(item: Any) -> dict[str, Any]:
         "kind": label(
             item.step.kind.value, state=_STEP_KIND_STATES.get(item.step.kind.value, NEUTRAL)
         ),
+        # Selected here for the same reason `activity_payload`'s `status_note` is: prose chosen by
+        # a state word is a branch on `Field.value`, and `render.js` may not perform one.
+        "kind_note": _STEP_KIND_NOTES.get(item.step.kind.value, ""),
         "stage": item.step.stage.value,
         "why": item.step.why,
         "how": item.step.how,

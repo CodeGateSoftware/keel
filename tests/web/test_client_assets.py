@@ -51,7 +51,28 @@ _CSS = _STATIC / "css" / "keel.css"
 #: The client's modules, in the spec's own order (§"JS file structure"). A closed list, so a file
 #: appearing under `js/` without a test author noticing fails `test_the_client_ships_exactly_the_
 #: declared_modules` rather than shipping unexamined.
-_MODULES = ("main.js", "api.js", "render.js", "format.js")
+#:
+#: `chart.js` and `live.js` arrived at #537, which is what the previous revision of this line
+#: predicted ("a fifth module is a design decision (#537 adds `chart`, `live`, `docs`, `sw`) and
+#: should arrive with the list updated, not silently"). `docs` (#539) and `sw` (#538) are still to
+#: come, and their absence here is what will make them arrive the same way.
+_MODULES = ("main.js", "api.js", "render.js", "chart.js", "live.js", "format.js")
+
+#: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
+#:
+#: `render.js` is the spec's own choice ("so that a reviewer can confirm the absence by reading one
+#: file"). `chart.js` is added at #537 rather than exempted, and the reason is that exempting it
+#: would have been the easy road and the wrong one: a chart module is exactly where "just this one
+#: subtraction, it is only a pixel" gets written, and once it is written the client is performing
+#: arithmetic over figures that were exact `Decimal`s a moment ago. The coordinates are computed in
+#: `keel.commands.insights.build_equity_curve` instead, so this scan holds over both files and the
+#: design spec's §Dependencies claim -- "the client performs no arithmetic", the sentence that
+#: removes the need for a decimal library -- is a property of the whole client.
+#:
+#: `main.js` is NOT here and cannot be: it owns timers and route indices, which are arithmetic
+#: about the interface rather than about money. `api.js` is not either -- it reads HTTP statuses.
+#: The line is drawn at the modules that touch PAYLOAD VALUES, which is where it means something.
+_DERIVATION_FREE = ("render.js", "chart.js")
 
 
 def _source(name: str) -> str:
@@ -231,34 +252,42 @@ def test_every_module_declares_ts_check(name: str) -> None:
     assert _source(name).splitlines()[0] == "// @ts-check"
 
 
-def test_render_uses_neither_template_nor_regex_literals() -> None:
+@pytest.mark.parametrize("name", _DERIVATION_FREE)
+def test_render_uses_neither_template_nor_regex_literals(name: str) -> None:
     """The two rules that keep `_code_only` small enough to be obviously correct.
 
     Asserted before `test_render_contains_no_arithmetic` relies on them, because that test's
     result is only meaningful if the lexer it uses is sound -- and the lexer is sound only under
     these two conditions."""
-    code = _code_only(_source("render.js"))
-    assert "`" not in code, "render.js must contain no template literals -- see its module note"
+    code = _code_only(_source(name))
+    assert "`" not in code, f"{name} must contain no template literals -- see its module note"
     # Every `/` in the residue is division (comments are already gone), which the arithmetic test
     # below rejects. Stated here as its own assertion so the REASON the lexer can be this small
     # fails loudly rather than showing up as a confusing arithmetic failure.
-    assert "/" not in code, "render.js must contain no regex literals and no division"
+    assert "/" not in code, f"{name} must contain no regex literals and no division"
 
 
-def test_render_contains_no_arithmetic() -> None:
+@pytest.mark.parametrize("name", _DERIVATION_FREE)
+def test_render_contains_no_arithmetic(name: str) -> None:
     """**The acceptance criterion, mechanised.**
 
     The spec asks for `render` specifically so "a reviewer can confirm the absence by reading one
     file". Reading is the point; this is the gate that stops the property decaying between
-    readings."""
-    code = _code_only(_source("render.js"))
+    readings.
+
+    `chart.js` joined it at #537. A chart is the one place a client is EXPECTED to do arithmetic
+    -- scale a series, map it onto a box -- so a scan that stopped at `render.js` would have left
+    the interesting file out. See `_DERIVATION_FREE`, and `build_equity_curve` for where the
+    geometry went instead."""
+    code = _code_only(_source(name))
     found = sorted({ch for ch in _ARITHMETIC_CHARS if ch in code})
-    assert not found, f"render.js contains arithmetic operators: {found}"
-    for name in _ARITHMETIC_NAMES:
-        assert name not in code, f"render.js reaches for {name}; money is formatted in Python"
+    assert not found, f"{name} contains arithmetic operators: {found}"
+    for word in _ARITHMETIC_NAMES:
+        assert word not in code, f"{name} reaches for {word}; money is formatted in Python"
 
 
-def test_render_never_judges_a_value_itself() -> None:
+@pytest.mark.parametrize("name", _DERIVATION_FREE)
+def test_render_never_judges_a_value_itself(name: str) -> None:
     """**The client places values; it never derives them -- including the judgement.**
 
     The arithmetic scan alone does NOT cover this, and that was found by mutation rather than by
@@ -279,12 +308,12 @@ def test_render_never_judges_a_value_itself() -> None:
       * **No relational comparison.** `<` and `>` (arrow functions excepted) are how a sign, a
         threshold or an ordering gets decided, and all three belong in Python.
     """
-    code = _code_only(_source("render.js"))
+    code = _code_only(_source(name))
     assert _DERIVATION_ATTRIBUTE not in code, (
-        "render.js reads Field.value; it may place `display` and style by `state`, nothing else"
+        f"{name} reads Field.value; it may place `display` and style by `state`, nothing else"
     )
     found = _relational_operators(code)
-    assert not found, f"render.js compares values ({found}); judgement is payload.py's job"
+    assert not found, f"{name} compares values ({found}); judgement is payload.py's job"
 
 
 def test_the_derivation_scanners_can_fail() -> None:
@@ -357,16 +386,46 @@ def test_fetch_appears_in_exactly_one_client_module() -> None:
 
 
 def test_no_client_module_opens_a_second_kind_of_connection() -> None:
-    """`XMLHttpRequest`, `EventSource`, `WebSocket`, `navigator.sendBeacon` -- none of them.
+    """`XMLHttpRequest`, `WebSocket`, `navigator.sendBeacon` -- none of them, anywhere. And
+    `EventSource` in exactly one place.
 
     `connect-src 'self'` covers all four in the browser, so this is not the security boundary; it
     is the pin that keeps `api.js`'s "the only place `fetch` appears" from being technically true
-    and substantively false. `EventSource` arrives in #537 for live updates, in `js/live.js`, and
-    updating this list is how that lands deliberately."""
+    and substantively false.
+
+    **`EventSource` arrived at #537 and is scoped to `live.js`, which is how it lands
+    deliberately** -- the previous revision of this docstring said so in advance, and the shape of
+    the exemption is the shape it predicted: one named file, not a relaxed rule. It matters
+    because `live.js` is the second way bytes enter this client, and the whole audit story is that
+    a reader can find every one of them by opening two files. That story survives two transports;
+    it would not survive an unbounded number."""
     for name in _MODULES:
         code = _code_only(_source(name))
-        for transport in ("XMLHttpRequest", "EventSource", "WebSocket", "sendBeacon"):
+        for transport in ("XMLHttpRequest", "WebSocket", "sendBeacon"):
             assert transport not in code, f"{name} opens a {transport}"
+        if name != "live.js":
+            assert "EventSource" not in code, (
+                f"{name} opens an EventSource; live.js is the only module that may"
+            )
+
+    # And the exemption is not vacuous: `live.js` really does open one.
+    assert "EventSource" in _code_only(_source("live.js"))
+
+
+def test_the_event_stream_carries_no_figures() -> None:
+    """The client's data still enters through ONE `fetch`, and the stream is not a second door.
+
+    `keel/web/events.py` puts one key in a tick's `data` -- a revision marker -- and this asserts
+    the client half of the same bargain: `live.js` reads `revision` and nothing else off a tick,
+    so a payload key added to the stream later cannot quietly start being rendered from a
+    transport that `api.js`'s "the only place `fetch` appears" docstring does not cover.
+
+    Checked on the SOURCE rather than at run time because a browser cannot run here -- so it is a
+    statement about what this module was written to read, which is the property a reviewer would
+    otherwise have to take on trust."""
+    code = _code_only(_source("live.js"))
+    reads = sorted(set(re.findall(r"\breading\.data\.([a-z_]+)", code)))
+    assert reads == ["revision"], f"live.js reads {reads} off a tick; the stream carries figures"
 
 
 # -- the two sources of truth that must not drift --------------------------------------------------
@@ -524,6 +583,16 @@ def test_the_stylesheet_is_responsive_and_theme_aware() -> None:
     widths = re.findall(r"@media \(max-width: ([\d.]+)rem\)", css)
     assert len(widths) >= 2, f"only {widths} -- the layout was not built responsive"
     assert "overflow-x: auto" in css, "a wide table must scroll inside itself, not scroll the page"
+    # The other half of that promise, and the half a scrolling table does not deliver: a file
+    # path or a dotted call site is an unbreakable run that sets the MINIMUM width of the
+    # paragraph holding it, and a paragraph is not inside a scroller. Found by driving a real
+    # browser at 360px -- `/activity` overflowed the document by 194px on its log path and
+    # `/gates` by 123px on a `<code>`, with every table on both pages scrolling correctly.
+    # `anywhere` specifically: it is the only value that counts towards `min-content`, so it is
+    # the only one that stops the long word forcing its ancestors wide.
+    assert "overflow-wrap: anywhere" in css, (
+        "an unbreakable path in a paragraph widens the document; see the note beside this rule"
+    )
     assert "grid-template-columns: repeat(auto-fit" in css
     assert ":focus-visible" in css, "visible focus is an acceptance criterion"
 
@@ -606,6 +675,8 @@ def test_the_client_route_fallback_is_behind_the_same_admission(running) -> None
         ("/static/js/main.js", "text/javascript; charset=utf-8"),
         ("/static/js/api.js", "text/javascript; charset=utf-8"),
         ("/static/js/render.js", "text/javascript; charset=utf-8"),
+        ("/static/js/chart.js", "text/javascript; charset=utf-8"),
+        ("/static/js/live.js", "text/javascript; charset=utf-8"),
         ("/static/js/format.js", "text/javascript; charset=utf-8"),
         ("/static/css/keel.css", "text/css; charset=utf-8"),
     ],
@@ -665,15 +736,30 @@ def test_the_status_payload_carries_every_field_the_status_view_places(running) 
             cursor = cursor[part]
 
 
-def _status_view_keys() -> list[str]:
-    """Every `data.<...>` path `statusView` reads, from the source.
+def _view_keys(view: str, root: str) -> list[str]:
+    """Every `<root>.<...>` path a view function reads, from the source.
+
+    Generalised from `_status_view_keys` at #537, when six more views needed the same check --
+    and the generalisation is a REQUIRED second argument, never a default. The views do not all
+    name their payload `data`: `insightsView` takes `insights` and `journal`, because it reads two
+    endpoints. A helper defaulting to `"data"` would have scanned nothing for that view, found no
+    keys, and passed -- over the view with the most keys in it. Every existing caller passes
+    `("statusView", "data")` and gets exactly what it got before.
 
     Row-level keys (`row.qty`, `row.product_id`) are out of scope: they live inside collections
     that are empty on a fresh deployment, so there is nothing to check them against here. They are
     covered by `tests/web/test_payload.py`, which builds populated reports.
     """
-    source = _source("render.js")
-    start = source.index("export function statusView(")
+    # Scanned over the CODE, not the raw file. `_code_only` strips comments, and the views
+    # document the keys they read -- `activityView`'s docstring names `data.scope` while
+    # explaining where the current scope comes from. Since a region runs up to the next `export
+    # function` LINE, the next view's docstring falls inside the previous view's region, and
+    # scanning the raw text reported `setupView` reading a key of `/api/activity`. Found by this
+    # test failing on its first run, which is the same way `_status_view_keys` learned it had to
+    # be bounded at all. It is the same lesson `_markup_only` records for `index.html`: a file
+    # that explains itself well is a file a naive grep cannot check.
+    source = _code_only(_source("render.js"))
+    start = source.index(f"export function {view}(")
     # BOUNDED at the next top-level export, not run to end-of-file. Unbounded, this swept up
     # `buildLine`'s `data.build` -- a key of `/api/config`, not of `/api/status` -- and reported a
     # payload gap that does not exist. Found by this test failing on its first run.
@@ -681,11 +767,81 @@ def _status_view_keys() -> list[str]:
     # The negative lookahead drops METHOD calls: `data.data_freshness.map(` must contribute
     # `data_freshness`, not `data_freshness.map`. Backtracking does that -- the two-segment
     # alternative fails the lookahead on `(` and the one-segment one succeeds on `.`.
-    found = re.findall(r"\bdata\.([a-z_]+(?:\.[a-z_0-9]+)?)\b(?!\s*\()", source[start:end])
-    # `.length` is not a payload key. One name rather than a general rule because it is the only
-    # non-call JavaScript member `statusView` reads; a second one appearing here should be
+    found = re.findall(rf"\b{root}\.([a-z_]+(?:\.[a-z_0-9]+)?)\b(?!\s*\()", source[start:end])
+    # Neither `.length` nor `.display` is a payload key: the first is a list length in JavaScript,
+    # the second is half of a `Field` whose presence is already checked one level up. Two names
+    # rather than a general rule, because a THIRD non-payload member appearing here should be
     # noticed, not absorbed.
-    return sorted({path for path in found if not path.endswith(".length")})
+    return sorted({path for path in found if not path.endswith((".length", ".display"))})
+
+
+def _status_view_keys() -> list[str]:
+    """`statusView`'s keys. Kept under its own name because three tests call it that."""
+    return _view_keys("statusView", "data")
+
+
+#: Each ported view, the parameter it reads a payload through, and the endpoint that fills it.
+#:
+#: `insightsView` appears twice because it reads two endpoints. `api.py` splits them so that "one
+#: sortable collection per endpoint keeps `?sort=` unambiguous", and both name `/insights` as
+#: their `html_route` -- which is the server saying they are one page.
+_VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
+    ("setupView", "data", "/api/setup"),
+    ("activityView", "data", "/api/activity"),
+    ("insightsView", "insights", "/api/insights"),
+    ("insightsView", "journal", "/api/journal"),
+    ("rulesView", "data", "/api/rules"),
+    ("venuesView", "data", "/api/venues"),
+    ("gatesView", "data", "/api/gates"),
+)
+
+
+@pytest.mark.parametrize(("view", "root", "endpoint"), _VIEW_ENDPOINTS)
+def test_every_ported_view_reads_only_keys_its_endpoint_sends(
+    view: str,
+    root: str,
+    endpoint: str,
+    running,  # type: ignore[no-untyped-def]
+) -> None:
+    """**The status parity check, for the six views #537 ports.**
+
+    A browser cannot run here, so the risk this removes is the one a browserless suite is
+    otherwise blind to: a view reaching for a key the payload does not emit, rendering `?`
+    forever -- which is what `render.py`'s `getattr(..., default)` calls do on the rendered pages
+    today (#548, plus the two more this issue found). Checking in the direction the API actually
+    answers is the only check available without a DOM, and it is a real one: it is precisely what
+    would have caught #548 had it existed when `render.py` was written.
+
+    The key list is parsed out of the JavaScript rather than restated here, so it cannot drift.
+    """
+    status, _headers, body = _request(running, endpoint, cookie=_session(running))
+    assert status == 200, endpoint
+    document = json.loads(body)
+    # A migrated but empty deployment: `engine` is running, so `data` is a real payload.
+    assert document["engine"]["value"] == "running", document
+    data = document["data"]
+
+    for path in _view_keys(view, root):
+        cursor = data
+        for part in path.split("."):
+            assert isinstance(cursor, dict), f"{path} -- {part} is not an object in {endpoint}"
+            assert part in cursor, f"{view} reads {root}.{path}; {endpoint} does not send it"
+            cursor = cursor[part]
+
+
+def test_the_view_key_scan_reads_every_ported_view() -> None:
+    """The premise: a scan that found nothing would make the test above pass on any payload.
+
+    Non-empty per view, so a parse that silently returned `[]` fails here by name. The three spot
+    checks are the keys most likely to be got wrong -- two of them are payload fields this issue
+    ADDED (`status_note`, `curve`), which is exactly the shape of key a client can start reading
+    before the server sends it."""
+    for view, root, _endpoint in _VIEW_ENDPOINTS:
+        assert _view_keys(view, root), f"{view} reads nothing off {root} -- the parser has broken"
+
+    assert "status_note" in _view_keys("activityView", "data")
+    assert "curve" in _view_keys("insightsView", "journal")
+    assert "steps" in _view_keys("setupView", "data")
 
 
 def test_the_status_key_scan_found_the_keys_it_claims_to_check() -> None:

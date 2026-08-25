@@ -47,6 +47,7 @@ from keel.commands.insights import (
     JournalEntry,
     JournalReport,
     RuleTrackRecord,
+    build_equity_curve,
 )
 from keel.commands.jobs import JobStatus
 from keel.commands.setup import ACTIONS, STEPS, DeploymentState, StepState
@@ -239,6 +240,22 @@ def _journal_report(**overrides: Any) -> JournalReport:
     return JournalReport(**base)
 
 
+def _journal_json(**overrides: Any) -> dict[str, Any]:
+    """`journal_payload` over `_journal_report(**overrides)`, with the curve built from THOSE
+    entries.
+
+    A new helper at #537 rather than a default on `journal_payload`, and the difference is the
+    point: `curve` is a required keyword on the serialiser, so every caller has to say which
+    curve, and this one says the only thing `keel/web/api.py::read_journal` ever says -- the curve
+    of the entries this report carries. A default of `None` would have left every test here green
+    while the shipped endpoint served a journal with no chart in it.
+
+    Nothing about `_journal_report` changed, and every test that called it directly still does.
+    """
+    report = _journal_report(**overrides)
+    return payload.journal_payload(report, curve=build_equity_curve(report.entries))
+
+
 def _activity_feed(**overrides: Any) -> ActivityFeed:
     cycle = ActivityCycle(
         cycle_id="c-1",
@@ -346,7 +363,7 @@ def _every_payload() -> dict[str, Any]:
     return {
         "status": payload.status_payload(_status_report()),
         "insights": payload.insights_payload(_insights_report()),
-        "journal": payload.journal_payload(_journal_report()),
+        "journal": _journal_json(),
         "activity": payload.activity_payload(_activity_feed()),
         "config": payload.config_payload(_build_info(), describe="keel 0.1.0+abc [checkout]"),
         "setup": payload.setup_payload(
@@ -585,6 +602,21 @@ def _report_figures(node: Any, seen: set[int] | None = None) -> set[Decimal]:
     return set()
 
 
+def _journal_case() -> tuple[str, tuple[Any, ...], dict[str, Any]]:
+    """The journal case for the guard below: the report AND the curve, against the payload of both.
+
+    `EquityCurve` is a second frozen report object, produced by `keel.commands.insights` like every
+    other one, and the running totals on it appear nowhere on `JournalReport` -- so handing the
+    guard only the report would make it fail on `curve.points[*].cumulative`, correctly, for a
+    figure that IS on a report. Both go in, `_report_figures` walks dataclasses generically, and
+    the guard keeps its teeth: a cumulative total the SERIALISER invented would still be on
+    neither.
+    """
+    report = _journal_report()
+    curve = build_equity_curve(report.entries)
+    return ("journal", (report, curve), payload.journal_payload(report, curve=curve))
+
+
 def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report() -> None:
     """Rule 2, enforced rather than asserted in prose.
 
@@ -597,11 +629,13 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
     an `int`; `InsightsReport` carries `float` win rates, which have no exact decimal form and are
     covered by their own test below.
     """
-    for name, report, built in (
-        ("status", _status_report(), payload.status_payload(_status_report())),
-        ("journal", _journal_report(), payload.journal_payload(_journal_report())),
+    for name, reports, built in (
+        ("status", (_status_report(),), payload.status_payload(_status_report())),
+        _journal_case(),
     ):
-        available = _report_figures(report)
+        available: set[Decimal] = set()
+        for report in reports:
+            available |= _report_figures(report)
         for path, leaf in _walk(json.loads(json.dumps(built))):
             if not path.endswith(".value") or not isinstance(leaf, str) or not leaf:
                 continue
@@ -667,7 +701,7 @@ def test_a_win_rate_float_is_re_encoded_not_recomputed() -> None:
 def test_a_loss_is_labelled_bad_in_python_not_by_the_sign_on_the_wire() -> None:
     """Rule 3. The client must never read a minus sign and conclude "bad" -- that is arithmetic by
     another name, and it relocates a trading judgement into a browser."""
-    entries = payload.journal_payload(_journal_report())["entries"]
+    entries = _journal_json()["entries"]
     loss, gain = entries[0], entries[1]
 
     assert loss["pnl"]["state"] == "bad"
@@ -679,7 +713,7 @@ def test_state_survives_without_colour() -> None:
     """#532: colour must never be the only signal. `display` carries a glyph and an explicit sign,
     so profit and loss stay distinguishable in greyscale, on e-ink, in sunlight, and to the
     roughly one man in twelve who cannot separate the palette's red from its green."""
-    entries = payload.journal_payload(_journal_report())["entries"]
+    entries = _journal_json()["entries"]
 
     assert entries[0]["pnl"]["display"] == "▼ −$12.34"
     assert entries[1]["pnl"]["display"] == "▲ +$41.00"
@@ -747,7 +781,7 @@ def test_shown_count_is_read_from_the_report_not_measured_here() -> None:
     in the serialiser for that reason, and this pins the pair a client needs to say "2 of 812"
     without subtracting anything.
     """
-    built = payload.journal_payload(_journal_report())
+    built = _journal_json()
 
     assert built["total_count"]["value"] == "812"
     assert built["total_count"]["display"] == "812"
@@ -940,7 +974,7 @@ def test_the_journal_filters_cross_as_strings_too() -> None:
     """`JournalReport.filters` holds the query that produced the report -- `limit`, `since_ts` and
     friends, which are ints. They are echoed back for the client to show, and an echoed int is a
     JSON number like any other."""
-    filters = payload.journal_payload(_journal_report())["filters"]
+    filters = _journal_json()["filters"]
 
     assert filters["limit"] == "50"
     assert filters["since_ts"] == str(NOW_TS - 604800)
@@ -994,7 +1028,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
     documents = {
         "status": payload.status_payload(empty_status),
         "insights": payload.insights_payload(_insights_report(rules=[], closed_trade_count=0)),
-        "journal": payload.journal_payload(_journal_report(entries=[], total_count=0, filters={})),
+        "journal": _journal_json(entries=[], total_count=0, filters={}),
         "activity": payload.activity_payload(
             ActivityFeed(status="missing", source="/tmp/nope.log")
         ),
@@ -1013,11 +1047,18 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
     matters beyond tidiness: `json.dumps(Decimal(...))` raises, and the natural fix a hurried
     author reaches for is `default=float`, which is the contract's exact failure mode installed as
     a convenience."""
-    report = {
+    if builder == "journal_payload":
+        # The one builder with a second required argument. Spelled out rather than folded into
+        # the table below, because folding it in would mean a default somewhere -- and the whole
+        # reason `curve` is required is that a default serves a journal with no chart.
+        report = _journal_report()
+        json.dumps(payload.journal_payload(report, curve=build_equity_curve(report.entries)))
+        return
+
+    other = {
         "status_payload": _status_report(),
         "insights_payload": _insights_report(),
-        "journal_payload": _journal_report(),
         "activity_payload": _activity_feed(),
     }[builder]
 
-    json.dumps(getattr(payload, builder)(report))  # no cls=, no default=
+    json.dumps(getattr(payload, builder)(other))  # no cls=, no default=
