@@ -71,6 +71,23 @@
       <li><a href="/static/rules">Rules</a></li>
       <li><a href="/static/venues">Venues</a></li>
       <li><a href="/static/gates">Gates</a></li>
+      <!--
+        THE EIGHTH NAV ENTRY IS A LINK, NOT A VIEW (#539).
+
+        `render.py`'s NAV has eight entries and this client has seven, and the difference is the
+        glossary. keel's `docs/` lives at the REPOSITORY root, outside the `keel/` module that
+        `uv_build` packages, so no wheel has ever carried it -- every installed deployment
+        renders an empty glossary today. That is not fixable with a packaging glob (measured at
+        #535: the `artifacts` key is inert on the pinned backend), so the documentation is
+        linked rather than shipped.
+
+        The href here is the un-versioned form and `main.js` replaces it with `?v=<build>` as
+        soon as `/api/config` answers. It is spelled out in the markup anyway rather than left
+        empty, because view-source is one of the reasons this project chose the web (§4), and a
+        nav entry whose destination only exists after a script runs is not readable there.
+      -->
+      <li><a id="docs-link" href="https://keeltrading.com/en/docs/"
+             target="_blank" rel="noopener noreferrer">Docs<span aria-hidden="true"> &#8599;</span></a></li>
     </ul>
   </nav>
 </header>

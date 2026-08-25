@@ -56,6 +56,7 @@
  */
 
 import { equityChart } from "./chart.js";
+import { termLink } from "./docs.js";
 import { instant } from "./format.js";
 
 /**
@@ -158,7 +159,14 @@ function plain(value) {
  */
 function kv(label, value) {
   const wrap = el("div", "kv");
-  wrap.append(el("span", "k", label));
+  // #539: a label that names a documented term becomes an outbound link to its definition,
+  // here rather than at each call site. `docs.TERMS` is the whole answer to "which words on
+  // this screen are defined somewhere", and a label it does not know stays plain text.
+  const linked = termLink(label);
+  const key = el("span", "k");
+  if (linked) key.append(linked);
+  else key.textContent = label;
+  wrap.append(key);
   const holder = el("span", "v");
   if (value instanceof Node) holder.append(value);
   else if (typeof value === "string") holder.textContent = value;
