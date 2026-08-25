@@ -88,13 +88,26 @@ const PRECACHE = [
 ];
 
 /**
- * Install: fill this build's cache, then take over immediately.
+ * Install: fill this build's cache, and then WAIT.
  *
- * `skipWaiting` rather than waiting for every tab to close, and the version key is what makes
- * that safe: the new worker serves the new build's cache, the old one is deleted in `activate`,
- * and a client that reloads gets a consistent set. Waiting would leave an upgraded engine being
- * read by the previous shell for as long as one tab stayed open -- exactly the failure the
- * version key exists to prevent.
+ * ── THIS CALLED `skipWaiting()` UNCONDITIONALLY, AND THAT WAS WRONG ─────────────────────────
+ * The argument was that the version-keyed cache made it safe: the new worker serves the new
+ * build's cache, the old one is deleted in `activate`, so nothing stale survives. That reasoning
+ * is sound about CACHES and silent about the thing that actually breaks -- the page already on
+ * screen. `skipWaiting()` plus `clients.claim()` takes over a document that was parsed and
+ * rendered by the OLD build's JavaScript, and every request it makes afterwards is answered from
+ * the NEW build's cache. One page, two builds, no indication.
+ *
+ * keel had a second line of defence that made this hard to notice: a new build means the process
+ * restarted, which means a new session token, which means every `/api/*` call from the old page
+ * is a 403 the banner reports. So the window was narrow and loud rather than wide and quiet. It
+ * was still a window, and "another layer happens to cover it" is not a reason to keep a hazard
+ * that costs one message to remove.
+ *
+ * So the new worker installs its cache and stays in `waiting`. `main.js` notices, tells the
+ * operator a new build is ready, and only a click sends `SKIP_WAITING` -- at which point the page
+ * reloads into the build it just accepted. Nothing is ever half-upgraded, and the operator finds
+ * out an upgrade happened, which they could not before.
  *
  * `cache: "reload"` on every request: the server sends `Cache-Control: no-store` on static
  * assets (`server._STATIC_BASE_HEADERS`), but the HTTP cache is not the only thing between here
@@ -105,9 +118,19 @@ self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
       .open(CACHE)
-      .then((cache) => cache.addAll(PRECACHE.map((path) => new Request(path, { cache: "reload" }))))
-      .then(() => self.skipWaiting()),
+      .then((cache) => cache.addAll(PRECACHE.map((path) => new Request(path, { cache: "reload" })))),
   );
+});
+
+/**
+ * The one message this worker answers: "the operator accepted the update, take over".
+ *
+ * A message rather than a timer or a heuristic, because the decision is not the worker's to make.
+ * `skipWaiting()` here is safe in the way it was not in `install`: the page that sent it is about
+ * to reload, so there is no document left running the old build for the new one to serve.
+ */
+self.addEventListener("message", (event) => {
+  if (event.data === "SKIP_WAITING") void self.skipWaiting();
 });
 
 /**

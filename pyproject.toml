@@ -147,6 +147,15 @@ warn_redundant_casts = true
 # fails the build when this list and mypy's own `--strict` bundle drift apart.
 [[tool.mypy.overrides]]
 module = [
+    # `keel.web.*` is not a new package, and it is here for the same reason the new packages are:
+    # it was ALREADY clean under these flags. Measured rather than assumed -- `mypy --strict
+    # keel/web` reported two errors, both in one function, and both were the same defect: a
+    # three-argument `type()` call returning `Any` into a function annotated `-> KeelServer`,
+    # under a `type: ignore[return-value]` that did not name the error mypy was actually
+    # reporting. Fixing that left zero, so gating it costs nothing today and is what stops the
+    # next edit from costing something. It is also the layer where it matters most: everything
+    # under `keel/web/` is reachable from a socket.
+    "keel.web.*",
     "keel_broker_api.*",
     "keel_broker_alpaca.*",
     "keel_broker_coinbase.*",

@@ -136,6 +136,15 @@
 
 <footer>
   <span>keel &middot; served from this machine only</span>
+  <!--
+    Empty until a new build has installed and is waiting (#538). `main.js` fills it with one
+    button; taking the offer sends the waiting worker `SKIP_WAITING` and reloads once it has
+    taken over. It lives here, beside the build line it is about to change, rather than in the
+    engine banner: that banner is the page's one `aria-live` region and it answers "is keel
+    running", so an upgrade notice there would interrupt a screen reader mid-table to say
+    something that can wait indefinitely.
+  -->
+  <span id="update"></span>
   <span id="build" class="muted"></span>
 </footer>
 

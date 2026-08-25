@@ -10,6 +10,8 @@ What that leaves uncovered is listed once, honestly, and each item was checked b
 running `keel serve` driven by a real Chromium; the results are in the PR body:
 
   * that the worker installs, activates and reaches `controlling` state;
+  * that a second build leaves the new worker WAITING and the offer appears in the footer;
+  * that taking the offer swaps the controller and reloads into the new build;
   * that the precache is populated and holds exactly `PRECACHE`;
   * that the shell still paints after `keel serve` is killed, with no figures on it;
   * that a changed build string swaps the cache and deletes the old one;
@@ -284,6 +286,93 @@ def test_the_worker_never_writes_to_a_cache_outside_install() -> None:
     )
     assert ".put(" not in code, "a runtime cache write in the service worker"
     assert code.count(".addAll(") == 1, "the precache should be the only thing written"
+
+
+def test_the_worker_never_takes_over_a_page_it_did_not_render() -> None:
+    """**This is a correction: the worker called `skipWaiting()` unconditionally at install.**
+
+    The original argument was that the version-keyed cache made it safe -- new worker, new cache,
+    old one deleted. That is true about CACHES and silent about the page already on screen:
+    `skipWaiting()` with `clients.claim()` takes over a document parsed and rendered by the OLD
+    build, and answers its later requests from the NEW build's cache. One page, two builds.
+
+    keel had a second line of defence that made it hard to notice -- a new build means a restarted
+    process, a new session token, and a 403 the banner reports -- but a hazard covered by an
+    unrelated layer is still a hazard.
+
+    So: `skipWaiting` appears only inside the message handler, never in `install`.
+    """
+    source = _sw_source()
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith(("*", "/*", "//"))
+    )
+    # Sliced to the install handler ALONE, not "install up to activate": the message handler now
+    # sits between them and it is the one place `skipWaiting` legitimately appears, so the wider
+    # slice would find it there and report the opposite of the truth.
+    start = code.index('addEventListener("install"')
+    install = code[start : code.index("self.addEventListener(", start + 1)]
+    assert "skipWaiting" not in install, (
+        "the worker takes over at install again; see this test's docstring before restoring it"
+    )
+    assert 'if (event.data === "SKIP_WAITING") void self.skipWaiting();' in code, (
+        "the consent path is gone -- an update could never be applied"
+    )
+
+
+def test_the_client_offers_the_update_rather_than_applying_it() -> None:
+    """The other half: a waiting worker is useless if nothing tells the operator it is waiting.
+
+    Both arrival paths are pinned. `registration.waiting` catches an update that installed during
+    a previous visit; `updatefound` + `installed` catches one that arrives while the page is open.
+    A build that handled only the second would leave an update stranded forever for anyone who
+    closed the tab at the wrong moment."""
+    main = (_STATIC / "js" / "main.js").read_text(encoding="utf-8")
+    assert "registration.waiting" in main, "an update installed on a previous visit is stranded"
+    assert '"updatefound"' in main, "an update arriving while the page is open is missed"
+    assert 'postMessage("SKIP_WAITING")' in main
+
+
+def test_the_first_install_is_not_announced_as_an_update() -> None:
+    """`navigator.serviceWorker.controller` is the test for "update" versus "first install".
+
+    Without it the very first visit -- a worker installing with nothing to replace -- would offer
+    the operator a reload for the build they are already running, which teaches them the notice
+    means nothing.
+
+    **And it gates the OFFER, never the watching.** An earlier spelling returned early from
+    `watchForUpdate` when there was no controller, which meant that on a first visit -- the one
+    load where there reliably is none -- the `updatefound` listener was never attached. This
+    asserts the listener is registered unconditionally."""
+    main = (_STATIC / "js" / "main.js").read_text(encoding="utf-8")
+    watcher = main[main.index("function watchForUpdate(") : main.index("function offerUpdate(")]
+    assert "navigator.serviceWorker.controller" in watcher, (
+        "a first install is announced as an update"
+    )
+    assert "return;" not in watcher.split('addEventListener("updatefound"')[0], (
+        "watchForUpdate returns before attaching its listener; a first visit would never watch"
+    )
+
+
+def test_the_reload_waits_for_the_new_worker_to_take_over() -> None:
+    """Reloading straight after `postMessage` races: the new worker may not be controlling yet, so
+    the reload fetches the old build again and leaves the offer standing."""
+    main = (_STATIC / "js" / "main.js").read_text(encoding="utf-8")
+    controller_change = main.index('"controllerchange"')
+    post = main.index('postMessage("SKIP_WAITING")')
+    assert controller_change < post, (
+        "the reload listener is registered after the message is sent -- the takeover can land first"
+    )
+
+
+def test_the_update_offer_is_not_in_the_live_region() -> None:
+    """The engine banner is the page's one `aria-live` region and it answers "is keel running".
+
+    An upgrade notice is neither urgent nor about the engine, and putting it there would interrupt
+    a screen reader mid-table to say something that can wait indefinitely."""
+    html = _INDEX.read_text(encoding="utf-8")
+    banner = html[html.index('id="engine"') : html.index('id="content"')]
+    assert 'id="update"' not in banner
+    assert 'id="update"' in html, "the offer has nowhere to go"
 
 
 def test_the_cache_name_is_keyed_to_the_build() -> None:

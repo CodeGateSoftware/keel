@@ -129,6 +129,8 @@ const contentNode = must("content");
 const buildNode = must("build");
 /** The header's outbound documentation link (#539); its href gains `?v=` once the build is known. */
 const docsNode = /** @type {HTMLAnchorElement} */ (must("docs-link"));
+/** Where the "a newer build is ready" offer goes (#538). Empty until there is one. */
+const updateNode = must("update");
 
 /**
  * This session's write token (#540), read off `/api/setup` whenever the setup view mounts.
@@ -761,7 +763,80 @@ function registerWorker(config) {
   // install an optional cache would be trading a working page for a nicety.
   void navigator.serviceWorker
     .register(`${BASE}sw.js?v=${encodeURIComponent(build)}`, { scope: BASE })
+    .then((registration) => watchForUpdate(registration))
     .catch(() => {});
+}
+
+/**
+ * Offer the operator a new build once one has finished installing (#538, corrected).
+ *
+ * **Why there is a prompt at all.** The worker used to call `skipWaiting()` the moment its cache
+ * was full, which takes over the page currently on screen -- a document rendered by the OLD
+ * build's JavaScript, whose later requests are then answered from the NEW build's cache. `sw.js`
+ * carries the full argument. The fix is that the new worker waits, and this is what tells the
+ * operator it is waiting.
+ *
+ * **Three states, because a worker can already be waiting when this runs.** A registration whose
+ * `waiting` is populated has an update that installed during a previous visit; `updatefound` plus
+ * `installed` catches one that arrives while the page is open. Both funnel to the same offer.
+ *
+ * `navigator.serviceWorker.controller` is the test for "is this an UPDATE or a first install".
+ * Without it, the very first visit -- where a worker installs and waits with nothing to replace
+ * -- would offer the operator a reload for a build they are already running.
+ *
+ * **It gates the OFFER, not the watching, and the first spelling got that wrong.** Returning
+ * early when there is no controller meant that on a first visit -- the one load where there
+ * reliably is none -- the `updatefound` listener was never attached at all, so an update arriving
+ * later in that same session went unnoticed. The window was narrow (an update needs a server
+ * restart, which invalidates the session token, which the banner reports) but the code was saying
+ * something it did not mean. Found by driving the flow in a browser rather than by reading it.
+ *
+ * @param {ServiceWorkerRegistration} registration
+ */
+function watchForUpdate(registration) {
+  if (registration.waiting && navigator.serviceWorker.controller) {
+    offerUpdate(registration.waiting);
+  }
+  registration.addEventListener("updatefound", () => {
+    const installing = registration.installing;
+    if (!installing) return;
+    installing.addEventListener("statechange", () => {
+      if (installing.state === "installed" && navigator.serviceWorker.controller) {
+        offerUpdate(installing);
+      }
+    });
+  });
+}
+
+/**
+ * The offer itself: one line in the footer, and a button that takes it.
+ *
+ * In the FOOTER rather than over the view, and not in the engine banner. The banner is the page's
+ * one `aria-live` region and it answers "is keel running"; an upgrade notice is neither urgent nor
+ * about the engine's state, and putting it there would interrupt a screen reader mid-table to say
+ * something that can wait indefinitely. It sits beside the build line it is about to change.
+ *
+ * The reload is driven by `controllerchange` rather than fired straight after the message: the
+ * new worker has to actually take over before a reload gets the new build, and reloading first
+ * would fetch the old one again and leave the offer standing.
+ *
+ * @param {ServiceWorker} waiting
+ */
+function offerUpdate(waiting) {
+  if (updateNode.childElementCount !== 0) return;
+
+  const button = document.createElement("button");
+  button.className = "update";
+  button.setAttribute("type", "button");
+  button.append(document.createTextNode("A newer build is ready — reload"));
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      window.location.reload();
+    });
+    waiting.postMessage("SKIP_WAITING");
+  });
+  updateNode.replaceChildren(button);
 }
 
 /**

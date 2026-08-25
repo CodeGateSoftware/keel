@@ -814,10 +814,30 @@ class KeelServer(ThreadingHTTPServer):
 
 
 def build_server(cfg: ServeConfig) -> KeelServer:
-    handler = type("BoundKeelHandler", (KeelHandler,), {"cfg": cfg})
-    family = socket.AF_INET6 if ":" in cfg.host else socket.AF_INET
-    server_type = type("BoundKeelServer", (KeelServer,), {"address_family": family})
-    return server_type((cfg.host, cfg.port), handler)  # type: ignore[return-value]
+    """A server bound to `cfg`, with the address family its host implies.
+
+    **Nested subclasses rather than three-argument `type()`.** Both bind a per-run config onto a
+    handler class and an address family onto a server class, and both are correct at runtime --
+    but `type(name, bases, namespace)` is declared to return plain `type`, so calling it produced
+    an `Any` that flowed straight out of a function annotated `-> KeelServer`. The
+    `# type: ignore[return-value]` that used to sit here did not even name the right error: mypy
+    reported `no-any-return` and noted the code was not covered, which is a suppression that
+    silences nothing while looking like it silences something. Written as classes, the types are
+    checked rather than asserted, and `keel/web/` type-checks under full `--strict`.
+
+    A fresh pair per call is deliberate: `address_family` and `cfg` are class attributes that
+    `http.server` reads during `__init__`, so binding them to the shared classes would make two
+    concurrently-built servers overwrite each other's configuration.
+    """
+    bound_cfg = cfg
+
+    class BoundKeelHandler(KeelHandler):
+        cfg = bound_cfg
+
+    class BoundKeelServer(KeelServer):
+        address_family = socket.AF_INET6 if ":" in cfg.host else socket.AF_INET
+
+    return BoundKeelServer((cfg.host, cfg.port), BoundKeelHandler)
 
 
 def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
