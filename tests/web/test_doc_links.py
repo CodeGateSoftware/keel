@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from keel.web import render, staticfiles
+from keel.web import staticfiles
 
 _REPO = Path(__file__).resolve().parents[2]
 _DOCS = _REPO / "docs"
@@ -247,55 +247,39 @@ def test_the_first_paint_already_knows_the_version() -> None:
     assert main.count("show(booted, false);") == 1, "the first paint happens twice"
 
 
-def test_the_rendered_pages_version_their_documentation_link_too(running) -> None:  # type: ignore[no-untyped-def]
-    """Both front-ends exist until #540, and the criterion is not "the client carries `?v=`".
-
-    `quote(..., safe="")` rather than an f-string: a full version is `0.11.2+c1634a3fa17f`, and a
-    raw `+` in a query string decodes to a space.
-    """
-    from tests.web.test_server import _request, _session
-
-    _status, _headers, body = _request(running, "/", cookie=_session(running))
-    assert render.DOCS_URL in body
-    # The fixture's build may be empty, in which case no `?v=` is correct -- an empty version is
-    # not a version to report. Asserted through the renderer instead, where a build is present.
-    versioned = render.page(
-        title="t",
-        path="/",
-        body="",
-        # The two are DIFFERENT strings, and passing both here is the point of this assertion:
-        # `build` is the footer's human-readable line and the first spelling of this feature put
-        # it in the query, yielding `?v=keel%200.11.2%2B...%20%28DIRTY%29%20%5Bcheckout%5D`.
-        build="keel 0.11.2+c1634a3fa17f (DIRTY) [checkout]",
-        version="0.11.2+c1634a3fa17f",
-    )
-    assert render.DOCS_URL + "?v=0.11.2%2Bc1634a3fa17f" in versioned, (
-        "the rendered nav's documentation link carries no version, or carries a raw `+`"
-    )
-    assert "keel%200.11.2" not in versioned, "the build LINE leaked into the query string"
-    assert 'rel="noopener noreferrer"' in versioned
+# `test_the_rendered_pages_version_their_documentation_link_too` stood here until #540. It existed
+# because two front-ends both linked out while both existed, and the criterion was not "the client
+# carries `?v=`". There is one front-end now. What that test actually caught -- `?v=` carrying the
+# human-readable BUILD LINE rather than the version -- is still pinned, by
+# `test_links_carry_the_running_version` below and by `server._docs_version`'s own deletion: there
+# is no longer a second place where the wrong string could be passed.
 
 
-def test_the_documentation_root_is_spelled_the_same_in_both_front_ends() -> None:
-    """`render.py` and `docs.js` both link out while both front-ends exist. Two spellings is two
-    things to update at #540, and one of them would be missed."""
+def test_the_documentation_root_is_spelled_in_exactly_two_places_and_they_agree() -> None:
+    """`docs.js`'s `SITE` and the shell's static `href`, and nothing else.
+
+    There were three until #540 -- `render.py` carried a `DOCS_URL` of its own for the rendered
+    nav -- and that duplication was the reason this test existed. One of them is gone with the
+    module. The two that remain cannot be collapsed: `index.html`'s href is the un-versioned form,
+    spelled in the markup so that view-source shows where the link goes without running a script,
+    and `main.js` replaces it with the `?v=` form once `/api/config` answers."""
     js = _DOCS_JS.read_text(encoding="utf-8")
     site = re.search(r'const SITE = "([^"]+)"', js)
     assert site is not None
-    assert site.group(1) == render.DOCS_URL
-    assert render.DOCS_URL in _INDEX.read_text(encoding="utf-8")
+    assert site.group(1) in _INDEX.read_text(encoding="utf-8")
 
 
 # -- the deletions ----------
 
 
 def test_the_glossary_page_is_gone() -> None:
-    """`/glossary` rendered a file no installed deployment has. A link replaced it."""
+    """`/glossary` rendered a file no installed deployment has. A link replaced it at #539, and
+    at #540 the entire rendering layer it belonged to went the same way."""
     from keel.web import server
 
-    assert "/glossary" not in server.ROUTES
-    assert not hasattr(render, "render_glossary")
+    assert not hasattr(server, "ROUTES"), "the HTML route table is back"
     assert not hasattr(server, "page_glossary")
+    assert "render" not in dir(server), "server.py imports a renderer again"
 
 
 def test_the_web_layer_no_longer_reads_the_glossary_file() -> None:

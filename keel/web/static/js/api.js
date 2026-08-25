@@ -257,3 +257,70 @@ function isField(value) {
     typeof value.state === "string"
   );
 }
+
+/**
+ * Perform one declared setup action (#540). The ONLY write this client can make.
+ *
+ * ── WHAT MAKES THIS SAFE IS NOT IN THIS FILE ────────────────────────────────────────────────
+ * `key` reaches the server as a path segment and is looked up in `keel.commands.setup.ACTIONS`,
+ * a closed registry of idempotent, non-destructive, `MECHANICAL` steps that a test asserts is
+ * disjoint from the eleven capability-increasing actions. Nothing this function is called with
+ * can widen that: an unknown key is a 404, and a known one runs the same step `keel setup` runs.
+ * The client cannot arm a rule, attest an asset or enable autonomy, and it is the SERVER that
+ * makes that true.
+ *
+ * ── THE TWO HEADERS ARE TWO INDEPENDENT PROOFS ──────────────────────────────────────────────
+ * `X-Keel-Client` proves the sender could set a header at all -- a cross-origin form cannot, and
+ * a cross-origin `fetch` cannot without surviving a preflight it will fail. `X-Keel-CSRF` proves
+ * the sender could READ this session's setup document, which a cross-origin page cannot do
+ * either. They close the same attack by different means, so a browser bug in one is not a
+ * browser bug in both.
+ *
+ * Never rejects, exactly like `read`: a failure is a `Reading` the view can show.
+ *
+ * @param {string} key                     an action key from `/api/setup`'s `actions`.
+ * @param {Record<string, string>} values  the declared fields, by name.
+ * @param {string} csrf                    `/api/setup`'s `data.csrf` for this session.
+ * @returns {Promise<Reading>}
+ */
+export async function runAction(key, values, csrf) {
+  const url = new URL(API_PREFIX + "setup/" + encodeURIComponent(key), window.location.origin);
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: Object.assign({}, HEADERS, {
+        "Content-Type": "application/json",
+        "X-Keel-CSRF": csrf,
+      }),
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      body: JSON.stringify(values),
+    });
+  } catch (cause) {
+    return {
+      as_of: "",
+      engine: stopped("keel isn't running — the local server at this address did not answer"),
+      data: null,
+      error: { status: "0", title: "No answer", detail: String(cause) },
+      sort: null,
+    };
+  }
+
+  let document_;
+  try {
+    document_ = await response.json();
+  } catch (cause) {
+    return {
+      as_of: "",
+      engine: stopped("Something on this port answered, but not with keel's API"),
+      data: null,
+      error: { status: String(response.status), title: "Unreadable answer", detail: String(cause) },
+      sort: null,
+    };
+  }
+
+  return readingFrom(document_, response.ok, String(response.status));
+}

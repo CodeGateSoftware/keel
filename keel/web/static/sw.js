@@ -6,20 +6,26 @@
  * styled as current is worse than an error, because an error is visible. So `/api/*` is
  * `NetworkOnly`, "no exceptions" (the design spec's Service worker table).
  *
- * That rule is enforced three times over, and the first one is the reason to trust it:
+ * ── THE SCOPE WIDENED AT #540, AND THE GUARD IS NOW THE ONE THAT HOLDS ──────────────────────
+ * Until #540 this file was served from `/static/`, so its registration scope was `/static/` and
+ * `/api/*` was OUTSIDE it -- the browser never consulted this worker for an API request at all,
+ * and no edit to this file could have cached one. That was a structural guarantee, and it is
+ * **gone**: the shell moved to `/`, so the scope is the whole origin and every `/api/*` request
+ * now passes through the `fetch` handler below.
  *
- *   1. **Scope.** This file is served from `/static/`, so its registration scope is `/static/`
- *      and `/api/*` is OUTSIDE it. A service worker's `fetch` handler is never invoked for a
- *      request outside its own scope -- not "is skipped", not "returns early": the browser does
- *      not consult it at all. No edit to this file can cache an API response, because no edit to
- *      this file can see one.
- *   2. **`PRECACHE`, a closed list.** The only writes to the cache are `addAll(PRECACHE)` at
+ * The rule is unchanged; what enforces it is not. Two things do now:
+ *
+ *   1. **An explicit guard in `fetch`.** It was written at #538 as dead code, with a test
+ *      (`test_the_worker_still_guards_the_api_prefix_explicitly`) whose docstring said it "stops
+ *      being redundant on the same day that nobody is thinking about it". This is that day. It
+ *      returns without calling `respondWith`, so the browser performs the request exactly as it
+ *      would with no worker installed.
+ *   2. **`PRECACHE`, a closed list.** The only write to the cache is `addAll(PRECACHE)` at
  *      install. There is no runtime `cache.put`, anywhere, so there is no code path by which a
- *      response fetched later becomes a stored one.
- *   3. **An explicit guard in `fetch`.** Belt and braces for the day #540 moves the shell to `/`
- *      and the scope widens to the whole origin -- at which point rules 1 and 2 stop being the
- *      same protection and this becomes the one that holds. `tests/web/test_service_worker.py`
- *      pins that the guard exists, so it cannot be tidied away as dead code before then.
+ *      response fetched later becomes a stored one -- and a test pins that there never is.
+ *
+ * `Cache-Control: no-store` on every `/api/*` response (`server._API_HEADERS`) is the layer
+ * below both, and it is the one that does not depend on this file being correct.
  *
  * ── THE CACHE NAME IS THE BUILD, AND THAT IS THE SECOND HAZARD ──────────────────────────────
  * `CacheFirst` on the shell means an upgraded engine could otherwise be met by a stale client
@@ -48,7 +54,7 @@ const BUILD = new URL(self.location.href).searchParams.get("v") || "unknown";
 const CACHE = `keel-shell-${BUILD}`;
 
 /** The prefix this worker is allowed to touch, matching its own scope. */
-const BASE = "/static/";
+const BASE = "/";
 
 /** The path prefix that is never cached, never stored, never served from a cache. */
 const API_PREFIX = "/api/";
@@ -146,13 +152,14 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
-  // Rule 3 (see the module comment): never anything under `/api/`. Unreachable while the scope is
-  // `/static/`, load-bearing the moment it is not.
+  // Never anything under `/api/`. This was unreachable while the scope was `/static/`; since
+  // #540 widened the scope to the whole origin it is the check that keeps a balance out of the
+  // cache. See the module comment.
   if (url.pathname.startsWith(API_PREFIX)) return;
 
   if (!url.pathname.startsWith(BASE)) return;
 
-  // A navigation is a request for a VIEW, not for a file: `/static/insights` names no asset, and
+  // A navigation is a request for a VIEW, not for a file: `/insights` names no asset, and
   // the server answers it with the shell (`staticfiles.resolve_client_route`). Matching that here
   // is what makes a deep link work with the engine stopped.
   if (request.mode === "navigate") {

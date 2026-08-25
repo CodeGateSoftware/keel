@@ -35,15 +35,22 @@ from urllib.parse import unquote
 #: exists to close (see the comment beside that glob).
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
-#: The URL prefix static requests are served under, and (#536) the prefix the client mounts at.
-#: Kept off `/` and the rest of `server.py`'s `ROUTES` table on purpose: the rendered pages still
-#: own the root paths until #540 deletes them, so nothing here can collide with current routing.
+#: The URL prefix static requests are served under, and the prefix the client mounts at.
 #:
-#: This string is spelled in three places -- here, `index.html`'s hrefs, and `main.js`'s `BASE` --
-#: and `tests/web/test_client_assets.py::test_the_mount_prefix_is_spelled_the_same_everywhere`
-#: pins that the three agree, so that moving the shell to `/` at #540 is one edit per file rather
-#: than a hunt for the ones that were missed.
-STATIC_PREFIX = "/static/"
+#: **`/` since #540.** It was `/static/` from #535 to #539 only because `server.ROUTES` still owned
+#: the root paths; deleting the rendered pages freed them, and the client is the application now
+#: rather than a second one parked beside it. The move was one edit per file rather than a hunt
+#: because `tests/web/test_client_assets.py::test_the_mount_prefix_is_spelled_the_same_everywhere`
+#: has pinned the three places that spell it -- here, `index.html`'s hrefs and `main.js`'s `BASE` --
+#: since the prefix was introduced.
+#:
+#: **The consequence worth stating: this prefix no longer NARROWS anything.** While it was
+#: `/static/`, `url_path.startswith(STATIC_PREFIX)` was itself a filter, and `resolve_static_asset`
+#: could not be reached by a request for `/api/status`. At `/` every path passes that test, so the
+#: containment check in `resolve_static_asset` -- `resolve()` then `relative_to()` -- is the only
+#: thing keeping a request inside the static root, and `server.do_GET` orders `/api/` ahead of
+#: static resolution rather than relying on the prefix to separate them.
+STATIC_PREFIX = "/"
 
 #: Content-Type by extension, spelled out rather than left to `mimetypes.guess_type`. The stdlib
 #: table is OS-dependent -- some platforms still answer a `.js` file with `text/plain` -- and a

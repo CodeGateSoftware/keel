@@ -17,24 +17,32 @@ pytest looks.
 from __future__ import annotations
 
 import http.client
+import json
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import urlencode
 
 import pytest
 
 from keel.web import server as web_server
 from keel.web.security import SESSION_COOKIE, new_session_token
 
+#: Every endpoint that can carry deployment data, for the tests that sweep all of them.
+#:
+#: These were the seven server-rendered PAGES until #540. They are the JSON endpoints now, which
+#: is a stronger sweep for the one test that uses it: a secret that leaked into a rendered page
+#: would also have to leak into the document that page was built from, and this reads the
+#: documents directly.
 ROUTES = (
-    "/",
-    "/setup",
-    "/activity",
-    "/insights",
-    "/rules",
-    "/venues",
-    "/gates",
+    "/api/status",
+    "/api/setup",
+    "/api/activity",
+    "/api/insights",
+    "/api/journal",
+    "/api/rules",
+    "/api/venues",
+    "/api/gates",
+    "/api/config",
 )
 
 
@@ -46,15 +54,23 @@ def _request(
     cookie: str | None = None,
     host: str | None = None,
     form: dict[str, str] | None = None,
+    raw_body: str | None = None,
+    csrf: str | None = None,
     client_header: str | None = "1",
     sec_fetch_site: str | None = None,
     origin: str | None = None,
 ) -> tuple[int, dict[str, str], str]:
-    """`client_header` defaults to `"1"` and is only sent on `POST`: it is only CHECKED on
-    `API_PREFIX` (`/api/*`), so a default of `"1"` on every POST test in this module is
-    harmless everywhere else -- ignored by `/setup/*` -- and is what a real `fetch()` client
-    would send anyway (per the design spec's `api.js`). Tests of the layer itself pass
-    `client_header=None` (omitted entirely) or an explicit wrong value against an `/api/*` path.
+    """`client_header` defaults to `"1"` and is only sent on `POST`.
+
+    **Since #540 that default is load-bearing rather than harmless.** The write surface moved
+    under `/api/`, where `X-Keel-Client` IS checked -- it used to be a form at `/setup/*`, which
+    could not send a header and therefore could not be gated on one. A POST without it is now
+    refused, and `test_a_form_style_post_is_refused_without_the_api_client_header` is the test
+    that says so, in the place where its ancestor asserted the opposite.
+
+    `form` is sent as a JSON object, because the write surface speaks JSON now; `raw_body` sends
+    bytes verbatim, for the tests that are about what the parser does with a body rather than
+    about what an action does with a field.
 
     `sec_fetch_site` and `origin` are both unset by default; pass them to reproduce what a real
     browser sends for a same-origin form submission -- see
@@ -70,10 +86,16 @@ def _request(
         headers["Sec-Fetch-Site"] = sec_fetch_site
     if origin is not None:
         headers["Origin"] = origin
+    if csrf is not None:
+        headers["X-Keel-CSRF"] = csrf
     body = None
-    if form is not None:
-        body = urlencode(form)
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if raw_body is not None:
+        body = raw_body
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+    elif form is not None:
+        body = json.dumps(form)
+        headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
     try:
         conn.request(method, path, body=body, headers=headers)
@@ -82,6 +104,13 @@ def _request(
         return response.status, dict(response.getheaders()), body
     finally:
         conn.close()
+
+
+def _P(rest: str) -> str:
+    """A request path under the mount, composed rather than spelled -- #540 moved it to `/`."""
+    from keel.web import staticfiles
+
+    return staticfiles.STATIC_PREFIX + rest
 
 
 def _session(cfg: web_server.ServeConfig) -> str:
@@ -103,7 +132,7 @@ def test_no_verb_beyond_get_head_and_post_is_answered(
 ) -> None:
     """Everything outside the three implemented verbs dies in the stdlib, before any keel code
     or any authentication runs."""
-    status, _headers, _body = _request(running, "/", method=method, cookie=_session(running))
+    status, _headers, body = _request(running, "/", method=method, cookie=_session(running))
     assert status == 501
 
 
@@ -125,8 +154,8 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
     """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
     is no write surface at that path at all."""
     for path in ("/", "/insights", "/gates", "/setup"):
-        status, _headers, _body = _request(
-            running, path, method="POST", cookie=_session(running), form={"csrf": _csrf(running)}
+        status, _headers, body = _request(
+            running, path, method="POST", cookie=_session(running), form={}, csrf=_csrf(running)
         )
         assert status == 404, path
 
@@ -173,33 +202,6 @@ def test_no_off_venue_step_is_ever_an_action() -> None:
     assert not (off_venue & {a.key for a in ACTIONS})
 
 
-def test_a_judgement_action_asks_for_everything_and_assumes_nothing() -> None:
-    """The secondary policy, and the one that makes exposing a judgement acceptable: a wizard may
-    RECORD what the operator supplies; it may never SUPPLY it.
-
-    So an action over a judgement step must declare inputs, and no field may open on a valid
-    answer. A `pays_yield` checkbox would open unticked, and unticked is `no` -- the permissive
-    answer, since a yield-bearing asset fails the screen. A form whose default is the compliant
-    one attests on the operator's behalf."""
-    from keel.commands.setup import ACTIONS, STEPS, StepKind
-    from keel.web import render
-
-    by_key = {step.key: step for step in STEPS}
-    judgements = [a for a in ACTIONS if by_key[a.key].kind is StepKind.JUDGEMENT]
-    assert judgements, "no judgement actions exist, so this proves nothing"
-
-    for action in judgements:
-        assert action.inputs, action.key
-        html = render._action_form(action, "tok")
-        assert html.count("required") == len(action.inputs), action.key
-        # Nothing pre-filled and nothing pre-chosen: every select opens on the disabled
-        # placeholder, and no input carries a value.
-        assert 'value="" disabled selected' in html or "<select" not in html
-        assert 'value="' not in html.replace('value="tok"', "").replace(
-            'value="" disabled selected', ""
-        ), action.key
-
-
 def test_the_backing_choices_match_the_screens_own_vocabulary() -> None:
     """The form lists them as literals to keep `keel.compliance.screen` off the CLI's import
     path. That is a duplication, so it is pinned: a backing kind added to the screen and missing
@@ -236,22 +238,6 @@ def test_an_action_declares_inputs_exactly_when_its_step_needs_them() -> None:
     for action in ACTIONS:
         needs = by_key[action.key].kind in (StepKind.OPERATOR_INPUT, StepKind.JUDGEMENT)
         assert action.needs_input is needs, action.key
-
-
-def test_the_credential_form_never_renders_a_value_back_into_the_page() -> None:
-    """Pre-filling a secret field puts the secret in the page source, where it survives a
-    screenshot, a "view source", and anything that saves the page. A failed submission must be
-    retyped; that is the correct cost."""
-    from keel.commands.setup import ACTIONS
-    from keel.web import render
-
-    secret_actions = [a for a in ACTIONS if any(f.secret for f in a.inputs)]
-    assert secret_actions, "no secret fields exist, so this proves nothing"
-    for action in secret_actions:
-        html = render._action_form(action, "csrf-token")
-        assert 'type="password"' in html
-        assert "value=" not in html.split('type="password"')[1].split(">")[0]
-        assert 'autocomplete="off"' in html
 
 
 def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> None:
@@ -333,8 +319,8 @@ def test_a_write_without_the_session_cookie_is_refused(
 ) -> None:
     """Admission is shared with GET, deliberately: a write path with a laxer check than the read
     path is exactly the shape of a bug nobody notices."""
-    status, _headers, _body = _request(
-        empty_machine, "/setup/config", method="POST", form={"csrf": _csrf(empty_machine)}
+    status, _headers, body = _request(
+        empty_machine, "/api/setup/config", method="POST", form={}, csrf=_csrf(empty_machine)
     )
     assert status == 403
     assert not Path(empty_machine.config_path).exists()
@@ -346,9 +332,9 @@ def test_a_write_without_the_csrf_token_is_refused(
     """`SameSite=Strict` already stops a cross-site POST in any current browser. This is the
     layer that does not depend on the browser being current."""
     for form in ({}, {"csrf": ""}, {"csrf": "not-the-token"}):
-        status, _headers, _body = _request(
+        status, _headers, body = _request(
             empty_machine,
-            "/setup/config",
+            "/api/setup/config",
             method="POST",
             cookie=_session(empty_machine),
             form=form,
@@ -360,12 +346,12 @@ def test_a_write_without_the_csrf_token_is_refused(
 def test_a_write_from_a_rebound_hostname_is_refused(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
+        form={}, csrf=_csrf(empty_machine),
         host=f"evil.example:{empty_machine.port}",
     )
     assert status == 403
@@ -375,22 +361,27 @@ def test_a_write_from_a_rebound_hostname_is_refused(
 def test_the_csrf_token_is_not_the_session_token(
     running: web_server.ServeConfig,
 ) -> None:
-    """The session token is `HttpOnly` and must never be written into the page; the CSRF token
-    is. They must therefore be different values, and the derivation must not be reversible."""
+    """The session token is `HttpOnly` and must never leave the cookie; the CSRF token is handed
+    to the client. They must therefore be different values, and the derivation must not be
+    reversible.
+
+    Read off `/api/setup` since #540, which is where the token is delivered now that there is no
+    rendered form to carry it. `payload.setup_payload`'s docstring records why it is in a body at
+    all -- that was a reversal of an earlier decision, and the reasoning is written down there."""
     from keel.web.security import csrf_token
 
     assert csrf_token(running.token) != running.token
-    _status, _headers, body = _request(running, "/setup", cookie=_session(running))
-    assert running.token not in body
+    _status, _headers, body = _request(running, "/api/setup", cookie=_session(running))
+    assert running.token not in body, "the SESSION token reached a response body"
     assert csrf_token(running.token) in body
 
 
-# -- Sec-Fetch-Site (#535), checked on every POST -- /setup/* included --------------------------
+# -- Sec-Fetch-Site (#535), checked on every POST ----------------------------------------------
 #
-# Unlike X-Keel-Client (below), a real browser form POST DOES carry Sec-Fetch-Site: it is Fetch
-# Metadata, set by the browser itself on every request the page initiates -- forms included --
-# and page JavaScript can neither set nor override it. That makes it load-bearing on /setup/*,
-# the write surface the shipped, script-free UI actually uses, unlike a custom header (see the
+# A real browser form POST DOES carry Sec-Fetch-Site: it is Fetch Metadata, set by the browser
+# itself on every request the page initiates -- forms included -- and page JavaScript can neither
+# set nor override it. That mattered most while the write surface WAS a script-free form; since
+# #540 it is one layer of three on the same request, alongside a custom header (see the
 # section after the next one), which that UI has no way to attach at all.
 
 
@@ -399,29 +390,29 @@ def test_a_write_missing_sec_fetch_site_is_accepted(
 ) -> None:
     """Older browsers never send `Sec-Fetch-Site` at all; its absence must not be a refusal, or
     every one of them would be locked out of the one write surface that exists."""
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
+        form={}, csrf=_csrf(empty_machine),
         sec_fetch_site=None,
     )
-    assert status == 303
+    assert status == 200
 
 
 def test_a_write_with_sec_fetch_site_same_origin_is_accepted(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
+        form={}, csrf=_csrf(empty_machine),
         sec_fetch_site="same-origin",
     )
-    assert status == 303
+    assert status == 200
 
 
 @pytest.mark.parametrize("value", ["cross-site", "same-site", "none"])
@@ -430,12 +421,12 @@ def test_a_write_with_a_wrong_sec_fetch_site_is_refused(
 ) -> None:
     """Page JavaScript cannot forge this header -- the browser sets it. A value present and
     wrong is therefore real evidence of a cross-origin request, unlike a missing one."""
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
+        form={}, csrf=_csrf(empty_machine),
         sec_fetch_site=value,
     )
     assert status == 403, value
@@ -445,50 +436,50 @@ def test_a_write_with_a_wrong_sec_fetch_site_is_refused(
 # -- the browser form the shipped UI actually submits --------------------------------------------
 
 
-def test_a_browser_form_post_succeeds_without_the_api_client_header(
+def test_a_form_style_post_is_refused_without_the_api_client_header(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    """THE regression this file exists to catch, and the reason X-Keel-Client below is scoped to
-    `/api/*` rather than every POST. `render.py`'s `_action_form` emits `<form method="post"
-    action="/setup/{key}">`, and `_SECURITY_HEADERS` ships `default-src 'none'` with no
-    `script-src` at all -- there is no code path by which that form can attach a custom request
-    header. An earlier version of #535 checked `X-Keel-Client` over EVERY POST, which made this
-    request -- exactly what a real browser sends for the shipped UI's only write action -- a
-    403. Every setup action (create config, create database, seed rules, capture credentials)
-    would have been unreachable, with no terminal to fall back to on the desktop bundle.
+    """**This test asserted the OPPOSITE until #540, and the inversion is the point.**
 
-    This sends what a real browser sends for that form: the session cookie, the CSRF token
-    (`render.py` embeds it as a hidden input), `Origin` (browsers attach it to POST even for a
-    same-origin submission), and `Sec-Fetch-Site: same-origin` (Fetch Metadata, forged by
-    nothing real). Deliberately NOT `X-Keel-Client` -- the point being pinned is that nothing
-    in the shipped client ever sends it."""
-    status, headers, _body = _request(
+    Its ancestor was named `..._succeeds_without_the_api_client_header` and it existed to catch a
+    real regression: an earlier version of #535 checked `X-Keel-Client` over every POST, which
+    made a plain browser form submission a 403. The shipped UI's entire write surface WAS such a
+    form -- `<form method="post" action="/setup/{key}">`, on pages that shipped no `script-src`
+    at all -- so every setup action would have been unreachable, with no terminal to fall back to
+    on the desktop bundle. Scoping the header check to `/api/*` was the fix.
+
+    #540 deleted those forms. The write surface moved under `/api/`, every write now comes from a
+    `fetch()` client that sends the header, and the check the old shape could not survive is now
+    the one closing the gap `SameSite` and the HMAC token both assume shut: a plain form POST is
+    never preflighted, so a custom header is what a hostile origin cannot produce.
+
+    This sends exactly what a browser sends for a form submission -- cookie, CSRF token, `Origin`,
+    and `Sec-Fetch-Site: same-origin` -- and deliberately not `X-Keel-Client`. It must be refused,
+    and nothing must be written.
+    """
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine)},
+        form={},
+        csrf=_csrf(empty_machine),
         client_header=None,
         sec_fetch_site="same-origin",
         origin=f"http://{empty_machine.host}:{empty_machine.port}",
     )
-    assert status == 303
-    assert headers["Location"] == "/setup?ran=config"
-
-    from keel.commands.setup import inspect
-
-    state = inspect(empty_machine.config_path, empty_machine.db_path)
-    item = next(s for s in state.states if s.step.key == "config")
-    assert item.done is True
+    assert status == 403
+    assert not Path(empty_machine.config_path).exists()
 
 
-# -- the client header (#535's third CSRF layer), scoped to API_PREFIX only ---------------------
+# -- the client header (#535's third CSRF layer), over the whole write surface ------------------
 #
 # A custom request header is only obtainable from a `fetch()` client -- an HTML
-# `<form method=post>` cannot set one, which the section above pins directly. The shipped UI's
-# write surface IS such a form, so this check does not apply to it; #536's client will speak
-# `fetch()` over `/api/*`, which is where the check actually runs. `SameSite=Strict` and the HMAC
-# CSRF token both assume a hostile cross-origin write is PREFLIGHTED -- true for `fetch()`, never
+# `<form method=post>` cannot set one, which the section above pins directly. That used to make
+# this check inapplicable to the write surface, because the write surface WAS such a form; since
+# #540 every write comes from a `fetch()` client under `/api/`, and the check covers all of it.
+# `SameSite=Strict` and the HMAC CSRF token both assume a hostile cross-origin write is
+# PREFLIGHTED -- true for `fetch()`, never
 # true for a form -- so a custom header closes that gap specifically where a `fetch()` client
 # exists to carry it. A hostile origin's script could still try to add the header itself, but
 # doing so makes the request cross-origin-with-a-custom-header, which is exactly the shape CORS
@@ -500,7 +491,7 @@ def test_a_browser_form_post_succeeds_without_the_api_client_header(
 def test_an_api_write_without_the_client_header_is_refused(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
         "/api/whatever",
         method="POST",
@@ -514,7 +505,7 @@ def test_an_api_write_without_the_client_header_is_refused(
 def test_an_api_write_with_a_wrong_client_header_value_is_refused(
     empty_machine: web_server.ServeConfig, value: str
 ) -> None:
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
         "/api/whatever",
         method="POST",
@@ -553,15 +544,15 @@ def test_a_first_run_user_can_build_a_paper_deployment_from_the_browser(
     from keel.commands.setup import ACTIONS, inspect
 
     for action in ACTIONS:
-        status, headers, _body = _request(
+        status, headers, body = _request(
             empty_machine,
-            f"/setup/{action.key}",
+            f"/api/setup/{action.key}",
             method="POST",
             cookie=_session(empty_machine),
-            form={"csrf": _csrf(empty_machine)},
+            form={}, csrf=_csrf(empty_machine),
         )
-        assert status == 303, action.key
-        assert headers["Location"] == f"/setup?ran={action.key}"
+        assert status == 200, action.key
+        assert json.loads(body)["data"]["step_key"] == action.key
 
     state = inspect(empty_machine.config_path, empty_machine.db_path)
     done = {item.step.key: item.done for item in state.states}
@@ -582,14 +573,14 @@ def test_running_every_action_twice_changes_nothing_the_second_time(
 
     for _pass in range(2):
         for action in ACTIONS:
-            status, _headers, _body = _request(
+            status, _headers, body = _request(
                 empty_machine,
-                f"/setup/{action.key}",
+                f"/api/setup/{action.key}",
                 method="POST",
                 cookie=_session(empty_machine),
-                form={"csrf": _csrf(empty_machine)},
+                form={}, csrf=_csrf(empty_machine),
             )
-            assert status == 303
+            assert status == 200
 
     config_text = Path(empty_machine.config_path).read_text()
     assert "auto_trade" in config_text
@@ -607,12 +598,12 @@ def test_an_undeclared_action_key_is_a_404_not_a_lookup_that_falls_through(
     empty_machine: web_server.ServeConfig,
 ) -> None:
     for key in ("autonomy", "resume", "reset-hwm", "../../etc/passwd", ""):
-        status, _headers, _body = _request(
+        status, _headers, body = _request(
             empty_machine,
-            f"/setup/{key}",
+            f"/api/setup/{key}",
             method="POST",
             cookie=_session(empty_machine),
-            form={"csrf": _csrf(empty_machine)},
+            form={}, csrf=_csrf(empty_machine),
         )
         assert status == 404, key
 
@@ -621,15 +612,75 @@ def test_an_oversized_form_body_is_refused_without_being_read(
     empty_machine: web_server.ServeConfig,
 ) -> None:
     """`rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion primitive, and there
-    is no proxy in front of this server to impose a limit."""
-    status, _headers, _body = _request(
+    is no proxy in front of this server to impose a limit.
+
+    **The refusal is a 400 since #540, and it used to be a 403.** The difference is where the
+    write token lives: it was a field IN the body, so an oversized body meant the token never
+    arrived and the CSRF layer refused first. It is a header now, so the token is present and
+    valid and the body itself is what is rejected -- which is a more accurate answer to what went
+    wrong. What has not changed is the part that matters: the body is refused on its declared
+    `Content-Length`, before a single byte of it is read, and nothing is written."""
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/config",
+        "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine), "padding": "x" * 32_000},
+        csrf=_csrf(empty_machine), form={"padding": "x" * 32_000},
     )
-    assert status == 403  # the body was discarded, so the csrf field never arrived
+    assert status == 400
+    assert not Path(empty_machine.config_path).exists()
+
+
+def test_a_refused_write_does_not_poison_the_next_request_on_the_same_connection(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """**The bug this test exists for was invisible to every other test in this file.**
+
+    `protocol_version` is HTTP/1.1, so browsers reuse connections -- and every helper here opens a
+    fresh one per request, which is precisely why none of them could see this. A POST refused
+    before its body was read left those bytes in the socket; the stdlib then parsed them as the
+    next request line and answered 501. The refusal was correct and the request AFTER it failed,
+    with a status unrelated to either.
+
+    It became possible at #540: the CSRF token moved from a form field into a header, so the
+    refusal now happens in front of the body read rather than behind it. Found by driving a real
+    browser through a sequence of writes; fixed in `server._drain_request_body`.
+
+    This drives two requests down ONE connection, which is the only way to observe it.
+    """
+    conn = http.client.HTTPConnection(empty_machine.host, empty_machine.port, timeout=10)
+    try:
+        body = json.dumps({"padding": "x" * 200})
+        headers = {
+            "Host": f"{empty_machine.host}:{empty_machine.port}",
+            "Cookie": _session(empty_machine),
+            "X-Keel-Client": "1",
+            "X-Keel-CSRF": "not-the-token",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        }
+        conn.request("POST", "/api/setup/config", body=body, headers=headers)
+        first = conn.getresponse()
+        first.read()
+        assert first.status == 403
+
+        # The SAME connection. Before the fix this answered 501, having parsed the previous
+        # request's body as a request line.
+        conn.request(
+            "GET",
+            "/api/config",
+            headers={
+                "Host": f"{empty_machine.host}:{empty_machine.port}",
+                "Cookie": _session(empty_machine),
+            },
+        )
+        second = conn.getresponse()
+        payload = second.read().decode("utf-8", "replace")
+        assert second.status == 200, payload[:200]
+        assert json.loads(payload)["data"] is not None
+    finally:
+        conn.close()
+
     assert not Path(empty_machine.config_path).exists()
 
 
@@ -650,7 +701,10 @@ def test_the_token_is_exchanged_for_a_strict_cookie_and_leaves_the_url(
     """`SameSite=Strict`, not `Lax`: `Lax` attaches the cookie to top-level navigations, so a
     link on a hostile page would arrive authenticated. And the redirect drops the token from the
     URL, so it stops appearing in history, bookmarks and anything the user pastes for help."""
-    status, headers, _body = _request(running, f"/?token={running.token}")
+    status, headers, body = _request(running, f"/?token={running.token}")
+    # Still a 303, and the ONE redirect this server still sends. The write surface stopped
+    # redirecting at #540 -- there is no page left to redirect to -- but the token exchange is a
+    # navigation, and getting the credential out of the address bar is the whole point of it.
     assert status == 303
     assert headers["Location"] == "/"
     assert "token" not in headers["Location"]
@@ -661,9 +715,9 @@ def test_the_token_is_exchanged_for_a_strict_cookie_and_leaves_the_url(
 
 
 def test_a_wrong_token_is_refused(running: web_server.ServeConfig) -> None:
-    status, _headers, _body = _request(running, "/?token=not-the-token")
+    status, _headers, body = _request(running, "/?token=not-the-token")
     assert status == 403
-    status, _headers, _body = _request(running, "/", cookie=f"{SESSION_COOKIE}=not-the-token")
+    status, _headers, body = _request(running, "/", cookie=f"{SESSION_COOKIE}=not-the-token")
     assert status == 403
 
 
@@ -695,67 +749,12 @@ def test_the_host_check_runs_before_the_token_check(running: web_server.ServeCon
 # -- the pages -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ROUTES)
-def test_every_route_renders_on_an_empty_deployment(
-    running: web_server.ServeConfig, path: str
-) -> None:
-    """A fresh install is the state a first-run user is in, and it is the state most likely to
-    render as a stack trace: no trades, no log file, no market data. Every page must be a page."""
-    status, headers, body = _request(running, path, cookie=_session(running))
-    assert status == 200, (path, body[:400])
-    assert headers["Content-Type"] == "text/html; charset=utf-8"
-    assert "<title>" in body
-    assert "Traceback" not in body
-
-
-@pytest.mark.parametrize("path", ROUTES)
-def test_every_response_carries_the_security_headers(
-    running: web_server.ServeConfig, path: str
-) -> None:
-    status, headers, _body = _request(running, path, cookie=_session(running))
-    assert status == 200
-    csp = headers["Content-Security-Policy"]
-    assert "default-src 'none'" in csp
-    assert "frame-ancestors 'none'" in csp
-    assert "script-src" not in csp  # no scripts are allowed at all, so none is named
-    assert headers["X-Frame-Options"] == "DENY"
-    assert headers["X-Content-Type-Options"] == "nosniff"
-    assert headers["Referrer-Policy"] == "no-referrer"
-    assert "no-store" in headers["Cache-Control"]
-
-
-def test_the_page_contains_no_script_tag(running: web_server.ServeConfig) -> None:
-    """The CSP forbids scripts; this asserts we never ship one to be forbidden. A page with no
-    JavaScript is a page whose whole behaviour is readable in its source."""
-    for path in ROUTES:
-        _status, _headers, body = _request(running, path, cookie=_session(running))
-        assert "<script" not in body.lower(), path
-
-
 def test_an_unknown_path_is_a_page_not_a_stack_trace(
     running: web_server.ServeConfig,
 ) -> None:
     status, _headers, body = _request(running, "/nope", cookie=_session(running))
     assert status == 404
     assert "No such page" in body
-
-
-def test_a_broken_page_does_not_take_the_server_down(
-    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One page failing is a 500 on that page; the operator can still reach the others. A server
-    that dies on a bad read would take the whole view away at exactly the moment it is wanted."""
-
-    def _explode(*_args: object, **_kwargs: object) -> tuple[str, str, int | None]:
-        raise RuntimeError("no rules table")
-
-    monkeypatch.setitem(web_server.ROUTES, "/rules", _explode)
-    status, _headers, body = _request(running, "/rules", cookie=_session(running))
-    assert status == 500
-    assert "RuntimeError" in body
-
-    status, _headers, _body = _request(running, "/", cookie=_session(running))
-    assert status == 200
 
 
 def test_head_returns_the_headers_without_a_body(running: web_server.ServeConfig) -> None:
@@ -775,7 +774,7 @@ def test_head_returns_the_headers_without_a_body(running: web_server.ServeConfig
 
 
 def test_a_shipped_static_asset_is_served(running: web_server.ServeConfig) -> None:
-    status, headers, body = _request(running, "/static/index.html", cookie=_session(running))
+    status, headers, body = _request(running, _P("index.html"), cookie=_session(running))
     assert status == 200
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert "keel" in body.lower()
@@ -786,13 +785,13 @@ def test_static_assets_are_behind_the_same_admission_as_every_other_page(
 ) -> None:
     """Never weakened: a static file is not exempted from the loopback-plus-session model just
     because it holds no secrets today. The same guard that protects `/rules` protects this."""
-    status, _headers, _body = _request(running, "/static/index.html")  # no cookie
+    status, _headers, body = _request(running, _P("index.html"))  # no cookie
     assert status == 403
 
 
 def test_a_missing_static_asset_is_a_404(running: web_server.ServeConfig) -> None:
-    status, _headers, _body = _request(
-        running, "/static/does-not-exist.html", cookie=_session(running)
+    status, _headers, body = _request(
+        running, _P("does-not-exist.html"), cookie=_session(running)
     )
     assert status == 404
 
@@ -800,11 +799,11 @@ def test_a_missing_static_asset_is_a_404(running: web_server.ServeConfig) -> Non
 @pytest.mark.parametrize(
     "path",
     [
-        "/static/../keel/web/security.py",
-        "/static/../../pyproject.toml",
-        "/static/%2e%2e/%2e%2e/pyproject.toml",
-        "/static//etc/passwd",
-        "/static/..%2f..%2fpyproject.toml",
+        _P("../keel/web/security.py"),
+        _P("../../pyproject.toml"),
+        _P("%2e%2e/%2e%2e/pyproject.toml"),
+        _P("/etc/passwd"),
+        _P("..%2f..%2fpyproject.toml"),
     ],
 )
 def test_directory_traversal_through_the_wire_is_refused(
@@ -824,7 +823,7 @@ def test_a_static_html_response_carries_the_new_header_set(
     """The full set from #535, on `text/html`. `form-action`, `base-uri` and `frame-ancestors`
     do NOT inherit from `default-src` under CSP3 -- each defaults to "anywhere" unless named --
     so all three are asserted individually, not just `default-src`/`connect-src`."""
-    status, headers, _body = _request(running, "/static/index.html", cookie=_session(running))
+    status, headers, body = _request(running, _P("index.html"), cookie=_session(running))
     assert status == 200
     csp = headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp
@@ -850,7 +849,7 @@ def test_a_static_svg_response_also_carries_the_csp(
     (tmp_path / "icon.svg").write_text("<svg></svg>")
     monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
 
-    status, headers, _body = _request(running, "/static/icon.svg", cookie=_session(running))
+    status, headers, body = _request(running, _P("icon.svg"), cookie=_session(running))
     assert status == 200
     assert headers["Content-Type"] == "image/svg+xml"
     csp = headers["Content-Security-Policy"]
@@ -870,7 +869,7 @@ def test_a_non_html_non_svg_static_asset_carries_no_csp(
     (tmp_path / "style.css").write_text("body { color: black; }")
     monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
 
-    status, headers, _body = _request(running, "/static/style.css", cookie=_session(running))
+    status, headers, body = _request(running, _P("style.css"), cookie=_session(running))
     assert status == 200
     assert headers["Content-Type"] == "text/css; charset=utf-8"
     assert "Content-Security-Policy" not in headers
@@ -891,8 +890,8 @@ def test_an_unrecognised_static_extension_is_refused(
     (tmp_path / "payload.exe").write_bytes(b"MZ")
     monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
 
-    status, _headers, _body = _request(
-        running, "/static/payload.exe", cookie=_session(running)
+    status, _headers, body = _request(
+        running, _P("payload.exe"), cookie=_session(running)
     )
     assert status == 404
 
@@ -919,27 +918,9 @@ def test_a_static_file_removed_between_resolve_and_read_is_a_500_not_a_hang(
 
     monkeypatch.setattr(staticfiles, "resolve_static_asset", _resolve_then_delete)
 
-    status, _headers, body = _request(running, "/static/flaky.html", cookie=_session(running))
+    status, _headers, body = _request(running, _P("flaky.html"), cookie=_session(running))
     assert status == 500
     assert "OSError" in body or "FileNotFoundError" in body
-
-
-def test_the_activity_scope_comes_from_the_query_and_hostile_input_collapses_safely(
-    running: web_server.ServeConfig,
-) -> None:
-    """`normalise_scope` already refuses to produce an empty screen for an unrecognised scope;
-    this pins that the web layer routes through it rather than filtering on raw input."""
-    status, _headers, body = _request(running, "/activity?scope=7d", cookie=_session(running))
-    assert status == 200
-    assert "7d" in body
-
-    status, _headers, body = _request(
-        running,
-        "/activity?scope=%3Cscript%3Ealert(1)%3C/script%3E",
-        cookie=_session(running),
-    )
-    assert status == 200
-    assert "<script" not in body.lower()
 
 
 # -- the token must not leak -----------------------------------------------------------------
@@ -964,40 +945,6 @@ def test_the_printed_url_is_the_one_that_carries_the_token(
     url = running.url()
     assert url.startswith(f"http://{running.host}:{running.port}/?token=")
     assert running.token in url
-
-
-def test_the_nav_and_the_routing_table_agree() -> None:
-    """A page with no nav entry is unreachable; a nav entry with no page is a 404 the user is
-    invited to click. Neither is caught by testing either side alone.
-
-    **The nav has one entry that is deliberately not a route (#539).** `Docs` links out to
-    keeltrading.com, because `docs/` has never shipped inside a wheel and the page that used to
-    render it was empty in every installed deployment. It is separated here by its scheme rather
-    than by its label, so a second outbound entry needs no edit and an internal entry that loses
-    its route still fails."""
-    from keel.web import render
-
-    internal = {href for href, _label in render.NAV if not href.startswith("https://")}
-    outbound = {href for href, _label in render.NAV if href.startswith("https://")}
-    assert internal == set(web_server.ROUTES)
-    assert outbound == {render.DOCS_URL}, "an unexpected outbound nav entry"
-    assert set(ROUTES) == set(web_server.ROUTES), "this test module's list drifted from the server"
-
-
-def test_the_gates_page_names_every_capability_and_claims_none_of_them(
-    running: web_server.ServeConfig,
-) -> None:
-    """The audit surface #436 asks for. It must list every gated action -- and say plainly that
-    this view cannot perform any of them, which is true because no write verb is served."""
-    from keel.capabilities import CAPABILITIES
-    from keel.web import render
-
-    _status, _headers, body = _request(running, "/gates", cookie=_session(running))
-    for cap in CAPABILITIES:
-        # Escaped, not raw: an invocation containing an apostrophe reaches the page as `&#x27;`,
-        # and asserting on the raw form would quietly stop checking those rows.
-        assert render.esc(cap.invocation) in body, cap.invocation
-    assert "cannot perform any of them" in body
 
 
 # -- first run (#437) --------------------------------------------------------------------------
@@ -1033,30 +980,6 @@ def empty_machine(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
         thread.join(timeout=5)
 
 
-def test_the_landing_page_of_a_machine_with_nothing_on_it_is_the_checklist(
-    empty_machine: web_server.ServeConfig,
-) -> None:
-    """`gather_status` reads tables, so against a database with no schema it raises. Without
-    first-run detection the very first thing a new user sees is a 500 whose real cause is that
-    they have not set anything up yet."""
-    status, _headers, body = _request(empty_machine, "/", cookie=_session(empty_machine))
-    assert status == 200
-    assert "There is no deployment here yet" in body
-    assert "Traceback" not in body
-
-
-@pytest.mark.parametrize("path", ROUTES)
-def test_no_page_is_a_stack_trace_on_a_machine_with_nothing_on_it(
-    empty_machine: web_server.ServeConfig, path: str
-) -> None:
-    """Every route, not just the landing page. Smoke-testing an empty directory found `/activity`,
-    `/insights` and `/rules` answering 500 while `/` was fine -- so a first-run user who clicked
-    anything in the nav got an error page."""
-    status, _headers, body = _request(empty_machine, path, cookie=_session(empty_machine))
-    assert status == 200, (path, body[:300])
-    assert "Traceback" not in body
-
-
 def test_looking_at_a_machine_with_nothing_on_it_creates_nothing(
     empty_machine: web_server.ServeConfig,
 ) -> None:
@@ -1068,21 +991,6 @@ def test_looking_at_a_machine_with_nothing_on_it_creates_nothing(
         _request(empty_machine, path, cookie=_session(empty_machine))
     assert not Path(empty_machine.db_path).exists()
     assert not Path(empty_machine.config_path).exists()
-
-
-def test_the_checklist_never_shows_an_off_venue_step_as_done(
-    running: web_server.ServeConfig,
-) -> None:
-    """keel cannot see whether USDC Rewards is off. Rendering it as done would turn an open riba
-    exposure into a false assurance -- the operator runbook says so explicitly."""
-    from keel.commands.setup import STEPS, StepKind
-
-    _status, _headers, body = _request(running, "/setup", cookie=_session(running))
-    off_venue = [step for step in STEPS if step.kind is StepKind.OFF_VENUE]
-    assert off_venue
-    for step in off_venue:
-        assert render_esc(step.title) in body
-    assert "cannot verify it" in body
 
 
 def render_esc(value: str) -> str:
@@ -1097,9 +1005,14 @@ def render_esc(value: str) -> str:
 def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
     empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A secret in a redirect URL is a secret in browser history, in the Referer header of
-    anything the page later loads, and in any proxy log in between -- which is the whole reason
-    the form is a POST. This drives the real wire and then re-reads every page."""
+    """A submitted secret must not come back out of any surface that can be read.
+
+    **There is no redirect to check any more** -- #540 deleted the POST/redirect/GET cycle along
+    with the page it redirected to -- and that removes one of the three leaks this test was
+    written for: a secret in a redirect URL is a secret in browser history, in the `Referer` of
+    anything the page later loads, and in any proxy log in between. What remains is the leak that
+    was always the harder one to notice: the value coming back in a document. This drives the
+    real wire and then re-reads every endpoint."""
     from keel.commands import setup as setup_mod
 
     stored: dict[str, str] = {}
@@ -1112,25 +1025,25 @@ def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
     secret = "cdp-secret-that-must-never-be-echoed"
     status, headers, body = _request(
         empty_machine,
-        "/setup/credentials",
+        "/api/setup/credentials",
         method="POST",
         cookie=_session(empty_machine),
-        form={
-            "csrf": _csrf(empty_machine),
+        csrf=_csrf(empty_machine),
+            form={
             "CDP_API_KEY": "cdp-key-value",
             "CDP_API_SECRET": secret,
         },
     )
-    assert status == 303
-    assert headers["Location"] == "/setup?ran=credentials"
-    assert secret not in headers["Location"]
+    assert status == 200
+    assert json.loads(body)["data"]["step_key"] == "credentials"
+    assert "Location" not in headers, "the write surface redirects again; a secret can ride in one"
     assert secret not in body
     assert stored["CDP_API_SECRET"] == secret
 
     for path in ROUTES:
-        _status, _headers, page = _request(empty_machine, path, cookie=_session(empty_machine))
-        assert secret not in page, path
-        assert "cdp-key-value" not in page, path
+        _status, _headers, document = _request(empty_machine, path, cookie=_session(empty_machine))
+        assert secret not in document, path
+        assert "cdp-key-value" not in document, path
 
     assert setup_mod.MARKET_DATA_SECRETS == ("CDP_API_KEY", "CDP_API_SECRET")
 
@@ -1144,14 +1057,14 @@ def test_a_blank_field_records_nothing(
     monkeypatch.setattr(
         "keel_core.secrets.store_secret", lambda name, value: stored.__setitem__(name, value)
     )
-    status, _headers, _body = _request(
+    status, _headers, body = _request(
         empty_machine,
-        "/setup/credentials",
+        "/api/setup/credentials",
         method="POST",
         cookie=_session(empty_machine),
-        form={"csrf": _csrf(empty_machine), "CDP_API_KEY": "k", "CDP_API_SECRET": "   "},
+        csrf=_csrf(empty_machine), form={"CDP_API_KEY": "k", "CDP_API_SECRET": "   "},
     )
-    assert status == 303
+    assert status == 200
     assert stored == {}
 
 
@@ -1180,11 +1093,11 @@ def test_a_field_the_action_did_not_declare_is_dropped(
     )
     _request(
         empty_machine,
-        "/setup/credentials",
+        "/api/setup/credentials",
         method="POST",
         cookie=_session(empty_machine),
-        form={
-            "csrf": _csrf(empty_machine),
+        csrf=_csrf(empty_machine),
+            form={
             "CDP_API_KEY": "k",
             "CDP_API_SECRET": "s",
             "SOMETHING_ELSE": "should not arrive",
@@ -1194,57 +1107,6 @@ def test_a_field_the_action_did_not_declare_is_dropped(
 
 
 # -- the background job, on the page -----------------------------------------------------------
-
-
-def test_the_setup_page_refreshes_only_while_a_job_runs(
-    empty_machine: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A finished page that kept reloading would fight a reader; a running one that did not
-    would be a progress display that never progresses. The zero-JS meta refresh is the only
-    mechanism available to a page that ships no scripts."""
-    from keel.commands import jobs
-
-    jobs.reset()
-    _status, _headers, idle = _request(empty_machine, "/setup", cookie=_session(empty_machine))
-    assert 'http-equiv="refresh"' not in idle
-
-    gate = threading.Event()
-    jobs.start("market_data", lambda echo: (echo("fetching BTC-USD"), gate.wait(5)))
-    try:
-        _status, _headers, running = _request(
-            empty_machine, "/setup", cookie=_session(empty_machine)
-        )
-        assert 'http-equiv="refresh"' in running
-        assert "fetching BTC-USD" in running
-        assert "running" in running
-    finally:
-        gate.set()
-        jobs.wait(5)
-
-    _status, _headers, finished = _request(empty_machine, "/setup", cookie=_session(empty_machine))
-    assert 'http-equiv="refresh"' not in finished
-    assert "done" in finished
-    jobs.reset()
-
-
-def test_a_failed_job_is_shown_on_the_page_and_stays(
-    empty_machine: web_server.ServeConfig,
-) -> None:
-    """Nobody was watching when it broke. If the page did not still say so, nothing would."""
-    from keel.commands import jobs
-
-    jobs.reset()
-
-    def boom(_echo):
-        raise RuntimeError("the venue said no")
-
-    jobs.start("market_data", boom)
-    jobs.wait(5)
-    for _ in range(2):
-        _status, _headers, body = _request(empty_machine, "/setup", cookie=_session(empty_machine))
-        assert "failed" in body
-        assert "the venue said no" in body
-    jobs.reset()
 
 
 def test_starting_market_data_returns_immediately(
@@ -1273,15 +1135,15 @@ def test_starting_market_data_returns_immediately(
         ),
     )
     try:
-        status, headers, _body = _request(
+        status, headers, body = _request(
             empty_machine,
-            "/setup/market_data",
+            "/api/setup/market_data",
             method="POST",
             cookie=_session(empty_machine),
-            form={"csrf": _csrf(empty_machine)},
+            form={}, csrf=_csrf(empty_machine),
         )
-        assert status == 303
-        assert headers["Location"] == "/setup?ran=market_data"
+        assert status == 200
+        assert json.loads(body)["data"]["step_key"] == "market_data"
         assert started.wait(5), "the job never started"
         assert jobs.is_running(), "the request returned before the job finished, as intended"
     finally:

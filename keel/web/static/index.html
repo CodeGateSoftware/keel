@@ -7,16 +7,14 @@
 <!--
   keel's client shell (#536). The first JavaScript this project ships.
 
-  ── WHERE THIS IS SERVED FROM, AND WHY IT IS NOT `/` YET ────────────────────────────────────
-  Under `/static/`, alongside the assets it loads. `/` and the seven paths beside it are still
-  owned by `keel/web/server.py`'s `ROUTES` table and rendered in Python; the design spec's build
-  order removes those at step 7 (#540), not here. Serving this at `/` today would mean deleting
-  a working page to install a shell with one view in it.
+  ── WHERE THIS IS SERVED FROM ───────────────────────────────────────────────────────────────
+  `/`, since #540. The seven server-rendered pages that owned the root paths are deleted, and
+  `keel/web/render.py` with them: the server's whole job is now static files with correct headers
+  plus JSON, and this file is the application rather than a second one parked beside it.
 
-  At #540 this file moves to `/`, every `/static/` prefix below becomes `/`, and
-  `staticfiles.CLIENT_ROUTES` stops needing a prefix at all. `tests/web/test_client_assets.py`
-  pins that the prefix is spelled the same in all three places that spell it, so that move is a
-  mechanical edit rather than a hunt.
+  The move cost one edit per file rather than a hunt, because `tests/web/test_client_assets.py`
+  has pinned the three places that spell the prefix -- `staticfiles.STATIC_PREFIX`, the hrefs
+  below, and `main.js`'s `BASE` -- since the prefix was introduced at #535.
 
   ── WHY THE SHELL IS MARKUP AND ONLY THE VIEW IS BUILT BY SCRIPT ────────────────────────────
   The header, the nav, the landmarks and the footer are HTML here rather than nodes `main.js`
@@ -37,7 +35,7 @@
   reason -- `base-uri 'none'` -- which is why the hrefs below are absolute rather than relative
   to a declared base.
 -->
-<link rel="stylesheet" href="/static/css/keel.css">
+<link rel="stylesheet" href="/css/keel.css">
 <!--
   ── THE INSTALL SURFACE (#538), AND THE ONE ATTRIBUTE THAT MAKES IT WORK ────────────────────
   `crossorigin="use-credentials"` is NOT boilerplate and NOT optional here. A `rel="manifest"`
@@ -50,11 +48,11 @@
   tab and for iOS's home screen, which reads `apple-touch-icon` and ignores the manifest's
   `icons` array entirely.
 -->
-<link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#1a5578">
-<link rel="icon" href="/static/icons/keel.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/static/icons/keel-192.png">
-<script type="module" src="/static/js/main.js"></script>
+<link rel="icon" href="/icons/keel.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/keel-192.png">
+<script type="module" src="/js/main.js"></script>
 </head>
 <body>
 
@@ -64,13 +62,13 @@
   <span class="brand">keel</span>
   <nav aria-label="Views">
     <ul>
-      <li><a href="/static/status">Status</a></li>
-      <li><a href="/static/setup">Setup</a></li>
-      <li><a href="/static/activity">Activity</a></li>
-      <li><a href="/static/insights">Insights</a></li>
-      <li><a href="/static/rules">Rules</a></li>
-      <li><a href="/static/venues">Venues</a></li>
-      <li><a href="/static/gates">Gates</a></li>
+      <li><a href="/status">Status</a></li>
+      <li><a href="/setup">Setup</a></li>
+      <li><a href="/activity">Activity</a></li>
+      <li><a href="/insights">Insights</a></li>
+      <li><a href="/rules">Rules</a></li>
+      <li><a href="/venues">Venues</a></li>
+      <li><a href="/gates">Gates</a></li>
       <!--
         THE EIGHTH NAV ENTRY IS A LINK, NOT A VIEW (#539).
 

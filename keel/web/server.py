@@ -40,20 +40,19 @@ than a long-lived reader that could sit inside someone else's transaction.
 
 from __future__ import annotations
 
-import functools
 import json
 import socket
 import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from keel.web import api, events, render, staticfiles
+from keel.web import api, events, staticfiles
 from keel.web.security import (
+    CSRF_HEADER,
     SESSION_COOKIE,
     HostPolicy,
     csrf_token,
@@ -69,7 +68,7 @@ _REFRESH_SEC = 15
 #: Cap on a form body. `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
 #: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
 #: an action key and a token.
-_MAX_FORM_BYTES = 8 * 1024
+_MAX_BODY_BYTES = 8 * 1024
 
 #: How often the setup page reloads WHILE a background job runs. Shorter than the dashboards'
 #: 15s: someone watching a fetch wants to see it moving, and the page is a few kilobytes of local
@@ -150,161 +149,8 @@ def ensure_schema(db_path: str) -> None:
         conn.close()
 
 
-def page_setup(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands import jobs
-    from keel.commands.setup import ACTIONS, NOT_AUTOMATED_YET
-
-    job = jobs.status()
-    return (
-        "Setup",
-        render.render_setup(
-            api.deployment_state(cfg),
-            actions=ACTIONS,
-            not_automated=NOT_AUTOMATED_YET,
-            csrf=csrf_token(cfg.token),
-            ran=(query.get("ran") or [""])[0],
-            job=job,
-        ),
-        # Auto-refresh ONLY while something is running. A finished page that kept reloading would
-        # fight a reader, and the zero-JS meta refresh is the only progress mechanism available
-        # to a page that ships no scripts.
-        _JOB_REFRESH_SEC if job is not None and job.is_running else None,
-    )
-
-
-def needs_database(
-    page: Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]],
-) -> Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]]:
-    """Serve the checklist instead of building a page that has no database to build from.
-
-    Every page below this reads tables, and `sqlite3.connect` CREATES the file it cannot find --
-    so without this a first-run user clicking "Activity" would get a 500 *and* leave an empty
-    `keel.db` behind, brought into existence by a read-only view being looked at. Found by
-    smoke-testing an empty directory; the unit tests missed it because they only exercised the
-    landing page.
-
-    The guard is on the whole set rather than on the landing page alone for the same reason the
-    thinness pin globs a directory: a page added later gets the behaviour by construction, not by
-    its author remembering."""
-
-    @functools.wraps(page)
-    def guarded(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-        if not api.deployment_state(cfg).has_usable_database:
-            # The full setup page, not a bare checklist: someone who lands here has nothing set
-            # up, and the actions are the reason they are being shown this instead of a 500.
-            return page_setup(cfg, query)
-        return page(cfg, query)
-
-    return guarded
-
-
-def page_status(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands.status import gather_status
-
-    repo = api.open_repo(cfg.db_path)
-    try:
-        config = api.load_config(cfg.config_path)
-        report = gather_status(repo, config, now_ts=int(time.time()))
-    finally:
-        api.close_repo(repo)
-    return "Status", render.render_status(report), _REFRESH_SEC
-
-
-def page_activity(cfg: ServeConfig, query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands.activity import (
-        apply_scope,
-        feed_from_lines,
-        normalise_scope,
-        read_log_window,
-        resolve_log_path,
-    )
-
-    scope = normalise_scope((query.get("scope") or [""])[0])
-    config = api.load_config(cfg.config_path)
-    path = resolve_log_path(config)
-    window = read_log_window(path)
-    feed = feed_from_lines(window.lines, source=str(path), truncated=window.truncated)
-    if window.status != "ok" and feed.status == "empty":
-        # A read that failed and a window that held nothing are different facts; the reader's
-        # status is the more specific one and must not be flattened into "empty".
-        feed = feed_from_lines((), source=str(path))
-    feed = apply_scope(feed, scope, now_ts=time.time())
-    body = render.render_activity(feed)
-    links = " &middot; ".join(
-        (
-            f"<strong>{render.esc(name)}</strong>"
-            if name == scope
-            else f'<a href="/activity?scope={render.esc(name)}">{render.esc(name)}</a>'
-        )
-        for name in ("today", "7d", "all")
-    )
-    return "Activity", body + f'<p class="note">scope: {links}</p>', _REFRESH_SEC
-
-
-def page_insights(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands.insights import build_insights_report, build_journal_report
-    from keel.commands.status import gather_status
-
-    repo = api.open_repo(cfg.db_path)
-    try:
-        config = api.load_config(cfg.config_path)
-        now_ts = int(time.time())
-        status_report = gather_status(repo, config, now_ts=now_ts)
-        insights = build_insights_report(repo, config, status_report, now_ts)
-        journal = build_journal_report(repo, status_report, now_ts, limit=_JOURNAL_LIMIT)
-    finally:
-        api.close_repo(repo)
-    return "Insights", render.render_insights(insights, journal), None
-
-
-def page_rules(cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    repo = api.open_repo(cfg.db_path)
-    try:
-        rows = repo.get_rules(None)
-    finally:
-        api.close_repo(repo)
-    return "Rules", render.render_rules(rows), None
-
-
-def page_venues(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    from keel.commands.brokers import list_installed_brokers
-
-    return "Venues", render.render_venues(list_installed_brokers()), None
-
-
-def page_gates(_cfg: ServeConfig, _query: dict[str, list[str]]) -> tuple[str, str, int | None]:
-    """Read from `keel.capabilities`, which is a pure declaration -- no config, no database, no
-    network. It describes the binary that is serving the page."""
-    from keel.capabilities import CAPABILITIES, GATES
-
-    return "Gates", render.render_gates(GATES, CAPABILITIES), None
-
-
-ROUTES: dict[str, Callable[[ServeConfig, dict[str, list[str]]], tuple[str, str, int | None]]] = {
-    # First-run detection (#437): every page that reads the database serves the checklist when
-    # there is no database to read, rather than a 500 whose real cause is that the user has not
-    # set anything up yet. `/venues` and `/gates` are not wrapped -- neither touches the
-    # deployment, and both are useful before one exists.
-    "/": needs_database(page_status),
-    "/setup": page_setup,
-    "/activity": needs_database(page_activity),
-    "/insights": needs_database(page_insights),
-    "/rules": needs_database(page_rules),
-    "/venues": page_venues,
-    "/gates": page_gates,
-}
-
-
-#: The write surface, in full, today. A path here maps to one `keel.commands.setup.Action`; there
-#: is no other way into this handler, and no other verb.
-SETUP_ACTION_PREFIX = "/setup/"
-
-#: The JSON API (#534). `GET` under this prefix routes through `keel/web/api.py`'s own table --
-#: reads only, one bounded read per endpoint. `POST` under it is unchanged from #535: it clears
-#: `_api_client_header_ok` (the third CSRF layer, scoped to this prefix specifically -- see that
-#: method's docstring for why it must NOT also gate `SETUP_ACTION_PREFIX`) and then meets the same
-#: 404 every unmapped path gets, because there is still no JSON write surface and this issue added
-#: none.
+#: The JSON API's prefix (#534). Everything under it answers in `application/json`, admitted or
+#: refused; nothing under it is a browsing context, so nothing under it carries a CSP.
 API_PREFIX = "/api/"
 
 #: The one path under `API_PREFIX` that is a STREAM rather than a document (#537).
@@ -312,12 +158,29 @@ API_PREFIX = "/api/"
 #: It is not in `api.API_ROUTES` because it does not have that table's shape: every entry there
 #: maps to `(status, document)` through `api.respond`, and an `EventSource` connection is a
 #: response that never finishes. Bolting a "this one streams" flag onto `ApiRoute` would have put
-#: a branch into the one function whose uniformity is the reason #536's `fetch` wrapper needs no
-#: per-endpoint branch of its own.
+#: a branch into the one function whose uniformity is the reason the client's `fetch` wrapper
+#: needs no per-endpoint branch of its own.
 #:
-#: It is still a GET, still behind `_admitted()`, and still answers no POST -- `do_POST` refuses
-#: everything under `API_PREFIX` before it ever looks at a path.
+#: It is a GET, behind `_admitted()`, and answers no POST: `do_POST` reaches only
+#: `API_SETUP_PREFIX`.
 EVENTS_PATH = "/api/events"
+
+#: The write surface, in full, today. A path here maps to one `keel.commands.setup.Action`; there
+#: is no other POST this server answers, and `keel/web/__init__.py` is the file to read before
+#: adding one.
+#:
+#: **It moved under `/api/` at #540**, from `/setup/`, when the HTML form that used to submit to it
+#: was deleted along with the rest of the rendered pages. The move is what let `X-Keel-Client` --
+#: a header a plain form can never set -- finally cover the write path too: `_api_client_header_ok`
+#: recorded that widening as "#536's call to make, once (and only once) the forms it replaces are
+#: gone", and they are gone.
+#:
+#: The action SET is unchanged by all of this, and that is the invariant that matters more than the
+#: path: `keel.commands.setup.ACTIONS` still contains only idempotent, non-destructive,
+#: `MECHANICAL` steps, and a test still asserts it is disjoint from the eleven capability-
+#: increasing actions in `keel/capabilities.py`. A browser can set a deployment up. It still cannot
+#: arm a rule, attest an asset or enable autonomy.
+API_SETUP_PREFIX = "/api/setup/"
 
 
 def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
@@ -338,39 +201,16 @@ def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
 
 # -- the handler -------------------------------------------------------------------------------
 
-#: Sent on every response, success or refusal.
+#: The header set for the static tree -- which, since #540, is the whole application.
 #:
-#: `default-src 'none'` with only `style-src 'unsafe-inline'` added states exactly what the page
-#: is: markup and one inline stylesheet. No scripts, no images, no fonts, no connections. If a
-#: future change smuggles in a script tag, the browser refuses it and the omission is visible
-#: rather than silent. `frame-ancestors 'none'` (and the legacy `X-Frame-Options`) keep the page
-#: out of an iframe on a hostile origin, which is the other half of the DNS-rebinding defence.
-_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
-    (
-        "Content-Security-Policy",
-        # `form-action 'self'`, not `'none'`: the setup form posts back here, and `'none'`
-        # would have the browser silently refuse it. `'self'` is still the tightest value that
-        # works -- a form on this page cannot be made to submit anywhere else, which is what the
-        # directive is for.
-        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; "
-        "form-action 'self'; base-uri 'none'",
-    ),
-    ("X-Content-Type-Options", "nosniff"),
-    ("X-Frame-Options", "DENY"),
-    ("Referrer-Policy", "no-referrer"),
-    ("Cache-Control", "no-store, max-age=0"),
-)
-
-
-#: The header set for `/static/*` (#535), separate from `_SECURITY_HEADERS` above because the
-#: two routes need different values for the SAME header, not merely an additional one.
-#: `_SECURITY_HEADERS`'s `default-src 'none'` is correct for the rendered pages -- they ship no
-#: script, no style file, no image, nothing to permit -- but #536's client is exactly the thing
-#: `'none'` forbids: its own JS, its own CSS, its own icons, all same-origin. `'self'` is the
-#: tightest policy that still allows that, and `connect-src 'self'` on top of it is the specific
-#: guarantee the design spec asks for: the interface is provably incapable of sending positions,
-#: equity or trade history anywhere but this local process, checkable in the response headers
-#: rather than merely promised.
+#: There used to be a second set beside this one (`_SECURITY_HEADERS`) for the server-rendered
+#: pages, whose `default-src 'none'` was correct for markup that shipped no script, no style file
+#: and no image. Those pages are deleted and it went with them. What is left is the client, which
+#: is exactly what `'none'` forbids: its own JS, its own CSS, its own icons, all same-origin.
+#: `'self'` is the tightest policy that still allows that, and `connect-src 'self'` on top of it
+#: is the specific guarantee the design spec asks for: the interface is provably incapable of
+#: sending positions, equity or trade history anywhere but this local process, checkable in the
+#: response headers rather than merely promised.
 #:
 #: `X-Frame-Options`, `Referrer-Policy` and `X-Content-Type-Options` are unconditional -- all
 #: three are meaningful (and harmless) on any content type, exactly as they are for the rendered
@@ -404,9 +244,8 @@ _STATIC_BASE_HEADERS: tuple[tuple[str, str], ...] = (
 #: `<form method=post action="https://evil.example">` is not a connection and would have sailed
 #: through, an injected `<base href="https://evil.example/">` could retarget every relative URL
 #: on the page, and the page could still be framed by a hostile origin -- the exact DNS-rebinding
-#: half `_SECURITY_HEADERS` above already closes for the rendered pages
-#: (`frame-ancestors 'none'` there is called "the other half of the DNS-rebinding defence"; this
-#: is the same half, for the route that will host all of #536's JavaScript).
+#: half the unconditional headers above already close (`frame-ancestors 'none'` is the other half
+#: of the DNS-rebinding defence, and this is the same half for the route that hosts the client).
 _STATIC_CSP = (
     "default-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; "
     "frame-ancestors 'none'"
@@ -459,22 +298,6 @@ _API_HEADERS: tuple[tuple[str, str], ...] = (
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 
-def _docs_version(cfg: ServeConfig) -> str:
-    """The build the nav's documentation link should report, or `""`.
-
-    Read off `build_info` rather than off `cfg.build`, because those are different strings and
-    only one of them is a version: `cfg.build` is the footer's human-readable LINE
-    (`keel 0.11.2+c1634a3fa17f (DIRTY) [checkout]`), and putting it in a query string produced
-    `?v=keel%200.11.2%2B...%20%28DIRTY%29%20%5Bcheckout%5D`. This is the same field `/api/config`
-    hands the client for the same purpose (`payload.config_document`'s `"build"`), so both
-    front-ends report the identical string while both exist.
-
-    `""` when there is no build info at all -- an unversioned link is honest, and a link claiming
-    `?v=unknown` is not.
-    """
-    return str(getattr(cfg.build_info, "full_version", "") or "")
-
-
 def _static_headers(content_type: str) -> tuple[tuple[str, str], ...]:
     """`_STATIC_BASE_HEADERS` plus CSP, but ONLY when `content_type` is one of
     `_CSP_CONTENT_TYPES` -- see the comments on `_STATIC_BASE_HEADERS` and `_CSP_CONTENT_TYPES`
@@ -497,6 +320,14 @@ class KeelHandler(BaseHTTPRequestHandler):
     #: Set by `build_server`.
     cfg: ServeConfig
 
+    #: Whether this request's body has already been read off the socket.
+    #:
+    #: Per REQUEST, not per connection, and reset at the top of each verb: a handler instance
+    #: serves every request on a keep-alive connection, so a flag left set by one write would make
+    #: the next refusal skip its drain and re-create the desynchronisation this exists to prevent.
+    #: `_drain_request_body` reads it; `_read_json_object` sets it.
+    body_consumed: bool = False
+
     # -- logging --
     def log_message(self, fmt: str, *args: Any) -> None:
         """Overridden to a near-silence, and NEVER with the query string.
@@ -512,14 +343,21 @@ class KeelHandler(BaseHTTPRequestHandler):
         code: int,
         body: str,
         *,
-        content_type: str = "text/html; charset=utf-8",
+        content_type: str = "text/plain; charset=utf-8",
         extra: tuple[tuple[str, str], ...] = (),
     ) -> None:
         payload = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
-        for name, value in _SECURITY_HEADERS:
+        # `_STATIC_BASE_HEADERS`, not a set of its own: the two responses this method now sends
+        # are the token-exchange redirect and a plain-text refusal, and neither is a browsing
+        # context. The header set that used to live here carried a CSP written for the rendered
+        # pages (`style-src 'unsafe-inline'`, for their inline stylesheet), and keeping a policy
+        # that describes a page nobody serves any more would be a comment pretending to be a
+        # defence. The shell keeps its CSP through `_static_headers`, which applies one to
+        # `text/html` -- and that is where the shell is served from now.
+        for name, value in _STATIC_BASE_HEADERS:
             self.send_header(name, value)
         for name, value in extra:
             self.send_header(name, value)
@@ -531,10 +369,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         """One JSON response, with its own headers.
 
         Writes them itself rather than going through `_send` for the same reason `_serve_static`
-        does: `_send` puts `_SECURITY_HEADERS` on every response, and one of those is a CSP that
-        has no meaning on `application/json` (see `_API_HEADERS`). Sharing the method would have
-        meant a parameter with a default, and a default on a shared sender is how a header set
-        silently changes for a route nobody was thinking about.
+        does: the two senders need different values for the SAME headers, and sharing one method
+        would have meant a parameter with a default -- which is how a header set silently changes
+        for a route nobody was thinking about. `no-store` matters more here than anywhere else on
+        this server (see `_API_HEADERS`).
 
         A plain `json.dumps`: `keel/web/payload.py` normalises every leaf to a string before it
         gets here, so there is nothing for an encoder to convert -- and the encoder a hurried
@@ -559,30 +397,71 @@ class KeelHandler(BaseHTTPRequestHandler):
     def _refuse(self, code: int, heading: str, detail: str) -> None:
         """A refusal, in the media type the caller asked for by the path it used.
 
-        **Path-scoped, not method-scoped, and not content-negotiated.** An HTML error page handed
-        to a `fetch()` client's `res.json()` is a parse error in the client, which is a strictly
-        worse diagnostic than the 403 it is hiding -- so everything under `API_PREFIX` refuses in
-        JSON, including the POST that still 404s there. The GATE in front of that POST
-        (`_api_client_header_ok`) is untouched by this: same trigger, same status, same ordering;
-        only the body's media type follows the path.
+        **Path-scoped, not method-scoped, and not content-negotiated.** A refusal handed to a
+        `fetch()` client's `res.json()` in some other format is a parse error in the client, which
+        is a strictly worse diagnostic than the 403 it is hiding -- so everything under
+        `API_PREFIX` refuses in JSON.
+
+        **Everything else refuses in PLAIN TEXT, since #540.** It used to refuse in HTML, through
+        `render.page`, and that module is gone: the server generates no markup at all now. Plain
+        text rather than JSON for these because the requests that land here are NAVIGATIONS -- a
+        person has opened `http://127.0.0.1:8765/` in a browser without the token, and the useful
+        answer is the sentence telling them to use the URL keel printed. A JSON envelope would
+        wrap that sentence in punctuation for a reader who is not a program. It is not HTML and
+        there is no template: two lines joined by a blank one.
 
         `Accept`-based negotiation was the alternative and it is worse here: a client that forgets
-        the header would get HTML from a JSON endpoint, and the one thing this server can be
-        certain about is which path was requested.
+        the header would get the wrong media type from a JSON endpoint, and the one thing this
+        server can be certain about is which path was requested.
         """
+        # **Before anything is written.** See `_drain_request_body`: a refusal that leaves a
+        # request body unread poisons the next request on the same connection.
+        self._drain_request_body()
         if urlsplit(self.path).path.startswith(API_PREFIX):
             self._send_json(code, api.refusal_document(code, heading, detail))
             return
-        self._send(
-            code,
-            render.page(
-                title=heading,
-                path="",
-                body=render.render_message(heading, detail),
-                build=self.cfg.build,
-                version=_docs_version(self.cfg),
-            ),
-        )
+        self._send(code, f"{heading}\n\n{detail}\n")
+
+    def _drain_request_body(self) -> None:
+        """Consume an unread request body, or close the connection rather than consume it.
+
+        **This is keep-alive correctness, and its absence was a real bug.** `protocol_version` is
+        HTTP/1.1, so a connection is reused by default. A POST refused before its body is read
+        leaves those bytes sitting in the socket, and the stdlib then parses them as the NEXT
+        request line -- which is not a request line, so the next request dies as a 501. The symptom
+        is the worst kind: the refusal itself is correct, and the request AFTER it fails, with a
+        status that has nothing to do with either.
+
+        It could not happen before #540 because the CSRF token was a field in the form body, so
+        every write read its body before it could refuse. Moving the token into a header (which is
+        what let it prove something a body cannot) put the refusal in front of the read. Found by
+        driving a browser, which reuses connections; every test in the suite opened a fresh one and
+        could not have seen it.
+
+        **An oversized body is not drained, it is disconnected.** Reading it to be polite would
+        hand an attacker exactly the memory-exhaustion primitive `_MAX_BODY_BYTES` exists to deny.
+        Closing costs the client one reconnection and costs this server nothing.
+        """
+        if self.body_consumed:
+            # Already off the socket -- `do_POST` reads the body before it can refuse for a reason
+            # that depends on the body's CONTENT (an unknown action key, an unreadable object).
+            # Reading it a second time blocks until the client's timeout, which is a hang rather
+            # than an error and was exactly what the first version of this did.
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > _MAX_BODY_BYTES:
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:  # pragma: no cover - a client that vanished mid-body
+            self.close_connection = True
 
     # -- shared admission --
     def _admitted(self) -> bool:
@@ -635,25 +514,24 @@ class KeelHandler(BaseHTTPRequestHandler):
         return True
 
     def _api_client_header_ok(self) -> bool:
-        """The third CSRF layer (#535), and scoped to `API_PREFIX` ONLY -- never to
-        `SETUP_ACTION_PREFIX`. This was gated at the top of `do_POST`, over every write, in an
+        """The third CSRF layer (#535). Scoped to `API_PREFIX`, which since #540 includes
+        the write path. This was gated at the top of `do_POST`, over every write, in an
         earlier version of this change, and that was a defect, not a stricter check: the shipped
-        UI's entire write surface IS a plain HTML `<form method=post action="/setup/...">`
-        (`render.py`'s `_action_form`), and `_SECURITY_HEADERS` ships no `script-src` at all --
-        there is no code path by which that form can set a custom request header. Gating
-        `/setup/*` on it would have refused every legitimate submission the shipped client can
-        make, with no fallback: the desktop bundle has no terminal.
-        `test_a_browser_form_post_succeeds_without_the_api_client_header` pins that this route
-        stays reachable from exactly what ships.
+        UI's entire write surface WAS a plain HTML `<form method=post action="/setup/...">`, and
+        the rendered pages shipped no `script-src` at all -- so there was no code path by which
+        that form could set a custom request header, and gating it here would have refused every
+        legitimate submission the shipped client could make, with no fallback: the desktop bundle
+        has no terminal.
+
+        **That form is deleted (#540) and this check now covers the write path**, which is what
+        the last paragraph below said should happen "once, and only once, the forms it replaces
+        are gone".
 
         `X-Keel-Client: 1` is a real defence where it CAN apply: a custom header forces a CORS
         preflight a hostile origin cannot satisfy, closing the one gap `SameSite=Strict` and the
         HMAC CSRF token both assume shut -- a plain form POST, which is never preflighted, in any
-        browser. But "a custom header" and "a `fetch()` client" are the same requirement, and
-        `/setup/*` has no `fetch()` client today. `API_PREFIX` is reserved for #533/#534's JSON
-        API, which #536's client speaks over `fetch()` -- that is where this check belongs, and
-        widening it onto `/setup/*` is #536's call to make, once (and only once) the forms it
-        replaces are gone."""
+        browser. "A custom header" and "a `fetch()` client" are the same requirement, and every
+        write now comes from a `fetch()` client."""
         if self.headers.get("X-Keel-Client") != "1":
             self._refuse(
                 403,
@@ -748,16 +626,21 @@ class KeelHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib's naming, not ours
-        """The ENTIRE write surface (#437). Read `keel/web/__init__.py` before extending it.
+        """The ENTIRE write surface (#437, moved under `/api/` at #540). Read
+        `keel/web/__init__.py` before extending it.
 
-        Admission, then `Sec-Fetch-Site` (both apply to every POST), then a PATH-SCOPED branch:
-        `API_PREFIX` additionally requires `X-Keel-Client` before falling through to the 404 no
-        route there answers yet; `SETUP_ACTION_PREFIX` does not, and reads its own CSRF token
-        instead (see `_api_client_header_ok`'s docstring for why the two paths differ -- it is
-        not an oversight, it is the fix for one). Either way there is no dynamic dispatch here,
-        no getattr on a user-supplied name, and no path that reaches keel other than
-        `keel.commands.setup.ACTIONS` -- which contains three idempotent, non-destructive,
-        `MECHANICAL` steps and cannot contain anything else without failing a test."""
+        Five checks, in this order, and every one of them applies to every write now -- which is
+        the change #540 brought. While the write surface was an HTML form at `/setup/*`, the
+        `X-Keel-Client` gate could not cover it (a form cannot set a header) and the two paths had
+        to differ; `_api_client_header_ok`'s docstring called that "the fix for one" defect and
+        said the widening was to happen "once, and only once, the forms it replaces are gone".
+        They are gone.
+
+        There is no dynamic dispatch here, no getattr on a user-supplied name, and no path that
+        reaches keel other than `keel.commands.setup.ACTIONS` -- which contains only idempotent,
+        non-destructive, `MECHANICAL` steps and cannot contain anything else without failing a
+        test."""
+        self.body_consumed = False
         parsed = urlsplit(self.path)
         if not self._admitted():
             return
@@ -765,70 +648,95 @@ class KeelHandler(BaseHTTPRequestHandler):
         if not self._sec_fetch_site_ok():
             return
 
-        if parsed.path.startswith(API_PREFIX):
-            if not self._api_client_header_ok():
-                return
-            # No JSON API write surface exists yet (#533/#534 land the reads; a write is
-            # further out still) -- this is a 404 like any other unmapped path, not a stub
-            # success. Checked here, ahead of that surface existing, so its first action does
-            # not have to remember to add the gate.
-            self._refuse(404, "No such action", f"Nothing accepts a POST at {parsed.path}.")
-            return
-
-        if not parsed.path.startswith(SETUP_ACTION_PREFIX):
+        if not parsed.path.startswith(API_PREFIX):
             # Not "method not allowed" -- there is no write surface at this path at all, and
             # saying so is both true and less informative to someone probing.
             self._refuse(404, "No such action", f"Nothing accepts a POST at {parsed.path}.")
             return
 
-        body = self._read_form()
-        if not tokens_match(body.get("csrf"), csrf_token(self.cfg.token)):
-            # `SameSite=Strict` already stops a cross-site POST in any current browser. This is
-            # the layer that does not depend on the browser being current.
+        if not self._api_client_header_ok():
+            return
+
+        if not parsed.path.startswith(API_SETUP_PREFIX):
+            self._refuse(404, "No such action", f"Nothing accepts a POST at {parsed.path}.")
+            return
+
+        # The HMAC layer, "the layer that does not depend on the browser being current". It rides
+        # in a HEADER rather than in the body, so a request that reaches this line has proved the
+        # same thing twice -- a form can set neither header, and a cross-origin `fetch` cannot get
+        # past the preflight that either of them triggers.
+        if not tokens_match(self.headers.get(CSRF_HEADER), csrf_token(self.cfg.token)):
             self._refuse(
                 403,
                 "Refused",
-                "That form did not carry this session's write token. Reload the page and try "
+                "That request did not carry this session's write token. Reload the page and try "
                 "again.",
             )
             return
 
-        key = parsed.path[len(SETUP_ACTION_PREFIX) :]
+        values = self._read_json_object()
+        if values is None:
+            self._refuse(400, "Unreadable request", "The body was not a JSON object of fields.")
+            return
+
+        key = parsed.path[len(API_SETUP_PREFIX) :]
         try:
-            result = run_setup_action(self.cfg, key, body)
+            result = run_setup_action(self.cfg, key, values)
         except Exception as exc:
+            # A failed step is a stated 500 with a JSON body, never a traceback down the socket
+            # and never a 200 whose body says it went fine.
             self._refuse(500, "That step could not be completed", f"{type(exc).__name__}: {exc}")
             return
         if result is None:
             self._refuse(404, "No such action", f"{key!r} is not a setup step keel performs.")
             return
 
-        # POST/redirect/GET: a browser reload must not re-submit. The actions are idempotent, so
-        # a re-submission would be harmless -- but "harmless" is not a reason to leave a
-        # re-submitting page in a setup flow someone is clicking nervously.
-        #
-        # The Location carries the step KEY and nothing else. A submitted value in a redirect URL
-        # is a secret in browser history, in the Referer header of anything the page later loads,
-        # and in any proxy log between here and nowhere -- which is the whole reason the form is a
-        # POST in the first place.
-        self._send(303, "", extra=(("Location", f"/setup?ran={quote(result.step_key)}"),))
+        # No POST/redirect/GET any more, and nothing to redirect TO: the page that used to be
+        # reloaded is a client view that re-reads `/api/setup` itself. The actions are idempotent,
+        # so a repeated submission is harmless by construction rather than by a redirect.
+        self._send_json(200, api.action_document(result))
 
-    def _read_form(self) -> dict[str, str]:
-        """The urlencoded body, bounded.
+    def _read_json_object(self) -> dict[str, str] | None:
+        """The JSON request body as `{field: string}`, or `None` for anything else.
 
-        Bounded because `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
-        primitive, and this server has no proxy in front of it to impose a limit. A setup form
-        carries an action key and a token; anything past a few kilobytes is not one."""
+        Bounded, because `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
+        primitive and this server has no proxy in front of it to impose a limit. A setup action
+        carries a handful of named fields; anything past a few kilobytes is not one.
+
+        **Every value is coerced to `str`, and a nested object or array makes the whole body
+        `None`.** `run_setup_action` hands these to an `Action.run`, and a field that arrived as a
+        list or a dict would reach code written for a string -- the shape of bug that shows up as
+        a `TypeError` deep inside a step that has already half-run. JSON replaced urlencoded form
+        bodies at #540 along with the form that sent them; this is the one place that difference
+        can be exploited, so it is the one place it is refused.
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            return None
+        if length < 0 or length > _MAX_BODY_BYTES:
+            return None
+        if length == 0:
+            # An action with no declared inputs is submitted with an empty body, and that is a
+            # legitimate request rather than a malformed one.
             return {}
-        if length <= 0 or length > _MAX_FORM_BYTES:
-            return {}
+        self.body_consumed = True
         raw = self.rfile.read(length).decode("utf-8", "replace")
-        return {key: values[0] for key, values in parse_qs(raw, keep_blank_values=True).items()}
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        values: dict[str, str] = {}
+        for name, value in parsed.items():
+            if isinstance(value, (dict, list)):
+                return None
+            values[str(name)] = "" if value is None else str(value)
+        return values
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib's naming, not ours
+        self.body_consumed = False
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query, keep_blank_values=True)
 
@@ -885,41 +793,15 @@ class KeelHandler(BaseHTTPRequestHandler):
             self._send_json(code, document)
             return
 
-        if parsed.path.startswith(staticfiles.STATIC_PREFIX):
-            # Same admission as every rendered page (never weakened): a static asset is not
-            # exempted from the loopback-plus-session model just because it holds no secrets
-            # today. #536's client is what actually reads these, and it authenticates the same
-            # way any other fetch from this origin does -- the session cookie already on the
-            # request.
-            self._serve_static(parsed.path)
-            return
-
-        handler = ROUTES.get(parsed.path)
-        if handler is None:
-            self._refuse(404, "No such page", f"Nothing is served at {parsed.path}.")
-            return
-
-        try:
-            title, body, refresh = handler(self.cfg, query)
-        except Exception as exc:  # a broken page must not take the server down
-            self._refuse(
-                500,
-                "That page could not be built",
-                f"{type(exc).__name__}: {exc}",
-            )
-            return
-
-        self._send(
-            200,
-            render.page(
-                title=title,
-                path=parsed.path,
-                body=body,
-                build=self.cfg.build,
-                version=_docs_version(self.cfg),
-                refresh_sec=refresh,
-            ),
-        )
+        # Everything else is the client: a file under the static root, or one of the seven names
+        # `CLIENT_ROUTES` answers with the shell. `_serve_static` 404s anything that is neither,
+        # which is what keeps a mistyped asset a 404 rather than a 200 carrying HTML.
+        #
+        # This is the last branch because the prefix stopped narrowing anything when #540 moved
+        # the mount to `/`: `staticfiles.STATIC_PREFIX` matches every path now, so the ORDER of
+        # these branches -- events, then `/api/`, then the client -- is what separates them, not
+        # the prefixes themselves.
+        self._serve_static(parsed.path)
 
 
 class KeelServer(ThreadingHTTPServer):

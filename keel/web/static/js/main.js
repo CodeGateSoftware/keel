@@ -18,14 +18,13 @@
  * `CLIENT_ROUTES` and 404s everything else. That function is also exactly what step 7 of the
  * spec's build order needs anyway, when this shell moves to `/`.
  *
- * ── WHY THE PREFIX IS `/static/` TODAY ───────────────────────────────────────────────────────
+ * ── THE MOUNT IS `/` ─────────────────────────────────────────────────────────────────────────
  *
- * `/` and the seven paths beside it are still rendered in Python (`server.ROUTES`) and are
- * deleted at #540, not here. So this shell mounts under the static prefix, and `BASE` is the one
- * place in the JavaScript that says so. `index.html`'s hrefs and `staticfiles.STATIC_PREFIX` are
- * the other two places it is spelled;
+ * Since #540, which deleted the seven server-rendered pages that owned the root paths. `BASE` is
+ * the one place in the JavaScript that says so; `index.html`'s hrefs and
+ * `staticfiles.STATIC_PREFIX` are the other two places it is spelled, and
  * `tests/web/test_client_assets.py::test_the_mount_prefix_is_spelled_the_same_everywhere` pins
- * that the three agree, so #540's move is an edit rather than a hunt.
+ * that the three agree -- which is what made that move an edit rather than a hunt.
  *
  * A `<base href>` would have collapsed those three into one. It is not available: `_STATIC_CSP`
  * sets `base-uri 'none'`, and an injected `<base>` retargeting every relative URL on the page is
@@ -33,7 +32,7 @@
  * it is worth paying.
  */
 
-import { read } from "./api.js";
+import { read, runAction } from "./api.js";
 import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
 import {
@@ -50,10 +49,10 @@ import {
 } from "./render.js";
 
 /**
- * Where this client is mounted. Becomes `"/"` at #540. See the module note above.
+ * Where this client is mounted. `/` since #540. See the module note above.
  * @type {string}
  */
-const BASE = "/static/";
+const BASE = "/";
 
 /**
  * One route.
@@ -130,6 +129,18 @@ const contentNode = must("content");
 const buildNode = must("build");
 /** The header's outbound documentation link (#539); its href gains `?v=` once the build is known. */
 const docsNode = /** @type {HTMLAnchorElement} */ (must("docs-link"));
+
+/**
+ * This session's write token (#540), read off `/api/setup` whenever the setup view mounts.
+ *
+ * `""` until then, and that is correct rather than a gap: the only thing that can submit a form
+ * is a form this client drew, and it draws them only on the view that just supplied the token.
+ * An empty token would be refused by the server, which is the right outcome for a submission
+ * that could not have come from a rendered action card.
+ *
+ * @type {string}
+ */
+let csrf = "";
 
 /**
  * An element that `index.html` guarantees. Throwing beats rendering half a page: the two files
@@ -316,6 +327,14 @@ function rebuildInto(view, force) {
   deferred = false;
   contentNode.replaceChildren(view);
 
+  // What each action last reported, re-applied here rather than at the one call site that
+  // triggered a rebuild. **The first version restored only after an action's own repaint, and the
+  // message then survived exactly until the next 15-second poll wiped it** -- long enough to look
+  // like it worked, short enough that an operator reading the outcome watched it vanish
+  // mid-sentence. Every path that replaces the view comes through this function, which is why it
+  // is the one place this can be correct. Same argument as the `<details>` state above.
+  restoreOutcomes();
+
   for (const node of contentNode.querySelectorAll("details > summary[id]")) {
     if (open.has(node.id) && node.parentElement instanceof HTMLDetailsElement) {
       node.parentElement.open = true;
@@ -344,7 +363,13 @@ function mount(route, readings) {
   const data = primary.data;
   const onSort = sorter(route, route.endpoints[0]);
 
-  if (route.name === "setup") return setupView(data);
+  if (route.name === "setup") {
+    // The write token for this session, kept for the submit handler below. It is read off the
+    // document that was just fetched rather than stored anywhere: it dies with the process that
+    // minted it, and a stale one produces a 403 the view shows rather than a silent no-op.
+    csrf = (data && typeof data.csrf === "string") ? data.csrf : "";
+    return setupView(data);
+  }
   if (route.name === "activity") {
     return activityView(data, primary.sort, onSort, (scope) => {
       paramsFor(route.endpoints[0]).scope = scope;
@@ -511,6 +536,124 @@ window.addEventListener("popstate", () => {
 });
 
 /** Catch up immediately when a hidden tab is looked at again -- see the poll comment in `show`. */
+/**
+ * The write path (#540): one delegated `submit` listener for every action form.
+ *
+ * Delegated on `contentNode` rather than bound per form, because the view is rebuilt from
+ * scratch on every poll and on every tick -- a listener attached to a form would be attached to
+ * a node that is about to be replaced, and re-binding after each rebuild is the bug that shows
+ * up as "the button works until the page refreshes".
+ *
+ * **The form is disabled for the duration and re-enabled by the rebuild.** A setup action is
+ * idempotent, so a double submission is harmless by construction; this is about the operator
+ * being able to tell that something is happening, not about protecting the server.
+ */
+contentNode.addEventListener("submit", (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  const key = form.getAttribute("data-action");
+  if (!key) return;
+  // Always: this page never performs a native form submission. The `<form>` element is used for
+  // its semantics and its keyboard behaviour (Enter submits, labels bind to controls), and the
+  // navigation it would otherwise cause is exactly what a client-rendered view must not do.
+  event.preventDefault();
+
+  const values = {};
+  for (const control of form.elements) {
+    const name = control.getAttribute && control.getAttribute("name");
+    if (name) values[name] = control.value;
+  }
+
+  setBusy(form, true);
+  showOutcome(key, "Running…");
+
+  void runAction(key, values, csrf).then((reading) => {
+    // Recorded BEFORE the repaint, and re-applied after it. Writing straight into the node would
+    // put the sentence into an element `paint` is about to replace -- which is exactly what the
+    // first version of this did, and the message was never visible for a single frame. Found by
+    // clicking the button in a browser; nothing in the suite could have seen it.
+    outcomes.set(key, outcomeText(reading));
+    showOutcome(key, outcomes.get(key));
+    // Re-read the whole view: a step that ran has changed the deployment this page describes, and
+    // patching one card would leave the checklist above it saying the opposite.
+    void paint(routeFor(window.location.pathname), true, false);
+  });
+});
+
+/**
+ * What each action last reported, by action key.
+ *
+ * Kept here rather than in the view because the view does not survive: `paint` rebuilds it from
+ * the server's documents on every poll, every tick and after every action, and an outcome written
+ * into a card is gone at the next rebuild. This is the small amount of state that belongs to the
+ * SESSION rather than to the deployment -- "what did I just do", which no document can answer.
+ *
+ * Not persisted, and cleared by a reload: it describes this sitting at this machine, and a
+ * message about an action from an hour ago presented as current is the same failure #538 refuses
+ * to make with a cached balance, in a much milder register.
+ *
+ * @type {Map<string, Node>}
+ */
+const outcomes = new Map();
+
+/**
+ * Put an action's outcome into its card, if that card is on screen.
+ *
+ * @param {string} key
+ * @param {Node | string} text
+ */
+function showOutcome(key, text) {
+  const form = contentNode.querySelector('form[data-action="'.concat(key, '"]'));
+  const node = form ? form.querySelector(".action-outcome") : null;
+  if (!node) return;
+  node.replaceChildren(typeof text === "string" ? document.createTextNode(text) : text);
+}
+
+/** Re-apply every remembered outcome after a rebuild has replaced the cards. */
+function restoreOutcomes() {
+  for (const [key, text] of outcomes) {
+    // `cloneNode`: a `Node` can only be in one place in a document, and this map outlives any
+    // number of rebuilds. Inserting the same node twice would move it out of the map's reach.
+    showOutcome(key, text.cloneNode(true));
+  }
+}
+
+/**
+ * Disable or re-enable every control in a form.
+ *
+ * @param {HTMLFormElement} form
+ * @param {boolean} busy
+ */
+function setBusy(form, busy) {
+  for (const control of form.elements) {
+    if (control instanceof HTMLElement) control.toggleAttribute("disabled", busy);
+  }
+}
+
+/**
+ * What to show for a finished action.
+ *
+ * The SERVER's own words in every branch: `data.message.display` when it ran, `error.detail` when
+ * it did not. This function chooses which field to read and never composes a sentence -- the same
+ * rule `render.js` follows, applied to the one outcome that arrives outside a view.
+ *
+ * @param {import("./api.js").Reading} reading
+ * @returns {Node}
+ */
+function outcomeText(reading) {
+  const data = reading.data;
+  if (data && data.message && typeof data.message.display === "string") {
+    const changed = data.changed && data.changed.display ? data.changed.display : "";
+    return document.createTextNode(
+      changed ? data.message.display.concat(" — ", changed) : data.message.display,
+    );
+  }
+  const error = reading.error;
+  const detail = error && error.detail ? error.detail : "";
+  const title = error && error.title ? error.title : reading.engine.display;
+  return document.createTextNode(detail ? title.concat(" — ", detail) : title);
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void paint(current, false);
 });
@@ -577,7 +720,7 @@ subscribe((reading, seen) => {
 // -- boot ---------------------------------------------------------------------------------------
 
 /**
- * Normalise `/static/` and `/static/index.html` to `/static/status` with `replaceState`.
+ * Normalise `/` and `/index.html` to `/status` with `replaceState`.
  *
  * `replaceState`, never `pushState`: this happens before the user has done anything, and a
  * history entry here would make the first press of the back button appear to do nothing.

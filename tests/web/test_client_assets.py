@@ -32,15 +32,18 @@ import re
 
 import pytest
 
-from keel.web import render, staticfiles
+from keel.web import staticfiles
 
-# `_theme_palette` is IMPORTED from the contrast module rather than reimplemented, and nothing in
-# it is modified: this module only calls it with a different `css` string. That direction matters
-# -- a shared test helper that grows a parameter to accommodate a new caller is how #545 ended up
-# with a suite that was green because every pre-existing test had quietly started sending
-# something the real client could not send. Here the existing tests keep calling it with
-# `render._STYLE` exactly as before, and the only new thing is a second caller.
-from tests.web.test_palette_contrast import _theme_palette
+
+def _P(rest: str) -> str:
+    """A request path under the mount, composed rather than spelled.
+
+    Every one of these was a literal `/static/...` until #540 moved the mount to `/`. Composed
+    from the constant the client and the server both read, the next move needs no edit here --
+    which is the same argument `test_the_mount_prefix_is_spelled_the_same_everywhere` makes about
+    the three places that legitimately DO spell it."""
+    return staticfiles.STATIC_PREFIX + rest
+
 
 _STATIC = staticfiles.STATIC_ROOT
 _JS = _STATIC / "js"
@@ -366,11 +369,22 @@ def test_the_arithmetic_scanner_can_fail() -> None:
 def test_no_client_module_can_write_markup() -> None:
     """No `innerHTML`, anywhere in the client.
 
-    `render.py::esc` exists because "rule names, product ids and adapter error strings all
-    originate outside this process; none of them is trusted markup" -- and every one of those
-    strings reaches this client too. `textContent` cannot interpret markup, so with no markup sink
-    on the page there is no escaping to get right and no injection sink to audit. This asserts the
-    sink is absent rather than that the escaping is correct, which is the stronger property."""
+    **This is where `tests/web/test_render.py` went at #540.** That module existed for one
+    security property -- "nothing reaching the page is trusted markup" -- and tested it by feeding
+    `<script>alert("x")</script>` through `render_rules` and `render_venues` and asserting the
+    output was escaped. Both functions are deleted, and so is the escaping they did.
+
+    The property did not go with them; it got stronger, and this is the assertion that carries it.
+    `render.py::esc` had to be CORRECT on every string it touched, and a call site that forgot to
+    invoke it was a hole no test of `esc` would find. `textContent` cannot interpret markup at
+    all, so with no markup sink anywhere on the page there is nothing to escape and no call site
+    that can forget. Asserting the SINK IS ABSENT is a stronger claim than asserting the escaping
+    is right, and it is checkable over the whole client rather than function by function.
+
+    Rule names, product ids, log highlights and adapter error strings all still originate outside
+    this process -- an operator names a rule, the engine writes a highlight, and a third-party
+    package chooses what its exception says. Every one of them reaches this client. None of them
+    can reach a parser."""
     for name in _MODULES:
         source = _source(name)
         for sink in _MARKUP_SINKS:
@@ -436,34 +450,11 @@ def test_the_event_stream_carries_no_figures() -> None:
 # -- the two sources of truth that must not drift --------------------------------------------------
 
 
-def test_the_client_palette_is_byte_identical_to_the_rendered_one() -> None:
-    """`css/keel.css`'s palette equals `render.py::_STYLE`'s, token for token, in both themes.
-
-    The client's stylesheet is a COPY, and this is what makes the copy safe: every WCAG ratio in
-    `tests/web/test_palette_contrast.py` is measured against `render.py`, so it guards this file
-    only for as long as the two agree. Equality here is what makes that transitive.
-
-    The duplication has an end date. At #540 `render.py` goes, this test goes with it, and
-    `test_palette_contrast._load_themes` re-points at this file."""
-    client = _CSS.read_text(encoding="utf-8")
-    for dark in (False, True):
-        theirs = _theme_palette(render._STYLE, dark=dark)
-        ours = _theme_palette(client, dark=dark)
-        assert ours == theirs, (
-            f"the {'dark' if dark else 'light'} palettes have diverged; the contrast gate in "
-            "test_palette_contrast.py only measures render.py's"
-        )
-
-
-def test_the_palette_comparison_would_notice_a_divergence() -> None:
-    """The premise: the comparison above is only worth running if it can fail.
-
-    Asserted because both sides are parsed by the same function from files that were written to
-    match -- exactly the shape of test that passes because it is comparing something to itself."""
-    client = _CSS.read_text(encoding="utf-8")
-    tampered = client.replace("--good: #1f5f4f", "--good: #1f5f50", 1)
-    assert tampered != client, "the light --good declaration is no longer spelled as expected"
-    assert _theme_palette(tampered, dark=False) != _theme_palette(render._STYLE, dark=False)
+# `test_the_client_palette_is_byte_identical_to_the_rendered_one` and its mutation check stood
+# here, and both were deleted at #540 exactly as their own docstring said they would be: "the
+# duplication has an end date. At #540 `render.py` goes, this test goes with it, and
+# `test_palette_contrast._load_themes` re-points at this file." It does. There is one stylesheet
+# now, the contrast gate measures it directly, and there is nothing left to hold in agreement.
 
 
 def test_the_python_and_javascript_route_tables_agree() -> None:
@@ -640,7 +631,7 @@ from tests.web.test_server import _request, _session  # noqa: E402
 
 
 def test_the_shell_is_served_at_the_static_prefix(running) -> None:  # type: ignore[no-untyped-def]
-    status, headers, body = _request(running, "/static/", cookie=_session(running))
+    status, headers, body = _request(running, _P(""), cookie=_session(running))
     assert status == 200
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert '<main id="view"' in body
@@ -654,7 +645,7 @@ def test_every_client_route_serves_the_shell_on_a_reload(name: str, running) -> 
     `pushState`, so `/static/insights` appears in the address bar, and without this a reload or a
     bookmark asks for a file that does not exist. Parametrised over `CLIENT_ROUTES` itself so a
     view added there is covered without a test edit."""
-    status, headers, body = _request(running, f"/static/{name}", cookie=_session(running))
+    status, headers, body = _request(running, _P(name), cookie=_session(running))
     assert status == 200, name
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert '<script type="module"' in body
@@ -667,13 +658,13 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
     same wildcard turns a missing `.js` into a `text/html` response the browser refuses to execute
     under `nosniff`, and reports as a MIME-type error naming the module rather than as "that file
     is not there"."""
-    status, _headers, _body = _request(running, "/static/glossary", cookie=_session(running))
+    status, _headers, _body = _request(running, _P("glossary"), cookie=_session(running))
     assert status == 404
 
 
 def test_a_missing_asset_is_a_404_and_never_the_shell(running) -> None:  # type: ignore[no-untyped-def]
     """The failure mode the closed list exists to prevent, asserted directly."""
-    status, _headers, body = _request(running, "/static/js/nope.js", cookie=_session(running))
+    status, _headers, body = _request(running, _P("js/nope.js"), cookie=_session(running))
     assert status == 404
     # `<main>` is the WRONG marker here and this test failed on it first: `server._refuse` renders
     # its own error page through `render.page`, which has a `<main>` of its own. The shell is
@@ -683,7 +674,7 @@ def test_a_missing_asset_is_a_404_and_never_the_shell(running) -> None:  # type:
 
 def test_a_real_file_wins_over_a_client_route(running) -> None:  # type: ignore[no-untyped-def]
     """`index.html` is reachable by its own name, not shadowed by the fallback."""
-    status, headers, body = _request(running, "/static/index.html", cookie=_session(running))
+    status, headers, body = _request(running, _P("index.html"), cookie=_session(running))
     assert status == 200
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert "<noscript>" in body
@@ -692,20 +683,20 @@ def test_a_real_file_wins_over_a_client_route(running) -> None:  # type: ignore[
 def test_the_client_route_fallback_is_behind_the_same_admission(running) -> None:  # type: ignore[no-untyped-def]
     """Never weakened. A path that resolves to the shell is not exempt from the loopback-plus-
     session model for having been synthesised rather than found on disk."""
-    status, _headers, _body = _request(running, "/static/status")  # no cookie
+    status, _headers, _body = _request(running, _P("status"))  # no cookie
     assert status == 403
 
 
 @pytest.mark.parametrize(
     ("path", "content_type"),
     [
-        ("/static/js/main.js", "text/javascript; charset=utf-8"),
-        ("/static/js/api.js", "text/javascript; charset=utf-8"),
-        ("/static/js/render.js", "text/javascript; charset=utf-8"),
-        ("/static/js/chart.js", "text/javascript; charset=utf-8"),
-        ("/static/js/live.js", "text/javascript; charset=utf-8"),
-        ("/static/js/format.js", "text/javascript; charset=utf-8"),
-        ("/static/css/keel.css", "text/css; charset=utf-8"),
+        (_P("js/main.js"), "text/javascript; charset=utf-8"),
+        (_P("js/api.js"), "text/javascript; charset=utf-8"),
+        (_P("js/render.js"), "text/javascript; charset=utf-8"),
+        (_P("js/chart.js"), "text/javascript; charset=utf-8"),
+        (_P("js/live.js"), "text/javascript; charset=utf-8"),
+        (_P("js/format.js"), "text/javascript; charset=utf-8"),
+        (_P("css/keel.css"), "text/css; charset=utf-8"),
     ],
 )
 def test_every_shipped_asset_is_served_with_the_right_type(
@@ -727,7 +718,7 @@ def test_the_shell_is_served_with_the_static_header_set(running) -> None:  # typ
     the tightest policy that does. Asserted here on the SHELL specifically, because
     `test_server.py` asserts it on the placeholder asset that used to be the only HTML under
     `/static/`."""
-    status, headers, _body = _request(running, "/static/status", cookie=_session(running))
+    status, headers, _body = _request(running, _P("status"), cookie=_session(running))
     assert status == 200
     csp = headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp

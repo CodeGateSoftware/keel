@@ -885,15 +885,25 @@ function stepCard(step, actions, notAutomated) {
 }
 
 /**
- * One declared action, as a DESCRIPTION of what keel would do and what it would ask for.
+ * One declared action, as a FORM that performs it (#540).
  *
- * The inputs are listed, never rendered as a form. A disabled form is worse than a list: it looks
- * like something that could be filled in, and a `secret` field drawn as an input someone types
- * into and cannot submit is a password typed into a page for no reason at all.
+ * It was a description until #540 -- a list of the fields keel would ask for, and a link to the
+ * server-rendered `/setup` page, "which is where this session's write token is". That page is
+ * deleted; the write token now arrives in `/api/setup`'s own document, and this is where the
+ * action runs.
+ *
+ * **The gate did not move with the button, and that is the property to keep in view.** What may be
+ * performed here is `keel.commands.setup.ACTIONS` and nothing else: idempotent, non-destructive,
+ * `MECHANICAL` steps, asserted disjoint from the eleven capability-increasing actions. A client
+ * that hides a button is not a gate, so nothing is hidden -- and nothing needed to be, because the
+ * server refuses what is not in that set regardless of what this file draws.
  *
  * `secret` arrives carrying its own words -- `_action_input_payload` sends "never echoed back"
  * against "shown as typed" -- rather than as a boolean this file would have to translate, which
- * is the same rule that keeps `state` out of the client's hands.
+ * is the same rule that keeps `state` out of the client's hands. The INPUT TYPE comes from a
+ * separate `kind` string for exactly that reason: a password field drawn as `type="text"` puts a
+ * credential on screen and into the browser's autofill history, and choosing which to draw must
+ * not require this file to read a `Field`'s value.
  *
  * @param {any} action
  * @returns {HTMLElement}
@@ -902,28 +912,85 @@ function actionCard(action) {
   const card = el("div", "action");
   card.append(el("p", "muted", plain(action.detail)));
 
-  const inputs = action.inputs || [];
-  if (inputs.length !== 0) {
-    const list = el("ul", "inputs");
-    for (const input of inputs) {
-      const item = el("li");
-      item.append(el("strong", undefined, plain(input.label)), " ");
-      item.append(field(input.secret));
-      if (input.hint) item.append(el("div", "muted", plain(input.hint)));
-      const choices = stringList(input.choices, "choices");
-      if (choices) item.append(choices);
-      list.append(item);
-    }
-    card.append(list);
+  const key = plain(action.key);
+  const form = el("form", "action-form");
+  form.setAttribute("data-action", key);
+
+  for (const input of action.inputs || []) {
+    form.append(actionField(key, input));
   }
 
-  // An ordinary link to the rendered page, so a real navigation: `main.js` intercepts only hrefs
-  // under its own `BASE`, and this is not one.
-  const link = el("a", "runlink", plain(action.title));
-  link.setAttribute("href", "/setup");
-  card.append(link);
-  card.append(note("Runs on keel's own setup page, which is where this session's write token is."));
+  const button = el("button", "run");
+  button.setAttribute("type", "submit");
+  button.append(document.createTextNode(plain(action.title)));
+  form.append(button);
+
+  // Filled by `main.js` with the server's own `display` for the result. Present in the markup
+  // rather than created on submit, because it is an `aria-live` region and a live region has to
+  // exist BEFORE the text it announces is put in it -- `index.html`'s engine banner carries the
+  // same note for the same reason.
+  const outcome = el("p", "action-outcome");
+  outcome.setAttribute("role", "status");
+  outcome.setAttribute("aria-live", "polite");
+  form.append(outcome);
+
+  card.append(form);
   return card;
+}
+
+/**
+ * One field of an action's form.
+ *
+ * `choices` renders a `<select>` whose first option is disabled and selected with an EMPTY value,
+ * so nothing is pre-chosen. A select that arrives with a valid answer already in it is a form
+ * that can be submitted without a decision having been made, and every one of these fields is a
+ * decision about a deployment.
+ *
+ * @param {string} key    the action's key, for ids that cannot collide across cards.
+ * @param {any} input
+ * @returns {HTMLElement}
+ */
+function actionField(key, input) {
+  const name = plain(input.name);
+  const id = "f-".concat(key, "-", name);
+  const wrap = el("div", "field");
+  const label = el("label", undefined, plain(input.label));
+  label.setAttribute("for", id);
+  wrap.append(label);
+
+  const choices = input.choices || [];
+  let control;
+  if (choices.length !== 0) {
+    control = el("select");
+    const placeholder = el("option", undefined, "choose…");
+    placeholder.setAttribute("value", "");
+    placeholder.setAttribute("disabled", "disabled");
+    placeholder.setAttribute("selected", "selected");
+    control.append(placeholder);
+    for (const choice of choices) {
+      const option = el("option", undefined, plain(choice));
+      option.setAttribute("value", plain(choice));
+      control.append(option);
+    }
+  } else {
+    control = el("input");
+    // `input.kind`, not `input.secret.value`: the server sends the rendering instruction as a
+    // plain string precisely so this file never reads a `Field`'s value. See the note beside
+    // `kind` in `payload._action_input_payload`.
+    control.setAttribute("type", plain(input.kind) === "secret" ? "password" : "text");
+    control.setAttribute("autocomplete", "off");
+    control.setAttribute("spellcheck", "false");
+  }
+  control.id = id;
+  control.setAttribute("name", name);
+  wrap.append(control);
+
+  if (input.hint) wrap.append(el("div", "muted", plain(input.hint)));
+  // The server's own sentence about what `secret` means for this field, shown beside it rather
+  // than translated: "never echoed back" is a promise about handling, and restating it here in
+  // this file's words would be this file making that promise instead.
+  wrap.append(field(input.secret));
+  return wrap;
 }
 
 /**

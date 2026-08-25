@@ -32,6 +32,14 @@ import pytest
 from keel.web import staticfiles
 from scripts import build_icons
 
+
+def _P(rest: str) -> str:
+    """A request path under the mount, composed rather than spelled -- see the identical helper
+    in `test_staticfiles.py`. #540 moved the mount from `/static/` to `/`, and every literal had
+    to be edited; composed, the next move is none."""
+    return staticfiles.STATIC_PREFIX + rest
+
+
 _STATIC = staticfiles.STATIC_ROOT
 _SW = _STATIC / "sw.js"
 _MANIFEST = _STATIC / "manifest.webmanifest"
@@ -222,21 +230,33 @@ def test_the_worker_is_served_from_the_scope_it_must_control() -> None:
     )
 
 
-def test_the_api_prefix_is_outside_the_workers_scope() -> None:
-    """The rule the whole issue is about, asserted as arithmetic on two constants.
+def test_the_api_prefix_is_now_inside_the_workers_scope() -> None:
+    """**A guarantee this suite used to make, and no longer can. Recorded, not quietly dropped.**
 
-    This is stronger than any browser check: it is not that the worker declines to cache `/api/*`,
-    it is that the browser never consults the worker for those requests at all. Nothing that could
-    be written inside `sw.js` changes this.
+    At #538 this test asserted the opposite: the worker was served from `/static/`, so `/api/*`
+    was OUTSIDE its scope and the browser never consulted it for an API request at all. That was
+    structural -- nothing written inside `sw.js` could have cached a balance, because nothing
+    inside `sw.js` could see one.
+
+    #540 moved the shell to `/`. The scope is the whole origin, every `/api/*` request now passes
+    through the worker's `fetch` handler, and the structural guarantee is gone. What replaces it
+    is the explicit guard, which #538 wrote as dead code and pinned with a test whose docstring
+    said it "stops being redundant on the same day that nobody is thinking about it" -- that day
+    was this one. This test asserts the new arrangement so that nobody reads the module comment
+    and assumes the old one still holds.
     """
     source = _sw_source()
     base = re.search(r'const BASE = "([^"]+)"', source)
     api = re.search(r'const API_PREFIX = "([^"]+)"', source)
     assert base is not None and api is not None
     assert base.group(1) == staticfiles.STATIC_PREFIX
-    assert not api.group(1).startswith(base.group(1)), (
-        f"{api.group(1)} is inside {base.group(1)} -- the scope no longer excludes the API"
+    assert api.group(1).startswith(base.group(1)), (
+        "the mount moved back off `/`; if that is deliberate, restore the #538 form of this test "
+        "rather than deleting it -- the scope would be excluding the API again"
     )
+    # And therefore the guard below is the whole protection. Asserted here, next to the loss, so
+    # the two facts are read together.
+    assert "url.pathname.startsWith(API_PREFIX)" in source
 
 
 def test_the_worker_still_guards_the_api_prefix_explicitly() -> None:
@@ -366,12 +386,12 @@ from tests.web.test_server import _request, _session  # noqa: E402
 @pytest.mark.parametrize(
     ("path", "content_type"),
     [
-        ("/static/sw.js", "text/javascript; charset=utf-8"),
-        ("/static/manifest.webmanifest", "application/manifest+json"),
-        ("/static/icons/keel.svg", "image/svg+xml"),
-        ("/static/icons/keel-192.png", "image/png"),
-        ("/static/icons/keel-512.png", "image/png"),
-        ("/static/icons/keel-maskable-512.png", "image/png"),
+        (_P("sw.js"), "text/javascript; charset=utf-8"),
+        (_P("manifest.webmanifest"), "application/manifest+json"),
+        (_P("icons/keel.svg"), "image/svg+xml"),
+        (_P("icons/keel-192.png"), "image/png"),
+        (_P("icons/keel-512.png"), "image/png"),
+        (_P("icons/keel-maskable-512.png"), "image/png"),
     ],
 )
 def test_every_install_asset_is_served_with_the_type_the_browser_requires(  # type: ignore[no-untyped-def]
@@ -387,7 +407,7 @@ def test_every_install_asset_is_served_with_the_type_the_browser_requires(  # ty
 def test_the_install_assets_are_behind_the_same_admission(running) -> None:  # type: ignore[no-untyped-def]
     """Not weakened for the browser's convenience. This is the reason the manifest link needs
     `use-credentials`, asserted from the server's side."""
-    for path in ("/static/sw.js", "/static/manifest.webmanifest", "/static/icons/keel-192.png"):
+    for path in (_P("sw.js"), _P("manifest.webmanifest"), _P("icons/keel-192.png")):
         status, _headers, _body = _request(running, path)  # no cookie
         assert status == 403, path
 
@@ -396,7 +416,7 @@ def test_the_served_manifest_is_valid_json(running) -> None:  # type: ignore[no-
     """Parsed off the wire, not off disk: a manifest that is correct in the repository and
     mangled by the server is a manifest the browser rejects."""
     _status, _headers, body = _request(
-        running, "/static/manifest.webmanifest", cookie=_session(running)
+        running, _P("manifest.webmanifest"), cookie=_session(running)
     )
     manifest = json.loads(body)
     assert manifest["name"] == "keel"
@@ -406,5 +426,5 @@ def test_the_served_manifest_is_valid_json(running) -> None:  # type: ignore[no-
 def test_the_worker_is_served_with_no_store(running) -> None:  # type: ignore[no-untyped-def]
     """The layer BELOW the worker's own versioning: a worker script held in the HTTP cache is a
     worker that keeps serving the previous build's shell after an upgrade."""
-    _status, headers, _body = _request(running, "/static/sw.js", cookie=_session(running))
+    _status, headers, _body = _request(running, _P("sw.js"), cookie=_session(running))
     assert headers["Cache-Control"] == "no-store, max-age=0"
