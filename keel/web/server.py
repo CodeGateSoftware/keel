@@ -646,8 +646,18 @@ class KeelHandler(BaseHTTPRequestHandler):
         `ROUTES` path gets -- containment and the Content-Type table are `staticfiles`'s job
         (`tests/web/test_staticfiles.py` pins the resolver in isolation); this method's only
         responsibility is refusing anything it returns `None` for, uniformly, so a missing
-        static file and a missing page look identical to a client probing the server."""
+        static file and a missing page look identical to a client probing the server.
+
+        **A file wins over a client route, always** (#536). `resolve_client_route` is consulted
+        only where `resolve_static_asset` found nothing, so no name in `CLIENT_ROUTES` can shadow
+        a shipped asset -- and, more importantly, the reverse cannot happen either: a `.js` file
+        that is missing or misspelled stays a 404 rather than becoming a 200 of HTML that the
+        browser then refuses to execute under `nosniff`, which is a MIME-type error several steps
+        removed from its cause. See `CLIENT_ROUTES`'s own note on why that list is closed.
+        """
         resolved = staticfiles.resolve_static_asset(staticfiles.STATIC_ROOT, url_path)
+        if resolved is None:
+            resolved = staticfiles.resolve_client_route(staticfiles.STATIC_ROOT, url_path)
         content_type = staticfiles.content_type_for(resolved) if resolved is not None else None
         if resolved is None or content_type is None:
             self._refuse(404, "No such page", f"Nothing is served at {url_path}.")

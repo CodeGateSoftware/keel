@@ -1,0 +1,318 @@
+/* keel's client stylesheet (#536).
+ *
+ * Served exactly as authored: no preprocessor, no autoprefixer, no minifier. The file a reader
+ * opens in devtools is this file, byte for byte, which is the same property the JavaScript is
+ * held to and for the same reason (§4 of the design spec's Philosophy).
+ *
+ * ── THE PALETTE IS A COPY, AND A TEST PINS THAT IT STAYS ONE ──────────────────────────────────
+ *
+ * Every `--token: #hex` below is byte-identical to the corresponding declaration in
+ * `keel/web/render.py`'s `_STYLE`, which is where #532 chose these values and where
+ * `tests/web/test_palette_contrast.py` measures their WCAG ratios. A copy is a second source of
+ * truth, so `tests/web/test_client_assets.py::test_the_client_palette_is_byte_identical_to_the_
+ * rendered_one` parses BOTH stylesheets with that test module's own parser and fails on any
+ * divergence -- which means the contrast gate that guards render.py's palette transitively
+ * guards this one, without a second copy of the WCAG arithmetic.
+ *
+ * REJECTED: extracting the palette to a shared file that `render.py` reads at import time and
+ * inlines into `_STYLE`. It would remove the duplication, but it adds a file read to module
+ * import for a module the build order (§"Build order", step 7 / #540) deletes outright, and it
+ * would put the stylesheet's single source of truth outside the package's Python at the exact
+ * moment the Python is going away. The duplication has a known end date and a test that makes it
+ * loud until then; the extraction would outlive its own reason.
+ *
+ * The reversal condition is stated for the same reason: when #540 deletes `render.py`'s HTML,
+ * this file becomes the only palette, the pin test is deleted, and
+ * `tests/web/test_palette_contrast.py::_load_themes` re-points at this file. That is a
+ * three-line change and it is the whole migration.
+ *
+ * ── THE STATE CLASSES ARE #532'S, NOT A SECOND CONVENTION ─────────────────────────────────────
+ *
+ * `.good` / `.warn` / `.bad` / `.muted` are spelled exactly as `render.py` spells them, so the
+ * two front-ends style the same judgement the same way and the merge at #540 is a deletion
+ * rather than a reconciliation. The API's `state` vocabulary has five words to these four
+ * classes; `js/render.js`'s `STATE_CLASS` table holds that mapping and explains it.
+ */
+
+:root {
+  --bg: #fbfaf8; --fg: #1c1b19; --muted: #6b6862; --line: #e3dfd8;
+  --card: #ffffff; --accent: #1a5578; --warn: #8a5a00; --bad: #7b2915; --good: #1f5f4f;
+  --control-line: #84817c;
+}
+:root:not([data-theme="light"]) { color-scheme: light dark; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16150f; --fg: #ecead5; --muted: #9a968a; --line: #2f2d25;
+    --card: #1d1c15; --accent: #86b1e5; --warn: #d9a441; --bad: #e07a6a; --good: #83d3b2;
+    --control-line: #706d66;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* ── focus ────────────────────────────────────────────────────────────────────────────────────
+ *
+ * One rule, applied to everything focusable, rather than per-component focus styling. `:focus-
+ * visible` rather than `:focus` so a mouse click does not paint a ring, while every keyboard
+ * path does -- which is the acceptance criterion ("focus is visible throughout"), and it is a
+ * criterion a per-component approach fails by omission the first time a component is added
+ * without one.
+ *
+ * `outline-offset` is what makes the ring visible against `--accent` backgrounds (the buttons):
+ * an outline drawn flush against a filled control is hard to see on the control it is marking.
+ */
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* The skip link. Off-screen until focused -- `display: none` would remove it from the tab order
+ * entirely, which is the one thing it exists to be in. */
+.skip {
+  position: absolute;
+  left: -100vw;
+  top: 0;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--control-line);
+  padding: 0.5rem 0.9rem;
+  border-radius: 0 0 8px 0;
+  z-index: 10;
+}
+.skip:focus { left: 0; }
+
+/* ── header and navigation ────────────────────────────────────────────────────────────────────
+ *
+ * The nav is a `<ul>` of `<a>`s: a list, because it is one, and assistive technology announces
+ * "7 items" from the markup rather than from an `aria-` attribute restating it. `aria-current=
+ * "page"` marks the active view -- `main.js` sets it, and `.on`'s underline is the sighted
+ * half of the same signal, so the two can never disagree because there is only one source.
+ */
+header {
+  border-bottom: 1px solid var(--line);
+  padding: 0.85rem 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  align-items: baseline;
+}
+header .brand { font-weight: 650; letter-spacing: 0.02em; margin-right: 0.6rem; }
+header nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+}
+header a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.15rem 0;
+  border-bottom: 2px solid transparent;
+  /* Touch targets. Phones are out of scope (§"The app cannot be served from keeltrading.com"),
+   * touch-capable laptops and tablets running a full OS are not, and a 15px text link with no
+   * padding is a 20px tall target against WCAG 2.5.8's 24px minimum. `inline-block` is what
+   * lets the vertical padding count towards the hit area at all. */
+  display: inline-block;
+  min-height: 24px;
+}
+header a:hover { color: var(--fg); }
+header a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
+
+/* ── layout ───────────────────────────────────────────────────────────────────────────────────
+ *
+ * `max-width: 62rem` is render.py's measure, kept: it is the line length the existing page was
+ * designed at and there is no reason for the two to differ while both exist.
+ *
+ * RESPONSIVE FROM THE START, not retrofitted. The three mechanisms below are the whole strategy
+ * and there is no fourth:
+ *
+ *   1. `auto-fit` / `minmax` grids reflow with no breakpoint at all. Most of the layout is this.
+ *   2. Two `@media` breakpoints for the things a grid cannot fix -- padding at very narrow
+ *      widths, and the header stacking.
+ *   3. Every wide thing (tables) scrolls INSIDE its own container, never the page.
+ *
+ * Point 3 is the acceptance criterion "layout holds from a narrow window to full width without
+ * horizontal scrolling", and it is the one a grid cannot deliver: a table of eight columns of
+ * `white-space: nowrap` financial figures has a real minimum width, and the choice is between
+ * scrolling the table and scrolling the document. Scrolling the document moves the header and
+ * the nav off-screen, so it is the table that scrolls.
+ */
+main {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+main:focus { outline: none; }
+
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; }
+.sub { color: var(--muted); margin: 0 0 1.5rem; font-size: 0.9rem; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
+  margin: 0 0 1rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.75rem;
+}
+
+.kv { display: flex; flex-direction: column; gap: 0.15rem; }
+.kv .k {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.kv .v { font-size: 1.05rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+.tablewrap {
+  overflow-x: auto;
+  /* A scrollable region must be reachable by keyboard. `tabindex="0"` on the wrapper (set in
+   * `render.js`) is what does that; this is the pairing that makes the focus ring land on the
+   * region rather than inside it. */
+  max-width: 100%;
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td {
+  text-align: left;
+  padding: 0.42rem 0.7rem 0.42rem 0;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+th {
+  color: var(--muted);
+  font-weight: 550;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 1.1rem; }
+
+.pill {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  border: 1px solid var(--line);
+}
+
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.muted { color: var(--muted); }
+
+.empty { color: var(--muted); padding: 1.5rem 0; }
+.note { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0 0; }
+
+/* ── the engine banner ────────────────────────────────────────────────────────────────────────
+ *
+ * The one region that is `aria-live` (see `index.html`), so it is also the one region styled to
+ * be read at a glance without one. `border-left` carries the judgement as position and weight in
+ * addition to hue, for the same reason #532 added the `▲`/`▼` glyphs: a signal that exists only
+ * as colour is a signal roughly one in twelve men cannot read.
+ */
+.engine {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  background: var(--card);
+  padding: 0.7rem 1rem;
+  margin: 0 0 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  align-items: baseline;
+}
+.engine.good { border-left-color: var(--good); color: var(--fg); }
+.engine.warn { border-left-color: var(--warn); color: var(--fg); }
+.engine.bad { border-left-color: var(--bad); color: var(--fg); }
+.engine .what { font-weight: 600; }
+.engine .when { color: var(--muted); font-size: 0.85rem; }
+
+/* The "keel isn't running" and "that report could not be built" panels. Deliberately NOT styled
+ * as an empty state: an empty state says "there is nothing here", and the whole point of these
+ * two is that they say WHY there is nothing here and what to do about it. */
+.stopped { max-width: 44rem; }
+.stopped h1 { margin-bottom: 0.5rem; }
+.stopped p { margin: 0 0 0.7rem; }
+.stopped .detail {
+  color: var(--muted);
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+button {
+  font: inherit;
+  font-weight: 550;
+  padding: 0.35rem 0.9rem;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--card);
+  cursor: pointer;
+  /* WCAG 2.5.8 again: a 24px minimum target on a control that exists to be pressed. */
+  min-height: 24px;
+}
+button:hover { filter: brightness(1.08); }
+button[disabled] { opacity: 0.6; cursor: default; }
+
+footer {
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+}
+
+/* ── breakpoints ──────────────────────────────────────────────────────────────────────────────
+ *
+ * Two, and only for what the grids above cannot do by themselves.
+ *
+ * 34rem: below roughly 544px the header's single flex row runs out of room and wraps into a
+ * ragged two-and-a-half lines, so the brand and the nav become explicit rows instead. Page
+ * padding also comes down -- 1.25rem of side padding is 15% of a 360px viewport.
+ *
+ * 22rem: the `minmax(11rem, 1fr)` grid stops fitting even one full column, at which point the
+ * `minmax` floor is what forces the page wider than the viewport. Dropping the floor to `0` at
+ * that width is what keeps the promise that the DOCUMENT never scrolls sideways.
+ */
+@media (max-width: 34rem) {
+  header { flex-direction: column; align-items: stretch; gap: 0.6rem; }
+  header .brand { margin-right: 0; }
+  main { padding: 1.1rem 0.85rem 3rem; }
+  footer { padding: 1rem 0.85rem; }
+}
+
+@media (max-width: 22rem) {
+  .grid { grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); }
+}
+
+/* Honour a reader who has asked the operating system for less motion. There is no animation in
+ * this stylesheet today; the rule is here so that the first one added inherits the courtesy
+ * rather than depending on its author remembering -- the same reasoning `server.needs_database`
+ * gives for guarding a whole route set instead of one page. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
