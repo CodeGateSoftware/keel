@@ -257,7 +257,12 @@ by outbound documentation links.
 - **live** — the `EventSource` subscription and its reconnect behaviour.
 - **format** — `Intl.DateTimeFormat` wrappers. Dates only; money is formatted server-side.
 - **docs** — constructs outbound keeltrading.com links, with the anchor and the `?v=` version.
-- **sw** — the service worker.
+- **sw** — the service worker. **Amended at #538: this one file is NOT under `js/`.** A service
+  worker's registration scope is its own directory, so `static/js/sw.js` would be scoped to
+  `/static/js/` and could not answer a navigation to `/static/insights` — the deep links §"Static
+  assets" requires. It ships at `static/sw.js` instead. The alternative, a `Service-Worker-Allowed`
+  header widening the scope from `js/`, was rejected for failing silently: remove the header and
+  the worker still installs, still activates, and simply stops controlling the app.
 
 In **js/external** there is nothing, and that is the intended end state rather than a stage.
 

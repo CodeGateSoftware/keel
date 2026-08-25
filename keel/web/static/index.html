@@ -38,6 +38,22 @@
   to a declared base.
 -->
 <link rel="stylesheet" href="/static/css/keel.css">
+<!--
+  ── THE INSTALL SURFACE (#538), AND THE ONE ATTRIBUTE THAT MAKES IT WORK ────────────────────
+  `crossorigin="use-credentials"` is NOT boilerplate and NOT optional here. A `rel="manifest"`
+  link is fetched with credentials mode "omit" by default -- no cookies -- and every response
+  this server sends is gated on the session cookie (`server._admitted`). Without the attribute
+  the manifest fetch is a 403, the browser reports no manifest, and the app is simply not
+  installable, with nothing in the page or the console pointing at the cause.
+
+  `theme-color` is the standalone window's title bar; the two `icon` links are for the browser
+  tab and for iOS's home screen, which reads `apple-touch-icon` and ignores the manifest's
+  `icons` array entirely.
+-->
+<link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
+<meta name="theme-color" content="#1a5578">
+<link rel="icon" href="/static/icons/keel.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icons/keel-192.png">
 <script type="module" src="/static/js/main.js"></script>
 </head>
 <body>

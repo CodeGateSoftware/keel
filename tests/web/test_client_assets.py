@@ -54,8 +54,14 @@ _CSS = _STATIC / "css" / "keel.css"
 #:
 #: `chart.js` and `live.js` arrived at #537, which is what the previous revision of this line
 #: predicted ("a fifth module is a design decision (#537 adds `chart`, `live`, `docs`, `sw`) and
-#: should arrive with the list updated, not silently"). `docs` (#539) and `sw` (#538) are still to
-#: come, and their absence here is what will make them arrive the same way.
+#: should arrive with the list updated, not silently"). `docs` (#539) is still to come, and its
+#: absence here is what will make it arrive the same way.
+#:
+#: **`sw` arrived at #538 and is deliberately NOT in this list**, because it is not under `js/`:
+#: a service worker's scope is its own directory, so `js/sw.js` would be scoped to `/static/js/`
+#: and could not answer a navigation to `/static/insights`. It sits at the static root instead,
+#: and `tests/web/test_pwa.py::test_the_worker_is_served_from_the_scope_it_must_control` asserts
+#: that placement rather than leaving it to whoever next reads the spec's file list.
 _MODULES = ("main.js", "api.js", "render.js", "chart.js", "live.js", "format.js")
 
 #: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
