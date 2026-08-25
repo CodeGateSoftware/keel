@@ -1,6 +1,6 @@
 """WCAG contrast gate for the web UI palette (#532).
 
-Everything here is measured from `keel/web/render.py:_STYLE` itself -- the light `:root { }`
+Everything here is measured from `keel/web/static/css/keel.css` itself -- the light `:root { }`
 block and the dark `@media (prefers-color-scheme: dark)` block are parsed with a regex, not
 copied into this file as a second source of truth. That is deliberate: a hardcoded expected
 hex string only proves this file agrees with itself, while re-deriving the ratios from the
@@ -16,17 +16,20 @@ https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio) -- twenty lines of arithmetic,
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-from keel.web import render
+from keel.web import staticfiles
 
-# `render.RENDER_PY` doesn't exist -- reading `render.__file__` keeps this test tied to
-# whatever module actually shipped the stylesheet, rather than a path guessed from this
-# test file's own location (which breaks the moment either file moves).
-_RENDER_PY = Path(render.__file__)
+# The stylesheet the client actually loads, located through `staticfiles.STATIC_ROOT` rather than
+# by a path guessed from this test file's own location (which breaks the moment either moves).
+#
+# It was `render._STYLE` -- an inline stylesheet inside a Python module -- until #540 deleted the
+# server-rendered pages. Nothing about these measurements changed: a test at #536 asserted the two
+# palettes were BYTE-IDENTICAL, so the values being measured here are the same values that were
+# being measured before, now read from the file that was already the one in the browser.
+_CSS = staticfiles.STATIC_ROOT / "css" / "keel.css"
 
 #: WCAG 2.x AA, normal-size text (SC 1.4.3): fg/muted/accent/warn/bad/good all render body-
-#: or label-sized text somewhere in render.py (table cells, `.kv .v`, `.pill`), never large text.
+#: or label-sized text somewhere in the client (table cells, `.kv .v`, `.pill`), never large text.
 _AA_TEXT_MIN = 4.5
 
 #: WCAG 2.x AA, non-text UI component boundaries (SC 1.4.11): the form-input border this issue
@@ -78,7 +81,7 @@ _MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.025, "dark": 0.2}
 #: simultaneously AAA, well-separated from `--good`, AND as far from `--fg` as the original
 #: was. The floors instead sit with margin under what THIS palette actually reaches -- light
 #: 1.7 (measured minimum 1.78, at `--bad`), dark 1.4 (measured minimum 1.45, at `--good`,
-#: see render.py's dark `:root` comment) -- high enough to reject the 1.19:1 regression that
+#: see the stylesheet's dark `:root` comment) -- high enough to reject the 1.19:1 regression that
 #: prompted this test, low enough to admit the corrected palette.
 _MIN_SIGNAL_FG_RATIO = {"light": 1.7, "dark": 1.4}
 
@@ -96,7 +99,7 @@ _VAR_RE = re.compile(r"--([a-z-]+):\s*(#[0-9a-fA-F]{6})")
 #: way would poison the parse silently rather than raising.
 _COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
-#: Every token render.py's stylesheet declares text or UI-boundary colour with, in both themes.
+#: Every token the stylesheet declares text or UI-boundary colour with, in both themes.
 _EXPECTED_TOKENS = {
     "bg", "fg", "muted", "line", "card", "accent", "warn", "bad", "good", "control-line",
 }
@@ -153,7 +156,7 @@ def _theme_palette(css: str, *, dark: bool) -> dict[str, str]:
 
 
 def _load_themes() -> tuple[dict[str, str], dict[str, str]]:
-    css = render._STYLE
+    css = _CSS.read_text(encoding="utf-8")
     return _theme_palette(css, dark=False), _theme_palette(css, dark=True)
 
 
@@ -167,7 +170,7 @@ def test_every_token_is_declared_in_both_themes() -> None:
 
 
 def test_text_foregrounds_meet_aa_against_bg_and_card_in_both_themes() -> None:
-    """SC 1.4.3: every colour render.py uses for text (`.good`, `.warn`, `.bad`, `.muted`,
+    """SC 1.4.3: every colour the client uses for text (`.good`, `.warn`, `.bad`, `.muted`,
     nav labels, and `--accent` as button text on its own background) must reach 4.5:1 against
     both surfaces text can sit on -- the page (`--bg`) and a card (`--card`)."""
     for theme_name, palette in zip(("light", "dark"), _load_themes()):
@@ -265,7 +268,7 @@ def test_accent_is_not_good() -> None:
 
 def test_control_border_meets_the_ui_boundary_minimum_in_both_themes() -> None:
     """SC 1.4.11: `.field input, .field select` sit on `--bg` (their own background is the
-    page background, per render.py), so `--control-line` -- the border token this issue adds --
+    page background), so `--control-line` -- the border token this issue adds --
     must reach 3:1 against `--bg` on its own. Before #532 the only boundary was `--line` at
     1.27:1 light / 1.33:1 dark, which is why this is a distinct, higher-contrast token rather
     than a change to `--line` itself."""
@@ -298,7 +301,7 @@ def test_field_input_border_uses_the_control_line_token_not_line() -> None:
     """Belt-and-suspenders on the CSS itself, not just the token's contrast value: this fails
     if `.field input, .field select` is ever pointed back at `var(--line)`, even if `--line`'s
     own hex value happened to reach 3:1 some day by coincidence."""
-    css = render._STYLE
+    css = _CSS.read_text(encoding="utf-8")
     field_rule = re.search(r"\.field input,\s*\.field select\s*\{[^}]*\}", css)
     assert field_rule is not None
     assert "var(--control-line)" in field_rule.group(0)

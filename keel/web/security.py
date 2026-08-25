@@ -58,6 +58,18 @@ _TOKEN_BYTES = 32
 #: a name that silently disables the cookie is worse than a plain name that works.
 SESSION_COOKIE = "keel_session"
 
+#: The request header carrying the CSRF token on a write (#540).
+#:
+#: A HEADER rather than a body field, and the difference is the whole reason this layer still
+#: earns its place now that the write surface is JSON. The token used to ride in a `<form>` as a
+#: hidden input, where its job was to prove the submission came from a page keel rendered. There
+#: is no form any more -- so putting it in the JSON body would prove only that the sender could
+#: read the token, while putting it in a header ALSO proves the sender could set a header, which
+#: a cross-origin form cannot do at all and a cross-origin `fetch` cannot do without surviving a
+#: preflight. The same request now clears `X-Keel-Client` and this by the same mechanism, which
+#: is redundancy rather than duplication: they fail independently.
+CSRF_HEADER = "X-Keel-CSRF"
+
 #: Hostnames that mean "this machine" and are therefore acceptable in a `Host:` header when the
 #: server is bound to a loopback address. Anything else -- including a hostname that RESOLVES to
 #: 127.0.0.1 -- is rejected, which is the entire point of checking the header at all.

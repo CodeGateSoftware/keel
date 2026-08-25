@@ -702,7 +702,20 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     # #435: the web UI is a front-end over the same services and is pinned by the same rules.
     # Named explicitly so that deleting or renaming a web module fails HERE, loudly, rather than
     # quietly shrinking the scanned set and leaving the rules green over less code.
-    assert {"render", "security", "server"} <= stems
+    #
+    # **`render` was in this list and is not any more (#540), and this is where that had to be
+    # noticed.** It worked exactly as intended: deleting the module failed HERE first, and the
+    # replacement had to be named deliberately rather than inherited. The property `render`
+    # carried -- its own docstring called it "a THIRD renderer over the same reports, never a
+    # second place that computes them" -- now belongs to the API layer, which is what turns those
+    # reports into JSON. `api`, `events` and `staticfiles` are named for the same reason `render`
+    # was, and the set is LARGER than before rather than smaller: four web modules pinned where
+    # there were three.
+    assert {"api", "events", "security", "server", "staticfiles"} <= stems
+    assert "render" not in stems, (
+        "keel/web/render.py is back; if that is deliberate it needs a line here, and the reason "
+        "#540 deleted it -- the server generates no markup -- needs revisiting first"
+    )
     # #533: the JSON serialiser joins them. Named here for the same reason and with an extra one:
     # Rule 6 is scoped BY STEM, so a serialiser renamed out of `SERIALISER_STEMS` would keep
     # passing Rules 1-5 while silently losing the money-contract pin entirely.

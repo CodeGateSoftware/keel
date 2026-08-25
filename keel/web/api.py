@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload
+from keel.web.security import csrf_token
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.web.server import ServeConfig
@@ -157,7 +158,8 @@ def read_status(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> di
 def read_setup(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dict[str, Any]:
     """The first-run checklist -- the ONE deployment-reading endpoint that must answer when there
     is no deployment, because it is the thing that says how to make one. `needs_database=False`
-    for that reason, and `server.needs_database` serves the same page in HTML for the same one.
+    for that reason: an endpoint that refused to answer until a deployment existed would refuse
+    precisely the operator who has none.
 
     `state` is the `DeploymentState` the envelope already read for `engine`, passed in rather than
     re-inspected: one 3.6 ms probe per response, not two."""
@@ -165,7 +167,15 @@ def read_setup(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dic
     from keel.commands.setup import ACTIONS, NOT_AUTOMATED_YET
 
     return payload.setup_payload(
-        state, actions=ACTIONS, not_automated=NOT_AUTOMATED_YET, job=jobs.status()
+        state,
+        actions=ACTIONS,
+        not_automated=NOT_AUTOMATED_YET,
+        job=jobs.status(),
+        # The write token for this session, on the one endpoint whose view performs writes. Scoped
+        # to that endpoint rather than put on `/api/config` (which every view reads at boot) so it
+        # travels only to the page that needs it -- see `payload.setup_payload` for why it is in a
+        # body at all, which was a reversal.
+        csrf=csrf_token(cfg.token),
     )
 
 
@@ -605,6 +615,38 @@ def refusal_document(status: int, title: str, detail: str) -> dict[str, Any]:
     happen before admission, and filling in `engine` would mean an unauthenticated request reading
     the deployment state off disk."""
     return payload.error_envelope(int(time.time()), status=status, title=title, detail=detail)
+
+
+def action_document(result: Any) -> dict[str, Any]:
+    """One completed setup action, as JSON (#540).
+
+    **`changed` is the field the client actually needs**, and it is not a success flag: it is the
+    difference between "created" and "already there". `keel.commands.setup`'s own note on it calls
+    it "the property that makes a double-click safe" -- every action is idempotent, so a repeated
+    submission succeeds and reports `changed: false`, which is a true statement about the
+    deployment rather than a soft failure.
+
+    Judged here, in the serialiser, exactly as every other payload value is: the client is handed
+    `display` and `state` and never decides what a result means.
+    """
+    return payload.envelope(
+        int(time.time()),
+        # `running=True` is a statement of fact rather than a probe: this document is built only
+        # after an action has RUN in this process, so the engine's presence is not in question and
+        # re-inspecting the deployment to say so would be one disk probe spent on a known answer.
+        running=True,
+        data={
+            "step_key": str(getattr(result, "step_key", "")),
+            "changed": payload.flag(
+                bool(getattr(result, "changed", False)),
+                on="done",
+                off="already done — nothing to change",
+                on_state=payload.GOOD,
+                off_state=payload.NEUTRAL,
+            ),
+            "message": payload.label(str(getattr(result, "message", ""))),
+        },
+    )
 
 
 def sortable_columns() -> Mapping[str, Sequence[str]]:

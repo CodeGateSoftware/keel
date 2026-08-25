@@ -231,13 +231,24 @@ def test_the_glossary_has_no_api_counterpart(running: web_server.ServeConfig) ->
 def test_the_api_routes_cover_every_html_route_that_reads(
     running: web_server.ServeConfig,
 ) -> None:
-    """The pin that keeps the two surfaces in step. Read off both route tables, so an HTML route
-    added without a JSON counterpart fails here rather than being noticed when a client cannot
-    render it."""
-    html = set(web_server.ROUTES) - {"/glossary"}
+    """**This pin lost its other side at #540, and what is left still earns its place.**
+
+    It compared `server.ROUTES` -- the HTML route table -- against the JSON endpoints, so that a
+    page added without a counterpart failed here. There are no pages. What the comparison was
+    really protecting is that every VIEW the client offers has an endpoint behind it, and that
+    survives: `staticfiles.CLIENT_ROUTES` is the client's own list of views, and every one of them
+    must be covered by an endpoint whose `html_route` names it.
+
+    `/insights` is named by two endpoints (`/api/insights` and `/api/journal`) and that is the
+    server's own decision, recorded in `api.API_ROUTES`; a set comparison absorbs it."""
+    from keel.web import staticfiles
+
+    views = {"/" + name for name in staticfiles.CLIENT_ROUTES}
+    # The client's `status` view is served by the endpoint that named the old landing page `/`.
+    views = {"/" if view == "/status" else view for view in views}
     covered = {web_api.HTML_ROUTE_FOR[name] for name in web_api.API_ROUTES}
 
-    assert html <= covered, html - covered
+    assert views <= covered, views - covered
 
 
 # -- /api/config ----------------------------------------------------------------------------------
@@ -628,19 +639,29 @@ def test_setup_is_answerable_with_nothing_set_up(empty_machine: web_server.Serve
     assert document["data"]["actions"]
 
 
-def test_setup_carries_no_csrf_token(empty_machine: web_server.ServeConfig) -> None:
-    """`render_setup` takes a `csrf` argument; this payload does not, and that is deliberate. A
-    CSRF token authorises a WRITE, this issue ships reads only, and minting one into a read
-    response would put a live write credential into every cached and logged copy of a GET.
+def test_setup_carries_the_csrf_token_and_only_setup_does(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """**This test asserted the opposite until #540, and the reversal is recorded rather than
+    silently applied.** It read: "a CSRF token authorises a WRITE, this issue ships reads only,
+    and minting one into a read response would put a live write credential into every cached and
+    logged copy of a GET."
 
-    Asserted against the token's VALUE and against the key names, not against the substring
-    `"csrf"` in the whole document: the payload echoes `config_path` and `db_path`, and a
-    deployment living in a directory whose name happens to contain those four letters would fail a
-    substring check for a reason that has nothing to do with the contract."""
+    Two of those concerns were already answered -- `/api/*` is `no-store` and the service worker
+    refuses to cache it, and the server binds loopback -- and the third does not survive the
+    observation that this token authorises NOTHING without the session cookie. Anyone who can
+    read this endpoint holds that cookie and can mint the same token. `payload.setup_payload`'s
+    docstring carries the full argument.
+
+    What is still asserted is the scope: the token appears on `/api/setup`, the one endpoint whose
+    view performs writes, and on no other. An endpoint every view reads at boot -- `/api/config`
+    -- would spread a live credential across every page load for no benefit."""
     _status, _headers, document = _json(empty_machine, "/api/setup")
+    assert document["data"]["csrf"] == csrf_token(empty_machine.token)
 
-    assert csrf_token(empty_machine.token) not in json.dumps(document)
-    assert not [path for path, _leaf in _walk(document) if "csrf" in path.lower()]
+    for path in ("/api/config", "/api/status", "/api/venues", "/api/gates"):
+        _status, _headers, other = _json(empty_machine, path)
+        assert csrf_token(empty_machine.token) not in json.dumps(other), path
 
 
 def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
@@ -757,24 +778,34 @@ def test_a_read_from_a_foreign_host_header_is_refused_in_json(
     assert "Refused" in json.loads(body)["error"]["title"]
 
 
-def test_an_html_route_still_refuses_in_html(running: web_server.ServeConfig) -> None:
-    """The other half of the same statement: making `/api/*` speak JSON did not make the rendered
-    pages speak it. A person who opens the URL without the token still gets a readable page."""
+def test_a_navigation_still_refuses_in_something_a_person_can_read(
+    running: web_server.ServeConfig,
+) -> None:
+    """The other half of the same statement: `/api/*` speaks JSON, and a NAVIGATION does not.
+
+    This asserted `text/html` until #540, because `server._refuse` rendered an error page through
+    `render.page`. There is no renderer now -- the server generates no markup at all -- so the
+    refusal is plain text. The property is unchanged and is the one that matters: someone who
+    opens `http://127.0.0.1:8765/` in a browser without the token gets the sentence telling them
+    to use the URL keel printed, not a JSON envelope around it and not an empty page."""
     status, headers, body = _get(running, "/insights")
 
     assert status == 403
-    assert headers["Content-Type"].startswith("text/html")
-    assert "<h1>" in body
+    assert headers["Content-Type"].startswith("text/plain")
+    assert "Open the address keel printed" in body
+    assert "<" not in body, "the refusal is markup again"
 
 
-# -- the write surface did not move ----------------------------------------------------------------
+# -- the read surface answers no write ------------------------------------------------------------
 
 
 @pytest.mark.parametrize("path", API_ROUTES)
-def test_no_api_route_answers_a_post(running: web_server.ServeConfig, path: str) -> None:
-    """This issue ships READS. Every route added here is a 404 for a POST -- reached only after
-    the `X-Keel-Client` gate, which is unchanged -- so nothing below widened what the browser may
-    do."""
+def test_no_api_read_route_answers_a_post(running: web_server.ServeConfig, path: str) -> None:
+    """Every READ endpoint is a 404 for a POST, reached only after the `X-Keel-Client` gate.
+
+    #540 gave this server a write surface under `/api/` for the first time, at
+    `API_SETUP_PREFIX`. This is the pin that keeps it there and only there: not one of the
+    documents below became writable by the prefix acquiring a POST."""
     status, _headers, body = _get(
         running,
         path,

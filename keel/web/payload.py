@@ -1479,6 +1479,16 @@ def _action_input_payload(field: Any) -> dict[str, Any]:
         # a form that can be submitted safely and one that leaks its own contents into browser
         # history. The client is told the answer rather than deriving it from the field's name.
         "secret": flag(field.secret, on="never echoed back", off="shown as typed"),
+        # The SAME fact as `secret`, in the form the client needs to act on rather than to show.
+        #
+        # Two keys for one boolean looks like duplication and is the opposite: `secret` is a
+        # `Field`, and a `Field` is a thing the client DISPLAYS -- Rule 3 of the client's pins
+        # forbids `render.js` from reading `.value` at all, precisely so no view can start
+        # deciding what a payload means. Choosing between `type="password"` and `type="text"` is
+        # not a judgement about a value, it is a rendering instruction, and the server is the one
+        # that gives it. Without this the client would have had to read `secret.value`, which is
+        # the whole rule.
+        "kind": "secret" if field.secret else "text",
         # A closed set of answers, rendered with NOTHING pre-selected: an action that could fill in
         # a field the operator left blank is one that could record something they never supplied.
         "choices": list(field.choices),
@@ -1526,22 +1536,42 @@ def setup_payload(
     actions: Sequence[Any] = (),
     not_automated: Mapping[str, str] | None = None,
     job: Any = None,
+    csrf: str = "",
 ) -> dict[str, Any]:
     """`keel.commands.setup.inspect`'s `DeploymentState`, as JSON.
 
-    **No CSRF token, and that is the point rather than an omission.** `render_setup` takes one
-    because it emits `<form method=post>`; this issue ships reads only, and minting a live write
-    credential into a GET response would put it into every cached copy, every proxy log and every
-    paste of "here is what the API returned". The token is `csrf_token(session)` and it stays where
-    the write is.
+    **`csrf` is here since #540, and an earlier revision of this docstring argued it should not
+    be.** That argument is recorded rather than deleted, because reversing it was a decision:
+
+        "No CSRF token, and that is the point rather than an omission. `render_setup` takes one
+        because it emits `<form method=post>`; this issue ships reads only, and minting a live
+        write credential into a GET response would put it into every cached copy, every proxy log
+        and every paste of 'here is what the API returned'."
+
+    Two of those three concerns were already answered by the time the form was deleted: `/api/*`
+    is `Cache-Control: no-store` and #538's service worker refuses to cache it, so there is no
+    cached copy; and the server binds loopback, so there is no proxy. The third -- an operator
+    pasting API output into an issue -- is real, and it is what settles the question rather than
+    what blocks it: **this token is not a credential on its own.** It authorises nothing without
+    the session cookie, and anyone holding that cookie can read this endpoint and mint the same
+    token for themselves. A paste of it grants exactly what a paste of a random hex string grants.
+
+    What the alternative would have cost is the reason not to be clever here: delivering it in a
+    second, script-readable cookie would take a live token out of a body and put it into
+    `document.cookie`, which is a strictly worse place for it on an origin whose session cookie is
+    deliberately `HttpOnly`.
 
     `actions` and `not_automated` are read from `keel.commands.setup`'s own closed registries and
     copied, never filtered here: an action appears only where the registry carries one, which is
     what stops "attest this asset" appearing because somebody edited a front-end.
+
     """
     from keel.commands.setup import Stage
 
     return {
+        # A bare string, not a `Field`: it is a credential the client SENDS, never a value it
+        # displays, and giving it a `display` would invite exactly that.
+        "csrf": str(csrf),
         "root": str(state.root),
         "config_path": str(state.config_path),
         "db_path": str(state.db_path),
