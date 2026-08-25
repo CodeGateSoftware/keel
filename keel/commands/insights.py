@@ -51,7 +51,6 @@ import click
 from keel import agent as agent_mod
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands.status import StatusReport, _human_age, gather_status
-from keel.commands.tui import _human_dt
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.strategy.paper import track_record
@@ -430,6 +429,20 @@ def build_gate_distance(
         passing=passing,
         blocking_reasons=reasons,
     )
+
+
+def _human_dt(ts: int) -> str:
+    """Local-time `YYYY-MM-DD HH:MM:SS` for a unix timestamp.
+
+    Moved here from `keel/commands/tui.py` at #541, which deleted that module; this was the only
+    use left outside it. **Local time, and deliberately unlabelled**, which is a divergence from
+    every other surface keel has: `keel/web/payload.py::_gmt` renders UTC and says so, because
+    keel's day boundaries are UTC everywhere and rendering in local time is what made the activity
+    feed show a permanently stale "today" (#381). This line is a terminal reading for a person
+    sitting in front of it, where local time is what they mean; the browser is the surface that
+    has to be unambiguous, and it is.
+    """
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 def build_rule_track_record(

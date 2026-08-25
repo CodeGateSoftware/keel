@@ -194,7 +194,6 @@ from keel.commands.trading import (
 )
 from keel.commands.trading import record_flow as record_declared_flow
 from keel.commands.trials import trials_group
-from keel.commands.tui import tui_cmd
 from keel.commands.update import update_cmd
 from keel.commands.versions import versions_cmd
 from keel.commands.withdrawals import withdrawals_group
@@ -1326,20 +1325,23 @@ cli.add_command(status_cmd)
 cli.add_command(doctor_cmd)
 
 
-# -- tui (live, full-screen operator dashboard, with a help menu and a few gated actions) --------
+# -- serve (the interactive surface -- there is one, and it is a browser) ------------------------
 
-# `keel status` was built as the substrate for this: `tui_cmd` is a curses view over the same
-# `gather_status` report, defined in `keel.commands.tui` and registered here.
-cli.add_command(tui_cmd)
-
-
-# -- serve (the same read surface in a browser, for machines and users a TUI cannot reach) -------
-
-# `curses` does not exist in CPython on Windows and a macOS app launched from Finder has no
-# controlling terminal at all, so the TUI is unreachable on both of the platforms a desktop
-# release targets. `keel serve` renders the same reports over loopback HTTP instead: read-only by
-# construction (GET and HEAD are the only verbs it implements), and pinned by the same thinness
-# test as the console layer. Defined in `keel.commands.serve` over `keel.web`.
+# **`keel tui` was here, and #541 deleted it.** `curses` does not exist in CPython on Windows and
+# a macOS app launched from Finder has no controlling terminal at all, so the TUI was unreachable
+# on both of the platforms a desktop release targets -- and `windows-curses`, which papered over
+# the first, is unmaintained. The console layer went with it: it was reachable only from inside
+# the dashboard, so keeping it would have shipped fourteen thousand lines nothing could open.
+#
+# `keel serve` renders the same reports over loopback HTTP: `keel status` was built as the
+# substrate for both, and `gather_status` is still the one report behind them. Defined in
+# `keel.commands.serve` over `keel.web`.
+#
+# What did NOT move is every capability-increasing action. All seven that remain are CLI commands
+# behind `_require_interactive_confirmation`'s typed gate, and the browser can perform none of
+# them -- see `keel/capabilities.py`, which shrank from eleven surfaces to seven when the
+# dashboard's autonomy action and the console's three gated actions went. Each of those four
+# mirrored a CLI command that is still here.
 cli.add_command(serve_cmd)
 
 

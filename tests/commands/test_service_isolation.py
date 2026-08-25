@@ -1,18 +1,21 @@
-"""Architecture pins for the service extraction (issue #387 C1): the shared service layer --
-and `keel.commands.tui`, the console's future consumer -- must be reachable WITHOUT the CLI
-composition root.
+"""Architecture pins for the service extraction (issue #387 C1): the shared service layer must be
+reachable WITHOUT the CLI composition root.
 
 PRD O2: "the TUI renders and dispatches. All behavior comes from the same services the CLI
-calls." That has a structural precondition the UI code cannot be trusted to keep by
+calls." That had a structural precondition the UI code could not be trusted to keep by
 convention: before the extraction, `keel/commands/tui.py` had to lazy-import
 `from keel.cli import _screen_product` inside two functions (an import-cycle dodge), which
-meant the "shared" gate physically lived in the front-end. Two pins keep that shape from
-coming back:
+meant the "shared" gate physically lived in the front-end.
+
+**The TUI is gone (#541) and these pins are not.** The front-end that replaced it -- `keel/web/`,
+and `keel serve` over it -- has exactly the same relationship to the service layer, and the
+failure mode is identical: a service that cannot be imported without the CLI is a service the
+next front-end will have to reach through the CLI. Two pins keep that shape from coming back:
 
 1. `test_services_import_without_the_cli` -- in a fresh interpreter, importing every audited
-   service module AND `keel.commands.tui` must leave `keel.cli` out of `sys.modules`. A fresh
-   interpreter is required because THIS process has `keel.cli` loaded (the parity tests drive
-   it); the check is about the import graph, not any one process's history.
+   service module must leave `keel.cli` out of `sys.modules`. A fresh interpreter is required
+   because THIS process has `keel.cli` loaded; the check is about the import graph, not any one
+   process's history.
 2. `test_no_commands_module_imports_the_cli` -- a source-level scan (AST, module-level
    statements only, so a docstring mentioning `keel.cli` stays legal) asserting no
    `keel/commands/*` module imports the composition root at load time. Function-level lazy
@@ -41,10 +44,8 @@ SERVICE_MODULES = [
     "keel.commands.autonomy",
     "keel.commands.brokers",
     "keel.commands.confirm",
-    "keel.commands.console",
     "keel.commands.db",
     "keel.commands.fetch",
-    "keel.commands.help_console",
     "keel.commands.insights",
     "keel.commands.monitor",
     "keel.commands.pnl",
@@ -55,9 +56,13 @@ SERVICE_MODULES = [
     "keel.commands.subscription",
     "keel.commands.trading",
     "keel.commands.trials",
-    "keel.commands.tui",
     "keel.commands.versions",
     "keel.commands.withdrawals",
+    # `keel.corpus` is not under `keel/commands/`, and is here because it is what #541 kept
+    # when the console layer was deleted: the MCP server reads the research corpora through it,
+    # and an MCP server that could only start after the CLI had loaded would be the exact
+    # coupling this test exists to prevent.
+    "keel.corpus",
 ]
 
 

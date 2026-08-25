@@ -204,9 +204,9 @@ opens the database and reaches the venue.
 
 If the deployment runs on a schedule (LaunchAgents, cron), a new build takes effect on the next
 cycle with nothing to restart — each cycle is a fresh process. A **long-running** process is the
-exception: a `keel tui` left open keeps the build it started with until you quit and relaunch it.
+exception: a `keel serve` left running keeps the build it started with until you stop and restart it.
 
-### Self-update: `keel update` and the console's update view
+### Self-update: `keel update`
 
 The four commands above — plus the per-database `keel migrate --db` step the updater also
 runs (the four commands don't include it; it runs for every `keel*.db` with the new build,
@@ -272,18 +272,16 @@ run: the wheels would land in a venv that is not this deployment's), or an insta
 is not the wheels. From a checkout, this section's four commands by hand
 remain the procedure.
 
-**The relaunch split.** On a verified success the **TUI relaunches itself** — it replaces its
-own process with the new build's `keel` entry (`os.execv`, the terminal restored first, the
-original invocation's arguments carried over VERBATIM after argv[0] — wrappers that exec
-`keel --config X --db Y tui` relaunch with exactly those flags in that order; only a wrapper
-invoked with no arguments at all relaunches as plain `keel tui`), because a console left
-running would keep the replaced
-binary it started with. A relaunch that cannot exec at all renders the manual `keel tui` start
-and holds it for an Enter retry that re-installs nothing. The **CLI prints the command instead**
-and does NOT relaunch anything:
-`keel update` ends by telling you to run `keel tui` (or your deployment wrapper). A wrapper
-invoked directly (`./keel-live tui`) relaunches through the venv's `keel` entry with the same
-flags.
+**Nothing relaunches itself, and there used to be one thing that did.** On a verified success
+`keel update` prints what to restart and stops there. Until #541 the TUI replaced its own process
+with the new build's `keel` entry (`os.execv`, the terminal restored first), because a curses
+front-end left running keeps the build it started with and there was no other way to pick up a new
+one without the operator noticing. That code went with the dashboard, and its fallback had already
+become wrong: with no arguments to carry it rebuilt `keel tui`, a command that no longer exists.
+
+A long-running `keel serve` has the same property -- it keeps the build it started with -- and
+needs no execv to fix it: stop it and start it again, and the browser tab reconnects to whatever is
+listening.
 
 **The manual fallback is unchanged.** The four commands at the top of this section still work
 and remain the documented procedure when uv is absent, the API is rate-limiting, or you simply
@@ -324,8 +322,7 @@ database — do not delete them while keel is running, and prefer `keel update`'
 SQLite's own online-backup API) over copying the `.db` file by hand. Conversion happens on the
 next connection and needs nothing from you.
 
-**Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel tui`,
-`keel serve`) the
+**Which one am I looking at.** On any dashboard (`keel status`, `keel insights`, `keel serve`) the
 `equity_state_mode` line names the account the equity, high-water mark and drawdown figures
 describe, and `paper_cash_usdc` is printed in paper mode only. On the command line it is the
 `--config`/`--db` pair — and `--db` is the one that bites, because `keel.db` is its default, so a
@@ -336,10 +333,9 @@ account. Live commands always carry both:
 keel --config config.live-sandbox.yaml --db keel-live.db status
 ```
 
-**The same view in a browser: `keel serve`.** `keel tui` needs a terminal, and there are two
-places it cannot go — Windows, where CPython ships no `curses`, and a macOS app launched from
-Finder, which has no controlling terminal at all. `keel serve` renders the same reports over
-loopback HTTP instead:
+**The same view in a browser: `keel serve`.** This is the only interactive surface keel has; the
+curses dashboard it replaced was deleted at #541, for reasons the console section below records.
+`keel serve` renders the same reports over loopback HTTP:
 
 ```bash
 keel --config config.live-sandbox.yaml --db keel-live.db serve
@@ -684,84 +680,42 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 - **Trademark posture** — unchanged and stated where it lives: the README's standing
   disclaimer covers Alpaca alongside every other venue, and nothing here duplicates it.
 
-## The TUI console
+## The operator console, in a browser
 
-`keel tui` (or any wrapper, e.g. `./keel-live tui`) opens the **operator console**: the dashboard is
-still the landing screen, and `m` opens a menu tree over it — Profile, Trading, Rules, Compliance,
-Data, Research, Account, Help — covering every operational read and write the CLI knows (the
-setup-only writes are deliberately absent: `rules seed` is bootstrap, and schema migration rides
-along every database open rather than being a menu action). The console
-is **thin by construction**: each entry dispatches to the same `keel/commands/*` service layer the
-CLI commands call, and an architectural test (`tests/commands/test_console_thinness.py`) pins that
-the TUI layer contains no business logic — no sizing, screening, gating or reporting math, no
-`Decimal` arithmetic beyond display, and no broker construction outside the service seams. If a
-feature is missing, the fix lands in the service layer and both front-ends get it.
+`keel serve` opens keel's **operator console**: a local web page showing Status, Setup, Activity,
+Insights, Rules, Venues and Gates, over the same `keel/commands/*` service layer the CLI commands
+call. An architectural test (`tests/commands/test_console_thinness.py`) pins that thinness -- the
+front-end renders and dispatches, and every behaviour comes from the services.
 
-**Profile switching and the live guard.** The Profile menu lists every deployment as its config+db
-**pair** — the same pairs the table above pins — and switching rebinds both halves everywhere, in
-one action: every screen, banner and read answers about the new deployment on the next paint.
-Selecting **LIVE** asks an explicit y/N at the terminal first; declining keeps the binding exactly
-where it was, and no key path can rebind around that confirm (the one guarded entry point is
-pinned by test). The switch rebinds the **console only** — a `keel agent` process keeps the pair
-its own command line gave it, so pointing the console at live never changes what a running agent
-trades. Binding a deployment directly through the CLI's `--config`/`--db` flags remains the
-wrappers' documented path.
+```bash
+keel --config config.live-sandbox.yaml --db keel-live.db serve
+```
 
-**The session banner.** Every screen's header names the active deployment (LIVE styled
-unmistakably) and the market session state with the venue clock — OPEN/CLOSED with the recorded
-next open/close, `24/7` for always-open venues, and **CLOCK UNAVAILABLE** rendered fail-loud when
-the recorded clock is absent or stale, exactly as `fetch --check` treats it. The banner reads the
-recorded session state; there is no TUI-side calendar.
+It binds loopback and prints a URL carrying a one-time token for that run. The token is never
+written to disk, so stopping the server invalidates it.
 
-**The typed contracts: seven of the CLI's own, two the console adds.** Seven actions run the
-CLI's own typed prompt in-console, word for word (curses suspends around it so the prompt
-renders at the terminal): `resume`, `resume-entries`, `record-flow`, `reset-hwm`,
-`withdrawals attest --enabled`, `autonomy on`, and `update` (the self-update run — the same
-gate `keel update` demands; see "Self-update" under "Deploying a new version") — each the same
-`_require_interactive_confirmation` gate the CLI command runs, demanding a typed `yes` and
-failing closed off a TTY. Two more typed prompts are **ceremony the console adds on top of
-an ungated CLI action** — deliberately *stricter* than the CLI, not identical to it: asset
-`attest` makes you type the **asset code** back (the CLI's `keel assets attest` is not
-gated — an attestation only ever admits to a list rail 1 still enforces per-trade), and the
-retry flow's `rules promote --force` demands a typed `yes` quoting the CLI's own force
-warning (the CLI's `--force` is a bare flag). Both are built on the same shared
-typed-confirmation gate as the CLI's six. Every typed prompt **cannot be pre-filled, piped
-or bypassed**; a wrong phrase or a decline writes nothing. `kill` is the deliberate
-exception: **one key, no confirmation**, its own CLI contract — engaging the halt is the
-safe direction — and the console adds no ceremony to it. The whole ceremony map (every
-state-mutating console action → typed-phrase / confirm-step / ARMED+Enter /
-ungated-by-design, each with its refusal proof) is pinned as a table-driven suite,
-`tests/commands/test_console_ceremony.py`, so a newly added mutating action without a
-classified ceremony row fails the tests.
+**`keel tui` was the console until #541, and it is gone.** It needed a terminal, and there were two
+places it could not go: Windows, where CPython ships no `curses`, and a macOS app launched from
+Finder, which has no controlling terminal at all -- both of them platforms a desktop release
+targets. The menu tree it carried (Profile, Trading, Rules, Compliance, Data, Research, Account,
+Help) went with it, along with roughly 24,000 lines of code and tests.
 
-**ARMED and blocking surfaces.** The runs that do real work — one agent cycle, one monitor poll,
-fetch and its check/repair variants, one simulate — open **ARMED**: nothing runs until Enter,
-which is the confirm step. While a run executes the screen freezes (it can take minutes, exactly
-like the CLI) and the result is held on screen afterwards. **Ctrl-C exits the console
-gracefully, discards held results, and the in-flight run does not complete** — as every frozen
-screen states; the interrupt propagates out of the run itself (the loop's failure handlers
-catch `Exception` only), which is what restores the terminal cleanly. The one entry that can
-place orders, the agent cycle, goes through `agent.run_once` with the CLI's own
-order-confirmation gate — there is no TUI-originated order path.
+**On a headless host, forward the port rather than reaching for a terminal UI:**
 
-**Venues and help.** The Profile menu's **Venues** entry browses every installed adapter and its
-declared capabilities — the same payload `keel brokers list` prints, one service, both
-front-ends — with the selected adapter highlighted; no key presence is read or implied, and no
-secret is ever shown. `?` on any screen opens that screen's own "what am I looking at" help, and
-the Help menu holds the glossary (one source, `docs/glossary.md`, the fiqh terms anchored to
-`docs/fiqh-basis.md`), every screen's rows consolidated, and the per-rule-parameter help rendered
-from the rule classes themselves.
+```bash
+ssh -L 8765:127.0.0.1:8765 your-host
+```
 
-**Safety design notes.** Re-entering any sub-menu resets its cursor to the top — a remembered
-row is a loaded one (leave Trading with the cursor on kill and a replayed Enter would engage the
-halt with no ceremony). The Account menu's pnl (the FIFO report over imported transactions, with
-an honest empty state until `keel db import` has loaded any) and versions (the deploy check)
-entries are read-only views; the branch's **one** write path is the update entry (issue #415) —
-an ARMED view whose run demands the CLI's own typed gate, and which on a verified success
-relaunches the console on the new build ("Self-update" under "Deploying a new version" is its
-procedure). The console runs no loop of its own and schedules
-nothing: it is a front-end over the same services, and closing it never stops a deployment's own
-scheduled cycles.
+The browser at the reading end gets the full interface, encrypted by SSH, and `http://127.0.0.1`
+is still a secure context there -- which is what makes the installable app work. `keel status`
+covers the rest from a plain shell.
+
+**What the browser cannot do, and that is deliberate.** Every capability-increasing action --
+arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
+drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, and
+replacing the binary -- is a CLI command behind a typed confirmation at an interactive terminal.
+`keel capabilities` lists all seven with the gate covering each. The server implements no verb
+that would reach one, so this is a property of the server rather than of what the page draws.
 
 ## How much money moves
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,8 +20,6 @@ from click.testing import CliRunner
 
 from keel.cli import cli
 from keel.commands import brokers
-from keel.commands import console as console_mod
-from keel.config import load_config
 
 #: Every field the payload may carry -- the closed capability vocabulary. A field outside
 #: this set (an env read, a key-presence probe, a config content) is a scope violation,
@@ -246,50 +243,7 @@ def test_a_poisoned_registry_entry_renders_an_error_row_and_keeps_the_rest(
     assert "healthy" in text and "ok-venue" in text
 
 
-def test_a_poisoned_registry_entry_does_not_crash_the_cli_nor_the_venues_browser(
-    monkeypatch: Any,
-) -> None:
-    """Both front-ends render the SAME resilient payload: the CLI exits 0 with the error
-    row and the healthy row, and the console's Venues browser (the TUI's rendering of
-    the service) renders both within the 80-column clip -- a broken adapter is a row on
-    a screen, never a dead console."""
-    _poison_the_registry(monkeypatch)
-    result = CliRunner().invoke(cli, ["brokers", "list"])
-    assert result.exit_code == 0, result.output
-    assert "broken" in result.output and "adapter metadata unreadable" in result.output
-    assert "healthy" in result.output
-
-    infos = brokers.list_installed_brokers()
-    lines = console_mod.build_venues_lines(
-        infos,
-        selected_venue="healthy",
-        profile=None,
-        binding_pair=None,
-    )
-    texts = [line.text for line in lines]
-    joined = "\n".join(texts)
-    assert "broken" in joined and "adapter metadata unreadable" in joined
-    assert "healthy" in joined and "ok-venue" in joined
-    assert all(len(text) <= 80 for text in texts)
-
-
 # -- the wired/optional classification is pinned to the tracked configs ----------------------------
-
-
-def test_the_wired_set_is_what_the_tracked_configs_actually_select() -> None:
-    """[review #406] Drift guard: `WIRED_FOR_DEPLOYMENT` is a hand-maintained constant,
-    so it is derived HERE from the tracked config files' own `broker.name` selections --
-    loaded the way the profile convention loads them (`load_config`, whose absent
-    `broker:` section means coinbase) and unioned. A newly wired adapter with a tracked
-    config fails this test until the constant (and its reasoning comment) is updated."""
-    root = Path(__file__).resolve().parents[2]
-    configs = sorted(root.glob("config*.yaml"))
-    found = {path.name for path in configs}
-    assert found >= {
-        profile.config_path for profile in console_mod.KNOWN_PROFILES
-    } | {"config.yaml"}, found
-    selected = {load_config(path).broker.name for path in configs}
-    assert brokers.WIRED_FOR_DEPLOYMENT == frozenset(selected)
 
 
 # -- the CLI (O7): `keel brokers list` --------------------------------------------------------
@@ -324,103 +278,12 @@ def test_brokers_list_help_carries_the_readme_trademark_line() -> None:
     )
 
 
-# -- the TUI Venues browser (O7): under Profile, over the same service ---------------------------
+# The Venues-browser section stood here: `_venues_lines` and five tests over
+# `console.build_venues_lines`, the TUI's rendering of the same service `keel brokers list`
+# renders. #541 deleted the console layer, so the renderer is gone and its tests with it.
+#
+# The SERVICE is untouched and still covered above -- `list_installed_brokers` is what both
+# front-ends always called, and `keel brokers list` is the surface that remains. What is no
+# longer asserted is a second rendering of it, because there is no second rendering.
 
 
-def _venues_lines(selected: str = "alpaca") -> list[str]:
-    infos = brokers.list_installed_brokers()
-    lines = console_mod.build_venues_lines(
-        infos,
-        selected_venue=selected,
-        profile=console_mod.active_profile(
-            "config.paper-equities.yaml", "keel-equities.db"
-        ),
-        binding_pair=("config.paper-equities.yaml", "keel-equities.db"),
-        endpoint="paper",
-        data_feed="iex",
-    )
-    return [line.text for line in lines]
-
-
-def test_the_venues_browser_renders_the_service_rows_with_one_selected_mark() -> None:
-    texts = _venues_lines()
-    joined = "\n".join(texts)
-    for info in brokers.list_installed_brokers():
-        assert info.name in joined, info.name
-    selected_rows = [t for t in texts if "[selected]" in t]
-    assert len(selected_rows) == 1 and "alpaca" in selected_rows[0]
-
-
-def test_the_venues_browser_shows_the_active_deployments_binding() -> None:
-    joined = "\n".join(_venues_lines())
-    assert "config.paper-equities.yaml + keel-equities.db" in joined
-    assert "endpoint paper" in joined
-    assert "data feed iex" in joined
-
-
-def test_the_venues_browser_and_the_cli_render_one_service_payload() -> None:
-    """THE O7 acceptance pin: both front-ends over one payload. The browser's rows are
-    built from the service's return, and the CLI's `--json` is the same return asdict-ed
-    -- asserted in one place so a front-end that starts sourcing its own data fails here."""
-    infos = brokers.list_installed_brokers()
-    lines = console_mod.build_venues_lines(
-        infos,
-        selected_venue="coinbase",
-        profile=console_mod.active_profile("config.paperforward.yaml", "keel.db"),
-        binding_pair=("config.paperforward.yaml", "keel.db"),
-        endpoint=None,
-        data_feed=None,
-    )
-    joined = "\n".join(line.text for line in lines)
-    for info in infos:
-        assert info.name in joined
-        # the capability FACTS the CLI json carries appear in the browser's rows
-        assert info.deployment in joined
-        for quote in info.quote_currencies:
-            assert quote in joined
-        if info.preview != "none":
-            assert info.preview in joined
-    result = CliRunner().invoke(cli, ["brokers", "list", "--json"])
-    assert json.loads(result.output) == _service_payload()
-
-
-def test_the_venues_browser_renders_no_secret_material() -> None:
-    """The browser's ROWS carry no secret vocabulary -- the one line that may say the
-    word "secret" is the posture note itself (`NO_KEY_INFERENCE_LINE`), which is the
-    honesty statement, not material."""
-    import textwrap
-
-    posture = set(textwrap.wrap(brokers.NO_KEY_INFERENCE_LINE, width=78))
-    posture |= set(
-        textwrap.wrap(
-            brokers.NO_KEY_INFERENCE_LINE, width=78, initial_indent="", subsequent_indent=""
-        )
-    )
-    texts = [t for t in _venues_lines() if t not in posture]
-    joined = "\n".join(texts).lower()
-    for needle in ("api_key", "apikey", "secret", "password", "credential", "passphrase"):
-        assert needle not in joined, needle
-
-
-def test_the_venues_browser_fits_the_80_column_clip() -> None:
-    for text in _venues_lines(selected="coinbase") + _venues_lines(selected="alpaca"):
-        assert len(text) <= 80, text
-
-
-def test_the_profile_menu_lists_the_venues_entry_under_the_deployments() -> None:
-    profiles = [p for p in console_mod.KNOWN_PROFILES if p.key != "live"]
-    lines = console_mod.build_profile_menu_lines(profiles, cursor=0, binding_pair=None)
-    texts = [line.text for line in lines]
-    assert any("Venues" in t for t in texts), texts
-    # the Venues entry rides BELOW the deployments (the PRD tree: Profile -> Venues)
-    venues_at = next(i for i, t in enumerate(texts) if "Venues" in t)
-    last_profile_at = max(i for i, t in enumerate(texts) if "config.paperforward.yaml" in t)
-    assert venues_at > last_profile_at
-
-
-def test_the_venues_browser_states_its_no_inference_posture() -> None:
-    """Capability display, not key-presence inference: the screen SAYS so, so an operator
-    does not read 'wired' as 'my keys are set up'."""
-    joined = "\n".join(_venues_lines())
-    assert "capabilit" in joined.lower()
-    assert "no key" in joined.lower()

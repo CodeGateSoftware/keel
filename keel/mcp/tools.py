@@ -54,7 +54,7 @@ TRIALS_MAX_TAIL = 100
 #: damage onward -- a tool response is not the place to restate every one of them.
 TRIALS_MAX_CHAIN_ERRORS = 20
 
-#: The corpora `keel.commands.research_console.corpus_path` resolves -- repeated here only so
+#: The corpora `keel.corpus.corpus_path` resolves -- repeated here only so
 #: the schema an MCP client sees can enumerate them.
 CORPORA = ("research", "experiments", "reports")
 
@@ -310,7 +310,7 @@ def build_tools(
         }
 
     def _reports(args: dict[str, Any]) -> dict[str, Any]:
-        from keel.commands.research_console import corpus_path, list_documents, read_document_lines
+        from keel.corpus import corpus_path, list_documents, read_document_lines
 
         corpus = str(args.get("corpus") or "research")
         if corpus not in CORPORA:
