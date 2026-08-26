@@ -67,6 +67,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -481,6 +482,31 @@ class RobinhoodAdapter:
                 f"robinhood does not support order kind {spec.kind!r} "
                 f"(supported: {', '.join(sorted(_CAPABILITIES.supported_orders))})"
             )
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """One pair's minimum order increment, from `trading_pairs/`.
+
+        Robinhood reports `min_order_size` for a pair, which is the same fact
+        `base_increment` names on Coinbase: the finest base quantity the venue will accept. The
+        port's field keeps keel's name for it, not the venue's, exactly as `BracketGTC` keeps
+        `take_profit_price` rather than Coinbase's `limit_price`.
+
+        `None` for an unlisted symbol or an unusable value -- see the port's docstring for why
+        that is an answer rather than an error.
+        """
+        response = self._require_transport().get_trading_pairs(symbol=product_id)
+        for raw in _results(response):
+            if _field(raw, "symbol") != product_id:
+                continue
+            size = _field(raw, "min_order_size")
+            if size is None:
+                return None
+            try:
+                value = Decimal(str(size))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            return Instrument(product_id=product_id, base_increment=value) if value > 0 else None
+        return None
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Synthesise a preview. Always `synthetic=True` -- there is no preview endpoint here.

@@ -34,6 +34,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -145,6 +146,17 @@ class FakeAdapter:
             Balance(currency="USD", available=Decimal("1000"), total=Decimal("1000")),
             Balance(currency="BTC", available=Decimal("0.5"), total=Decimal("0.75")),
         ]
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """A fixed satoshi-grained increment for anything, and `None` for one reserved id.
+
+        The reserved id is the point: `None` is a documented answer of this port method ("this
+        venue does not list it"), and a fake that could only ever answer with an Instrument would
+        let the conformance suite pass without any adapter ever exercising the absent case.
+        """
+        if product_id == "NOT-LISTED":
+            return None
+        return Instrument(product_id=product_id, base_increment=Decimal("0.00000001"))
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         """This venue has no preview endpoint and does not estimate one.

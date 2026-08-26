@@ -13,6 +13,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -127,6 +128,23 @@ class Broker(Protocol):
     ) -> list[Candle]: ...
 
     def get_balances(self) -> list[Balance]: ...
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """One product's venue-imposed granularity, or `None` if this venue does not list it.
+
+        **`None` is an answer, not a failure, and that is why this differs from `get_order`.** An
+        order id is one the caller was handed by this venue, so its absence is a genuine
+        inconsistency worth raising on. A product id arrives from an operator's config allowlist
+        and may simply not be listed here -- a perfectly ordinary fact about a venue, and the one
+        a multi-venue deployment most needs to be able to ask without catching an exception.
+
+        Raise for anything that is a real failure: an unreachable venue, a refused credential, a
+        response that cannot be parsed. `executor._base_increment_for` treats every one of those
+        the same way it treats `None` -- unknown, send the quantity unquantized, never refuse the
+        exit -- but that is the CALLER's policy about its own path, not a licence for an adapter
+        to swallow errors on its behalf.
+        """
+        ...
 
     def preview_order(self, spec: OrderSpec) -> Preview: ...
 

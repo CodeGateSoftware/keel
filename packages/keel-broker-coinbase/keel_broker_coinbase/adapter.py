@@ -26,6 +26,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -137,6 +138,33 @@ class CoinbaseAdapter:
     def _reject_unsupported(self, spec: OrderSpec) -> None:
         if spec.kind not in _CAPABILITIES.supported_orders:
             raise UnsupportedOrder(f"coinbase does not support order kind {spec.kind!r}")
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """One product's `base_increment`, read from Coinbase's per-product endpoint.
+
+        `get_product` rather than `get_products`: the caller
+        (`executor._base_increment_for`) needs ONE product and caches ONE, and asking the venue
+        for the whole catalogue -- about 900 rows -- inside the order-placement path to use a
+        single field of it is the wrong shape. The transport has carried `get_product` since
+        before this method existed.
+
+        `None` for a product this venue does not list, or whose `base_increment` is missing,
+        unparseable or non-positive. All four are the same fact to a caller -- no usable
+        granularity -- and none of them is an error worth raising on: a product id comes from an
+        operator's allowlist and may simply not be listed here.
+        """
+        response = self._require_transport().get_product(product_id)
+        raw = _field(response, "product", response)
+        increment = _field(raw, "base_increment")
+        if increment is None:
+            return None
+        try:
+            value = Decimal(str(increment))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return Instrument(product_id=product_id, base_increment=value)
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Preview via Coinbase's own endpoint -- hence `synthetic=False`."""
