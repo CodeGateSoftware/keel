@@ -490,6 +490,50 @@ jobs:
       # Checksums AFTER (the sums must cover the signed bytes -- a checksum of an unsigned
       # binary that is then signed proves nothing about what the user downloads).
 
+      # ── WHETHER THIS LEG CAN SIGN, DECIDED IN A STEP AND NOT IN AN `if:` ────────────────────
+      #
+      # **`secrets` is not a context GitHub allows in a step-level `if:`.** The four signing
+      # steps below were written as `if: runner.os == 'macOS' && secrets.X != ''`, which GitHub
+      # rejects at PARSE time with "Unrecognized named-value: 'secrets'" -- so the whole file was
+      # invalid from the moment #512 landed it, `Release` never appeared as a dispatchable
+      # workflow, and every push recorded a failed run named after the file path rather than
+      # after `name: Release`. It read as CI noise for three days.
+      #
+      # The usual fix is a job-level `env:` block, because `env` IS allowed in `if:`. That is
+      # rejected here: it would put every signing certificate and notarisation key into the
+      # environment of EVERY step in this job, including `uv sync` and the PyInstaller build,
+      # which is precisely the exposure #512's "protected signing environment" exists to avoid.
+      #
+      # So the secrets stay scoped to the one step that reads them, and what leaves that step is
+      # a boolean. `shell: bash` because this runs on both macOS and Windows runners and the
+      # default on Windows is pwsh; `-n` on the quoted expansions is the whole test.
+      - name: Can this leg sign?
+        id: signing
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_KEY_CONTENT }}
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          macos=no
+          if [ -n "$MACOS_CERT_P12_BASE64" ] && [ -n "$MACOS_CERT_PASSWORD" ] \
+             && [ -n "$APP_STORE_CONNECT_KEY_ID" ] && [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] \
+             && [ -n "$APP_STORE_CONNECT_KEY_CONTENT" ]; then
+            macos=yes
+          fi
+          windows=no
+          if [ -n "$WINDOWS_CERT_PFX_BASE64" ] && [ -n "$WINDOWS_CERT_PASSWORD" ]; then
+            windows=yes
+          fi
+          # Only ever yes/no reaches an output. An output is not a secret and is visible in the
+          # run's API payload, so nothing derived from the certificates themselves goes here.
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+          echo "windows=$windows" >> "$GITHUB_OUTPUT"
+
       # macOS: Developer ID Application certificate (p12) + App Store Connect API key (the
       # notarytool credential). Sign with the hardened runtime notarisation requires,
       # notarise the app and the dmg (--wait, so a Rejected submission fails the step),
@@ -497,10 +541,7 @@ jobs:
       # macos_app.sh produced carries a READ ME that explains Gatekeeper refusals, and a
       # signed build must not ship a note about a warning it no longer triggers.
       - name: Sign, notarise and staple (macOS)
-        if: >-
-          runner.os == 'macOS' && secrets.MACOS_CERT_P12_BASE64 != '' &&
-          secrets.MACOS_CERT_PASSWORD != '' && secrets.APP_STORE_CONNECT_KEY_ID != '' &&
-          secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APP_STORE_CONNECT_KEY_CONTENT != ''
+        if: runner.os == 'macOS' && steps.signing.outputs.macos == 'yes'
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -595,19 +636,14 @@ jobs:
       # every missing secret and the product that unlocks them -- the #402 discipline, so a
       # future reader of a green run learns signing was SKIPPED, not forgotten.
       - name: "Notice: macOS signing skipped"
-        if: >-
-          runner.os == 'macOS' && (secrets.MACOS_CERT_P12_BASE64 == '' ||
-          secrets.MACOS_CERT_PASSWORD == '' || secrets.APP_STORE_CONNECT_KEY_ID == '' ||
-          secrets.APP_STORE_CONNECT_ISSUER_ID == '' || secrets.APP_STORE_CONNECT_KEY_CONTENT == '')
+        if: runner.os == 'macOS' && steps.signing.outputs.macos != 'yes'
         run: |
           echo "::notice::macOS build shipped UNSIGNED -- signing, notarisation and stapling are implemented in this workflow but skipped: the Apple credentials are not configured. Notarisation requires the \$99/yr Apple Developer Program (a Developer ID Application certificate, plus an App Store Connect API key for notarytool). To activate: Settings > Environments > 'signing' > add repository secrets MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_CONTENT -- the full checklist is in docs/desktop-install.md. Until then the artifacts carry build attestations and SHA256SUMS instead."
 
       # Windows: sign the setup.exe ONLY (the zip cannot carry a signature). RFC 3161
       # timestamping is not optional: an untimestamped signature dies with the certificate.
       - name: Sign the installer (Windows)
-        if: >-
-          runner.os == 'Windows' && secrets.WINDOWS_CERT_PFX_BASE64 != '' &&
-          secrets.WINDOWS_CERT_PASSWORD != ''
+        if: runner.os == 'Windows' && steps.signing.outputs.windows == 'yes'
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
@@ -641,9 +677,7 @@ jobs:
           "signed $($setup.Name)"
 
       - name: "Notice: Windows signing skipped"
-        if: >-
-          runner.os == 'Windows' && (secrets.WINDOWS_CERT_PFX_BASE64 == '' ||
-          secrets.WINDOWS_CERT_PASSWORD == '')
+        if: runner.os == 'Windows' && steps.signing.outputs.windows != 'yes'
         run: |
           echo "::notice::setup.exe shipped UNSIGNED -- signing is implemented in this workflow but skipped: the Windows certificate is not configured. An OV code-signing certificate costs ~\$70-500/yr from a CA (SSL.com, Certum, Sectigo) or Azure Trusted Signing is \$9.99/mo (~\$120/yr); since 2024 an EV certificate no longer buys an instant SmartScreen pass, so EV is not worth paying extra for. To activate: Settings > Environments > 'signing' > add repository secrets WINDOWS_CERT_PFX_BASE64 and WINDOWS_CERT_PASSWORD -- the full checklist is in docs/desktop-install.md. Until then the artifacts carry build attestations and SHA256SUMS instead."
 
