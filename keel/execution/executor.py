@@ -63,7 +63,7 @@ would cut the long winners the system exists to let run. `scale_out` stays unwir
 `trade_outcomes` row so rail 16 does not count a scaled-out winner as a loss).
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
-available balance of the PRODUCT's quote leg from `broker.get_accounts()` and hands
+available balance of the PRODUCT's quote leg from `broker.get_balances()` and hands
 it to `guards.check` via `OrderIntent.available_quote` -- guards itself has no broker access, by
 design. This happens *before* `guards.check` runs (the balance is an input to the rail, not
 something guarded itself), so it is the one broker call this module makes ahead of the guard
@@ -411,7 +411,7 @@ def _coerce_increment(raw: object) -> Decimal | None:
 
 
 def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal | None:
-    """Live available balance of `quote_currency` from `broker.get_accounts()`.
+    """Live available balance of `quote_currency`, from the port's `get_balances()`.
 
     `quote_currency` is the **product's own settlement leg** (`BTC-USD` -> `USD`), not
     `config.quote_currency`: the currency an order spends is a property of the product. Checking
@@ -432,7 +432,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
         # that is expected and already handled (rail 13 is skipped offline).
         return None
     try:
-        accounts = broker.get_accounts()
+        balances = broker.get_balances()
     except Exception:
         # `log_venue_failure`, not `log_exception`: an unreachable venue outside a trade cycle
         # is a dashboard balance refresh on a sleeping laptop, and this line is the SECOND
@@ -444,22 +444,14 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
         log_venue_failure(logger, "executor.quote_fetch_failed", quote_currency=quote_currency)
         return None
 
-    for account in accounts or []:
-        currency = (
-            account.get("currency")
-            if isinstance(account, dict)
-            else getattr(account, "currency", None)
-        )
-        if (currency or "").upper() != quote_currency.upper():
-            continue
-        balance = (
-            account.get("available_balance")
-            if isinstance(account, dict)
-            else getattr(account, "available_balance", None)
-        )
-        if balance is None:
-            return None
-        return balance if isinstance(balance, Decimal) else Decimal(str(balance))
+    # ONE shape, since #524. This probed for two -- a dict key or an attribute, `currency` or
+    # `.currency`, `available_balance` or `.available_balance` -- because it did not know whether
+    # it held the pre-port `CoinbaseClient` or a port adapter. `CoinbaseClient.get_balances` now
+    # answers in the port's `Balance` type as well, so there is one question and one answer, and
+    # the fork that existed only to bridge them is gone.
+    for balance in balances or []:
+        if balance.currency.upper() == quote_currency.upper():
+            return balance.available
 
     return None
 
