@@ -53,6 +53,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -362,6 +363,24 @@ class AlpacaAdapter:
                 f"alpaca does not support order kind {spec.kind!r} "
                 f"(supported: {', '.join(sorted(_CAPABILITIES.supported_orders))})"
             )
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """Not written yet, and that is a statement about this ADAPTER, not about Alpaca.
+
+        Alpaca has an assets endpoint (`/v2/assets/{symbol}`) carrying exactly this -- whether a
+        symbol is fractionable and its minimum trade increment. This adapter's `Transport`
+        protocol does not declare it, so there is nothing here to read it through, and adding one
+        is a change to the transport contract rather than a line in this method.
+
+        `NotImplementedError` rather than `None`. `None` is the port's word for "this venue does
+        not list that product", and answering it here would tell a caller a symbol is unlisted
+        when the truth is that nobody has written the lookup -- which on the executor's path
+        means silently skipping quantization for every equity.
+        """
+        raise NotImplementedError(
+            "keel-broker-alpaca has no product-catalogue read: Transport declares no assets "
+            "endpoint. See #524."
+        )
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Synthesize a preview. Always `synthetic=True` -- Alpaca has no preview

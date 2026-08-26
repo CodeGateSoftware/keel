@@ -135,6 +135,43 @@ class Balance:
 
 
 @dataclass(frozen=True)
+class Instrument:
+    """One tradeable product's venue-imposed granularity.
+
+    **Why this exists at all.** `executor._base_increment_for` (#516) needs the finest `base_size`
+    a venue will accept, and reads it today by calling `broker.list_products()` and picking
+    through raw dicts for `product_id` and `base_increment`. That is the pre-port
+    `CoinbaseClient`'s shape, and it is one of the two gaps #524 names as the reason the live path
+    cannot move onto the port: the port had no catalog read at all.
+
+    **One product, not the catalogue, and that is the caller's own argument.** `list_products`
+    returns every product the venue lists -- about 900 on Coinbase -- and
+    `_base_increment_for` caches exactly ONE of them per miss, because `Repository.set_state`
+    commits per call and caching all of them would mean ~900 fsyncs inside the order-placement
+    path. A port method shaped like the caller's need lets an adapter ask the venue for one
+    product where the venue supports that, and filter locally where it does not.
+
+    **Only `base_increment`, for now.** Quote-side granularity and minimum sizes are the same
+    class of fact and would sit here naturally, but nothing reads them yet, and a field no caller
+    reads is a field no test meaningfully checks.
+    """
+
+    product_id: str
+    #: The venue's finest acceptable `base_size` for this product. Always positive: an adapter
+    #: that cannot obtain a usable value returns `None` from `get_instrument` rather than
+    #: constructing an Instrument carrying zero, which a caller would quantize against and get
+    #: a division error or a silent zero size.
+    base_increment: Decimal
+
+    def __post_init__(self) -> None:
+        if self.base_increment <= 0:
+            raise ValueError(
+                f"base_increment must be positive, got {self.base_increment} for "
+                f"{self.product_id}"
+            )
+
+
+@dataclass(frozen=True)
 class Preview:
     """What the human approves at the confirm gate (`executor.py:311`).
 
@@ -204,6 +241,7 @@ class FeeSummary:
 
 __all__ = [
     "Balance",
+    "Instrument",
     "CancelOutcome",
     "FeeSummary",
     "MarketSchedule",

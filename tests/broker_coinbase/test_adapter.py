@@ -46,6 +46,7 @@ class FakeTransport:
         placed: dict[str, Any] | None = None,
         summary: dict[str, Any] | None = None,
         order: dict[str, Any] | None = None,
+        product: dict[str, Any] | None = None,
     ) -> None:
         self._candles = candles
         self._accounts = accounts
@@ -53,6 +54,7 @@ class FakeTransport:
         self._placed = placed
         self._summary = summary
         self._order = order
+        self._product = product
         self.calls: dict[str, dict[str, Any]] = {}
         # Ids this transport has actually issued via `create_order`, so `cancel_orders` can tell
         # a genuine order apart from one the suite's unknown-id test made up -- the same
@@ -71,7 +73,8 @@ class FakeTransport:
         return self._candles
 
     def get_product(self, product_id: str, **kwargs: Any) -> Any:
-        return {}
+        self.calls["get_product"] = {"product_id": product_id}
+        return {} if self._product is None else self._product
 
     def get_accounts(self, **kwargs: Any) -> Any:
         self.calls["get_accounts"] = {}
@@ -402,3 +405,57 @@ def test_cancel_order_is_unknown_on_an_empty_result_set() -> None:
     outcome = adapter.cancel_order("abc")
     assert outcome is CancelOutcome.UNKNOWN
     assert not outcome.settled
+
+
+# -- the product catalogue (#524) ------------------------------------------------------------
+
+
+def test_get_instrument_reads_the_base_increment_from_the_per_product_endpoint() -> None:
+    """`get_product`, not `get_products`.
+
+    The caller (`executor._base_increment_for`) needs ONE product and caches ONE; fetching the
+    whole ~900-row catalogue inside the order-placement path to use a single field of it is the
+    wrong shape, and Coinbase exposes the per-product read this uses instead.
+    """
+    transport = FakeTransport(product={"product_id": "BTC-USD", "base_increment": "0.00000001"})
+    adapter = CoinbaseAdapter(transport)
+
+    instrument = adapter.get_instrument("BTC-USD")
+
+    assert instrument is not None
+    assert instrument.product_id == "BTC-USD"
+    assert instrument.base_increment == Decimal("0.00000001")
+    assert transport.calls["get_product"] == {"product_id": "BTC-USD"}
+
+
+def test_get_instrument_unwraps_a_product_envelope() -> None:
+    """Coinbase returns the product both bare and wrapped in `{"product": {...}}` depending on
+    the endpoint and the client version; both must read the same."""
+    adapter = CoinbaseAdapter(
+        FakeTransport(product={"product": {"product_id": "ETH-USD", "base_increment": "0.0001"}})
+    )
+    instrument = adapter.get_instrument("ETH-USD")
+    assert instrument is not None and instrument.base_increment == Decimal("0.0001")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"product_id": "BTC-USD"},
+        {"product_id": "BTC-USD", "base_increment": None},
+        {"product_id": "BTC-USD", "base_increment": "not-a-number"},
+        {"product_id": "BTC-USD", "base_increment": "0"},
+        {"product_id": "BTC-USD", "base_increment": "-1"},
+    ],
+)
+def test_get_instrument_answers_none_for_anything_unusable(payload: dict[str, Any]) -> None:
+    """Missing, unparseable, zero and negative are one fact to a caller: no usable granularity.
+
+    Zero and negative matter most. `executor._order_configuration` quantizes a SELL against this
+    value, so a zero crossing the port is a division error or a silent zero size on the exit
+    path -- which is why `Instrument.__post_init__` refuses it too, and why this returns `None`
+    rather than constructing one.
+    """
+    adapter = CoinbaseAdapter(FakeTransport(product=payload))
+    assert adapter.get_instrument("BTC-USD") is None

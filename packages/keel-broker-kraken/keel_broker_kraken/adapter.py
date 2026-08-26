@@ -33,6 +33,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -93,6 +94,10 @@ class KrakenAdapter:
 
     def get_balances(self) -> list[Balance]:
         """Not implemented: the stub reads no account and holds no credentials."""
+        raise NotImplementedError(_STUB_MESSAGE)
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """Not implemented: the stub reads no catalogue."""
         raise NotImplementedError(_STUB_MESSAGE)
 
     def preview_order(self, spec: OrderSpec) -> Preview:

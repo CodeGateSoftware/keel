@@ -43,6 +43,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     FeeSummary,
+    Instrument,
     MarketSchedule,
     OrderStatus,
     PlaceResult,
@@ -327,6 +328,48 @@ class BrokerConformanceTests:
         assert isinstance(summary.maker_rate, Decimal)
         assert isinstance(summary.volume_usd, Decimal)
         assert isinstance(summary.fees_usd, Decimal)
+
+    def test_get_instrument_answers_the_port_type_or_declares_it_is_unwritten(self) -> None:
+        """`Instrument | None`, or an explicit `NotImplementedError` -- never a venue dict.
+
+        There is no capability flag gating this one, unlike `get_fee_summary`, and that is
+        deliberate: a product catalogue is not an optional venue FEATURE, it is something every
+        venue has and some adapters have not been taught to read yet. `NotImplementedError` says
+        which of those it is. `None` must not be used for it -- `None` is this method's word for
+        "this venue does not list that product", and an adapter answering it for an unwritten
+        lookup would tell `executor._base_increment_for` a symbol is unlisted when the truth is
+        that nobody wrote the read, which on the live path means silently skipping quantization.
+
+        The value is checked rather than only its type: a zero or negative increment is what a
+        caller divides and quantizes against, so it must never cross the port at all.
+        """
+        broker = self.broker()
+        try:
+            instrument = broker.get_instrument("BTC-USD")
+        except NotImplementedError:
+            return
+
+        if instrument is None:
+            return
+        assert isinstance(instrument, Instrument), (
+            f"get_instrument returned {type(instrument).__name__}, not the port's Instrument"
+        )
+        assert isinstance(instrument.base_increment, Decimal)
+        assert instrument.base_increment > 0, "a non-positive increment must never cross the port"
+        assert instrument.product_id == "BTC-USD", (
+            "the Instrument must describe the product that was asked for"
+        )
+
+    def test_get_instrument_may_answer_none_for_a_product_the_venue_does_not_list(self) -> None:
+        """An id that no venue lists. `None` or `NotImplementedError` are both correct; an
+        exception of any other kind is not, because a product id reaching this method comes from
+        an operator's allowlist and being absent is ordinary."""
+        broker = self.broker()
+        try:
+            instrument = broker.get_instrument("NOT-LISTED")
+        except NotImplementedError:
+            return
+        assert instrument is None or isinstance(instrument, Instrument)
 
     # --- no broker-native type crosses the port --------------------------------------------
 
