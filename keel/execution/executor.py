@@ -1689,6 +1689,36 @@ def _roll_stop(
         )
         return None
 
+    # A stop AT OR ABOVE the target is not a tighter stop; it is a coin flip.
+    #
+    # The replacement is a single native bracket carrying both prices, so a stop that has caught
+    # up with the target describes two exits racing at the same level, where whichever side the
+    # venue evaluates first decides whether this position took a profit or a loss.
+    # `keel_broker_api.orders.BracketGTC` refuses exactly this shape at construction -- "a coin
+    # flip wearing a protective order's name" -- but the live path does not build one of those
+    # yet (#502 stage 2 is blocked on #524's port migration), so nothing between the ratchet and
+    # Coinbase has been checking it.
+    #
+    # Reachable rather than theoretical: `trail_stop_atr` computes `price - atr * multiplier` and
+    # the live agent cycles ONCE A DAY, so a gap through the target that has not yet been
+    # reconciled leaves a position whose recorded target sits below the newly computed stop.
+    #
+    # Refusing here is the conservative half: the roll is abandoned and the EXISTING bracket stays
+    # in force, so the position keeps the protection it already had. Placing the inverted pair
+    # instead would cancel a working bracket to install a coin flip -- and if the venue refused it,
+    # leave the position naked until the next sweep.
+    if new_stop >= target:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.stop_roll_refused",
+            product=product_id,
+            new_stop=new_stop,
+            target=target,
+            reason="new_stop is at or above the target -- the existing bracket stays in force",
+        )
+        return None
+
     # THE CRASH LEDGER, written BEFORE the venue is touched (#519).
     #
     # Everything below this line can die mid-flight, and until this record existed one of those
