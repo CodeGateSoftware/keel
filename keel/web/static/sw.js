@@ -74,6 +74,7 @@ const PRECACHE = [
   SHELL,
   `${BASE}manifest.webmanifest`,
   `${BASE}css/keel.css`,
+  `${BASE}js/actions.js`,
   `${BASE}js/api.js`,
   `${BASE}js/chart.js`,
   `${BASE}js/docs.js`,
