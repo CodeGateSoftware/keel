@@ -419,39 +419,116 @@ def test_the_signing_secrets_live_on_a_protected_environment(desktop_job: dict) 
     )
 
 
+def test_the_signing_gate_is_a_step_and_not_an_if_condition(workflow: dict) -> None:
+    """**`secrets` is not a context GitHub allows in a step-level `if:`.**
+
+    The four signing steps were gated as `if: ... && secrets.MACOS_CERT_P12_BASE64 != ''` from
+    #512 until #558. GitHub rejects that at PARSE time -- "Unrecognized named-value: 'secrets'" --
+    so the whole workflow was invalid and `Release` could not be dispatched at all for three days.
+    It hid well: an unparseable workflow cannot report its own name, so every failure was filed
+    under the file path rather than `name: Release`, with zero jobs, on a `push` event, for a
+    workflow that is `workflow_dispatch`-only.
+
+    These tests did not catch it, and could not have as written: they asserted the presence of a
+    string in a condition, which says nothing about whether GitHub can parse the file. So this one
+    pins the SHAPE that keeps it parseable -- no `secrets` in any `if:`, anywhere in the workflow.
+    """
+    offenders = []
+    for job_name, job in workflow["jobs"].items():
+        if "secrets." in str(job.get("if", "")):
+            offenders.append(f"job {job_name}")
+        for step in job.get("steps", []):
+            if "secrets." in str(step.get("if", "")):
+                offenders.append(f"{job_name} / {step.get('name', '?')}")
+    assert not offenders, (
+        "`secrets` in an `if:` makes the whole workflow unparseable and undispatchable: "
+        f"{offenders}. Compute the gate in a step and read its output instead."
+    )
+
+
+def test_the_signing_secrets_are_not_exposed_to_every_step(desktop_job: dict) -> None:
+    """The obvious fix for the above is a job-level `env:` block, because `env` IS allowed in
+    `if:`. It is the wrong one here.
+
+    That would put every signing certificate and notarisation key into the environment of EVERY
+    step in this job -- `uv sync`, the PyInstaller build, the smoke test -- which is precisely the
+    exposure the `signing` environment exists to prevent. A certificate reachable by a compromised
+    build dependency is not protected by having been fetched from a reviewed environment.
+    """
+    job_env = desktop_job.get("env") or {}
+    leaked = [k for k, v in job_env.items() if "secrets." in str(v)]
+    assert not leaked, (
+        f"job-level env exposes {leaked} to every step in the desktop job; scope signing "
+        "credentials to the one step that reads them"
+    )
+
+
+def test_the_signing_gate_requires_every_credential(desktop_job: dict) -> None:
+    """**All FIVE or none.** A signed-but-un-notarised app is the worst state on macOS -- it still
+    trips Gatekeeper, and now looks like it tried not to -- so the gate is the whole Apple set:
+    the Developer ID Application `.p12` to sign, and the App Store Connect API key trio
+    `notarytool` needs. #402's lesson is measured per component, never by one token.
+
+    Asserted on the gate STEP since #558, which is where that decision now lives. Every secret
+    must be readable by the step (its own `env`) and tested by it (`-n "$SECRET"`), so a partial
+    credential set produces `no` and the sign step is skipped.
+    """
+    gate = _step(desktop_job, "Can this leg sign?")
+    assert gate.get("id") == "signing", "the gate step must be addressable as `steps.signing`"
+    assert gate.get("shell") == "bash", (
+        "the gate runs on macOS AND Windows runners, where the default shell is pwsh"
+    )
+
+    env = gate.get("env") or {}
+    run = str(gate.get("run", ""))
+    for secret in _MACOS_SIGNING_SECRETS + _WINDOWS_SIGNING_SECRETS:
+        assert f"secrets.{secret}" in str(env.get(secret, "")), (
+            f"the gate step cannot read {secret}, so it cannot require it"
+        )
+        assert f'-n "${secret}"' in run, (
+            f"the gate must test {secret} -- a partial credential set must skip, not half-sign"
+        )
+
+    # Only a boolean leaves the step. An output is visible in the run's API payload, so nothing
+    # derived from a certificate may be written to one.
+    assert 'echo "macos=$macos" >> "$GITHUB_OUTPUT"' in run
+    assert 'echo "windows=$windows" >> "$GITHUB_OUTPUT"' in run
+    for secret in _MACOS_SIGNING_SECRETS + _WINDOWS_SIGNING_SECRETS:
+        assert f'{secret}" >> "$GITHUB_OUTPUT' not in run, f"{secret} is written to an output"
+
+
 def test_macos_signing_runs_only_when_every_apple_credential_exists(desktop_job: dict) -> None:
-    """All FIVE or none: a signed-but-un-notarised app is the worst state on macOS (it
-    still trips Gatekeeper, and now looks like it tried not to), so the gate is the whole
-    Apple set -- the Developer ID Application .p12 to sign, and the App Store Connect API
-    key trio notarytool needs. #402's lesson is measured per component, not by one token."""
+    """The sign step reads the gate's verdict and nothing else."""
     condition = str(_step(desktop_job, "Sign, notarise and staple (macOS)").get("if", ""))
     assert "runner.os == 'macOS'" in condition
-    for secret in _MACOS_SIGNING_SECRETS:
-        assert f"secrets.{secret} != ''" in condition, (
-            f"the macOS sign step must require {secret} -- a partial credential set must "
-            "skip, not half-sign"
-        )
+    assert "steps.signing.outputs.macos == 'yes'" in condition, (
+        "the macOS sign step must gate on the credential check in `steps.signing`"
+    )
 
 
 def test_windows_signing_runs_only_when_the_certificate_exists(desktop_job: dict) -> None:
     condition = str(_step(desktop_job, "Sign the installer (Windows)").get("if", ""))
     assert "runner.os == 'Windows'" in condition
-    for secret in _WINDOWS_SIGNING_SECRETS:
-        assert f"secrets.{secret} != ''" in condition
+    assert "steps.signing.outputs.windows == 'yes'" in condition
 
 
 def test_each_skip_notice_names_every_missing_secret_and_the_price_of_fixing_it(
     desktop_job: dict,
 ) -> None:
-    """The honest skip: each notice fires on the exact COMPLEMENT of its sign step's gate,
-    and says what to buy, which secrets to create, and where the checklist is -- so a
-    reader of a green run learns signing was SKIPPED, never believes it happened, and
-    knows the purchase that would turn it on (#438's signing table, restated as text)."""
+    """The honest skip: each notice fires on the exact COMPLEMENT of its sign step's gate, and
+    says what to buy, which secrets to create, and where the checklist is -- so a reader of a
+    green run learns signing was SKIPPED, never believes it happened, and knows the purchase that
+    would turn it on (#438's signing table, restated as text).
+
+    The COMPLEMENT is asserted literally: `!= 'yes'` against the sign step's `== 'yes'`. Written
+    as two independent conditions they could drift into a state where neither fires and a release
+    goes out silently unsigned, which is the failure this pairing exists to make impossible.
+    """
     cases = [
-        ("Notice: macOS signing skipped", _MACOS_SIGNING_SECRETS, "$99"),
-        ("Notice: Windows signing skipped", _WINDOWS_SIGNING_SECRETS, "SmartScreen"),
+        ("Notice: macOS signing skipped", _MACOS_SIGNING_SECRETS, "$99", "macos"),
+        ("Notice: Windows signing skipped", _WINDOWS_SIGNING_SECRETS, "SmartScreen", "windows"),
     ]
-    for name, secrets, product in cases:
+    for name, secrets, product, leg in cases:
         notice = _step(desktop_job, name)
         condition = str(notice.get("if", ""))
         run = str(notice.get("run", ""))
@@ -461,11 +538,10 @@ def test_each_skip_notice_names_every_missing_secret_and_the_price_of_fixing_it(
             f"{name} must name the paid product that unlocks signing -- the reader is "
             "being asked to accept an unsigned binary, and the price is the context"
         )
+        assert f"steps.signing.outputs.{leg} != 'yes'" in condition, (
+            f"{name} must fire on the exact complement of the sign step's gate"
+        )
         for secret in secrets:
-            assert f"secrets.{secret} == ''" in condition, (
-                f"{name} must fire when {secret} is missing -- every gap in the gate "
-                "needs its explanation"
-            )
             assert secret in run, (
                 f"{name} must NAME {secret} -- a notice that says only 'not configured' "
                 "has already been failed by code-quality.yml's preflight prose (#402)"
