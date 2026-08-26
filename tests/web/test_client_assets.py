@@ -59,12 +59,27 @@ _CSS = _STATIC / "css" / "keel.css"
 #: revision of this line predicted ("a fifth module is a design decision (#537 adds `chart`,
 #: `live`, `docs`, `sw`) and should arrive with the list updated, not silently").
 #:
+#: `actions.js` is the write boundary, split out of `main.js` after the reference implementation's
+#: own shape: youperiod.app keeps `main.js` to "DOM manipulation and event listener attachment"
+#: and puts the storage boundary in `data-manager.js` behind a small interface. #540 gave keel a
+#: write surface and left all of it -- token, submit handler, outcome memory, sentence-picking --
+#: in `main.js`, which is the module that reference keeps emptiest.
+#:
 #: **`sw` arrived at #538 and is deliberately NOT in this list**, because it is not under `js/`:
 #: a service worker's scope is its own directory, so `js/sw.js` would be scoped to `/static/js/`
 #: and could not answer a navigation to `/static/insights`. It sits at the static root instead,
 #: and `tests/web/test_pwa.py::test_the_worker_is_served_from_the_scope_it_must_control` asserts
 #: that placement rather than leaving it to whoever next reads the spec's file list.
-_MODULES = ("main.js", "api.js", "render.js", "chart.js", "live.js", "format.js", "docs.js")
+_MODULES = (
+    "main.js",
+    "api.js",
+    "actions.js",
+    "render.js",
+    "chart.js",
+    "live.js",
+    "format.js",
+    "docs.js",
+)
 
 #: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
 #:
@@ -392,6 +407,61 @@ def test_no_client_module_can_write_markup() -> None:
             # sinks while explaining that it does not use them, and a raw substring search would
             # fail on the documentation of the property it is checking.
             assert sink not in _code_only(source), f"{name} can write markup via {sink}"
+
+
+def test_the_write_token_lives_only_in_the_write_boundary() -> None:
+    """**The module split this file's `_MODULES` note describes, asserted rather than intended.**
+
+    The design spec's reference implementation keeps `main.js` to "DOM manipulation and event
+    listener attachment" and puts the storage boundary in a module of its own behind a small
+    interface. #540 gave keel a write surface and left every part of it in `main.js`: the session
+    write token, the submit handler, the memory of what each action reported, and the choice of
+    which server field to show. `actions.js` owns all of that now.
+
+    The token is the sharpest part to pin, and the rule is about where it is HELD rather than
+    where the word appears. `api.js` names it because it is the parameter it puts in a header --
+    that module is the only one allowed to open a connection, so it is the only one that can send
+    it -- but it takes it as an argument and keeps nothing. `actions.js` is the one module with a
+    variable holding it between calls.
+
+    Stated that way rather than "the word appears once", because a credential that acquires a
+    second home is a credential the next thing added there will read, and that is what this
+    catches. A parameter passed straight into a header is not a home.
+    """
+    # Asserted as BEHAVIOUR, not as prose. `actions.js` names `X-Keel-CSRF` in a comment listing
+    # what it hides from its callers, and a raw-source search would read that explanation as a
+    # violation of the thing it explains -- the same trap `_markup_only` exists for on
+    # `index.html`. What actually matters is that the boundary builds no headers at all: the
+    # transport is `api.js`'s job and nothing here should be assembling a request.
+    boundary = _code_only(_source("actions.js"))
+    assert "headers" not in boundary.lower(), (
+        "the write boundary assembles a request; that belongs to api.js, which sends it"
+    )
+    assert "let token" in boundary, "the write boundary holds no token"
+
+    assert "X-Keel-CSRF" in _source("api.js"), "nothing sends the token"
+    transport = _code_only(_source("api.js"))
+    assert "let csrf" not in transport and "const csrf" not in transport, (
+        "api.js stores the write token; it takes one as an argument and keeps nothing"
+    )
+
+    for name in _MODULES:
+        if name in ("actions.js", "api.js"):
+            continue
+        assert "csrf" not in _code_only(_source(name)).lower(), (
+            f"{name} names the write token; it is held by actions.js and sent by api.js"
+        )
+
+
+def test_the_write_boundary_opens_no_connection_and_builds_no_dom() -> None:
+    """It sits between the two modules that do, and touches neither's job.
+
+    `api.js` is still the only module that calls `fetch` (pinned below), and the DOM is
+    `render.js`'s and the listener's. A boundary module that reached into either would be a third
+    place to look for behaviour that already has two homes."""
+    code = _code_only(_source("actions.js"))
+    for forbidden in ("fetch(", "document.", "querySelector", "createElement", "innerHTML"):
+        assert forbidden not in code, f"actions.js reaches past its boundary via {forbidden}"
 
 
 def test_fetch_appears_in_exactly_one_client_module() -> None:

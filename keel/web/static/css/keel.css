@@ -564,3 +564,21 @@ button.run:disabled { cursor: progress; opacity: 0.7; }
    it is present on every card from the moment the card is drawn. */
 .action-outcome { margin: 0.5rem 0 0; }
 .action-outcome:empty { margin: 0; }
+
+/* The "a newer build is ready" offer (#538). Sized like the footer text it sits in rather than
+   like the action buttons: it is an offer an operator may ignore indefinitely, and a page that
+   shouts about an available upgrade while somebody is reading a drawdown has its priorities
+   backwards. `--warn` because it reports a real difference between what is running and what is
+   installed, without claiming anything is broken. */
+button.update {
+  background: none;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  color: var(--warn);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+}
+button.update:hover { color: var(--fg); }
+button.update:disabled { cursor: progress; opacity: 0.7; }

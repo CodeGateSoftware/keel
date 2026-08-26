@@ -160,11 +160,22 @@ def _mypy_overrides() -> list[dict]:
 
 
 def _strict_modules() -> list[str]:
-    """Import packages the root `[tool.mypy]` config checks in strict mode.
+    """DISTRIBUTION ROOTS the root `[tool.mypy]` config checks in strict mode.
 
     Read from the config rather than listed here, so that tightening a package (giving it the
     strict flag block) automatically brings it under the marker rule below instead of requiring
     someone to remember this file.
+
+    **Dotted patterns are skipped, and the distinction is the whole point of the rule below.**
+    PEP 561's marker is a promise to whoever INSTALLS a distribution: it tells their type checker
+    that this package's annotations are real. A submodule of a distribution -- `keel.web.*`, made
+    strict at the same time as this filter -- has no installer of its own to make that promise to,
+    and the place a marker would go (`keel/py.typed`) covers `keel.*`, which is still
+    `ignore_errors`. Shipping it would be exactly what the docstring below warns against: "a
+    marker on unchecked code promises a guarantee nothing verifies."
+
+    So the rule keeps its teeth where it was aimed -- every distribution under `packages/` -- and
+    stops misfiring on internal modules that are strict for their own sake.
     """
     modules: list[str] = []
     for override in _mypy_overrides():
@@ -172,8 +183,23 @@ def _strict_modules() -> list[str]:
             continue
         entry = override["module"]
         for pattern in [entry] if isinstance(entry, str) else entry:
-            modules.append(pattern.removesuffix(".*"))
+            root = pattern.removesuffix(".*")
+            if "." in root:
+                continue
+            modules.append(root)
     return sorted(modules)
+
+
+def test_the_strict_module_reader_still_sees_the_distributions() -> None:
+    """Mutation guard on the filter above: skipping dotted patterns must not skip everything.
+
+    A filter that quietly emptied this list would make `test_strictly_typed_packages_ship_a_
+    py_typed_marker` parametrise over nothing and pass by having no cases -- the exact shape of
+    vacuous green this file exists to prevent elsewhere."""
+    roots = _strict_modules()
+    assert "keel_broker_api" in roots, roots
+    assert len(roots) >= 6, roots
+    assert not [r for r in roots if "." in r], roots
 
 
 @pytest.mark.parametrize("module", _strict_modules())
