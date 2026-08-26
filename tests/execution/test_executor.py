@@ -1024,6 +1024,87 @@ def test_roll_to_break_even_never_widens_the_stop(repo):
     assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
 
 
+def test_a_roll_that_reaches_the_target_is_refused_and_the_bracket_stays(repo):
+    """**A stop at or above the target is not a tighter stop; it is a coin flip.**
+
+    The replacement is a single native bracket carrying both prices, so a stop that has caught up
+    with the target describes two exits racing at the same level -- whichever side the venue
+    evaluates first decides whether this position took a profit or a loss.
+    `keel_broker_api.orders.BracketGTC` refuses exactly this at construction, but the live path
+    does not build one yet (#502 stage 2 is blocked on #524), so nothing between the ratchet and
+    Coinbase was checking it.
+
+    Refusing is the conservative half, and this asserts that half: the roll is abandoned, the
+    EXISTING bracket is untouched (`pending`, not `canceled`), and the recorded stop is unchanged,
+    so the position keeps the protection it already had. The alternative -- cancel a working
+    bracket to install an inverted one -- risks a venue refusal that leaves the position naked.
+    """
+    broker = FakeBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+
+    # A break-even roll to a price ABOVE the recorded target. It tightens (53500 > 49000, so the
+    # ratchet is satisfied) and is still nonsense.
+    result = roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("53500"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert result is None
+    assert repo.get_order(stop_id)["status"] == "pending", "a working bracket was cancelled"
+    assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
+    assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
+
+
+def test_a_roll_exactly_onto_the_target_is_refused_too(repo):
+    """`>=`, not `>`. Equal is the subtler half: two equal prices read as an ordinary pair of
+    numbers, and what they describe is a stop and a target racing at the SAME price. `BracketGTC`
+    refuses equal legs as firmly as inverted ones, for the same reason."""
+    broker = FakeBroker()
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+
+    result = roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("53000"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert result is None
+    assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
+
+
 # -- ATR trailing stop -----------------------------------------------------------------------
 
 
