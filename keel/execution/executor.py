@@ -364,12 +364,12 @@ def _base_increment_for(
     (no broker in paper mode, a venue error, a malformed or absent field) returns `None`, and the
     exit proceeds exactly as it did before #516.
 
-    **Exactly ONE row is written per miss, deliberately, even though the response carries every
-    product.** `Repository.set_state` commits per call, so caching all ~900 would mean ~900
-    commits -- 900 fsyncs -- inside the order-placement path, which is the most latency-sensitive
-    moment in the engine. The alternative it buys is a handful of extra `list_products` calls:
-    one per allowlisted product per TTL, so roughly six a week at the current allowlist. Trading
-    900 disk syncs during an order to save six network calls a week is the wrong way round.
+    **The venue is asked for ONE product, and that is a change from how this read began (#524).**
+    It called `list_products()` -- about 900 rows on Coinbase -- and cached exactly one of them,
+    because `Repository.set_state` commits per call and caching all of them would have meant ~900
+    fsyncs inside the order-placement path, the most latency-sensitive moment in the engine. The
+    argument was sound and the shape was not: the port's `get_instrument` asks the venue for the
+    product the caller actually wants, so there is no longer a catalogue to decline to cache.
     """
     key = f"{BASE_INCREMENT_PREFIX}{product_id}"
     cached = repo.get_state(key)
@@ -384,19 +384,19 @@ def _base_increment_for(
         # `_fetch_available_quote`).
         return None
     try:
-        products = broker.list_products()
+        instrument = broker.get_instrument(product_id)
     except Exception:
+        # Every failure is the same answer here -- unknown, send the quantity unquantized, never
+        # refuse the exit. `NotImplementedError` from an adapter that has not written the read
+        # (keel-broker-alpaca) lands here too, and correctly: it is unknown to THIS deployment.
         log_venue_failure(logger, "executor.base_increment_fetch_failed", product=product_id)
         return None
 
-    for product in products or []:
-        if not isinstance(product, dict) or product.get("product_id") != product_id:
-            continue
-        increment = _coerce_increment(product.get("base_increment"))
-        if increment is not None:
-            repo.set_state(key, {"increment": str(increment), "fetched_at": now_ts})
-        return increment
-    return None
+    if instrument is None:
+        return None
+    increment = instrument.base_increment
+    repo.set_state(key, {"increment": str(increment), "fetched_at": now_ts})
+    return increment
 
 
 def _coerce_increment(raw: object) -> Decimal | None:

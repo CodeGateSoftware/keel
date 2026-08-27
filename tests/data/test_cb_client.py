@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_broker_api.results import Balance, CancelOutcome
+from keel_broker_api.results import Balance, CancelOutcome, Instrument
 from keel_core import telemetry
 
 from keel.data.cb_client import CoinbaseClient
@@ -203,6 +203,35 @@ def test_get_spot_returns_decimal() -> None:
     assert price == Decimal("65432.10")
     assert isinstance(price, Decimal)
     assert transport.calls["get_product"] == {"product_id": "BTC-USD"}
+
+
+# --- get_instrument (the port's shape, #524) ----------------------------------------------
+
+
+def test_get_instrument_answers_the_ports_type_from_the_per_product_endpoint() -> None:
+    """`get_product`, not `get_products`.
+
+    `executor._base_increment_for` needs ONE product. This client's `list_products` returns about
+    900 and stays where it belongs -- `keel assets discover`, which genuinely wants the catalogue.
+    """
+    transport = FakeTransport(product={"product_id": "XLM-USD", "base_increment": "0.000001"})
+
+    instrument = CoinbaseClient(transport).get_instrument("XLM-USD")
+
+    assert isinstance(instrument, Instrument)
+    assert instrument.base_increment == Decimal("0.000001")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"base_increment": None}, {"base_increment": "nope"}, {"base_increment": "0"}],
+)
+def test_get_instrument_answers_none_for_anything_unusable(payload: dict) -> None:
+    """Missing, unparseable and non-positive are one fact to the caller: no usable granularity.
+
+    Zero matters most -- the exit path quantizes against this value, so a zero crossing the
+    boundary is a division error or a silent zero size on a SELL."""
+    assert CoinbaseClient(FakeTransport(product=payload)).get_instrument("XLM-USD") is None
 
 
 # --- get_balances (the port's shape, #524) ------------------------------------------------
