@@ -96,26 +96,22 @@ def test_bracket_gtc_carries_no_stop_direction() -> None:
     assert "stop_direction" not in to_order_configuration(spec)["trigger_bracket_gtc"]
 
 
-def test_bracket_gtc_is_byte_identical_to_what_the_executor_ships_today() -> None:
-    """Parity with the shipped, venue-accepted dict IS the contract for this kind.
+# `test_bracket_gtc_is_byte_identical_to_what_the_executor_ships_today` stood here, and #524
+# deleted it along with the thing it was pinning.
+#
+# It existed because the tree carried TWO Coinbase order renderers: this translation, and
+# `executor._bracket_order_configuration`, which built the same dict by hand for the live path.
+# #502 stage 1 could not delete the second one -- the executor was not on the port yet -- so it
+# pinned them byte-identical instead, and said so: "The test imports both; production code does
+# not."
+#
+# The executor now builds a `BracketGTC` and hands it to `CoinbaseClient.place_order`, which
+# renders it through THIS function. There is one renderer, so there is nothing left to hold in
+# agreement, and a test comparing a function to itself would pass forever without saying anything.
+#
+# What the bracket's wire shape still owes is covered where it belongs: the cases below pin the
+# three keys and the deliberate absence of `stop_direction`, and
+# `tests/data/test_cb_client.py::test_place_order_renders_a_bracket_through_the_one_renderer`
+# proves the live client sends exactly what this function returns.
 
-    `executor._bracket_order_configuration` is what Coinbase has actually been accepting on the
-    live path. The port's job here is to reach the same wire shape through a typed spec, not to
-    improve on it -- so this test pins the two together and will fail the moment either side
-    drifts.
 
-    The TEST imports both; production code must not. `keel_broker_coinbase` is a standalone
-    package that knows nothing about `keel.execution`, and the day Stage 2 switches the live
-    caller over, this assertion is what says the switch changed no bytes on the wire.
-    """
-    from keel.execution.executor import _bracket_order_configuration
-
-    qty, target, stop = Decimal("0.12345678"), Decimal("70123.45"), Decimal("60987.65")
-    spec = BracketGTC(
-        product_id="BTC-USD",
-        side=Side.SELL,
-        base_size=qty,
-        take_profit_price=target,
-        stop_trigger_price=stop,
-    )
-    assert to_order_configuration(spec) == _bracket_order_configuration(qty, target, stop)

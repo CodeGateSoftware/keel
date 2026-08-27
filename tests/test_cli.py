@@ -19,7 +19,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from click.testing import CliRunner
-from keel_broker_api.results import SessionState
+from keel_broker_api.orders import OrderSpec
+from keel_broker_api.results import PlaceResult, Preview, SessionState
 
 import keel.cli as cli_module
 from keel import agent
@@ -51,28 +52,21 @@ class FakeBroker:
         self.get_candles_calls.append((product_id, granularity, start, end))
         return []
 
-    def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        return {
-            "order_total": Decimal("50.00"),
-            "commission_total": Decimal("0"),
-            "errs": [],
-            "warning": [],
-            # Both book sides, as the real venue returns them: #350's spread gate fails
-            # closed on a preview without them.
-            "best_bid": Decimal("99.95"),
-            "best_ask": Decimal("100"),
-        }
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        return Preview(
+            product_id=spec.product_id,
+            side=spec.side,
+            est_base_size=Decimal("0"),
+            est_quote_size=Decimal("50.00"),
+            est_fee=Decimal("0"),
+            synthetic=False,
+            # Both book sides, as the real venue returns them: #350's spread gate fails closed on
+            # a preview without them.
+            detail={"best_bid": "99.95", "best_ask": "100", "order_total": "50.00"},
+        )
 
-    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        return {
-            "success": True,
-            "order_id": "fake-order-1",
-            "product_id": product_id,
-            "side": side.value if hasattr(side, "value") else side,
-            "client_order_id": "fake-client-1",
-            "order_configuration": order_configuration,
-            "error": None,
-        }
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        return PlaceResult(success=True, broker_order_id="fake-order-1")
 
     def cancel_order(self, order_id: str) -> bool:
         return True        # a CONFIRMED cancel -- see `_cancel_at_exchange`

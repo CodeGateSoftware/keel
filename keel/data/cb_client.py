@@ -26,10 +26,18 @@ import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
-from keel_broker_api.results import Balance, CancelOutcome, Instrument
+from keel_broker_api.orders import OrderSpec
+from keel_broker_api.results import (
+    Balance,
+    CancelOutcome,
+    Instrument,
+    PlaceResult,
+    Preview,
+)
+from keel_broker_coinbase.translate import to_order_configuration
 from keel_core.telemetry import log_exception, log_venue_failure
 
-from keel.types import Candle, Granularity, Side
+from keel.types import Candle, Granularity
 
 logger = logging.getLogger(__name__)
 
@@ -298,70 +306,72 @@ class CoinbaseClient:
             )
         return balances
 
-    def preview_order(self, product_id: str, side: Side, order_configuration: dict) -> dict:
-        """Preview an order (no funds moved) -- returns `Decimal` money fields + any errors."""
-        response = self._transport.preview_order(
-            product_id=product_id,
-            side=side.value if isinstance(side, Side) else side,
-            order_configuration=order_configuration,
-        )
-        decimal_fields = (
-            "order_total",
-            "commission_total",
-            "quote_size",
-            "base_size",
-            "best_bid",
-            "best_ask",
-        )
-        result: dict[str, Any] = {}
-        for key in decimal_fields:
-            value = _field(response, key)
-            if value is not None:
-                result[key] = Decimal(value)
-        result["errs"] = _field(response, "errs", []) or []
-        result["warning"] = _field(response, "warning", []) or []
-        return result
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        """Preview an order (no funds moved), in the PORT's shape (#524).
 
-    def place_order(self, product_id: str, side: Side, order_configuration: dict) -> dict:
-        """Place a live order -- supports market/limit/stop configs, no funds-moving retries.
+        **One renderer, not two.** The wire configuration comes from
+        `keel_broker_coinbase.translate.to_order_configuration` -- the same function the adapter
+        uses -- rather than a dict this module builds itself. Until now the tree carried two
+        Coinbase order renderers, and #502 stage 1 had to ship a test pinning them byte-identical
+        to stop them drifting while both existed. There is one now, so there is nothing left to
+        hold in agreement.
 
-        Callers (the Phase-3 executor) are responsible for running rails/guards and any
-        confirm-mode gate *before* calling this -- `place_order` itself performs no risk
-        checks, it only talks to the transport and normalizes the response. A fresh
-        `client_order_id` is generated per call for idempotency on the Coinbase side.
+        `detail` carries `best_bid`/`best_ask` as strings because that is what the port's `Preview`
+        declares and what `executor._preview_book` already reads off the port shape -- the spread
+        gate (#350) and the entry-override warning (#332) both come through it unchanged.
         """
-        side_str = side.value if isinstance(side, Side) else side
-        client_order_id = str(uuid.uuid4())
-        response = self._transport.create_order(
-            client_order_id=client_order_id,
-            product_id=product_id,
-            side=side_str,
-            order_configuration=order_configuration,
+        response = self._transport.preview_order(
+            product_id=spec.product_id,
+            side=spec.side.value,
+            order_configuration=to_order_configuration(spec),
+        )
+        return Preview(
+            product_id=spec.product_id,
+            side=spec.side,
+            est_base_size=Decimal(_field(response, "base_size", "0") or "0"),
+            est_quote_size=Decimal(_field(response, "quote_size", "0") or "0"),
+            est_fee=Decimal(_field(response, "commission_total", "0") or "0"),
+            # A real quote from the venue, never an estimate this client computed.
+            synthetic=False,
+            detail={
+                key: str(value)
+                for key in ("best_bid", "best_ask", "order_total")
+                if (value := _field(response, key)) is not None
+            },
+            errors=tuple(str(e) for e in (_field(response, "errs", []) or [])),
         )
 
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        """Place a live order, in the PORT's shape (#524).
+
+        Callers run rails/guards and any confirm-mode gate BEFORE calling this -- `place_order`
+        performs no risk checks, it only talks to the transport.
+
+        `idempotency_key` identifies the INTENT, not the order, exactly as the port declares:
+        omit it and a fresh `client_order_id` is minted per attempt, which is what this method did
+        before the parameter existed and remains the default. Two identical orders a strategy
+        genuinely meant to place are two orders.
+        """
+        response = self._transport.create_order(
+            client_order_id=idempotency_key or str(uuid.uuid4()),
+            product_id=spec.product_id,
+            side=spec.side.value,
+            order_configuration=to_order_configuration(spec),
+        )
         success = bool(_field(response, "success", False))
         success_response = _field(response, "success_response") or {}
         error_response = _field(response, "error_response") or {}
-        raw_order_configuration = _field(response, "order_configuration")
-
-        result: dict[str, Any] = {
-            "success": success,
-            "order_id": _field(success_response, "order_id"),
-            "product_id": _field(success_response, "product_id", product_id),
-            "side": _field(success_response, "side", side_str),
-            "client_order_id": _field(success_response, "client_order_id", client_order_id),
-            "order_configuration": _decimal_map_order_configuration(raw_order_configuration),
-            "error": None,
-        }
-        if not success:
-            result["error"] = {
-                "error": _field(error_response, "error"),
-                "message": _field(error_response, "message"),
-                "error_details": _field(error_response, "error_details"),
-                "preview_failure_reason": _field(error_response, "preview_failure_reason"),
-                "new_order_failure_reason": _field(error_response, "new_order_failure_reason"),
-            }
-        return result
+        return PlaceResult(
+            success=success,
+            broker_order_id=_field(success_response, "order_id"),
+            reason=None
+            if success
+            else str(
+                _field(error_response, "message")
+                or _field(error_response, "error")
+                or "the venue refused the order without stating a reason"
+            ),
+        )
 
     def get_order(self, order_id: str) -> dict:
         """Observed state of a previously placed order, normalized to `Decimal` money fields.

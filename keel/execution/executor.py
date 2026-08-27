@@ -102,7 +102,13 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from keel_broker_api.results import CancelOutcome, Preview, coerce_cancel_outcome
+from keel_broker_api.orders import (
+    BracketGTC,
+    MarketIOCByBase,
+    MarketIOCByQuote,
+    OrderSpec,
+)
+from keel_broker_api.results import CancelOutcome, PlaceResult, Preview, coerce_cancel_outcome
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
@@ -360,7 +366,7 @@ def _base_increment_for(
     """The venue's finest acceptable `base_size` for `product_id`, cached, or `None` if unknown.
 
     `None` means UNKNOWN and, for a SELL, means "send the quantity unquantized" -- NOT "refuse".
-    See `_order_configuration`. This function therefore **never raises**: every failure path
+    See `_order_spec`. This function therefore **never raises**: every failure path
     (no broker in paper mode, a venue error, a malformed or absent field) returns `None`, and the
     exit proceeds exactly as it did before #516.
 
@@ -531,7 +537,7 @@ def _build_intent(
         is_dca=False,
         rule_kind=signal.rule_name,
         rule_id=signal.rule_id,
-        # #516. Fetched here, like `available_quote` above, so `_order_configuration` stays a
+        # #516. Fetched here, like `available_quote` above, so `_order_spec` stays a
         # pure function of the intent. `None` is fine and means "send unquantized".
         base_increment=_base_increment_for(broker, repo, signal.product_id, now_ts),
     )
@@ -567,7 +573,7 @@ def _run_order(
     mode: str,
     confirm_fn: ConfirmFn | None,
     now_ts: int,
-    order_configuration: dict[str, Any] | None = None,
+    spec: OrderSpec | None = None,
 ) -> ExecutionResult:
     guard_result = guards.check(intent, repo, config, now_ts)
     if not guard_result.ok:
@@ -587,7 +593,7 @@ def _run_order(
             reason="vetoed by guards: " + "; ".join(guard_result.violations),
         )
 
-    if order_configuration is None:
+    if spec is None:
         # A size that cannot be expressed in the venue's units REFUSES THIS ORDER, and refuses
         # only this order (#513). `agent.run_once` does not wrap its `executor.execute` call, so
         # letting `SizePrecisionUnavailable` escape here would abort the whole cycle and skip
@@ -595,7 +601,7 @@ def _run_order(
         # outage. Refuse-and-log is what every other unknown in this engine does; a raise here
         # would be the one that behaves differently.
         try:
-            order_configuration = _order_configuration(intent)
+            spec = _order_spec(intent)
         except SizePrecisionUnavailable as exc:
             log_event(
                 logger,
@@ -614,7 +620,7 @@ def _run_order(
                 reason=f"size precision unavailable: {exc}",
             )
     try:
-        preview = broker.preview_order(intent.product_id, intent.side, order_configuration)
+        preview = broker.preview_order(spec)
     except Exception:
         log_exception(
             logger, "executor.preview_failed", product=intent.product_id, side=intent.side
@@ -643,7 +649,7 @@ def _run_order(
     # same way. So the moment the venue's own book -- the `best_ask` in the preview just
     # fetched, no extra call -- says the intended entry is materially off the market, say so
     # at WARNING, before the confirm gate and before placement.
-    _warn_if_market_routing_overrides_entry(intent, preview, order_configuration)
+    _warn_if_market_routing_overrides_entry(intent, preview, spec)
 
     # #350: THE ROUTING-TIME MAX-SPREAD ENTRY GATE. A live BUY whose book -- read from the
     # same preview the warning above just consumed -- is too wide (or unreadable) is refused
@@ -685,7 +691,7 @@ def _run_order(
     order_id = repo.insert_order(_order_row(intent, mode, now_ts))
 
     try:
-        place_result = broker.place_order(intent.product_id, intent.side, order_configuration)
+        place_result = broker.place_order(spec)
     except Exception:
         log_exception(
             logger,
@@ -695,8 +701,8 @@ def _run_order(
             order_id=order_id,
         )
         raise
-    success = bool(place_result.get("success"))
-    status = _initial_status(order_configuration) if success else "rejected"
+    success = place_result.success
+    status = _initial_status(spec) if success else "rejected"
     # `fee` was previously left NULL forever: nothing else in the live path ever wrote it, so
     # `streak.record_closed_trade` was always handed `fees=0` and every `pnl_net` was GROSS.
     # That defeats rail 16 precisely where it matters -- fees dominate small moves, so a trade
@@ -707,13 +713,17 @@ def _run_order(
     # lines below (`_upgrade_to_observed_economics`) for an immediate fill, and by
     # `execution.reconcile` for an order that fills later. These remain the fallback when the
     # status endpoint is unavailable.
-    fee = preview.get("commission_total") if isinstance(preview, dict) else None
+    fee = preview.est_fee
     repo.update_order(
         order_id,
         status=status,
         actual_fill=intent.entry if status == "filled" else None,
         fee=fee if status == "filled" else None,
-        raw_response=json.dumps(place_result, default=str),
+        # The venue's own id for this order, which is what `_native_order_id` reads back to
+        # cancel it. It was `json.dumps(place_result)` -- the whole pre-port response dict -- and
+        # the id was dug out of that blob afterwards. `PlaceResult.broker_order_id` names it
+        # directly, so the column now stores the one field anything ever read from it.
+        raw_response=json.dumps({"order_id": place_result.broker_order_id}),
         updated_at=now_ts,
     )
 
@@ -728,14 +738,14 @@ def _run_order(
             product=intent.product_id,
             side=intent.side,
             order_id=order_id,
-            error=place_result.get("error"),
+            error=place_result.reason,
         )
         return ExecutionResult(
             placed=False,
             order_id=order_id,
             vetoed_by=[],
             preview=preview,
-            reason=f"broker rejected order: {place_result.get('error')}",
+            reason=f"broker rejected order: {place_result.reason}",
         )
 
     # `open_stop`/`open_target` are written by `place_bracket` ONLY, once the exchange has
@@ -762,7 +772,7 @@ def _upgrade_to_observed_economics(
     broker: Any,
     repo: Repository,
     order_id: int,
-    place_result: dict[str, Any],
+    place_result: PlaceResult,
     now_ts: int,
     intent: OrderIntent | None = None,
 ) -> None:
@@ -782,7 +792,7 @@ def _upgrade_to_observed_economics(
     get_order = getattr(broker, "get_order", None)
     if get_order is None:
         return
-    native_id = place_result.get("order_id")
+    native_id = place_result.broker_order_id
     if not native_id:
         return
     try:
@@ -985,8 +995,8 @@ def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
 
 def _warn_if_market_routing_overrides_entry(
     intent: OrderIntent,
-    preview: Preview | dict[str, Any] | None,
-    order_configuration: dict[str, Any] | None = None,
+    preview: Preview | None,
+    spec: OrderSpec | None = None,
 ) -> None:
     """WARNING, at routing time, when a BUY's intended entry is materially off the market.
 
@@ -1006,7 +1016,7 @@ def _warn_if_market_routing_overrides_entry(
 
     Scoped to BUYs on the market configuration only. SELL intents (exits, brackets, stop
     rolls) either carry no entry condition or hand their prices to the venue verbatim, and a
-    caller passing its own non-market `order_configuration` -- a future resting order out of
+    caller passing its own non-market spec -- a future resting order out of
     #260's remediation plan -- is not on the override path at all. Never raises: telemetry
     must not be able to fail a routing. `deviation_bps` is signed, positive meaning the rule
     intended to enter ABOVE the market (follow-through demanded, pullback's case), negative
@@ -1017,19 +1027,21 @@ def _warn_if_market_routing_overrides_entry(
     """
     if preview is None or intent.side != Side.BUY:
         return
-    if order_configuration is None:
-        # Same resolution `_run_order` performs: no explicit configuration means the default
-        # routing, which today is always market.
+    if spec is None:
+        # Same resolution `_run_order` performs: no explicit spec means the default routing,
+        # which today is always market.
         try:
-            order_configuration = _order_configuration(intent)
+            spec = _order_spec(intent)
         except SizePrecisionUnavailable:
             # This function is a DIAGNOSTIC (it records how far the venue's book sat from the
             # intent). An order whose size cannot be serialised has already been refused
             # upstream, so there is nothing to measure and nothing to report -- and a diagnostic
             # must never be the thing that raises out of the order path.
             return
-    config_type = next(iter(order_configuration), "")
-    if not config_type.startswith("market_"):
+    # The KIND, off the spec, rather than the first key of a wire dict. `market_ioc_by_quote`
+    # and `market_ioc_by_base` are the two market kinds; a limit, stop or bracket spec is not on
+    # the override path.
+    if not spec.kind.startswith("market_"):
         return
     ref = _preview_best_ask(preview)
     if ref is None:
@@ -1256,7 +1268,7 @@ class SizePrecisionUnavailable(RuntimeError):
     """
 
 
-def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
+def _order_spec(intent: OrderIntent) -> OrderSpec:
     """Serialise the order's size at the VENUE's precision, not the engine's (#513).
 
     Everything upstream computes in full `Decimal` precision -- `sizing.size()` returns
@@ -1297,8 +1309,12 @@ def _order_configuration(intent: OrderIntent) -> dict[str, dict[str, str]]:
                 f"{intent.product_id!r} notional {intent.notional} quantizes to {notional} at "
                 f"increment {increment} -- refusing to send a zero-size order"
             )
-        return {"market_market_ioc": {"quote_size": str(notional)}}
-    return {"market_market_ioc": {"base_size": str(_sell_base_size(intent))}}
+        return MarketIOCByQuote(
+            product_id=intent.product_id, side=Side.BUY, quote_size=notional
+        )
+    return MarketIOCByBase(
+        product_id=intent.product_id, side=Side.SELL, base_size=_sell_base_size(intent)
+    )
 
 
 def _sell_base_size(intent: OrderIntent) -> Decimal:
@@ -1335,12 +1351,24 @@ def _sell_base_size(intent: OrderIntent) -> Decimal:
     return quantized
 
 
-def _initial_status(order_configuration: dict[str, Any]) -> str:
-    """A market (IOC) order fills immediately; a limit/stop-limit order rests as `pending` on
-    the exchange until a later fill event. `execution.reconcile`, run at the top of every
-    cycle, observes that fill and marks it `filled` with the observed price and fees."""
-    config_type = next(iter(order_configuration), "")
-    return "filled" if config_type.startswith("market_") else "pending"
+def _initial_status(spec: OrderSpec) -> str:
+    """A market (IOC) order fills immediately; a limit/stop-limit/bracket order rests as
+    `pending` on the exchange until a later fill event. `execution.reconcile`, run at the top of
+    every cycle, observes that fill and marks it `filled` with the observed price and fees.
+
+    **Driven off `spec.kind`, and deliberately NOT off `spec.initial_status` (#524).** Every
+    `OrderSpec` carries an `initial_status` ClassVar, and reaching for it here is the obvious
+    move and the wrong one: the port's vocabulary is the VENUE's (`filled_or_rejected`, `open`)
+    and this column is KEEL's (`filled`, `pending`). They describe the same moment in different
+    words, and the words are not interchangeable -- `reconcile` sweeps for `pending`, so writing
+    `open` into this column would leave every resting order invisible to the sweep that exists to
+    observe its fill. A bracket recorded as `open` is a protective order keel would never look at
+    again.
+
+    The dict inspection this replaced (`next(iter(order_configuration), "")`) is gone either way;
+    what stays is keel's own status vocabulary, mapped explicitly.
+    """
+    return "filled" if spec.kind.startswith("market_") else "pending"
 
 
 class CancelUnavailable(RuntimeError):
@@ -1436,8 +1464,12 @@ def _cancel_at_exchange(broker: Any, repo: Repository, order_row: dict[str, Any]
 
 
 def _native_order_id(order_row: dict[str, Any]) -> str | None:
-    """The broker-native order id for a repo order row, read back out of the `place_order`
-    response JSON stashed in `raw_response` -- used to cancel a specific broker order."""
+    """The broker-native order id for a repo order row, read back out of `raw_response` -- used
+    to cancel a specific broker order.
+
+    Rows written before #524 hold the entire pre-port placement response; rows written since hold
+    `{"order_id": ...}` alone. Both are read by the same `data.get("order_id")`, which is why the
+    narrowing needed no migration: the key that mattered is the key that was kept."""
     raw = order_row.get("raw_response")
     if not raw:
         return None
@@ -1448,41 +1480,46 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
     return data.get("order_id")
 
 
-def _bracket_order_configuration(
-    qty: Decimal, target: Decimal, stop: Decimal, base_increment: Decimal | None = None
-) -> dict[str, dict[str, str]]:
-    """Coinbase's NATIVE trigger bracket: ONE order carrying both exit prices.
+def _bracket_spec(
+    product_id: str,
+    qty: Decimal,
+    target: Decimal,
+    stop: Decimal,
+    base_increment: Decimal | None = None,
+) -> BracketGTC:
+    """The exit bracket as a port value: ONE order carrying both protective prices.
 
-    `limit_price` is the take-profit and `stop_trigger_price` the stop-loss. The exchange owns
-    the race between them, which is the entire reason for using it: the previous design placed
-    two independent SELL legs and paired them client-side via `oco_sibling:` state, so a fill we
-    failed to observe left the other leg live and able to sell an already-closed position. That
-    whole failure mode does not exist here -- there is no sibling to cancel.
+    **This used to render Coinbase's wire dict itself.** #502 stage 1 added `BracketGTC` to the
+    port and shipped a test pinning the two byte-identical, because two renderers of one order
+    existed and had to be kept in agreement. #524 removed the second one: the spec goes to
+    `CoinbaseClient.place_order`, which renders it through the adapter's own
+    `to_order_configuration`, and the parity test goes with the duplicate it was pinning.
 
-    It also fixes an inventory bug in that design: both legs were sized at the FULL qty, so a
-    1x position was committed 2x. On spot the second leg should simply be rejected for
-    insufficient funds.
+    What the port adds beyond a shared renderer is REFUSAL. `BracketGTC.__post_init__` rejects a
+    non-positive price and a stop that does not sit on the losing side of the target -- equal legs
+    as firmly as inverted ones, because an equal-leg "bracket" is a stop and a target racing at
+    the same price. The dict this replaced checked none of that; `_roll_stop` grew its own guard
+    for the same hazard (#560) and now has a second line behind it.
 
-    `trigger_bracket_gtc` is exactly what `RESTClient.trigger_bracket_order_gtc` builds, so this
-    reaches it through the `place_order`/`create_order` path we already use -- no new broker API
-    surface, no new transport method.
+    #516's quantization is unchanged and still happens HERE, before the spec is built: quantize
+    down when the increment is known, send unchanged when it is not. A bracket the venue refuses
+    leaves a position unprotected, so this path must never become more likely to fail than it was.
     """
-    # 516: the protective legs carry a `base_size` too, and had the identical full-precision
-    # defect as a plain SELL. Same rule, same asymmetry: quantize DOWN when the increment is
-    # known, send unchanged when it is not. A bracket that the venue refuses leaves the position
-    # unprotected, so this path must never become more likely to fail than it is today.
     size = (
         qty
         if base_increment is None or base_increment <= 0
         else _floor_or_original(qty, base_increment)
     )
-    return {
-        "trigger_bracket_gtc": {
-            "base_size": str(size),
-            "limit_price": str(target),
-            "stop_trigger_price": str(stop),
-        }
-    }
+    return BracketGTC(
+        product_id=product_id,
+        # A bracket keel places always EXITS a long: keel enters with a market IOC and protects
+        # afterwards, so the protective order is a SELL. `BracketGTC` derives the stop's trigger
+        # direction from this rather than taking it as a field.
+        side=Side.SELL,
+        base_size=size,
+        take_profit_price=target,
+        stop_trigger_price=stop,
+    )
 
 
 def _floor_or_original(qty: Decimal, increment: Decimal) -> Decimal:
@@ -1518,7 +1555,7 @@ def place_bracket(
 ) -> int | None:
     """Place the exchange-side exit bracket for an open long position, or `None` if vetoed.
 
-    ONE native trigger-bracket order (see `_bracket_order_configuration`), so the exchange owns
+    ONE native trigger-bracket order (see `_bracket_spec`), so the exchange owns
     the stop-vs-target race and the position is committed exactly once. It runs through
     `guards.check` like any other order (un-overridable).
 
@@ -1548,8 +1585,8 @@ def place_bracket(
         "autonomous",
         None,
         now_ts,
-        order_configuration=_bracket_order_configuration(
-            qty, target, stop, _base_increment_for(broker, repo, product_id, now_ts)
+        spec=_bracket_spec(
+            product_id, qty, target, stop, _base_increment_for(broker, repo, product_id, now_ts)
         ),
     )
     if not result.placed:
@@ -1771,8 +1808,8 @@ def _roll_stop(
         "autonomous",
         None,
         now_ts,
-        order_configuration=_bracket_order_configuration(
-            qty, target, new_stop, _base_increment_for(broker, repo, product_id, now_ts)
+        spec=_bracket_spec(
+            product_id, qty, target, new_stop, _base_increment_for(broker, repo, product_id, now_ts)
         ),
     )
     if not result.placed:

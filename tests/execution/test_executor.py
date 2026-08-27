@@ -18,7 +18,8 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from keel_broker_api.results import Balance
+from keel_broker_api.orders import BracketGTC, LimitGTC, OrderSpec
+from keel_broker_api.results import Balance, PlaceResult, Preview
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
@@ -51,6 +52,36 @@ NOW_TS = 1_700_000_000
 
 
 # -- fakes ----------------------------------------------------------------------------------
+
+
+def _preview_from(spec: OrderSpec, payload: dict[str, Any]) -> Preview:
+    """A `Preview` from the dict shape these fakes have always described a quote in.
+
+    Kept as a dict at the call sites deliberately: dozens of tests construct a bespoke preview to
+    exercise one degraded field -- a missing `best_bid`, a non-numeric `best_ask`, an `errs` list
+    -- and rewriting every one of them into a `Preview` constructor would have been a far larger
+    diff than the behaviour change it accompanies, with more chances to alter a case by accident.
+    This function is the one place the translation happens.
+
+    The book goes into `detail` as STRINGS, which is what the port's `Preview` declares and what
+    `executor._preview_book` reads: the spread gate (#350) and the entry-override warning (#332)
+    both come through it, so a fake that carried the book anywhere else would silently stop
+    exercising two safety paths.
+    """
+    return Preview(
+        product_id=spec.product_id,
+        side=spec.side,
+        est_base_size=Decimal(str(payload.get("base_size", "0"))),
+        est_quote_size=Decimal(str(payload.get("quote_size", "0"))),
+        est_fee=Decimal(str(payload.get("commission_total", "0"))),
+        synthetic=False,
+        detail={
+            key: str(payload[key])
+            for key in ("best_bid", "best_ask", "order_total")
+            if payload.get(key) is not None
+        },
+        errors=tuple(str(e) for e in (payload.get("errs") or [])),
+    )
 
 
 class FakeBroker:
@@ -118,38 +149,18 @@ class FakeBroker:
             Balance(currency="USDC", available=self._usdc_balance, total=self._usdc_balance),
         ]
 
-    def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        self.preview_calls.append(
-            {"product_id": product_id, "side": side, "order_configuration": order_configuration}
-        )
-        return dict(self._preview)
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        self.preview_calls.append({"spec": spec})
+        return _preview_from(spec, self._preview)
 
-    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         self._place_order_id_seq += 1
         order_id = f"{self._place_order_id_prefix}-{self._place_order_id_seq}"
         self.events.append("place")
-        self.place_calls.append(
-            {"product_id": product_id, "side": side, "order_configuration": order_configuration}
-        )
+        self.place_calls.append({"spec": spec})
         if self._place_success:
-            return {
-                "success": True,
-                "order_id": order_id,
-                "product_id": product_id,
-                "side": side.value if isinstance(side, Side) else side,
-                "client_order_id": f"client-{order_id}",
-                "order_configuration": order_configuration,
-                "error": None,
-            }
-        return {
-            "success": False,
-            "order_id": None,
-            "product_id": product_id,
-            "side": side.value if isinstance(side, Side) else side,
-            "client_order_id": f"client-{order_id}",
-            "order_configuration": order_configuration,
-            "error": {"error": "INSUFFICIENT_FUND", "message": "no funds"},
-        }
+            return PlaceResult(success=True, broker_order_id=order_id)
+        return PlaceResult(success=False, broker_order_id=None, reason="no funds")
 
     def cancel_order(self, order_id: str) -> bool:
         # Returns True: a CONFIRMED cancel. The real client returns bool and
@@ -329,7 +340,7 @@ def test_confirm_mode_calls_confirm_fn_with_the_preview(repo):
     execute(signal, broker, repo, _config(), mode="confirm", confirm_fn=_capture, now_ts=NOW_TS)
 
     assert len(seen) == 1
-    assert "order_total" in seen[0]
+    assert "order_total" in seen[0].detail
 
 
 # -- confirm mode: reject -> not placed ---------------------------------------------------------
@@ -419,8 +430,8 @@ def test_rule_id_is_purely_additive_metadata_placement_and_guards_are_unchanged(
     assert len(broker_a.preview_calls) == len(broker_b.preview_calls)
     assert len(broker_a.place_calls) == len(broker_b.place_calls)
     assert (
-        broker_a.place_calls[0]["order_configuration"]
-        == broker_b.place_calls[0]["order_configuration"]
+        broker_a.place_calls[0]["spec"]
+        == broker_b.place_calls[0]["spec"]
     )
 
     order_a = repo.get_order(result_a.order_id)
@@ -755,8 +766,8 @@ def test_live_execute_sizing_is_immune_to_reward_income_through_the_public_entry
     )
     # The order actually sent to the venue is identical -- same sized base_size.
     assert (
-        reward_broker.place_calls[0]["order_configuration"]
-        == clean_broker.place_calls[0]["order_configuration"]
+        reward_broker.place_calls[0]["spec"]
+        == clean_broker.place_calls[0]["spec"]
     )
 
 
@@ -874,7 +885,7 @@ def test_execute_attaches_oco_bracket_after_a_stop_target_entry_fills(repo):
     orders = repo.get_orders(product_id="BTC-USD")
     sell_orders = [o for o in orders if o["side"] == "SELL"]
     assert len(sell_orders) == 1
-    assert "trigger_bracket_gtc" in broker.place_calls[-1]["order_configuration"]
+    assert isinstance(broker.place_calls[-1]["spec"], BracketGTC)
     assert repo.get_state("open_stop:BTC-USD") == Decimal("49000")
     assert repo.get_state("open_target:BTC-USD") == Decimal("53000")
 
@@ -1392,8 +1403,8 @@ def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, ca
     assert "executor.entry_partially_filled" in caplog.text
     # Detect-and-surface, NOT auto-resize: the bracket is still placed for the ORDERED size
     # (resizing it is the amend-vs-replace decision #502 owns).
-    bracket = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
-    assert bracket["base_size"] == "1.000"
+    bracket = broker.place_calls[-1]["spec"]
+    assert bracket.base_size == Decimal("1.000")
 
 
 def test_a_fully_filled_entry_records_the_filled_quantity_without_warning(repo, caplog):
@@ -1603,12 +1614,13 @@ def test_bracket_places_exactly_one_order_committing_the_position_once(repo):
     assert len(sells) == 1
     assert len(broker.place_calls) == 1
 
-    config = broker.place_calls[0]["order_configuration"]
-    assert "trigger_bracket_gtc" in config
-    leg = config["trigger_bracket_gtc"]
-    assert leg["base_size"] == "0.01"
-    assert leg["limit_price"] == "53000"  # take-profit
-    assert leg["stop_trigger_price"] == "49000"  # stop-loss
+    spec = broker.place_calls[0]["spec"]
+    assert isinstance(spec, BracketGTC)
+    assert spec.base_size == Decimal("0.01")
+    assert spec.take_profit_price == Decimal("53000")  # take-profit
+    assert spec.stop_trigger_price == Decimal("49000")  # stop-loss
+    # The port names the take-profit `take_profit_price`, not Coinbase's `limit_price` -- so a
+    # second venue's translation never starts from Coinbase's vocabulary (#521).
 
 
 def test_bracket_records_the_stop_for_rail_9_and_the_target_for_later_rolls(repo):
@@ -1734,9 +1746,9 @@ def test_rolling_the_stop_carries_the_original_target_forward(repo):
     # bracket must be placed only AFTER the old one is cancelled, or the exchange would reject
     # it for insufficient funds (the resting bracket commits the whole position).
     assert broker.events == ["place", "cancel", "place"], broker.events
-    replacement = broker.place_calls[-1]["order_configuration"]["trigger_bracket_gtc"]
-    assert replacement["limit_price"] == "53000"  # original target preserved
-    assert replacement["stop_trigger_price"] == "50000"  # stop moved to break-even
+    replacement = broker.place_calls[-1]["spec"]
+    assert replacement.take_profit_price == Decimal("53000")  # original target preserved
+    assert replacement.stop_trigger_price == Decimal("50000")  # stop moved to break-even
 
 
 def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_naked(repo, caplog):
@@ -1748,11 +1760,11 @@ def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_nak
             super().__init__(**kw)
             self.calls = 0
 
-        def place_order(self, product_id, side, order_configuration):
+        def place_order(self, spec, *, idempotency_key=None):  # noqa: ANN001, ANN202
             self.calls += 1
             if self.calls > 1:  # the original bracket places; the replacement fails
-                return {"success": False, "error": "INSUFFICIENT_FUND"}
-            return super().place_order(product_id, side, order_configuration)
+                return PlaceResult(success=False, broker_order_id=None, reason="INSUFFICIENT_FUND")
+            return super().place_order(spec, idempotency_key=idempotency_key)
 
     broker = _RejectingBroker()
     old_id = place_bracket(
@@ -2691,7 +2703,14 @@ class TestEntryOverrideWarningAtRouting:
         market-override path -- its prices reach the venue, and this warning must not fire."""
         from keel.execution.executor import _warn_if_market_routing_overrides_entry
 
-        resting = {"limit_limit_gtc": {"base_size": "0.001", "limit_price": "50300"}}
+        # A resting LIMIT spec, not the market routing -- the override warning is scoped to
+        # market orders, and a caller passing its own non-market spec is not on that path.
+        resting = LimitGTC(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            base_size=Decimal("0.001"),
+            limit_price=Decimal("50300"),
+        )
 
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(
@@ -3146,11 +3165,11 @@ def test_a_failed_roll_RETAINS_its_crash_ledger_for_the_sweep(repo, caplog):
             super().__init__(**kw)
             self.calls = 0
 
-        def place_order(self, product_id, side, order_configuration):
+        def place_order(self, spec, *, idempotency_key=None):  # noqa: ANN001, ANN202
             self.calls += 1
             if self.calls > 1:  # the original bracket places; the replacement fails
-                return {"success": False, "error": "INSUFFICIENT_FUND"}
-            return super().place_order(product_id, side, order_configuration)
+                return PlaceResult(success=False, broker_order_id=None, reason="INSUFFICIENT_FUND")
+            return super().place_order(spec, idempotency_key=idempotency_key)
 
     broker = _RejectingBroker()
     stop_id = place_bracket(

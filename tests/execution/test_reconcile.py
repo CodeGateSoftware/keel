@@ -15,6 +15,8 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_broker_api.orders import OrderSpec
+from keel_broker_api.results import Balance, PlaceResult, Preview
 
 from keel.config import Caps, Config, MarketDataConfig, MoneyMgmtConfig
 from keel.data.db import connect, migrate
@@ -70,27 +72,28 @@ class _RebracketingBroker(_Broker):
         super().__init__(orders)
         self.placed: list[dict[str, Any]] = []
 
-    def get_accounts(self) -> list[dict[str, Any]]:
-        return [{"currency": "USDC", "available_balance": Decimal("1000000")}]
+    def get_balances(self) -> list[Balance]:
+        return [
+            Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000"))
+        ]
 
-    def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        return {
-            "order_total": Decimal("50"),
-            "commission_total": Decimal("0"),
-            "errs": [],
-            "warning": [],
-            # Both book sides, as the real venue returns them: #350's spread gate
-            # fails closed on a preview without them (reconcile places SELLs only,
-            # which the gate never touches -- this keeps the fake honest anyway).
-            "best_bid": Decimal("49990"),
-            "best_ask": Decimal("50000"),
-        }
-
-    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        self.placed.append(
-            {"product_id": product_id, "side": side, "order_configuration": order_configuration}
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        return Preview(
+            product_id=spec.product_id,
+            side=spec.side,
+            est_base_size=Decimal("0"),
+            est_quote_size=Decimal("50"),
+            est_fee=Decimal("0"),
+            synthetic=False,
+            # Both book sides, as the real venue returns them: #350's spread gate fails closed on
+            # a preview without them (reconcile places SELLs only, which the gate never touches --
+            # this keeps the fake honest anyway).
+            detail={"best_bid": "49990", "best_ask": "50000", "order_total": "50"},
         )
-        return {"success": True, "order_id": f"cb-re-{len(self.placed)}"}
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.placed.append({"spec": spec})
+        return PlaceResult(success=True, broker_order_id=f"cb-re-{len(self.placed)}")
 
 
 def _allow_orders(repo: Repository) -> None:
@@ -862,9 +865,9 @@ def test_a_dead_bracket_on_a_held_position_is_replaced(repo):
     reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
 
     assert broker.placed, "no replacement bracket was placed"
-    leg = broker.placed[-1]["order_configuration"]["trigger_bracket_gtc"]
-    assert leg["stop_trigger_price"] == "49000"
-    assert leg["limit_price"] == "53000"
+    leg = broker.placed[-1]["spec"]
+    assert leg.stop_trigger_price == Decimal("49000")
+    assert leg.take_profit_price == Decimal("53000")
     # The tranche must now name the REPLACEMENT. Leaving it on the dead order is silent data
     # loss: the replacement's eventual fill would resolve to no tranche, take the
     # "exit without position context" skip, and close the position with no `trade_outcomes` row.
@@ -1118,11 +1121,11 @@ class _RejectingRebracketBroker(_RebracketingBroker):
     """Placement reaches the exchange and comes back refused -- min-size, precision, a venue
     error. The reachable cause of a never-placed bracket, and the one no rail can prevent."""
 
-    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        self.placed.append(
-            {"product_id": product_id, "side": side, "order_configuration": order_configuration}
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.placed.append({"spec": spec})
+        return PlaceResult(
+            success=False, broker_order_id=None, reason="PREVIEW_INVALID_BASE_SIZE"
         )
-        return {"success": False, "error": "PREVIEW_INVALID_BASE_SIZE"}
 
 
 def _seed_unbracketed_tranche(
@@ -1192,10 +1195,10 @@ def test_a_tranche_whose_bracket_was_never_placed_is_bracketed_next_cycle(repo):
     reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
 
     assert broker.placed, "the unprotected tranche was left without a bracket"
-    leg = broker.placed[-1]["order_configuration"]["trigger_bracket_gtc"]
+    leg = broker.placed[-1]["spec"]
     # The levels the ORIGINAL trade was risk-sized against, not invented ones.
-    assert leg["stop_trigger_price"] == "49000"
-    assert leg["limit_price"] == "53000"
+    assert leg.stop_trigger_price == Decimal("49000")
+    assert leg.take_profit_price == Decimal("53000")
 
     placed_id = repo.get_orders(mode="live", product_id=PRODUCT, status="pending")[-1]["id"]
     owner = repo.get_position_for_bracket(placed_id)
