@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_broker_api.results import CancelOutcome
+from keel_broker_api.results import Balance, CancelOutcome
 from keel_core import telemetry
 
 from keel.data.cb_client import CoinbaseClient
@@ -203,6 +203,63 @@ def test_get_spot_returns_decimal() -> None:
     assert price == Decimal("65432.10")
     assert isinstance(price, Decimal)
     assert transport.calls["get_product"] == {"product_id": "BTC-USD"}
+
+
+# --- get_balances (the port's shape, #524) ------------------------------------------------
+
+
+def test_get_balances_answers_the_ports_type() -> None:
+    """`Balance`, not this client's account dicts.
+
+    The point of the method: `executor._fetch_available_quote` used to probe for a dict key OR an
+    attribute because it did not know whether it held this pre-port client or a real adapter.
+    Answering in the port's own type removes the fork -- one question, one shape, whichever kind
+    of broker is on the other end.
+    """
+    client = CoinbaseClient(FakeTransport(accounts=_load_fixture("cb_accounts.json")))
+
+    balances = client.get_balances()
+
+    assert all(isinstance(b, Balance) for b in balances)
+    btc = next(b for b in balances if b.currency == "BTC")
+    assert btc.available == Decimal("0.53219871")
+    usd = next(b for b in balances if b.currency == "USD")
+    assert usd.available == Decimal("1042.55")
+
+
+def test_get_balances_totals_available_plus_hold_like_the_adapter_does() -> None:
+    """Coinbase exposes no single "total" field, so both implementations compute it -- and they
+    must not disagree about what the word means while both exist.
+    `keel_broker_coinbase.adapter.get_balances` sums `available_balance` and `hold`; so does this.
+    """
+    transport = FakeTransport(
+        accounts={
+            "accounts": [
+                {
+                    "currency": "USD",
+                    "available_balance": {"value": "100.25"},
+                    "hold": {"value": "9.75"},
+                }
+            ]
+        }
+    )
+
+    balance = CoinbaseClient(transport).get_balances()[0]
+
+    assert balance.available == Decimal("100.25")
+    assert balance.total == Decimal("110.00")
+
+
+def test_get_balances_reraises_an_unreachable_venue() -> None:
+    """Rail 13 fails closed on the exception itself, so this must not swallow it -- the same
+    contract `get_accounts` keeps."""
+
+    class _Down:
+        def get_accounts(self, **_: object) -> object:
+            raise ConnectionError("venue unreachable")
+
+    with pytest.raises(ConnectionError):
+        CoinbaseClient(_Down()).get_balances()  # type: ignore[arg-type]
 
 
 # --- get_accounts -------------------------------------------------------------------------

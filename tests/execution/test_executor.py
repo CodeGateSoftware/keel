@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_broker_api.results import Balance
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
@@ -95,20 +96,26 @@ class FakeBroker:
         # Ordered log of exchange interactions -- lets a test assert SEQUENCE, not just that a
         # call happened. `_roll_stop` must cancel before it places.
         self.events: list[str] = []
-        self.get_accounts_calls = 0
+        self.get_balances_calls = 0
 
-    def get_accounts(self) -> list[dict[str, Any]]:
-        self.get_accounts_calls += 1
+    def get_balances(self) -> list[Balance]:
+        """The port's shape since #524.
+
+        The "no balance known" case is an EMPTY LIST rather than a row carrying `None`. That is
+        not a shortcut around `Balance` requiring a `Decimal`: in the port's model a currency
+        with no account simply is not in the list, and `_fetch_available_quote` returns `None`
+        for it either way -- by falling off the loop instead of by testing a null field.
+        """
+        self.get_balances_calls += 1
         if self._balances is not None:
-            return [{"currency": c, "available_balance": b} for c, b in self._balances.items()]
-        if self._usdc_balance is None:
             return [
-                {"currency": "USD", "available_balance": None},
-                {"currency": "USDC", "available_balance": None},
+                Balance(currency=c, available=b, total=b) for c, b in self._balances.items()
             ]
+        if self._usdc_balance is None:
+            return []
         return [
-            {"currency": "USD", "available_balance": self._usdc_balance},
-            {"currency": "USDC", "available_balance": self._usdc_balance},
+            Balance(currency="USD", available=self._usdc_balance, total=self._usdc_balance),
+            Balance(currency="USDC", available=self._usdc_balance, total=self._usdc_balance),
         ]
 
     def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
@@ -487,8 +494,8 @@ class _BrokerAccountsError:
     or placing.
     """
 
-    def get_accounts(self) -> list[dict[str, Any]]:
-        raise ConnectionError("simulated broker outage fetching accounts")
+    def get_balances(self) -> list[Balance]:
+        raise ConnectionError("simulated broker outage fetching balances")
 
     def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         raise AssertionError("preview_order must not be called when the balance fetch failed")
@@ -504,7 +511,7 @@ def test_execute_fetches_the_available_quote_balance_for_a_buy_and_places(repo):
     result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
-    assert broker.get_accounts_calls == 1
+    assert broker.get_balances_calls == 1
 
 
 def test_broker_balance_fetch_error_vetoes_the_buy_before_preview_or_place(repo):
@@ -551,7 +558,7 @@ def test_exit_signal_never_fetches_a_balance(repo):
     result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
-    assert broker.get_accounts_calls == 0
+    assert broker.get_balances_calls == 0
 
 
 # -- autonomous mode: compliant -> placed without a prompt
@@ -2211,12 +2218,12 @@ def test_no_account_at_all_for_the_required_currency_fails_closed(repo):
 
 
 class _UnreachableBroker:
-    """A broker whose `get_accounts` raises as an offline HTTP stack does."""
+    """A broker whose `get_balances` raises as an offline HTTP stack does."""
 
     def __init__(self, exc: BaseException) -> None:
         self._exc = exc
 
-    def get_accounts(self) -> list[dict]:
+    def get_balances(self) -> list[Balance]:
         raise self._exc
 
 
@@ -2231,6 +2238,52 @@ def _quote_failure_payload(caplog, exc: BaseException) -> tuple[Decimal | None, 
     records = [r for r in caplog.records if r.getMessage() == "executor.quote_fetch_failed"]
     assert len(records) == 1
     return result, json.loads(formatter.format(records[0]))
+
+
+def test_the_quote_read_takes_available_and_never_total() -> None:
+    """**Rail 13 is about SPENDABLE funds, and `Balance` carries two numbers that differ.**
+
+    `available` is what the venue will let an order draw on; `total` includes funds on hold --
+    settling proceeds, collateral behind a resting order. Reading `total` would let rail 13 pass
+    an order the account cannot actually fund, which is the precise failure the rail exists to
+    prevent, and it would do it silently because both numbers are plausible balances.
+
+    Pinned with a balance whose two figures DIFFER. Every other fake in this file sets them
+    equal, so before this test existed, swapping `.available` for `.total` in
+    `_fetch_available_quote` passed the entire suite -- verified by making that change.
+    """
+    from keel.execution.executor import _fetch_available_quote
+
+    class _OnHold:
+        def get_balances(self) -> list[Balance]:
+            # 900 of the 1000 is on hold: spendable is 100.
+            return [Balance(currency="USD", available=Decimal("100"), total=Decimal("1000"))]
+
+    assert _fetch_available_quote(_OnHold(), "USD") == Decimal("100")
+
+
+def test_the_quote_read_matches_the_currency_case_insensitively() -> None:
+    """Venues disagree about casing and the product's quote leg is derived from a product id.
+    A `usd` row must satisfy a `USD` question -- the same comparison `gather_holdings` makes."""
+    from keel.execution.executor import _fetch_available_quote
+
+    class _Lowercase:
+        def get_balances(self) -> list[Balance]:
+            return [Balance(currency="usd", available=Decimal("42"), total=Decimal("42"))]
+
+    assert _fetch_available_quote(_Lowercase(), "USD") == Decimal("42")
+
+
+def test_the_quote_read_answers_none_when_the_currency_has_no_account() -> None:
+    """`None` means UNKNOWN and rail 13 fails closed on it. In the port's model a currency with
+    no account simply is not in the list -- there is no row carrying a null balance to inspect."""
+    from keel.execution.executor import _fetch_available_quote
+
+    class _NoUsd:
+        def get_balances(self) -> list[Balance]:
+            return [Balance(currency="EUR", available=Decimal("500"), total=Decimal("500"))]
+
+    assert _fetch_available_quote(_NoUsd(), "USD") is None
 
 
 def test_quote_fetch_logs_an_unreachable_venue_as_a_warning(caplog) -> None:

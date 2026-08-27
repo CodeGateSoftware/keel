@@ -26,7 +26,7 @@ import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
-from keel_broker_api.results import CancelOutcome
+from keel_broker_api.results import Balance, CancelOutcome
 from keel_core.telemetry import log_exception, log_venue_failure
 
 from keel.types import Candle, Granularity, Side
@@ -232,6 +232,42 @@ class CoinbaseClient:
                 }
             )
         return accounts
+
+    def get_balances(self) -> list[Balance]:
+        """The same read as `get_accounts`, in the PORT's shape (#524).
+
+        This client predates `keel-broker-api` and its `get_accounts` returns venue-shaped dicts
+        (`available_balance`, plus `uuid`/`default`/`active` nobody reads). The port's answer is
+        `list[Balance]` -- `currency`, `available`, `total` -- and `executor._fetch_available_quote`
+        had to probe for BOTH shapes, dict key or attribute, because it did not know which kind of
+        broker it held.
+
+        Teaching this client the port's shape removes that fork without flipping anything: the
+        executor now asks one question, and the answer is the same type whether it is talking to
+        this pre-port client or to a real adapter. When `_build_broker` finally resolves through
+        `load_broker`, this path needs no further change.
+
+        `total` is `available + hold`, matching `keel_broker_coinbase.adapter.get_balances`
+        exactly -- Coinbase exposes no single "total" field, and the two implementations must not
+        disagree about what the word means while both exist.
+        """
+        try:
+            response = self._transport.get_accounts()
+        except Exception:
+            log_venue_failure(logger, "cb_client.accounts_fetch_failed")
+            raise
+        balances: list[Balance] = []
+        for raw in _field(response, "accounts", []) or []:
+            available = Decimal(_field(_field(raw, "available_balance") or {}, "value", "0"))
+            hold = Decimal(_field(_field(raw, "hold") or {}, "value", "0"))
+            balances.append(
+                Balance(
+                    currency=str(_field(raw, "currency", "")),
+                    available=available,
+                    total=available + hold,
+                )
+            )
+        return balances
 
     def preview_order(self, product_id: str, side: Side, order_configuration: dict) -> dict:
         """Preview an order (no funds moved) -- returns `Decimal` money fields + any errors."""

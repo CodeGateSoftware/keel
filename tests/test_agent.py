@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from keel_broker_api.results import MarketSchedule, SessionState
+from keel_broker_api.results import Balance, MarketSchedule, SessionState
 from keel_core.telemetry import _FIELDS_ATTR
 
 from keel import agent
@@ -65,12 +65,12 @@ class FakeBroker:
         self.place_calls: list[dict[str, Any]] = []
         self._order_seq = 0
 
-    def get_accounts(self) -> list[dict[str, Any]]:
+    def get_balances(self) -> list[Balance]:
         """Comfortable balances -- rail 13 fails closed otherwise. Both legs are funded because
         rail 13 checks the PRODUCT's quote leg (BTC-USD spends USD), not config.quote_currency."""
         return [
-            {"currency": "USD", "available_balance": Decimal("1000000")},
-            {"currency": "USDC", "available_balance": Decimal("1000000")},
+            Balance(currency="USD", available=Decimal("1000000"), total=Decimal("1000000")),
+            Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000")),
         ]
 
     def get_candles(
@@ -1290,12 +1290,12 @@ def test_run_once_skips_the_drawdown_update_when_the_quote_balance_is_unreadable
     high-water mark PERMANENTLY -- an HWM cannot be walked back, so an under-read arms the
     breaker on a phantom drawdown forever after. Skip and keep last cycle's scalars instead."""
 
-    class _BrokenAccountsBroker(FakeBroker):
-        def get_accounts(self) -> list[dict[str, Any]]:
+    class _BrokenBalancesBroker(FakeBroker):
+        def get_balances(self) -> list[Balance]:
             raise RuntimeError("broker down")
 
     series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
-    broker = _BrokenAccountsBroker(series=series)
+    broker = _BrokenBalancesBroker(series=series)
 
     run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
 
@@ -1314,12 +1314,12 @@ def test_paper_to_live_flip_clears_stale_scalars_even_when_broker_unreadable(
     repo.set_state("drawdown_total_pct", Decimal("0.9"))
     repo.set_state("drawdown_weekly_pct", Decimal("0.5"))
 
-    class _BrokenAccountsBroker(FakeBroker):
-        def get_accounts(self) -> list[dict[str, Any]]:
+    class _BrokenBalancesBroker(FakeBroker):
+        def get_balances(self) -> list[Balance]:
             raise RuntimeError("broker down")
 
     series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
-    broker = _BrokenAccountsBroker(series=series)
+    broker = _BrokenBalancesBroker(series=series)
 
     run_once(broker, repo, _config(), now_ts=1_000 + 29 * 86_400)
 
@@ -1343,8 +1343,8 @@ def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) ->
             super().__init__(**kwargs)
             self.balance = Decimal("10000")
 
-        def get_accounts(self) -> list[dict[str, Any]]:
-            return [{"currency": "USD", "available_balance": self.balance}]
+        def get_balances(self) -> list[Balance]:
+            return [Balance(currency="USD", available=self.balance, total=self.balance)]
 
     series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
     broker = _DecliningBroker(series=series)
@@ -1739,7 +1739,7 @@ class _MarketDataOnlyBroker(FakeBroker):
     def preview_order(self, *a, **k):
         raise AssertionError("paper mode previewed an order")
 
-    def get_accounts(self, *a, **k):
+    def get_balances(self, *a, **k):
         raise AssertionError("paper mode read account state")
 
 
@@ -1898,7 +1898,7 @@ class _NullBalanceBroker(FakeBroker):
     (and therefore the paper seed's real-equity attempt) must return `None` here, forcing the
     config fallback rather than a phantom balance."""
 
-    def get_accounts(self) -> list[dict[str, Any]]:
+    def get_balances(self) -> list[Balance]:
         return []
 
 
@@ -2601,10 +2601,10 @@ def test_equity_counts_settled_cash_in_EVERY_quote_leg_being_traded(repo):
     """
 
     class TwoCurrencyBroker:
-        def get_accounts(self):
+        def get_balances(self):
             return [
-                {"currency": "USD", "available_balance": Decimal("1000")},
-                {"currency": "USDC", "available_balance": Decimal("7")},
+                Balance(currency="USD", available=Decimal("1000"), total=Decimal("1000")),
+                Balance(currency="USDC", available=Decimal("7"), total=Decimal("7")),
             ]
 
     equity = agent._mark_to_market_equity(repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC")
@@ -2620,8 +2620,8 @@ def test_equity_is_a_total_when_only_SOME_currencies_are_readable(repo):
     would return None on a perfectly ordinary account and stall rail 11's equity tracking."""
 
     class OnlyUsd:
-        def get_accounts(self):
-            return [{"currency": "USD", "available_balance": Decimal("1000")}]
+        def get_balances(self):
+            return [Balance(currency="USD", available=Decimal("1000"), total=Decimal("1000"))]
 
     equity = agent._mark_to_market_equity(repo, OnlyUsd(), ["BTC-USD"], {}, "USDC")
     assert equity == Decimal("1000"), f"expected a total, got {equity!r}"
@@ -2629,7 +2629,7 @@ def test_equity_is_a_total_when_only_SOME_currencies_are_readable(repo):
 
 def test_equity_is_None_only_when_NOTHING_is_readable(repo):
     class NoAccounts:
-        def get_accounts(self):
+        def get_balances(self):
             return []
 
     assert agent._mark_to_market_equity(repo, NoAccounts(), ["BTC-USD"], {}, "USDC") is None
@@ -2641,8 +2641,8 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
     an under-read, and the HWM never falls."""
 
     class EurOnly:
-        def get_accounts(self):
-            return [{"currency": "EUR", "available_balance": Decimal("500")}]
+        def get_balances(self):
+            return [Balance(currency="EUR", available=Decimal("500"), total=Decimal("500"))]
 
     monkeypatch.setattr(repo, "held_products", lambda: ["BTC-EUR"])
     equity = agent._mark_to_market_equity(repo, EurOnly(), [], {}, "USD")
