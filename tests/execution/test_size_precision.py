@@ -13,7 +13,7 @@ from decimal import Decimal
 import pytest
 
 from keel.execution import sizing
-from keel.execution.executor import SizePrecisionUnavailable, _order_configuration
+from keel.execution.executor import SizePrecisionUnavailable, _order_spec
 from keel.execution.guards import OrderIntent
 from keel.types import Side
 
@@ -109,19 +109,19 @@ def test_quote_increment_answers_about_the_currency_not_the_instrument_shape() -
     assert sizing.quote_increment_for("BTC-PERP-USD") == Decimal("0.01")
 
 
-# -- _order_configuration: the regression ---------------------------------------------------
+# -- _order_spec: the regression ---------------------------------------------------
 
 
 def test_the_rejected_order_now_serialises_to_two_decimals() -> None:
     """Regression on the real payload. This exact string was answered INVALID_SIZE_PRECISION."""
-    config = _order_configuration(_buy())
-    assert config == {"market_market_ioc": {"quote_size": "23.00"}}
+    config = _order_spec(_buy())
+    assert config.quote_size == Decimal("23.00")
 
 
 def test_serialised_quote_size_never_exceeds_the_authorised_notional() -> None:
     """The rails approved `notional`; the wire value must not be larger than what they passed."""
     intent = _buy(notional=Decimal("23.999999999"))
-    sent = Decimal(_order_configuration(intent)["market_market_ioc"]["quote_size"])
+    sent = Decimal(_order_spec(intent).quote_size)
     assert sent <= intent.notional
 
 
@@ -131,18 +131,18 @@ def test_dca_style_round_notional_is_unchanged() -> None:
     Orders 1 and 2 sent 26 decimal places and filled, because the VALUE was exactly 50.
     """
     intent = _buy(product_id="BTC-USD", notional=Decimal("50.00000000000000000000000000"))
-    assert _order_configuration(intent) == {"market_market_ioc": {"quote_size": "50.00"}}
+    assert _order_spec(intent).quote_size == Decimal("50.00")
 
 
 def test_unknown_increment_refuses_rather_than_guessing() -> None:
     with pytest.raises(SizePrecisionUnavailable, match="no quote increment known"):
-        _order_configuration(_buy(product_id="BTC-XYZ"))
+        _order_spec(_buy(product_id="BTC-XYZ"))
 
 
 def test_a_notional_that_quantizes_to_zero_is_refused() -> None:
     """A size rounded to nothing must never be sent as an order."""
     with pytest.raises(SizePrecisionUnavailable, match="zero-size order"):
-        _order_configuration(_buy(notional=Decimal("0.004")))
+        _order_spec(_buy(notional=Decimal("0.004")))
 
 
 def test_sell_is_deliberately_untouched_pending_base_increments() -> None:
@@ -162,4 +162,4 @@ def test_sell_is_deliberately_untouched_pending_base_increments() -> None:
         is_dca=False,
         rule_kind="turtle_breakout",
     )
-    assert _order_configuration(sell) == {"market_market_ioc": {"base_size": str(intent.qty)}}
+    assert _order_spec(sell).base_size == intent.qty

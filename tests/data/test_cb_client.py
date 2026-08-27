@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_broker_api.results import Balance, CancelOutcome, Instrument
+from keel_broker_api.orders import BracketGTC, MarketIOCByQuote
+from keel_broker_api.results import Balance, CancelOutcome, Instrument, PlaceResult, Preview
+from keel_broker_coinbase.translate import to_order_configuration
 from keel_core import telemetry
 
 from keel.data.cb_client import CoinbaseClient
@@ -322,184 +324,120 @@ def test_get_accounts_returns_list_of_dicts() -> None:
     assert all(isinstance(a, dict) for a in accounts)
 
 
-# --- preview_order ------------------------------------------------------------------------
+# --- preview_order / place_order: the PORT's shapes (#524) ---------------------------------
+#
+# These replace nine tests that asserted the pre-port dict contract -- `result["order_total"]`,
+# `result["success"]`, `result["client_order_id"]`. That contract is gone: both methods take an
+# `OrderSpec` and answer `Preview`/`PlaceResult`, and the wire configuration is rendered by
+# `keel_broker_coinbase.translate.to_order_configuration` rather than built here. There is now
+# ONE Coinbase order renderer in the tree; #502 stage 1 had shipped a test pinning two of them
+# byte-identical, and that test goes with the duplicate it was holding in place.
 
 
-def test_preview_order_maps_money_fields_to_decimal() -> None:
-    transport = FakeTransport(preview=_load_fixture("cb_preview_order.json"))
-    client = CoinbaseClient(transport)
-
-    result = client.preview_order(
-        "BTC-USD",
-        Side.BUY,
-        {"market_market_ioc": {"quote_size": "100.00"}},
+def _buy_spec(quote: str = "100.00") -> MarketIOCByQuote:
+    return MarketIOCByQuote(
+        product_id="BTC-USD", side=Side.BUY, quote_size=Decimal(quote)
     )
 
-    assert result["order_total"] == Decimal("100.60")
-    assert result["commission_total"] == Decimal("0.60")
-    assert result["quote_size"] == Decimal("100.00")
-    assert result["base_size"] == Decimal("0.00152834")
-    assert isinstance(result["order_total"], Decimal)
-    assert result["errs"] == []
+
+def test_preview_order_answers_the_ports_type() -> None:
+    result = CoinbaseClient(
+        FakeTransport(preview=_load_fixture("cb_preview_order.json"))
+    ).preview_order(_buy_spec())
+
+    assert isinstance(result, Preview)
+    assert result.est_fee == Decimal("0.60")
+    assert result.est_quote_size == Decimal("100.00")
+    assert result.est_base_size == Decimal("0.00152834")
+    assert result.errors == ()
+    # A real quote from the venue, never an estimate this client computed.
+    assert result.synthetic is False
 
 
-def test_preview_order_passes_correct_params_to_transport() -> None:
+def test_preview_carries_the_book_in_detail_where_the_spread_gate_reads_it() -> None:
+    """#350's spread gate and #332's entry-override warning both read the book through
+    `executor._preview_book`, which takes it off `Preview.detail` as strings. A client that put
+    the book anywhere else would disable both without failing anything."""
+    result = CoinbaseClient(
+        FakeTransport(preview=_load_fixture("cb_preview_order.json"))
+    ).preview_order(_buy_spec())
+
+    assert "best_bid" in result.detail
+    assert "best_ask" in result.detail
+    assert all(isinstance(v, str) for v in result.detail.values())
+
+
+def test_preview_renders_the_spec_through_the_adapters_translation() -> None:
+    """One renderer. The transport must receive exactly what the adapter would have sent."""
     transport = FakeTransport(preview=_load_fixture("cb_preview_order.json"))
-    client = CoinbaseClient(transport)
-    order_configuration = {"market_market_ioc": {"quote_size": "100.00"}}
+    spec = _buy_spec()
 
-    client.preview_order("BTC-USD", Side.BUY, order_configuration)
+    CoinbaseClient(transport).preview_order(spec)
 
     assert transport.calls["preview_order"] == {
         "product_id": "BTC-USD",
         "side": "BUY",
-        "order_configuration": order_configuration,
+        "order_configuration": to_order_configuration(spec),
     }
 
 
-# --- place_order (Phase 3) -----------------------------------------------------------------
+def test_place_order_answers_the_ports_type() -> None:
+    result = CoinbaseClient(
+        FakeTransport(placed=_load_fixture("cb_place_order_market.json"))
+    ).place_order(_buy_spec())
+
+    assert isinstance(result, PlaceResult)
+    assert result.success is True
+    assert result.broker_order_id == "b1cd9a3b-4e5f-4a3c-9c8a-1f2e3d4c5b6a"
+    assert result.reason is None
 
 
-def test_place_order_market_maps_success_response() -> None:
+def test_place_order_states_a_reason_when_the_venue_refuses() -> None:
+    """A refusal with no reason is the worst of both: the caller records `rejected` and the
+    operator learns nothing. The fallback sentence is deliberate rather than an empty string."""
+    transport = FakeTransport(
+        placed={"success": False, "error_response": {"message": "insufficient funds"}}
+    )
+
+    result = CoinbaseClient(transport).place_order(_buy_spec())
+
+    assert result.success is False
+    assert result.broker_order_id is None
+    assert result.reason == "insufficient funds"
+
+
+def test_place_order_mints_an_idempotency_key_per_attempt_unless_given_one() -> None:
+    """The port's contract: the key identifies the INTENT, not the order. Omit it and two
+    identical orders a strategy genuinely meant to place are two orders."""
     transport = FakeTransport(placed=_load_fixture("cb_place_order_market.json"))
     client = CoinbaseClient(transport)
 
-    result = client.place_order(
-        "BTC-USD",
-        Side.BUY,
-        {"market_market_ioc": {"quote_size": "100.00"}},
-    )
+    client.place_order(_buy_spec())
+    first = transport.calls["create_order"]["client_order_id"]
+    client.place_order(_buy_spec())
+    second = transport.calls["create_order"]["client_order_id"]
+    assert first != second
 
-    assert result["success"] is True
-    assert result["order_id"] == "b1cd9a3b-4e5f-4a3c-9c8a-1f2e3d4c5b6a"
-    assert result["product_id"] == "BTC-USD"
-    assert result["side"] == "BUY"
-    assert result["client_order_id"] == "6a5e1e4a-7c8b-4d9e-9f0a-2b3c4d5e6f7a"
-    assert result["error"] is None
-    assert result["order_configuration"] == {
-        "market_market_ioc": {"quote_size": Decimal("100.00")}
-    }
-    assert isinstance(result["order_configuration"]["market_market_ioc"]["quote_size"], Decimal)
+    client.place_order(_buy_spec(), idempotency_key="the-same-intent")
+    assert transport.calls["create_order"]["client_order_id"] == "the-same-intent"
 
 
-def test_place_order_market_passes_market_config_through_to_transport() -> None:
+def test_place_order_renders_a_bracket_through_the_one_renderer() -> None:
+    """The kind that had two renderers until #524, and the reason the parity test existed."""
     transport = FakeTransport(placed=_load_fixture("cb_place_order_market.json"))
-    client = CoinbaseClient(transport)
-    order_configuration = {"market_market_ioc": {"quote_size": "100.00"}}
-
-    client.place_order("BTC-USD", Side.BUY, order_configuration)
-
-    call = transport.calls["create_order"]
-    assert call["product_id"] == "BTC-USD"
-    assert call["side"] == "BUY"
-    assert call["order_configuration"] == order_configuration
-    assert call["client_order_id"]  # a client_order_id is always generated/passed
-
-
-def test_place_order_limit_maps_success_response_and_decimal_fields() -> None:
-    transport = FakeTransport(placed=_load_fixture("cb_place_order_limit.json"))
-    client = CoinbaseClient(transport)
-    order_configuration = {
-        "limit_limit_gtc": {
-            "base_size": "0.00150000",
-            "limit_price": "66000.00",
-            "post_only": False,
-        }
-    }
-
-    result = client.place_order("BTC-USD", Side.SELL, order_configuration)
-
-    assert result["success"] is True
-    assert result["order_id"] == "c2de0b4c-5f60-4b5d-ad9b-2030415263f8"
-    assert result["side"] == "SELL"
-    limit_config = result["order_configuration"]["limit_limit_gtc"]
-    assert limit_config["base_size"] == Decimal("0.00150000")
-    assert limit_config["limit_price"] == Decimal("66000.00")
-    assert limit_config["post_only"] is False
-    assert isinstance(limit_config["base_size"], Decimal)
-    assert isinstance(limit_config["limit_price"], Decimal)
-
-    call = transport.calls["create_order"]
-    assert call["order_configuration"] == order_configuration
-    assert call["side"] == "SELL"
-
-
-def test_place_order_stop_limit_maps_decimal_fields() -> None:
-    transport = FakeTransport(placed=_load_fixture("cb_place_order_stop_limit.json"))
-    client = CoinbaseClient(transport)
-    order_configuration = {
-        "stop_limit_stop_limit_gtc": {
-            "base_size": "0.00150000",
-            "limit_price": "60000.00",
-            "stop_price": "61000.00",
-            "stop_direction": "STOP_DIRECTION_STOP_DOWN",
-        }
-    }
-
-    result = client.place_order("BTC-USD", Side.SELL, order_configuration)
-
-    stop_config = result["order_configuration"]["stop_limit_stop_limit_gtc"]
-    assert stop_config["base_size"] == Decimal("0.00150000")
-    assert stop_config["limit_price"] == Decimal("60000.00")
-    assert stop_config["stop_price"] == Decimal("61000.00")
-    assert stop_config["stop_direction"] == "STOP_DIRECTION_STOP_DOWN"
-
-
-def test_place_order_maps_error_response_when_not_successful() -> None:
-    transport = FakeTransport(placed=_load_fixture("cb_place_order_error.json"))
-    client = CoinbaseClient(transport)
-
-    result = client.place_order(
-        "BTC-USD",
-        Side.BUY,
-        {"market_market_ioc": {"quote_size": "100.00"}},
+    spec = BracketGTC(
+        product_id="BTC-USD",
+        side=Side.SELL,
+        base_size=Decimal("0.01"),
+        take_profit_price=Decimal("53000"),
+        stop_trigger_price=Decimal("49000"),
     )
 
-    assert result["success"] is False
-    assert result["order_id"] is None
-    assert result["error"] == {
-        "error": "INSUFFICIENT_FUND",
-        "message": "Insufficient balance in source account",
-        "error_details": "",
-        "preview_failure_reason": "PREVIEW_INSUFFICIENT_FUND",
-        "new_order_failure_reason": "INSUFFICIENT_FUND",
-    }
+    CoinbaseClient(transport).place_order(spec)
 
-
-def test_place_order_accepts_side_as_plain_string() -> None:
-    transport = FakeTransport(placed=_load_fixture("cb_place_order_market.json"))
-    client = CoinbaseClient(transport)
-
-    client.place_order("BTC-USD", "BUY", {"market_market_ioc": {"quote_size": "100.00"}})
-
-    assert transport.calls["create_order"]["side"] == "BUY"
-
-
-def test_place_order_works_with_real_response_wrapper_types() -> None:
-    """`place_order` must also work when the transport returns the real typed
-    `CreateOrderResponse` from `coinbase-advanced-py` (not just a plain dict).
-    """
-    from coinbase.rest.types.orders_types import CreateOrderResponse
-
-    raw = _load_fixture("cb_place_order_limit.json")
-    wrapped = CreateOrderResponse(dict(raw))
-
-    class WrappedTransport:
-        def create_order(self, **kwargs: Any) -> CreateOrderResponse:
-            return wrapped
-
-    client = CoinbaseClient(WrappedTransport())
-    result = client.place_order(
-        "BTC-USD",
-        Side.SELL,
-        {"limit_limit_gtc": {"base_size": "0.0015", "limit_price": "66000.00"}},
-    )
-
-    assert result["success"] is True
-    assert result["order_id"] == "c2de0b4c-5f60-4b5d-ad9b-2030415263f8"
-    assert result["order_configuration"]["limit_limit_gtc"]["limit_price"] == Decimal(
-        "66000.00"
-    )
+    sent = transport.calls["create_order"]["order_configuration"]
+    assert sent == to_order_configuration(spec)
+    assert sent["trigger_bracket_gtc"]["stop_trigger_price"] == "49000"
 
 
 # --- zero network in tests -----------------------------------------------------------------

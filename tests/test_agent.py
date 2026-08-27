@@ -20,7 +20,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from keel_broker_api.results import Balance, MarketSchedule, SessionState
+from keel_broker_api.orders import OrderSpec
+from keel_broker_api.results import (
+    Balance,
+    MarketSchedule,
+    PlaceResult,
+    Preview,
+    SessionState,
+)
 from keel_core.telemetry import _FIELDS_ATTR
 
 from keel import agent
@@ -64,6 +71,8 @@ class FakeBroker:
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
         self._order_seq = 0
+        # The previewed fee, overridable by a subclass that means to test fee splitting.
+        self.commission = Decimal("0")
 
     def get_balances(self) -> list[Balance]:
         """Comfortable balances -- rail 13 fails closed otherwise. Both legs are funded because
@@ -80,34 +89,25 @@ class FakeBroker:
         series = self._series.get((product_id, granularity), [])
         return [c for c in series if start <= c.ts <= end]
 
-    def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-        self.preview_calls.append({"product_id": product_id, "side": side})
-        return {
-            "order_total": Decimal("50.00"),
-            "commission_total": Decimal("0"),
-            "errs": [],
-            "warning": [],
-            # Both book sides, as the real venue returns them: #350's spread gate fails
-            # closed on a preview without them (tests that mean a degraded/bookless
-            # response pass their own preview dict).
-            "best_bid": Decimal("99.95"),
-            "best_ask": Decimal("100"),
-        }
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        self.preview_calls.append({"product_id": spec.product_id, "side": spec.side})
+        return Preview(
+            product_id=spec.product_id,
+            side=spec.side,
+            est_base_size=Decimal("0"),
+            est_quote_size=Decimal("50.00"),
+            est_fee=self.commission,
+            synthetic=False,
+            # Both book sides, as the real venue returns them: #350's spread gate fails closed on
+            # a preview without them (tests that mean a degraded/bookless response build their
+            # own Preview).
+            detail={"best_bid": "99.95", "best_ask": "100", "order_total": "50.00"},
+        )
 
-    def place_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         self._order_seq += 1
-        order_id = f"broker-order-{self._order_seq}"
-        self.place_calls.append({"product_id": product_id, "side": side})
-        side_str = side.value if isinstance(side, Side) else side
-        return {
-            "success": True,
-            "order_id": order_id,
-            "product_id": product_id,
-            "side": side_str,
-            "client_order_id": f"client-{order_id}",
-            "order_configuration": order_configuration,
-            "error": None,
-        }
+        self.place_calls.append({"product_id": spec.product_id, "side": spec.side})
+        return PlaceResult(success=True, broker_order_id=f"broker-order-{self._order_seq}")
 
     def cancel_order(self, order_id: str) -> bool:
         return True  # a CONFIRMED cancel -- see `_cancel_at_exchange`
@@ -1673,10 +1673,9 @@ def test_a_rule_exit_apportions_the_exit_fee_across_tranches(repo: Repository) -
     )
 
     class _FeeBroker(FakeBroker):
-        def preview_order(self, product_id: str, side: Any, order_configuration: dict) -> dict:
-            preview = super().preview_order(product_id, side, order_configuration)
-            preview["commission_total"] = Decimal("4.00")
-            return preview
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.commission = Decimal("4.00")
 
     repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
     broker = _FeeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -2483,14 +2482,19 @@ def test_confirm_fn_sees_the_broker_preview(repo, monkeypatch):
     _live_ready_repo(repo)
     _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
-    seen = {}
+    seen: list[Preview] = []
 
-    def _capture(preview):
-        seen.update(preview)
+    def _capture(preview):  # noqa: ANN001, ANN202
+        seen.append(preview)
         return True
 
     run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=_capture)
-    assert "order_total" in seen  # the preview the operator would be shown
+    # The operator is shown the port's `Preview` since #524, not a venue dict. `order_total` is
+    # still there -- it moved into `detail`, which is where the port carries the venue's own
+    # figures as strings.
+    assert len(seen) == 1
+    assert isinstance(seen[0], Preview)
+    assert "order_total" in seen[0].detail
 
 
 def test_a_rail_veto_means_the_confirm_prompt_is_never_reached(repo, monkeypatch):

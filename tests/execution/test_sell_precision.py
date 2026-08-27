@@ -16,8 +16,8 @@ from keel_broker_api.results import Instrument
 
 from keel.execution.executor import (
     _base_increment_for,
-    _bracket_order_configuration,
-    _order_configuration,
+    _bracket_spec,
+    _order_spec,
     _sell_base_size,
 )
 from keel.execution.guards import OrderIntent
@@ -53,8 +53,8 @@ def test_unknown_increment_sends_unquantized_and_does_not_refuse() -> None:
     least sometimes works -- a round quantity is accepted -- so refusing would replace
     "sometimes exits" with "never exits".
     """
-    config = _order_configuration(_sell(increment=None))
-    assert config == {"market_market_ioc": {"base_size": str(MESSY_QTY)}}
+    config = _order_spec(_sell(increment=None))
+    assert config.base_size == MESSY_QTY
 
 
 def test_a_buy_refuses_where_a_sell_sends() -> None:
@@ -72,10 +72,10 @@ def test_a_buy_refuses_where_a_sell_sends() -> None:
         rule_kind="turtle_breakout",
     )
     with pytest.raises(SizePrecisionUnavailable):
-        _order_configuration(buy)
+        _order_spec(buy)
 
     sell = _sell(increment=None)
-    assert _order_configuration(sell)["market_market_ioc"]["base_size"] == str(MESSY_QTY)
+    assert _order_spec(sell).base_size == MESSY_QTY
 
 
 @pytest.mark.parametrize("increment", [None, Decimal("0"), Decimal("-1")])
@@ -111,25 +111,25 @@ def test_a_quantity_smaller_than_one_increment_is_sent_unchanged() -> None:
 
 
 def test_bracket_quantizes_its_base_size_when_the_increment_is_known() -> None:
-    config = _bracket_order_configuration(
-        MESSY_QTY, Decimal("0.25"), Decimal("0.18"), Decimal("0.000001")
+    config = _bracket_spec(
+        "XLM-USD", MESSY_QTY, Decimal("0.25"), Decimal("0.18"), Decimal("0.000001")
     )
-    assert config["trigger_bracket_gtc"]["base_size"] == "114.011787"
+    assert config.base_size == Decimal("114.011787")
 
 
 def test_bracket_sends_unquantized_when_the_increment_is_unknown() -> None:
     """A bracket the venue refuses leaves the position UNPROTECTED -- never make this stricter."""
-    config = _bracket_order_configuration(MESSY_QTY, Decimal("0.25"), Decimal("0.18"), None)
-    assert config["trigger_bracket_gtc"]["base_size"] == str(MESSY_QTY)
+    config = _bracket_spec("XLM-USD", MESSY_QTY, Decimal("0.25"), Decimal("0.18"), None)
+    assert config.base_size == MESSY_QTY
 
 
 def test_bracket_prices_are_untouched() -> None:
     """Only the SIZE is quantized here. Prices have their own increment and are not in scope."""
-    config = _bracket_order_configuration(
-        Decimal("1"), Decimal("0.25"), Decimal("0.18"), Decimal("0.01")
+    config = _bracket_spec(
+        "XLM-USD", Decimal("1"), Decimal("0.25"), Decimal("0.18"), Decimal("0.01")
     )
-    assert config["trigger_bracket_gtc"]["limit_price"] == "0.25"
-    assert config["trigger_bracket_gtc"]["stop_trigger_price"] == "0.18"
+    assert config.take_profit_price == Decimal("0.25")
+    assert config.stop_trigger_price == Decimal("0.18")
 
 
 # -- the cached lookup -------------------------------------------------------------------------
