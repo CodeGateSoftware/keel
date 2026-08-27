@@ -12,6 +12,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from keel_broker_api.results import Instrument
 
 from keel.execution.executor import (
     _base_increment_for,
@@ -150,16 +151,26 @@ class _Repo:
 
 
 class _Broker:
+    """The port's catalogue read (#524), not the pre-port `list_products`.
+
+    `products` is still a mapping of the whole catalogue so the fixtures below read the same, but
+    the broker now answers ONE product per call -- which is the point of the change: the executor
+    asks for what it wants rather than fetching ~900 rows to use one field of one of them.
+    """
+
     def __init__(self, products=None, raises: bool = False) -> None:  # noqa: ANN001
-        self._products = products or []
+        self._products = {p["product_id"]: p["base_increment"] for p in (products or [])}
         self._raises = raises
         self.calls = 0
 
-    def list_products(self):  # noqa: ANN202
+    def get_instrument(self, product_id: str) -> Instrument | None:
         self.calls += 1
         if self._raises:
             raise RuntimeError("venue unreachable")
-        return self._products
+        raw = self._products.get(product_id)
+        if raw is None:
+            return None
+        return Instrument(product_id=product_id, base_increment=Decimal(str(raw)))
 
 
 PRODUCTS = [
@@ -186,9 +197,13 @@ def test_a_second_call_for_the_same_product_is_served_from_cache() -> None:
 def test_a_miss_writes_exactly_one_row_not_one_per_product() -> None:
     """The review finding this test exists for.
 
-    `set_state` commits per call, so caching all ~900 products would mean ~900 fsyncs inside the
-    order-placement path -- the most latency-sensitive moment in the engine -- to save a handful
-    of `list_products` calls per week. One row per miss is the right way round.
+    The finding this test was written for: `set_state` commits per call, so caching all ~900
+    products would have meant ~900 fsyncs inside the order-placement path to save a handful of
+    `list_products` calls per week.
+
+    #524 removed the temptation rather than resisting it -- `get_instrument` returns the one
+    product asked for, so there is no catalogue to decline to cache. The assertion still holds
+    and is still worth holding: one venue answer must still write one row.
     """
     repo, broker = _Repo(), _Broker(PRODUCTS)
     _base_increment_for(broker, repo, "XLM-USD", NOW)
@@ -219,3 +234,20 @@ def test_a_missing_or_malformed_increment_is_unknown() -> None:
     repo, broker = _Repo(), _Broker(PRODUCTS)
     assert _base_increment_for(broker, repo, "BAD-USD", NOW) is None
     assert _base_increment_for(broker, repo, "NOT-LISTED", NOW) is None
+
+
+def test_an_adapter_without_a_catalogue_read_is_unknown_not_a_crash() -> None:
+    """`keel-broker-alpaca` raises `NotImplementedError` from `get_instrument` -- deliberately,
+    so a caller is never told a symbol is unlisted when the truth is that nobody wrote the read.
+
+    On this path that must land as UNKNOWN, not as an exception. `_base_increment_for` never
+    raises by contract: unknown means send the quantity unquantized, and an exit that refused to
+    place because a catalogue lookup was unimplemented would be a protective order withheld over
+    a missing convenience.
+    """
+
+    class _Unwritten:
+        def get_instrument(self, product_id: str) -> Instrument | None:
+            raise NotImplementedError("no catalogue read on this adapter")
+
+    assert _base_increment_for(_Unwritten(), _Repo(), "XLM-USD", NOW) is None

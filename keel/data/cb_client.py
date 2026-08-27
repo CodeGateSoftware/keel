@@ -26,7 +26,7 @@ import uuid
 from decimal import Decimal
 from typing import Any, Protocol
 
-from keel_broker_api.results import Balance, CancelOutcome
+from keel_broker_api.results import Balance, CancelOutcome, Instrument
 from keel_core.telemetry import log_exception, log_venue_failure
 
 from keel.types import Candle, Granularity, Side
@@ -232,6 +232,35 @@ class CoinbaseClient:
                 }
             )
         return accounts
+
+    def get_instrument(self, product_id: str) -> Instrument | None:
+        """One product's `base_increment`, in the PORT's shape (#524).
+
+        The same bridge `get_balances` is: this client predates `keel-broker-api`, and
+        `executor._base_increment_for` had to read `list_products()` and pick through raw dicts
+        because that was the only catalogue read this client offered. Answering `Instrument` here
+        means the executor asks one question whether it holds this client or a real adapter, and
+        the flip needs no further change on this path.
+
+        `get_product`, not `get_products`. The caller needs ONE product; `list_products` returns
+        about 900 and stays where it belongs -- `keel assets discover`, which genuinely wants the
+        catalogue.
+
+        `None` for a product this venue does not list, or whose increment is missing, unparseable
+        or non-positive: all four are the same fact to a caller, and none is worth raising on.
+        """
+        response = self._transport.get_product(product_id=product_id)
+        raw = _field(response, "product", response)
+        increment = _field(raw, "base_increment")
+        if increment is None:
+            return None
+        try:
+            value = Decimal(str(increment))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return Instrument(product_id=product_id, base_increment=value)
 
     def get_balances(self) -> list[Balance]:
         """The same read as `get_accounts`, in the PORT's shape (#524).
