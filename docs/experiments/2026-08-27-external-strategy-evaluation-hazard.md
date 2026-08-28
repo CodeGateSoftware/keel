@@ -108,8 +108,9 @@ them at all. "Not stated" is a real answer and a finding.
 **Why it matters here:** keel is **cost-bound, not signal-bound** (PRD §0). Round-trip friction
 is `2 × fee_pct + 2 × slippage_pct` — 2.50% of notional at taker, 1.30% at maker
 ([`2026-08-12-fee-curve-and-rsi-meanrev.md`](2026-08-12-fee-curve-and-rsi-meanrev.md)) — the
-same order of magnitude as the per-trade edge of everything ever measured here. Seven assets
-showed gross PF > 1.0 in the restated intersection and **all seven died at the maker rate**,
+same order of magnitude as the per-trade edge of everything ever measured here. Seven cells
+(five distinct assets) showed gross PF > 1.0 in the restated intersection and **all seven died
+at the maker rate**,
 before the taker rate actually paid was reached
 ([`2026-08-13-restated-under-a-production-faithful-engine.md`](2026-08-13-restated-under-a-production-faithful-engine.md)
 §3).
@@ -131,8 +132,11 @@ engine; the level shift appears within either engine: 1.1631 → 0.8938 old, 1.1
 faithful)
 ([`2026-08-13-restated-under-a-production-faithful-engine.md`](2026-08-13-restated-under-a-production-faithful-engine.md)
 §4). It was not a decline as trades accumulated; it was a level shift at the measurability
-floor. The window trap bit here too: ZEC-`turtle` printed 1.555 gross over five years while
-running three consecutive losing years and compressing 92.7% of its lifetime PnL into 2025–26.
+floor. The window trap bit here too: ZEC-`turtle` printed 1.555 gross across 2021–26 while
+running three consecutive losing years and compressing 92.7% of its lifetime PnL into 2025–26
+([`2026-08-12-shipped-defaults-intersection.md`](2026-08-12-shipped-defaults-intersection.md)
+§3.2/§6 — the faithful engine later restated the same cell at 1.442, which strengthens rather
+than weakens the point).
 
 **What a wrong answer costs:** a headline profit factor on a small sample is a lottery ticket,
 not an edge. Porting effort is spent on variance, and the resulting backtest — even run honestly
@@ -217,7 +221,7 @@ discipline; the two are kept in step.
 | next-bar-open market fill; `order_type="market"`, `limit_price=None`; "free optionality on the entry price … and unbounded patience" | same, §1 (#258); `keel/strategy/backtest.py` module docstring; `keel/execution/executor.py` ("Entry routing is unconditional market (#258, #260)") |
 | round-trip friction 2.50% taker / 1.30% maker (`2 × fee_pct + 2 × slippage_pct`) | [`2026-08-12-fee-curve-and-rsi-meanrev.md`](2026-08-12-fee-curve-and-rsi-meanrev.md) |
 | `rsi_meanrev` 1.1631 at median n=38 (old engine); 0.8396 across 82 cells at n≥100, 1.1251 at median n=42 (faithful engine); old-engine n≥100 pair 1.1631 → 0.8938 across 76 cells | [`2026-08-13-restated-under-a-production-faithful-engine.md`](2026-08-13-restated-under-a-production-faithful-engine.md) §4 |
-| ZEC-`turtle` 1.555 gross, three consecutive losing years, 92.7% of PnL in 2025–26 | same, §2 (and §3's forensics repositioning) |
+| ZEC-`turtle` 1.555 gross, three consecutive losing years, 92.7% of PnL in 2025–26 | [`2026-08-12-shipped-defaults-intersection.md`](2026-08-12-shipped-defaults-intersection.md) §3.2/§6 (faithful-engine restatement: 1.442, 08-13 §2) |
 | "keel is cost-bound, not signal-bound"; Jesse `self.buy = qty, entry`; capability-to-issue map (#333/#447/#502) | [`docs/superpowers/specs/2026-08-23-strategy-api-expressiveness-prd.md`](../superpowers/specs/2026-08-23-strategy-api-expressiveness-prd.md) §0/§2/§3 |
 | Jesse `go_long` snippet | issue #529, quoting the idiom documented in the PRD §2 comparison |
 
