@@ -2017,7 +2017,13 @@ def test_a_family_row_only_manages_the_tranches_of_its_own_product(repo: Reposit
     btc_bracket = _seed_bracketed_tranche(
         repo, bracket_ref="btc-bracket-1", target=Decimal("60000")
     )
-    eth_bracket = _seed_bracketed_tranche(repo, product=eth, bracket_ref="eth-bracket-1", ts=2_000)
+    # target=60000, NOT the 55000 default: the 57-bar climb trails to ~55.4k, and under a
+    # name-only key the leaked roll would be vetoed by the at/above-target refusal before any
+    # cancel -- leaving the test green against the very bug it exists to pin (the at/above-target
+    # guard fires before the cancel, so the fixture must stay clear of it on BOTH products).
+    eth_bracket = _seed_bracketed_tranche(
+        repo, product=eth, bracket_ref="eth-bracket-1", ts=2_000, target=Decimal("60000")
+    )
     # The SAME climb on both products: under a name-only key this series rolls ETH too.
     series = _rising_series(57)
     _seed_history(repo, series)
@@ -2110,15 +2116,16 @@ def test_the_trail_arm_waits_for_a_warm_candle_table(repo: Repository, caplog) -
     say so at INFO once per product, not once per cycle (the second cycle stays quiet). The
     threshold side of the boundary is
     `test_run_once_trails_a_ratcheting_stop_through_the_broker` (57 bars, rolls)."""
+    warmup_product = "WARM-USD"  # unique: the once-per-product notice set is module state
     repo.insert_rule(
         "pullback_continuation",
-        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        {"product_id": warmup_product, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
         status="live",
     )
-    bracket_id = _seed_bracketed_tranche(repo)
+    bracket_id = _seed_bracketed_tranche(repo, product=warmup_product)
     series = _rising_series(56)
-    _seed_history(repo, series)
-    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    _seed_history(repo, series, product=warmup_product)
+    broker = FakeBroker(series={(warmup_product, Granularity.ONE_DAY): series})
 
     with caplog.at_level(logging.INFO):
         run_once(broker, repo, _config(), now_ts=_management_now_ts(56))
@@ -2131,13 +2138,13 @@ def test_the_trail_arm_waits_for_a_warm_candle_table(repo: Repository, caplog) -
     ]
     assert len(notices) == 1, "the warmup notice is per product, not per cycle"
     assert getattr(notices[0], _FIELDS_ATTR, {}) == {
-        "product": PRODUCT,
+        "product": warmup_product,
         "rule": "pullback_continuation",
         "bars": 56,
         "needed": 57,
     }
     assert "cancel" not in broker.events, "a young table rolled a trail anyway"
-    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_state(f"open_stop:{warmup_product}") == Decimal("49000")
     assert repo.get_order(bracket_id)["status"] == "pending"
 
 
@@ -2184,13 +2191,14 @@ def test_a_failed_roll_is_loud_and_isolated_never_a_dead_cycle(repo: Repository,
 
     assert result.skipped is False, "a failed roll killed the whole cycle"
     failures = [
-        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        record
         for record in caplog.records
         if record.getMessage() == "agent.stop_management_roll_failed"
     ]
     assert len(failures) == 1
-    assert failures[0][1]["product"] == PRODUCT
-    assert failures[0][1]["old_stop_order_id"] == btc_bracket
+    assert getattr(failures[0], _FIELDS_ATTR, {})["product"] == PRODUCT
+    assert getattr(failures[0], _FIELDS_ATTR, {})["old_stop_order_id"] == btc_bracket
+    assert failures[0].exc_info, "a CRITICAL half-completed live-money action carries the traceback"
     # The raise lands inside the executor's cancel, BEFORE the local `canceled` mark, so
     # the old bracket still rests and the crash ledger stands for the next cycle's sweep.
     assert repo.get_order(btc_bracket)["status"] == "pending"
