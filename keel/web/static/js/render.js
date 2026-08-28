@@ -1822,6 +1822,58 @@ function invocationCell(action) {
 }
 
 /**
+ * The emphasis each mode word carries in the badge. See `modeBadge` below for why paper is the
+ * quiet one and why there is no `state` anywhere in this table.
+ *
+ * @type {Record<string, string>}
+ */
+const MODE_CLASS = {
+  paper: "mode-paper",
+  confirm: "mode-confirm",
+  live: "mode-live",
+};
+
+/**
+ * The header's mode badge, from `/api/config` (#597).
+ *
+ * **A readout, not a control.** The word placed here is the served deployment's own
+ * `auto_trade.mode` (`paper` or `confirm` today), copied verbatim: changing it is a config-file
+ * edit plus a terminal action by design, and there is no control on this page and no route
+ * behind one. What the badge answers is the question the buried status row never could -- "is
+ * THIS browser looking at the paper deployment or the live one?" -- and the tooltip names the
+ * db and config in play so the answer is checkable rather than trusted.
+ *
+ * `mode` crosses the wire as a bare string, not a `Field`, and this function honours that: no
+ * `state`, no judgement, because `confirm` beside `paper` is neither good nor bad. What differs
+ * is EMPHASIS, and the table above is the whole of it -- paper is the quiet one (muted, like any
+ * label), confirm and live carry the accent, because a deployment that can place orders should
+ * sit up in the header without being graded by it. `live` is in the table for the day the
+ * config vocabulary grows it; an unknown word renders UNGRADED but still renders, which is the
+ * same forward-compatibility `STATE_CLASS` gives a server one version ahead of this page.
+ *
+ * No mode in the document (a first run, or a config that could not be read) empties the node,
+ * and `keel.css` hides it while empty: an absent answer is not `paper`, and guessing a mode on
+ * a trading console is the one thing this badge must never do.
+ *
+ * @param {HTMLElement} node
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+export function modeBadge(node, config) {
+  const mode = config && typeof config.mode === "string" ? config.mode : "";
+  if (!mode) {
+    node.className = "pill mode";
+    node.removeAttribute("title");
+    node.replaceChildren();
+    return;
+  }
+  node.className = "pill mode ".concat(MODE_CLASS[mode] || "");
+  node.replaceChildren(document.createTextNode(mode));
+  // The "where am I" half: one process serves one --db/--config pair, and naming both makes
+  // paper-vs-live confusion answerable at a glance instead of by asking the terminal.
+  node.title = (config.db_path || "").concat(" · config ", config.config_path || "");
+}
+
+/**
  * The footer's build line, from `/api/config`.
  *
  * `reproducible` is the one judged field on that payload, and `payload.config_payload` calls it

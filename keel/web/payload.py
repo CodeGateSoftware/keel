@@ -1362,8 +1362,16 @@ def order_rows(
 # -- config (#534) -------------------------------------------------------------------------------
 
 
-def config_payload(build: Any, *, describe: str = "") -> dict[str, Any]:
-    """The running build, for the two consumers that need it by name.
+def config_payload(
+    build: Any,
+    *,
+    describe: str = "",
+    mode: str = "",
+    db_path: str = "",
+    config_path: str = "",
+) -> dict[str, Any]:
+    """The running build and the deployment it serves, for the consumers that need either by
+    name.
 
     `version` is what #539 carries as `?v=` on a documentation link, so version skew between the
     engine and the docs is visible rather than silent. `build` is `full_version` -- the version
@@ -1378,6 +1386,22 @@ def config_payload(build: Any, *, describe: str = "") -> dict[str, Any]:
     environment in which the page footer is already empty -- reports absent rather than inventing
     a version: a cache key of `""` still keys a cache, whereas a wrong version in a `?v=` link
     would send a reader to documentation for a build that does not exist.
+
+    ── THE DEPLOYMENT, NOT THE BINARY (#597) ───────────────────────────────────────────────────
+    `mode`, `db_path` and `config_path` name the ONE deployment this process serves, and they
+    ride this payload because it is the one endpoint the client reads on EVERY view (it keys the
+    worker and the docs links at boot), so the header's mode badge is present on every screen
+    rather than only where a status report happens to load. All three are bare strings, not
+    `Field`s: `mode` is an enum word and the paths are identifiers (the "what is NOT a Field"
+    note above names `mode` in that class), and a `Field` would force a `state` -- `confirm`
+    beside `paper` is neither good nor bad, and the badge's whole job is to REPORT the served
+    deployment, never to grade it.
+
+    **`mode` is a readout, not a control.** Nothing in the web package writes it: changing
+    `auto_trade.mode` is a config-file edit plus a terminal action by design (the TTY gate
+    `keel.commands._common._require_interactive_confirmation` exists for), and the browser can
+    display that decision and cannot make it. An absent `mode` (`""`) means the config could
+    not be read -- the first-run state -- and the badge hides rather than guessing.
     """
     return {
         "version": str(getattr(build, "version", "") or ""),
@@ -1385,6 +1409,12 @@ def config_payload(build: Any, *, describe: str = "") -> dict[str, Any]:
         "commit": str(getattr(build, "commit", "") or ""),
         "source": str(getattr(build, "source", "") or ""),
         "describe": describe,
+        # The served deployment (#597): the config's own word for `auto_trade.mode`, and the two
+        # paths that answer "where am I" for a process serving one --db/--config pair. See the
+        # module note above for why these are bare strings and why mode is read-only.
+        "mode": mode,
+        "db_path": db_path,
+        "config_path": config_path,
         # keel's central honesty signal, and the one judgement this payload carries: `False` means
         # the running code corresponds to no commit (a dirty tree, or no idea), and `keel.version`
         # treats saying so as more important than looking tidy.

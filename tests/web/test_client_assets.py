@@ -71,6 +71,14 @@ _CSS = _STATIC / "css" / "keel.css"
 #: and could not answer a navigation to `/static/insights`. It sits at the static root instead,
 #: and `tests/web/test_pwa.py::test_the_worker_is_served_from_the_scope_it_must_control` asserts
 #: that placement rather than leaving it to whoever next reads the spec's file list.
+#:
+#: **`theme.js` arrived at #597 and is the one entry that is not an ES module**, on purpose. It
+#: exists to restore the reader's light/dark choice BEFORE FIRST PAINT, and a `type="module"`
+#: script is deferred by definition -- the flash of the wrong theme it exists to prevent would
+#: happen while the module was still loading. It is a classic parser-blocking script in `<head>`
+#: instead: same-origin, so `default-src 'self'` permits it, and it joins the closed list -- and
+#: with it every scan this module runs over `_MODULES` -- precisely because shipping under `js/`
+#: without a test author noticing is what this list exists to prevent.
 _MODULES = (
     "main.js",
     "api.js",
@@ -80,6 +88,7 @@ _MODULES = (
     "live.js",
     "format.js",
     "docs.js",
+    "theme.js",
 )
 
 #: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
@@ -610,7 +619,7 @@ def test_the_mount_prefix_is_spelled_the_same_everywhere() -> None:
     hrefs = re.findall(r'<li><a href="([^"]+)">', html)
     assert hrefs == [prefix + name for name in staticfiles.CLIENT_ROUTES]
 
-    for asset in ("css/keel.css", "js/main.js"):
+    for asset in ("css/keel.css", "js/main.js", "js/theme.js"):
         loaded = f'href="{prefix}{asset}"' in html or f'src="{prefix}{asset}"' in html
         assert loaded, f"index.html does not load {asset} from {prefix}"
 
@@ -647,19 +656,201 @@ def test_the_shell_carries_its_accessibility_affordances() -> None:
     assert "<noscript>" in html, "a shell with no fallback message is a blank page"
 
 
+# -- the header is the brand (#597) ----------------------------------------------------------------
+
+
+def test_the_header_brand_is_the_mark_and_it_goes_home() -> None:
+    """**The brand block: the site's mark and the wordmark, in ONE anchor to `/`.**
+
+    Three properties, each answering one symptom the issue reports:
+
+      * the MARK is inline SVG, not an `<img>` -- inline strokes can reference the palette's
+        tokens, which is what keeps one geometry readable against the paper and against the
+        slate (#593's favicon cannot do that; it is a fixed raster of the light theme);
+      * the mark and the wordmark are inside ONE `<a href="/">`: since #540 the app's home is
+        `/` (`main.js::BASE`), and a brand where only the text is clickable is a brand half of
+        which looks broken;
+      * `aria-label="keel home"` because the anchor's accessible name should say where it goes,
+        not spell the wordmark twice -- a reader hears "keel home, link".
+
+    The anchor is focusable by being an anchor, and the global `:focus-visible` ring is what a
+    keyboard reader sees on it -- asserted on the stylesheet by
+    `test_the_stylesheet_is_responsive_and_theme_aware`, which pins that the rule exists."""
+    html = _markup_only(_INDEX.read_text(encoding="utf-8"))
+
+    # One brand anchor, and it goes to the mount, not to /status: the home of this app is `/`.
+    assert html.count('<a class="brand"') == 1, "the brand block must be exactly one anchor"
+    assert 'href="/" aria-label="keel home"' in html, (
+        "the brand anchor must go to / and name itself for a reader"
+    )
+
+    # The anchor holds BOTH halves of the brand, and only those: the mark, then the wordmark.
+    # `aria-hidden` on the svg because the anchor's name is the aria-label above -- a reader
+    # would otherwise hear the svg's own label and the wordmark as three names for one link.
+    start = html.index('<a class="brand"')
+    end = html.index("</a>", start)
+    brand = html[start:end]
+    assert "<svg" in brand and 'aria-hidden="true"' in brand, "the mark is missing from the brand"
+    assert "<span>keel</span>" in brand, "the wordmark is missing from the brand"
+    assert brand.index("<svg") < brand.index("<span>keel</span>"), "the mark leads the wordmark"
+
+
+def test_the_inline_mark_is_the_one_the_icons_carry() -> None:
+    """The header's mark is the SAME mark as `icons/keel.svg` (#594 transcribed it from the
+    site), not a second drawing of a boat.
+
+    Pinned on the geometry rather than on bytes: the header copy deliberately DIFFERS from the
+    file in its colours (token references instead of the favicon's fixed light-theme literals,
+    which is the entire reason it is inline -- see the test above). What must not differ is the
+    shape: the mast, the two sail strokes and the hull path, and the `1 1` viewBox they were
+    transcribed against. A hand-redrawn mark here would be a third identity for one product,
+    which is the drift #593 closed."""
+    html = _markup_only(_INDEX.read_text(encoding="utf-8"))
+    keel_svg = (staticfiles.STATIC_ROOT / "icons" / "keel.svg").read_text(encoding="utf-8")
+
+    start = html.index('<a class="brand"')
+    end = html.index("</a>", start)
+    inline = html[start:end]
+
+    assert 'viewBox="0 0 1 1"' in inline, "the inline mark must keep the transcribed viewBox"
+    for path in re.findall(r'<path d="([^"]+)"/>', keel_svg):
+        assert path in inline, f"the header mark is missing the icon's geometry: {path}"
+    # corner radius and stroke weight are geometry too: a softer square or a heavier mast
+    # would be a third drawing of one boat.
+    for attr in re.findall(r'(?:rx|stroke-width)="([^"]+)"', keel_svg):
+        assert attr in inline, f"the header mark is missing the icon's {attr} shape"
+
+
+def test_the_header_carries_a_theme_toggle_and_a_mode_badge() -> None:
+    """The other two header surfaces #597 adds, pinned as structure the way the shell's other
+    landmarks are above.
+
+    The toggle is a `<button>` (keyboard-operable and announced for what it is), carries the
+    site's own accessible name for the same control, and holds BOTH icons inline -- no icon
+    font, no external asset, and the stylesheet decides which one shows so the visible icon
+    matches the painted theme even before `main.js` has hydrated the click.
+
+    The badge is in the MARKUP and empty, not built by script: it is a landmark of the page a
+    reader can find, and `main.js` fills it from the `/api/config` read the shell already makes
+    at boot -- which is why the badge is present on every view rather than only where a status
+    report happens to load. It has no `role` and no live region: it changes once, at boot, and
+    an `aria-live` region is for things that change underneath a reader (see `index.html`'s note
+    on the one region the page does carry)."""
+    html = _markup_only(_INDEX.read_text(encoding="utf-8"))
+
+    assert '<button type="button" id="theme-toggle"' in html, "the theme toggle is missing"
+    assert 'aria-label="Toggle light and dark theme"' in html, (
+        "the toggle's name must say what it does -- this is the site's own wording for it"
+    )
+    assert 'class="icon-sun"' in html and 'class="icon-moon"' in html, (
+        "both toggle icons ship inline; the stylesheet decides which shows"
+    )
+    for icon in re.findall(r'<svg class="icon-(?:sun|moon)"[^>]*>', html):
+        assert "currentColor" in icon and 'aria-hidden="true"' in icon, (
+            f"an icon that is not token-coloured or is self-announcing: {icon}"
+        )
+
+    assert '<span id="mode-badge" class="pill mode"' in html, "the mode badge is missing"
+    # Empty in the markup, like #build: filled from the boot config read, hidden until it is.
+    assert html.count('id="mode-badge"') == 1
+
+
+def test_the_theme_choice_is_spelled_where_it_is_stored() -> None:
+    """Two files share the light/dark choice and neither imports the other.
+
+    `js/theme.js` READS it before first paint; `main.js` WRITES it when the toggle is pressed.
+    A spelling drift between the two is not an error anywhere -- it is a choice that silently
+    stops surviving the reload it was stored for, which is the exact acceptance criterion this
+    pins ("persists across reloads"). keeltrading.com's `global.css` spells the same key for the
+    same reason; the app keeps the same literal so the two products describe one mechanism."""
+    boot = _source("theme.js")
+    main = _source("main.js")
+
+    assert '"keel-theme"' in boot, "the pre-paint restore does not read the stored choice"
+    assert '"keel-theme"' in main, "the toggle does not store its choice where boot restores it"
+
+
+# -- config parity (#597) --------------------------------------------------------------------------
+
+
+#: The `render.js` functions that read `/api/config`'s payload, and the parameter each reads it
+#: through. `buildLine` has read this payload since #538 with NO parity check of its own -- its
+#: keys were covered only by a note in `_view_keys` saying where the scan was bounded. #597 adds
+#: a second consumer (`modeBadge`, for the header badge), and with it the check that covers both.
+_CONFIG_READERS: tuple[tuple[str, str], ...] = (
+    ("buildLine", "data"),
+    ("modeBadge", "config"),
+)
+
+
+@pytest.mark.parametrize(("view", "root"), _CONFIG_READERS)
+def test_the_config_payload_carries_every_key_the_header_reads(
+    view: str,
+    root: str,
+    running,  # type: ignore[no-untyped-def]
+) -> None:
+    """**The key-parity scanner, for `/api/config`.**
+
+    The same contract `test_every_ported_view_reads_only_keys_its_endpoint_sends` holds for the
+    seven views: a browser cannot run here, so the failure this prevents is a header reaching
+    for a key the payload does not emit -- a badge that renders nothing, forever, with nothing
+    in the console naming the gap. The badge hydrates from the ONE endpoint every view reads at
+    boot, so this is the parity check that travels with it to every screen."""
+    status, _headers, body = _request(running, "/api/config", cookie=_session(running))
+    assert status == 200
+    document = json.loads(body)
+    data = document["data"]
+
+    for path in _view_keys(view, root):
+        cursor = data
+        for part in path.split("."):
+            assert isinstance(cursor, dict), f"{path} -- {part} is not an object in /api/config"
+            assert part in cursor, f"{view} reads {root}.{path}; /api/config does not send it"
+            cursor = cursor[part]
+
+
+def test_the_config_key_scan_found_the_keys_it_claims_to_check() -> None:
+    """The premise, as ever: a scan that found nothing passes any payload check vacuously."""
+    badge = _view_keys("modeBadge", "config")
+    assert "mode" in badge, f"the badge's keys did not parse: {badge}"
+    assert "db_path" in badge and "config_path" in badge, (
+        f"the badge's tooltip names the deployment; its keys did not parse: {badge}"
+    )
+    assert "build" in _view_keys("buildLine", "data"), "the footer's keys did not parse"
+
+
 def test_the_shell_ships_no_inline_script_or_style() -> None:
     """`_STATIC_CSP` is `default-src 'self'` with no `'unsafe-inline'`.
 
     So an inline block here is not a style violation caught in review -- it is markup the browser
     silently refuses at run time, which is the worst place to find out. `<base href>` is impossible
-    for the same reason (`base-uri 'none'`), which is why every href in the shell is absolute."""
+    for the same reason (`base-uri 'none'`), which is why every href in the shell is absolute.
+
+    #597 adds the ONE exception this file has ever needed, and it is not an inline block: a
+    same-origin CLASSIC script in `<head>` that restores the stored light/dark choice before
+    first paint. A module cannot do that job (deferred by definition), and an inline one is
+    refused by the policy -- so the exception is narrow in both directions at once: exactly one
+    non-module tag, exactly one file, and it must load BEFORE the stylesheet so the theme
+    attribute is set before a single rule is applied to a single element.
+
+    See `js/theme.js`'s own module note, which carries the full argument."""
     html = _markup_only(_INDEX.read_text(encoding="utf-8")).lower()
     assert "<style" not in html
     assert "<base" not in html
     # A `<script>` with a `src` is the only permitted form.
-    for tag in re.findall(r"<script[^>]*>", html):
+    tags = re.findall(r"<script[^>]*>", html)
+    assert tags, "the shell loads no script at all"
+    for tag in tags:
         assert "src=" in tag, f"inline script in index.html: {tag}"
-        assert 'type="module"' in tag, f"the client is ES modules: {tag}"
+    # Everything is an ES module except the one pre-paint classic script...
+    classic = [tag for tag in tags if 'type="module"' not in tag]
+    assert classic == ['<script src="/js/theme.js">'], (
+        f"the one permitted non-module script is the theme restore: {classic}"
+    )
+    # ...and that one runs before the stylesheet is applied, which is the no-flash property.
+    assert html.index('<script src="/js/theme.js"') < html.index('<link rel="stylesheet"'), (
+        "the theme restore must load before the stylesheet, or the page paints before it runs"
+    )
 
 
 def test_the_client_loads_nothing_from_a_third_party_origin() -> None:
@@ -808,6 +999,7 @@ def test_the_client_route_fallback_is_behind_the_same_admission(running) -> None
         (_P("js/chart.js"), "text/javascript; charset=utf-8"),
         (_P("js/live.js"), "text/javascript; charset=utf-8"),
         (_P("js/format.js"), "text/javascript; charset=utf-8"),
+        (_P("js/theme.js"), "text/javascript; charset=utf-8"),
         (_P("css/keel.css"), "text/css; charset=utf-8"),
     ],
 )
@@ -891,9 +1083,15 @@ def _view_keys(view: str, root: str) -> list[str]:
     source = _code_only(_source("render.js"))
     start = source.index(f"export function {view}(")
     # BOUNDED at the next top-level export, not run to end-of-file. Unbounded, this swept up
-    # `buildLine`'s `data.build` -- a key of `/api/config`, not of `/api/status` -- and reported a
-    # payload gap that does not exist. Found by this test failing on its first run.
-    end = source.index("\nexport function ", start + 1)
+    # `data.build` -- a key of `/api/config`, not of `/api/status` -- and reported a payload gap
+    # that does not exist. Found by this test failing on its first run.
+    #
+    # The bound is the next export OR the end of the file, whichever comes first: #597's config
+    # parity check reads `buildLine`, which is the last export in the file, and a helper that
+    # raised on "no next export" would have made the last function in the file the one function
+    # no payload check could ever cover. Mid-file scans are bounded exactly as they were.
+    next_export = source.find("\nexport function ", start + 1)
+    end = len(source) if next_export == -1 else next_export
     # The negative lookahead drops METHOD calls: `data.data_freshness.map(` must contribute
     # `data_freshness`, not `data_freshness.map`. Backtracking does that -- the two-segment
     # alternative fails the lookahead on `(` and the one-segment one succeeds on `.`.
