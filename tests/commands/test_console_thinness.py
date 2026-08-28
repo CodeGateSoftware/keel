@@ -759,7 +759,6 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
         "keel/mcp/ is not in the scanned set; #588 put it there because it is the one front-end "
         "these rules did not cover, and an MCP handler must not grow compute unnoticed"
     )
-    assert any(os.path.join("keel", "mcp") in path for path in paths)
     # The seven `*console*` modules were named here, one per line, so that deleting one would
     # fail HERE rather than quietly shrink the scanned set. #541 deleted all seven at once, and
     # this is where that had to be acknowledged -- which is the mechanism working, not failing.

@@ -10,7 +10,8 @@ it that way.
 **Why these seams.** Each tool delegates to the SAME service calls an operator's front-end
 makes -- `keel.commands.doctor` for health, `keel.capabilities` for the inventory,
 `keel.compliance.purification` for §65.9, `keel.research.ledger` for experiments, and
-`keel.commands.research_console` for the corpora -- so an assistant and a terminal cannot be
+`keel.corpus` for the corpora (the `research_console` front-end was deleted at #541) -- so
+an assistant and a terminal cannot be
 shown two different accounts of one deployment. The JSON-safety helper stringifies `Decimal`
 recursively, matching the repo's TEXT-money convention: a number that has been through JSON
 floating point is a number that has been rounded twice.
