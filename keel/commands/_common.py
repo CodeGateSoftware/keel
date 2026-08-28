@@ -156,55 +156,57 @@ def _load_cfg(ctx: click.Context) -> Config:
     return config
 
 
-def _build_broker(
-    config: Config, *, timeout: int | None = None
-) -> Any:
+def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     """Construct the real, network-talking broker for the venue `config.broker` selects.
 
-    **Venue selection (issue #370 B2).** The `broker:` config section is the one surface:
-    absent (or `name: coinbase`), this builds exactly what it always built -- a
-    `CoinbaseClient` over a `coinbase.rest.RESTClient` fed by `load_secrets()` -- so every
-    pre-existing config, deployment and test is byte-identical. A named venue resolves
-    through the `keel.brokers` entry points (`keel_broker_api.registry.load_broker`), so
-    installing an adapter is a package install, not a core change; today the CLI knows how
-    to construct CREDENTIALS for one non-Coinbase venue (alpaca: paper/live endpoint, iex/
-    sip feed, `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`), and an adapter that resolves but
-    has no wiring is refused by name rather than constructed credential-less.
+    **Every name resolves through the registry (issue #524).** The `broker:` config section
+    selects a venue; the `keel.brokers` entry points (`keel_broker_api.registry.load_broker`)
+    decide which adapter class that name means -- coinbase included, so the default venue has
+    no second, direct construction path to drift against the conformance-tested adapter. The
+    CLI's per-venue knowledge is the TRANSPORT it hands the resolved adapter: coinbase wiring
+    is `load_secrets()` from `.env` into a `coinbase.rest.RESTClient`; alpaca wiring is the
+    paper/live endpoint, the iex/sip feed and `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`. An
+    adapter that resolves but has no wiring is refused by name rather than constructed
+    credential-less, and a name with no entry point at all fails through the registry's own
+    LookupError, which lists what IS installed.
 
     Tests monkeypatch this function; the branches are additionally driven against fakes and
-    the real (network-free at construction) Alpaca classes by
+    the real (network-free at construction) Alpaca and Coinbase classes by
     `tests/test_paper_equities_profile.py`.
 
     `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no
     timeout), matching every existing caller (the agent/executor broker path) exactly.
-    Callers that cannot tolerate a hung network call (e.g. `keel tui`'s live balance
-    refresh, which must never freeze the dashboard) pass an explicit bound.
+    Callers that cannot tolerate a hung network call pass an explicit bound.
     """
     venue = config.broker.name
 
-    if venue == "coinbase":
-        from coinbase.rest import RESTClient
-
-        from keel.config import load_secrets
-        from keel.data.cb_client import CoinbaseClient
-
-        secrets = load_secrets()
-        transport = RESTClient(
-            api_key=secrets.get("api_key"), api_secret=secrets.get("api_secret"), timeout=timeout
-        )
-        return CoinbaseClient(transport)
-
-    # Every other name resolves through the entry points -- the registry is the authority on
-    # which adapters exist, and its LookupError already names what is installed.
     from keel_broker_api.registry import load_broker
 
     adapter_cls = load_broker(venue)
 
-    if adapter_cls.__module__.split(".")[0] != "keel_broker_alpaca":
+    module_root = adapter_cls.__module__.split(".")[0]
+    if module_root == "keel_broker_coinbase":
+        from coinbase.rest import RESTClient
+
+        from keel.config import load_secrets
+
+        secrets = load_secrets()
+        transport = RESTClient(
+            api_key=secrets.get("api_key"),
+            api_secret=secrets.get("api_secret"),
+            timeout=timeout,
+        )
+        # The registry-resolved adapter, not a hand-imported client -- the same
+        # conformance-tested class every other venue resolves through.
+        return adapter_cls(transport)
+
+    if module_root != "keel_broker_alpaca":
         raise RuntimeError(
             f"broker.name {venue!r} resolved to an installed adapter, but the CLI does not "
             "yet know how to give it credentials -- venue wiring exists for 'coinbase' and "
-            "'alpaca' only. Constructing it anyway would hand the engine a broker that "
+            "'alpaca' only. For robinhood the missing piece is the Ed25519 credential wiring "
+            "its transport signs with, which the CLI does not carry yet by choice -- the "
+            "venue is dev-only. Constructing it anyway would hand the engine a broker that "
             "cannot reach its venue."
         )
 

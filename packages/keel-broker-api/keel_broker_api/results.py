@@ -1,8 +1,9 @@
 """Domain types crossing the port in the broker-to-engine direction.
 
-These replace the raw dicts today's `cb_client` returns: `get_accounts() -> list[dict]` probed at
-`executor.py:168`, and `place_order`'s dict probed via `place_result.get("success")` at
-`executor.py:345`.
+These replaced the raw dicts the pre-port `cb_client` returned -- `get_accounts() -> list[dict]`
+and `place_order`'s dict probed via `place_result.get("success")` -- and, since #524 finished
+the broker-port migration, they are the only shapes the engine reads: every broker the live path
+can construct answers in these types, and the probing branches are deleted rather than dormant.
 """
 
 from __future__ import annotations
@@ -166,8 +167,7 @@ class Instrument:
     def __post_init__(self) -> None:
         if self.base_increment <= 0:
             raise ValueError(
-                f"base_increment must be positive, got {self.base_increment} for "
-                f"{self.product_id}"
+                f"base_increment must be positive, got {self.base_increment} for {self.product_id}"
             )
 
 

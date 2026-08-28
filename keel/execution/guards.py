@@ -839,11 +839,13 @@ def check(
     #
     #     Spot-only is this agent's CHARTER, not an operator preference, so there is no config
     #     field here to widen (unlike rail 18's `settlement_currencies`). Nor does this consult
-    #     `BrokerCapabilities.asset_classes`: `guards.check` has no broker handle, the live path
-    #     constructs `data.cb_client.CoinbaseClient` which has no `capabilities()` at all, and
-    #     paper passes `broker=None` -- so such a gate would be dead code that reads as a
-    #     defence. That exact pattern was built and deleted once already (R1's "what was
-    #     deliberately NOT shipped"). It belongs with the broker-port migration.
+    #     `BrokerCapabilities.asset_classes`: `guards.check` is broker-less BY DESIGN (paper
+    #     passes `broker=None`, and the rails must hold identically there), so such a gate
+    #     would be dead code that reads as a defence. Every broker the live path constructs
+    #     since #524 finished the broker-port migration answers `capabilities()` -- the
+    #     pre-port client's grandfather clause retired with it -- but reachable is not read,
+    #     and this rail stays shape-based. That exact pattern was built and deleted once
+    #     already (R1's "what was deliberately NOT shipped").
     #
     #     Returns a VIOLATION, never raises, on any input. `parse_spot_product_id` is total.
     if parse_spot_product_id(intent.product_id) is None:

@@ -10,9 +10,9 @@ as "keel has no idea what this costs".
 
 So these tests assert on the *rendered text a human sees*, not on a return value: the failure
 mode being defended against is a human misreading the screen, and only the screen can be wrong.
-They also pin the two shapes the gate accepts during the port migration -- the legacy Coinbase
-dict and the port's `Preview` -- because breaking the dict path breaks the only venue that
-actually trades.
+The gate reads ONE shape -- the port's `Preview` -- since #524 finished the broker-port
+migration; a dict is refused as unreadable, fail-closed, because nothing on the live path
+produces one anymore.
 """
 
 from __future__ import annotations
@@ -154,9 +154,7 @@ def test_unpriced_synthetic_preview_cannot_render_as_a_real_quote(
 
     assert (
         cli_module._interactive_confirm(
-            _preview(
-                synthetic=True, est_base_size=Decimal("0"), est_quote_size=Decimal("0")
-            )
+            _preview(synthetic=True, est_base_size=Decimal("0"), est_quote_size=Decimal("0"))
         )
         is False
     )
@@ -204,90 +202,57 @@ def test_an_aborted_typed_prompt_declines(monkeypatch, at_a_terminal):
     assert cli_module._interactive_confirm(_preview(est_quote_size=Decimal("0"))) is False
 
 
-# -- the legacy Coinbase dict, which is what actually trades today ------------------------------
+# -- a shape the port deleted (#524) ------------------------------------------------------------
 
 
-def test_legacy_coinbase_dict_still_renders_and_confirms(monkeypatch, capsys, at_a_terminal):
-    """The live path passes `cb_client.preview_order`'s dict. Do not break it."""
-    _answers(monkeypatch, confirm=True)
-
-    assert cli_module._interactive_confirm(
-        {
-            "order_total": Decimal("5.00"),
-            "commission_total": Decimal("0.03"),
-            "errs": [],
-            "warning": [],
-        }
-    )
-
-    out = capsys.readouterr().out
-    assert "Coinbase order preview" in out
-    assert "order_total: 5.00" in out
-    assert cli_module.NATIVE_PREVIEW_MARKER in out
-    assert cli_module.SYNTHETIC_PREVIEW_MARKER not in out
-
-
-def test_legacy_dict_errs_are_promoted_out_of_the_key_value_list(
-    monkeypatch, capsys, at_a_terminal
-):
-    """A Coinbase preview that came back with `errs` used to be one quiet line among ten."""
+def test_a_dict_preview_is_refused_as_an_unreadable_shape(monkeypatch, capsys, at_a_terminal):
+    """#524 deleted the gate's legacy dict arm: every broker the live path can now construct --
+    the default venue's registry-resolved adapter included -- answers `preview_order` in the
+    port's `Preview` type, so a dict is a shape nothing produces anymore. The gate must fail
+    closed on it rather than render it as a quote: unrecognized means degraded, and degraded
+    means the typed phrase, never a bare y/n."""
     _answers(monkeypatch, prompt="")
     monkeypatch.setattr(
         cli_module.click,
         "confirm",
-        lambda *a, **k: pytest.fail("an error-carrying preview must not take a bare y/n"),
+        lambda *a, **k: pytest.fail("an unreadable preview must not take a bare y/n"),
     )
 
     assert (
         cli_module._interactive_confirm(
-            {"order_total": Decimal("5.00"), "errs": ["INSUFFICIENT_FUND"], "warning": []}
+            {
+                "order_total": Decimal("5.00"),
+                "commission_total": Decimal("0.03"),
+                "errs": [],
+                "warning": [],
+                "best_bid": Decimal("49990"),
+                "best_ask": Decimal("50000"),
+            }
         )
         is False
     )
 
     out = capsys.readouterr().out
-    assert "PREVIEW ERRORS" in out
-    assert "INSUFFICIENT_FUND" in out
+    assert cli_module.UNREADABLE_PREVIEW_MARKER in out
+    # The dict renders as NOTHING readable: not the numbers...
+    assert "order_total: 5.00" not in out
+    # ...not the broker-quote banner...
+    assert cli_module.NATIVE_PREVIEW_MARKER not in out
+    # ...and not the venue-specific header the legacy arm used to draw.
+    assert "Coinbase order preview" not in out
 
 
-@pytest.mark.parametrize("order_total", [Decimal("5.00"), Decimal("-5.00")])
-def test_a_signed_dict_order_total_does_not_manufacture_friction(
-    monkeypatch, at_a_terminal, order_total
-):
-    """Whether Coinbase reports a SELL's `order_total` as signed proceeds is UNVERIFIED. If it
-    does and the gate read `<= 0` as unpriced, every live sell would demand the typed phrase --
-    which trains the operator to type it by reflex and destroys the signal on the previews that
-    actually need it. Only a genuine zero means "no size". Revisit if a live probe settles it."""
-    _answers(monkeypatch, confirm=True)
-    monkeypatch.setattr(
-        cli_module.click,
-        "prompt",
-        lambda *a, **k: pytest.fail("a priced order must not demand a typed phrase"),
-    )
-    assert cli_module._interactive_confirm({"order_total": order_total, "errs": []}) is True
-
-
-def test_a_zero_dict_order_total_is_still_unpriced(monkeypatch, at_a_terminal):
-    """The sign-agnostic rule above must not soften the case it exists for."""
-    _answers(monkeypatch, prompt="")
-    monkeypatch.setattr(
-        cli_module.click,
-        "confirm",
-        lambda *a, **k: pytest.fail("a zero-sized preview must not take a bare y/n"),
-    )
-    assert cli_module._interactive_confirm({"order_total": Decimal("0"), "errs": []}) is False
-
-
-def test_a_dict_that_declares_itself_synthetic_is_believed(monkeypatch, capsys, at_a_terminal):
-    """Defense in depth: dicts are assumed to be Coinbase's native shape, but a dict that says
-    otherwise is taken at its word rather than dressed up as a broker quote."""
+def test_the_header_is_venue_neutral_for_every_readable_preview(monkeypatch, capsys, at_a_terminal):
+    """The "Coinbase order preview" header existed because the dict shape WAS Coinbase's own
+    response, and only Coinbase's. A `Preview` can come from any venue, so the header names
+    none of them."""
     _answers(monkeypatch, confirm=True)
 
-    cli_module._interactive_confirm({"order_total": Decimal("5.00"), "synthetic": True})
+    assert cli_module._interactive_confirm(_preview()) is True
 
     out = capsys.readouterr().out
-    assert cli_module.SYNTHETIC_PREVIEW_MARKER in out
-    assert cli_module.NATIVE_PREVIEW_MARKER not in out
+    assert "Rails PASSED. Order preview:" in out
+    assert "Coinbase order preview" not in out
 
 
 def test_an_unreadable_preview_is_treated_as_degraded(monkeypatch, capsys, at_a_terminal):

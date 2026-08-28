@@ -34,28 +34,34 @@ both problems by construction. It still runs through `guards.check` like any oth
 (un-overridable); a vetoed bracket is simply never placed and `place_bracket` returns `None`.
 
 **Stop management -- wired on the live cycle, DEFAULT OFF per rule (#442 wired the policy;
-#502 stage 2 wired the live step).** `roll_to_break_even` / `trail_stop_atr` cancel the
-existing protective bracket and replace it at a new price, never widening it: both delegate
-to `_roll_stop`, which refuses (returns `None`, leaving the existing stop in force) if the
-proposed new stop is below the last-recorded `open_stop:<product_id>` -- the same "only
-ratchet toward profit" invariant rail 9 enforces on entries, applied directly here since the
-replacement order's own `guards.check` call (still mandatory) can't reuse rail 9 as-is:
-rail 9 is paired with the min-move/anti-scalping rail, which has no meaning for a
-stop-replacement order that has no separate entry price of its own. `roll_stop_to` is the
-general single-roll form the agent's per-cycle step drives (see its docstring for why one
-roll, not one per arm). The live caller is `agent.run_once`'s stop-management step (#502):
-per held tranche whose owning rule carries `trail_atr_mult` / `be_roll_rr` (the
-`pullback_continuation` / `rsi_meanrev` knobs), it applies the same `strategy/exit_policy`
-the sim/backtest engines apply and rolls the resting bracket to the ratcheted level. A rule
-whose params carry NEITHER knob is never managed -- the #442 experiment
-(docs/experiments/2026-08-22-trailing-vs-static-exits.md) measured trailing WORSE and the
-break-even roll no better than the static exit at the 120 bp fee, so the capability ships
-and the operator opts in per rule; `turtle_breakout` deliberately offers neither knob (its
-real exit is the Donchian channel, and a trail would cut the long winners the system exists
-to let run). `scale_out` is the one primitive still WITHOUT a live caller: it stays unwired
-(pinned by `tests/execution/test_executor.py::test_scale_out_has_no_production_caller`)
-until its two prerequisites are built -- bracket resize for a partial SELL, and a
-`trade_outcomes` row so rail 16 does not count a scaled-out winner as a loss.
+#502 stage 2 wired the live step; the port migration that once blocked this is DONE -- the
+bracket has been an `OrderSpec` (`BracketGTC`) since #569, reaching the venue through
+`place_order` like every other order, and the port flip finished in #582).**
+`roll_to_break_even` / `trail_stop_atr` cancel the existing protective bracket and replace
+it at a new price, never widening it: both delegate to `_roll_stop`, which refuses (returns
+`None`, leaving the existing stop in force) if the proposed new stop is below the
+last-recorded `open_stop:<product_id>` -- the same "only ratchet toward profit" invariant
+rail 9 enforces on entries, applied directly here since the replacement order's own
+`guards.check` call (still mandatory) can't reuse rail 9 as-is: rail 9 is paired with the
+min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has no
+separate entry price of its own. Ratchet-only is rail-9-safe BY CONSTRUCTION (`_roll_stop`
+refuses a widening proposal before `guards.check` ever runs; pinned by
+`tests/execution/test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`).
+`roll_stop_to` is the general single-roll form the agent's per-cycle step drives (see its
+docstring for why one roll, not one per arm). The live caller is `agent.run_once`'s
+stop-management step (#502): per held tranche whose owning rule carries `trail_atr_mult` /
+`be_roll_rr` (the `pullback_continuation` / `rsi_meanrev` knobs), it applies the same
+`strategy/exit_policy` the sim/backtest engines apply and rolls the resting bracket to the
+ratcheted level. A rule whose params carry NEITHER knob is never managed -- the #442
+experiment (docs/experiments/2026-08-22-trailing-vs-static-exits.md) measured trailing
+WORSE and the break-even roll no better than the static exit at the 120 bp fee, so the
+capability ships and the operator opts in per rule; `turtle_breakout` deliberately offers
+neither knob (its real exit is the Donchian channel, and a trail would cut the long winners
+the system exists to let run). `scale_out` is the one primitive still WITHOUT a live
+caller: it stays unwired (pinned by
+`tests/execution/test_executor.py::test_scale_out_has_no_production_caller`) until its two
+prerequisites are built -- bracket resize for a partial SELL, and a `trade_outcomes` row so
+rail 16 does not count a scaled-out winner as a loss.
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
 available balance of the PRODUCT's quote leg from `broker.get_balances()` and hands
@@ -92,7 +98,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -103,7 +109,13 @@ from keel_broker_api.orders import (
     MarketIOCByQuote,
     OrderSpec,
 )
-from keel_broker_api.results import CancelOutcome, PlaceResult, Preview, coerce_cancel_outcome
+from keel_broker_api.results import (
+    CancelOutcome,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    coerce_cancel_outcome,
+)
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
@@ -133,10 +145,10 @@ class ExecutionResult:
     placed: bool
     order_id: int | None
     vetoed_by: list[str]
-    # Whatever `broker.preview_order` handed back, verbatim. A dict from the pre-port
-    # `CoinbaseClient` today; a `Preview` once Phase B migrates the call. Anything reading money
-    # out of this must branch on the shape -- see `ConfirmFn` below and `_run_order`'s `fee`.
-    preview: Preview | dict[str, Any] | None
+    # Whatever `broker.preview_order` handed back, verbatim -- the port's `Preview` since #524
+    # finished the broker-port migration: every broker the live path can construct answers in
+    # that type, so there is no second shape to branch on anywhere downstream.
+    preview: Preview | None
     reason: str
     # The local `orders.id` of the exit bracket this entry left resting, when one was placed.
     # `execute` places the bracket itself, so this is the ONLY way a caller can learn its id --
@@ -147,13 +159,12 @@ class ExecutionResult:
     bracket_order_id: int | None = None
 
 
-#: The human confirm gate for `mode="confirm"`. Takes BOTH shapes on purpose: `broker` here is
-#: still the pre-port `CoinbaseClient`, whose `preview_order` returns a dict, but the port's
-#: `Preview` is what carries `synthetic` -- the flag that tells a human whether they are
-#: approving a venue's quote or an estimate keel computed. A gate typed to `dict` alone has
-#: nowhere to render that (issue #199), and one typed to `Preview` alone breaks the only venue
-#: that trades today. Both, until Phase B makes `preview_order` return `Preview` everywhere.
-ConfirmFn = Callable[[Preview | Mapping[str, Any]], bool]
+#: The human confirm gate for `mode="confirm"`. One shape: the port's `Preview`, the only thing
+#: `broker.preview_order` returns since the migration finished. `Preview` is what carries
+#: `synthetic` -- the flag that tells a human whether they are approving a venue's quote or an
+#: estimate keel computed (issue #199) -- so a gate typed to anything less has nowhere to
+#: render that distinction.
+ConfirmFn = Callable[[Preview], bool]
 
 
 # -- main entry point -----------------------------------------------------------------------
@@ -406,7 +417,7 @@ def _coerce_increment(raw: object) -> Decimal | None:
         return None
     try:
         value = Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
     return value if value > 0 else None
 
@@ -437,7 +448,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     except Exception:
         # `log_venue_failure`, not `log_exception`: an unreachable venue outside a trade cycle
         # is a dashboard balance refresh on a sleeping laptop, and this line is the SECOND
-        # record for that one failure (`cb_client.get_accounts` logs it first) -- two full
+        # record for that one failure (`cb_client.get_balances` logs it first) -- two full
         # tracebacks per poll, every 30s, for as long as the machine is offline. Inside a cycle
         # it escalates back to ERROR on its own: there it means rail 13 failed closed and an
         # order did not go out. Kept as its own event rather than dropped because it carries
@@ -796,8 +807,8 @@ def _upgrade_to_observed_economics(
         log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
         return
 
-    fill = observed.get("average_filled_price")
-    fees = observed.get("total_fees")
+    fill = observed.average_filled_price
+    fees = observed.total_fees
     if not fill or fill <= 0:
         return
     repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
@@ -808,7 +819,7 @@ def _upgrade_to_observed_economics(
 def _record_observed_fill_quantity(
     repo: Repository,
     order_id: int,
-    observed: dict[str, Any],
+    observed: OrderStatus,
     intent: OrderIntent | None,
     now_ts: int,
 ) -> None:
@@ -825,14 +836,14 @@ def _record_observed_fill_quantity(
     the exit-side over-booking is #502's to flag. The observation itself is recorded for
     BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
 
-    DELIBERATELY detect-and-surface only. The port can EXPRESS the replacement since #502
-    stage 1 (`BracketGTC` -- every order is a spec now), and `_roll_stop` cancels-and-replaces
-    through it; what does not exist yet is the RESIZE policy (a roll re-places the SAME size).
-    Auto-cancelling a protective order on the strength of a snapshot that may still be
-    settling is a wrong auto-action on live money; a loud warning is the safe half, and the
-    automated resize policy remains #502's open half (with `scale_out`).
+    DELIBERATELY detect-and-surface only. The port migration is done and the replacement
+    itself is expressible (`BracketGTC` since #569; `_roll_stop` cancels-and-replaces
+    through `place_order`); what does not exist yet is the RESIZE policy (a roll re-places
+    the SAME size). Auto-cancelling a protective order on the strength of a snapshot that
+    may still be settling is a wrong auto-action on live money; a loud warning is the safe
+    half, and the automated resize policy remains #502's open half (with `scale_out`).
     """
-    filled = observed.get("filled_size")
+    filled = observed.filled_size
     if not filled or filled <= 0:
         return
     row = repo.get_order(order_id) or {}
@@ -895,7 +906,7 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
         if expected <= 0:
             return
         divergence_bps = (actual - expected) / expected * Decimal(10_000)
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         log_exception(logger, "executor.intent_divergence_uncomputable", order_id=order_id)
         return
 
@@ -938,16 +949,14 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 ENTRY_OVERRIDE_WARN_BP = Decimal("50")
 
 
-def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
-    """The venue's book out of a preview response, as `(best_bid, best_ask)`, each field read
-    INDEPENDENTLY and safely, in whichever of the preview's two shapes.
+def _preview_book(preview: Preview) -> tuple[Decimal | None, Decimal | None]:
+    """The venue's book out of a preview, as `(best_bid, best_ask)`, each field read
+    INDEPENDENTLY and safely.
 
     One helper, two consumers (#350): #332's entry-override warning needs only the ask, and
-    the routing-time max-spread gate needs both sides plus their midpoint. Both shapes
-    already cross this module (`ConfirmFn`'s docstring explains why they coexist): the
-    pre-port `CoinbaseClient.preview_order` dict, which maps `best_bid`/`best_ask` to
-    `Decimal`s, and the port's `Preview`, whose Coinbase adapter carries the same book as
-    strings inside `detail`.
+    the routing-time max-spread gate needs both sides plus their midpoint. The book lives in
+    `Preview.detail` as strings -- the port's one shape since #524 finished the migration, so
+    there is no dict arm to keep in agreement with it.
 
     Each side is `None` when THE VENUE returned no usable value for that field -- absent key,
     non-numeric string, or a non-finite/non-positive number -- a degraded response, not an
@@ -960,13 +969,14 @@ def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, De
     RAISES InvalidOperation, and a venue string of "nan" parses into exactly that
     (`cb_client` does `Decimal(value)` on venue strings with no finiteness check, so the
     input is reachable). A non-finite side is a degraded preview, not a routing failure.
+
+    `getattr` rather than `preview.detail`, because this helper feeds #332's warning whose
+    contract is NEVER-RAISES: an object without a `detail` -- a contract-violating broker, a
+    stale dict from a pre-port fake -- reads as no book at all, which is already this
+    function's answer to "cannot know". No shape is probed back into existence; garbage just
+    falls into the same fail-closed arm as an absent key.
     """
-    raw: dict[str, Any] = {}
-    if isinstance(preview, Mapping):
-        raw = {"best_bid": preview.get("best_bid"), "best_ask": preview.get("best_ask")}
-    else:
-        detail = getattr(preview, "detail", None)
-        raw = detail if detail is not None else {}
+    raw = getattr(preview, "detail", None) or {}
 
     def _side(key: str) -> Decimal | None:
         value = raw.get(key)
@@ -974,17 +984,17 @@ def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, De
             return None
         try:
             parsed = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError):
+        except InvalidOperation, TypeError, ValueError:
             return None
         return parsed if parsed.is_finite() and parsed > 0 else None
 
     return _side("best_bid"), _side("best_ask")
 
 
-def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
-    """The venue's best ask out of a preview response, in whichever of its two shapes.
+def _preview_best_ask(preview: Preview) -> Decimal | None:
+    """The venue's best ask out of a preview.
 
-    A thin consumer of `_preview_book` (above): same shapes, same per-field safety, ask only.
+    A thin consumer of `_preview_book` (above): same read, same per-field safety, ask only.
     """
     return _preview_book(preview)[1]
 
@@ -1044,7 +1054,7 @@ def _warn_if_market_routing_overrides_entry(
         return
     try:
         expected = Decimal(str(intent.entry))
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return
     if not expected.is_finite() or expected <= 0:
         return
@@ -1102,7 +1112,7 @@ class _SpreadGateRefusal:
 
 def _entry_spread_gate(
     intent: OrderIntent,
-    preview: Preview | dict[str, Any] | None,
+    preview: Preview | None,
     max_entry_spread_pct: Decimal,
 ) -> _SpreadGateRefusal | None:
     """Refuse a live BUY whose previewed book is too wide to enter (#350). `None` = proceed.
@@ -1142,9 +1152,9 @@ def _entry_spread_gate(
     than swallowed here because this is a money gate) is refused with the DISTINCT
     `book_unreadable` token: "cannot know" is a different fact from "too wide", and a gate
     that guessed a spread from half a book would be a gate that sometimes trades on fiction.
-    The real venue's preview carries both sides for market orders (`cb_client.preview_order`
-    maps `best_bid`/`best_ask` to `Decimal`), so an unreadable book on the live path means a
-    degraded response -- exactly the moment not to spend.
+    The real venue's preview carries both sides for market orders (the Coinbase adapter maps
+    `best_bid`/`best_ask` into `Preview.detail`), so an unreadable book on the live path means
+    a degraded response -- exactly the moment not to spend.
 
     Every BUY routes market today (#258), so "every live BUY" and "every market-routed live
     BUY" are the same set; if #260's remediation ever lands resting BUY orders, revisit the
@@ -1305,9 +1315,7 @@ def _order_spec(intent: OrderIntent) -> OrderSpec:
                 f"{intent.product_id!r} notional {intent.notional} quantizes to {notional} at "
                 f"increment {increment} -- refusing to send a zero-size order"
             )
-        return MarketIOCByQuote(
-            product_id=intent.product_id, side=Side.BUY, quote_size=notional
-        )
+        return MarketIOCByQuote(product_id=intent.product_id, side=Side.BUY, quote_size=notional)
     return MarketIOCByBase(
         product_id=intent.product_id, side=Side.SELL, base_size=_sell_base_size(intent)
     )
@@ -1377,9 +1385,8 @@ class CancelUnavailable(RuntimeError):
     SELL on the exchange that our own records said was gone.
 
     `CoinbaseClient.cancel_order` exists now, but the guard still matters and now covers a
-    second case: it returns `False` when the exchange REFUSES a cancel (already filled, unknown
-    id), and a refusal recorded as a success is the same lie by a different route. The
-    `keel-broker-api` port and the Coinbase adapter still have no cancel method.
+    second case: the port's `cancel_order` answers `CancelOutcome`, and a REFUSED (already
+    filled, unknown id) recorded as a success is the same lie by a different route.
 
     Failing loudly is the safe direction: our state must never claim a cancel that did not
     happen. A caller that cannot tolerate the raise must reconcile with the exchange, not
@@ -1471,7 +1478,7 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
         return None
     try:
         data = json.loads(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return data.get("order_id")
 
@@ -1488,7 +1495,7 @@ def _bracket_spec(
     **This used to render Coinbase's wire dict itself.** #502 stage 1 added `BracketGTC` to the
     port and shipped a test pinning the two byte-identical, because two renderers of one order
     existed and had to be kept in agreement. #524 removed the second one: the spec goes to
-    `CoinbaseClient.place_order`, which renders it through the adapter's own
+    the broker's `place_order`, which renders it through the adapter package's own
     `to_order_configuration`, and the parity test goes with the duplicate it was pinning.
 
     What the port adds beyond a shared renderer is REFUSAL. `BracketGTC.__post_init__` rejects a

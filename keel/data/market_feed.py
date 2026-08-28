@@ -1,6 +1,7 @@
 """Keep the `candles` table populated: historical backfill + periodic polling.
 
-`market_feed` wires an injected `CoinbaseClient` (#7) to `Repository` (#2) -- it never talks
+`market_feed` wires an injected broker (#7 -- the port's `Broker`, resolved by `_build_broker`)
+to `Repository` (#2) -- it never talks
 to the network itself and never opens its own DB connection, so tests exercise it against a
 fake client and an in-memory `Repository` with zero network calls.
 
@@ -25,7 +26,8 @@ from keel.data.history import MAX_CANDLES_PER_REQUEST
 from keel.types import Candle, Granularity
 
 if TYPE_CHECKING:
-    from keel.data.cb_client import CoinbaseClient
+    from keel_broker_api.port import Broker
+
     from keel.data.repository import Repository
 
 _GRANULARITY_SECONDS: dict[Granularity, int] = {
@@ -98,7 +100,7 @@ def _missing_ranges(expected: list[int], present: set[int], gran_sec: int) -> li
 
 
 def backfill(
-    client: CoinbaseClient,
+    client: Broker,
     repo: Repository,
     products: list[str],
     granularities: list[Granularity],
@@ -148,7 +150,7 @@ def backfill(
 
 
 def _poll_catch_up(
-    client: CoinbaseClient,
+    client: Broker,
     repo: Repository,
     product_id: str,
     granularity: Granularity,
@@ -182,7 +184,7 @@ def _poll_catch_up(
 
 
 def poll_once(
-    client: CoinbaseClient,
+    client: Broker,
     repo: Repository,
     products: list[str],
     granularities: list[Granularity],

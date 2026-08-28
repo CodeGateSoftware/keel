@@ -15,7 +15,14 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import BracketGTC, MarketIOCByQuote
-from keel_broker_api.results import Balance, CancelOutcome, Instrument, PlaceResult, Preview
+from keel_broker_api.results import (
+    Balance,
+    CancelOutcome,
+    Instrument,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+)
 from keel_broker_coinbase.translate import to_order_configuration
 from keel_core import telemetry
 
@@ -130,9 +137,7 @@ def test_get_candles_maps_json_to_typed_candles() -> None:
     transport = FakeTransport(candles=_load_fixture("cb_candles.json"))
     client = CoinbaseClient(transport)
 
-    candles = client.get_candles(
-        "BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000
-    )
+    candles = client.get_candles("BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000)
 
     assert len(candles) == 3
     assert all(isinstance(c, Candle) for c in candles)
@@ -142,9 +147,7 @@ def test_get_candles_maps_decimal_ohlcv_and_ts_correctly() -> None:
     transport = FakeTransport(candles=_load_fixture("cb_candles.json"))
     client = CoinbaseClient(transport)
 
-    candles = client.get_candles(
-        "BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000
-    )
+    candles = client.get_candles("BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000)
     oldest = candles[0]
 
     assert oldest.ts == 1720915200
@@ -163,9 +166,7 @@ def test_get_candles_sorted_ascending_by_ts() -> None:
     transport = FakeTransport(candles=_load_fixture("cb_candles.json"))
     client = CoinbaseClient(transport)
 
-    candles = client.get_candles(
-        "BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000
-    )
+    candles = client.get_candles("BTC-USD", Granularity.ONE_DAY, start=1720915200, end=1721088000)
 
     assert [c.ts for c in candles] == sorted(c.ts for c in candles)
 
@@ -335,9 +336,7 @@ def test_get_accounts_returns_list_of_dicts() -> None:
 
 
 def _buy_spec(quote: str = "100.00") -> MarketIOCByQuote:
-    return MarketIOCByQuote(
-        product_id="BTC-USD", side=Side.BUY, quote_size=Decimal(quote)
-    )
+    return MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal(quote))
 
 
 def test_preview_order_answers_the_ports_type() -> None:
@@ -486,7 +485,8 @@ def test_get_order_normalizes_status_fill_price_and_fees():
     """The reconciliation pass needs three things a placement response cannot give: whether the
     order actually filled, at what price, and for how much in fees. `average_filled_price` and
     `total_fees` are OBSERVED, replacing the expected-price and previewed-commission estimates
-    the executor records at placement time."""
+    the executor records at placement time. The answer is the port's `OrderStatus` (#524), the
+    same type the adapter answers in."""
     transport = FakeTransport(
         order={
             "order": {
@@ -506,11 +506,12 @@ def test_get_order_normalizes_status_fill_price_and_fees():
     order = client.get_order("abc-123")
 
     assert transport.calls["get_order"] == {"order_id": "abc-123"}
-    assert order["order_id"] == "abc-123"
-    assert order["status"] == "FILLED"
-    assert order["filled_size"] == Decimal("0.01")
-    assert order["average_filled_price"] == Decimal("49875.42")
-    assert order["total_fees"] == Decimal("2.9925")
+    assert isinstance(order, OrderStatus)
+    assert order.order_id == "abc-123"
+    assert order.status == "FILLED"
+    assert order.filled_size == Decimal("0.01")
+    assert order.average_filled_price == Decimal("49875.42")
+    assert order.total_fees == Decimal("2.9925")
 
 
 def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none():
@@ -523,16 +524,14 @@ def test_get_order_on_an_unfilled_order_reports_zero_fill_not_none():
 
     order = client.get_order("abc-123")
 
-    assert order["status"] == "OPEN"
-    assert order["filled_size"] == Decimal("0")
-    assert order["average_filled_price"] == Decimal("0")
-    assert order["total_fees"] == Decimal("0")
+    assert order.status == "OPEN"
+    assert order.filled_size == Decimal("0")
+    assert order.average_filled_price == Decimal("0")
+    assert order.total_fees == Decimal("0")
 
 
 def test_cancel_order_is_confirmed_when_the_exchange_confirms():
-    transport = FakeTransport(
-        cancel={"results": [{"success": True, "order_id": "abc-123"}]}
-    )
+    transport = FakeTransport(cancel={"results": [{"success": True, "order_id": "abc-123"}]})
     client = CoinbaseClient(transport)
 
     assert client.cancel_order("abc-123") is CancelOutcome.CONFIRMED

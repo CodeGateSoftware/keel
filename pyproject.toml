@@ -25,8 +25,12 @@ dependencies = [
     # `version`, and `tests/test_packaging.py` fails the build if a pin is left behind.
     "keel-core==0.11.2",
     "keel-broker-api==0.11.2",
-    # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
-    # on the adapter keeps it available transitively. Phase B deletes those imports and this.
+    # The default venue resolves through the keel.brokers entry points (#524), so the adapter
+    # is a hard runtime dependency, not a convenience: without it installed, every config --
+    # including one with no `broker:` section -- fails at broker construction. The CLI also
+    # imports the SDK directly to build the adapter's RESTClient transport
+    # (`keel/commands/_common.py`); moving that construction into the adapter package is
+    # Phase B's, with cb_client.py's deletion.
     "keel-broker-coinbase==0.11.2",
 ]
 
@@ -97,15 +101,17 @@ dev = [
     # Dev-only on purpose: the fake venue exists to exert design pressure on the port and to
     # prove two-plugin discovery. A production engine must never have it installed.
     "keel-broker-fake",
-    # Dev-only for a different reason: Robinhood is an OPTIONAL venue, not one keel needs in
-    # order to run. Making it a runtime dependency of `keel-trader` would put an Ed25519 stack
-    # (pynacl) into every install for an adapter the live path cannot even reach today --
-    # nothing constructs it, `keel/commands/_common.py` still builds `CoinbaseClient` directly,
-    # and the broker-port migration has not landed. Coinbase is a hard dependency only because
-    # `keel/` still imports its SDK directly; no such import exists for this one, so the
-    # workspace entry above plus this line is the whole wiring. It is here rather than nowhere
-    # so the conformance suite actually runs against it in CI. Users who want the venue install
-    # `keel-broker-robinhood` themselves and entry-point discovery picks it up.
+    # Dev-only -- a DELIBERATE post-#524 choice, not a leftover of the pre-port world. The
+    # broker-port migration is finished, so a deployment that installs this package and selects
+    # `broker.name: robinhood` gets all the way to `_build_broker`, which refuses the name
+    # EXPLICITLY: the CLI has no credential wiring for its Ed25519 keys, and constructing it
+    # anyway would hand the engine a broker that cannot reach its venue. Runtime availability
+    # would therefore change nothing for an install until that wiring exists, while putting an
+    # Ed25519 stack (pynacl) into every install -- so it stays a dependency choice, made here,
+    # and flipping it is a real decision that also wants #233's capability-based venue
+    # visibility (an install must not silently widen what a deployment can select). Until
+    # then: the dev entry runs the conformance suite against it in CI, and users who want the
+    # venue install `keel-broker-robinhood` themselves -- entry-point discovery picks it up.
     "keel-broker-robinhood",
     # Dev-only for the same reason as Robinhood: Alpaca is an optional venue (the Phase 12
     # equities milestone). It rides the dev group so the conformance suite runs against it

@@ -24,6 +24,7 @@ from keel_broker_api.orders import OrderSpec
 from keel_broker_api.results import (
     Balance,
     MarketSchedule,
+    OrderStatus,
     PlaceResult,
     Preview,
     SessionState,
@@ -1568,14 +1569,14 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     )
 
     class _ReconcilingBroker(FakeBroker):
-        def get_order(self, order_id: str) -> dict[str, Any]:
-            return {
-                "order_id": order_id,
-                "status": "FILLED",
-                "filled_size": Decimal("0.01"),
-                "average_filled_price": Decimal("48900"),
-                "total_fees": Decimal("2.93"),
-            }
+        def get_order(self, order_id: str) -> OrderStatus:
+            return OrderStatus(
+                order_id=order_id,
+                status="FILLED",
+                filled_size=Decimal("0.01"),
+                average_filled_price=Decimal("48900"),
+                total_fees=Decimal("2.93"),
+            )
 
     broker = _ReconcilingBroker(
         series={(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
@@ -2859,6 +2860,25 @@ def test_a_rail_veto_means_the_confirm_prompt_is_never_reached(repo, monkeypatch
 # -- the CLI wires the interactive prompt --------------------------------------
 
 
+def _gate_preview(**overrides):
+    """The port's `Preview` -- the one shape the confirm gate reads since #524."""
+    from decimal import Decimal
+
+    from keel_broker_api.results import Preview
+    from keel_core.types import Side
+
+    fields: dict = {
+        "product_id": "BTC-USD",
+        "side": Side.BUY,
+        "est_base_size": Decimal("0.0001"),
+        "est_quote_size": Decimal("5.00"),
+        "est_fee": Decimal("0.03"),
+        "synthetic": False,
+    }
+    fields.update(overrides)
+    return Preview(**fields)
+
+
 def test_interactive_confirm_places_on_yes_declines_on_no(monkeypatch, capsys):
     """`_interactive_confirm` renders the preview and returns the human's yes/no."""
     import keel.cli as cli_module
@@ -2867,13 +2887,13 @@ def test_interactive_confirm_places_on_yes_declines_on_no(monkeypatch, capsys):
     monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
 
     monkeypatch.setattr(cli_module.click, "confirm", lambda *a, **k: True)
-    assert cli_module._interactive_confirm({"order_total": "5.00", "commission_total": "0.03"})
+    assert cli_module._interactive_confirm(_gate_preview())
     out = capsys.readouterr().out
-    assert "Coinbase order preview" in out
-    assert "order_total: 5.00" in out
+    assert "Rails PASSED. Order preview:" in out
+    assert "est_quote_size: 5.00" in out
 
     monkeypatch.setattr(cli_module.click, "confirm", lambda *a, **k: False)
-    assert cli_module._interactive_confirm({"order_total": "5.00"}) is False
+    assert cli_module._interactive_confirm(_gate_preview()) is False
 
 
 def test_interactive_confirm_fails_closed_without_a_tty(monkeypatch):
@@ -2881,7 +2901,7 @@ def test_interactive_confirm_fails_closed_without_a_tty(monkeypatch):
 
     # The TTY predicate lives in keel.commands._common; _interactive_confirm calls it there.
     monkeypatch.setattr("keel.commands._common._is_interactive", lambda: False)
-    assert cli_module._interactive_confirm({"order_total": "5.00"}) is False
+    assert cli_module._interactive_confirm(_gate_preview()) is False
 
 
 def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypatch):

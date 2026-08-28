@@ -47,6 +47,7 @@ class FakeTransport:
         summary: dict[str, Any] | None = None,
         order: dict[str, Any] | None = None,
         product: dict[str, Any] | None = None,
+        products: dict[str, Any] | None = None,
     ) -> None:
         self._candles = candles
         self._accounts = accounts
@@ -55,11 +56,16 @@ class FakeTransport:
         self._summary = summary
         self._order = order
         self._product = product
+        self._products = products
         self.calls: dict[str, dict[str, Any]] = {}
         # Ids this transport has actually issued via `create_order`, so `cancel_orders` can tell
         # a genuine order apart from one the suite's unknown-id test made up -- the same
         # distinction the real venue draws, and the whole point of that assertion.
         self._issued_order_ids: set[str] = set()
+
+    def get_products(self, product_type: str = "SPOT", **kwargs: Any) -> Any:
+        self.calls["get_products"] = {"product_type": product_type}
+        return self._products
 
     def get_candles(
         self, product_id: str, start: str, end: str, granularity: str, **kwargs: Any
@@ -459,3 +465,52 @@ def test_get_instrument_answers_none_for_anything_unusable(payload: dict[str, An
     """
     adapter = CoinbaseAdapter(FakeTransport(product=payload))
     assert adapter.get_instrument("BTC-USD") is None
+
+
+def test_list_products_serves_the_discovery_sweep() -> None:
+    """The whole-catalogue read `keel assets discover` needs (#524's move of the last
+    Coinbase-only client method onto the registry-resolved adapter).
+
+    NOT a port method, on purpose: the port's catalogue surface is the per-product
+    `get_instrument` the executor reads on the order path, and a ~900-row sweep is a DISCOVERY
+    concern, not an order-path one. The projection is pinned field-for-field because the
+    discovery sweep's filters read these keys -- a silently renamed key would quietly narrow
+    every candidate list.
+    """
+    transport = FakeTransport(
+        products={
+            "products": [
+                {
+                    "product_id": "BTC-USD",
+                    "base_name": "Bitcoin",
+                    "quote_currency_id": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                    "is_disabled": False,
+                    "view_only": False,
+                    "approximate_quote_24h_volume": "12345.67",
+                    "base_increment": "0.00000001",
+                    "quote_increment": "0.01",
+                }
+            ]
+        }
+    )
+    adapter = CoinbaseAdapter(transport)
+
+    products = adapter.list_products()
+
+    assert products == [
+        {
+            "product_id": "BTC-USD",
+            "base_name": "Bitcoin",
+            "quote_currency_id": "USD",
+            "status": "online",
+            "trading_disabled": False,
+            "is_disabled": False,
+            "view_only": False,
+            "quote_24h_volume": "12345.67",
+            "base_increment": "0.00000001",
+            "quote_increment": "0.01",
+        }
+    ]
+    assert transport.calls["get_products"] == {"product_type": "SPOT"}

@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from keel_broker_api.results import Balance
 
 import keel.cli as cli_module
 from keel.cli import cli
@@ -137,8 +138,11 @@ class _ExplodingBroker:
         raise AssertionError(f"no broker method may be called under --check ({name})")
 
 
-_GRAN_STEPS = [(Granularity.FIFTEEN_MINUTE, 900), (Granularity.ONE_HOUR, 3600),
-               (Granularity.ONE_DAY, 86_400)]
+_GRAN_STEPS = [
+    (Granularity.FIFTEEN_MINUTE, 900),
+    (Granularity.ONE_HOUR, 3600),
+    (Granularity.ONE_DAY, 86_400),
+]
 
 
 def _seed_current_series(repo: Repository, products: tuple[str, ...]) -> None:
@@ -175,8 +179,7 @@ def test_fetch_check_failing_parity(tmp_path, valid_config_path, monkeypatch, ch
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_cli), "--config", str(valid_config_path), "fetch", "--check",
-         *check_args],
+        ["--db", str(db_cli), "--config", str(valid_config_path), "fetch", "--check", *check_args],
     )
     assert result.exit_code != 0
 
@@ -336,9 +339,19 @@ def test_simulate_report_parity(tmp_path, valid_config_path, monkeypatch):
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_cli), "--config", str(valid_config_path),
-         "simulate", "--no-fetch", "--years", "1",
-         "--out", str(out_cli), "--no-trial-record"],
+        [
+            "--db",
+            str(db_cli),
+            "--config",
+            str(valid_config_path),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_cli),
+            "--no-trial-record",
+        ],
     )
     assert result.exit_code == 0, result.output
 
@@ -426,8 +439,16 @@ def test_assets_screen_verdicts_match_the_service(tmp_path, valid_config_path):
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_cli), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD,ETH-USD"],
+        [
+            "--db",
+            str(db_cli),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD,ETH-USD",
+        ],
     )
     assert result.exit_code == 0, result.output
 
@@ -446,11 +467,11 @@ def test_assets_screen_verdicts_match_the_service(tmp_path, valid_config_path):
 
 
 class _AccountsBroker(_FakePollBroker):
-    def get_accounts(self) -> list[dict[str, Any]]:
+    def get_balances(self) -> list[Balance]:
         return [
-            {"currency": "BTC", "available_balance": Decimal("1.5")},
-            {"currency": "USDC", "available_balance": Decimal("900")},
-            {"currency": "SOL", "available_balance": Decimal("10")},
+            Balance(currency="BTC", available=Decimal("1.5"), total=Decimal("1.5")),
+            Balance(currency="USDC", available=Decimal("900"), total=Decimal("900")),
+            Balance(currency="SOL", available=Decimal("10"), total=Decimal("10")),
         ]
 
 
@@ -473,7 +494,7 @@ def test_assets_holdings_render_parity(tmp_path, valid_config_path, monkeypatch)
 
     cfg = load_config(str(valid_config_path))
     report = assets_service.gather_holdings(
-        _repo_at(db_svc), cfg, _AccountsBroker().get_accounts(), Decimal("0")
+        _repo_at(db_svc), cfg, _AccountsBroker().get_balances(), Decimal("0")
     )
     rendered = "".join(line + "\n" for line in assets_service.render_holdings(report))
     assert _disclaimerless(result.output) == rendered
@@ -504,8 +525,16 @@ def test_assets_discover_render_parity(tmp_path, valid_config_path, monkeypatch)
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(tmp_path / "cli.db"), "--config", str(valid_config_path),
-         "assets", "discover", "--min-volume-24h", "100000"],
+        [
+            "--db",
+            str(tmp_path / "cli.db"),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "discover",
+            "--min-volume-24h",
+            "100000",
+        ],
     )
     assert result.exit_code == 0, result.output
 
@@ -562,9 +591,7 @@ def test_pnl_render_parity(tmp_path, extra_args, asset, marks):
     result = CliRunner().invoke(cli, ["--db", str(db_cli), "pnl", *extra_args])
     assert result.exit_code == 0, result.output
 
-    report = pnl_service.build_pnl_report(
-        _repo_at(db_svc).get_transactions(asset), asset, marks
-    )
+    report = pnl_service.build_pnl_report(_repo_at(db_svc).get_transactions(asset), asset, marks)
     rendered = "".join(line + "\n" for line in pnl_service.render_pnl_report(report))
     assert _disclaimerless(result.output) == rendered
 
@@ -652,6 +679,4 @@ def test_agent_cycle_lines_come_from_the_shared_renderer() -> None:
     skipped = agent.LoopResult(
         ts=NOW_TS, skipped=True, skip_reason="market_closed", mode="paper", polled=0
     )
-    assert trading_service.render_loop_result(skipped) == [
-        f"[{NOW_TS}] skipped: market_closed"
-    ]
+    assert trading_service.render_loop_result(skipped) == [f"[{NOW_TS}] skipped: market_closed"]

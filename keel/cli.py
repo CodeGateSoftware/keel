@@ -52,8 +52,8 @@ always, even when the command errors out or is refused at a confirmation prompt.
 commands such as `trials *`, `withdrawals show` and `assets list` deliberately omit it.)
 
 **No live network in tests.** `_build_broker` is the one seam that would construct a real,
-network-talking broker (a `CoinbaseClient` for the default/absent `broker:` section, or the
-configured venue's adapter otherwise — venue selection, #370 B2); tests monkeypatch it to
+network-talking broker (the configured venue's registry-resolved adapter — coinbase for the
+default/absent `broker:` section, #524; venue selection, #370 B2); tests monkeypatch it to
 inject a fake broker instead, exactly like `tests/test_agent.py`'s `FakeBroker` (the
 venue-selection branches themselves are driven against fakes and network-free construction
 in `tests/test_paper_equities_profile.py`).
@@ -554,7 +554,7 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
         raise click.BadParameter(f"--min-balance must be finite and >= 0; got {min_balance!r}")
 
     try:
-        accounts = _build_broker(config).get_accounts()
+        balances = _build_broker(config).get_balances()
     except Exception as exc:  # noqa: BLE001 -- an unreachable venue is an error, not "nothing held"
         # Includes broker CONSTRUCTION, so a missing/invalid `.env` credential surfaces here
         # rather than as a raw traceback. Reporting an empty list instead would read as
@@ -565,7 +565,7 @@ def assets_holdings(ctx: click.Context, min_balance: str, run_screen: bool) -> N
             f"  If this is an authentication error, check {broker_auth_hint(config)}."
         ) from exc
 
-    report = gather_holdings(repo, config, accounts, floor, run_screen=run_screen)
+    report = gather_holdings(repo, config, balances, floor, run_screen=run_screen)
     for line in render_holdings(report):
         click.echo(line)
 
