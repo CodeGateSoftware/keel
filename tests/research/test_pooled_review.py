@@ -12,7 +12,11 @@ cannot be omitted. These tests pin the three things the issue says make the repo
 2. **The extraction mapping.** orders/trade_outcomes rows -> the `OutcomeRow` sequence
    `significance()` reads: win/loss by the SIGN of fee-honest net pnl, scratch (exactly 0)
    and open trades excluded but counted, FIFO matching, ledger dedup, streak's own pnl
-   formula for orders-derived round trips.
+   formula for orders-derived round trips. The fee TRUTH is pinned with it: the ledger's
+   `fees` column is the exit leg only (the entry fee is folded into `pnl_net` and stored
+   nowhere), so a deduped twin donates both legs' fees and a pure ledger row renders its
+   fee as the labelled lower bound it is -- and the power sentence is generated at the
+   measurement's own n (wins+losses), so one artifact never carries two n_eff numbers.
 3. **The refusal and the no-verdict shape.** Zero pooled trades refuses ("nothing to
    review") instead of emitting a degenerate report, and a real report NEVER carries a
    pass/fail verdict on the edge — the verdict vocabulary is about POWER.
@@ -20,7 +24,13 @@ cannot be omitted. These tests pin the three things the issue says make the repo
 
 from __future__ import annotations
 
+import sqlite3
+import subprocess
+import sys
 from decimal import Decimal
+from pathlib import Path
+
+import pytest
 
 from keel.research.pooled_review import (
     EVENT_DATE,
@@ -39,6 +49,10 @@ from keel.research.pooled_review import (
     round_trips_from_orders,
 )
 from keel.research.throughput import design_effect, detectable_edge, n_eff
+
+DRIVER = (
+    Path(__file__).resolve().parents[2] / "docs" / "experiments" / "2026-09-30-pooled-review.py"
+)
 
 
 def _order(
@@ -198,6 +212,17 @@ def test_open_unfilled_and_stray_rows_are_excluded_and_counted() -> None:
     assert read.stray_sells == 1
 
 
+def test_a_filled_row_without_fill_or_fee_is_a_named_data_error() -> None:
+    # The seam's contract the driver catches for its exit-2 refusal: a 'filled' row with
+    # no actual_fill/fee cannot be priced into a round trip, so it raises (the driver
+    # turns that into REFUSED, never a traceback).
+    orders = [
+        _order(1, "BTC-USD", "BUY", "1", "100", None, created_at=1_000),
+    ]
+    with pytest.raises(ValueError, match="filled but carries no actual_fill/fee"):
+        round_trips_from_orders("keel.db", orders, {1: "turtle_breakout"})
+
+
 def test_matching_never_crosses_modes_products_rules_or_sizes() -> None:
     orders = [
         _order(1, "BTC-USD", "BUY", "1", "100", "0.12", mode="paper", created_at=1_000),
@@ -245,6 +270,84 @@ def test_ledger_rows_carry_their_recorded_pnl_verbatim() -> None:
     assert trip.rule == "turtle_breakout"
 
 
+# -- the fee truth: the ledger's `fees` column is the EXIT leg only --------------------------
+
+
+def test_a_pure_ledger_rows_fee_is_the_exit_leg_only() -> None:
+    # streak.record_closed_trade writes pnl_net = (exit - entry) * qty - fees - entry_fee
+    # and stores ONLY the exit fee in `fees` (agent.py:521 / reconcile.py:477 hand it the
+    # exit order's fee); the entry fee lives in pnl_net and nowhere else. So a ledger row
+    # with no orders twin contributes its exit leg alone -- a lower bound, flagged as one.
+    (trip,) = ledger_round_trips(
+        "keel.db", [_ledger("CRV-USD", "100", "0.30", "0.35", "1.20", "-3.70")]
+    )
+    assert trip.exit_fee == Decimal("1.20")
+    assert trip.entry_fee == Decimal("0")
+    assert trip.fees_paid() == Decimal("1.20")
+    assert trip.fees_both_legs is False
+
+
+def test_dedup_carries_the_orders_twins_both_legs_fees_into_the_kept_ledger_row() -> None:
+    # The ledger row wins the dedup (its pnl_net is authoritative) but records only the
+    # exit leg's fee; the orders twin observed BOTH legs, so its fees ride into the kept
+    # row -- otherwise the measured per-leg fee line would understate ~2x once ledger
+    # rows exist (the review's MAJOR finding).
+    orders = round_trips_from_orders(
+        "keel.db",
+        [
+            _order(1, "BCH-USD", "BUY", "1", "219", "2.41", created_at=1_300),
+            _order(2, "BCH-USD", "SELL", "1", "214", "2.36", created_at=1_400),
+        ],
+        {1: "turtle_breakout"},
+    )
+    # The row streak.py would have written: fees = the exit order's 2.36, pnl_net nets
+    # BOTH legs: (214 - 219) * 1 - 2.36 - 2.41 = -9.77.
+    ledger = [_ledger("BCH-USD", "1", "219", "214", "2.36", "-9.77", closed_at=1_400)]
+    (trip,) = build_sample([("keel.db", orders, ledger)]).trips
+    assert trip.source == "ledger"
+    assert trip.pnl_net == Decimal("-9.77")  # the recorded pnl stays authoritative
+    assert trip.entry_fee == Decimal("2.41")  # the twin's entry leg...
+    assert trip.exit_fee == Decimal("2.36")  # ...and exit leg, both carried
+    assert trip.fees_paid() == Decimal("4.77")
+    assert trip.fees_both_legs is True
+
+
+def test_a_pure_ledger_trip_renders_its_fee_as_an_explicit_lower_bound() -> None:
+    # No orders twin exists to donate the entry leg: the report's fee line must say LOWER
+    # bound and why, never let the exit-leg figure pose as a per-leg measurement.
+    sample = build_sample(
+        [("keel.db", _empty_read(), [_ledger("CRV-USD", "100", "0.30", "0.35", "1.20", "-3.70")])]
+    )
+    text = "\n".join(render_report(descriptive_review(sample, run_date="2026-08-27")))
+    assert "LOWER bound" in text
+    assert "exit leg only" in text
+    assert "the entry fee is folded into pnl_net and not stored" in text
+
+
+def test_an_orders_only_pool_keeps_the_plain_both_legs_fee_line() -> None:
+    # Every trip reconstructed from orders observed both legs' fees: the plain per-leg
+    # line stands, with no lower-bound hedge.
+    sample = build_sample(
+        [
+            (
+                "keel.db",
+                round_trips_from_orders(
+                    "keel.db",
+                    [
+                        _order(1, "BTC-USD", "BUY", "1", "100", "0.12", created_at=1_000),
+                        _order(2, "BTC-USD", "SELL", "1", "110", "0.13", created_at=1_100),
+                    ],
+                    {1: "turtle_breakout"},
+                ),
+                [],
+            )
+        ]
+    )
+    text = "\n".join(render_report(descriptive_review(sample, run_date="2026-08-27")))
+    assert "both legs" in text
+    assert "LOWER bound" not in text
+
+
 # -- pooling: dedup, scratch/open exclusion, oldest-first order -----------------------------
 
 
@@ -288,6 +391,28 @@ def test_pool_dedups_a_ledger_row_against_the_same_round_trip_in_orders() -> Non
     assert [t.product_id for t in sample.trips] == ["CRV-USD", "BTC-USD", "BCH-USD"]
 
 
+def test_the_dedup_key_carries_entry_fill_so_a_distinct_trip_never_vanishes() -> None:
+    # Two round trips of the same (profile, product, qty, exit fill) but DIFFERENT entry
+    # fills; the ledger recorded one of them. Keyed without the entry fill both orders
+    # trips drop against the single ledger row and a real trip silently vanishes; keyed
+    # with it, only the twin whose entry fill matches dedupes.
+    orders = round_trips_from_orders(
+        "keel.db",
+        [
+            _order(1, "BTC-USD", "BUY", "1", "100", "0.12", created_at=1_000),
+            _order(2, "BTC-USD", "BUY", "1", "105", "0.12", created_at=1_050),
+            _order(3, "BTC-USD", "SELL", "1", "110", "0.13", created_at=1_100),
+            _order(4, "BTC-USD", "SELL", "1", "110", "0.13", created_at=1_150),
+        ],
+        {1: "turtle_breakout"},
+    )
+    ledger = [_ledger("BTC-USD", "1", "105", "110", "0.13", "-5.25", closed_at=1_150)]
+    sample = build_sample([("keel.db", orders, ledger)])
+    assert sample.n_pooled() == 2  # the ledger row AND the 100-entry trip (1 would drop one)
+    assert sample.deduped == 1  # only the twin whose entry fill matches
+    assert sorted(t.entry_fill for t in sample.trips) == [Decimal("100"), Decimal("105")]
+
+
 def test_pool_excludes_open_positions_and_counts_them() -> None:
     sample = _sample_with_two_profiles()
     assert sample.excluded_open == 1  # the PAXG buy with no sell
@@ -317,6 +442,117 @@ def test_scratch_pnl_exactly_zero_counts_toward_nothing() -> None:
     stat = sample.significance()
     assert stat.n_trades == 1
     assert stat.wins == 1
+
+
+def test_a_pool_of_only_scratches_refuses_like_an_empty_one() -> None:
+    # Every trip a scratch: significance counts NOTHING, so there is no win rate and no n
+    # to put a power sentence at -- the same refusal as an empty pool, not a degenerate
+    # report whose sentence would claim power from trades that count toward nothing.
+    ledger = [
+        _ledger("BTC-USD", "1", "100", "100", "0", "0"),
+        _ledger("ETH-USD", "1", "50", "50", "0", "0"),
+    ]
+    sample = build_sample([("keel.db", _empty_read(), ledger)])
+    assert sample.n_pooled() == 2
+    assert is_refused(sample)
+    assert descriptive_review(sample, run_date="2026-08-27").refusal is not None
+
+
+def _eight_pooled_one_scratch() -> PooledSample:
+    """8 pooled trips of which exactly 1 is a scratch -- 4 wins, 3 losses, 1 scratch."""
+    rows = [
+        _ledger(f"WIN{i}-USD", "1", "100", "110", "0.26", "9.60", closed_at=2_000 + i)
+        for i in range(4)
+    ] + [
+        _ledger(f"LOSS{i}-USD", "1", "100", "96", "0.26", "-3.70", closed_at=2_100 + i)
+        for i in range(3)
+    ]
+    rows.append(_ledger("FLAT-USD", "1", "100", "100", "0", "0", closed_at=2_200))
+    return build_sample([("keel.db", _empty_read(), rows)])
+
+
+def test_the_power_sentence_uses_the_measurement_n_one_basis_per_artifact() -> None:
+    # 8 pooled, 1 scratch: the measurement counts 7 (stat.n_trades), so the sentence is
+    # generated at 7 too and the artifact carries ONE n_eff -- never the sentence's
+    # n_eff(8) beside the measurement's n_eff(7).
+    sample = _eight_pooled_one_scratch()
+    assert sample.n_pooled() == 8
+    assert sample.scratches() == 1
+    stat = sample.significance()
+    assert stat.n_trades == 7
+    text = "\n".join(render_report(descriptive_review(sample, run_date="2026-08-27")))
+    assert power_sentence(7) in text
+    assert f"{stat.n_effective.quantize(Decimal('0.01'))} effective of 7 pooled" in text
+    # The split is printed with a label, so the counted n is explicit...
+    assert "7 win/loss + 1 scratch counting toward nothing" in text
+    # ...and the 8-based n_eff (3.11) appears nowhere in the artifact.
+    assert f"{n_eff(Decimal(8)).quantize(Decimal('0.01'))}" not in text
+
+
+# -- the driver: unreadable input refuses (exit 2) with a named reason, never a traceback --
+
+_DRIVER_SCHEMA = """
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY, mode TEXT, product_id TEXT, side TEXT, qty TEXT,
+    status TEXT, actual_fill TEXT, fee TEXT, rule_id INTEGER, created_at INTEGER
+);
+CREATE TABLE rules (id INTEGER PRIMARY KEY, kind TEXT);
+CREATE TABLE trade_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, rule_name TEXT,
+    opened_at INTEGER, closed_at INTEGER, qty TEXT, entry_fill TEXT, exit_fill TEXT,
+    fees TEXT, pnl_net TEXT
+);
+"""
+
+
+def _run_driver(db: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DRIVER),
+            "--db",
+            str(db),
+            "--out",
+            str(tmp_path / "report.md"),
+            "--jsonl",
+            str(tmp_path / "report.jsonl"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=DRIVER.parents[2],
+    )
+
+
+def test_a_filled_order_row_without_a_fee_refuses_exit_2_not_a_traceback(tmp_path: Path) -> None:
+    # A 'filled' row carrying no fee is a data error the review NAMES on the exit-2 path;
+    # before the fix this escaped as a ValueError traceback out of main().
+    db = tmp_path / "keel.db"
+    connection = sqlite3.connect(db)
+    connection.executescript(_DRIVER_SCHEMA)
+    connection.execute(
+        "INSERT INTO orders VALUES (1, 'paper', 'BTC-USD', 'BUY', '1', 'filled', '100', "
+        "NULL, NULL, 1000)"
+    )
+    connection.commit()
+    connection.close()
+    result = _run_driver(db, tmp_path)
+    assert result.returncode == 2
+    assert "REFUSED" in result.stderr
+    assert "cannot be read as pre-registered" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_a_db_missing_the_orders_table_refuses_exit_2_not_a_traceback(tmp_path: Path) -> None:
+    # A reachable db with no `orders` table cannot be read as pre-registered; before the
+    # fix this escaped as an sqlite3.OperationalError traceback out of main().
+    db = tmp_path / "keel.db"
+    sqlite3.connect(db).close()  # a valid, empty sqlite file -- reachable, but no tables
+    result = _run_driver(db, tmp_path)
+    assert result.returncode == 2
+    assert "REFUSED" in result.stderr
+    assert "orders" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 # -- the refusal: zero pooled trades is "nothing to review", never a degenerate report -------

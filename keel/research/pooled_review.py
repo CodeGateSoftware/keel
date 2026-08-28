@@ -14,17 +14,24 @@ is the machinery that makes that report impossible to write imprecisely:
   empty, round trips reconstructed from filled orders using the ledger writer's own pnl
   formula (`keel/execution/streak.py`). Win/loss is the SIGN of fee-honest net pnl; a
   `pnl_net` of exactly zero is a scratch and counts toward nothing (significance.py's
-  contract); OPEN positions are excluded and counted, never guessed at.
-* **The power sentence** is generated from the pool's ACTUAL n through
-  `throughput.n_eff`/`throughput.detectable_edge`, so a 7-trade pool says something very
-  different from a 100-trade one — the honest sentence scales with reality, and a report
-  assembled by `render_report` cannot omit it.
+  contract); OPEN positions are excluded and counted, never guessed at. The ledger's
+  `fees` column is the EXIT order's fee only — `streak.record_closed_trade` nets it plus
+  the entry fee into `pnl_net` and stores the entry leg nowhere — so a deduped orders
+  twin's both-legs fees ride into the ledger row that wins the dedup, and a pure ledger
+  trip's fee is rendered as the labelled lower bound it is.
+* **The power sentence** is generated at the SAME n the measurement uses
+  (`stat.n_trades` — wins+losses; a scratch counts toward nothing) through
+  `throughput.n_eff`/`throughput.detectable_edge`, so the artifact never carries two
+  different n_eff numbers and a 7-trade pool says something very different from a
+  100-trade one — the honest sentence scales with reality, and a report assembled by
+  `render_report` cannot omit it.
 * **The verdict vocabulary is about POWER, not the edge.** The significance machinery
   measures (win rate, break-even, edge, interval) but this report renders none of its
   pass/fail verdicts: the descriptive reframing means the only verdict-shaped statement is
   "at this n_eff the review can only see an edge of X points or larger".
-* **Zero pooled trades refuses.** A review with nothing to review says "nothing to review"
-  and produces no degenerate report.
+* **A pool with nothing counted refuses.** Zero pooled trades — or a non-empty pool whose
+  every trip is a scratch, which has no win rate and no n to put a power sentence at —
+  says "nothing to review" and produces no degenerate report.
 
 `Decimal` for every rate, price and pnl — they are money — exactly as `significance.py`
 documents. The driver (`docs/experiments/2026-09-30-pooled-review.py`) owns all I/O: it
@@ -34,7 +41,7 @@ opens the deployment dbs read-only and writes the artifacts.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TypedDict
 
@@ -102,6 +109,10 @@ def round_trip_pnl(
     return (exit_fill - entry_fill) * qty - entry_fee - exit_fee
 
 
+#: The dedup identity tuple (see :meth:`RoundTrip.key`).
+TripKey = tuple[str, str, Decimal, Decimal, Decimal]
+
+
 @dataclass(frozen=True)
 class RoundTrip:
     """One closed forward round trip, from either record of it.
@@ -111,6 +122,12 @@ class RoundTrip:
     folds the entry fee into pnl but does not store it separately, so recomputing from the
     fills would silently drop it). `rule` is `rules.kind`, or 'unknown' when the rule row is
     gone — the fill is real regardless, so the trip counts and the composition says so.
+
+    `fees_both_legs` is False only on a PURE ledger row: the ledger's `fees` column is the
+    exit order's fee (the entry fee lives in `pnl_net` and nowhere else), so
+    :meth:`fees_paid` on such a trip is a lower bound the report must label, never a
+    per-leg pretension. A ledger row whose orders twin was deduped away carries the twin's
+    both-legs fees and is marked True.
     """
 
     profile: str
@@ -126,10 +143,16 @@ class RoundTrip:
     opened_at: int
     closed_at: int
     pnl_net: Decimal
+    fees_both_legs: bool = True
 
-    def key(self) -> tuple[str, str, Decimal, Decimal]:
-        """The dedup identity: (profile, product, quantity, exit fill)."""
-        return (self.profile, self.product_id, self.qty, self.exit_fill)
+    def key(self) -> TripKey:
+        """The dedup identity: (profile, product, quantity, entry fill, exit fill).
+
+        The entry fill is load-bearing: two DISTINCT trips of the same size can share an
+        exit fill (a herd day exits at one price), and keying without the entry would drop
+        both when the ledger recorded only one of them.
+        """
+        return (self.profile, self.product_id, self.qty, self.entry_fill, self.exit_fill)
 
     def timestamps_inverted(self) -> bool:
         """True when the recorded close precedes the recorded open (id order still governs).
@@ -153,7 +176,11 @@ class RoundTrip:
         return ("scratch", self.pnl_net, None)
 
     def fees_paid(self) -> Decimal:
-        """Both legs' fees (the ledger stores the combined figure in `entry_fee`)."""
+        """Both legs' fees when :attr:`fees_both_legs`; the exit leg alone otherwise.
+
+        On a pure ledger row this is a LOWER bound: the ledger's `fees` column is the exit
+        order's fee and the entry fee is folded into `pnl_net`, stored nowhere.
+        """
         return self.entry_fee + self.exit_fee
 
 
@@ -248,8 +275,11 @@ def round_trips_from_orders(
 def ledger_round_trips(profile: str, rows: Sequence[LedgerRow]) -> list[RoundTrip]:
     """Map `trade_outcomes` rows to round trips, carrying the recorded pnl verbatim.
 
-    The ledger's `fees` column is the both-legs total the writer charged into `pnl_net`;
-    it rides in `entry_fee` (with a zero exit leg) so fee accounting stays one formula.
+    The ledger's `fees` column is the EXIT order's fee only — `streak.record_closed_trade`
+    nets it plus the tranche's entry fee into `pnl_net` (`(exit - entry) * qty - fees -
+    entry_fee`) and stores the entry leg nowhere — so the row rides in `exit_fee` with a
+    zero entry leg and `fees_both_legs=False`: `fees_paid()` on a pure ledger row is a
+    lower bound the report labels as one, never a both-legs pretension.
     """
     return [
         RoundTrip(
@@ -262,11 +292,12 @@ def ledger_round_trips(profile: str, rows: Sequence[LedgerRow]) -> list[RoundTri
             qty=row["qty"],
             entry_fill=row["entry_fill"],
             exit_fill=row["exit_fill"],
-            entry_fee=row["fees"],
-            exit_fee=Decimal("0"),
+            entry_fee=Decimal("0"),
+            exit_fee=row["fees"],
             opened_at=row["opened_at"],
             closed_at=row["closed_at"],
             pnl_net=row["pnl_net"],
+            fees_both_legs=False,
         )
         for row in rows
     ]
@@ -310,6 +341,14 @@ class PooledSample:
     def n_pooled(self) -> int:
         return len(self.trips)
 
+    def counted(self) -> int:
+        """Trades the MEASUREMENT counts (wins+losses; a scratch counts toward nothing).
+
+        This is the n `significance()` puts its standard error at and the n the power
+        sentence is generated at — one basis per artifact, never two.
+        """
+        return self.n_pooled() - self.scratches()
+
     def outcomes(self) -> list[OutcomeRow]:
         """The `OutcomeRow` sequence `significance()` reads, oldest first."""
         return [trip.outcome() for trip in self.trips]
@@ -327,7 +366,9 @@ def realized_fee_pct(trips: Sequence[RoundTrip]) -> Decimal:
 
     The forward trades' regime is an OUTCOME, not an assumption — inside the fee-free
     allowance this is ~0, at the taker rate ~120 bp — so it is measured off the same round
-    trips the win rate is, and reported beside it.
+    trips the win rate is, and reported beside it. Where a pure ledger row contributes (no
+    orders twin), its fee is the exit leg only, so the fraction is a lower bound —
+    `render_report` labels it rather than letting it pose as the both-legs figure.
     """
     fees = sum((t.fees_paid() for t in trips), Decimal(0))
     notional = sum(((t.entry_fill + t.exit_fill) * t.qty for t in trips), Decimal(0))
@@ -343,10 +384,13 @@ def build_sample(
 
     Each profile contributes its `OrdersRead` (already matched) and its raw ledger rows
     (converted here). Dedup drops the ORDERS-derived twin — the ledger row is the
-    authoritative record of the same round trip, keyed on profile, product, quantity and
-    exit fill. Ordering is `closed_at` then product — the ledger reader's own oldest-first
-    convention — with fill and source as tie-breakers so the order is a pure function of
-    the input.
+    authoritative record of the same round trip, keyed on profile, product, quantity,
+    entry fill and exit fill — BUT the twin's both-legs fees ride into the kept row: the
+    ledger records only the exit leg's fee (the entry fee is folded into `pnl_net` and
+    stored nowhere), while the twin observed both legs, so the measured-fee line cannot
+    silently understate once ledger rows exist. Ordering is `closed_at` then product — the
+    ledger reader's own oldest-first convention — with fill and source as tie-breakers so
+    the order is a pure function of the input.
     """
     trips: list[RoundTrip] = []
     summaries: list[ProfileSummary] = []
@@ -356,10 +400,23 @@ def build_sample(
     total_deduped = 0
     for profile, read, ledger_rows in per_profile:
         ledger = ledger_round_trips(profile, ledger_rows)
-        ledger_keys = {trip.key() for trip in ledger}
-        kept = [trip for trip in read.trips if trip.key() not in ledger_keys]
-        deduped = len(read.trips) - len(kept)
-        combined = list(ledger) + kept
+        ledger_by_key: dict[TripKey, RoundTrip] = {trip.key(): trip for trip in ledger}
+        upgraded: dict[TripKey, RoundTrip] = {}
+        kept: list[RoundTrip] = []
+        deduped = 0
+        for trip in read.trips:
+            ledger_twin = ledger_by_key.get(trip.key())
+            if ledger_twin is None:
+                kept.append(trip)
+                continue
+            deduped += 1
+            upgraded[trip.key()] = replace(
+                ledger_twin,
+                entry_fee=trip.entry_fee,
+                exit_fee=trip.exit_fee,
+                fees_both_legs=True,
+            )
+        combined = [upgraded.get(trip.key(), trip) for trip in ledger] + kept
         combined.sort(key=lambda t: (t.closed_at, t.product_id, t.exit_fill, t.source))
         trips += combined
         total_open += read.open_buys
@@ -393,21 +450,24 @@ def build_sample(
     )
 
 
-def power_sentence(n_pooled: int) -> str:
-    """The sentence #427 requires in the report, generated at the pool's ACTUAL n.
+def power_sentence(n: int) -> str:
+    """The sentence #427 requires in the report, generated at the n the MEASUREMENT uses.
 
     Exact wording, pinned by test: "at this n_eff (N effective of M pooled), this review
-    can only see an edge of X points or larger (80% power, one-sided 5%)". The numbers are
+    can only see an edge of X points or larger (80% power, one-sided 5%)". `n` is the
+    counted basis (`stat.n_trades`, wins+losses — a scratch counts toward nothing), the
+    SAME n `significance()` puts its standard error at, so the artifact never carries two
+    different n_eff numbers beside each other. The numbers are
     `throughput.n_eff`/`throughput.detectable_edge` on the real count — n=100 says
     "20.0 points" (the corrected discussion's display), n=12 says "57.6 points", and the
     sentence is constructed into the report, not typed into it.
     """
-    if n_pooled <= 0:
-        raise ValueError("n_pooled must be > 0 -- an empty pool refuses; it never gets a sentence")
-    effective = n_eff(Decimal(n_pooled))
+    if n <= 0:
+        raise ValueError("n must be > 0 -- a pool with nothing counted refuses; no sentence")
+    effective = n_eff(Decimal(n))
     edge_points = (detectable_edge(effective) * Decimal(100)).quantize(Decimal("0.1"))
     return (
-        f"at this n_eff ({effective.quantize(Decimal('0.01'))} effective of {n_pooled} "
+        f"at this n_eff ({effective.quantize(Decimal('0.01'))} effective of {n} "
         f"pooled), this review can only see an edge of {edge_points} points or larger "
         "(80% power, one-sided 5%)"
     )
@@ -417,8 +477,10 @@ def power_sentence(n_pooled: int) -> str:
 class DescriptiveReview:
     """The assembled review: the sample, the measurement, the sentence, or the refusal.
 
-    `refusal` is None exactly when the pool is non-empty; a refused review has no report to
-    render and the driver exits non-zero rather than write a degenerate artifact.
+    `refusal` is None exactly when the pool has at least one COUNTED trade — a non-empty
+    pool whose every trip is a scratch has no win rate and no n to put a power sentence at,
+    so it refuses too; a refused review has no report to render and the driver exits
+    non-zero rather than write a degenerate artifact.
     """
 
     run_date: str
@@ -438,21 +500,24 @@ def descriptive_review(
     event_date: str = EVENT_DATE,
 ) -> DescriptiveReview:
     """Assemble the review — or its refusal — for a pool read on `run_date`."""
-    if sample.n_pooled() == 0:
+    stat = sample.significance()
+    if is_refused(sample):
         refusal = (
-            f"nothing to review: {sample.n_pooled()} pooled forward trades match the "
-            "pre-registered definition",
+            f"nothing to review: {sample.counted()} counted win/loss trades of "
+            f"{sample.n_pooled()} pooled match the pre-registered definition "
+            "(a scratch counts toward nothing)",
             f"excluded as open positions: {sample.excluded_open}; unfilled orders: "
             f"{sample.excluded_unfilled}; stray sells: {sample.stray_sells}",
             f"the {event_date} review REFUSES rather than report a degenerate sample "
-            "(#427: a pool of zero has no win rate, no interval, and no sentence)",
+            "(#427: a pool with nothing counted has no win rate, no interval, and no "
+            "sentence)",
         )
         return DescriptiveReview(
             run_date=run_date,
             event_date=event_date,
             profiles=sample.profiles,
             sample=sample,
-            stat=sample.significance(),
+            stat=stat,
             fee_pct=Decimal(0),
             sentence="",
             refusal=refusal,
@@ -475,17 +540,21 @@ def descriptive_review(
         event_date=event_date,
         profiles=sample.profiles,
         sample=sample,
-        stat=sample.significance(),
+        stat=stat,
         fee_pct=realized_fee_pct(sample.trips),
-        sentence=power_sentence(sample.n_pooled()),
+        sentence=power_sentence(stat.n_trades),
         refusal=None,
         notes=tuple(notes),
     )
 
 
 def is_refused(sample: PooledSample) -> bool:
-    """True when the pool is empty — the review's honest answer to nothing to review."""
-    return sample.n_pooled() == 0
+    """True when the pool has no counted trades — empty, or every trip a scratch.
+
+    The honest answer to nothing to review: a scratch counts toward nothing, so a pool of
+    only scratches has no measurement to render any more than an empty pool does.
+    """
+    return sample.counted() == 0
 
 
 def render_report(review: DescriptiveReview) -> list[str]:
@@ -531,8 +600,9 @@ def render_report(review: DescriptiveReview) -> list[str]:
         "  to a filled SELL of the same profile, product, rule, mode and quantity (FIFO by",
         "  order id), priced with the ledger writer's own formula",
         "  `(exit - entry) * qty - entry fee - exit fee`;",
-        "- deduplicated on (profile, product, quantity, exit fill): a round trip the ledger",
-        f"  already recorded is never counted twice ({sample.deduped} deduped this run);",
+        "- deduplicated on (profile, product, quantity, entry fill, exit fill): a round trip",
+        f"  the ledger already recorded is never counted twice ({sample.deduped} deduped this",
+        "  run), and a deduped twin's both-legs fees ride into the kept ledger row;",
         f"- excluded and counted instead: OPEN positions ({sample.excluded_open}), unfilled",
         f"  or rejected orders ({sample.excluded_unfilled}); a net pnl of exactly zero is a",
         f"  SCRATCH and counts toward nothing ({sample.scratches()});",
@@ -568,14 +638,11 @@ def render_report(review: DescriptiveReview) -> list[str]:
         "## The measurement (descriptive — `keel/research/significance.py` at the fees "
         "actually paid)",
         "",
-        f"- closed trades n={sample.n_pooled()} pooled -> "
-        f"{stat.n_effective.quantize(Decimal('0.01'))} effective "
-        f"(design effect {design_effect()}, #427)",
+        _n_line(sample, stat),
         f"- payoff b={_fmt(stat.payoff_b)} -> break-even win rate {_fmt(stat.break_even)}; "
         f"observed {_fmt(stat.win_rate)} -> edge {_fmt(stat.edge)} ({edge_points} points)",
         f"- 95% one-sided lower bound on the edge: {_fmt(stat.edge_ci_low)}",
-        f"- fees as recorded across the pool: {fee_bp} bp per leg (realized fees over notional "
-        "traded, both legs — the forward trades' regime is measured, not assumed)",
+        _fee_line(sample, fee_bp),
     ]
     if review.notes:
         lines += [f"- note: {note}" for note in review.notes]
@@ -597,6 +664,45 @@ def render_report(review: DescriptiveReview) -> list[str]:
         "(n_eff 101) before any future review is allowed to be confirmatory.",
     ]
     return lines
+
+
+def _n_line(sample: PooledSample, stat: FamilySignificance) -> str:
+    """The raw-n line — n pooled, its counted split when scratches exist, then n_eff.
+
+    `stat.n_effective` is `n_eff(stat.n_trades)` (wins+losses basis), so when the pool has
+    scratches the split is printed WITH a label: the same n the power sentence below is
+    generated at, never a second, disagreeing n_eff beside it.
+    """
+    line = f"- closed trades n={sample.n_pooled()} pooled"
+    if sample.scratches():
+        line += (
+            f" ({stat.n_trades} win/loss + {sample.scratches()} scratch counting toward nothing)"
+        )
+    return (
+        f"{line} -> {stat.n_effective.quantize(Decimal('0.01'))} effective "
+        f"(design effect {design_effect()}, #427)"
+    )
+
+
+def _fee_line(sample: PooledSample, fee_bp: Decimal) -> str:
+    """The measured-fee line — per leg when every trip knows both legs, a lower bound else.
+
+    A pure ledger row's `fees` is the exit order's fee only (the entry fee is folded into
+    `pnl_net` and stored nowhere), so when any such trip is in the pool the line says LOWER
+    bound and why, rather than letting the exit-leg figure pose as the both-legs one.
+    """
+    exit_leg_only = sum(1 for t in sample.trips if not t.fees_both_legs)
+    if not exit_leg_only:
+        return (
+            f"- fees as recorded across the pool: {fee_bp} bp per leg (realized fees over "
+            "notional traded, both legs — the forward trades' regime is measured, not assumed)"
+        )
+    return (
+        f"- fees as recorded across the pool: at least {fee_bp} bp per leg — a LOWER bound: "
+        f"{exit_leg_only} of {sample.n_pooled()} pooled trip(s) are ledger rows whose recorded "
+        "fee is the exit leg only (the entry fee is folded into pnl_net and not stored), so "
+        "the true both-legs figure is higher than this; the regime is measured, not assumed"
+    )
 
 
 def _fmt(value: Decimal) -> str:

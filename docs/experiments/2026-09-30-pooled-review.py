@@ -22,9 +22,13 @@ cannot be written imprecisely: the sentence is constructed into the artifact, ne
    Override with repeatable `--db PATH`; every listed profile MUST be reachable read-only
    — a silently smaller pool than pre-registered would change the review without saying so.
 2. **A pooled trade is ONE closed forward round trip, win/loss resolved.** Two records of
-   it, deduplicated on (profile, product, quantity, exit fill):
+   it, deduplicated on (profile, product, quantity, entry fill, exit fill):
    - a `trade_outcomes` row — the authoritative closed-trade ledger rails 11/16 read, its
-     `pnl_net` carried VERBATIM (realized, net of fees, written by `streak.py`);
+     `pnl_net` carried VERBATIM (realized, net of fees, written by `streak.py`). Its
+     `fees` column is the EXIT order's fee only (the entry fee is folded into `pnl_net`
+     and stored nowhere), so when the row's orders twin is deduped away the twin's
+     both-legs fees ride into the kept trip, and a ledger row with no twin renders its
+     fee as the labelled lower bound it is;
    - where the ledger has none, a filled BUY matched to a filled SELL of the same profile,
      product, rule, mode and quantity, FIFO by order id, priced with the ledger writer's
      own formula `(exit - entry) * qty - entry fee - exit fee`.
@@ -36,18 +40,25 @@ cannot be written imprecisely: the sentence is constructed into the artifact, ne
    rows: break-even `1/(1+b)` from the payoff of the SAME trades, one-sided 5%, the
    standard error on `throughput.n_eff` at the ACTUAL n, and the fee fraction MEASURED off
    the pool (fees paid over notional traded) rather than assumed — the forward trades'
-   regime is an outcome.
+   regime is an outcome. The n is the COUNTED one (wins+losses; a scratch counts toward
+   nothing), and the power sentence is generated at that same n so the artifact carries
+   one n_eff basis, never two.
 5. **No pass/fail verdict on the edge.** The report renders the measurements but none of
    the significance machinery's verdict vocabulary; the only verdict-shaped statement is
    about POWER (the sentence). The owner's floor decision (n=100 descriptive vs
    `min_trades` 259+ confirmatory) stays with the owner — the report says so.
-6. **Refusal.** Zero pooled trades refuses ("nothing to review"), writes only a refusal
-   JSONL row, and exits 2 — never a degenerate report.
+6. **Refusal.** Zero counted trades refuses ("nothing to review" — an empty pool, or a
+   pool whose every trip is a scratch), writes only a refusal JSONL row, and exits 2 —
+   never a degenerate report. A db that cannot be read as pre-registered (not reachable
+   read-only, a missing `orders`/`trade_outcomes` table, a 'filled' order row with no
+   fill/fee) refuses the same way, with a named reason — never a traceback.
 
 ## Provenance and safety
 - READ-ONLY against every db: `sqlite3.connect(f"file:{db}?mode=ro", uri=True)`. The only
-  writes are the `--out` markdown report and the `--jsonl` row (one row per run; re-running
-  truncates and rewrites both).
+  writes are the `--out` markdown report and the `--jsonl` row (one row per run; a
+  non-refused re-run truncates and rewrites both). A REFUSED run rewrites only the JSONL
+  (its refusal row is the record of record): a markdown report from an earlier run is
+  left in place, STALE — read the JSONL, and delete the stale markdown by hand.
 - A run before 2026-09-30 labels itself a PREVIEW and states that the event re-runs on
   2026-09-30 (#353) under this same pre-registration — the pool reported is what exists
   on the run date, honestly, whatever its size.
@@ -67,6 +78,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from keel.research.pooled_review import (
@@ -84,9 +96,9 @@ from keel.research.pooled_review import (
 from keel.research.throughput import design_effect
 
 DEFAULT_DBS = (
-    "/Users/elmehdiaitbrahim/keel/keel.db",
-    "/Users/elmehdiaitbrahim/keel/keel-live.db",
-    "/Users/elmehdiaitbrahim/keel/keel-paperhourly.db",
+    str(Path.home() / "keel" / "keel.db"),
+    str(Path.home() / "keel" / "keel-live.db"),
+    str(Path.home() / "keel" / "keel-paperhourly.db"),
 )
 DEFAULT_OUT = "docs/experiments/2026-09-30-pooled-review.md"
 DEFAULT_JSONL = "docs/experiments/2026-09-30-pooled-review.jsonl"
@@ -262,9 +274,17 @@ def main() -> None:
 
     per_profile: list[tuple[str, OrdersRead, list[LedgerRow]]] = []
     for db in dbs:
-        orders, rule_kinds = read_orders(db)
-        read = round_trips_from_orders(db, orders, rule_kinds)
-        ledger = read_ledger(db)
+        try:
+            orders, rule_kinds = read_orders(db)
+            read = round_trips_from_orders(db, orders, rule_kinds)
+            ledger = read_ledger(db)
+        except (ValueError, sqlite3.Error) as exc:
+            # A db that cannot be read as pre-registered -- a missing orders/rules/
+            # trade_outcomes table, or a 'filled' order row carrying no fill/fee -- refuses
+            # with a named reason on the exit-2 path, never a traceback: the review never
+            # silently shrinks the pool and never crashes on a deployment's bad rows.
+            print(f"REFUSED: {db} cannot be read as pre-registered: {exc}", file=sys.stderr)
+            sys.exit(2)
         per_profile.append((db, read, ledger))
         print(
             f"{db}: {len(orders)} orders -> {len(read.trips)} closed round trips "
