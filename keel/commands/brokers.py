@@ -80,6 +80,10 @@ class BrokerInfo:
     #: Whether the venue CLOSES (`capabilities().session_bound`): session-bound
     #: venues render with a market clock; the rest are 24/7.
     session_bound: bool
+    #: Whether the adapter spends settled cash only (`capabilities().cash_only`, #372)
+    #: -- the declared funding posture. Every first-party adapter declares True; a False
+    #: row would be an adapter announcing a borrowing path the engine can refuse at load.
+    cash_only: bool
     quote_currencies: tuple[str, ...]
     asset_classes: tuple[str, ...]
     supported_orders: tuple[str, ...]
@@ -173,6 +177,7 @@ def list_installed_brokers() -> list[BrokerInfo]:
                     venue=capabilities.venue,
                     deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
                     session_bound=bool(capabilities.session_bound),
+                    cash_only=bool(capabilities.cash_only),
                     quote_currencies=tuple(sorted(capabilities.quote_currencies)),
                     asset_classes=tuple(sorted(capabilities.asset_classes)),
                     supported_orders=tuple(sorted(capabilities.supported_orders)),
@@ -193,6 +198,7 @@ def list_installed_brokers() -> list[BrokerInfo]:
                     venue="",
                     deployment=WIRED if name in WIRED_FOR_DEPLOYMENT else OPTIONAL,
                     session_bound=False,
+                    cash_only=False,
                     quote_currencies=(),
                     asset_classes=(),
                     supported_orders=(),
@@ -221,9 +227,11 @@ def capability_facts(info: BrokerInfo) -> str:
     """The row's capability facts as one " · "-joined phrase -- the SHARED wording the CLI
     prints and the Venues browser wraps, so the two front-ends cannot drift. PURE."""
     hours = "session-bound (opens and closes)" if info.session_bound else "24/7"
+    funding = "cash only" if info.cash_only else "MARGIN-CAPABLE"
     facts = [
         info.deployment,
         hours,
+        funding,
         f"quotes {'/'.join(info.quote_currencies)}",
         f"asset classes {'/'.join(info.asset_classes)}",
         f"preview {info.preview}",

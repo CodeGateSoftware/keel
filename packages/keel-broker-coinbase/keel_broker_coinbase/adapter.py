@@ -53,6 +53,9 @@ _CAPABILITIES = BrokerCapabilities(
     quote_currencies=frozenset({"USD", "USDC"}),
     asset_classes=frozenset({"spot"}),
     session_bound=False,
+    # #372: this adapter spends spot balances only -- the Coinbase surface it speaks has
+    # no borrowing path to declare.
+    cash_only=True,
 )
 
 

@@ -130,6 +130,11 @@ _CAPABILITIES = BrokerCapabilities(
     # declaring session awareness for a market this adapter cannot trade would be a comment,
     # not a capability.
     session_bound=False,
+    # #372: the crypto api this adapter speaks has no margin leg. (Robinhood the broker's
+    # Instant/Gold settlement features are margin-shaped, and a future equities adapter
+    # there would have to answer this question for THAT surface -- cash_only=False would
+    # then be the loud declaration the engine refuses, not a silent default.)
+    cash_only=True,
 )
 
 #: Every `Granularity` the port defines, refused with the same reason. Kept as a single message

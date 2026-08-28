@@ -145,6 +145,22 @@ class BrokerConformanceTests:
         """
         assert isinstance(self.broker().capabilities().session_bound, bool)
 
+    # --- funding posture (#372, PRD §5 "Cash-account discipline") ----------------------------
+
+    def test_cash_only_is_declared(self) -> None:
+        """Every adapter states whether it can borrow (#372).
+
+        The field is `bool`-typed and required, so what this holds in place is the
+        declaration itself: an adapter author cannot leave the borrowing question
+        unanswered and let silence read as the cash posture. The suite pins the
+        DECLARATION, not the answer -- a hypothetical margin-capable adapter declares
+        `False` honestly, and refusing that posture is the engine's load-time
+        reconciliation to make when a first consumer exists. (Every first-party adapter
+        declares `True`; the uniformity is pinned in `tests/commands/test_brokers.py`,
+        which sees all installed adapters at once, where this per-adapter suite cannot.)
+        """
+        assert isinstance(self.broker().capabilities().cash_only, bool)
+
     def test_market_clock_answers_the_port_type(self) -> None:
         """The clock crosses the port as a `SessionState`, never a venue-native shape.
 

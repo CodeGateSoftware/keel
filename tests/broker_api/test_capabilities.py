@@ -22,6 +22,7 @@ def _caps(**overrides: object) -> BrokerCapabilities:
         quote_currencies=frozenset({"USD"}),
         asset_classes=frozenset({"spot"}),
         session_bound=False,
+        cash_only=True,
     )
     base.update(overrides)
     return BrokerCapabilities(**base)  # type: ignore[arg-type]

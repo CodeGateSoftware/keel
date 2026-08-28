@@ -206,6 +206,7 @@ def _capabilities() -> SimpleNamespace:
     return SimpleNamespace(
         venue="ok-venue",
         session_bound=False,
+        cash_only=True,
         quote_currencies=("USD",),
         asset_classes=("spot",),
         supported_orders=("market",),

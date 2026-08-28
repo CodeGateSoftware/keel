@@ -60,6 +60,8 @@ _CAPABILITIES = BrokerCapabilities(
     quote_currencies=frozenset(),
     asset_classes=frozenset({"spot"}),
     session_bound=False,
+    # #372: spot-only surface; Kraken's extend-volume/margin endpoints are not spoken.
+    cash_only=True,
 )
 
 
