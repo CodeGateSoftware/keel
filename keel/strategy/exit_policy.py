@@ -1,34 +1,41 @@
-"""The per-family, ratchet-only stop-management policy for held positions (#442).
+"""The per-family, ratchet-only stop-management policy for held positions (#442; live wiring
+#502).
 
-`execution/executor.py` implements three exit primitives -- `trail_stop_atr`,
-`roll_to_break_even`, `scale_out` -- that have ZERO callers on the live path: live exits
-ride ONE native Coinbase trigger-bracket placed at entry (the exchange owns the
-stop-vs-target race), the broker port has no bracket/OCO order kind to express a
-cancel-and-replace through, and the agent cycle has no per-bar stop-management step at
-all. That live wiring is split out to issue #502; it is NOT this module's concern.
+`execution/executor.py` implements the exit primitives -- `trail_stop_atr`,
+`roll_to_break_even`, `roll_stop_to`, `scale_out`. The first three have a live caller since
+#502 stage 2: `agent.run_once`'s per-cycle stop-management step applies the policy computed
+HERE (`policy_for` + `next_stop`) to each held tranche whose owning rule carries the knobs,
+then rolls the resting exchange-side bracket through the executor's single-roll protocol.
+Live management is DEFAULT OFF exactly like the sim wiring -- a rule whose params carry
+neither knob gets `EXIT_POLICY_OFF` and nothing ever moves its stop (#442 measured trailing
+WORSE and the break-even roll no better than the static exit at the 120 bp fee, so the
+operator opts in per rule). `scale_out` remains without a live caller, pinned by its tripwire
+test until its two prerequisites (bracket resize, `trade_outcomes` for a partial exit) exist.
 
-What this module IS: the exit POLICY those live primitives encode -- an ATR-multiple
-trailing stop and a break-even roll, both strictly ratchet-only (a stop may move toward
-profit, never away from it) -- expressed as pure functions the engines that DO drive
-exits per bar can apply:
+What this module IS: the exit POLICY itself -- an ATR-multiple trailing stop and a
+break-even roll, both strictly ratchet-only (a stop may move toward profit, never away from
+it) -- expressed as pure functions every engine that drives exits applies the same way:
 
-- `strategy.backtest.backtest` (the single-rule, production-faithful backtester), and
-- `sim.portfolio_sim._process_held` (the account simulator's exit resolution).
+- `strategy.backtest.backtest` (the single-rule, production-faithful backtester),
+- `sim.portfolio_sim._process_held` (the account simulator's exit resolution), and
+- `agent._manage_stops` (the live per-cycle step, #502 stage 2).
 
-Both engines apply it with the SAME sequencing, which is the no-lookahead contract:
+All three apply it with the SAME sequencing, which is the no-lookahead contract:
 
 1. touch checks for a bar run against the stop level carried INTO that bar (the level
    management produced from COMPLETED prior bars -- live, the bracket rests at the old
    level until a management cycle replaces it, and this mirrors that exactly);
 2. only if the position survives the bar does `next_stop` run, on that bar's own
-   high/close and an ATR over a window ending at that bar.
+   high/close and an ATR over a window ending at that bar. The live step reads the latest
+   COMPLETED bar on the rule's trading timeframe (`market_feed.poll_once` stores closed
+   candles only), which is this same rule at cycle cadence.
 
 **Where the policy lives (design decision).** The knobs are per-rule-family constructor
 params (`trail_atr_mult`, `be_roll_rr`, mirroring the existing `atr_mult`-style naming),
 NOT a global config block: exit behavior is a property of a rule family in the same way
 `stop_method` is, and a global knob could not express "turtle does not trail". A rule
 whose `params` carry neither knob gets `EXIT_POLICY_OFF` and trades exactly as before
-the wiring existed -- pinned by tests on both engines.
+the wiring existed -- pinned by tests on both engines and on the live step.
 
 **Why turtle is deliberately not offered the knobs** (#442 hypothesis 3, confirmed):
 `turtle_breakout`'s real exit is the asymmetric Donchian channel (`exit_signal`), with
@@ -41,7 +48,8 @@ rule's own PARAM_DOCS/module docstring say so.
 compares a proposed protective stop against the last recorded one and vetoes any
 strictly lower proposal. `next_stop` starts from the current stop and only ever takes
 maxima, so it can never emit a wider stop -- the sim-side twin of
-`tests/execution/test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`.
+`tests/execution/test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`,
+and the property the live step inherits by computing its level HERE.
 """
 
 from __future__ import annotations

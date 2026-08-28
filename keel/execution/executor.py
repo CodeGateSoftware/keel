@@ -33,35 +33,35 @@ committed a 1x position 2x, since both legs carried the full qty. The native bra
 both problems by construction. It still runs through `guards.check` like any other order
 (un-overridable); a vetoed bracket is simply never placed and `place_bracket` returns `None`.
 
-**Stop management -- IMPLEMENTED, TESTED, AND NOT CALLED ON THE LIVE PATH (#442; be not
-misled).** `roll_to_break_even` / `trail_stop_atr` cancel the existing protective stop leg
-and replace it at a new price, never widening it: both delegate to `_roll_stop`, which
-refuses (returns `None`, leaving the existing stop in force) if the proposed new stop is
-below the last-recorded `open_stop:<product_id>` -- the same "only ratchet toward profit"
-invariant rail 9 enforces on entries, applied directly here since the replacement order's
-own `guards.check` call (still mandatory) can't reuse rail 9 as-is: rail 9 is paired with
-the min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has
-no separate entry price of its own. `scale_out` closes part of a position (a rule-driven
-partial profit-take) through the same guard+preview+place+log pipeline as a plain SELL leg.
-NONE of the three has a live caller: nothing in the agent cycle manages a stop after
-placement (`agent._handle_exits` executes rule EXIT signals only), so reading this module
-alone OVERSTATES what keel does -- live, a position's exits are exactly the entry-time
-bracket above and a rule EXIT signal, nothing that ratchets. Why unwired, established in
-#442: (1) ratchet-only is rail-9-safe BY CONSTRUCTION (`_roll_stop` refuses a widening
-proposal before `guards.check` ever runs; pinned by `tests/execution/
-test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`); (2) live wiring needs
-a cancel-and-replace of the native bracket, and that policy -- amending a live protective
-order versus cancelling and re-placing it -- is unsettled, so live stop management is split
-out to issue #502 rather than solved here (the bracket itself has been an `OrderSpec`
-(`BracketGTC`) since #569, reaching the venue through `place_order` like every other order,
-so the port is no longer the blocker); (3) the exit POLICY those primitives encode (the same
-ratchet-only ATR trail and break-even roll) IS wired where exits are driven per bar: the
-sim/backtest engines, via `strategy/exit_policy.py` and the per-family `trail_atr_mult` /
-`be_roll_rr` params on `pullback_continuation` and `rsi_meanrev`. `turtle_breakout`
-deliberately carries neither knob -- its real exit is the Donchian channel, and a trail
-would cut the long winners the system exists to let run. `scale_out` stays unwired until
-#502 also covers its two pinned prerequisites (bracket resize for a partial SELL, and a
-`trade_outcomes` row so rail 16 does not count a scaled-out winner as a loss).
+**Stop management -- wired on the live cycle, DEFAULT OFF per rule (#442 wired the policy;
+#502 stage 2 wired the live step; the port migration that once blocked this is DONE -- the
+bracket has been an `OrderSpec` (`BracketGTC`) since #569, reaching the venue through
+`place_order` like every other order, and the port flip finished in #582).**
+`roll_to_break_even` / `trail_stop_atr` cancel the existing protective bracket and replace
+it at a new price, never widening it: both delegate to `_roll_stop`, which refuses (returns
+`None`, leaving the existing stop in force) if the proposed new stop is below the
+last-recorded `open_stop:<product_id>` -- the same "only ratchet toward profit" invariant
+rail 9 enforces on entries, applied directly here since the replacement order's own
+`guards.check` call (still mandatory) can't reuse rail 9 as-is: rail 9 is paired with the
+min-move/anti-scalping rail, which has no meaning for a stop-replacement order that has no
+separate entry price of its own. Ratchet-only is rail-9-safe BY CONSTRUCTION (`_roll_stop`
+refuses a widening proposal before `guards.check` ever runs; pinned by
+`tests/execution/test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`).
+`roll_stop_to` is the general single-roll form the agent's per-cycle step drives (see its
+docstring for why one roll, not one per arm). The live caller is `agent.run_once`'s
+stop-management step (#502): per held tranche whose owning rule carries `trail_atr_mult` /
+`be_roll_rr` (the `pullback_continuation` / `rsi_meanrev` knobs), it applies the same
+`strategy/exit_policy` the sim/backtest engines apply and rolls the resting bracket to the
+ratcheted level. A rule whose params carry NEITHER knob is never managed -- the #442
+experiment (docs/experiments/2026-08-22-trailing-vs-static-exits.md) measured trailing
+WORSE and the break-even roll no better than the static exit at the 120 bp fee, so the
+capability ships and the operator opts in per rule; `turtle_breakout` deliberately offers
+neither knob (its real exit is the Donchian channel, and a trail would cut the long winners
+the system exists to let run). `scale_out` is the one primitive still WITHOUT a live
+caller: it stays unwired (pinned by
+`tests/execution/test_executor.py::test_scale_out_has_no_production_caller`) until its two
+prerequisites are built -- bracket resize for a partial SELL, and a `trade_outcomes` row so
+rail 16 does not count a scaled-out winner as a loss.
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
 available balance of the PRODUCT's quote leg from `broker.get_balances()` and hands
@@ -836,11 +836,12 @@ def _record_observed_fill_quantity(
     the exit-side over-booking is #502's to flag. The observation itself is recorded for
     BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
 
-    DELIBERATELY detect-and-surface only. Resizing the bracket means either amending a live
-    native trigger-bracket or cancel-and-replace, and the resize policy is #502's to settle.
-    Auto-cancelling a protective order on the strength of a snapshot that may still be
-    settling is a wrong auto-action on live money; a loud warning is the safe half, and it is
-    what this does.
+    DELIBERATELY detect-and-surface only. The port migration is done and the replacement
+    itself is expressible (`BracketGTC` since #569; `_roll_stop` cancels-and-replaces
+    through `place_order`); what does not exist yet is the RESIZE policy (a roll re-places
+    the SAME size). Auto-cancelling a protective order on the strength of a snapshot that
+    may still be settling is a wrong auto-action on live money; a loud warning is the safe
+    half, and the automated resize policy remains #502's open half (with `scale_out`).
     """
     filled = observed.filled_size
     if not filled or filled <= 0:
@@ -1690,6 +1691,13 @@ def _roll_stop(
     entries. The replacement order still runs through `guards.check` (allowlist/caps/kill-switch/
     etc. -- every order, no exceptions) before it is placed.
 
+    **The kill-switch window inside a roll.** A cancel is not rail-gated -- it REMOVES risk, and
+    there is nothing for a guard to veto -- so a kill switch that engages mid-roll, AFTER the
+    cancel, fails only the REPLACEMENT: rail 12 fails every order closed and the position is left
+    unbracketed until the switch clears. Never trading against a thrown switch is the correct
+    failure direction, but the window must be understood, not discovered: the CRITICAL below is
+    loud, and `reconcile_unbracketed_positions` heals from the crash ledger when cycles resume.
+
     **The cancel-then-place window is not atomic and cannot be made so** (see the comment at the
     cancel below). What it CAN be is recoverable: an `unbracketed:<product_id>` record is written
     before the venue is touched and cleared only once the replacement rests, so a process that
@@ -1726,9 +1734,11 @@ def _roll_stop(
     # up with the target describes two exits racing at the same level, where whichever side the
     # venue evaluates first decides whether this position took a profit or a loss.
     # `keel_broker_api.orders.BracketGTC` refuses exactly this shape at construction -- "a coin
-    # flip wearing a protective order's name" -- but the live path does not build one of those
-    # yet (#502 stage 2 is blocked on #524's port migration), so nothing between the ratchet and
-    # Coinbase has been checking it.
+    # flip wearing a protective order's name" -- and the spec built below IS one of those
+    # (#524/#569: every order this module places is a port value now), so the construction check
+    # itself is one line behind this guard. #560 added this earlier, explicit refusal for the
+    # same hazard because it predates the spec-shaped live path; it stays because it refuses
+    # BEFORE the cancel, leaving the existing bracket in force.
     #
     # Reachable rather than theoretical: `trail_stop_atr` computes `price - atr * multiplier` and
     # the live agent cycles ONCE A DAY, so a gap through the target that has not yet been
@@ -1844,6 +1854,18 @@ def _roll_stop(
     # `place_bracket`'s own success path; leaving it would have the sweep re-place a bracket that
     # already exists on the next cycle.
     repo.set_state(f"{UNBRACKETED_PREFIX}{product_id}", None)
+    # Repoint the owning tranche at the replacement (#502). `get_position_for_bracket` is the
+    # ONE linkage direction reconciliation has: it resolves a bracket FILL back to the trade it
+    # closed. Until rolls were reachable this link could not go stale here -- `place_bracket`
+    # and the sweep's re-place both set it -- but a roll that cancels the bracket a tranche
+    # names and leaves the name behind orphans the replacement: when it eventually fills, the
+    # fill resolves to no tranche, its `trade_outcomes` row is dropped, and rail 16 miscounts a
+    # managed winner as nothing at all. `None` (no tranche names the old order -- e.g. a tranche
+    # predating the ledger) is skipped silently: the roll is still correct, only the attribution
+    # is absent, exactly as it was before the ledger existed.
+    position = repo.get_position_for_bracket(old_stop_order_id)
+    if position is not None:
+        repo.set_position_bracket(position["id"], result.order_id)
     log_event(
         logger,
         logging.INFO,
@@ -1854,6 +1876,37 @@ def _roll_stop(
         order_id=result.order_id,
     )
     return result.order_id
+
+
+def roll_stop_to(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    product_id: str,
+    old_stop_order_id: int,
+    new_stop: Decimal,
+    qty: Decimal,
+    rule_name: str,
+    now_ts: int,
+) -> int | None:
+    """Roll the protective bracket's stop to `new_stop` -- the GENERAL, single-roll entry point.
+
+    `roll_to_break_even` and `trail_stop_atr` are the two named special cases (a level derived
+    from the entry, a level derived from an ATR multiple), and each performs its own full
+    cancel-and-replace. A rule carrying BOTH exit knobs can win on both in one cycle, and
+    calling the two named primitives back-to-back would walk #519's cancel-before-place window
+    TWICE against the same position for no benefit. The caller that faces that case --
+    `agent.run_once`'s live stop-management step (#502) -- therefore computes ONE ratcheted
+    level (`strategy.exit_policy.next_stop`, the max over the arms, the same function the
+    sim/backtest engines apply) and hands it here, so exactly one replacement is placed.
+
+    Every `_roll_stop` guarantee applies unchanged: refusal on widening, refusal at/above the
+    target, the crash ledger before the venue is touched, cancel before place, and the
+    tranche-bracket repoint on success. `None` means the existing bracket stays in force.
+    """
+    return _roll_stop(
+        broker, repo, config, product_id, old_stop_order_id, new_stop, qty, rule_name, now_ts
+    )
 
 
 def roll_to_break_even(

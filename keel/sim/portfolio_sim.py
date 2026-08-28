@@ -54,8 +54,8 @@ evaluation.
   through the stop exits at its OPEN (`strategy.backtest._stop_exit_price`, the shared
   convention). A rule without the knobs trades exactly as before the wiring existed --
   identity pinned by the unit-identity tests plus the unchanged pre-existing suite with the
-  wiring live. This is the sim-side expression of the live `executor` stop-management
-  primitives, which themselves stay uncalled on the live path (port-blocked, issue #502).
+  wiring live. This is the sim-side expression of the `executor` stop-management primitives,
+  which the live cycle drives too since #502 stage 2 (`agent._manage_stops`, default off).
 
 **No lookahead:** the per-bar `candles_by_tf` window handed to `Rule.detect`/`exit_signal` and to
 `engine.evaluate` only ever contains candles with `ts <= t` (the current bar). The one deliberate

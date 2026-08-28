@@ -71,6 +71,10 @@ class FakeBroker:
         self.get_candles_calls: list[tuple[str, Granularity, int, int]] = []
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
+        self.cancel_calls: list[str] = []
+        # Ordered exchange interactions (place/cancel), so a test can assert SEQUENCE -- the
+        # stop-management step (#502) must cancel a bracket before placing its replacement.
+        self.events: list[str] = []
         self._order_seq = 0
         # The previewed fee, overridable by a subclass that means to test fee splitting.
         self.commission = Decimal("0")
@@ -108,9 +112,12 @@ class FakeBroker:
     def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         self._order_seq += 1
         self.place_calls.append({"product_id": spec.product_id, "side": spec.side})
+        self.events.append("place")
         return PlaceResult(success=True, broker_order_id=f"broker-order-{self._order_seq}")
 
     def cancel_order(self, order_id: str) -> bool:
+        self.cancel_calls.append(order_id)
+        self.events.append("cancel")
         return True  # a CONFIRMED cancel -- see `_cancel_at_exchange`
 
 
@@ -150,6 +157,16 @@ def _register_fake_rules():
     yield
     del agent.RULE_REGISTRY["fake_exit"]
     del agent.RULE_REGISTRY["fake_no_exit"]
+
+
+@pytest.fixture(autouse=True)
+def _reset_warmup_notice():
+    """Start every test with a clean per-product warmup-notice set: the notice is once per
+    product PER PROCESS (`agent._WARMUP_LOGGED_PRODUCTS`), so without a reset an earlier
+    test's notice would suppress the one a later test asserts on."""
+    agent._WARMUP_LOGGED_PRODUCTS.clear()
+    yield
+    agent._WARMUP_LOGGED_PRODUCTS.clear()
 
 
 # -- fixtures / builders --------------------------------------------------------------------
@@ -1628,6 +1645,613 @@ def test_run_once_brackets_a_tranche_whose_bracket_was_never_placed(repo: Reposi
         "run_once left a held tranche with no bracket -- the sweep is not on the cycle path"
     )
     assert repo.get_state(f"unbracketed:{PRODUCT}") is None
+
+
+# -- live stop management (#502 stage 2): the per-cycle step, default off --------------------
+#
+# The state these tests seed is what a real entry leaves behind: held inventory in the orders
+# audit log, ONE resting exchange-side bracket, the `open_stop:`/`open_target:` pair
+# `place_bracket` records, and a `positions` tranche naming the bracket and carrying the
+# ORIGINAL setup stop (`initial_stop`, #520) the break-even threshold is measured from.
+
+
+def _seed_bracketed_tranche(
+    repo: Repository,
+    *,
+    rule_name: str = "pullback_continuation",
+    product: str = PRODUCT,
+    bracket_ref: str = "cb-bracket-1",
+    entry: Decimal = Decimal("50000"),
+    initial_stop: Decimal | None = Decimal("49000"),
+    qty: Decimal = Decimal("0.01"),
+    target: Decimal = Decimal("55000"),
+    ts: int = 1_000,
+) -> int:
+    """Held inventory + a resting bracket + the tranche row that owns it. Returns the bracket's
+    order id. `initial_stop=None` seeds the pre-#520 TRANCHE shape the ledger documents as "BE
+    arm disabled", not "zero" -- while the resting bracket's own stop (`open_stop:` state and
+    the order row's `expected_fill`) stays a real number, because it always is: the bracket
+    exists, so it rests at some level. `bracket_ref` is the broker-side order id the cancel
+    path reads out of `raw_response` -- distinct per product so a multi-product test can tell
+    whose cancel was whose."""
+    stop = initial_stop if initial_stop is not None else Decimal("49000")
+    _seed_open_position(repo, product, qty, entry, ts=ts)
+    bracket_id = repo.insert_order(
+        dict(
+            mode="live",
+            product_id=product,
+            side=Side.SELL.value,
+            order_type="market",
+            qty=qty,
+            limit_price=None,
+            status="pending",
+            fee=None,
+            expected_fill=stop,
+            actual_fill=None,
+            raw_response=f'{{"order_id": "{bracket_ref}"}}',
+            created_at=ts,
+            updated_at=ts,
+        )
+    )
+    repo.set_state(f"position_rule:{product}", {"rule_name": rule_name, "opened_at": ts})
+    repo.open_position(
+        product_id=product,
+        rule_name=rule_name,
+        opened_at=ts,
+        qty=qty,
+        entry_fill=entry,
+        entry_fee=Decimal("0"),
+        initial_stop=initial_stop,
+        bracket_order_id=bracket_id,
+    )
+    repo.set_state(f"open_stop:{product}", stop)
+    repo.set_state(f"open_target:{product}", target)
+    return bracket_id
+
+
+def _ranged_candle(ts: int, low: Decimal, high: Decimal, close: Decimal, open_: Decimal) -> Candle:
+    return Candle(ts=ts, open=open_, high=high, low=low, close=close, volume=Decimal("1"))
+
+
+#: Bar timestamps are exact multiples of ONE_DAY and `now` sits one full period past the last
+#: bar, so the whole series is CLOSED and STORED by `market_feed.poll_once` and the product is
+#: FRESH by `is_fresh`'s own arithmetic (age = one bar + 1,000s < 3 cycles at interval 50,000).
+#: The pre-existing `1_000 + i * 86_400` pattern leaves bars OFF the day grid, the last stored
+#: bar a full period older, and the product STALE -- which skips the step for a reason these
+#: tests are not about.
+def _bar_ts(i: int) -> int:
+    return (i + 1) * 86_400
+
+
+def _management_now_ts(n_bars: int = 30) -> int:
+    return (n_bars + 1) * 86_400 + 1_000
+
+
+def _rising_series(
+    n: int = 30, base: Decimal = Decimal("50000"), step: Decimal = Decimal("100")
+) -> list[Candle]:
+    """A steady climb with a real high/low range, so Wilder ATR is non-zero and the trail arm
+    has something to trail. Bar i: closes at `base + i*step`, +/-60 around it."""
+    return [
+        _ranged_candle(
+            _bar_ts(i),
+            low=base + i * step - Decimal("60"),
+            high=base + i * step + Decimal("60"),
+            close=base + i * step,
+            open_=base + (i - 1) * step if i else base,
+        )
+        for i in range(n)
+    ]
+
+
+def _seed_history(repo: Repository, series: list[Candle], product: str = PRODUCT) -> None:
+    """Pre-store the series in the candles table. `market_feed.poll_once` cold-starts an EMPTY
+    table with only the newest closed bar (its catch-up start is `latest_closed`), so a test
+    that means "a deployment with ATR history" must seed the table itself -- the cycle's poll
+    then finds the tail current and stores nothing new."""
+    repo.upsert_candles(product, Granularity.ONE_DAY, series)
+
+
+def test_run_once_leaves_stops_alone_when_the_rule_carries_no_exit_knobs(repo: Repository) -> None:
+    """THE DEFAULTS-OFF PIN. A rule whose params carry neither `trail_atr_mult` nor `be_roll_rr`
+    gets `EXIT_POLICY_OFF` (see `strategy.exit_policy.policy_for`), and the management step
+    must leave its position byte-for-byte as the pre-#502 cycle did: no roll attempt (no
+    cancel at the broker), the resting bracket untouched, the recorded levels unchanged. This
+    is every rule row in existence today unless an operator opts a rule in."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    series = _rising_series()
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+
+    assert "cancel" not in broker.events, "a knob-less rule had its bracket rolled"
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_state(f"open_target:{PRODUCT}") == Decimal("55000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+    tranche = repo.get_open_positions(PRODUCT)[0]
+    assert tranche["bracket_order_id"] == bracket_id
+
+
+def test_run_once_trails_a_ratcheting_stop_through_the_broker(repo: Repository) -> None:
+    """OPTED IN (`trail_atr_mult`), the cycle manages the held position's bracket with the SAME
+    policy the sim/backtest engines apply: `next_stop` on the latest COMPLETED bar (poll stores
+    closed candles only), then ONE roll -- #519's cancel-before-place protocol -- so the venue's
+    bracket ratchets with the climb. The expected level is computed here with the policy's own
+    functions: the live step's contract is fidelity to `strategy.exit_policy`, not a re-derived
+    trail of its own.
+
+    57 bars is the young-table warmup threshold (`4 x 14 + 1`, the default ATR period) -- the
+    threshold side of the boundary `test_the_trail_arm_waits_for_a_warm_candle_table` pins
+    from below."""
+    from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
+
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    # A 57-bar climb trails to ~55.4k, past the default 55k target -- the at/above-target
+    # refusal (a stop that has caught the target is a coin flip) would veto the roll these
+    # tests exist to observe, so the fixture's target sits above the trail's reach.
+    bracket_id = _seed_bracketed_tranche(repo, target=Decimal("60000"))
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    policy = policy_for(_build_rule(repo.get_rules("live")[0]))
+    expected = next_stop(
+        policy,
+        Decimal("50000"),
+        Decimal("49000"),
+        Decimal("49000"),
+        series[-1],
+        trailing_atr(series, policy.atr_period),
+    )
+    assert expected > Decimal("49000"), "the fixture must climb far enough to trail"
+    assert repo.get_state(f"open_stop:{PRODUCT}") == expected
+    # The #519 protocol through the cycle: the roll cancels the old bracket, then places.
+    assert broker.events[-2:] == ["cancel", "place"], broker.events
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    replacement_id = repo.get_open_positions(PRODUCT)[0]["bracket_order_id"]
+    assert replacement_id is not None and replacement_id != bracket_id
+    assert repo.get_order(replacement_id)["status"] == "pending"
+    assert repo.get_state(f"open_target:{PRODUCT}") == Decimal("60000")
+
+
+def test_the_live_trail_never_widens_the_stop(repo: Repository) -> None:
+    """Rail 9's invariant on the live path: a falling cycle proposes a trail BELOW the recorded
+    stop, and the step must not roll at all -- the existing bracket stays resting, the recorded
+    stop unmoved. `next_stop` is ratchet-only by construction; this pins that the LIVE step
+    inherits it (it only rolls when the level strictly improves). 57 bars so the trail arm is
+    PAST warmup and genuinely proposing -- a no-roll here is the ratchet refusing, not the
+    warmup gate muting the arm."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo, initial_stop=Decimal("52000"))
+    falling = [
+        _ranged_candle(
+            _bar_ts(i),
+            low=Decimal("53000") - Decimal("120") * i - Decimal("60"),
+            high=Decimal("53000") - Decimal("120") * i + Decimal("60"),
+            close=Decimal("53000") - Decimal("120") * i,
+            open_=Decimal("53000") - Decimal("120") * (i - 1) if i else Decimal("53000"),
+        )
+        for i in range(57)
+    ]
+    _seed_history(repo, falling)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): falling})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert "cancel" not in broker.events
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("52000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_run_once_rolls_to_break_even_once_the_trade_reaches_be_roll_rr(repo: Repository) -> None:
+    """The other arm, opted in alone: a bar whose HIGH clears `entry + be_roll_rr x` the
+    ORIGINAL per-unit risk (the tranche's `initial_stop`, #520 -- never the already-raised
+    current stop) rolls the stop to the entry. 30 bars also pins that the BE arm is NOT
+    young-table-gated (see `_manage_stops`'s warmup note): it reads only the latest bar's
+    high, exactly what the sim does from bar one."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "be_roll_rr": "1"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    series = [
+        _ranged_candle(
+            _bar_ts(i),
+            low=Decimal("49950"),
+            high=Decimal("50050"),
+            close=Decimal("50000"),
+            open_=Decimal("50000"),
+        )
+        for i in range(29)
+    ] + [
+        # high 51200 clears entry + 1R (50000 + 1 * (50000 - 49000) = 51000)
+        _ranged_candle(
+            _bar_ts(29),
+            low=Decimal("50300"),
+            high=Decimal("51200"),
+            close=Decimal("50800"),
+            open_=Decimal("50000"),
+        )
+    ]
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("50000")
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    assert broker.events[-2:] == ["cancel", "place"], broker.events
+
+
+def test_a_tranche_without_initial_stop_disables_the_break_even_arm(repo: Repository) -> None:
+    """The ledger's own contract (`Repository.open_position` / #520's migration): `initial_stop
+    IS NULL` means "nobody recorded it" -- pre-ledger tranches and DCA -- and the BE arm must
+    switch OFF rather than substitute the current stop, which is a different policy (and, on a
+    ratcheted position, a guaranteed profit-stealing roll to a stale level)."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "be_roll_rr": "1"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo, initial_stop=None)
+    series = [
+        _ranged_candle(
+            _bar_ts(i),
+            low=Decimal("49950"),
+            high=Decimal("50050"),
+            close=Decimal("50000"),
+            open_=Decimal("50000"),
+        )
+        for i in range(29)
+    ] + [
+        _ranged_candle(
+            _bar_ts(29),
+            low=Decimal("50300"),
+            high=Decimal("51200"),
+            close=Decimal("50800"),
+            open_=Decimal("50000"),
+        )
+    ]
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+
+    assert "cancel" not in broker.events
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_turtle_positions_are_never_managed(repo: Repository) -> None:
+    """`policy_for` reads turtle as OFF by DESIGN (#442 hypothesis 3): its real exit is the
+    asymmetric Donchian channel, and a trail would cut the rare long winners a low-win-rate
+    trend-follower exists to let run. The family carries neither knob and cannot express
+    them."""
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT}, status="live")
+    bracket_id = _seed_bracketed_tranche(repo, rule_name="turtle_breakout")
+    flat = [
+        _ranged_candle(
+            _bar_ts(i),
+            low=Decimal("49950"),
+            high=Decimal("50050"),
+            close=Decimal("50000"),
+            open_=Decimal("50000"),
+        )
+        for i in range(30)
+    ]
+    _seed_history(repo, flat)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): flat})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+
+    assert "cancel" not in broker.events
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_paper_cycles_do_not_manage_exchange_brackets(repo: Repository) -> None:
+    """Paper mode never places exchange-side brackets (its entries resolve on the synthetic
+    account), so there is nothing for a live step to roll -- and touching the broker's real
+    order book from the paper path would be a category error. The step is live-mode only."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="paper",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    # The SAME data the trail test rolls on -- so "no roll" here proves the PAPER gate blocked
+    # the step, not an unlucky series.
+    series = _rising_series()
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(
+        broker,
+        repo,
+        _config(auto_trade=AutoTradeConfig(mode="paper", interval_sec=50_000)),
+        now_ts=_management_now_ts(),
+    )
+
+    assert "cancel" not in broker.events
+    assert broker.place_calls == []
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_a_family_row_only_manages_the_tranches_of_its_own_product(repo: Repository) -> None:
+    """PRODUCT-SCOPED ownership (#502 review): the rules table holds ONE row per
+    (kind, product) and `Rule.name` is the FAMILY name, so resolving a tranche's policy by
+    name alone governed a multi-product family's every tranche under whichever same-family
+    row loaded last -- here the ETH row (id 1, knob-less) loses a name-only dict to the BTC
+    row (id 2, opted in), and BTC's trail policy would have rolled ETH's bracket on a climb
+    ETH never asked for. The step keys rows by `(product_id, name)` -- the same product
+    scoping `_handle_exits` uses -- so each product's tranche answers to its OWN row."""
+    eth = "ETH-USD"
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": eth, "granularity": "ONE_DAY"},
+        status="live",
+    )
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    btc_bracket = _seed_bracketed_tranche(
+        repo, bracket_ref="btc-bracket-1", target=Decimal("60000")
+    )
+    # target=60000, NOT the 55000 default: the 57-bar climb trails to ~55.4k, and under a
+    # name-only key the leaked roll would be vetoed by the at/above-target refusal before any
+    # cancel -- leaving the test green against the very bug it exists to pin (the at/above-target
+    # guard fires before the cancel, so the fixture must stay clear of it on BOTH products).
+    eth_bracket = _seed_bracketed_tranche(
+        repo, product=eth, bracket_ref="eth-bracket-1", ts=2_000, target=Decimal("60000")
+    )
+    # The SAME climb on both products: under a name-only key this series rolls ETH too.
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    _seed_history(repo, series, product=eth)
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): series,
+            (eth, Granularity.ONE_DAY): series,
+        }
+    )
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert "eth-bracket-1" not in broker.cancel_calls, (
+        "the knob-less product's tranche was managed under the opted-in row's policy"
+    )
+    assert repo.get_order(eth_bracket)["status"] == "pending"
+    assert repo.get_state(f"open_stop:{eth}") == Decimal("49000")
+    assert "btc-bracket-1" in broker.cancel_calls, "the opted-in product's tranche was not managed"
+    assert repo.get_order(btc_bracket)["status"] == "canceled"
+    assert repo.get_state(f"open_stop:{PRODUCT}") > Decimal("49000")
+
+
+def test_a_tranche_whose_owning_row_is_absent_this_cycle_is_skipped(repo: Repository) -> None:
+    """The dict-miss path, pinned: the tranche names a family whose row is not on this
+    cycle's (product, name) set -- demoted, retired, or simply never existed -- and the step
+    skips it rather than falling back to any OTHER row's policy, not even the same
+    product's different family's row (the opted-in `pullback_continuation` here must not
+    adopt a tranche opened by `rsi_meanrev`)."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo, rule_name="rsi_meanrev")
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert "cancel" not in broker.events, "a tranche was managed under a row it does not own"
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_management_skips_and_logs_when_the_rules_timeframe_has_no_candles(
+    repo: Repository, caplog
+) -> None:
+    """The empty-timeframe path, pinned: the rule declares ONE_HOUR, this deployment polls
+    ONE_DAY only, so the management series is empty and the tranche waits a cycle WITH an
+    INFO skip -- never rolling on a bar that does not exist."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_HOUR", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    with caplog.at_level(logging.INFO):
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    skips = [
+        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_skipped"
+    ]
+    assert skips == [
+        (
+            "agent.stop_management_skipped",
+            {
+                "product": PRODUCT,
+                "rule": "pullback_continuation",
+                "reason": "no candles on the rule's trading timeframe",
+            },
+        )
+    ]
+    assert "cancel" not in broker.events
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_the_trail_arm_waits_for_a_warm_candle_table(repo: Repository, caplog) -> None:
+    """Young-table warmup (#502 review): the trail level only matches the #442-measured sim
+    behavior once the table holds `4 x atr_period + 1` closed bars, and the live table does
+    not start there (`poll_once` cold-starts at ONE bar; backfill has no production caller).
+    56 bars -- one short of 4 x 14 + 1 -- carries the trail knob but must NOT roll, and must
+    say so at INFO once per product, not once per cycle (the second cycle stays quiet). The
+    threshold side of the boundary is
+    `test_run_once_trails_a_ratcheting_stop_through_the_broker` (57 bars, rolls)."""
+    warmup_product = "WARM-USD"  # unique: the once-per-product notice set is module state
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": warmup_product, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo, product=warmup_product)
+    series = _rising_series(56)
+    _seed_history(repo, series, product=warmup_product)
+    broker = FakeBroker(series={(warmup_product, Granularity.ONE_DAY): series})
+
+    with caplog.at_level(logging.INFO):
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(56))
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(56) + 500)
+
+    notices = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_waiting_for_warmup"
+    ]
+    assert len(notices) == 1, "the warmup notice is per product, not per cycle"
+    assert getattr(notices[0], _FIELDS_ATTR, {}) == {
+        "product": warmup_product,
+        "rule": "pullback_continuation",
+        "bars": 56,
+        "needed": 57,
+    }
+    assert "cancel" not in broker.events, "a young table rolled a trail anyway"
+    assert repo.get_state(f"open_stop:{warmup_product}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_a_failed_roll_is_loud_and_isolated_never_a_dead_cycle(repo: Repository, caplog) -> None:
+    """PER-TRANCHE ISOLATION (#502 review): a cancel that raises mid-roll -- `CancelPending`/
+    `CancelUnavailable` are ordinary Coinbase batch-cancel outcomes when a fill lands during
+    the roll -- must not abort `run_once`. A dead cycle AFTER entries were placed costs the
+    `LoopResult`, the post-cycle notify, and the live-run wrapper's UTC day-stamp, so the
+    next trigger re-runs the whole cycle into the duplicate-entry window. The failure is
+    CRITICAL (the roll may be half-completed on live money), the crash-ledger record stands
+    for the sweep to heal from, and the LATER tranche is still managed."""
+    eth = "ETH-USD"
+    for product in (PRODUCT, eth):
+        repo.insert_rule(
+            "pullback_continuation",
+            {"product_id": product, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+            status="live",
+        )
+    btc_bracket = _seed_bracketed_tranche(
+        repo, bracket_ref="btc-bracket-1", target=Decimal("60000")
+    )
+    eth_bracket = _seed_bracketed_tranche(
+        repo, product=eth, bracket_ref="eth-bracket-2", ts=2_000, target=Decimal("60000")
+    )
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    _seed_history(repo, series, product=eth)
+
+    class _CancelDeniedBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> bool:
+            if order_id == "btc-bracket-1":
+                raise RuntimeError("batch cancel unavailable (fill in flight)")
+            return super().cancel_order(order_id)
+
+    broker = _CancelDeniedBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): series,
+            (eth, Granularity.ONE_DAY): series,
+        }
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        result = run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert result.skipped is False, "a failed roll killed the whole cycle"
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_roll_failed"
+    ]
+    assert len(failures) == 1
+    assert getattr(failures[0], _FIELDS_ATTR, {})["product"] == PRODUCT
+    assert getattr(failures[0], _FIELDS_ATTR, {})["old_stop_order_id"] == btc_bracket
+    assert failures[0].exc_info, "a CRITICAL half-completed live-money action carries the traceback"
+    # The raise lands inside the executor's cancel, BEFORE the local `canceled` mark, so
+    # the old bracket still rests and the crash ledger stands for the next cycle's sweep.
+    assert repo.get_order(btc_bracket)["status"] == "pending"
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is not None
+    # The LATER tranche was still managed -- isolation, not abandonment.
+    assert "eth-bracket-2" in broker.cancel_calls
+    assert repo.get_order(eth_bracket)["status"] == "canceled"
+    assert repo.get_state(f"open_stop:{eth}") > Decimal("49000")
+
+
+def test_both_knobs_resolve_to_one_roll_per_cycle(repo: Repository) -> None:
+    """ONE roll, not one per arm (#502 review): a rule carrying BOTH knobs can win on both
+    in the same cycle, and the step must walk #519's cancel-before-place window exactly
+    once -- `next_stop` takes the max over the arms and `roll_stop_to` places exactly one
+    replacement, never `trail_stop_atr` and `roll_to_break_even` back to back."""
+    from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
+
+    repo.insert_rule(
+        "pullback_continuation",
+        {
+            "product_id": PRODUCT,
+            "granularity": "ONE_DAY",
+            "trail_atr_mult": "1.5",
+            "be_roll_rr": "1",
+        },
+        status="live",
+    )
+    # A 57-bar climb trails to ~55.4k, past the default 55k target -- the at/above-target
+    # refusal (a stop that has caught the target is a coin flip) would veto the roll these
+    # tests exist to observe, so the fixture's target sits above the trail's reach.
+    bracket_id = _seed_bracketed_tranche(repo, target=Decimal("60000"))
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    policy = policy_for(_build_rule(repo.get_rules("live")[0]))
+    expected = next_stop(
+        policy,
+        Decimal("50000"),
+        Decimal("49000"),
+        Decimal("49000"),
+        series[-1],
+        trailing_atr(series, policy.atr_period),
+    )
+    # Both arms genuinely contended: the climb clears the BE threshold (the last bar's high
+    # is ~55,660 >> 51,000) and the trail proposes higher still.
+    assert expected > Decimal("50000")
+    assert broker.events == ["cancel", "place"], broker.events
+    assert repo.get_state(f"open_stop:{PRODUCT}") == expected
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    assert repo.get_open_positions(PRODUCT)[0]["bracket_order_id"] is not None
 
 
 def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:

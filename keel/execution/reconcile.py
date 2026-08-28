@@ -30,9 +30,12 @@ recorded before this change, which is the gap itself. That rarity changes the pr
 auto-remediation, not the validity of recognizing the state.
 
 What is deliberately NOT done here: resizing or amending the bracket when a partially-filled
-entry leaves it oversized for what is held. The amend-vs-cancel-and-replace policy is #502's to
-settle, and auto-cancelling live protective orders on the strength of a possibly-still-settling
-partial snapshot is strictly worse than a loud warning. This module records and surfaces.
+entry leaves it oversized for what is held. The port migration is done and the
+cancel-and-replace is expressible (`BracketGTC` since #569; `executor._roll_stop` performs
+one through `place_order`), but a RESIZE is a re-place at a different size, and
+auto-cancelling live protective orders on the strength of a possibly-still-settling partial
+snapshot is strictly worse than a loud warning. This module records and surfaces; the
+resize policy rides with `scale_out`'s remaining #502 scope.
 """
 
 from __future__ import annotations

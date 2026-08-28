@@ -134,13 +134,19 @@ def log_event(logger: logging.Logger, level: int, event: str, /, **fields: Any) 
     logger.log(level, event, extra={_FIELDS_ATTR: fields})
 
 
-def log_exception(logger: logging.Logger, event: str, /, **fields: Any) -> None:
-    """Emit a structured `event` at ERROR with the active exception's traceback attached.
+def log_exception(
+    logger: logging.Logger, event: str, /, *, level: int = logging.ERROR, **fields: Any
+) -> None:
+    """Emit a structured `event` at ERROR (or `level`) with the active exception's traceback.
 
-    Use inside an `except` block. Equivalent to `log_event` at ERROR level plus `exc_info`,
-    which `JsonFormatter` renders into the payload's `exc` key.
+    Use inside an `except` block. Equivalent to `log_event` at the given level plus
+    `exc_info`, which `JsonFormatter` renders into the payload's `exc` key. `level` exists
+    for the one severity a traceback must not downgrade from: a caller reporting a
+    possibly-half-completed action on live money (#502's stop-management roll) logs at
+    CRITICAL and still keeps the stack. Like `log_event`'s positional-only guard, `level`
+    is keyword-only; no existing caller passes a field of that name.
     """
-    logger.log(logging.ERROR, event, exc_info=True, extra={_FIELDS_ATTR: fields})
+    logger.log(level, event, exc_info=True, extra={_FIELDS_ATTR: fields})
 
 
 def is_venue_unreachable(exc: BaseException | None) -> bool:

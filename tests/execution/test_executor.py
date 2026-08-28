@@ -39,6 +39,7 @@ from keel.execution.executor import (
     ExecutionResult,
     execute,
     place_bracket,
+    roll_stop_to,
     roll_to_break_even,
     scale_out,
     trail_stop_atr,
@@ -1040,9 +1041,10 @@ def test_a_roll_that_reaches_the_target_is_refused_and_the_bracket_stays(repo):
     The replacement is a single native bracket carrying both prices, so a stop that has caught up
     with the target describes two exits racing at the same level -- whichever side the venue
     evaluates first decides whether this position took a profit or a loss.
-    `keel_broker_api.orders.BracketGTC` refuses exactly this at construction, but the live path
-    does not build one yet (#502 stage 2 is blocked on #524), so nothing between the ratchet and
-    Coinbase was checking it.
+    `keel_broker_api.orders.BracketGTC` refuses exactly this at construction, and every roll
+    IS one of those since #524/#569 -- but #560 added this earlier, explicit refusal for the
+    same hazard, and it stays because it refuses BEFORE the cancel, leaving the existing
+    bracket resting rather than relying on the construction error after the cancel landed.
 
     Refusing is the conservative half, and this asserts that half: the roll is abandoned, the
     EXISTING bracket is untouched (`pending`, not `canceled`), and the recorded stop is unchanged,
@@ -1739,6 +1741,101 @@ def test_rolling_the_stop_carries_the_original_target_forward(repo):
     replacement = broker.place_calls[-1]["spec"]
     assert replacement.take_profit_price == Decimal("53000")  # original target preserved
     assert replacement.stop_trigger_price == Decimal("50000")  # stop moved to break-even
+
+
+def test_roll_stop_to_rolls_to_an_explicit_policy_computed_level(repo):
+    """`roll_stop_to` is the single-roll entry point the agent's live management step drives
+    (#502 stage 2). `roll_to_break_even` and `trail_stop_atr` each perform their OWN
+    cancel-and-replace; a policy carrying both arms can win on both in one cycle, and calling
+    the two named primitives back-to-back would walk the naked-position window (#519's
+    cancel-before-place) TWICE for no benefit. The step therefore computes ONE ratcheted level
+    (`strategy.exit_policy.next_stop` -- max over the arms, the same function the sim and
+    backtester apply) and hands it here.
+    """
+    broker = FakeBroker()
+    old_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("54000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+
+    new_id = roll_stop_to(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=old_id,
+        new_stop=Decimal("50750"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert new_id is not None and new_id != old_id
+    assert repo.get_order(old_id)["status"] == "canceled"
+    assert repo.get_state("open_stop:BTC-USD") == Decimal("50750")
+    # The #519 protocol, unchanged by the new entry point: cancel BEFORE place.
+    assert broker.events == ["place", "cancel", "place"], broker.events
+    replacement = broker.place_calls[-1]["spec"]
+    assert isinstance(replacement, BracketGTC)
+    assert replacement.stop_trigger_price == Decimal("50750")
+    assert replacement.take_profit_price == Decimal("54000")
+
+
+def test_a_roll_repoints_the_owning_tranche_at_the_replacement_bracket(repo):
+    """The tranche<->bracket link is how a bracket FILL resolves back to the trade it closed
+    (`Repository.get_position_for_bracket`, reconciliation's one lookup direction). Until the
+    live management step (#502) rolls were unreachable, so `_roll_stop` never had to maintain
+    it; with rolls live, a roll that cancels the bracket a tranche names and does not repoint
+    it leaves every LATER fill of the replacement bracket resolving to no tranche -- its
+    `trade_outcomes` row is dropped and rail 16 miscounts a managed winner.
+    """
+    broker = FakeBroker()
+    old_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("54000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    position_id = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("0"),
+        initial_stop=Decimal("49000"),
+        bracket_order_id=old_id,
+    )
+
+    new_id = roll_stop_to(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=old_id,
+        new_stop=Decimal("50750"),
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert new_id is not None
+    # The replacement is the tranche's bracket now, and the cancelled order no longer answers.
+    assert repo.get_position_for_bracket(new_id) is not None
+    assert repo.get_position_for_bracket(new_id)["id"] == position_id
+    assert repo.get_position_for_bracket(old_id) is None
 
 
 def test_a_roll_that_cannot_replace_the_bracket_screams_that_the_position_is_naked(repo, caplog):

@@ -62,14 +62,16 @@ class RsiMeanReversion(Rule):
         "trail_atr_mult": (
             "ratchet-only trailing stop this many ATRs below each bar's close, once the "
             "trade is open. Default off: measured WORSE than the static exit at the 120 bp "
-            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
-            "engines only -- live stop management is issue #502."
+            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Applied by the "
+            "sim/backtest engines and, since #502, by the agent's live per-cycle stop "
+            "management -- off until a rule opts in."
         ),
         "be_roll_rr": (
             "roll the stop to the entry once the trade has been up this many R. Default "
             "off: measured no-better than the static exit at the 120 bp fee "
-            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
-            "engines only -- live stop management is issue #502."
+            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Applied by the "
+            "sim/backtest engines and, since #502, by the agent's live per-cycle stop "
+            "management -- off until a rule opts in."
         ),
         "level_tolerance": (
             "how close two prices must be to count as one support/resistance level."
@@ -120,7 +122,8 @@ class RsiMeanReversion(Rule):
     fixed_rr: Decimal = Decimal("2")
     # #442: the per-family exit-policy knobs `strategy.exit_policy` reads. Default OFF
     # (None) -- the wiring changes no rule's behavior until an operator/research run turns
-    # a knob on; the live executor has no management cycle to honor them (issue #502).
+    # a knob on. Honored by the sim/backtest engines and by the live cycle's management
+    # step since #502 stage 2.
     trail_atr_mult: Decimal | None = None
     be_roll_rr: Decimal | None = None
     level_tolerance: Decimal = Decimal("0.002")
