@@ -133,6 +133,12 @@ the strategy meant to decline.
 the docs as a stated hazard, so the next person evaluating an external strategy knows to check the
 fill model before the returns.
 
+> **Documented (#529):**
+> [`docs/experiments/2026-08-27-external-strategy-evaluation-hazard.md`](../../experiments/2026-08-27-external-strategy-evaluation-hazard.md)
+> — the four questions (fill model, cost regime, sample size, capability) with their measured keel
+> anchors and a pre-port checklist, cross-referenced from the proposal entry points (the
+> keel-asset-scout skill and the proposer design's strategy-proposer scope).
+
 ---
 
 ## 5. Proposal
