@@ -1691,6 +1691,13 @@ def _roll_stop(
     entries. The replacement order still runs through `guards.check` (allowlist/caps/kill-switch/
     etc. -- every order, no exceptions) before it is placed.
 
+    **The kill-switch window inside a roll.** A cancel is not rail-gated -- it REMOVES risk, and
+    there is nothing for a guard to veto -- so a kill switch that engages mid-roll, AFTER the
+    cancel, fails only the REPLACEMENT: rail 12 fails every order closed and the position is left
+    unbracketed until the switch clears. Never trading against a thrown switch is the correct
+    failure direction, but the window must be understood, not discovered: the CRITICAL below is
+    loud, and `reconcile_unbracketed_positions` heals from the crash ledger when cycles resume.
+
     **The cancel-then-place window is not atomic and cannot be made so** (see the comment at the
     cancel below). What it CAN be is recoverable: an `unbracketed:<product_id>` record is written
     before the venue is touched and cleared only once the replacement rests, so a process that

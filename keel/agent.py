@@ -826,6 +826,14 @@ def _close_tranches(
         repo.close_position(position["id"], closed_at=now_ts)
 
 
+#: Products whose young-table warmup notice has already been logged THIS PROCESS (#502). The
+#: notice is per product, not per cycle -- a daily deployment a few bars short of the
+#: `4 x atr_period + 1` threshold would otherwise repeat the same line every cycle until
+#: warmed. Process scope is the deliberate bound: an `agent_state` key would outlive the
+#: condition it describes and suppress the notice forever after a restart.
+_WARMUP_LOGGED_PRODUCTS: set[str] = set()
+
+
 def _manage_stops(
     broker: Any,
     repo: Repository,
@@ -873,6 +881,13 @@ def _manage_stops(
     it propagate would abort `run_once` AFTER entries were placed: no `LoopResult`, no
     post-cycle notify, a nonzero CLI exit, and the live-run wrapper declining to stamp the
     UTC day -- so the next trigger re-runs the whole cycle into the duplicate-entry window.
+
+    The kill-switch window inside a roll (see `executor._roll_stop`): a cancel is not
+    rail-gated -- it REMOVES risk, so there is nothing for a guard to veto -- and a switch
+    that engages mid-roll, after the cancel, fails only the REPLACEMENT closed (rail 12
+    fails every order), leaving the position unbracketed until the switch clears. That is
+    the correct failure direction, and it is not silent: the CRITICAL is loud, and
+    `reconcile` heals from the crash ledger when cycles resume.
     """
     rules_by_owner = {(getattr(rule, "product_id", None), rule.name): rule for rule in rules}
     for tranche in repo.get_open_positions():
@@ -889,6 +904,10 @@ def _manage_stops(
         old_order = repo.get_order(bracket_id)
         if old_order is None or old_order["status"] not in executor.RESTING_STATUSES:
             continue  # filled or dead: reconciliation owns that bracket, not this step
+        # Per-PRODUCT ratchet state read inside the per-TRANCHE loop: this assumes the
+        # ledger's one-tranche-per-asset shape (the same assumption that lets the defers
+        # treat a product's slots as exclusive). Keying the ratchet per TRANCHE is a
+        # prerequisite for pyramiding, and is deliberately not invented here.
         current_stop = repo.get_state(f"open_stop:{tranche['product_id']}")
         if current_stop is None:
             continue  # no recorded level to ratchet from -- nothing this step may act on
@@ -903,7 +922,20 @@ def _manage_stops(
 
         candles_by_tf = candles_by_tf_by_product.get(tranche["product_id"])
         if not candles_by_tf:
-            continue  # stale product this cycle: no completed bar to manage on
+            # Stale product this cycle: the freshness pre-pass skipped it, so THIS cycle
+            # fetched no bars for it -- which is not "the table holds nothing" (it usually
+            # holds older closed bars; staleness is a claim about the newest one). The
+            # tranche waits a cycle, and says so at the same INFO volume as the
+            # empty-timeframe skip below rather than skipping silently.
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.stop_management_skipped",
+                product=tranche["product_id"],
+                rule=rule.name,
+                reason="product skipped this cycle (stale feed) -- no bars fetched",
+            )
+            continue
         series = candles_by_tf.get(_management_timeframe(rule, candles_by_tf)) or []
         if not series:
             log_event(
@@ -915,6 +947,29 @@ def _manage_stops(
                 reason="no candles on the rule's trading timeframe",
             )
             continue
+
+        # Young-table warmup (#442 fidelity). `trailing_atr` prices the trail off a
+        # Wilder average that only matches the #442-measured sim behavior once the table
+        # holds `4 x atr_period + 1` closed bars, and the live table does not start there:
+        # `market_feed.poll_once` cold-starts an EMPTY table with one bar, and backfill has
+        # no production caller. Short of the threshold the trail arm is OFF for the cycle.
+        # The BE arm is NOT equally affected -- it reads only the latest bar's HIGH against
+        # thresholds fixed at entry time, which is exactly what the sim does from bar one --
+        # so it stays live. The notice fires once per product, not per cycle.
+        warmup_bars = 4 * policy.atr_period + 1
+        if policy.trail_atr_mult is not None and len(series) < warmup_bars:
+            policy = replace(policy, trail_atr_mult=None)
+            if tranche["product_id"] not in _WARMUP_LOGGED_PRODUCTS:
+                _WARMUP_LOGGED_PRODUCTS.add(tranche["product_id"])
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "agent.stop_management_waiting_for_warmup",
+                    product=tranche["product_id"],
+                    rule=rule.name,
+                    bars=len(series),
+                    needed=warmup_bars,
+                )
 
         atr = trailing_atr(series, policy.atr_period)
         level = next_stop(
@@ -966,8 +1021,11 @@ def _management_timeframe(rule: Rule, candles_by_tf: dict[Granularity, list[Any]
     """The series stop management reads: the rule's own trading timeframe when it declares one
     (`granularity` on `TurtleBreakout`/`PullbackContinuation`, `timeframe` on `RsiMeanReversion`
     -- the same attribute order `engine._trading_granularity` and `backtest._rule_trading_tf`
-    use), else the finest series this cycle actually has. Every knob-carrying family declares
-    its timeframe, so the fallback is a bound, not a path anyone trades on."""
+    use), else the finest series this cycle actually has. One deliberate divergence from the
+    backtester, bounded: `backtest._rule_trading_tf` falls back to a fixed ONE_HOUR, this falls
+    back to whatever the cycle polled finest -- but every knob-carrying family declares its
+    timeframe, so a rule that is ever actually managed (`policy_for` non-OFF) never takes a
+    fallback series at all, and the divergence is a bound, not a path anyone trades on."""
     for attr in ("granularity", "timeframe"):
         value = getattr(rule, attr, None)
         if isinstance(value, Granularity):

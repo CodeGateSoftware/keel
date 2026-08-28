@@ -159,6 +159,16 @@ def _register_fake_rules():
     del agent.RULE_REGISTRY["fake_no_exit"]
 
 
+@pytest.fixture(autouse=True)
+def _reset_warmup_notice():
+    """Start every test with a clean per-product warmup-notice set: the notice is once per
+    product PER PROCESS (`agent._WARMUP_LOGGED_PRODUCTS`), so without a reset an earlier
+    test's notice would suppress the one a later test asserts on."""
+    agent._WARMUP_LOGGED_PRODUCTS.clear()
+    yield
+    agent._WARMUP_LOGGED_PRODUCTS.clear()
+
+
 # -- fixtures / builders --------------------------------------------------------------------
 
 
@@ -1756,7 +1766,6 @@ def test_run_once_leaves_stops_alone_when_the_rule_carries_no_exit_knobs(repo: R
     bracket_id = _seed_bracketed_tranche(repo)
     series = _rising_series()
     _seed_history(repo, series)
-    _seed_history(repo, series)
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
 
     run_once(broker, repo, _config(), now_ts=_management_now_ts())
@@ -1775,7 +1784,11 @@ def test_run_once_trails_a_ratcheting_stop_through_the_broker(repo: Repository) 
     closed candles only), then ONE roll -- #519's cancel-before-place protocol -- so the venue's
     bracket ratchets with the climb. The expected level is computed here with the policy's own
     functions: the live step's contract is fidelity to `strategy.exit_policy`, not a re-derived
-    trail of its own."""
+    trail of its own.
+
+    57 bars is the young-table warmup threshold (`4 x 14 + 1`, the default ATR period) -- the
+    threshold side of the boundary `test_the_trail_arm_waits_for_a_warm_candle_table` pins
+    from below."""
     from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
 
     repo.insert_rule(
@@ -1783,12 +1796,15 @@ def test_run_once_trails_a_ratcheting_stop_through_the_broker(repo: Repository) 
         {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
         status="live",
     )
-    bracket_id = _seed_bracketed_tranche(repo)
-    series = _rising_series()
+    # A 57-bar climb trails to ~55.4k, past the default 55k target -- the at/above-target
+    # refusal (a stop that has caught the target is a coin flip) would veto the roll these
+    # tests exist to observe, so the fixture's target sits above the trail's reach.
+    bracket_id = _seed_bracketed_tranche(repo, target=Decimal("60000"))
+    series = _rising_series(57)
     _seed_history(repo, series)
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
 
-    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
 
     policy = policy_for(_build_rule(repo.get_rules("live")[0]))
     expected = next_stop(
@@ -1807,14 +1823,16 @@ def test_run_once_trails_a_ratcheting_stop_through_the_broker(repo: Repository) 
     replacement_id = repo.get_open_positions(PRODUCT)[0]["bracket_order_id"]
     assert replacement_id is not None and replacement_id != bracket_id
     assert repo.get_order(replacement_id)["status"] == "pending"
-    assert repo.get_state(f"open_target:{PRODUCT}") == Decimal("55000")
+    assert repo.get_state(f"open_target:{PRODUCT}") == Decimal("60000")
 
 
 def test_the_live_trail_never_widens_the_stop(repo: Repository) -> None:
     """Rail 9's invariant on the live path: a falling cycle proposes a trail BELOW the recorded
     stop, and the step must not roll at all -- the existing bracket stays resting, the recorded
     stop unmoved. `next_stop` is ratchet-only by construction; this pins that the LIVE step
-    inherits it (it only rolls when the level strictly improves)."""
+    inherits it (it only rolls when the level strictly improves). 57 bars so the trail arm is
+    PAST warmup and genuinely proposing -- a no-roll here is the ratchet refusing, not the
+    warmup gate muting the arm."""
     repo.insert_rule(
         "pullback_continuation",
         {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
@@ -1829,12 +1847,12 @@ def test_the_live_trail_never_widens_the_stop(repo: Repository) -> None:
             close=Decimal("53000") - Decimal("120") * i,
             open_=Decimal("53000") - Decimal("120") * (i - 1) if i else Decimal("53000"),
         )
-        for i in range(30)
+        for i in range(57)
     ]
     _seed_history(repo, falling)
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): falling})
 
-    run_once(broker, repo, _config(), now_ts=_management_now_ts())
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
 
     assert "cancel" not in broker.events
     assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("52000")
@@ -1844,7 +1862,9 @@ def test_the_live_trail_never_widens_the_stop(repo: Repository) -> None:
 def test_run_once_rolls_to_break_even_once_the_trade_reaches_be_roll_rr(repo: Repository) -> None:
     """The other arm, opted in alone: a bar whose HIGH clears `entry + be_roll_rr x` the
     ORIGINAL per-unit risk (the tranche's `initial_stop`, #520 -- never the already-raised
-    current stop) rolls the stop to the entry."""
+    current stop) rolls the stop to the entry. 30 bars also pins that the BE arm is NOT
+    young-table-gated (see `_manage_stops`'s warmup note): it reads only the latest bar's
+    high, exactly what the sim does from bar one."""
     repo.insert_rule(
         "pullback_continuation",
         {"product_id": PRODUCT, "granularity": "ONE_DAY", "be_roll_rr": "1"},
@@ -2021,6 +2041,106 @@ def test_a_family_row_only_manages_the_tranches_of_its_own_product(repo: Reposit
     assert repo.get_state(f"open_stop:{PRODUCT}") > Decimal("49000")
 
 
+def test_a_tranche_whose_owning_row_is_absent_this_cycle_is_skipped(repo: Repository) -> None:
+    """The dict-miss path, pinned: the tranche names a family whose row is not on this
+    cycle's (product, name) set -- demoted, retired, or simply never existed -- and the step
+    skips it rather than falling back to any OTHER row's policy, not even the same
+    product's different family's row (the opted-in `pullback_continuation` here must not
+    adopt a tranche opened by `rsi_meanrev`)."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo, rule_name="rsi_meanrev")
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert "cancel" not in broker.events, "a tranche was managed under a row it does not own"
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_management_skips_and_logs_when_the_rules_timeframe_has_no_candles(
+    repo: Repository, caplog
+) -> None:
+    """The empty-timeframe path, pinned: the rule declares ONE_HOUR, this deployment polls
+    ONE_DAY only, so the management series is empty and the tranche waits a cycle WITH an
+    INFO skip -- never rolling on a bar that does not exist."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_HOUR", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    with caplog.at_level(logging.INFO):
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    skips = [
+        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_skipped"
+    ]
+    assert skips == [
+        (
+            "agent.stop_management_skipped",
+            {
+                "product": PRODUCT,
+                "rule": "pullback_continuation",
+                "reason": "no candles on the rule's trading timeframe",
+            },
+        )
+    ]
+    assert "cancel" not in broker.events
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_the_trail_arm_waits_for_a_warm_candle_table(repo: Repository, caplog) -> None:
+    """Young-table warmup (#502 review): the trail level only matches the #442-measured sim
+    behavior once the table holds `4 x atr_period + 1` closed bars, and the live table does
+    not start there (`poll_once` cold-starts at ONE bar; backfill has no production caller).
+    56 bars -- one short of 4 x 14 + 1 -- carries the trail knob but must NOT roll, and must
+    say so at INFO once per product, not once per cycle (the second cycle stays quiet). The
+    threshold side of the boundary is
+    `test_run_once_trails_a_ratcheting_stop_through_the_broker` (57 bars, rolls)."""
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    bracket_id = _seed_bracketed_tranche(repo)
+    series = _rising_series(56)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    with caplog.at_level(logging.INFO):
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(56))
+        run_once(broker, repo, _config(), now_ts=_management_now_ts(56) + 500)
+
+    notices = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_waiting_for_warmup"
+    ]
+    assert len(notices) == 1, "the warmup notice is per product, not per cycle"
+    assert getattr(notices[0], _FIELDS_ATTR, {}) == {
+        "product": PRODUCT,
+        "rule": "pullback_continuation",
+        "bars": 56,
+        "needed": 57,
+    }
+    assert "cancel" not in broker.events, "a young table rolled a trail anyway"
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_order(bracket_id)["status"] == "pending"
+
+
 def test_a_failed_roll_is_loud_and_isolated_never_a_dead_cycle(repo: Repository, caplog) -> None:
     """PER-TRANCHE ISOLATION (#502 review): a cancel that raises mid-roll -- `CancelPending`/
     `CancelUnavailable` are ordinary Coinbase batch-cancel outcomes when a fill lands during
@@ -2079,6 +2199,51 @@ def test_a_failed_roll_is_loud_and_isolated_never_a_dead_cycle(repo: Repository,
     assert "eth-bracket-2" in broker.cancel_calls
     assert repo.get_order(eth_bracket)["status"] == "canceled"
     assert repo.get_state(f"open_stop:{eth}") > Decimal("49000")
+
+
+def test_both_knobs_resolve_to_one_roll_per_cycle(repo: Repository) -> None:
+    """ONE roll, not one per arm (#502 review): a rule carrying BOTH knobs can win on both
+    in the same cycle, and the step must walk #519's cancel-before-place window exactly
+    once -- `next_stop` takes the max over the arms and `roll_stop_to` places exactly one
+    replacement, never `trail_stop_atr` and `roll_to_break_even` back to back."""
+    from keel.strategy.exit_policy import next_stop, policy_for, trailing_atr
+
+    repo.insert_rule(
+        "pullback_continuation",
+        {
+            "product_id": PRODUCT,
+            "granularity": "ONE_DAY",
+            "trail_atr_mult": "1.5",
+            "be_roll_rr": "1",
+        },
+        status="live",
+    )
+    # A 57-bar climb trails to ~55.4k, past the default 55k target -- the at/above-target
+    # refusal (a stop that has caught the target is a coin flip) would veto the roll these
+    # tests exist to observe, so the fixture's target sits above the trail's reach.
+    bracket_id = _seed_bracketed_tranche(repo, target=Decimal("60000"))
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    policy = policy_for(_build_rule(repo.get_rules("live")[0]))
+    expected = next_stop(
+        policy,
+        Decimal("50000"),
+        Decimal("49000"),
+        Decimal("49000"),
+        series[-1],
+        trailing_atr(series, policy.atr_period),
+    )
+    # Both arms genuinely contended: the climb clears the BE threshold (the last bar's high
+    # is ~55,660 >> 51,000) and the trail proposes higher still.
+    assert expected > Decimal("50000")
+    assert broker.events == ["cancel", "place"], broker.events
+    assert repo.get_state(f"open_stop:{PRODUCT}") == expected
+    assert repo.get_order(bracket_id)["status"] == "canceled"
+    assert repo.get_open_positions(PRODUCT)[0]["bracket_order_id"] is not None
 
 
 def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:
