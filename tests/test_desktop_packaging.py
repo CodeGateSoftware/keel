@@ -159,12 +159,14 @@ def test_every_artifact_carries_provenance_and_checksums(desktop_job: dict) -> N
     # keel.app/ and dmg-stage/ directories macOS packaging leaves beside the .dmg, and a
     # shared `*.dmg *.zip` pattern would hand each leg one glob matching nothing.
     # Windows carries BOTH its deliverables (the zip and the setup.exe) in one
-    # space-separated subject-path -- multi-subject attestation, supported since Dec 2024 --
+    # NEWLINE-separated subject-path -- multi-subject attestation. (The space-separated
+    # form is treated as one path and failed the v0.12.0 dispatch at this exact step.)
     # because both are attached to the release, so both must be verifiable.
     subjects = {s["with"]["subject-path"] for s in attest}
-    assert subjects == {"out/*.dmg", "out/*.zip out/*-setup.exe"}
+    # (the trailing newline is the block scalar's, not a typo)
+    assert subjects == {"out/*.dmg", "out/*.zip\nout/*-setup.exe\n"}
     macos = next(s for s in attest if s["with"]["subject-path"] == "out/*.dmg")
-    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip out/*-setup.exe")
+    windows = next(s for s in attest if s["with"]["subject-path"] == "out/*.zip\nout/*-setup.exe\n")
     assert str(macos.get("if", "")).strip() == "runner.os == 'macOS'"
     assert str(windows.get("if", "")).strip() == "runner.os == 'Windows'"
     assert "SHA256SUMS-" in _steps_text(desktop_job)

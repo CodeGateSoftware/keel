@@ -717,10 +717,14 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/attest-build-provenance@v4
         with:
-          # Both Windows deliverables: the zip AND the setup.exe. Multiple globs in one
-          # subject-path are space-separated (attestations grew multi-subject support in
-          # Dec 2024); a second attestation step would work too but duplicates the job.
-          subject-path: out/*.zip out/*-setup.exe
+          # Both Windows deliverables: the zip AND the setup.exe. The multi-subject form
+          # is NEWLINE-separated, one path per line -- the space-separated form this step
+          # originally shipped with is treated by the action as ONE path, and the v0.12.0
+          # dispatch failed at exactly this step with "Could not find subject at path
+          # out/*.zip out/*-setup.exe" while both files sat in out/ (run 33146487866).
+          subject-path: |
+            out/*.zip
+            out/*-setup.exe
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v7
