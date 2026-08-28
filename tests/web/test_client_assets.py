@@ -715,6 +715,10 @@ def test_the_inline_mark_is_the_one_the_icons_carry() -> None:
     assert 'viewBox="0 0 1 1"' in inline, "the inline mark must keep the transcribed viewBox"
     for path in re.findall(r'<path d="([^"]+)"/>', keel_svg):
         assert path in inline, f"the header mark is missing the icon's geometry: {path}"
+    # corner radius and stroke weight are geometry too: a softer square or a heavier mast
+    # would be a third drawing of one boat.
+    for attr in re.findall(r'(?:rx|stroke-width)="([^"]+)"', keel_svg):
+        assert attr in inline, f"the header mark is missing the icon's {attr} shape"
 
 
 def test_the_header_carries_a_theme_toggle_and_a_mode_badge() -> None:

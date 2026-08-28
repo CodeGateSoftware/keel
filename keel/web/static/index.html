@@ -158,43 +158,45 @@
     (`:empty` in `keel.css`), because an empty pill is a stray mark, and an unreadable config
     should cost the badge rather than guess a mode.
   -->
-  <span id="mode-badge" class="pill mode"></span>
-
-  <!--
-    THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.
-
-    The css keys dark on BOTH `@media (prefers-color-scheme: dark) :root:not([data-theme=
-    "light"])` and `:root[data-theme="dark"]`, so: no stored choice -> the OS preference paints
-    the page; a stored choice -> it paints the page on any OS. This button writes that one
-    attribute (`main.js` handles the click; `js/theme.js` restores it before first paint) and
-    stores the choice under `keel-theme`, the same key keeltrading.com's toggle uses.
-
-    BOTH icons ship here and the STYLESHEET decides which one shows -- the same two selectors
-    that paint the page decide which icon is visible, so what a reader sees in the circle is
-    always the icon of the theme they would switch TO, and it cannot disagree with the painted
-    page even in the moment between this markup parsing and `main.js` loading. The icons are
-    the site's own sun and moon (`Header.astro`), inline SVG on `currentColor`: no icon font,
-    no external asset, and legible on both themes because the ink is the theme's own.
-  -->
-  <button type="button" id="theme-toggle" class="theme-toggle"
-          aria-label="Toggle light and dark theme">
-    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="4.2"/>
-      <line x1="12" y1="2.5" x2="12" y2="5"/>
-      <line x1="12" y1="19" x2="12" y2="21.5"/>
-      <line x1="2.5" y1="12" x2="5" y2="12"/>
-      <line x1="19" y1="12" x2="21.5" y2="12"/>
-      <line x1="5.3" y1="5.3" x2="7" y2="7"/>
-      <line x1="17" y1="17" x2="18.7" y2="18.7"/>
-      <line x1="5.3" y1="18.7" x2="7" y2="17"/>
-      <line x1="17" y1="7" x2="18.7" y2="5.3"/>
-    </svg>
-    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
-      <path d="M20.2 13.2A8.2 8.2 0 1 1 10.8 3.8a6.5 6.5 0 0 0 9.4 9.4Z"/>
-    </svg>
-  </button>
+<span class="right">
+    <span id="mode-badge" class="pill mode"></span>
+  
+    <!--
+      THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.
+  
+      The css keys dark on BOTH `@media (prefers-color-scheme: dark) :root:not([data-theme=
+      "light"])` and `:root[data-theme="dark"]`, so: no stored choice -> the OS preference paints
+      the page; a stored choice -> it paints the page on any OS. This button writes that one
+      attribute (`main.js` handles the click; `js/theme.js` restores it before first paint) and
+      stores the choice under `keel-theme`, the same key keeltrading.com's toggle uses.
+  
+      BOTH icons ship here and the STYLESHEET decides which one shows -- the same two selectors
+      that paint the page decide which icon is visible, so what a reader sees in the circle is
+      always the icon of the theme they would switch TO, and it cannot disagree with the painted
+      page even in the moment between this markup parsing and `main.js` loading. The icons are
+      the site's own sun and moon (`Header.astro`), inline SVG on `currentColor`: no icon font,
+      no external asset, and legible on both themes because the ink is the theme's own.
+    -->
+    <button type="button" id="theme-toggle" class="theme-toggle"
+            aria-label="Toggle light and dark theme">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4.2"/>
+        <line x1="12" y1="2.5" x2="12" y2="5"/>
+        <line x1="12" y1="19" x2="12" y2="21.5"/>
+        <line x1="2.5" y1="12" x2="5" y2="12"/>
+        <line x1="19" y1="12" x2="21.5" y2="12"/>
+        <line x1="5.3" y1="5.3" x2="7" y2="7"/>
+        <line x1="17" y1="17" x2="18.7" y2="18.7"/>
+        <line x1="5.3" y1="18.7" x2="7" y2="17"/>
+        <line x1="17" y1="7" x2="18.7" y2="5.3"/>
+      </svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20.2 13.2A8.2 8.2 0 1 1 10.8 3.8a6.5 6.5 0 0 0 9.4 9.4Z"/>
+      </svg>
+    </button>
+  </span>
 </header>
 
 <main id="view" tabindex="-1">

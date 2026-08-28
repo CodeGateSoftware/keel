@@ -227,11 +227,17 @@ header a.brand svg.mark g { stroke: var(--bg); }
 /* ── the mode badge and the theme toggle (#597) ────────────────────────────────────────────────
  *
  * The header's two answers ABOUT the session -- which deployment, which theme -- sit at the
- * margin the nav leaves, which is why the badge takes `margin-left: auto` and the toggle
- * follows it. Both are `align-self: center` because the row is baseline-aligned for TEXT and
- * these two are shapes: a pill and a circle have no meaningful baseline of their own. */
-header .mode {
+ * margin the nav leaves, which is why the RIGHT CLUSTER carries `margin-left: auto` and the
+ * badge and toggle share it (a degraded, hidden badge must not drag the toggle off the right
+ * margin with it). Both are `align-self: center` because the row is baseline-aligned for TEXT
+ * and these two are shapes: a pill and a circle have no meaningful baseline of their own. */
+header .right {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+header .mode {
   align-self: center;
   font-weight: 600;
 }
