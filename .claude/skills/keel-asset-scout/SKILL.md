@@ -314,6 +314,13 @@ proposal:
 - **Say so when a proposal depends on entry timing.** That is a real finding for the operator and
   it points at issue #260 (making the executor honour a conditional entry), not at a parameter.
 
+The full statement of this hazard — the four questions (fill model, cost regime, sample size,
+capability) with their measured keel anchors, and the pre-port checklist a human answers before
+any porting effort — is
+`~/Development/work/CodeGate/keel/docs/experiments/2026-08-27-external-strategy-evaluation-hazard.md`
+(#529). Read it before writing a research brief around an externally-sourced strategy; a brief
+that has not answered its four questions is not yet interpretable by the operator.
+
 **`sample_size` and `evaluation_window` exist because both traps have already bitten this project,
 and both are visible in a paper's own abstract if you look.**
 

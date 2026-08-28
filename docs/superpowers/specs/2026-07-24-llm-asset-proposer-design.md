@@ -46,7 +46,10 @@ wallet. That is what the LLM proposer adds.
   alignment with existing seams.
 - **(B) Strategy proposer — future, own spec.** LLM proposes candidate *rules/strategies* → the
   backtest→paper→promotion gate. Larger and riskier (effectively rule/parameter generation); a
-  different gate.
+  different gate. Any such spec inherits the externally-sourced-strategy hazard: its proposals
+  must clear the fill-model checklist in
+  [`docs/experiments/2026-08-27-external-strategy-evaluation-hazard.md`](../../experiments/2026-08-27-external-strategy-evaluation-hazard.md)
+  (#529) before porting effort is spent on them.
 - **(C) Insights / veto / anomaly-flagger — future, own spec.** The "may reduce risk directly" side
   of the asymmetry (explain, pause, flag). Overlaps with insights/journaling.
 

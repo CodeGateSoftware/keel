@@ -18,6 +18,10 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-08
 
+- [`2026-08-27-external-strategy-evaluation-hazard.md`](2026-08-27-external-strategy-evaluation-hazard.md)
+  — No new measurement: the fill-model hazard in externally-sourced strategies (#529) — the four
+  questions to answer before porting one (fill model, cost regime, sample size, capability) and
+  the checklist form · cites the 08-13 restatement and the 08-12 fee curve
 - [`2026-08-22-trailing-vs-static-exits.md`](2026-08-22-trailing-vs-static-exits.md) — Does
   the #442 ratchet-only exit policy (ATR trail / break-even roll) help `pullback_continuation`
   or `rsi_meanrev` at the 120 bp fee? No — and the trailing arm is clearly worse; the knobs
