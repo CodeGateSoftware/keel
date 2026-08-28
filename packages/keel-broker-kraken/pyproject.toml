@@ -1,13 +1,13 @@
 [project]
 name = "keel-broker-kraken"
-version = "0.12.0"
+version = "0.12.1"
 description = "Kraken adapter for keel (port-complete stub; every data/market method raises)"
 license = "Apache-2.0"
 requires-python = ">=3.14"
 # Siblings pinned `==` (see the root `pyproject.toml`). There is deliberately NO third-party
 # dependency: this package is a stub (#313) that handles no keys and makes no network calls,
 # so a Kraken SDK (and its credentials) arrive with the real implementation, not before it.
-dependencies = ["keel-core==0.12.0", "keel-broker-api==0.12.0"]
+dependencies = ["keel-core==0.12.1", "keel-broker-api==0.12.1"]
 
 [project.entry-points."keel.brokers"]
 kraken = "keel_broker_kraken:KrakenAdapter"
