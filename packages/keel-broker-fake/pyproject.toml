@@ -1,11 +1,11 @@
 [project]
 name = "keel-broker-fake"
-version = "0.12.0"
+version = "0.12.1"
 description = "A deliberately divergent second broker adapter, to keep the port honest"
 license = "Apache-2.0"
 requires-python = ">=3.14"
 # Pinned `==`: see the note in the root `pyproject.toml`.
-dependencies = ["keel-core==0.12.0", "keel-broker-api==0.12.0"]
+dependencies = ["keel-core==0.12.1", "keel-broker-api==0.12.1"]
 
 [project.entry-points."keel.brokers"]
 fake = "keel_broker_fake:FakeAdapter"
