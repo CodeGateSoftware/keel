@@ -392,8 +392,9 @@ class PullbackContinuation(Rule):
     # remembered by the operator. Ranges are the ones the #476 Optuna study pinned; the
     # three fan slots are DISJOINT by design (a suggestion inside them cannot invert the
     # fan), each naming the ONE `ema_periods` tuple kwarg it feeds via `param=`. Steps are
-    # whole periods for the fan and one tick for the buffer -- the resolutions those
-    # studies moved in.
+    # whole periods for the fan and one tick for the buffer -- the grid the space is
+    # COUNTED at, never a record of the sampler: the #476 TPE study drew step-1 ints (on
+    # the fan's grid) and continuous floats (off the buffer's).
     _PARAM_SPACE: tuple[ParamSpec, ...] = (
         ParamSpec("ema_fast", "int", 5, 12, Decimal(1), param="ema_periods"),
         ParamSpec("ema_mid", "int", 15, 30, Decimal(1), param="ema_periods"),

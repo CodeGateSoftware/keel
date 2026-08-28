@@ -179,13 +179,18 @@ def _explored_box(family: str, trials: list[TrialRow]) -> dict[str, tuple[float,
     values: dict[str, list[float]] = {name: [] for name in SEARCH_SPACES[family]}
     for trial in trials:
         params = trial["params"]
-        slots = (
-            dict(zip(("ema_fast", "ema_mid", "ema_slow"), params["ema_periods"], strict=True))
-            if family == "pullback_continuation"
-            else params
-        )
+        if family == "pullback_continuation":
+            fan = params["ema_periods"]
+            assert isinstance(fan, tuple)
+            slots: dict[str, object] = dict(
+                zip(("ema_fast", "ema_mid", "ema_slow"), fan, strict=True)
+            )
+        else:
+            slots = params
         for name in values:
-            values[name].append(float(slots[name]))
+            value = slots[name]
+            assert isinstance(value, (int, float))
+            values[name].append(float(value))
     return {name: (min(seen), max(seen)) for name, seen in values.items()}
 
 
@@ -202,7 +207,9 @@ def _one(job: tuple[str, str, str, int, int]) -> CellRow:
     is checked against that declaration before the row is written — the sampler draws inside
     `SEARCH_SPACES` by construction (now itself derived from the rules' declarations), so
     the check passing is the point: it is the assertion that makes an out-of-declaration
-    sweep impossible to record silently rather than a fact this driver promises.
+    sweep impossible to record silently rather than a fact this driver promises. When a
+    LATE cell's check refuses, the cells already written stay in the JSONL — the offending
+    row is never written, but the artifact it leaves behind is partial.
     """
     db_path, family, product_id, window, n_trials = job
     candles = load_candles(db_path, product_id)[-window:]
@@ -264,7 +271,9 @@ def _render_cell(row: CellRow) -> list[str]:
         f"({row['bars']} bars, {row['n_trials']} trials, seed {row['seed']}, "
         f"fee {row['fee_pct']}/leg, slippage {row['slippage_pct']}/leg):",
         f"  {row['n_trials']} trials of a declared space of {row['declared_cells']} cells "
-        f"({share:.1f}%) -- the budget the multiple-comparison correction must assume",
+        f"({share:.1f}% of the grid, counted at the declared steps); the budget the "
+        f"multiple-comparison correction must assume is the {row['n_trials']} trials run, "
+        f"never the {row['declared_cells']} cells",
         f"  best params {row['best_params']}",
         f"  train expectancy {row['best_train_expectancy']} -> held-out "
         f"{row['held_out_expectancy']} over {row['held_out_n_trades']} closed trades",

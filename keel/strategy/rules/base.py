@@ -127,6 +127,9 @@ class ParamSpec:
     arithmetic both read), `lo`/`hi` (the range considered legitimate -- mirroring what the
     #476 study actually pinned, not an aspiration), and `step` (the grid resolution the
     space is COUNTED at, so `cells` below is well-defined for a continuous sampler's box).
+    The candor that sentence owes: the sampler itself draws OFF that grid --
+    `suggest_int`/`suggest_float` carry no step -- and an off-grid draw is invisible to a
+    min/max box, so every cells count is a grid convention, never a set of visited points.
 
     `param` names the constructor kwarg this dimension feeds, when that is not the
     dimension's own name: `PullbackContinuation`'s EMA fan is searched as three slots

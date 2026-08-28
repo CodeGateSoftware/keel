@@ -238,7 +238,11 @@ def explored_vs_declared(
     ranges -- otherwise, because an explored range that silently exceeds the declared one
     spends trials budget the count above never included, which is exactly the asymmetry
     #528 exists to close. A dimension the rule never declared is the worse drift (no
-    denominator exists for it at all) and is refused in the same breath.
+    denominator exists for it at all) and is refused in the same breath. The candor the
+    number owes: `explored_cells` is a grid-convention count -- the sampler draws off-grid
+    (`suggest_int`/`suggest_float` carry no step) and an off-grid draw is invisible to a
+    min/max box -- so it prices the box at the declared steps, it never enumerates what
+    was visited. An empty box explores the explicit `0`, never the empty product's `1`.
 
     PURE: reads only its arguments and the rule's own declaration -- no clock, no RNG, no
     ledger -- so a driver can call it per cell and get identical answers for identical
@@ -265,7 +269,10 @@ def explored_vs_declared(
     if violations:
         raise ValueError("; ".join(violations))
 
-    covered = 1
+    # An empty box is the explicit zero, not an error (the module's own convention for
+    # honest empties -- `declared_cells` gives dca `0` the same way): nothing was swept,
+    # and the empty product's `1` would claim a cell no trial ever visited.
+    covered = 1 if explored else 0
     for name, (low, high) in explored.items():
         spec = specs[name]
         span = Decimal(str(high)) - Decimal(str(low))

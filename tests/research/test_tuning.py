@@ -612,3 +612,8 @@ def test_explored_vs_declared_refuses_a_dimension_the_rule_never_declared() -> N
     budget, so the trials arithmetic has no denominator for it at all. Refused, named."""
     with pytest.raises(ValueError, match="adx_period"):
         tuning.explored_vs_declared({"adx_period": (10, 20)}, "turtle_breakout")
+
+
+def test_explored_vs_declared_empty_box_explores_zero_not_one() -> None:
+    """An empty box sweeps nothing: the explicit zero, never the empty product's phantom 1."""
+    assert tuning.explored_vs_declared({}, "rsi_meanrev").explored_cells == 0

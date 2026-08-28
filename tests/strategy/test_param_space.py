@@ -46,7 +46,9 @@ def _space(kind: str) -> tuple[ParamSpec, ...]:
 def test_turtle_declares_exactly_the_space_the_476_study_searched() -> None:
     """Field-for-field, equal to the ranges `tuning.SEARCH_SPACES` hand-maintained before
     #528 -- the walk-forward-validated Donchian channels, the KB ADX gate band, the Turtle
-    2N stop, the nominal R:R. Steps are the resolutions those studies actually moved in."""
+    2N stop, the nominal R:R. Steps are the older manual grids' resolutions -- the grid the
+    space is COUNTED at; the #476 TPE study drew step-1 ints and continuous floats, so it
+    did not move in them."""
     assert _space("turtle_breakout") == (
         ParamSpec("entry_lookback", "int", 20, 60, Decimal(5)),
         ParamSpec("exit_lookback", "int", 10, 30, Decimal(5)),

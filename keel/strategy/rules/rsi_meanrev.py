@@ -92,8 +92,10 @@ class RsiMeanReversion(Rule):
     # The declared parameter space (issue #528): what a sweep may legitimately explore on
     # this rule, stated HERE so the trials count is derived from the rule rather than
     # remembered by the operator. Ranges are the ones the #476 Optuna study pinned (and the
-    # 2026-08-12 sweep before it); steps are the resolutions those studies moved in -- RSI
-    # levels in 5s, the ATR stop in halves, R:R and the RSI length in whole numbers.
+    # 2026-08-12 sweep before it); steps are the resolutions that older manual grid moved
+    # in -- RSI levels in 5s, the ATR stop in halves, R:R and the RSI length in whole
+    # numbers -- while the #476 TPE study sampled step-1 ints and continuous floats, so a
+    # step is the grid the space is COUNTED at, never a record of what that sampler drew.
     # `ClassVar` keeps the dataclass machinery from mistaking this for a field, exactly as
     # `PARAM_DOCS` above does.
     _PARAM_SPACE: ClassVar[tuple[ParamSpec, ...]] = (

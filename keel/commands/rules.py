@@ -452,7 +452,7 @@ def _lookahead_warmup(rule: Any) -> int:
     if isinstance(ema_periods, (tuple, list)) and ema_periods:
         try:
             hints.append(max(int(period) for period in ema_periods))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             pass  # a non-numeric element is the add-flow's refusal, not this walk's problem
     return max([bias_mod.DEFAULT_WARMUP, *hints])
 
@@ -1830,7 +1830,7 @@ def _init_hints(rule_cls: type) -> dict[str, Any]:
         # `type: ignore[misc]`: mypy rejects reading `__init__` off a value because a subclass
         # could carry an incompatible one -- which is precisely what is being introspected here.
         return get_type_hints(rule_cls.__init__)  # type: ignore[misc]
-    except NameError, TypeError:  # an unresolvable forward ref, or a slot wrapper __init__
+    except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
         return {}
 
 
@@ -1893,7 +1893,7 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
         for spec in rule.param_space():
             declared.setdefault(spec.kwarg, ())
             declared[spec.kwarg] += (spec,)
-    except TypeError, ValueError, ArithmeticError:
+    except (TypeError, ValueError, ArithmeticError):
         persisted = None
         declared = {}
     docs = getattr(rule_cls, "PARAM_DOCS", {})

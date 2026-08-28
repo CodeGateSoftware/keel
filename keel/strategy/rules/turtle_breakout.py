@@ -178,8 +178,10 @@ class TurtleBreakout(Rule):
     # this rule, stated HERE so the trials count is derived from the rule rather than
     # remembered by the operator. Ranges are the ones the #476 Optuna study pinned (and the
     # walk-forward validation before it considered legitimate); steps are the resolutions
-    # those studies actually moved in -- Donchian channels and the ADX gate in 5s, the stop
-    # in half-N (the classic Turtle 2N), the R:R in whole numbers. Declaring this is not
+    # the older manual grids moved in -- Donchian channels and the ADX gate in 5s, the stop
+    # in half-N (the classic Turtle 2N), the R:R in whole numbers -- while the #476 TPE
+    # study sampled step-1 ints and continuous floats, so a step is the grid the space is
+    # COUNTED at, never a record of what that sampler drew. Declaring this is not
     # licence to search it: the non-goal stands, and `research.tuning` is the only reader.
     _PARAM_SPACE: tuple[ParamSpec, ...] = (
         ParamSpec("entry_lookback", "int", 20, 60, Decimal(5)),
