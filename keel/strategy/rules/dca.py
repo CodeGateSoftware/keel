@@ -128,11 +128,21 @@ class Dca(Rule):
             ts=latest.ts,
         )
 
-    def exit_signal(
-        self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> bool:
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """DCA never exits on a signal -- it's accumulation, not a risk-defined trade."""
         return False
 
+    # No `param_space()` override, deliberately: this rule declares NOTHING sweepable.
+    # DCA is accumulation, not a risk-defined trade -- no stop, no target, no entry logic
+    # a parameter study could legitimately explore (#476 excluded it for exactly that),
+    # so it inherits the ABC's empty declaration and `declared_cells("dca")` is an honest
+    # zero rather than a budget over knobs nobody has ever defended sweeping.
+
     def describe(self) -> dict:
-        return {"name": self.name, "params": self.params}
+        return {
+            "name": self.name,
+            "params": self.params,
+            # Empty, and rendered empty: a rule's self-description says what each
+            # parameter is ALLOWED to be, and for this rule that is "nothing is".
+            "param_space": [spec.plain() for spec in self.param_space()],
+        }

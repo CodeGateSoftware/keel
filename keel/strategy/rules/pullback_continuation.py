@@ -51,7 +51,7 @@ from typing import Literal
 
 from keel.analysis import candles as candle_lib
 from keel.analysis import indicators, levels, regime
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import ParamSpec, Rule, Setup
 from keel.types import Candle, Granularity
 
 EntryZone = Literal["ema_touch", "ema_band"]
@@ -387,6 +387,21 @@ class PullbackContinuation(Rule):
         ),
     }
 
+    # The declared parameter space (issue #528): what a sweep may legitimately explore on
+    # this rule, stated HERE so the trials count is derived from the rule rather than
+    # remembered by the operator. Ranges are the ones the #476 Optuna study pinned; the
+    # three fan slots are DISJOINT by design (a suggestion inside them cannot invert the
+    # fan), each naming the ONE `ema_periods` tuple kwarg it feeds via `param=`. Steps are
+    # whole periods for the fan and one tick for the buffer -- the grid the space is
+    # COUNTED at, never a record of the sampler: the #476 TPE study drew step-1 ints (on
+    # the fan's grid) and continuous floats (off the buffer's).
+    _PARAM_SPACE: tuple[ParamSpec, ...] = (
+        ParamSpec("ema_fast", "int", 5, 12, Decimal(1), param="ema_periods"),
+        ParamSpec("ema_mid", "int", 15, 30, Decimal(1), param="ema_periods"),
+        ParamSpec("ema_slow", "int", 40, 70, Decimal(1), param="ema_periods"),
+        ParamSpec("buffer_ticks", "decimal", 0.01, 0.05, Decimal("0.01")),
+    )
+
     def __init__(
         self,
         product_id: str,
@@ -576,7 +591,14 @@ class PullbackContinuation(Rule):
         return self._match_signal_pattern(candles, "bearish") is not None
 
     def describe(self) -> dict:
-        return {"name": self.name, "params": self.params}
+        return {
+            "name": self.name,
+            "params": self.params,
+            "param_space": [spec.plain() for spec in self.param_space()],
+        }
+
+    def param_space(self) -> tuple[ParamSpec, ...]:
+        return self._PARAM_SPACE
 
     # ------------------------------------------------------------------
     # Internals

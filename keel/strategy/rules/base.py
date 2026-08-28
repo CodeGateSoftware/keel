@@ -6,13 +6,18 @@ the evaluation engine, the backtester, and the paper trader (Phase 2 tasks 2-9).
 
 Money/prices are always `Decimal`. Long-only spot, no leverage: `Setup.direction`
 is pinned to `"long"` for v1; bearish setups are exit/don't-buy filters, not shorts.
+
+`ParamSpec`/`Rule.param_space` (issue #528) live here too: a rule's declaration of the
+dimensions a parameter sweep may legitimately explore, which is what makes the trials
+count for the overfitting correction DERIVABLE rather than remembered -- see the PRD
+(`docs/superpowers/specs/2026-08-23-strategy-api-expressiveness-prd.md` §4.1).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
 from typing import Any, Literal
 
@@ -103,6 +108,104 @@ class Trade:
     outcome: TradeOutcome
 
 
+#: The arithmetic a declared dimension carries: `"int"` means the legitimate values are
+#: INTEGRAL (whatever the constructor field's storage type -- `target_rr` is a `Decimal`
+#: field whose legitimate values are whole numbers), and only those bounds are suggested
+#: as ints; `"float"`/`"decimal"` name the field's own storage (a level like `oversold`
+#: vs a money-adjacent multiple like `atr_stop_mult`) and share the fractional dispatch.
+ParamType = Literal["int", "float", "decimal"]
+
+
+@dataclass(frozen=True)
+class ParamSpec:
+    """One dimension of a rule's declared parameter space (issue #528): what a sweep may
+    legitimately explore on this knob, stated BY THE RULE rather than restated by whoever
+    runs the sweep.
+
+    A declaration is three facts and a denominator: `name` (the dimension, in the searcher's
+    vocabulary), `type` (int vs fractional, which the suggest dispatch and the cells
+    arithmetic both read), `lo`/`hi` (the range considered legitimate -- mirroring what the
+    #476 study actually pinned, not an aspiration), and `step` (the grid resolution the
+    space is COUNTED at, so `cells` below is well-defined for a continuous sampler's box).
+    The candor that sentence owes: the sampler itself draws OFF that grid --
+    `suggest_int`/`suggest_float` carry no step -- and an off-grid draw is invisible to a
+    min/max box, so every cells count is a grid convention, never a set of visited points.
+
+    `param` names the constructor kwarg this dimension feeds, when that is not the
+    dimension's own name: `PullbackContinuation`'s EMA fan is searched as three slots
+    (`ema_fast`/`ema_mid`/`ema_slow`) but constructed as ONE `ema_periods` tuple, and the
+    drift test reads `kwarg` to assert every declared dimension lands on a real, persisted
+    constructor parameter -- a declaration naming a kwarg that no longer exists would
+    silently shrink the trials count derived from it, which is worse than no declaration.
+
+    This is a DECLARATION, not an invitation: nothing here searches anything, and running
+    an optimiser against it is the explicit non-goal of #528 (the issue's own words -- it
+    "would manufacture exactly the overfitting the deflated-Sharpe machinery exists to
+    detect"). What it buys is that the size of the explorable space is a property of the
+    rule, so `n_trials` stops being a number a human remembers to record.
+    """
+
+    name: str
+    type: ParamType
+    lo: int | float
+    hi: int | float
+    step: Decimal
+    #: The constructor kwarg this dimension feeds, when it is not `name` itself.
+    param: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse the malformations loudly, at construction, where the declaration is
+        written -- a silently-broken spec would corrupt every count derived from it."""
+        if self.type not in ("int", "float", "decimal"):
+            raise ValueError(f"{self.name!r}: unknown param space type {self.type!r}")
+        if Decimal(str(self.lo)) > Decimal(str(self.hi)):
+            raise ValueError(f"{self.name!r}: lo {self.lo} exceeds hi {self.hi}")
+        if self.step <= 0:
+            raise ValueError(f"{self.name!r}: step {self.step} must be positive")
+        if self.type == "int" and not (isinstance(self.lo, int) and isinstance(self.hi, int)):
+            # `bool` is an `int` subclass but no one declares a bool dimension; the strict
+            # pair check is what keeps the int-vs-float suggest dispatch honest.
+            raise ValueError(
+                f"{self.name!r}: type {self.type!r} needs int bounds, got {self.lo!r}, {self.hi!r}"
+            )
+
+    @property
+    def kwarg(self) -> str:
+        """The constructor kwarg this dimension feeds: itself, unless it is one slot of a
+        decomposed kwarg (`ema_fast` -> `ema_periods`)."""
+        return self.name if self.param is None else self.param
+
+    @property
+    def bounds(self) -> tuple[int, int] | tuple[float, float]:
+        """The `(lo, hi)` pair in the types the sampler dispatch reads: an INT pair exactly
+        when the dimension is integral (the #476 harness dispatches on `isinstance(low,
+        int)`, so a float `20.0` here would silently turn a discrete lookback into a
+        continuous draw), a float pair otherwise."""
+        if self.type == "int":
+            return (int(self.lo), int(self.hi))
+        return (float(self.lo), float(self.hi))
+
+    @property
+    def cells(self) -> int:
+        """How many grid points the dimension holds at its declared step, both ends
+        inclusive. A step that does not evenly divide the span FLOORS -- the honest count
+        of grid points inside the range, never one beyond it."""
+        span = Decimal(str(self.hi)) - Decimal(str(self.lo))
+        return int((span / self.step).to_integral_value(rounding=ROUND_FLOOR)) + 1
+
+    def plain(self) -> dict[str, object]:
+        """The spec as JSON-plain data (`step` as a string, the repo's TEXT-money
+        convention): the form `describe()` embeds, so a rule's self-description can say
+        what a parameter is ALLOWED to be wherever `describe()` already travels."""
+        return {
+            "name": self.name,
+            "type": self.type,
+            "lo": self.lo,
+            "hi": self.hi,
+            "step": str(self.step),
+        }
+
+
 class Rule(ABC):
     """A strategy rule: detects long entries and signals exits from held longs.
 
@@ -144,9 +247,7 @@ class Rule(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def exit_signal(
-        self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> bool:
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """Whether to close the held long `Setup` given the latest candles."""
         raise NotImplementedError
 
@@ -154,3 +255,17 @@ class Rule(ABC):
     def describe(self) -> dict:
         """Name + params, for persistence in the `rules` table."""
         raise NotImplementedError
+
+    def param_space(self) -> tuple[ParamSpec, ...]:
+        """The dimensions of this rule's parameter space a sweep may legitimately explore
+        (issue #528). Default: EMPTY -- a rule with nothing sweepable declares exactly
+        that, which is a truthful statement ("0 declared cells"), not a missing one.
+
+        The declaration is what makes the trials count for the overfitting correction
+        (`research.deflate.expected_max_sharpe(n_trials)`) derivable rather than
+        remembered: `research.tuning` reads it to build its search spaces (one source of
+        truth, not two that can disagree), `declared_cells` counts the grid it implies,
+        and a sweep that explores beyond it is refused rather than silently exceeded.
+        Declaring the space is NOT licence to search it -- no optimiser ships with this.
+        """
+        return ()

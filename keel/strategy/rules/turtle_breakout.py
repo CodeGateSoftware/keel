@@ -64,7 +64,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from keel.analysis.indicators import adx, atr, donchian_high, donchian_low, macd
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import ParamSpec, Rule, Setup
 from keel.types import Candle, Granularity
 
 _DAY_SECONDS = 24 * 60 * 60
@@ -173,6 +173,25 @@ class TurtleBreakout(Rule):
             "exists to clear the engine's rr>=1 kill-zone gate and let winners run."
         ),
     }
+
+    # The declared parameter space (issue #528): what a sweep may legitimately explore on
+    # this rule, stated HERE so the trials count is derived from the rule rather than
+    # remembered by the operator. Ranges are the ones the #476 Optuna study pinned (and the
+    # walk-forward validation before it considered legitimate); steps are the resolutions
+    # the older manual grids moved in -- Donchian channels and the ADX gate in 5s, the stop
+    # in half-N (the classic Turtle 2N), the R:R in whole numbers -- while the #476 TPE
+    # study sampled step-1 ints and continuous floats, so a step is the grid the space is
+    # COUNTED at, never a record of what that sampler drew. Declaring this is not
+    # licence to search it: the non-goal stands, and `research.tuning` is the only reader.
+    _PARAM_SPACE: tuple[ParamSpec, ...] = (
+        ParamSpec("entry_lookback", "int", 20, 60, Decimal(5)),
+        ParamSpec("exit_lookback", "int", 10, 30, Decimal(5)),
+        ParamSpec("adx_threshold", "float", 20.0, 35.0, Decimal(5)),
+        ParamSpec("atr_stop_mult", "decimal", 1.5, 3.0, Decimal("0.5")),
+        # A `Decimal` FIELD whose legitimate values are whole numbers: "int" names the
+        # RANGE's arithmetic (discrete, suggested and counted as ints), not the storage.
+        ParamSpec("target_rr", "int", 3, 8, Decimal(1)),
+    )
 
     # How many completed daily bars back the S1 filter replays to find the most recent
     # completed prior breakout trade (~16 months) -- generous enough to always contain it at
@@ -408,7 +427,14 @@ class TurtleBreakout(Rule):
         return float(daily[-1].close) <= exit_level
 
     def describe(self) -> dict:
-        return {"name": self.name, "params": self.params}
+        return {
+            "name": self.name,
+            "params": self.params,
+            "param_space": [spec.plain() for spec in self.param_space()],
+        }
+
+    def param_space(self) -> tuple[ParamSpec, ...]:
+        return self._PARAM_SPACE
 
     # ------------------------------------------------------------------
     # S1 profitable-trade filter (pure history; only called from detect() on a breakout bar)

@@ -184,6 +184,32 @@ def test_describe_params_quotable_matches_the_coercion_tables() -> None:
             assert help_.quotable == (name in quotable), f"{kind}.{name}"
 
 
+def test_describe_params_carries_the_declared_space_of_each_parameter() -> None:
+    """#528: the parameter help says what a parameter is ALLOWED to be, not just what it
+    currently is. `space` comes from the rule's own `param_space()` declaration (read off
+    the same constructed rule the persisted-params set comes from), so the help can never
+    restate a range the rule did not declare.
+
+    A param that is one slot of a larger declared kwarg (pullback's `ema_periods`, whose
+    three searched slots ride one tuple) carries ALL THREE specs; a param outside every
+    declaration (a filter toggle, an unsearched period) carries none -- empty, the honest
+    'no declared range', never a hand-typed range."""
+    turtle = describe_params("turtle_breakout")
+    (entry_space,) = turtle["entry_lookback"].space
+    assert (entry_space.name, entry_space.type) == ("entry_lookback", "int")
+    assert (entry_space.lo, entry_space.hi) == (20, 60)
+    assert turtle["adx_period"].space == ()  # real kwarg, never declared sweepable
+    assert turtle["use_macd_confirm"].space == ()  # a bool filter is not a dimension
+
+    pullback = describe_params("pullback_continuation")
+    fan = pullback["ema_periods"].space
+    assert [spec.name for spec in fan] == ["ema_fast", "ema_mid", "ema_slow"]
+    assert all(spec.kwarg == "ema_periods" for spec in fan)
+    assert pullback["entry_zone"].space == ()
+
+    assert all(help_.space == () for help_ in describe_params("dca").values())
+
+
 # -- add_rule_row: the `rules add` service --------------------------------------------------------
 
 

@@ -514,3 +514,106 @@ def test_run_study_names_the_extra_when_optuna_is_missing(
             n_trials=1,
             seed=1,
         )
+
+
+# -- 16-22. the declaration is the source; the budget is derived from it (#528) --------------------
+
+
+def test_search_spaces_is_derived_from_the_rules_own_declarations() -> None:
+    """The dedupe proof. `SEARCH_SPACES` used to be a hand-maintained dict that could
+    disagree with the rules; now every bound is READ off `Rule.param_space()` at import,
+    so deleting the dict literal changes nothing -- the rule is the only source, and a
+    bound moves only where the rule declares it."""
+    for kind, space in tuning.SEARCH_SPACES.items():
+        declared = build_rule_from_params(kind, {"product_id": "BTC-USD"}).param_space()
+        assert space == {spec.name: spec.bounds for spec in declared}, kind
+    # dca declares nothing sweepable -> no entry, exactly as when the dict was hand-kept.
+    assert "dca" not in tuning.SEARCH_SPACES
+
+
+def test_declared_cells_is_the_grid_size_at_the_declared_steps() -> None:
+    """The derivable trials budget: the number of cells a FULL sweep of the declared space
+    would visit. Pinned by hand so a step edit that silently resizes a family's budget
+    fails here, not in a ledger row six months later.
+
+    turtle: 9 lookbacks x 5 exits x 4 ADX gates x 4 stop widths x 6 R:R = 4320;
+    rsi:     4 oversold x 4 overbought x 4 stop widths x 3 R:R x 12 RSI lengths = 2304;
+    pullback: 8 fast x 16 mid x 31 slow EMAs x 5 buffers = 19840.
+    """
+    assert tuning.declared_cells("turtle_breakout") == 4320
+    assert tuning.declared_cells("rsi_meanrev") == 2304
+    assert tuning.declared_cells("pullback_continuation") == 19840
+
+
+def test_declared_cells_is_zero_for_dca_and_loud_for_an_unknown_kind() -> None:
+    """An empty declaration is the honest zero, not an error; an unregistered kind has no
+    declaration to read and must refuse rather than return a plausible 0."""
+    assert tuning.declared_cells("dca") == 0
+    with pytest.raises(ValueError, match="no rule registered"):
+        tuning.declared_cells("not_a_rule_kind")
+
+
+def test_explored_vs_declared_accepts_a_range_within_the_declaration() -> None:
+    """A sweep inside the declaration gets its honesty numbers: how many declared cells
+    the explored box covers, of how many exist. Nothing raises -- the box is legal."""
+    check = tuning.explored_vs_declared(
+        {
+            "entry_lookback": (25, 55),
+            "exit_lookback": (10, 30),
+            "adx_threshold": (20.0, 30.0),
+            "atr_stop_mult": (1.5, 2.5),
+            "target_rr": (3, 6),
+        },
+        "turtle_breakout",
+    )
+    assert check.declared_cells == 4320
+    # (55-25)/5+1 = 7, (30-10)/5+1 = 5, (30-20)/5+1 = 3, (2.5-1.5)/0.5+1 = 3, (6-3)+1 = 4.
+    assert check.explored_cells == 7 * 5 * 3 * 3 * 4 == 1260
+
+
+def test_explored_vs_declared_is_pure_and_deterministic() -> None:
+    """Same inputs, same check, twice: the helper reads only its arguments and the rule's
+    own declaration -- no clock, no RNG, no ledger -- so a driver can call it per cell and
+    get identical answers for identical sweeps."""
+    box = {"oversold": (15.0, 30.0), "atr_mult": (1.0, 2.5)}
+    first = tuning.explored_vs_declared(box, "rsi_meanrev")
+    second = tuning.explored_vs_declared(box, "rsi_meanrev")
+    assert first == second
+    assert first.declared_cells == tuning.declared_cells("rsi_meanrev")
+
+
+def test_explored_vs_declared_refuses_a_range_exceeding_the_declaration() -> None:
+    """The issue's own words: an explored range cannot silently exceed the declared one.
+    The refusal names the parameter AND both ranges, so the operator reads the fix off the
+    error rather than off the rule's source."""
+    with pytest.raises(ValueError) as excinfo:
+        tuning.explored_vs_declared(
+            {"entry_lookback": (10, 80), "exit_lookback": (10, 30)}, "turtle_breakout"
+        )
+    message = str(excinfo.value)
+    assert "entry_lookback" in message
+    assert "10..80" in message  # the explored range
+    assert "20..60" in message  # the declared range it exceeds
+
+
+def test_explored_vs_declared_refuses_every_exceeding_dimension_at_once() -> None:
+    """Two violations, both named: the refusal is one loud error carrying the whole
+    diagnosis, not a whack-a-mole of first-offender-only errors."""
+    with pytest.raises(ValueError) as excinfo:
+        tuning.explored_vs_declared(
+            {"entry_lookback": (10, 80), "target_rr": (2, 9)}, "turtle_breakout"
+        )
+    message = str(excinfo.value)
+    assert "entry_lookback" in message and "target_rr" in message
+
+
+def test_explored_vs_declared_refuses_a_dimension_the_rule_never_declared() -> None:
+    """Sweeping an undeclared knob is the worse drift: its range was never counted in any
+    budget, so the trials arithmetic has no denominator for it at all. Refused, named."""
+    with pytest.raises(ValueError, match="adx_period"):
+        tuning.explored_vs_declared({"adx_period": (10, 20)}, "turtle_breakout")
+
+
+def test_explored_vs_declared_empty_box_explores_zero_not_one() -> None:
+    """An empty box sweeps nothing: the explicit zero, never the empty product's phantom 1."""
+    assert tuning.explored_vs_declared({}, "rsi_meanrev").explored_cells == 0
