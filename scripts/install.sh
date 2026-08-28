@@ -119,6 +119,11 @@ say "  enforcing Python >= ${FLOOR} (from ${FLOOR_SOURCE})"
 # 3.11 tries python3 then 3.14, 3.13, 3.12, 3.11. On a machine whose `python3` is an
 # older system Python, the loop must still find a newer one installed alongside it -- a
 # pyenv or deadsnakes interpreter that never shims `python3` is found by its own name.
+#: The newest Python minor this script tries by name. UPDATE THIS CONSTANT when a newer
+#: minor is one machines actually carry: a release floor past 14 lifts the walk only to
+#: the floor itself, so a 3.15-or-later installed alongside an older `python3` -- the
+#: pyenv/deadsnakes case the comment above exists for -- is never tried by name until
+#: this number moves. Track what the platforms ship, never the development tree's floor.
 NEWEST_KNOWN_MINOR=14
 if [ "$FLOOR_MINOR" -gt "$NEWEST_KNOWN_MINOR" ]; then NEWEST_KNOWN_MINOR="$FLOOR_MINOR"; fi
 CANDIDATES=("python${FLOOR_MAJOR}")
@@ -295,6 +300,9 @@ printf '               key in ~/.keel/.env.\n'
 printf '               For a config that simulates instead -- the dev template in\n'
 printf '               auto_trade.mode: paper, which places nothing at all -- run from\n'
 printf '               ~/.keel: ./.venv/bin/keel init-config --force\n'
+printf '               (--force OVERWRITES the current config.yaml -- copy yours aside\n'
+printf '               first if you have edited it; flipping auto_trade.mode to paper in\n'
+printf '               the existing config.yaml is the no-overwrite alternative)\n'
 printf '  guide:       https://keeltrading.com\n'
 printf '  updates:     re-run this installer to move to a later release (#439, option A), or\n'
 printf '               run: keel update   (from ~/.keel -- it serves this venv layout).\n'

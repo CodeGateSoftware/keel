@@ -122,6 +122,20 @@ def test_the_floor_comes_from_the_release_being_installed(script: str) -> None:
         "the version check no longer compares against the derived floor -- a literal minor "
         "here is how #557 happened"
     )
+    # The parse is pinned whole, because the assertions above cannot tell a correct
+    # program from a loosened one: a specifier class like `[<>=]*` passes them all while
+    # reading a `<3.14`-style specifier as a floor of 3.14 -- #557 smuggled back in
+    # through the regex instead of a hardcoded minor. The program must accept ONLY a
+    # `>=X.Y` requires-python.
+    sed_program = (
+        r"""s/^[[:space:]]*requires-python[[:space:]]*=[[:space:]]*">=[[:space:]]*"""
+        r"""\([0-9][0-9]*\.[0-9][0-9]*\)\(\.[0-9][0-9]*\)*"[[:space:]]*$/\1/p"""
+    )
+    assert sed_program in script, (
+        "the requires-python parse is no longer the exact >=-only sed program -- a "
+        "loosened specifier class would accept '<3.14'-style specifiers and re-introduce "
+        "#557 through the regex"
+    )
 
 
 def test_the_floor_fetch_precedes_the_python_search(script: str) -> None:
@@ -147,12 +161,18 @@ def test_a_failed_floor_fetch_falls_back_to_a_commented_constant(script: str) ->
     )
 
 
-def test_the_enforced_floor_and_its_source_are_printed(script: str) -> None:
+def test_the_enforced_floor_and_its_source_are_printed(script: str, code: list[str]) -> None:
     """Auditable: the run must say WHICH floor it enforces and WHERE it came from, so an
-    operator (or a red CI leg) can see the release the number was read from."""
+    operator (or a red CI leg) can see the release the number was read from. The fallback
+    branch must be named by the text that reaches the operator -- the uppercase FALLBACK
+    literal inside the FLOOR_SOURCE construction -- not merely by a lowercase 'fallback'
+    in a comment, which tells the operator nothing."""
     assert ">= ${FLOOR}" in script, "the enforced floor is not stated"
     assert "${FLOOR_SOURCE}" in script, "the floor's source is not stated beside it"
-    assert "fallback" in script, "a fallback happens but is never named"
+    assert any('FLOOR_SOURCE="the FALLBACK constant' in line for line in code), (
+        "the fallback is never NAMED in what is printed -- the FLOOR_SOURCE construction "
+        "must carry the literal FALLBACK, not just a comment mentioning one"
+    )
 
 
 def test_the_candidate_names_are_built_from_the_floor(script: str) -> None:
@@ -292,14 +312,17 @@ def test_the_next_steps_point_at_the_real_paper_template(script: str) -> None:
 # -- the published one-liner, qualified where it is advertised (#557) -----------------------------
 
 
-def test_the_published_one_liner_is_qualified_for_linux() -> None:
+def test_the_published_one_liner_is_qualified_for_linux(script: str) -> None:
     """README.md publishes the one-liner and docs/desktop-install.md mirrors it, both
     without qualification; on Linux the script stops at its Python step unless a
     supported interpreter is already on PATH (#557). Both places must say so and state
     the CURRENT SHIPPED floor (3.11) -- not the development tree's floor, which is what
-    broke the Linux leg in the first place. Checked against whitespace-normalized text:
-    the qualifier must survive the repo's line wrapping, not sit on one lucky line.
-    """
+    broke the Linux leg in the first place. The DMG's first-mount note (written by
+    packaging/macos_app.sh, above the pip-install-the-wheels escape hatch) tells the same
+    truth. Checked against whitespace-normalized text: the qualifier must survive the
+    repo's line wrapping, not sit on one lucky line. The README's stated floor is then
+    checked against the script's FALLBACK_FLOOR constant, so the two numbers that are
+    maintained by hand cannot drift apart silently."""
     readme = " ".join((_ROOT / "README.md").read_text(encoding="utf-8").split())
     assert "On Linux" in readme and "wheels declare" in readme and "3.11" in readme, (
         "README.md does not qualify the installer one-liner for Linux with the shipped floor"
@@ -311,6 +334,23 @@ def test_the_published_one_liner_is_qualified_for_linux() -> None:
     assert "Python 3.14 or later" not in desktop, (
         "docs/desktop-install.md still publishes the DEV tree's floor as the installer's "
         "requirement -- exactly the confusion #557 is about"
+    )
+    dmg = " ".join((_ROOT / "packaging" / "macos_app.sh").read_text(encoding="utf-8").split())
+    assert "wheels declare" in dmg and "3.11" in dmg, (
+        "packaging/macos_app.sh's DMG note does not state the shipped floor beside the "
+        "pip-install-the-wheels alternative"
+    )
+    assert "Python 3.14 or later" not in dmg, (
+        "the DMG's first-mount note still publishes the DEV tree's floor as the wheels' "
+        "requirement -- the same confusion #557 is about, one mount screen later"
+    )
+    fallback = re.search(r'^FALLBACK_FLOOR="(\d+\.\d+)"', script, re.MULTILINE)
+    assert fallback, "the FALLBACK_FLOOR constant is gone from scripts/install.sh"
+    stated = re.search(r"wheels declare `?>=\s*(\d+\.\d+)", readme)
+    assert stated, "README.md no longer states the shipped floor beside the one-liner"
+    assert fallback.group(1) == stated.group(1), (
+        f"README.md states the shipped floor as {stated.group(1)!r} while the installer's "
+        f"FALLBACK_FLOOR is {fallback.group(1)!r} -- two manual constants that must be one"
     )
 
 
