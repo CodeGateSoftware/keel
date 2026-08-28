@@ -552,6 +552,9 @@ def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
     unaffected: it uses SQLite's own online-backup API, precisely because "a plain file copy of a
     database with a live rollback journal is not a snapshot", and that API reads committed WAL
     content too.
+
+    The standing decision this serves -- SQLite, one writer per file, and the four triggers that
+    would reopen the question -- is `docs/decisions/0002-sqlite-persistence.md` (#526).
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
