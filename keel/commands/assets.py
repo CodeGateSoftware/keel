@@ -60,19 +60,21 @@ LIQUIDITY_PROBE_DAYS = 180
 
 #: The venue every product screened here is listed on.
 #:
-#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The live path constructs
-#: `keel/data/cb_client.py`'s `CoinbaseClient` directly, so there is exactly one venue these
-#: product ids can mean, and an `InstrumentAttestation` is keyed on `(venue, product_id)` --
-#: which means the screen needs a venue id to look one up, and inventing a per-call parameter
-#: for a value with one possible answer would be a knob whose only safe setting is its default.
+#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The screen is REPO-DRIVEN
+#: and broker-less -- it reads cached candles, and no adapter handle reaches it -- so there is
+#: exactly one venue these product ids can mean, and an `InstrumentAttestation` is keyed on
+#: `(venue, product_id)` -- which means the screen needs a venue id to look one up, and
+#: inventing a per-call parameter for a value with one possible answer would be a knob whose
+#: only safe setting is its default.
 #:
-#: The broker-port migration replaces this with the adapter's own `BrokerCapabilities.venue`
-#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`), at which point the wrapper
-#: statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD` somewhere
-#: else -- which is issue #202's entire point and the reason the key is a pair. Until an adapter
-#: handle actually reaches this function, reading a venue id off one would be reading it off
-#: nothing: the same dead-gate pattern `capabilities.py` warns about, where a lookup that cannot
-#: fail reads as a defence.
+#: The eventual replacement is the adapter's own `BrokerCapabilities.venue`
+#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`) -- every broker the live path
+#: constructs since #524 finished the broker-port migration answers it -- at which point the
+#: wrapper statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD`
+#: somewhere else, which is issue #202's entire point and the reason the key is a pair.
+#: Threading a broker handle into this repo-driven screen (and a per-venue candle cache) is
+#: the remaining work; until it lands, reading a venue id off a broker this function does not
+#: hold would be reading it off nothing.
 VENUE = "coinbase"
 
 

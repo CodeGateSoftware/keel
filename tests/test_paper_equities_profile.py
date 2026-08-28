@@ -615,9 +615,9 @@ def test_build_broker_default_resolves_coinbase_through_the_registry(tmp_path, m
     config fails here. The direct `CoinbaseClient` construction this test used to pin is the
     thing #524 deleted; there is no second coinbase path left to drift against."""
     import coinbase.rest
+    from keel_broker_coinbase import CoinbaseAdapter
 
     from keel.commands._common import _build_broker
-    from keel_broker_coinbase import CoinbaseAdapter
 
     (tmp_path / ".env").write_text("CDP_API_KEY=cb-key\nCDP_API_SECRET=cb-secret\n")
     monkeypatch.chdir(tmp_path)
@@ -640,6 +640,13 @@ def test_build_broker_default_resolves_coinbase_through_the_registry(tmp_path, m
         "timeout": None,
     }
     assert isinstance(broker._transport, _FakeRESTClient)
+    # The default venue's broker is capabilities-bearing -- the read the venue-session
+    # recording already builds on. The pre-port client's grandfather clause (a live-path
+    # broker with no `capabilities()` at all) retired with #524, and this pins that it
+    # stays retired.
+    caps = broker.capabilities()
+    assert caps.venue == "coinbase"
+    assert caps.session_bound is False
 
 
 def test_build_broker_selects_alpaca_paper_iex(tmp_path, monkeypatch):

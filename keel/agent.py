@@ -910,9 +910,12 @@ def _venue_schedule(broker: Any) -> tuple[str, MarketSchedule, bool]:
     Returns `(venue, schedule, session_bound)`. `venue` comes from the same
     `capabilities()` read as `session_bound` (empty for a capabilities-less broker, which
     never records anyway). `session_bound=False` is also the answer for a broker that does
-    not implement the broker port at all (`keel/data/cb_client.py`'s `CoinbaseClient`, the
-    live path until the broker-port migration lands): a 24/7 posture with no clock to
-    consult, which keeps every existing crypto behavior byte-identical.
+    not implement the broker port at all -- paper mode's `broker=None`, or a third-party
+    object violating the port: a 24/7 posture with no clock to consult, which keeps every
+    existing crypto behavior byte-identical. (Every broker the LIVE path constructs since
+    #524 finished the migration is a registry-resolved adapter that answers `capabilities()`;
+    the pre-port client this fallback used to carry is gone from the path, but the fallback
+    itself stays: paper must never crash on its broker-less cycle.)
 
     The schedule read prefers the port's `market_schedule()` (issue #388 C2) and falls back
     to a DERIVED schedule -- `market_clock()`'s answer with null next open/close -- for a
