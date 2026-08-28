@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
+from typing import Any
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
@@ -160,11 +161,48 @@ class CoinbaseAdapter:
             return None
         try:
             value = Decimal(str(increment))
-        except (ArithmeticError, TypeError, ValueError):
+        except ArithmeticError, TypeError, ValueError:
             return None
         if value <= 0:
             return None
         return Instrument(product_id=product_id, base_increment=value)
+
+    def list_products(self, product_type: str = "SPOT") -> list[dict[str, Any]]:
+        """Every tradable product on the venue, as plain dicts. READ-ONLY market metadata.
+
+        A Coinbase-extra, not a port method, on purpose (#524): the port's catalogue surface is
+        the per-product `get_instrument` above, which is what the ORDER path reads; a ~900-row
+        catalogue sweep is a DISCOVERY concern (`keel assets discover`), and elevating it to the
+        port would hand every adapter a bulk endpoint only the discovery tool wants. Used only
+        by the allowlist DISCOVERY stage, which proposes candidates for human attestation -- it
+        decides nothing. Per §5's asymmetry, a proposal may come from anywhere; admission goes
+        through `compliance/screen.py`.
+
+        `base_increment`/`quote_increment` ride along as the venue's own strings because the
+        sweep surfaces them to the operator; the caller decides what is a Decimal.
+        """
+        raw = self._require_transport().get_products(product_type=product_type)
+        products = raw["products"] if isinstance(raw, dict) else raw.products
+        out: list[dict[str, Any]] = []
+        for product in products:
+            fields = product if isinstance(product, dict) else vars(product)
+            out.append(
+                {
+                    "product_id": fields.get("product_id"),
+                    "base_name": fields.get("base_name"),
+                    "quote_currency_id": fields.get("quote_currency_id"),
+                    "status": fields.get("status"),
+                    "trading_disabled": bool(fields.get("trading_disabled")),
+                    "is_disabled": bool(fields.get("is_disabled")),
+                    "view_only": bool(fields.get("view_only")),
+                    "quote_24h_volume": fields.get("approximate_quote_24h_volume"),
+                    # #516: the venue has always sent these, and the sweep surfaces them so an
+                    # operator can eyeball a product's granularity before fetching anything.
+                    "base_increment": fields.get("base_increment"),
+                    "quote_increment": fields.get("quote_increment"),
+                }
+            )
+        return out
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Preview via Coinbase's own endpoint -- hence `synthetic=False`."""

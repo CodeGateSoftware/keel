@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import BracketGTC, LimitGTC, OrderSpec
-from keel_broker_api.results import Balance, PlaceResult, Preview
+from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 from keel_core.subscription import SubscriptionStatus
 
 from keel.config import (
@@ -139,9 +139,7 @@ class FakeBroker:
         """
         self.get_balances_calls += 1
         if self._balances is not None:
-            return [
-                Balance(currency=c, available=b, total=b) for c, b in self._balances.items()
-            ]
+            return [Balance(currency=c, available=b, total=b) for c, b in self._balances.items()]
         if self._usdc_balance is None:
             return []
         return [
@@ -429,10 +427,7 @@ def test_rule_id_is_purely_additive_metadata_placement_and_guards_are_unchanged(
     assert result_a.vetoed_by == result_b.vetoed_by == []
     assert len(broker_a.preview_calls) == len(broker_b.preview_calls)
     assert len(broker_a.place_calls) == len(broker_b.place_calls)
-    assert (
-        broker_a.place_calls[0]["spec"]
-        == broker_b.place_calls[0]["spec"]
-    )
+    assert broker_a.place_calls[0]["spec"] == broker_b.place_calls[0]["spec"]
 
     order_a = repo.get_order(result_a.order_id)
     order_b = repo.get_order(result_b.order_id)
@@ -765,10 +760,7 @@ def test_live_execute_sizing_is_immune_to_reward_income_through_the_public_entry
         == expected * signal.setup.entry
     )
     # The order actually sent to the venue is identical -- same sized base_size.
-    assert (
-        reward_broker.place_calls[0]["spec"]
-        == clean_broker.place_calls[0]["spec"]
-    )
+    assert reward_broker.place_calls[0]["spec"] == clean_broker.place_calls[0]["spec"]
 
 
 # -- DCA sizing --------------------------------------------------------------------------------
@@ -1360,18 +1352,16 @@ class _PartiallyFillingBroker(FakeBroker):
 
     def __init__(self, filled_size: Decimal, average_price: Decimal) -> None:
         super().__init__()
-        self._observed = {
-            "order_id": "broker-order-1",
-            "product_id": "BTC-USD",
-            "side": "BUY",
-            "status": "FILLED",
-            "filled_size": filled_size,
-            "average_filled_price": average_price,
-            "total_fees": Decimal("0.18"),
-        }
+        self._observed = OrderStatus(
+            order_id="broker-order-1",
+            status="FILLED",
+            filled_size=filled_size,
+            average_filled_price=average_price,
+            total_fees=Decimal("0.18"),
+        )
 
-    def get_order(self, order_id: str) -> dict:
-        return dict(self._observed)
+    def get_order(self, order_id: str) -> OrderStatus:
+        return self._observed
 
 
 def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, caplog):
@@ -2063,14 +2053,14 @@ def test_an_immediately_filled_order_upgrades_to_the_OBSERVED_fill_and_fee(repo)
     """
 
     class _ObservingBroker(FakeBroker):
-        def get_order(self, order_id: str) -> dict:
-            return {
-                "order_id": order_id,
-                "status": "FILLED",
-                "filled_size": Decimal("0.001"),
-                "average_filled_price": Decimal("50123.45"),  # not the expected 50000
-                "total_fees": Decimal("0.42"),  # not the previewed 0.30
-            }
+        def get_order(self, order_id: str) -> OrderStatus:
+            return OrderStatus(
+                order_id=order_id,
+                status="FILLED",
+                filled_size=Decimal("0.001"),
+                average_filled_price=Decimal("50123.45"),  # not the expected 50000
+                total_fees=Decimal("0.42"),  # not the previewed 0.30
+            )
 
     broker = _ObservingBroker()
 
@@ -2087,7 +2077,7 @@ def test_an_unobservable_immediate_fill_keeps_the_estimate_rather_than_failing(r
     shipped before this upgrade existed."""
 
     class _BlindBroker(FakeBroker):
-        def get_order(self, order_id: str) -> dict:
+        def get_order(self, order_id: str) -> OrderStatus:
             raise RuntimeError("status endpoint down")
 
     broker = _BlindBroker()
@@ -2500,6 +2490,24 @@ def _quoted_preview(best_ask: str) -> dict[str, Any]:
     }
 
 
+def _quoted_quote(intent: Any, best_ask: str) -> Preview:
+    """`_quoted_preview`'s payload as the port's `Preview` -- the ONE shape the warning and the
+    spread gate read since #524 deleted their dict arms. Same `detail`-as-strings the real
+    adapter carries, so the safety paths exercise the same parsing they do live."""
+    return _preview_from(intent, _quoted_preview(best_ask))
+
+
+def test_preview_book_reads_the_ports_shape_only() -> None:
+    """#524's deletion proof: the dict arm of `_preview_book` is gone. A dict is no longer a
+    shape anything on the live path produces -- every constructible broker answers
+    `preview_order` with the port's `Preview` -- so the helper must read NO book out of one,
+    fail-closed exactly like a preview whose `detail` carries no sides."""
+    from keel.execution.executor import _preview_book
+
+    legacy_dict = _quoted_preview("50000")
+    assert _preview_book(legacy_dict) == (None, None)
+
+
 class TestEntryOverrideWarningAtRouting:
     """#260's minimum viable mitigation, at ROUTING time (the divergence class above reports
     after the fill; this warns before/at placement).
@@ -2581,9 +2589,10 @@ class TestEntryOverrideWarningAtRouting:
         market = Decimal("50000")
         at_the_line = market * (Decimal(1) + ENTRY_OVERRIDE_WARN_BP / Decimal(10_000))
 
+        at_the_line_intent = self._intent(entry=str(at_the_line))
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry=str(at_the_line)), _quoted_preview("50000")
+                at_the_line_intent, _quoted_quote(at_the_line_intent, "50000")
             )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
@@ -2597,10 +2606,9 @@ class TestEntryOverrideWarningAtRouting:
         """
         from keel.execution.executor import _warn_if_market_routing_overrides_entry
 
+        below = self._intent(entry="49700")
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(
-                self._intent(entry="49700"), _quoted_preview("50000")
-            )
+            _warn_if_market_routing_overrides_entry(below, _quoted_quote(below, "50000"))
 
         fields = _override_fields(caplog)
         assert fields["deviation_bps"] == "-60.00"
@@ -2624,10 +2632,14 @@ class TestEntryOverrideWarningAtRouting:
             "warning": [],
         }
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(self._intent(entry="50300"), bookless)
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="50300"), _preview_from(self._intent(), bookless)
+            )
             _warn_if_market_routing_overrides_entry(
                 self._intent(entry="50300"),
-                {**_quoted_preview("50000"), "best_ask": "not-a-number"},
+                _preview_from(
+                    self._intent(), {**_quoted_preview("50000"), "best_ask": "not-a-number"}
+                ),
             )
             # "nan" PARSES -- Decimal('NaN') constructs fine, and NaN > 0 raises
             # InvalidOperation. cb_client does Decimal(value) on venue strings with no
@@ -2636,11 +2648,11 @@ class TestEntryOverrideWarningAtRouting:
             # hazard inside its try).
             _warn_if_market_routing_overrides_entry(
                 self._intent(entry="50300"),
-                {**_quoted_preview("50000"), "best_ask": "nan"},
+                _preview_from(self._intent(), {**_quoted_preview("50000"), "best_ask": "nan"}),
             )
             # A zero/unusable intended entry has no meaningful deviation either.
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry="0"), _quoted_preview("50000")
+                self._intent(entry="0"), _quoted_quote(self._intent(), "50000")
             )
             # An extreme-but-finite exponent (a rule bug, not venue data): parses, is_finite,
             # and compares fine -- the DIVISION is what raises (Decimal Overflow, an
@@ -2693,7 +2705,9 @@ class TestEntryOverrideWarningAtRouting:
         )
 
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(sell_intent, _quoted_preview("50000"))
+            _warn_if_market_routing_overrides_entry(
+                sell_intent, _quoted_quote(sell_intent, "50000")
+            )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
 
@@ -2714,7 +2728,9 @@ class TestEntryOverrideWarningAtRouting:
 
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry="50300"), _quoted_preview("50000"), resting
+                self._intent(entry="50300"),
+                _quoted_quote(self._intent(entry="50300"), "50000"),
+                resting,
             )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
@@ -3202,3 +3218,160 @@ def test_a_failed_roll_RETAINS_its_crash_ledger_for_the_sweep(repo, caplog):
     assert intent, "a naked position with no ledger is the exact #519 hole"
     assert intent["stop"] == Decimal("50000")
     assert any("position_unprotected" in r.message for r in caplog.records)
+
+
+# -- #524: the registry serves the executor; the executor speaks only the port -----------------
+
+
+class _FixtureTransport:
+    """A `coinbase.rest.RESTClient` duck answering with the canned, real-shaped JSON the
+    `tests/fixtures/cb_*.json` files hold -- the same fixtures `tests/data/test_cb_client.py`
+    drives the legacy client with, so the adapter resolved below runs against data captured
+    from the venue's own response shapes. No network, no credentials."""
+
+    def __init__(self) -> None:
+        self.preview_calls: list[dict[str, Any]] = []
+        self.create_calls: list[dict[str, Any]] = []
+
+    def _fixture(self, name: str) -> Any:
+        from pathlib import Path
+
+        with (Path(__file__).parent.parent / "fixtures" / name).open() as f:
+            return json.load(f)
+
+    def get_accounts(self, **kwargs: Any) -> Any:
+        accounts = self._fixture("cb_accounts.json")
+        # The captured fixture holds USD 1042.55; the order the executor sizes from
+        # `_enter_signal` needs more, and rail 13 fails closed on the shortfall. Fund the
+        # account rather than shrink the order -- the point of this test is the full guarded
+        # path, not rail 13's arithmetic (that rail's own tests cover it).
+        for row in accounts["accounts"]:
+            if row["currency"] == "USD":
+                row["available_balance"]["value"] = "1000000.00"
+        return accounts
+
+    def get_product(self, product_id: str, **kwargs: Any) -> Any:
+        return self._fixture("cb_product.json")
+
+    def preview_order(
+        self, product_id: str, side: str, order_configuration: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        self.preview_calls.append(
+            {
+                "product_id": product_id,
+                "side": side,
+                "order_configuration": order_configuration,
+            }
+        )
+        return self._fixture("cb_preview_order.json")
+
+    def create_order(
+        self,
+        client_order_id: str,
+        product_id: str,
+        side: str,
+        order_configuration: dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        self.create_calls.append(
+            {
+                "client_order_id": client_order_id,
+                "product_id": product_id,
+                "side": side,
+                "order_configuration": order_configuration,
+            }
+        )
+        return self._fixture("cb_place_order_market.json")
+
+    def get_order(self, order_id: str, **kwargs: Any) -> Any:
+        return {
+            "order": {
+                "order_id": order_id,
+                "status": "FILLED",
+                "filled_size": "0.001",
+                "average_filled_price": "65440.00",
+                "total_fees": "0.60",
+            }
+        }
+
+
+def test_the_registry_resolved_coinbase_adapter_serves_execute_end_to_end(repo) -> None:
+    """#524's headline proof: the default venue's broker, resolved the way `_build_broker`
+    now resolves it, drives one full guarded BUY through the executor. The balance read feeds
+    rail 13, the instrument read sizes the order, the preview is the port's `Preview`, the
+    placement a `PlaceResult`, and the reconciliation read observes the fill -- with no dict
+    shape probed anywhere on the way through."""
+    from keel_broker_api.registry import load_broker
+
+    transport = _FixtureTransport()
+    broker = load_broker("coinbase")(transport)
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True
+    assert result.preview is not None and result.preview.synthetic is False
+    assert result.bracket_order_id is not None
+    # The entry and its bracket both reached the venue through the port's specs
+    assert [list(c["order_configuration"]) for c in transport.create_calls] == [
+        ["market_market_ioc"],
+        ["trigger_bracket_gtc"],
+    ]
+    assert transport.create_calls[0]["product_id"] == "BTC-USD"
+
+
+def test_the_registry_resolved_coinbase_adapter_serves_the_reconcile_sweep(repo) -> None:
+    """The third leg of the #524 pin. The same registry-built adapter that served the guarded
+    place and the preview also serves the sweep that later observes the resting bracket's fill:
+    the tranche is recorded the way `run_once` records it, the venue's answer arrives as the
+    port's `OrderStatus`, and the observed economics land on the order row and in the outcome --
+    with no dict shape probed anywhere on the way through."""
+    from keel_broker_api.registry import load_broker
+
+    from keel.execution.reconcile import reconcile_open_orders
+
+    transport = _FixtureTransport()
+    broker = load_broker("coinbase")(transport)
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+    assert result.placed and result.bracket_order_id is not None
+    # What `run_once` leaves behind after a filled entry: the tranche, pointed at its bracket.
+    entry = repo.get_order(result.order_id)
+    position_id = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=entry["qty"],
+        entry_fee=entry["fee"] or Decimal("0"),
+        entry_fill=entry["actual_fill"],
+    )
+    repo.set_position_bracket(position_id, result.bracket_order_id)
+
+    changed = reconcile_open_orders(broker, repo, _config(), now_ts=NOW_TS + 900)
+
+    # The market entry filled at placement; the resting bracket is the sweep's one row.
+    assert changed == [result.bracket_order_id]
+    bracket = repo.get_order(result.bracket_order_id)
+    assert bracket["status"] == "filled"
+    assert bracket["actual_fill"] == Decimal("65440.00")  # observed, not the stop it rested at
+    assert bracket["fee"] == Decimal("0.60")
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1 and outcomes[0]["exit_fill"] == Decimal("65440.00")
+
+
+def test_a_registry_resolved_fake_venue_serves_the_executors_port_reads(repo) -> None:
+    """The second adapter the registry can hand the executor: the fake venue, whose deliberate
+    divergences are the port's design pressure. Its balances and instrument reads serve the
+    executor's two pre-order port calls, and its refusal to preview is the port's honest
+    exception -- a capability-declined `NotImplementedError`, never a shape mismatch."""
+    from keel_broker_api.orders import MarketIOCByQuote
+    from keel_broker_api.registry import load_broker
+
+    fake = load_broker("fake")()
+
+    assert executor._fetch_available_quote(fake, "USD") == Decimal("1000")
+    assert executor._base_increment_for(fake, repo, "BTC-USD", NOW_TS) == Decimal("0.00000001")
+
+    with pytest.raises(NotImplementedError, match="no order preview"):
+        fake.preview_order(
+            MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("50"))
+        )

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from keel_broker_api.results import Balance
 from keel_core.products import quote_currency_of
 
 from keel.commands._products import _history_product
@@ -59,19 +60,21 @@ LIQUIDITY_PROBE_DAYS = 180
 
 #: The venue every product screened here is listed on.
 #:
-#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The live path constructs
-#: `keel/data/cb_client.py`'s `CoinbaseClient` directly, so there is exactly one venue these
-#: product ids can mean, and an `InstrumentAttestation` is keyed on `(venue, product_id)` --
-#: which means the screen needs a venue id to look one up, and inventing a per-call parameter
-#: for a value with one possible answer would be a knob whose only safe setting is its default.
+#: ⚠️ A CONSTANT because it is currently a fact, not a configuration. The screen is REPO-DRIVEN
+#: and broker-less -- it reads cached candles, and no adapter handle reaches it -- so there is
+#: exactly one venue these product ids can mean, and an `InstrumentAttestation` is keyed on
+#: `(venue, product_id)` -- which means the screen needs a venue id to look one up, and
+#: inventing a per-call parameter for a value with one possible answer would be a knob whose
+#: only safe setting is its default.
 #:
-#: The broker-port migration replaces this with the adapter's own `BrokerCapabilities.venue`
-#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`), at which point the wrapper
-#: statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD` somewhere
-#: else -- which is issue #202's entire point and the reason the key is a pair. Until an adapter
-#: handle actually reaches this function, reading a venue id off one would be reading it off
-#: nothing: the same dead-gate pattern `capabilities.py` warns about, where a lookup that cannot
-#: fail reads as a defence.
+#: The eventual replacement is the adapter's own `BrokerCapabilities.venue`
+#: (`packages/keel-broker-api/keel_broker_api/capabilities.py`) -- every broker the live path
+#: constructs since #524 finished the broker-port migration answers it -- at which point the
+#: wrapper statement recorded for `BTC-USD` on Coinbase correctly stops applying to `BTC-USD`
+#: somewhere else, which is issue #202's entire point and the reason the key is a pair.
+#: Threading a broker handle into this repo-driven screen (and a per-venue candle cache) is
+#: the remaining work; until it lands, reading a venue id off a broker this function does not
+#: hold would be reading it off nothing.
 VENUE = "coinbase"
 
 
@@ -169,9 +172,7 @@ def market_facts(repo: Repository, product: str, quote: str) -> MarketFacts:
     )
 
 
-def screen_product(
-    repo: Repository, product: str, quote: str
-) -> tuple[MarketFacts, ScreenResult]:
+def screen_product(repo: Repository, product: str, quote: str) -> tuple[MarketFacts, ScreenResult]:
     """THE admission decision, for every candidate source.
 
     `assets screen`, `assets holdings --screen`, the proposer and any future front-end (the TUI)
@@ -214,9 +215,7 @@ def screen_product(
         else None
     )
     waived = repo.get_screen_exceptions(asset)
-    return facts, screen_mod.screen_asset(
-        facts, attestation, waived=waived, instrument=instrument
-    )
+    return facts, screen_mod.screen_asset(facts, attestation, waived=waived, instrument=instrument)
 
 
 @dataclass(frozen=True)
@@ -233,9 +232,7 @@ class ScreenedAsset:
         return self.result.admitted
 
 
-def screen_products(
-    repo: Repository, config: Config, products: list[str]
-) -> list[ScreenedAsset]:
+def screen_products(repo: Repository, config: Config, products: list[str]) -> list[ScreenedAsset]:
     """Screen an explicit product list through THE gate -- `keel assets screen`'s compute.
 
     The caller owns the `--products` semantics (the CLI deliberately passes them UNVALIDATED --
@@ -340,9 +337,7 @@ def gather_attestations_in_force(repo: Repository, config: Config) -> Attestatio
             unattested.append(asset)
             continue
         asset_rows.append(row)
-        instrument = repo.get_instrument_attestation(
-            VENUE, _history_product(asset, quote)
-        )
+        instrument = repo.get_instrument_attestation(VENUE, _history_product(asset, quote))
         if instrument is not None:
             instrument_rows.append(instrument)
     allow_set = {asset.upper() for asset in allowlist}
@@ -403,12 +398,12 @@ def broker_auth_hint(config: Config) -> str:
 def gather_holdings(
     repo: Repository,
     config: Config,
-    accounts: list[dict[str, Any]],
+    balances: list[Balance],
     floor: Decimal,
     *,
     run_screen: bool = False,
 ) -> HoldingsReport:
-    """Turn broker account rows into allowlist CANDIDATES -- a SOURCE, not a gate.
+    """Turn the port's balance rows into allowlist CANDIDATES -- a SOURCE, not a gate.
 
     Holding an asset is not a reason to trade it: this admits nothing and mutates nothing. It
     answers "what do I already own that this system might trade?" by filtering out the
@@ -417,33 +412,32 @@ def gather_holdings(
     and everything at/below the dust floor, sorting by asset, and optionally screening each
     survivor through THE gate (unattested assets are REJECTED, because sector and backing cannot
     be derived from a balance any more than from a price).
+
+    `list[Balance]` -- the port's shape since #524, so the read works against every venue an
+    adapter exists for, not only the one whose client happened to return dicts. `available`
+    is the SPENDABLE figure, which is the one a dust floor is asking about.
     """
     quote = config.quote_currency
     excluded = FIAT_CURRENCIES | CASH_EQUIVALENTS | {quote.upper()}
-    accounts = sorted(
-        (
-            a
-            for a in accounts
-            if (a.get("currency") or "").upper() not in excluded
-            and a["available_balance"] > floor
-        ),
-        key=lambda a: (a.get("currency") or "").upper(),
+    balances = sorted(
+        (b for b in balances if b.currency.upper() not in excluded and b.available > floor),
+        key=lambda b: b.currency.upper(),
     )
 
     allowlist = {asset.upper() for asset in config.allowlist}
     rows: list[HoldingRow] = []
-    for account in accounts:
+    for balance in balances:
         # Uppercase here too, not just for the exclusion set: screening the raw code would look
         # up `btc` (UNATTESTED) while the allowlist check matched `BTC`, and would hand the
         # operator `keel fetch --products btc-USD`, a product id that never resolves.
-        asset = (account.get("currency") or "").upper()
+        asset = balance.currency.upper()
         attested = repo.get_asset_attestation(asset) is not None
 
         if not run_screen:
             rows.append(
                 HoldingRow(
                     asset=asset,
-                    balance=account["available_balance"],
+                    balance=balance.available,
                     on_allowlist=asset in allowlist,
                     attested=attested,
                     facts=None,
@@ -487,7 +481,7 @@ def gather_holdings(
         rows.append(
             HoldingRow(
                 asset=asset,
-                balance=account["available_balance"],
+                balance=balance.available,
                 on_allowlist=asset in allowlist,
                 attested=attested,
                 facts=facts,
@@ -503,19 +497,14 @@ def gather_holdings(
 def render_holdings(report: HoldingsReport) -> list[str]:
     """The exact `keel assets holdings` lines, as a pure function of the report."""
     if not report.rows:
-        return [
-            f"no holdings above {report.floor} (excluding {report.quote} and fiat)."
-        ]
+        return [f"no holdings above {report.floor} (excluding {report.quote} and fiat)."]
     lines = [
-        f"{len(report.rows)} holding(s) above {report.floor}, excluding "
-        f"{report.quote} and fiat:\n"
+        f"{len(report.rows)} holding(s) above {report.floor}, excluding {report.quote} and fiat:\n"
     ]
     for row in report.rows:
         on_allowlist = "on-allowlist" if row.on_allowlist else "not-on-allowlist"
         attested = "attested" if row.attested else "UNATTESTED"
-        lines.append(
-            f"  {row.asset:<8} balance={row.balance:<18} {on_allowlist:<16} {attested}"
-        )
+        lines.append(f"  {row.asset:<8} balance={row.balance:<18} {on_allowlist:<16} {attested}")
         if row.result is None or row.facts is None:
             continue
         lines.append(f"      {row.result.summary}  ({row.facts.daily_bars} daily bars cached)")
@@ -597,17 +586,13 @@ def run_discovery(
     """
     if now_ts is None:
         now_ts = int(time.time())
-    volume_floor = (
-        min_volume_24h if min_volume_24h is not None else DEFAULT_MIN_QUOTE_24H_VOLUME
-    )
+    volume_floor = min_volume_24h if min_volume_24h is not None else DEFAULT_MIN_QUOTE_24H_VOLUME
     shown = limit if limit is not None else DEFAULT_DISCOVER_LIMIT
     policy = DiscoveryPolicy(
         quote_currency=quote or config.quote_currency,
         min_quote_24h_volume=volume_floor,
     )
-    result = discover_candidates(
-        products, policy, exclude_assets=frozenset(config.allowlist)
-    )
+    result = discover_candidates(products, policy, exclude_assets=frozenset(config.allowlist))
 
     screen_policy = screen_mod.ScreenPolicy()
     four_years_ago = now_ts - 4 * DAYS_PER_YEAR * 86400

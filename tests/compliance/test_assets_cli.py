@@ -70,14 +70,11 @@ def _attest_instrument(runner, db_path, config_path, product, **over):
     flat = [item for pair in args.items() for item in pair]
     return runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(config_path),
-         "assets", "attest-instrument", *flat],
+        ["--db", str(db_path), "--config", str(config_path), "assets", "attest-instrument", *flat],
     )
 
 
-def test_an_unattested_asset_is_rejected_even_with_perfect_market_data(
-    tmp_path, valid_config_path
-):
+def test_an_unattested_asset_is_rejected_even_with_perfect_market_data(tmp_path, valid_config_path):
     """The gate's whole point: good candles do not substitute for a classification."""
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
@@ -101,9 +98,7 @@ def test_attesting_admits_an_otherwise_clean_asset(tmp_path, valid_config_path):
     runner = CliRunner()
     for asset in ("BTC", "ETH", "PAXG"):
         assert _attest(runner, db_path, valid_config_path, asset).exit_code == 0
-        assert _attest_instrument(
-            runner, db_path, valid_config_path, f"{asset}-USD"
-        ).exit_code == 0
+        assert _attest_instrument(runner, db_path, valid_config_path, f"{asset}-USD").exit_code == 0
 
     result = runner.invoke(
         cli, ["--db", str(db_path), "--config", str(valid_config_path), "assets", "screen"]
@@ -121,8 +116,16 @@ def test_a_haram_sector_attestation_still_rejects(tmp_path, valid_config_path):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
     assert "0/1 admitted" in result.output
     assert "haram_sector" in result.output
@@ -138,8 +141,16 @@ def test_short_history_rejects_regardless_of_attestation(tmp_path, valid_config_
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "0/1 admitted" in result.output
     assert "history" in result.output
@@ -192,8 +203,18 @@ def _exempt(runner, db_path, config_path, **over):
 def _unexempt(runner, db_path, config_path, asset="PAXG", criterion="history"):
     return runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(config_path), "assets", "unexempt",
-         "--asset", asset, "--criterion", criterion],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(config_path),
+            "assets",
+            "unexempt",
+            "--asset",
+            asset,
+            "--criterion",
+            criterion,
+        ],
     )
 
 
@@ -206,15 +227,21 @@ def test_exempt_admits_a_history_failing_asset_and_screen_prints_WAIVED(
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
-    assert _attest_instrument(
-        runner, db_path, valid_config_path, "PAXG-USD"
-    ).exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "PAXG-USD").exit_code == 0
 
     # Before the exception: REJECT on history.
     before = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "0/1 admitted" in before.output
     assert "history" in before.output
@@ -225,16 +252,22 @@ def test_exempt_admits_a_history_failing_asset_and_screen_prints_WAIVED(
 
     after = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "1/1 admitted" in after.output
     assert "WAIVED" in after.output
 
 
-def test_exempt_rejects_a_non_waivable_criterion_at_the_cli_boundary(
-    tmp_path, valid_config_path
-):
+def test_exempt_rejects_a_non_waivable_criterion_at_the_cli_boundary(tmp_path, valid_config_path):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     result = _exempt(CliRunner(), db_path, valid_config_path, **{"--criterion": "bogus"})
@@ -270,9 +303,7 @@ def test_exempt_normalizes_a_lowercase_asset_so_screening_still_finds_the_waiver
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
-    assert _attest_instrument(
-        runner, db_path, valid_config_path, "PAXG-USD"
-    ).exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "PAXG-USD").exit_code == 0
 
     result = _exempt(runner, db_path, valid_config_path, **{"--asset": "paxg"})
     assert result.exit_code == 0, result.output
@@ -280,8 +311,16 @@ def test_exempt_normalizes_a_lowercase_asset_so_screening_still_finds_the_waiver
 
     screened = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "1/1 admitted" in screened.output
     assert "WAIVED" in screened.output
@@ -309,15 +348,21 @@ def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
     runner = CliRunner()
     attested = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert attested.exit_code == 0
-    assert _attest_instrument(
-        runner, db_path, valid_config_path, "PAXG-USD"
-    ).exit_code == 0
+    assert _attest_instrument(runner, db_path, valid_config_path, "PAXG-USD").exit_code == 0
     assert _exempt(runner, db_path, valid_config_path).exit_code == 0
 
     admitted = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "1/1 admitted" in admitted.output
 
@@ -327,8 +372,16 @@ def test_unexempt_revokes_and_screen_rejects_again(tmp_path, valid_config_path):
 
     rejected = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "0/1 admitted" in rejected.output
     assert "✗" in rejected.output
@@ -364,8 +417,16 @@ def test_unexempt_normalizes_a_lowercase_asset(tmp_path, valid_config_path):
 
     rejected = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     assert "0/1 admitted" in rejected.output
 
@@ -486,8 +547,16 @@ def test_discover_states_total_and_shown_when_limit_truncates(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "discover", "--limit", "3"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "discover",
+            "--limit",
+            "3",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -531,8 +600,15 @@ def test_probe_history_marks_candidates_without_a_four_year_series(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "discover", "--probe-history"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "discover",
+            "--probe-history",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert set(venue.probe_calls) == {"SOL-USD", "NEW-USD"}
@@ -558,8 +634,15 @@ def test_a_failed_probe_reads_as_UNKNOWN_not_as_a_rejection(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "discover", "--probe-history"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "discover",
+            "--probe-history",
+        ],
     )
     assert result.exit_code == 0
     sol_line = next(ln for ln in result.output.splitlines() if "SOL-USD" in ln)
@@ -574,14 +657,14 @@ def test_a_failed_probe_reads_as_UNKNOWN_not_as_a_rejection(
 
 
 class _FakeBroker:
-    """Duck-types the bits of CoinbaseClient this command uses."""
+    """Duck-types the port read this command uses: `get_balances()` -> `list[Balance]`."""
 
     def __init__(self, accounts, fail=False):
         self._accounts = accounts
         self._fail = fail
         self.calls = 0
 
-    def get_accounts(self):
+    def get_balances(self):
         self.calls += 1
         if self._fail:
             raise RuntimeError("venue unreachable")
@@ -589,13 +672,9 @@ class _FakeBroker:
 
 
 def _account(currency, balance):
-    return {
-        "uuid": f"u-{currency}",
-        "currency": currency,
-        "available_balance": Decimal(balance),
-        "default": False,
-        "active": True,
-    }
+    from keel_broker_api.results import Balance
+
+    return Balance(currency=currency, available=Decimal(balance), total=Decimal(balance))
 
 
 def _with_broker(monkeypatch, broker):
@@ -679,8 +758,16 @@ def test_holdings_screen_agrees_with_assets_screen_for_the_same_asset(
 
     screened = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
     held = _holdings(db_path, valid_config_path, "--screen")
 
@@ -731,9 +818,7 @@ def test_a_broker_failure_is_an_ERROR_not_an_empty_clean_result(
     assert "unreachable" in result.output.lower() or "error" in result.output.lower()
 
 
-def test_holdings_auth_advice_names_the_coinbase_env_vars(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_holdings_auth_advice_names_the_coinbase_env_vars(tmp_path, valid_config_path, monkeypatch):
     """The auth hint is actionable only if it names the keys THIS deployment reads: on the
     default (coinbase) config that is the CDP pair -- the historical advice, unchanged."""
     db_path = tmp_path / "t.db"
@@ -768,9 +853,7 @@ def test_holdings_auth_advice_names_the_alpaca_env_vars(tmp_path, write_config, 
     assert "CDP_API_KEY" not in result.output
 
 
-def test_holdings_marks_assets_already_on_the_allowlist(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_holdings_marks_assets_already_on_the_allowlist(tmp_path, valid_config_path, monkeypatch):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     _with_broker(monkeypatch, _FakeBroker([_account("BTC", "0.5"), _account("SOL", "12")]))
@@ -795,15 +878,23 @@ def test_holdings_screen_does_not_DROP_compliance_warnings(
     repo = _repo_at(db_path)
     _seed_history(repo, "PAXG-USD")
     runner = CliRunner()
-    assert _attest(
-        runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}
-    ).exit_code == 0
+    assert (
+        _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}).exit_code == 0
+    )
     _with_broker(monkeypatch, _FakeBroker([_account("PAXG", "3")]))
 
     screened = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
     held = _holdings(db_path, valid_config_path, "--screen")
 
@@ -869,9 +960,9 @@ def test_a_genuinely_young_asset_still_reports_history_as_a_real_verdict_via_hol
     repo = _repo_at(db_path)
     _seed_history(repo, "PAXG-USD", bars=400)  # real bars, genuinely short of the floor
     runner = CliRunner()
-    assert _attest(
-        runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}
-    ).exit_code == 0
+    assert (
+        _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"}).exit_code == 0
+    )
     _with_broker(monkeypatch, _FakeBroker([_account("PAXG", "3")]))
 
     result = _holdings(db_path, valid_config_path, "--screen")
@@ -897,8 +988,16 @@ def test_zero_cached_bars_never_prints_a_history_depth_failure_via_assets_screen
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "SOL-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "SOL-USD",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -919,8 +1018,16 @@ def test_assets_screen_still_reports_a_genuinely_short_history_as_a_real_verdict
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "PAXG-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "PAXG-USD",
+        ],
     )
 
     assert "✗ history" in result.output
@@ -1006,13 +1113,12 @@ def test_a_lowercase_holding_is_screened_as_the_attested_uppercase_asset(
     assert "ADMIT" in result.output
 
 
-def test_an_account_with_no_currency_field_does_not_crash(
-    tmp_path, valid_config_path, monkeypatch
-):
-    """`CoinbaseClient.get_accounts` defaults a missing currency to None."""
+def test_an_account_with_no_currency_field_does_not_crash(tmp_path, valid_config_path, monkeypatch):
+    """The port's `Balance.currency` is a str, but a venue row with no currency coerces to the
+    empty string -- an unusable asset code must degrade to a blank row, never a crash."""
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
-    broken = {"uuid": "u", "currency": None, "available_balance": Decimal("1"), "active": True}
+    broken = _account("", "1")
     _with_broker(monkeypatch, _FakeBroker([broken, _account("BTC", "0.5")]))
 
     result = _holdings(db_path, valid_config_path)
@@ -1059,8 +1165,16 @@ def test_the_settlement_criterion_still_catches_an_EXTERNALLY_supplied_product(
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-EUR"],   # settlement is USD
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-EUR",
+        ],  # settlement is USD
     )
 
     assert "settlement" in result.output, "a cross-settled product must fail the settlement check"
@@ -1087,8 +1201,16 @@ def test_screen_REPORTS_on_a_futures_id_rather_than_refusing_the_option(
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "ADA-28AUG26-CDE"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "ADA-28AUG26-CDE",
+        ],
     )
 
     assert result.exit_code == 0, "screening must report a verdict, not a usage error"
@@ -1119,8 +1241,16 @@ def test_screen_REJECTS_the_derivative_shaped_id_rail_19_exists_to_refuse(
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-PERP-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-PERP-USD",
+        ],
     )
 
     assert result.exit_code == 0, "screening must report a verdict, not a usage error"
@@ -1141,8 +1271,16 @@ def test_screen_still_ADMITS_a_well_formed_spot_pair(tmp_path, valid_config_path
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1173,8 +1311,16 @@ def test_screen_REJECTS_a_fully_asset_attested_product_with_no_instrument_attest
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1197,8 +1343,16 @@ def test_asset_and_spot_instrument_attestation_together_ADMIT(tmp_path, valid_co
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1216,14 +1370,25 @@ def test_a_cfd_wrapper_on_an_admissible_underlying_still_REJECTS(tmp_path, valid
     _seed_history(repo, "BTC-USD")
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
-    assert _attest_instrument(
-        runner, db_path, valid_config_path, "BTC-USD", **{"--wrapper": "cfd"}
-    ).exit_code == 0
+    assert (
+        _attest_instrument(
+            runner, db_path, valid_config_path, "BTC-USD", **{"--wrapper": "cfd"}
+        ).exit_code
+        == 0
+    )
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1292,16 +1457,22 @@ def test_attest_instrument_normalizes_a_lowercase_product_so_screening_still_fin
     runner = CliRunner()
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
 
-    result = _attest_instrument(
-        runner, db_path, valid_config_path, "btc-usd"
-    )
+    result = _attest_instrument(runner, db_path, valid_config_path, "btc-usd")
     assert result.exit_code == 0, result.output
     assert "BTC-USD" in result.output
 
     screened = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "screen", "--products", "BTC-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
     assert "ADMIT" in screened.output
 
@@ -1328,8 +1499,16 @@ def test_propose_rejects_an_unattested_candidate(tmp_path, valid_config_path):
     shortlist = _write_shortlist(tmp_path, [_SOL])
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "propose", "--from", str(shortlist)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
     assert result.exit_code == 0
     assert "REJECT" in result.output
@@ -1349,8 +1528,16 @@ def test_zero_cached_bars_never_prints_a_history_depth_failure_via_propose(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "propose", "--from", str(shortlist)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
 
     assert result.exit_code == 0
@@ -1369,15 +1556,34 @@ def test_propose_and_screen_agree_for_the_same_asset(tmp_path, valid_config_path
     assert _attest(runner, db_path, valid_config_path, "BTC").exit_code == 0
     assert _attest_instrument(runner, db_path, valid_config_path, "BTC-USD").exit_code == 0
     shortlist = _write_shortlist(
-        tmp_path, [{"asset": "BTC", "rationale": "reserve asset", "sources": ["https://bitcoin.org"]}]
+        tmp_path,
+        [{"asset": "BTC", "rationale": "reserve asset", "sources": ["https://bitcoin.org"]}],
     )
     proposed = runner.invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist)],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
     screened = runner.invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "screen", "--products", "BTC-USD"],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "screen",
+            "--products",
+            "BTC-USD",
+        ],
     )
     assert "ADMIT" in proposed.output
     assert "ADMIT" in screened.output
@@ -1389,8 +1595,17 @@ def test_propose_writes_nothing(tmp_path, valid_config_path):
     _repo_at(db_path)
     shortlist = _write_shortlist(tmp_path, [_SOL])
     CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist)],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
     # Reopen from the path (not the handle held from before the run) so a stray write to ANY
     # asset/table would actually be caught, not just the one candidate we happened to propose.
@@ -1402,8 +1617,18 @@ def test_propose_json_is_valid_and_has_no_trailing_prose(tmp_path, valid_config_
     _repo_at(db_path)
     shortlist = _write_shortlist(tmp_path, [_SOL])
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist), "--json"],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+            "--json",
+        ],
     )
     payload = json.loads(result.output)  # must parse cleanly
     assert payload["admitted_count"] == 0
@@ -1422,8 +1647,18 @@ def test_propose_json_tells_the_same_zero_bar_story_the_human_output_tells(
     shortlist = _write_shortlist(tmp_path, [_SOL])
 
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist), "--json"],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+            "--json",
+        ],
     )
 
     row = json.loads(result.output)["screened"][0]
@@ -1437,8 +1672,17 @@ def test_propose_missing_file_is_a_clean_error(tmp_path, valid_config_path):
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(tmp_path / "nope.json")],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(tmp_path / "nope.json"),
+        ],
     )
     assert result.exit_code != 0
 
@@ -1456,8 +1700,17 @@ def test_propose_non_utf8_shortlist_is_a_clean_error_not_a_traceback(tmp_path, v
     shortlist.write_bytes(json.dumps({"candidates": [_SOL]}).encode("utf-16"))
 
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist)],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
 
     assert result.exit_code != 0
@@ -1471,12 +1724,27 @@ def test_propose_hypothesis_never_admits(tmp_path, valid_config_path):
     _repo_at(db_path)
     shortlist = _write_shortlist(
         tmp_path,
-        [{"asset": "SOL", "rationale": "x", "sources": ["https://x.invalid"],
-          "shariah_hypothesis": "definitely halal"}],
+        [
+            {
+                "asset": "SOL",
+                "rationale": "x",
+                "sources": ["https://x.invalid"],
+                "shariah_hypothesis": "definitely halal",
+            }
+        ],
     )
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist)],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
     assert "REJECT" in result.output  # unattested + no history => rejected despite the hypothesis
     assert "UNVERIFIED" in result.output
@@ -1487,8 +1755,17 @@ def test_propose_human_output_ends_with_the_disclaimer(tmp_path, valid_config_pa
     _repo_at(db_path)
     shortlist = _write_shortlist(tmp_path, [_SOL])
     result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path),
-              "assets", "propose", "--from", str(shortlist)],
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "propose",
+            "--from",
+            str(shortlist),
+        ],
     )
     assert DISCLAIMER in result.output
 
@@ -1537,8 +1814,15 @@ def test_probe_liquidity_flags_a_candidate_whose_24h_snapshot_beats_its_median(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "assets", "discover", "--probe-liquidity"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "assets",
+            "discover",
+            "--probe-liquidity",
+        ],
     )
 
     assert result.exit_code == 0, result.output

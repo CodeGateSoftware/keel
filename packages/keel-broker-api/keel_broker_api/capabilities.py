@@ -28,16 +28,19 @@ class BrokerCapabilities:
     ⚠️ `asset_classes` is **not** what keeps keel spot-only today, and no engine code reads it.
     The spot gate on the live path is **rail 19 (`spot_instrument`)** in
     `keel/execution/guards.py`, which checks the product id's shape and needs no broker handle.
-    That is deliberate, not an oversight: `guards.check` has no broker, the only broker the live
-    path constructs is `keel/data/cb_client.py`'s `CoinbaseClient` -- which has no
-    `capabilities()` at all -- and the paper path passes `broker=None`, so a gate built on this
-    field would be dead code on every real path while reading as a defence. That exact pattern
-    was built and deleted once already (R1's "what was deliberately NOT shipped").
+    That is deliberate, not an oversight: `guards.check` is broker-less BY DESIGN (its rails
+    must hold in paper mode, where the executor passes `broker=None`), so a gate built on this
+    field cannot live there. Every broker the live path constructs since #524 finished the
+    broker-port migration IS an adapter that answers `capabilities()` -- the grandfather clause
+    for the pre-port client, which had no `capabilities()` at all, retired with it -- but
+    reachable is not the same as read, and a capabilities gate that no path consults is still
+    dead code that reads as a defence. That exact pattern was built and deleted once already
+    (R1's "what was deliberately NOT shipped").
 
-    This field's job until then is to keep the declaration honest and checkable, so the
-    broker-port migration that makes `capabilities()` reachable inherits a vocabulary rather
-    than a free-form set. At that point the reconciliation belongs at LOAD time, not as a
-    per-order raise -- a raise on the exit path can trap a position.
+    This field's job until something consumes it is to keep the declaration honest and
+    checkable, so the first consumer inherits a vocabulary rather than a free-form set. When
+    that happens the reconciliation belongs at LOAD time, not as a per-order raise -- a raise
+    on the exit path can trap a position.
     """
 
     venue: str
