@@ -11,3 +11,7 @@ by writing a new record that supersedes it, never by quietly editing an old one.
    self-update)](0001-desktop-update-path.md) · #439
 2. [0002 — Persistence is SQLite, one writer per file, until a named trigger
    fires](0002-sqlite-persistence.md) · #526
+3. [0003 — The commands layer is the explanation engine, and stays — measured, not
+   assumed](0003-commands-layer-survey.md) · #525
+4. [0004 — Monetisation is not now, and affiliate links are a permanent
+   no](0004-monetisation-not-now.md) · #603
