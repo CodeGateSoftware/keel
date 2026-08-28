@@ -13,10 +13,11 @@
  * cannot read, so no test can compare the copy against its source the way the old render.py pin
  * compared two files in this one. What stands in its place:
  * `tests/web/test_client_assets.py::test_the_palette_wears_keeltrading_coms_identity` pins the
- * two literals that carry the identity -- `--accent` and `--bg` -- and names the site file as
- * the upstream, and `tests/web/test_palette_contrast.py` still measures every pair's WCAG ratio
- * straight off this file. (Until #540 the copy was of `render.py`'s `_STYLE`, held identical by
- * a test that died with it, exactly as its own docstring said it would.)
+ * literals that carry the identity -- `--accent`, `--bg` and `--link`, in both themes -- and
+ * names the site file as the upstream, and `tests/web/test_palette_contrast.py` still measures
+ * every pair's WCAG ratio straight off this file. (Until #540 the copy was of `render.py`'s
+ * `_STYLE`, held identical by a test that died with it, exactly as its own docstring said it
+ * would.)
  *
  * ── THE STATE TOKENS HAVE NO SITE COUNTERPART, AND EACH RETUNE IS DOCUMENTED ───────────────────
  *
@@ -48,6 +49,8 @@
   --line: #d9d4c8;    /* site --border: decorative only, exempt from 1.4.11 (see --control-line) */
   --card: #fffefb;    /* site --surface */
   --accent: #0c5d52;  /* site --accent: the teal */
+  --link: #0c5d52;    /* site --link: light links ARE the accent teal on the site; declared apart
+                         so dark can differ below, as it does there */
 
   /* The app's semantic tokens, on the site's paper -- no site counterpart, each retuned (#593). */
   --warn: #7a5c15;
@@ -60,7 +63,7 @@
   :root:not([data-theme="light"]) {
     /* keeltrading.com global.css, dark `@media` block -- byte-identical copies (#593). */
     --bg: #0f171d; --fg: #e9e7e0; --muted: #a4b4be; --line: #2b3a44;
-    --card: #162128; --accent: #57c5af;
+    --card: #162128; --accent: #57c5af; --link: #6fd0bb;
 
     /* The app's semantic tokens, on the site's slate -- no site counterpart (#593). */
     --warn: #d4af37; --bad: #e07a6a; --good: #7cd69f;
@@ -481,7 +484,10 @@ details .card { border: none; padding: 0; margin: 0 0 0.6rem; background: none; 
 .action { margin: 0.6rem 0 0; }
 .action .inputs { margin: 0.3rem 0; padding-left: 1.2rem; }
 .action .choices { margin: 0.2rem 0; padding-left: 1.2rem; color: var(--muted); }
-a.runlink { color: var(--accent); }
+/* The one anchor this page colours: `--link`, not `--accent` -- they are the same teal in
+ * light but split in dark (#6fd0bb beside #57c5af), and a dark tab running this app beside the
+ * site must not show two link teals (#593). */
+a.runlink { color: var(--link); }
 
 pre.joblines {
   background: var(--bg);

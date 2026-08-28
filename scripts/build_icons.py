@@ -75,7 +75,8 @@ def _octagon(cx: float, cy: float, r: float) -> tuple[tuple[float, float], ...]:
     The site's mark strokes round caps and joins, and a circle is not a polygon. This is the
     closest eight-sided stand-in, sized so its EDGES are tangent to the true cap circle
     (`r = radius / cos(pi/8)`): coverage is never less than the cap it replaces, and the corners
-    poke past it by four per cent of the stroke width -- subpixel at every size rendered here.
+    poke past it by four per cent of the stroke width -- subpixel at 192 and below, under
+    1.5px at 512.
     """
     return tuple(
         (cx + r * cos(pi / 8 + k * pi / 4), cy + r * sin(pi / 8 + k * pi / 4)) for k in range(8)
@@ -101,28 +102,33 @@ _CORNER_RADIUS = 5.0
 _MASTHEAD = (12.0, 4.0)
 _MASTFOOT = (12.0, 14.0)
 _STAY_PORTS = ((8.8, 8.0), (15.2, 8.0))
-#: The hull: the site's `M12 14 c-4 0 -6.4 1.8 -7.6 4.8 h15.2 C18.4 15.8 16 14 12 14 Z`,
-#: with both cubic beziers sampled at t = 0, .125, ..., 1 (this rasteriser draws polygons; the
-#: chords sit a tenth of a per cent of the tile from the true curve -- half a pixel at 512).
-#: Four samples per side were tried first and read as facets; eight do not.
+#: The hull, CLOSED as the site draws it: apex, left flare down, the `h15.2` bottom edge
+#: (the waterline), right flare back up to the apex -- `M12 14 c-4 0 -6.4 1.8 -7.6 4.8 h15.2
+#: C18.4 15.8 16 14 12 14 Z`, with both cubic beziers sampled at t = 0, .125, ..., 1 (this
+#: rasteriser draws polygons; the chords sit a tenth of a per cent of the tile from the true
+#: curve -- half a pixel at 512). Four samples per side were tried first and read as facets;
+#: eight do not. The first #593 revision transcribed the two flares and dropped the bottom
+#: edge, leaving an arch where the site's mark closes: a quarter of the mark's ink by stroke
+#: length, and the waterline the shape is a section of.
 _HULL = (
-    (4.4, 18.8),
-    (4.907, 17.732),
-    (5.531, 16.784),
-    (6.277, 15.963),
-    (7.15, 15.275),
-    (8.154, 14.728),
-    (9.294, 14.328),
-    (10.574, 14.083),
     (12.0, 14.0),
-    (13.426, 14.083),
-    (14.706, 14.328),
-    (15.846, 14.728),
-    (16.85, 15.275),
-    (17.723, 15.963),
-    (18.469, 16.784),
-    (19.093, 17.732),
+    (10.574, 14.083),
+    (9.294, 14.328),
+    (8.154, 14.728),
+    (7.15, 15.275),
+    (6.277, 15.963),
+    (5.531, 16.784),
+    (4.907, 17.732),
+    (4.4, 18.8),
     (19.6, 18.8),
+    (19.093, 17.732),
+    (18.469, 16.784),
+    (17.723, 15.963),
+    (16.85, 15.275),
+    (15.846, 14.728),
+    (14.706, 14.328),
+    (13.426, 14.083),
+    (12.0, 14.0),
 )
 
 
@@ -138,17 +144,20 @@ STROKES: tuple[tuple[tuple[float, float], ...], ...] = (
     _unit(_HULL),
 )
 
-#: Every vertex of every stroke, in design space. The site's mark strokes with round caps AND
-#: round joins, so each of these gets a cap octagon: the octagons at the polyline's ends are the
-#: round caps, and the ones at its interior vertices are the round joins -- without them, the
-#: butt caps of consecutive hull chords leave a wedge on the outside of each turn (the chords
-#: turn by up to eighteen degrees, and the wedge is three pixels at 512 -- found by sampling the
-#: render against the true round-join coverage at 2048px, not by looking). The mast's foot needs
-#: no special case: its octagon is the same as every other vertex's, and the mast's bottom end
-#: sits inside the hull's stroke besides, the same trick the `k` used at its arm junction.
-_CAP_POINTS = tuple(
-    point for stroke in STROKES for point in _unit(stroke)
-)
+#: Every vertex of every stroke, in unit space -- `STROKES` is already unit space, so dividing
+#: again here would shrink every cap into a 1/24-wide blob in the tile's top-left corner while
+#: the strokes themselves went bare: exactly what the first #593 icons shipped, stray blobs and
+#: square masthead both, because the double application hid inside a folded generator.
+#: The site's mark strokes round caps AND round joins, so each vertex gets a cap octagon: the
+#: octagons at a polyline's ends are the round caps, the interior ones are the round joins.
+#: Those joins are load-bearing, and measurably so: the chords along the flares turn by at most
+#: 9.7 degrees (the bare-cap wedge is 1.5px wide at the rim at 512), but where each flare meets
+#: the bottom edge the polyline turns by 115.4 degrees, and bare butt caps there leave a notch
+#: the full half-width of the stroke deep -- a 331-square-pixel hole at 512, the sector a round
+#: join fills being `(turn/2) * (w/2)**2`. The mast's foot needs no special case: its octagon
+#: is the same as every other vertex's, and the mast's bottom end sits inside the hull's stroke
+#: besides, the same trick the `k` used at its arm junction.
+_CAP_POINTS = tuple(point for stroke in STROKES for point in stroke)
 
 _W = _STROKE_WIDTH / _DESIGN
 

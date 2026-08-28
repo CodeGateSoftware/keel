@@ -33,8 +33,9 @@ from keel.web import staticfiles
 # being measured before, now read from the file that was already the one in the browser.
 _CSS = staticfiles.STATIC_ROOT / "css" / "keel.css"
 
-#: WCAG 2.x AA, normal-size text (SC 1.4.3): fg/muted/accent/warn/bad/good all render body-
-#: or label-sized text somewhere in the client (table cells, `.kv .v`, `.pill`), never large text.
+#: WCAG 2.x AA, normal-size text (SC 1.4.3): fg/muted/accent/link/warn/bad/good all render
+#: body- or label-sized text somewhere in the client (table cells, `.kv .v`, `.pill`), never
+#: large text.
 _AA_TEXT_MIN = 4.5
 
 #: WCAG 2.x AA, non-text UI component boundaries (SC 1.4.11): the form-input border this issue
@@ -108,13 +109,23 @@ _COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 #: Every token the stylesheet declares text or UI-boundary colour with, in both themes.
 _EXPECTED_TOKENS = {
-    "bg", "fg", "muted", "line", "card", "accent", "warn", "bad", "good", "control-line",
+    "bg",
+    "fg",
+    "muted",
+    "line",
+    "card",
+    "accent",
+    "link",
+    "warn",
+    "bad",
+    "good",
+    "control-line",
 }
 
 #: Tokens used to colour readable text somewhere in the page (table cells, `.kv .v`, pills,
-#: nav labels, the `.field em` hint) -- excludes `bg`, `card` and `line`, which are surfaces and
-#: a decorative divider, not foregrounds.
-_TEXT_FOREGROUND_TOKENS = ("fg", "muted", "accent", "warn", "bad", "good")
+#: nav labels, the `.field em` hint, the run links) -- excludes `bg`, `card` and `line`, which
+#: are surfaces and a decorative divider, not foregrounds.
+_TEXT_FOREGROUND_TOKENS = ("fg", "muted", "accent", "link", "warn", "bad", "good")
 
 
 def _relative_luminance(hex_color: str) -> float:
@@ -364,18 +375,42 @@ _GRADE_FLOOR: dict[str, dict[str, dict[str, str]]] = {
     # 0.0334) than it has ever been. Every other entry holds its #532 grade.
     "light": {
         "bg": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AA", "good": "AAA",
+            "fg": "AAA",
+            "muted": "AA",
+            "accent": "AAA",
+            "link": "AAA",
+            "warn": "AA",
+            "bad": "AA",
+            "good": "AAA",
         },
         "card": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AA", "good": "AAA",
+            "fg": "AAA",
+            "muted": "AA",
+            "accent": "AAA",
+            "link": "AAA",
+            "warn": "AA",
+            "bad": "AA",
+            "good": "AAA",
         },
     },
     "dark": {
         "bg": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AAA", "bad": "AA", "good": "AAA",
+            "fg": "AAA",
+            "muted": "AA",
+            "accent": "AAA",
+            "link": "AAA",
+            "warn": "AAA",
+            "bad": "AA",
+            "good": "AAA",
         },
         "card": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AAA", "bad": "AA", "good": "AAA",
+            "fg": "AAA",
+            "muted": "AA",
+            "accent": "AAA",
+            "link": "AAA",
+            "warn": "AAA",
+            "bad": "AA",
+            "good": "AAA",
         },
     },
 }

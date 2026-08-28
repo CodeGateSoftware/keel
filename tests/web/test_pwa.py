@@ -28,6 +28,8 @@ import json
 import re
 import subprocess
 import sys
+import zlib
+from math import hypot
 
 import pytest
 
@@ -161,10 +163,87 @@ def test_a_maskable_icon_is_declared_and_is_not_also_declared_any() -> None:
         assert purpose in ("any", "maskable"), f"{purpose} declares two roles for one file"
 
 
+def test_the_maskable_ink_stays_inside_the_circle_android_may_crop_to() -> None:
+    """Ink beyond the 0.40-radius safe circle is a mark the launcher will crop pieces off.
+
+    Android may crop a maskable icon to any shape inside the middle 80% of the tile, and a circle
+    is the tightest of them, so `MASKABLE_SCALE` exists to hold the mark whole under that crop.
+    This measures the committed PNG rather than the geometry's intentions: every pixel whose
+    CENTRE lies outside the 0.40 circle must be pure background. The first #593 icons shipped a
+    stray ink blob at radius 0.52 (a doubled design-space division in `_CAP_POINTS` that folded
+    every cap into the tile's corner), and a test that trusted the geometry instead of the bytes
+    would have inherited the bug it existed to catch.
+    """
+    pixels = _png_rgba((_ICONS / "keel-maskable-512.png").read_bytes())
+    size = len(pixels)
+    centre = size / 2
+    outside = [
+        (row, column)
+        for row, line in enumerate(pixels)
+        for column, pixel in enumerate(line)
+        if hypot(column + 0.5 - centre, row + 0.5 - centre) > 0.40 * size
+        and pixel != build_icons.BACKGROUND
+    ]
+    assert not outside, (
+        f"{len(outside)} inked pixels outside the maskable safe circle, nearest "
+        f"{outside[:3]} -- a launcher cropping to the middle 80% would cut the mark"
+    )
+
+
 def _png_size(payload: bytes) -> tuple[int, int]:
     """Width and height from a PNG's IHDR, which is always the first chunk."""
     assert payload[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
     return int.from_bytes(payload[16:20], "big"), int.from_bytes(payload[20:24], "big")
+
+
+def _png_rgba(payload: bytes) -> list[list[tuple[int, int, int, int]]]:
+    """Every pixel of one of the generator's PNGs, decoded with the stdlib.
+
+    The whole point of measuring the maskable safe zone is to read the bytes that ship, so the
+    test cannot lean on Pillow (a dependency the web surface refuses on principle) -- and it
+    does not need to: the generator emits plain RGBA8 with filter 0 on every scanline. All five
+    PNG filters are undone anyway rather than asserting on filter 0, so a future encoder change
+    fails nothing here -- `--check` is the gate whose business the filter choice is.
+    """
+    width, height = _png_size(payload)
+    assert payload[24:26] == b"\x08\x06", "the icons are 8-bit RGBA by construction"
+    compressed = bytearray()
+    offset = 8
+    while offset < len(payload):
+        length = int.from_bytes(payload[offset : offset + 4], "big")
+        if payload[offset + 4 : offset + 8] == b"IDAT":
+            compressed += payload[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+    raw = zlib.decompress(compressed)
+    stride = width * 4
+    rows: list[list[tuple[int, int, int, int]]] = []
+    previous = bytearray(stride)
+    for row in range(height):
+        start = row * (stride + 1)
+        line = bytearray(raw[start + 1 : start + 1 + stride])
+        for i in range(stride):
+            left = line[i - 4] if i >= 4 else 0
+            up = previous[i]
+            up_left = previous[i - 4] if i >= 4 else 0
+            match raw[start]:
+                case 0:
+                    continue
+                case 1:
+                    line[i] = (line[i] + left) & 0xFF
+                case 2:
+                    line[i] = (line[i] + up) & 0xFF
+                case 3:
+                    line[i] = (line[i] + (left + up) // 2) & 0xFF
+                case 4:
+                    p = left + up - up_left
+                    pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+                    predictor = left if pa <= pb and pa <= pc else up if pb <= pc else up_left
+                    line[i] = (line[i] + predictor) & 0xFF
+                case _:
+                    raise AssertionError(f"unknown PNG filter {raw[start]}")
+        previous = line
+        rows.append([tuple(line[i : i + 4]) for i in range(0, stride, 4)])
+    return rows
 
 
 # -- the manifest ----------------------------------------------------------------------------------
