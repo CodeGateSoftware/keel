@@ -55,6 +55,7 @@ from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
+from keel.strategy.rules.base import ParamSpec
 from keel.types import Candle, Granularity
 
 logger = logging.getLogger(__name__)
@@ -451,7 +452,7 @@ def _lookahead_warmup(rule: Any) -> int:
     if isinstance(ema_periods, (tuple, list)) and ema_periods:
         try:
             hints.append(max(int(period) for period in ema_periods))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass  # a non-numeric element is the add-flow's refusal, not this walk's problem
     return max([bias_mod.DEFAULT_WARMUP, *hints])
 
@@ -1805,7 +1806,13 @@ class ParamHelp:
     per-parameter docstring the class carries (`PARAM_DOCS`, added AT THE CLASS per O8 --
     never a second, drifting table), the constructor's own default, the type its annotation
     declares, the choices its own `Literal` states, and whether a QUOTED value is the right
-    shape (the coercion boundary's own answer, `agent.coerced_param_keys`)."""
+    shape (the coercion boundary's own answer, `agent.coerced_param_keys`).
+
+    `space` (issue #528) is what the parameter is ALLOWED to be, not just what it currently
+    is: every dimension of the rule's declared `param_space()` that feeds this kwarg. Empty
+    for a param no declaration covers (a filter toggle, an unsearched period) -- the honest
+    "no declared range", never a hand-typed one. A kwarg one declaration decomposes into
+    several slots (`ema_periods`) carries ALL of them."""
 
     name: str
     doc: str
@@ -1813,6 +1820,7 @@ class ParamHelp:
     type_name: str
     choices: tuple[str, ...] | None
     quotable: bool
+    space: tuple[ParamSpec, ...] = ()
 
 
 def _init_hints(rule_cls: type) -> dict[str, Any]:
@@ -1822,7 +1830,7 @@ def _init_hints(rule_cls: type) -> dict[str, Any]:
         # `type: ignore[misc]`: mypy rejects reading `__init__` off a value because a subclass
         # could carry an incompatible one -- which is precisely what is being introspected here.
         return get_type_hints(rule_cls.__init__)  # type: ignore[misc]
-    except (NameError, TypeError):  # an unresolvable forward ref, or a slot wrapper __init__
+    except NameError, TypeError:  # an unresolvable forward ref, or a slot wrapper __init__
         return {}
 
 
@@ -1876,12 +1884,18 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
     # `describe()["params"]` -- exactly the dict `add_rule_row` stores and
     # `agent._build_rule` rebuilds from. A kind whose defaults cannot even construct
     # offers everything it accepts (the honest fallback; no registered kind hits it).
+    # The SAME instance supplies the declared space, so the help's ranges are the rule's
+    # own declaration (`param_space()`) and can never restate a range it did not declare.
     try:
-        persisted = set(
-            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"}).describe()["params"]
-        )
-    except (TypeError, ValueError, ArithmeticError):
+        rule = agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
+        persisted = set(rule.describe()["params"])
+        declared: dict[str, tuple[ParamSpec, ...]] = {}
+        for spec in rule.param_space():
+            declared.setdefault(spec.kwarg, ())
+            declared[spec.kwarg] += (spec,)
+    except TypeError, ValueError, ArithmeticError:
         persisted = None
+        declared = {}
     docs = getattr(rule_cls, "PARAM_DOCS", {})
     hints = _init_hints(rule_cls)
     quotable = agent.coerced_param_keys(kind)
@@ -1899,5 +1913,6 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
             type_name=type_name,
             choices=choices,
             quotable=name in quotable,
+            space=declared.get(name, ()),
         )
     return params

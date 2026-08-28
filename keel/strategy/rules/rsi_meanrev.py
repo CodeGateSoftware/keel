@@ -23,7 +23,7 @@ from keel.analysis.levels import (
     find_levels,
     nearest_level,
 )
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import ParamSpec, Rule, Setup
 from keel.types import Candle, Granularity
 
 StopMethod = Literal["fixed", "atr"]
@@ -88,6 +88,23 @@ class RsiMeanReversion(Rule):
         "divergence_lookback": "bars scanned for the RSI divergence check.",
         "timeframe": "the candle series the rule decides on (ONE_HOUR default).",
     }
+
+    # The declared parameter space (issue #528): what a sweep may legitimately explore on
+    # this rule, stated HERE so the trials count is derived from the rule rather than
+    # remembered by the operator. Ranges are the ones the #476 Optuna study pinned (and the
+    # 2026-08-12 sweep before it); steps are the resolutions those studies moved in -- RSI
+    # levels in 5s, the ATR stop in halves, R:R and the RSI length in whole numbers.
+    # `ClassVar` keeps the dataclass machinery from mistaking this for a field, exactly as
+    # `PARAM_DOCS` above does.
+    _PARAM_SPACE: ClassVar[tuple[ParamSpec, ...]] = (
+        ParamSpec("oversold", "float", 15.0, 30.0, Decimal(5)),
+        ParamSpec("overbought", "float", 70.0, 85.0, Decimal(5)),
+        ParamSpec("atr_mult", "decimal", 1.0, 2.5, Decimal("0.5")),
+        # `Decimal` FIELDS whose legitimate values are whole numbers: "int" names the
+        # RANGE's arithmetic (discrete, suggested and counted as ints), not the storage.
+        ParamSpec("fixed_rr", "int", 1, 3, Decimal(1)),
+        ParamSpec("rsi_period", "int", 10, 21, Decimal(1)),
+    )
 
     oversold: float = 20.0
     overbought: float = 80.0
@@ -204,7 +221,14 @@ class RsiMeanReversion(Rule):
         return rsi_vals[-1] > self.overbought
 
     def describe(self) -> dict:
-        return {"name": self.name, "params": self.params}
+        return {
+            "name": self.name,
+            "params": self.params,
+            "param_space": [spec.plain() for spec in self.param_space()],
+        }
+
+    def param_space(self) -> tuple[ParamSpec, ...]:
+        return self._PARAM_SPACE
 
     # ------------------------------------------------------------------
     # Internal helpers
