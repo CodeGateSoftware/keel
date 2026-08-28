@@ -1,12 +1,18 @@
 """The architectural thinness pin (issue #392 C6; PRD §6.2 -- "grep-able proof of no
 duplicated logic ... pinned by an architectural test").
 
-WHAT IT FORBIDS, precisely. The presentation layer is the console shell
-(`keel/commands/console.py`), the live loop (`keel/commands/tui.py`), every console sub-menu
-module (`keel/commands/*console*.py`), and -- since #435 -- every module of the local web UI
-(`keel/web/*.py`). Those files render and dispatch; all behavior must come from the services
-the CLI calls. The pin is an AST scan enforcing six rules -- five that hold across the whole
-layer, and one (#533) scoped to the JSON serialiser:
+WHAT IT FORBIDS, precisely. The presentation layer is every module of the local web UI
+(`keel/web/*.py`, since #435) and every module of the MCP server (`keel/mcp/*.py`, since #588).
+Those files render and dispatch; all behavior must come from the services the CLI calls. ADR
+0003 (`docs/decisions/0003-commands-layer-survey.md`) is the record behind both inclusions: it
+measured the layer, found zero near-duplicate render paths because every load-bearing report is
+one shared core plus thin per-front-end projections, and its standing rule 2 says any front-end
+consumes `keel.commands.*` services or the engine directly -- it does not re-render another
+front-end's report from raw rows. This pin is what makes that rule mechanical, and #588 is what
+made it cover the one front-end it had missed: the pin passed vacuously green over all eight MCP
+handlers, which is the argument for scanning them BEFORE anything grows there rather than after.
+The pin is an AST scan enforcing six rules -- five that hold across the whole layer, and one
+(#533) scoped to the JSON serialiser:
 
 * **Rule 1 -- no compute-module imports.** Nothing may be imported from the compute
   trees -- `keel.strategy.*` (sizing/backtest/promotion math), `keel.execution.guards` /
@@ -76,27 +82,35 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-#: The PRESENTATION layer: the console shell, the live loop, every sub-menu module -- and, since
-#: #435, every module of the local web UI (`keel/web/`).
+#: The PRESENTATION layer: every module of the local web UI (`keel/web/`) and, since #588, every
+#: module of the MCP server (`keel/mcp/`).
 #:
-#: The web UI is scanned by the same rules rather than a parallel pin of its own, because it
-#: is the same kind of thing: a second front-end over `keel/commands/*`. A separate pin would have
-#: drifted -- two files stating the same architecture, diverging one allowance at a time -- and
-#: the failure it is guarding against is identical in both. `keel/commands/serve.py` is NOT
-#: scanned: it is the command that binds the socket and launches a browser, which is service work
-#: and is exactly what Rule 5 says belongs outside this layer.
+#: Both are scanned by the same rules rather than parallel pins of their own, because they are
+#: the same kind of thing: front-ends over `keel/commands/*` services and the engine. A separate
+#: pin would have drifted -- two files stating the same architecture, diverging one allowance at
+#: a time -- and the failure being guarded against is identical in both. `keel/commands/serve.py`
+#: and `keel/commands/mcp.py` are NOT scanned: they are the commands that bind the socket /
+#: launch the browser / wire argv to the stdio loop, which is service work and is exactly what
+#: Rule 5 says belongs outside this layer.
 def _console_module_paths() -> list[str]:
     """Every front-end module these rules hold over.
 
-    **This used to be two globs and is now one (#541).** `keel/commands/console.py`, `tui.py` and
-    the seven `*console*.py` modules were deleted with the TUI -- they were reachable only from
-    inside it -- so what remains is the front-end that replaced them. The glob over `keel/web/`
-    was always here; it is the whole file set now.
+    **One glob until #588, two again now.** `keel/commands/console.py`, `tui.py` and the seven
+    `*console*.py` modules were deleted with the TUI at #541, leaving `keel/web/` as the whole
+    file set. #588 restored the second glob for `keel/mcp/` -- ADR 0003's one actionable gap:
+    the MCP server is the other front-end over the same service cores, and nothing mechanical
+    stopped an MCP handler from growing compute the way a web module is stopped. The handlers
+    were all thin when the glob landed, so the pin passed green over them on day one -- which is
+    the point of adding it before anything grows there, and why the positive control
+    `test_rules_1_and_2_are_proven_false_capable_over_an_mcp_source` exists to prove the rules
+    FIRE over an `mcp/` key and the green is not silence.
 
     A glob that silently matched nothing would make every rule below vacuously green, which is
     what `test_the_scan_actually_scanned_the_console_layer` exists to prevent, and why that test
     names modules explicitly rather than counting them."""
-    return sorted(set(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py"))))
+    paths = sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py")))
+    paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "mcp", "*.py"))))
+    return sorted(set(paths))
 
 
 #: Rule 5's entry-scoped exceptions, in the same shape as every other allowance here:
@@ -179,15 +193,36 @@ def _is_compute(dotted: str) -> bool:
 #: a read a front-end may make, so no allowance is needed and one would be dead weight that
 #: looked like a pin. Stated here because #588 asked for the audit to say so explicitly rather
 #: than by accident of not being scanned.
-IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
+IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The §65.9 purification report's COMPUTE home, read by the MCP handler the same way the
+        # CLI's own `keel purification` body and the web's §65.9 view reach it: one
+        # implementation, three front-ends (ADR 0003's table lists `_purification` as the JSON
+        # projection of `build_report`, ~12 lines over the engine's report). A dispatch, never a
+        # re-implementation, and the call that names it is pinned below.
+        ("mcp/tools", "keel.compliance.purification.build_report"),
+    }
+)
 
 #: (module key, enclosing function's name, fully resolved callee) -- every call into a compute
 #: tree that survives the audit, each with its reason:
 #:
-#: #588's audit emptied this list for the same reason as `IMPORT_ALLOWLIST` above: every entry
-#: described a call in a console module #541 deleted. The MCP §65.9 projection joins it with the
-#: scan extension below.
-CALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset()
+#: #588's audit removed every entry that had described a console module #541 deleted. The one
+#: entry of the multi-front-end era is the MCP handler's §65.9 projection -- the same shape, and
+#: the same reason, as the `_do_compliance_payload` allowance the deleted TUI carried.
+CALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        # The purification tool's report: JSON of the engine's own `build_report` over the
+        # transaction rows -- the same report `keel purification` prints and the web renders.
+        # The handler adds nothing to it: every figure it returns is the report's own field,
+        # bar `len(report.needs_review)`, a count of a list the report itself holds (Rule 6e's
+        # len() ban is scoped to the serialiser; this is a tool response, not the wire
+        # contract). A projection site, not a compute site -- and the entry names the exact
+        # enclosing function, so a second `build_report` call anywhere else in the package
+        # still fails.
+        ("mcp/tools", "_purification", "keel.compliance.purification.build_report"),
+    }
+)
 
 #: (module key, enclosing function, constructor name) -- the audited broker-construction read
 #: sites (Rule 4b). Every other construction must ride the `build_broker`/`build_client` lambda
