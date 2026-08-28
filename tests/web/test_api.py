@@ -283,6 +283,57 @@ def test_config_survives_a_build_it_could_not_resolve(running: web_server.ServeC
     assert document["data"]["reproducible"]["state"] == "unknown"
 
 
+def test_config_names_the_served_deployment(running: web_server.ServeConfig) -> None:
+    """#597's mode badge answers "which deployment is this" from the header, on EVERY view.
+
+    `/api/config` is the one endpoint the client reads regardless of route -- it keys the
+    service worker and the docs links at boot -- so the deployment's identity rides the answer
+    that is already arriving, rather than a second endpoint or a badge that only hydrates where
+    `/api/status` happens to be the view.
+
+    `mode` is the config's own word for `auto_trade.mode`, copied verbatim and not judged:
+    `paper` beside `confirm` is neither good nor bad, and a `Field` with a `state` would force
+    exactly that judgement. The two paths are the "where am I" of `keel serve` -- one process
+    serves ONE `--db`/`--config` pair, and naming them here makes paper-vs-live confusion
+    answerable at a glance instead of by asking the terminal.
+    """
+    status, _headers, document = _json(running, "/api/config")
+
+    assert status == 200
+    # `VALID_CONFIG_YAML` declares no `auto_trade` block, and the config layer's default mode
+    # is paper -- the badge must move with the deployment's own answer, never with a guess here.
+    assert document["data"]["mode"] == "paper"
+    assert document["data"]["db_path"] == running.db_path
+    assert document["data"]["config_path"] == running.config_path
+
+
+def test_config_reports_the_mode_the_config_file_declares(tmp_path: Path) -> None:
+    """The same binary serving a confirm-mode config is a different deployment, and an operator
+    with two of them open in two tabs must be able to tell them apart from the header alone."""
+    config_path = tmp_path / "confirm.yaml"
+    config_path.write_text(VALID_CONFIG_YAML + "\nauto_trade:\n  mode: confirm\n")
+    for cfg in _bind(str(tmp_path / "keel.db"), str(config_path)):
+        status, _headers, document = _json(cfg, "/api/config")
+
+        assert status == 200
+        assert document["data"]["mode"] == "confirm"
+
+
+def test_config_survives_a_config_it_could_not_read(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    """The whole shell boots off this endpoint -- the worker registration, the docs links, the
+    footer AND the badge. A config that is missing (the first-run state this fixture binds) or
+    unreadable must degrade the mode to absent rather than 500 the page, exactly as a build that
+    could not be resolved already does above."""
+    status, _headers, document = _json(empty_machine, "/api/config")
+
+    assert status == 200
+    assert document["data"]["mode"] == ""
+    # The paths are this process's own arguments; they are known even when the config is not.
+    assert document["data"]["db_path"] == empty_machine.db_path
+
+
 class _FakeBuild:
     """A resolved `keel.version.BuildInfo`, without shelling out to git in a test."""
 

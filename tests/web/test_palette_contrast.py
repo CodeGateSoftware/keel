@@ -328,6 +328,71 @@ def test_field_input_border_uses_the_control_line_token_not_line() -> None:
     assert "var(--line)" not in field_rule.group(0)
 
 
+# -- the theme choice, and the colours of the header that carries it (#597) ------------------------
+
+
+def test_a_pinned_dark_choice_paints_dark_on_a_light_machine() -> None:
+    """The `:root[data-theme="dark"]` block duplicates the media block's tokens EXACTLY.
+
+    The duplication is the site's own device (keeltrading.com's global.css carries the same two
+    blocks beside a comment saying "the duplication below keeps both paths in plain CSS"), and
+    both paths are needed: the `@media` block answers "the OS prefers dark and the reader has
+    not pinned anything", the pinned block answers "the reader chose dark while their OS stays
+    light". Without the second, #597's toggle could only ever go light on a light-theme machine
+    -- a control with one working position.
+
+    Pinned as EXACT EQUALITY rather than as a floor: the two blocks are one palette stated
+    twice, and a value that drifts between them is not a new colour, it is the SAME page able
+    to render two different darks depending on how the reader arrived at dark."""
+    css = _COMMENT_RE.sub("", _CSS.read_text(encoding="utf-8"))
+    pinned = re.search(r':root\[data-theme="dark"\]\s*\{([^}]*)\}', css)
+    assert pinned is not None, "no pinned-dark block -- a stored dark choice cannot paint"
+    pinned_palette = dict(_VAR_RE.findall(pinned.group(1)))
+
+    media = re.search(
+        r"@media \(prefers-color-scheme: dark\)\s*\{\s*"
+        r':root:not\(\[data-theme="light"\]\)\s*\{([^}]*)\}',
+        css,
+    )
+    assert media is not None
+    media_palette = dict(_VAR_RE.findall(media.group(1)))
+
+    assert pinned_palette == media_palette, (
+        "the pinned-dark block and the media dark block are one palette stated twice; a value "
+        "here that differs is the same page rendering two different darks"
+    )
+    # And the duplication is not vacuous: both blocks really do carry the whole palette.
+    assert _EXPECTED_TOKENS <= pinned_palette.keys(), pinned_palette.keys()
+
+
+def test_every_colour_on_the_page_is_a_measured_token() -> None:
+    """**How #597's new header surfaces join this suite: by adding no colour of their own.**
+
+    The brand mark, the theme toggle (its circle, its border, both icons' `currentColor`) and
+    the mode badge are all coloured with `var(--...)` references into the SAME two token blocks
+    every ratio above is measured from. That is the property that makes "the contrast suite
+    covers them" true without a new pair per component: there is no hex literal outside the
+    token blocks, so there is no colour on this page whose ratio is not one of the ratios this
+    file already computes.
+
+    Pinned globally rather than per-rule, because the failure it guards is exactly a new rule
+    appearing with a hex in it -- `#0c5d52` pasted into a `.badge { color: ... }` would pass
+    every existing test while escaping the whole measurement apparatus."""
+    css = _COMMENT_RE.sub("", _CSS.read_text(encoding="utf-8"))
+    # Everything that is not a token block: the light `:root`, the `@media` dark block, the
+    # pinned-dark block (#597), and the `@media` wrapper text itself.
+    stripped = re.sub(r":root\s*\{[^}]*\}", "", css)
+    stripped = re.sub(r":root:not\(\[data-theme=\"light\"\]\)\s*\{[^}]*\}", "", stripped)
+    stripped = re.sub(r":root\[data-theme=\"dark\"\]\s*\{[^}]*\}", "", stripped)
+    stripped = re.sub(r"@media[^{]*\{", "", stripped)
+
+    literals = re.findall(r"#[0-9a-fA-F]{3,8}\b", stripped)
+    assert literals == [], (
+        f"hex colour literals outside the token blocks: {literals} -- every colour on this page "
+        "must be a token, so every pair is one this suite already measures"
+    )
+
+
 #: WCAG 2.x AAA, normal-size text (SC 1.4.6): 7:1. AA (`_AA_TEXT_MIN`, 4.5:1) is the WCAG floor
 #: this whole page must clear; AAA is this palette's actual working standard in practice --
 #: every text pair reached it before #532 except `--muted` and `--warn`, both pre-existing AA

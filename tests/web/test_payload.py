@@ -366,7 +366,13 @@ def _every_payload() -> dict[str, Any]:
         "insights": payload.insights_payload(_insights_report()),
         "journal": _journal_json(),
         "activity": payload.activity_payload(_activity_feed()),
-        "config": payload.config_payload(_build_info(), describe="keel 0.1.0+abc [checkout]"),
+        "config": payload.config_payload(
+            _build_info(),
+            describe="keel 0.1.0+abc [checkout]",
+            mode="paper",
+            db_path="/tmp/keel/keel.db",
+            config_path="/tmp/keel/config.yaml",
+        ),
         "setup": payload.setup_payload(
             _deployment_state(),
             actions=ACTIONS,
@@ -990,6 +996,40 @@ def test_an_error_count_is_bad_and_a_quiet_cycle_is_neutral() -> None:
 
     assert cycle["errors"]["state"] == "bad"
     assert cycle["quiet"]["state"] == "neutral"
+
+
+# -- the config payload (#597) --------------------------------------------------------------------
+
+
+def test_the_config_payload_names_the_deployment_without_judging_it() -> None:
+    """`mode`, `db_path` and `config_path` cross as BARE STRINGS, not `Field`s (#597).
+
+    Two reasons, and both are the payload's own conventions:
+
+      * `mode` is an enum word and the paths are identifiers -- the module note on "what is NOT
+        a Field" already names `mode` in that class, and `setup_payload` already sends
+        `config_path`/`db_path` the same way.
+      * A `Field` would force a `state`, and there is no honest one: `confirm` beside `paper` is
+        neither good nor bad, and the badge's whole brief is to REPORT the served deployment.
+
+    **The browser never changes the mode, and no key here grants it a way to.** This payload is
+    served by a GET-only route (`test_no_api_route_answers_a_post`); changing `auto_trade.mode`
+    is a config-file edit plus a terminal action by design, and the badge is a readout of that
+    decision, never a control for it.
+    """
+    document = payload.config_payload(
+        _build_info(),
+        describe="keel 0.1.0+abc [checkout]",
+        mode="confirm",
+        db_path="/tmp/keel/keel.db",
+        config_path="/tmp/keel/config.yaml",
+    )
+
+    assert document["mode"] == "confirm"
+    assert document["db_path"] == "/tmp/keel/keel.db"
+    assert document["config_path"] == "/tmp/keel/config.yaml"
+    # And every new key is a string, so the no-JSON-numbers walk holds over the growth.
+    assert not _json_numbers(document)
 
 
 # -- totality ------------------------------------------------------------------------------------
