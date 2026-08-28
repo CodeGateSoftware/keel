@@ -39,9 +39,10 @@ way #283 did, and re-check both bullets above, because both would have to be giv
 
 These tests pin every place the floor is stated, and each derives from `requires-python` rather
 than repeating a literal, so raising or lowering it again is one edit plus this docstring. The
-one exception lives elsewhere on purpose: `scripts/install.sh` states the floor in shell for
-the audience that meets it before pip does, and is pinned by `tests/test_install_script.py`,
-which derives it from this same metadata.
+one place that deliberately does NOT track this metadata is `scripts/install.sh` (#557): the
+installer enforces the floor of the RELEASE it installs -- read from that release's own
+`requires-python`, because the dev tree's floor can be (and was) higher than the wheels a
+release ships. `tests/test_install_script.py` pins that derivation instead.
 
 There is no successor to the old `assert_never` test, and that absence is the point: a policy
 floor has no binding feature to keep true. Asserting one would state a reason that is not the
