@@ -34,7 +34,23 @@
   caught in review. Everything is a same-origin file. `<base href>` is impossible for the same
   reason -- `base-uri 'none'` -- which is why the hrefs below are absolute rather than relative
   to a declared base.
+
+  ── THE ONE NON-MODULE SCRIPT, AND WHY IT IS WHERE IT IS (#597) ─────────────────────────────
+  `/js/theme.js` below is a CLASSIC script, the only one this shell loads. It exists to restore
+  the reader's stored light/dark choice on `<html>` BEFORE FIRST PAINT, and a `type="module"`
+  script cannot do that job: modules are deferred by definition, so the page would paint in the
+  OS theme and then flip after the module loaded -- a flash of the wrong theme on every load
+  for every reader who has chosen. The keeltrading.com pattern this copies (its `BaseHead`
+  restores `keel-theme` from `localStorage` in an inline head script) needs exactly one script
+  and ours must be same-origin rather than inline, which the policy permits and nothing else
+  about the shell changes: it is still a file this repository serves, byte for byte as authored.
+
+  It sits AHEAD of the stylesheet on purpose. `data-theme` must be on the root before a single
+  rule is applied to a single element, which is also why this is a parser-blocking classic
+  script rather than `defer`: the fifteen milliseconds it costs on a loopback socket buy the
+  guarantee that no reader ever sees the wrong paper.
 -->
+<script src="/js/theme.js"></script>
 <link rel="stylesheet" href="/css/keel.css">
 <!--
   ── THE INSTALL SURFACE (#538), AND THE ONE ATTRIBUTE THAT MAKES IT WORK ────────────────────
@@ -59,7 +75,43 @@
 <a class="skip" href="#view">Skip to content</a>
 
 <header>
-  <span class="brand">keel</span>
+  <!--
+    THE BRAND BLOCK (#597): the mark and the wordmark, in ONE anchor to `/`.
+
+    ── WHY THE MARK IS INLINE RATHER THAN AN `<img src="/icons/keel.svg">` ─────────────────────
+    The favicon must be one fixed file, so it is a fixed raster of the LIGHT theme: a teal
+    square, paper strokes. The header sits on both the paper and the slate, and an `<img>` of
+    that file would carry light-theme literals onto dark slate -- the square still reads (it is
+    the accent teal both ways) but the strokes were chosen against paper. Inlined, the same
+    geometry can reference the palette's tokens instead (`--accent` for the square, `--bg` for
+    the strokes, in `keel.css`), so the mark is the favicon's shape wearing each theme's own
+    colours. `tests/web/test_client_assets.py::test_the_inline_mark_is_the_one_the_icons_carry`
+    pins that the GEOMETRY stays the icon's, so this cannot drift into a second drawing.
+
+    ── ONE ANCHOR, NOT TWO ─────────────────────────────────────────────────────────────────────
+    The mark and the wordmark are one link to `/` -- the app's home since #540, where
+    `main.js::BASE` and this file's nav hrefs agree. A brand where the word is clickable and
+    the mark beside it is not is a brand that looks half-finished, and the fix is structural:
+    one `<a>` around both halves. `aria-label` says where it goes rather than restating the
+    wordmark, so a reader hears "keel home, link"; the svg is `aria-hidden` for the same
+    reason. Keyboard focus comes from being an anchor -- the global `:focus-visible` ring in
+    `keel.css` is the visible half of that.
+
+    This block is markup, not `main.js` nodes, for the reasons at the top of this file: it is
+    readable in view-source, present under `<noscript>`, and focusable before the module loads.
+  -->
+  <a class="brand" href="/" aria-label="keel home">
+    <svg class="mark" viewBox="0 0 1 1" aria-hidden="true">
+      <rect width="1" height="1" rx="0.208333"/>
+      <g fill="none" stroke-width="0.0708333" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M 0.5 0.166667 L 0.5 0.583333"/>
+        <path d="M 0.5 0.166667 L 0.366667 0.333333"/>
+        <path d="M 0.5 0.166667 L 0.633333 0.333333"/>
+        <path d="M 0.5 0.583333 L 0.440583 0.586792 L 0.38725 0.597 L 0.33975 0.613667 L 0.297917 0.636458 L 0.261542 0.665125 L 0.230458 0.699333 L 0.204458 0.738833 L 0.183333 0.783333 L 0.816667 0.783333 L 0.795542 0.738833 L 0.769542 0.699333 L 0.738458 0.665125 L 0.702083 0.636458 L 0.66025 0.613667 L 0.61275 0.597 L 0.559417 0.586792 L 0.5 0.583333"/>
+      </g>
+    </svg>
+    <span>keel</span>
+  </a>
   <nav aria-label="Views">
     <ul>
       <li><a href="/status">Status</a></li>
@@ -88,6 +140,61 @@
              target="_blank" rel="noopener noreferrer">Docs<span aria-hidden="true"> &#8599;</span></a></li>
     </ul>
   </nav>
+
+  <!--
+    THE MODE BADGE (#597): which deployment is this browser looking at.
+
+    Read-only, in the strictest sense this app has: it DISPLAYS the served config's
+    `auto_trade.mode` and nothing else. Mode is a config-file edit plus a terminal action by
+    design (the TTY confirmation gate exists for exactly that), and there is no control here,
+    no route behind one, and no capability added -- the value crosses on `/api/config`
+    (`payload.config_payload`'s note records the boundary) because that is the one endpoint
+    every view reads at boot, which is what makes the badge present everywhere rather than only
+    where a status report happens to load.
+
+    Empty in the markup, like `#build` in the footer: `main.js` fills it from the boot config
+    read. No `aria-live` and no `role` -- it changes once, at boot, and this page keeps exactly
+    one live region (see the note beside `#engine`). Until it fills it is hidden
+    (`:empty` in `keel.css`), because an empty pill is a stray mark, and an unreadable config
+    should cost the badge rather than guess a mode.
+  -->
+  <span id="mode-badge" class="pill mode"></span>
+
+  <!--
+    THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.
+
+    The css keys dark on BOTH `@media (prefers-color-scheme: dark) :root:not([data-theme=
+    "light"])` and `:root[data-theme="dark"]`, so: no stored choice -> the OS preference paints
+    the page; a stored choice -> it paints the page on any OS. This button writes that one
+    attribute (`main.js` handles the click; `js/theme.js` restores it before first paint) and
+    stores the choice under `keel-theme`, the same key keeltrading.com's toggle uses.
+
+    BOTH icons ship here and the STYLESHEET decides which one shows -- the same two selectors
+    that paint the page decide which icon is visible, so what a reader sees in the circle is
+    always the icon of the theme they would switch TO, and it cannot disagree with the painted
+    page even in the moment between this markup parsing and `main.js` loading. The icons are
+    the site's own sun and moon (`Header.astro`), inline SVG on `currentColor`: no icon font,
+    no external asset, and legible on both themes because the ink is the theme's own.
+  -->
+  <button type="button" id="theme-toggle" class="theme-toggle"
+          aria-label="Toggle light and dark theme">
+    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.2"/>
+      <line x1="12" y1="2.5" x2="12" y2="5"/>
+      <line x1="12" y1="19" x2="12" y2="21.5"/>
+      <line x1="2.5" y1="12" x2="5" y2="12"/>
+      <line x1="19" y1="12" x2="21.5" y2="12"/>
+      <line x1="5.3" y1="5.3" x2="7" y2="7"/>
+      <line x1="17" y1="17" x2="18.7" y2="18.7"/>
+      <line x1="5.3" y1="18.7" x2="7" y2="17"/>
+      <line x1="17" y1="7" x2="18.7" y2="5.3"/>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20.2 13.2A8.2 8.2 0 1 1 10.8 3.8a6.5 6.5 0 0 0 9.4 9.4Z"/>
+    </svg>
+  </button>
 </header>
 
 <main id="view" tabindex="-1">

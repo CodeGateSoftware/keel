@@ -82,6 +82,7 @@ const PRECACHE = [
   `${BASE}js/live.js`,
   `${BASE}js/main.js`,
   `${BASE}js/render.js`,
+  `${BASE}js/theme.js`,
   `${BASE}icons/keel.svg`,
   `${BASE}icons/keel-192.png`,
   `${BASE}icons/keel-512.png`,

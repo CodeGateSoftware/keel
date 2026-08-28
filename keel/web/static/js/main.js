@@ -42,6 +42,7 @@ import {
   engineBanner,
   gatesView,
   insightsView,
+  modeBadge,
   rulesView,
   setupView,
   statusView,
@@ -132,6 +133,10 @@ const buildNode = must("build");
 const docsNode = /** @type {HTMLAnchorElement} */ (must("docs-link"));
 /** Where the "a newer build is ready" offer goes (#538). Empty until there is one. */
 const updateNode = must("update");
+/** The header's mode badge (#597). Filled once, from the boot config read. */
+const modeNode = must("mode-badge");
+/** The header's theme toggle (#597). Clicked, it flips and stores the choice `theme.js` restores. */
+const themeNode = /** @type {HTMLButtonElement} */ (must("theme-toggle"));
 
 /**
  * An element that `index.html` guarantees. Throwing beats rendering half a page: the two files
@@ -526,6 +531,51 @@ window.addEventListener("popstate", () => {
   show(routeFor(window.location.pathname), true);
 });
 
+// -- the theme choice (#597) ----------------------------------------------------------------------
+
+/**
+ * The light/dark toggle: flip the theme, store the choice, and let the stylesheet notice.
+ *
+ * ── TWO STATES, AND THE ONE ATTRIBUTE THAT CARRIES THE CHOICE ────────────────────────────────
+ * `data-theme` on `<html>` is the whole mechanism, and `keel.css` reads it from two selectors:
+ * the dark `@media (prefers-color-scheme: dark)` block applies when the OS prefers dark and the
+ * reader has NOT pinned light (`:root:not([data-theme="light"])`), and a `:root[data-theme=
+ * "dark"]` block applies a pinned dark on any OS. So "no stored choice" needs no attribute at
+ * all -- the OS decides -- and a stored choice is one of the two words.
+ *
+ * ── WHY `current` IS COMPUTED RATHER THAN READ OFF THE ATTRIBUTE ─────────────────────────────
+ * When the reader has not chosen, the attribute is absent but the PAGE still has a theme: the
+ * one the OS preference painted. Flipping "absent" to `"dark"` on a dark-OS machine would be a
+ * no-op button on exactly the machine where the choice is most likely to be made; so the flip
+ * starts from the theme that is actually showing, asking `matchMedia` when the attribute does
+ * not answer. This is keeltrading.com's own toggle logic (`Header.astro`'s delegated listener),
+ * carried across rather than reinvented -- one identity, one behaviour.
+ *
+ * ── THE STORE, AND WHY THE WRITE IS GUARDED ──────────────────────────────────────────────────
+ * `keel-theme` in `localStorage`, the key `js/theme.js` restores before first paint. A reader
+ * whose storage is refused (private mode, disabled by policy) still gets a working toggle for
+ * THIS load -- the attribute flips, the page re-paints -- and simply starts from the OS
+ * preference next time, which is the same place a first-time reader starts. The two spellings
+ * of the key are pinned to agree by `test_the_theme_choice_is_spelled_where_it_is_stored`.
+ */
+themeNode.addEventListener("click", () => {
+  const root = document.documentElement;
+  const pinned = root.dataset.theme;
+  const showing =
+    pinned === "light" || pinned === "dark"
+      ? pinned
+      : window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+  const next = showing === "dark" ? "light" : "dark";
+  root.dataset.theme = next;
+  try {
+    window.localStorage.setItem("keel-theme", next);
+  } catch (cause) {
+    void cause; // storage refused: this load still flips; the next one starts from the OS again
+  }
+});
+
 /** Catch up immediately when a hidden tab is looked at again -- see the poll comment in `show`. */
 /**
  * The write path (#540): one delegated `submit` listener for every action form.
@@ -791,7 +841,7 @@ function offerUpdate(waiting) {
 }
 
 /**
- * The build, read once, and the three things that depend on it.
+ * The build, read once, and the four things that depend on it.
  *
  * Once, not per poll: `/api/config` describes the binary that is answering, and that cannot
  * change without the process restarting -- at which point the session token is new, every fetch
@@ -805,12 +855,18 @@ function offerUpdate(waiting) {
  * `/api/config` is the one endpoint that opens no database, so this costs a single round trip on
  * a loopback socket, and it cannot hang the app: `api.read` resolves with a stopped reading
  * rather than rejecting, so `show` runs even with nothing listening on the port.
+ *
+ * **The header's mode badge fills here too (#597), for the same reason the links do.** The
+ * deployment this process serves cannot change without a restart, so the badge would never
+ * need re-reading -- and hydrating it from the read every view already makes is what puts it
+ * on EVERY view, rather than only where a status report happens to load.
  */
 void read("config").then((reading) => {
   const config = reading.data;
   rememberVersion((config && (config.build || config.version)) || "");
   docsNode.href = indexUrl();
   buildLine(buildNode, config);
+  modeBadge(modeNode, config);
   registerWorker(config);
   show(booted, false);
 });

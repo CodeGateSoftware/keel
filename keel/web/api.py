@@ -146,9 +146,47 @@ def _status_report(cfg: ServeConfig, now_ts: int) -> Any:
 
 
 def read_config(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    """The running build. Reads no deployment and no database -- it describes the BINARY that is
-    answering, which is why it still has data to serve on a machine with nothing set up."""
-    return payload.config_payload(cfg.build_info, describe=cfg.build)
+    """The running build, and the deployment that build is serving (#597).
+
+    Still reads NO database -- it answers on a machine with nothing set up, which is why its
+    route is `needs_database=False`. The deployment half arrives as this process's own
+    arguments (`cfg.db_path`, `cfg.config_path`) plus one read of the config FILE, which opens
+    no database and forks no subprocess, unlike the `inspect` probe the envelope has already run
+    for `engine` by the time this returns.
+
+    **`_mode` degrades rather than raising, and the whole shell depends on that.** The client
+    boots from this one endpoint -- worker registration, docs links, the footer build line and
+    the header's mode badge -- so a config that is missing (a first run) or unreadable (a hand
+    edit gone wrong) must cost the page its badge, not its boot. `payload.config_payload`
+    records the read-only boundary: nothing in this package writes `auto_trade.mode`.
+    """
+    return payload.config_payload(
+        cfg.build_info,
+        describe=cfg.build,
+        mode=_auto_trade_mode(cfg.config_path),
+        db_path=cfg.db_path,
+        config_path=cfg.config_path,
+    )
+
+
+def _auto_trade_mode(config_path: str) -> str:
+    """The served config's own word for `auto_trade.mode`, or `""` when it cannot be read.
+
+    The config file is re-read per request rather than resolved at bind time on purpose: mode
+    changes are config-file edits by design, and `read_status` re-reads the same file on every
+    poll already -- a badge that showed a mode the served config no longer declares would be
+    worse than one that says nothing.
+
+    A report of absence rather than an exception, for every way a config can fail here: the
+    file is missing (a first run), the YAML is malformed, or `load_config` refused a value
+    (`ConfigError`). Naming the narrow ones would leave this reader deciding which failure is
+    which, and the caller's response is the same for all three.
+    """
+    try:
+        config = load_config(config_path)
+    except Exception:  # every unreadable config is one answer here: the mode is unknown
+        return ""
+    return str(getattr(getattr(config, "auto_trade", None), "mode", "") or "")
 
 
 def read_status(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:

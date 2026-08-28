@@ -71,6 +71,32 @@
   }
 }
 
+/* ── a PINNED dark, beside the OS-preferred one (#597) ─────────────────────────────────────
+ *
+ * The block above answers "the OS prefers dark and the reader has not pinned anything" --
+ * `:not([data-theme="light"])` is what keeps that honest. It cannot answer "the reader CHOSE
+ * dark while the machine stays light", which is what the header's toggle writes, so the same
+ * palette is stated a second time against the plain attribute. This is keeltrading.com's own
+ * device (its global.css carries the same two blocks, with a comment that "the duplication
+ * below keeps both paths in plain CSS"), and `tests/web/test_palette_contrast.py::
+ * test_a_pinned_dark_choice_paints_dark_on_a_light_machine` holds the two statements EQUAL --
+ * because a value that drifts between them is not a second colour, it is one page able to
+ * render two different darks depending on how the reader arrived at dark.
+ *
+ * `color-scheme` so the browser's own widgets (scrollbars, form controls, `<details>`
+ * markers) follow the pinned choice too; the unpinned case inherits `light dark` from the rule
+ * above, and a pinned light needs only the widgets, not the tokens -- light is the `:root`
+ * default. `js/theme.js` sets the attribute before first paint; `main.js` flips it.
+ */
+:root[data-theme="dark"] {
+  --bg: #0f171d; --fg: #e9e7e0; --muted: #a4b4be; --line: #2b3a44;
+  --card: #162128; --accent: #57c5af; --link: #6fd0bb;
+  --warn: #d4af37; --bad: #e07a6a; --good: #7cd69f;
+  --control-line: #606f7a;
+  color-scheme: dark;
+}
+:root[data-theme="light"] { color-scheme: light; }
+
 /* ── the semantic retunes, one note each (#593) ────────────────────────────────────────────────
  *
  * LIGHT `--warn: #7a5c15` is the site's own `--gold-4`. The site's gold set is its warm-ink
@@ -169,7 +195,98 @@ header {
   gap: 0.4rem 1.1rem;
   align-items: baseline;
 }
-header .brand { font-weight: 650; letter-spacing: 0.02em; margin-right: 0.6rem; }
+
+/* ── the brand block (#597): the mark and the wordmark, in one anchor to `/` ────────────────────
+ *
+ * `header a` below colours every link in the row `--muted`; the brand is the page's own name
+ * and overrides to the ink, as the site's own header brand does (`--ink` on keeltrading.com).
+ * It keeps the transparent `border-bottom` and the `min-height` `header a` gives it, so the
+ * hit area and the baseline it sits on are the nav's.
+ *
+ * The mark is the favicon's geometry inlined (`index.html`'s brand note says why inline), with
+ * its colours re-pointed at the tokens: in light that reproduces `icons/keel.svg` exactly --
+ * `--accent` IS #0c5d52 and `--bg` IS #f8f7f3 there -- and in dark the same shape wears the
+ * mint accent on the slate rather than carrying light-theme literals onto a dark page. `--bg`
+ * for the strokes rather than `--fg`: the strokes are negative space cut out of the square,
+ * and the paper is what they were drawn on. */
+header a.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--fg);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  margin-right: 0.6rem;
+  text-decoration: none;
+}
+header a.brand:hover { color: var(--accent); }
+header a.brand svg.mark { width: 1.35em; height: 1.35em; flex: none; }
+header a.brand svg.mark rect { fill: var(--accent); }
+header a.brand svg.mark g { stroke: var(--bg); }
+
+/* ── the mode badge and the theme toggle (#597) ────────────────────────────────────────────────
+ *
+ * The header's two answers ABOUT the session -- which deployment, which theme -- sit at the
+ * margin the nav leaves, which is why the badge takes `margin-left: auto` and the toggle
+ * follows it. Both are `align-self: center` because the row is baseline-aligned for TEXT and
+ * these two are shapes: a pill and a circle have no meaningful baseline of their own. */
+header .mode {
+  margin-left: auto;
+  align-self: center;
+  font-weight: 600;
+}
+/* Empty until `main.js` fills it from the boot config read, and hidden while it is: an empty
+ * pill is a stray mark, and an unreadable config should cost the badge rather than guess a
+ * mode. Same pairing as `#build` in the footer, which is also empty until the same read. */
+header .mode:empty { display: none; }
+/* The emphasis table `render.js::MODE_CLASS` places: paper is the quiet one (muted, like any
+ * label), confirm and live carry the accent, because a deployment that can place orders should
+ * sit up in the header. NOT `--good`/`--bad` -- those are `state`'s vocabulary and there is no
+ * judgement here, only emphasis; the payload sends `mode` as a bare string for exactly that
+ * reason. Both tokens are text foregrounds the contrast suite already measures against both
+ * surfaces, and `--accent` as the border of the armed pill clears the boundary minimum on the
+ * strength of that same measurement. */
+header .mode-paper { color: var(--muted); }
+header .mode-confirm,
+header .mode-live { color: var(--accent); border-color: var(--accent); }
+
+/* The toggle. It deliberately does NOT inherit the filled `button` rule: that one is for an
+ * action that changes something on the server, and a filled teal disc beside the nav would be
+ * the loudest thing in the header. `--control-line` for the border, not `--line`, for the
+ * reason `.field` inputs give: this control's only boundary is its border and WCAG 1.4.11
+ * asks 3:1 of it. The icons are `currentColor` (the markup carries them inline, on the site's
+ * own geometry), so what they are drawn in is whatever ink the theme is using -- legible on
+ * the paper and on the slate with no rule of their own. */
+button.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  align-self: center;
+  border: 1px solid var(--control-line);
+  border-radius: 999px;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+}
+button.theme-toggle:hover,
+button.theme-toggle:focus-visible { color: var(--accent); border-color: var(--accent); }
+button.theme-toggle svg { width: 15px; height: 15px; }
+/* The icon that shows is the one for the theme a click would switch TO, and the SAME two
+ * selectors that paint the page decide which one that is -- so the circle cannot disagree with
+ * the page even in the moment between this markup parsing and `main.js` hydrating the click.
+ * Default: light is showing, the moon offers dark. keeltrading.com's header does exactly this. */
+button.theme-toggle .icon-sun { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) button.theme-toggle .icon-sun { display: block; }
+  :root:not([data-theme="light"]) button.theme-toggle .icon-moon { display: none; }
+}
+:root[data-theme="dark"] button.theme-toggle .icon-sun { display: block; }
+:root[data-theme="dark"] button.theme-toggle .icon-moon { display: none; }
+
 header nav ul {
   list-style: none;
   margin: 0;
