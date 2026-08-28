@@ -3319,6 +3319,45 @@ def test_the_registry_resolved_coinbase_adapter_serves_execute_end_to_end(repo) 
     assert transport.create_calls[0]["product_id"] == "BTC-USD"
 
 
+def test_the_registry_resolved_coinbase_adapter_serves_the_reconcile_sweep(repo) -> None:
+    """The third leg of the #524 pin. The same registry-built adapter that served the guarded
+    place and the preview also serves the sweep that later observes the resting bracket's fill:
+    the tranche is recorded the way `run_once` records it, the venue's answer arrives as the
+    port's `OrderStatus`, and the observed economics land on the order row and in the outcome --
+    with no dict shape probed anywhere on the way through."""
+    from keel_broker_api.registry import load_broker
+
+    from keel.execution.reconcile import reconcile_open_orders
+
+    transport = _FixtureTransport()
+    broker = load_broker("coinbase")(transport)
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+    assert result.placed and result.bracket_order_id is not None
+    # What `run_once` leaves behind after a filled entry: the tranche, pointed at its bracket.
+    entry = repo.get_order(result.order_id)
+    position_id = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=entry["qty"],
+        entry_fee=entry["fee"] or Decimal("0"),
+        entry_fill=entry["actual_fill"],
+    )
+    repo.set_position_bracket(position_id, result.bracket_order_id)
+
+    changed = reconcile_open_orders(broker, repo, _config(), now_ts=NOW_TS + 900)
+
+    # The market entry filled at placement; the resting bracket is the sweep's one row.
+    assert changed == [result.bracket_order_id]
+    bracket = repo.get_order(result.bracket_order_id)
+    assert bracket["status"] == "filled"
+    assert bracket["actual_fill"] == Decimal("65440.00")  # observed, not the stop it rested at
+    assert bracket["fee"] == Decimal("0.60")
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1 and outcomes[0]["exit_fill"] == Decimal("65440.00")
+
+
 def test_a_registry_resolved_fake_venue_serves_the_executors_port_reads(repo) -> None:
     """The second adapter the registry can hand the executor: the fake venue, whose deliberate
     divergences are the port's design pressure. Its balances and instrument reads serve the

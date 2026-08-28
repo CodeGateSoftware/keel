@@ -204,7 +204,9 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
         raise RuntimeError(
             f"broker.name {venue!r} resolved to an installed adapter, but the CLI does not "
             "yet know how to give it credentials -- venue wiring exists for 'coinbase' and "
-            "'alpaca' only. Constructing it anyway would hand the engine a broker that "
+            "'alpaca' only. For robinhood the missing piece is the Ed25519 credential wiring "
+            "its transport signs with, which the CLI does not carry yet by choice -- the "
+            "venue is dev-only. Constructing it anyway would hand the engine a broker that "
             "cannot reach its venue."
         )
 

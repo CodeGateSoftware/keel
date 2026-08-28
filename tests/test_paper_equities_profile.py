@@ -699,7 +699,9 @@ def test_build_broker_alpaca_missing_secrets_names_the_venue_and_env_vars(tmp_pa
 def test_build_broker_refuses_a_venue_without_cli_wiring(tmp_path, monkeypatch):
     """A name that RESOLVES to an adapter but has no credential wiring in the CLI (fake,
     robinhood -- installed in dev) is refused with the two names that do have wiring, rather
-    than constructing an adapter that can never reach its venue."""
+    than constructing an adapter that can never reach its venue. For robinhood the refusal
+    also names the WHY: the Ed25519 credential wiring its transport signs with, which the CLI
+    does not carry by choice."""
     from keel.commands._common import _build_broker
 
     monkeypatch.chdir(tmp_path)
@@ -707,6 +709,11 @@ def test_build_broker_refuses_a_venue_without_cli_wiring(tmp_path, monkeypatch):
     config = load_config(str(_write_config(tmp_path, "\nbroker:\n  name: fake\n")))
 
     with pytest.raises(RuntimeError, match="coinbase.*alpaca"):
+        _build_broker(config)
+
+    config = load_config(str(_write_config(tmp_path, "\nbroker:\n  name: robinhood\n")))
+
+    with pytest.raises(RuntimeError, match="Ed25519.*dev-only"):
         _build_broker(config)
 
 
