@@ -30,10 +30,11 @@ import subprocess
 import sys
 import zlib
 from math import hypot
+from pathlib import Path
 
 import pytest
 
-from keel.web import staticfiles
+from keel.web import server, staticfiles
 from scripts import build_icons
 
 
@@ -461,6 +462,55 @@ def test_the_cache_name_is_keyed_to_the_build() -> None:
     assert 'searchParams.get("v")' in source, "the worker does not read a build from its own URL"
     assert re.search(r"const CACHE = `keel-shell-\$\{BUILD\}`", source), (
         "the cache name does not carry the build"
+    )
+
+
+def test_a_token_bearing_navigation_never_answers_from_cache() -> None:
+    """**The worker must not hold the door shut against the only key.**
+
+    `keel serve` prints `http://127.0.0.1:8765/?token=...` and the server exchanges that token for
+    the session cookie ON THAT NAVIGATION -- `server.do_GET` reads `query["token"]` and answers
+    with `Set-Cookie` before anything else happens. Every later `/api/*` read is gated on the
+    cookie (`_admitted`).
+
+    A cache-first answer to that navigation means the server never sees the token, never sets the
+    cookie, and the shell that loads is then refused by every endpoint it calls. What the operator
+    reads is "Not authorised -- open the address keel printed when it started", which is the one
+    instruction that cannot help, because they DID open it and the worker intercepted it. There is
+    no way out of that state from inside the page.
+
+    So the guard is asserted structurally: the navigation branch must return to the network
+    BEFORE it reaches the cache, and the parameter it looks for must be the one the server
+    actually reads. Binding both sides here is the point -- a rename on either side fails this.
+    """
+    source = _sw_source()
+    server_source = (Path(server.__file__)).read_text(encoding="utf-8")
+
+    param = re.search(r'query\.get\("([^"]+)"\)', server_source)
+    assert param is not None, "the server no longer reads a token out of the query string"
+
+    branch = re.search(
+        r'if \(request\.mode === "navigate"\) \{(.*?)\n  \}', source, re.DOTALL
+    )
+    assert branch is not None, "the navigation branch is not in the shape this test understands"
+    body = branch.group(1)
+
+    guard = body.find("searchParams.has(")
+    cache = body.find("caches.match(")
+    assert guard != -1, (
+        "the navigation branch does not check for the session token -- a token-bearing "
+        "navigation answered from cache locks the operator out with no way back"
+    )
+    assert cache != -1, "the navigation branch no longer consults the cache at all"
+    assert guard < cache, (
+        "the token check must come BEFORE the cache lookup; after it, the cached shell has "
+        "already been returned and the exchange never happened"
+    )
+    assert re.search(
+        r'const SESSION_TOKEN_PARAM = "' + re.escape(param.group(1)) + r'"', source
+    ), (
+        f"the worker's session-token parameter does not match the server's {param.group(1)!r} -- "
+        "one side was renamed and the other was not"
     )
 
 
