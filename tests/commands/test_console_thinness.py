@@ -1,12 +1,18 @@
 """The architectural thinness pin (issue #392 C6; PRD §6.2 -- "grep-able proof of no
 duplicated logic ... pinned by an architectural test").
 
-WHAT IT FORBIDS, precisely. The presentation layer is the console shell
-(`keel/commands/console.py`), the live loop (`keel/commands/tui.py`), every console sub-menu
-module (`keel/commands/*console*.py`), and -- since #435 -- every module of the local web UI
-(`keel/web/*.py`). Those files render and dispatch; all behavior must come from the services
-the CLI calls. The pin is an AST scan enforcing six rules -- five that hold across the whole
-layer, and one (#533) scoped to the JSON serialiser:
+WHAT IT FORBIDS, precisely. The presentation layer is every module of the local web UI
+(`keel/web/*.py`, since #435) and every module of the MCP server (`keel/mcp/*.py`, since #588).
+Those files render and dispatch; all behavior must come from the services the CLI calls. ADR
+0003 (`docs/decisions/0003-commands-layer-survey.md`) is the record behind both inclusions: it
+measured the layer, found zero near-duplicate render paths because every load-bearing report is
+one shared core plus thin per-front-end projections, and its standing rule 2 says any front-end
+consumes `keel.commands.*` services or the engine directly -- it does not re-render another
+front-end's report from raw rows. This pin is what makes that rule mechanical, and #588 is what
+made it cover the one front-end it had missed: the pin passed vacuously green over all eight MCP
+handlers, which is the argument for scanning them BEFORE anything grows there rather than after.
+The pin is an AST scan enforcing six rules -- five that hold across the whole layer, and one
+(#533) scoped to the JSON serialiser:
 
 * **Rule 1 -- no compute-module imports.** Nothing may be imported from the compute
   trees -- `keel.strategy.*` (sizing/backtest/promotion math), `keel.execution.guards` /
@@ -75,31 +81,40 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: The PRESENTATION layer: the console shell, the live loop, every sub-menu module -- and, since
-#: #435, every module of the local web UI (`keel/web/`).
+
+#: The PRESENTATION layer: every module of the local web UI (`keel/web/`) and, since #588, every
+#: module of the MCP server (`keel/mcp/`).
 #:
-#: The web UI is scanned by the same rules rather than a parallel pin of its own, because it
-#: is the same kind of thing: a second front-end over `keel/commands/*`. A separate pin would have
-#: drifted -- two files stating the same architecture, diverging one allowance at a time -- and
-#: the failure it is guarding against is identical in both. `keel/commands/serve.py` is NOT
-#: scanned: it is the command that binds the socket and launches a browser, which is service work
-#: and is exactly what Rule 5 says belongs outside this layer.
+#: Both are scanned by the same rules rather than parallel pins of their own, because they are
+#: the same kind of thing: front-ends over `keel/commands/*` services and the engine. A separate
+#: pin would have drifted -- two files stating the same architecture, diverging one allowance at
+#: a time -- and the failure being guarded against is identical in both. `keel/commands/serve.py`
+#: and `keel/commands/mcp.py` are NOT scanned: they are the commands that bind the socket /
+#: launch the browser / wire argv to the stdio loop, which is service work and is exactly what
+#: Rule 5 says belongs outside this layer.
 def _console_module_paths() -> list[str]:
     """Every front-end module these rules hold over.
 
-    **This used to be two globs and is now one (#541).** `keel/commands/console.py`, `tui.py` and
-    the seven `*console*.py` modules were deleted with the TUI -- they were reachable only from
-    inside it -- so what remains is the front-end that replaced them. The glob over `keel/web/`
-    was always here; it is the whole file set now.
+    **One glob until #588, two again now.** `keel/commands/console.py`, `tui.py` and the seven
+    `*console*.py` modules were deleted with the TUI at #541, leaving `keel/web/` as the whole
+    file set. #588 restored the second glob for `keel/mcp/` -- ADR 0003's one actionable gap:
+    the MCP server is the other front-end over the same service cores, and nothing mechanical
+    stopped an MCP handler from growing compute the way a web module is stopped. The handlers
+    were all thin when the glob landed, so the pin passed green over them on day one -- which is
+    the point of adding it before anything grows there, and why the positive control
+    `test_rules_1_and_2_are_proven_false_capable_over_an_mcp_source` exists to prove the rules
+    FIRE over an `mcp/` key and the green is not silence.
 
     A glob that silently matched nothing would make every rule below vacuously green, which is
     what `test_the_scan_actually_scanned_the_console_layer` exists to prevent, and why that test
     names modules explicitly rather than counting them."""
-    return sorted(set(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py"))))
+    paths = sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "web", "*.py")))
+    paths.extend(sorted(glob.glob(os.path.join(REPO_ROOT, "keel", "mcp", "*.py"))))
+    return sorted(set(paths))
 
 
 #: Rule 5's entry-scoped exceptions, in the same shape as every other allowance here:
-#: (module stem, imported module).
+#: (module key, imported module).
 #:
 #: Rule 5 bans `urllib` by ROOT, which is the right coarseness for a rule about network egress --
 #: `urllib.request.urlopen` is the thing it exists to stop. But `urllib.parse` performs no I/O at
@@ -109,17 +124,14 @@ def _console_module_paths() -> list[str]:
 #: hand-rolling percent-decoding on attacker-influenced input, which is a strictly worse trade
 #: than one named, scoped allowance.
 #:
-#: `render` joined them at #539, for the same reason in the other direction: it BUILDS a query
-#: string rather than splitting one. The nav's documentation link carries `?v=<build>`, a full
-#: version is `0.11.2+c1634a3fa17f`, and a raw `+` in a query string decodes to a space -- so the
-#: choice was `quote(build, safe="")` or a hand-rolled encoder for "the characters a version
-#: string might contain", which is a guess about an alphabet rather than a rule about one.
-#: (`render` is deleted at #540 and this entry goes with it.)
+#: `render` carried the third entry; the module is deleted (#540) and the entry goes with it.
 #:
-#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in any of them
-#: still fails, and `urllib.parse` anywhere else still fails.
+#: Scoped to the module and the exact import, so it cannot widen: `urllib.request` in either of
+#: them still fails, and `urllib.parse` anywhere else -- including `keel/mcp/`, whose own
+#: `server.py` is a DIFFERENT module key since #588 keyed allowances by package rather than by
+#: bare filename -- still fails.
 RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
-    {("server", "urllib.parse"), ("staticfiles", "urllib.parse"), ("render", "urllib.parse")}
+    {("web/server", "urllib.parse"), ("web/staticfiles", "urllib.parse")}
 )
 
 
@@ -128,11 +140,11 @@ RULE5_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
 #: do to every other module of this layer. Rule 6 below is the extra, narrower pin it needs,
 #: because it is the one module in the layer whose OUTPUT is a machine-readable money contract
 #: rather than a screen.
-SERIALISER_STEMS: frozenset[str] = frozenset({"payload"})
+SERIALISER_STEMS: frozenset[str] = frozenset({"web/payload"})
 
 
-#: Rule 6b's entry-scoped allowance, in the same (module, enclosing function, argument) shape as
-#: every other allowance here.
+#: Rule 6b's entry-scoped allowance, in the same (module key, enclosing function, argument) shape
+#: as every other allowance here.
 #:
 #: `float()` is banned in the serialiser because it is the one call that turns a `Decimal` into
 #: the IEEE-754 double the whole contract exists to keep off the wire. It is allowed on a
@@ -141,7 +153,7 @@ SERIALISER_STEMS: frozenset[str] = frozenset({"payload"})
 #: still fails.
 RULE6_FLOAT_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
     {
-        ("payload", "_gmt", "ts"),
+        ("web/payload", "_gmt", "ts"),
     }
 )
 
@@ -161,97 +173,65 @@ COMPUTE_PREFIXES: tuple[str, ...] = (
 
 
 def _is_compute(dotted: str) -> bool:
-    return any(
-        dotted == prefix or dotted.startswith(prefix + ".") for prefix in COMPUTE_PREFIXES
-    )
+    return any(dotted == prefix or dotted.startswith(prefix + ".") for prefix in COMPUTE_PREFIXES)
 
 
-#: (console module file stem, imported name as resolved against its source module) --
-#: function imports from the compute trees that survive the audit. Every entry's CALL
-#: sites are pinned by `CALL_ALLOWLIST`; the import allowance exists only so the pinned
-#: call sites can name their callee.
+#: (module key, imported name as resolved against its source module) -- function imports from
+#: the compute trees that survive the audit. Every entry's CALL sites are pinned by
+#: `CALL_ALLOWLIST`; the import allowance exists only so the pinned call sites can name their
+#: callee.
+#:
+#: #588's audit emptied this list. Every entry described a module of the console layer #541
+#: deleted (`strategy_console`, `tui`), and `test_every_allowance_names_a_scanned_module` now
+#: fails the build on an allowance whose module is not in the scanned set, so the dead entries
+#: went with the modules -- the same rule the `render` entry of `RULE5_IMPORT_ALLOWLIST`
+#: already states. The first entry of the multi-front-end era is the MCP handler's §65.9 read,
+#: added with the `keel/mcp/` glob below.
+#:
+#: Deliberately NOT here: `keel.data.db.connect`, which `mcp/tools.py` imports and calls. Rules
+#: 1 and 2 key on `COMPUTE_PREFIXES`, and `keel.data` is not a compute tree -- the connection is
+#: a read a front-end may make, so no allowance is needed and one would be dead weight that
+#: looked like a pin. Stated here because #588 asked for the audit to say so explicitly rather
+#: than by accident of not being scanned.
 IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
-        # strategy_console: the recorded-paper-track read the insights service itself
-        # performs (insights.py calls the same function the same way) -- dispatched,
-        # never re-implemented, and call-pinned. (The verdict view's backtest half rides
-        # `keel.commands.rules.resolve_rule_backtest`/`backtest_resolved` now, so the
-        # engine's backtest needs no console-side import allowance.)
-        ("strategy_console", "keel.strategy.paper.track_record"),
-        # tui: the §65.9 report COMPUTE home the CLI's own `keel purification` body calls
-        # (one implementation, two front-ends), and the executor's two READ helpers (the
-        # rail-17 state read and the live-balance read rail 13 funds) -- reads, never the
-        # order path.
-        ("tui", "keel.compliance.purification.build_report"),
-        ("tui", "keel.execution.executor._withdrawals_enabled"),
-        ("tui", "keel.execution.executor._fetch_available_quote"),
+        # The §65.9 purification report's COMPUTE home, read by the MCP handler the same way the
+        # CLI's own `keel purification` body and the web's §65.9 view reach it: one
+        # implementation, three front-ends (ADR 0003's table lists `_purification` as the JSON
+        # projection of `build_report`, ~12 lines over the engine's report). A dispatch, never a
+        # re-implementation, and the call that names it is pinned below.
+        ("mcp/tools", "keel.compliance.purification.build_report"),
     }
 )
 
-#: (console module file stem, enclosing function's name, fully resolved callee) -- every
-#: call into a compute tree that survives the audit, each with its reason:
+#: (module key, enclosing function's name, fully resolved callee) -- every call into a compute
+#: tree that survives the audit, each with its reason:
+#:
+#: #588's audit removed every entry that had described a console module #541 deleted. The one
+#: entry of the multi-front-end era is the MCP handler's §65.9 projection -- the same shape, and
+#: the same reason, as the `_do_compliance_payload` allowance the deleted TUI carried.
 CALL_ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
     {
-        # The ledger's paper-gate distance: constructs the gate's floor VALUE from the
-        # config's own keyword fields (no threshold is stated here) and reads the
-        # recorded paper track record exactly as `keel.commands.insights` does at its
-        # own call -- the console mirrors the service's call because the service's
-        # builder takes the record as an input.
-        ("strategy_console", "_paper_gate_lines", "keel.strategy.promotion.PromotionConfig"),
-        ("strategy_console", "_paper_gate_lines", "keel.strategy.paper.track_record"),
-        # The detail view's Enter-gated verdict: its BACKTEST half is fully delegated to
-        # the `keel.commands.rules` compute core (`resolve_rule_backtest` +
-        # `backtest_resolved` -- the same read/build/backtest `keel rules backtest` runs;
-        # the console-side granularity loop and input assembly are gone, so there is no
-        # engine-backtest allowance here). What remains is the GATE half's dispatch: the
-        # config's floor values and the engine's own `can_promote` judgment -- the same
-        # dispatched-never-reimplemented pattern `_paper_gate_lines` above keeps.
-        (
-            "strategy_console",
-            "compute_rule_verdict",
-            "keel.strategy.promotion.PromotionConfig",
-        ),
-        (
-            "strategy_console",
-            "compute_rule_verdict",
-            "keel.strategy.promotion.pbo_gate_from_config",
-        ),
-        ("strategy_console", "compute_rule_verdict", "keel.strategy.promotion.can_promote"),
-        # The retry form names the typed --force gate's from->to pair through the
-        # lifecycle vocabulary -- a pure status mapping, no gate math.
-        ("strategy_console", "run_retry_form", "keel.strategy.promotion.next_status"),
-        # The Shariah screen's purification report and rail-17 line: THE shared compute
-        # home / state read the CLI's own command bodies call (one implementation, two
-        # front-ends -- the C1 pattern; the console adds nothing to either).
-        ("tui", "_do_compliance_payload", "keel.compliance.purification.build_report"),
-        ("tui", "_do_compliance_payload", "keel.execution.executor._withdrawals_enabled"),
-        # The dashboard's own live-balance line: the EXACT quote read rail 13 funds a
-        # buy against, reused verbatim -- display-only, never an order.
-        ("tui", "_balance_fn", "keel.execution.executor._fetch_available_quote"),
+        # The purification tool's report: JSON of the engine's own `build_report` over the
+        # transaction rows -- the same report `keel purification` prints and the web renders.
+        # The handler adds nothing to it: every figure it returns is the report's own field,
+        # bar `len(report.needs_review)`, a count of a list the report itself holds (Rule 6e's
+        # len() ban is scoped to the serialiser; this is a tool response, not the wire
+        # contract). A projection site, not a compute site -- and the entry names the exact
+        # enclosing function, so a second `build_report` call anywhere else in the package
+        # still fails.
+        ("mcp/tools", "_purification", "keel.compliance.purification.build_report"),
     }
 )
 
-#: (console module file stem, enclosing function, constructor name) -- the audited
-#: broker-construction read sites (Rule 4b). Every other construction must ride the
-#: `build_broker`/`build_client` lambda seam of a service call.
-READ_SITES: frozenset[tuple[str, str, str]] = frozenset(
-    {
-        # The offline capability display: loads the adapter CLASS and constructs it with
-        # no transport to read `capabilities()` -- O7's capability display, not a handle.
-        ("console", "venue_session_bound", "load_broker"),
-        # The dashboard's pre-console bounded reads: the slow-cadence balance line, the
-        # compliance menu's two Enter-gated venue reads, the discover overlay's one
-        # product read, and the `f` fetch key's history warm -- all display/data reads,
-        # none an order path. The first three construct with the CLI's own bounded
-        # timeouts; `_do_fetch` deliberately constructs WITHOUT one, mirroring `keel
-        # fetch`'s own unbounded client -- the documented frozen-screen behavior (the
-        # screen freezes for as long as honest work takes, exactly like the CLI).
-        ("tui", "_balance_fn", "_build_broker"),
-        ("tui", "_do_compliance_network", "_build_broker"),
-        ("tui", "_do_discover_report", "_build_broker"),
-        ("tui", "_do_fetch", "_build_broker"),
-    }
-)
+#: (module key, enclosing function, constructor name) -- the audited broker-construction read
+#: sites (Rule 4b). Every other construction must ride the `build_broker`/`build_client` lambda
+#: seam of a service call.
+#:
+#: Empty since #541 deleted the console modules whose bounded venue reads these named, and
+#: confirmed empty by #588's audit: the MCP handlers construct no broker at all (they read the
+#: database directly, per `tests/mcp/test_readonly.py`), so Rule 4b needs no site.
+READ_SITES: frozenset[tuple[str, str, str]] = frozenset()
 
 _BROKER_CONSTRUCTORS = ("_build_broker", "load_broker")
 _ARITH_OPS = (
@@ -263,6 +243,20 @@ _ARITH_OPS = (
     ast.Mod,
     ast.Pow,
 )
+
+
+def _module_key(path: str) -> str:
+    """The allowance key for one scanned file: its path under `keel/` without the extension --
+    `web/server`, `mcp/tools`.
+
+    This file keyed allowances by BARE file stem until #588, which was sound while it scanned
+    one front-end. The MCP server made it unsound: `keel/web/server.py` and `keel/mcp/server.py`
+    are both `server`, so an allowance written for one would have covered the other -- and the
+    entries the deleted TUI left behind would have covered any same-named module a new front-end
+    grew. The key names the front-end's package now, so an allowance cannot cross to another
+    front-end's module by filename coincidence."""
+    relative = os.path.relpath(path, os.path.join(REPO_ROOT, "keel"))
+    return os.path.splitext(relative)[0]
 
 
 def _parse(path: str) -> ast.Module:
@@ -343,53 +337,73 @@ class _Findings(dict[str, list[str]]):
         self.setdefault(key, []).append(message)
 
 
+def _compute_tree_findings(
+    stem: str, tree: ast.Module, aliases: dict[str, str], owners: dict[ast.AST, str]
+) -> _Findings:
+    """Rules 1 and 2 over one parsed module: no imports from, and no calls into, the compute
+    trees outside the audited allowances.
+
+    Written as its own function rather than inline in the fixture -- in `_rule6_findings`'s
+    shape, and for the same reason -- so the positive control below can run it over a synthetic
+    module and prove it is capable of finding anything at all. Since #588 that control is an MCP
+    source specifically: the MCP front-end joined the scanned set with the pin passing vacuously
+    green over it, so the proof that the rules FIRE over an `mcp/` key is what keeps that green
+    from being silence."""
+    found = _Findings()
+
+    # Rule 1: no imports from the compute trees except constants/types/submodules
+    # and the audited function imports.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and isinstance(node.module, str):
+            if not _is_compute(node.module):
+                continue
+            for alias in node.names:
+                resolved = f"{node.module}.{alias.name}"
+                bound = alias.asname or alias.name
+                try:
+                    importlib.import_module(f"{node.module}.{alias.name}")
+                except Exception:
+                    is_submodule = False
+                else:
+                    is_submodule = True
+                if is_submodule:
+                    continue  # a module object; its CALLS are Rule 2's business
+                if _source_exports_constants_or_types(node.module, alias.name):
+                    continue
+                if (stem, resolved) in IMPORT_ALLOWLIST:
+                    continue
+                found.add(
+                    "rule1_imports",
+                    f"{stem}: imports compute function {resolved} (bound as {bound!r})",
+                )
+
+    # Rule 2: no calls resolving into the compute trees outside the audited sites.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _dotted_call_name(node.func, aliases)
+        if name is not None and _is_compute(name):
+            if (stem, owners.get(node, "<module>"), name) not in CALL_ALLOWLIST:
+                found.add(
+                    "rule2_calls",
+                    f"{stem}:{owners.get(node, '<module>')}: calls {name}",
+                )
+    return found
+
+
 @pytest.fixture(scope="module")
 def findings() -> dict[str, list[str]]:
-    """One scan over the whole console layer -- the shared fixture every rule-test reads."""
+    """One scan over the whole presentation layer -- the shared fixture every rule-test reads."""
     found = _Findings()
     for path in _console_module_paths():
-        stem = os.path.splitext(os.path.basename(path))[0]
+        stem = _module_key(path)
         tree = _parse(path)
         aliases = _collect_aliases(tree)
         owners = _enclosing_functions(tree)
 
-        # Rule 1: no imports from the compute trees except constants/types/submodules
-        # and the audited function imports.
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and isinstance(node.module, str):
-                if not _is_compute(node.module):
-                    continue
-                for alias in node.names:
-                    resolved = f"{node.module}.{alias.name}"
-                    bound = alias.asname or alias.name
-                    try:
-                        importlib.import_module(f"{node.module}.{alias.name}")
-                    except Exception:
-                        is_submodule = False
-                    else:
-                        is_submodule = True
-                    if is_submodule:
-                        continue  # a module object; its CALLS are Rule 2's business
-                    if _source_exports_constants_or_types(node.module, alias.name):
-                        continue
-                    if (stem, resolved) in IMPORT_ALLOWLIST:
-                        continue
-                    found.add(
-                        "rule1_imports",
-                        f"{stem}: imports compute function {resolved} (bound as {bound!r})",
-                    )
-
-        # Rule 2: no calls resolving into the compute trees outside the audited sites.
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = _dotted_call_name(node.func, aliases)
-            if name is not None and _is_compute(name):
-                if (stem, owners.get(node, "<module>"), name) not in CALL_ALLOWLIST:
-                    found.add(
-                        "rule2_calls",
-                        f"{stem}:{owners.get(node, '<module>')}: calls {name}",
-                    )
+        for key, messages in _compute_tree_findings(stem, tree, aliases, owners).items():
+            for message in messages:
+                found.add(key, message)
 
         # Rule 3: no arithmetic over a Decimal(...) construction.
         for node in ast.walk(tree):
@@ -421,9 +435,9 @@ def findings() -> dict[str, list[str]]:
                 parent = parents.get(current)
                 if isinstance(parent, ast.Lambda):
                     grand = parents.get(parent)
-                    if (
-                        isinstance(grand, ast.keyword)
-                        and grand.arg in ("build_broker", "build_client")
+                    if isinstance(grand, ast.keyword) and grand.arg in (
+                        "build_broker",
+                        "build_client",
                     ):
                         return True
                 current = parent
@@ -476,10 +490,13 @@ def findings() -> dict[str, list[str]]:
                 name = _dotted_call_name(node.func, aliases)
                 if name is None:
                     continue
-                if name in ("subprocess.run", "subprocess.check_output",
-                            "urllib.request.urlopen", "os.execv", "os.system") or name.endswith(
-                                ".execv"
-                            ):
+                if name in (
+                    "subprocess.run",
+                    "subprocess.check_output",
+                    "urllib.request.urlopen",
+                    "os.execv",
+                    "os.system",
+                ) or name.endswith(".execv"):
                     found.add(
                         "rule5_orchestration",
                         f"{stem}:{owners.get(node, '<module>')}: calls {name} -- the "
@@ -668,7 +685,7 @@ def test_rule_6_is_proven_false_capable() -> None:
     tree = ast.parse(snippet)
     owners = _enclosing_functions(tree)
 
-    messages = _rule6_findings("payload", tree, _collect_aliases(tree), owners).get(
+    messages = _rule6_findings("web/payload", tree, _collect_aliases(tree), owners).get(
         "rule6_serialisation", []
     )
 
@@ -700,19 +717,16 @@ def test_rule_5_is_proven_false_capable() -> None:
 
 
 def test_the_scan_actually_scanned_the_console_layer() -> None:
-    """The pin's own health check: the file set is the shell + the loop + every
-    `*console*` module -- a glob that silently matched nothing would make every rule
-    vacuously green."""
+    """The pin's own health check: every module of BOTH front-ends is in the file set -- a glob
+    that silently matched nothing would make every rule vacuously green."""
     paths = _console_module_paths()
-    stems = {os.path.splitext(os.path.basename(p))[0] for p in paths}
+    keys = {_module_key(p) for p in paths}
     # `{"console", "tui"}` was asserted here until #541 deleted both, along with the seven
     # `*console*` modules this pin was originally written for. The rules did not go with them:
     # they hold over `keel/web/`, which is the front-end that replaced the console layer and has
-    # been inside this file set since #435.
-    assert "tui" not in stems and "console" not in stems, (
-        "the console layer is back; if that is deliberate it needs its glob restored above, "
-        "because these rules would otherwise not be applied to it"
-    )
+    # been inside this file set since #435. Matched on the key's SUFFIX now that keys carry their
+    # package, so a `tui.py`/`console.py` resurrected under ANY scanned package is caught.
+    assert not [key for key in keys if key.endswith(("/tui", "/console"))], sorted(keys)
     # #435: the web UI is a front-end over the same services and is pinned by the same rules.
     # Named explicitly so that deleting or renaming a web module fails HERE, loudly, rather than
     # quietly shrinking the scanned set and leaving the rules green over less code.
@@ -725,22 +739,99 @@ def test_the_scan_actually_scanned_the_console_layer() -> None:
     # reports into JSON. `api`, `events` and `staticfiles` are named for the same reason `render`
     # was, and the set is LARGER than before rather than smaller: four web modules pinned where
     # there were three.
-    assert {"api", "events", "security", "server", "staticfiles"} <= stems
-    assert "render" not in stems, (
+    assert {"web/api", "web/events", "web/security", "web/server", "web/staticfiles"} <= keys
+    assert "web/render" not in keys, (
         "keel/web/render.py is back; if that is deliberate it needs a line here, and the reason "
         "#540 deleted it -- the server generates no markup -- needs revisiting first"
     )
     # #533: the JSON serialiser joins them. Named here for the same reason and with an extra one:
-    # Rule 6 is scoped BY STEM, so a serialiser renamed out of `SERIALISER_STEMS` would keep
+    # Rule 6 is scoped BY MODULE KEY, so a serialiser renamed out of `SERIALISER_STEMS` would keep
     # passing Rules 1-5 while silently losing the money-contract pin entirely.
-    assert SERIALISER_STEMS <= stems
+    assert SERIALISER_STEMS <= keys
     assert any(os.path.join("keel", "web") in path for path in paths)
+    # #588: the MCP server is the other front-end over the same service cores (ADR 0003's table
+    # lists its handlers as projections of the same reports the browser and the CLI render), so
+    # the same five rules hold over it -- named here for the same reason the web modules are: a
+    # `keel/mcp/` glob that silently matched nothing, or a renamed handler module, must fail HERE
+    # rather than leave the pin green over less code. `keel/commands/mcp.py` is NOT in the set:
+    # it is the argv-wiring command (the `serve.py` rule -- service work), not a front-end.
+    assert {"mcp/tools", "mcp/server"} <= keys, (
+        "keel/mcp/ is not in the scanned set; #588 put it there because it is the one front-end "
+        "these rules did not cover, and an MCP handler must not grow compute unnoticed"
+    )
     # The seven `*console*` modules were named here, one per line, so that deleting one would
     # fail HERE rather than quietly shrink the scanned set. #541 deleted all seven at once, and
     # this is where that had to be acknowledged -- which is the mechanism working, not failing.
     # They are asserted ABSENT now for the same reason `render` is: a module reappearing under a
     # name these rules no longer glob would be unpinned code wearing a familiar filename.
-    assert not [stem for stem in stems if stem.endswith("_console")], sorted(stems)
+    assert not [key for key in keys if key.endswith("_console")], sorted(keys)
+
+
+def test_every_allowance_names_a_scanned_module() -> None:
+    """#588's audit rule, made mechanical: an allowance whose module key is not a file in the
+    scanned set is dead weight at best -- and, before keys carried their package, a live hazard:
+    the entries #540/#541 left behind (`render`, `tui`, `strategy_console`, `console`) referenced
+    deleted modules, and under bare-stem keys a NEW front-end growing a same-named module would
+    have inherited them. Every allowance names a scanned module now, and this fails the build the
+    moment one does not -- which is the check that would have caught both deletions at the time."""
+    paths = _console_module_paths()
+    keys = {_module_key(p) for p in paths}
+    # The key space must identify exactly one file. Two scanned modules sharing a key would make
+    # every (key, ...) allowance ambiguous -- `web/server` vs `mcp/server` is the collision that
+    # made bare stems unsound the day a second front-end joined, so the scheme itself is pinned.
+    assert len(keys) == len(paths), sorted(keys)
+    for stem, _imported in sorted(RULE5_IMPORT_ALLOWLIST):
+        assert stem in keys, f"{stem}: an allowance for a module that is not scanned"
+    for stem in sorted(SERIALISER_STEMS):
+        assert stem in keys, stem
+    for stem, _fn, _argument in sorted(RULE6_FLOAT_ALLOWLIST):
+        assert stem in keys, stem
+    for stem, _dotted in sorted(IMPORT_ALLOWLIST):
+        assert stem in keys, stem
+    for stem, _fn, _dotted in sorted(CALL_ALLOWLIST):
+        assert stem in keys, stem
+    for stem, _fn, _constructor in sorted(READ_SITES):
+        assert stem in keys, stem
+
+
+def test_rules_1_and_2_are_proven_false_capable_over_an_mcp_source() -> None:
+    """#588's positive control, in `_rule6_findings`' house pattern: a synthetic `mcp/tools`
+    source with a compute import planted in it is flagged by BOTH rules.
+
+    The MCP front-end joined the scanned set passing vacuously green over all eight handlers, so
+    "green" carries no information until something proves the rules FIRE over an `mcp/` key. The
+    snippet also carries the audited shape -- `build_report` called from `_purification`, the
+    exact site `CALL_ALLOWLIST` names -- which must NOT be flagged (or the allowance is a blanket
+    ban wearing an allowlist), and the same callee at a NEW site, which MUST be (or the
+    allowance leaks across the layer)."""
+    snippet = (
+        "from keel.compliance.purification import build_report\n"
+        "from keel.execution.sizing import size\n"
+        "def build_tools():\n"
+        "    def _purification(args):\n"
+        "        return build_report(args)\n"
+        "    def _rogue_projection(args):\n"
+        "        return build_report(args)\n"
+        "    def _handler_sizing(args):\n"
+        "        return size(args)\n"
+        "    return _purification, _rogue_projection, _handler_sizing\n"
+    )
+    tree = ast.parse(snippet)
+    found = _compute_tree_findings(
+        "mcp/tools", tree, _collect_aliases(tree), _enclosing_functions(tree)
+    )
+
+    imports = found.get("rule1_imports", [])
+    calls = found.get("rule2_calls", [])
+
+    # The planted sizing import and its call fire -- over an `mcp/` module key, which is the
+    # thing nothing else in this file proves.
+    assert any("keel.execution.sizing.size" in m for m in imports), imports
+    assert any("_handler_sizing" in m and "size" in m for m in calls), calls
+    # The audited §65.9 site is the one shape that does not fire.
+    assert not any("_purification" in m for m in imports + calls), imports + calls
+    # The same callee at a site the allowance does not name still fires: entry-scoped.
+    assert any("_rogue_projection" in m and "build_report" in m for m in calls), calls
 
 
 def test_every_allowance_names_a_real_callee() -> None:
