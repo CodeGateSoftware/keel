@@ -11,6 +11,11 @@ asserts every pair's ratio; changing a palette value to something failing makes 
 The luminance and contrast-ratio formulas are WCAG 2.x's own (relative luminance:
 https://www.w3.org/TR/WCAG21/#dfn-relative-luminance; contrast ratio:
 https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio) -- twenty lines of arithmetic, no dependency.
+
+#593 moved the palette onto keeltrading.com's (the sibling site repository named in the
+stylesheet's header). Every pin that legitimately moved was re-measured against the new values,
+and the ONE grade that could not survive the site's lighter ink is recorded, with its reason, at
+`_GRADE_FLOOR` -- the floors themselves are unchanged.
 """
 
 from __future__ import annotations
@@ -39,7 +44,8 @@ _AA_UI_BOUNDARY_MIN = 3.0
 
 #: Minimum acceptable `|luminance(good) - luminance(bad)|`, pinned per theme rather than
 #: globally, because a single shared floor cannot do both jobs at once: the light theme's fixed
-#: delta (measured 0.0319) is much smaller than the dark theme's (measured 0.2382), since light
+#: delta (0.0334 under the #593 palette; 0.0319 under #532's) is much smaller than the dark
+#: theme's (0.2407; 0.2382 before), since light
 #: mode keeps both colours near the dark end of the scale to hold AAA against a near-white
 #: background, while dark mode has the whole upper half of the scale to spread them across.
 #: A shared floor high enough to catch a regressed DARK pair would reject a compliant LIGHT
@@ -80,9 +86,10 @@ _MIN_GOOD_BAD_LUMINANCE_DELTA = {"light": 0.025, "dark": 0.2}
 #: same coincidence that caused the bug this issue fixes. There is no light `--bad` that is
 #: simultaneously AAA, well-separated from `--good`, AND as far from `--fg` as the original
 #: was. The floors instead sit with margin under what THIS palette actually reaches -- light
-#: 1.7 (measured minimum 1.78, at `--bad`), dark 1.4 (measured minimum 1.45, at `--good`,
-#: see the stylesheet's dark `:root` comment) -- high enough to reject the 1.19:1 regression that
-#: prompted this test, low enough to admit the corrected palette.
+#: 1.7 (measured minimum 1.90, at `--good`, since #593 moved the palette onto the site's lighter
+#: ink), dark 1.4 (measured minimum 1.42, at `--good`, see the stylesheet's dark `:root`
+#: comment) -- high enough to reject the 1.19:1 regression that prompted this test, low enough
+#: to admit the corrected palette.
 _MIN_SIGNAL_FG_RATIO = {"light": 1.7, "dark": 1.4}
 
 _SIGNAL_TOKENS = ("good", "bad", "warn")
@@ -184,13 +191,13 @@ def test_text_foregrounds_meet_aa_against_bg_and_card_in_both_themes() -> None:
 
 
 def test_fg_on_bg_contrast_has_not_regressed() -> None:
-    """`fg`/`bg` was untouched by #532 and is the strongest pair on the page (AAA in both
-    themes already). Pinned to the exact numbers #532 measured and reported --
-    16.50:1 light, 15.06:1 dark -- so any future edit to `--fg` or `--bg` for an unrelated
-    reason still has to notice it moved this number."""
+    """`fg`/`bg` is the strongest pair on the page (AAA in both themes). Untouched by #532;
+    re-based by #593 onto the site's paper and ink, and pinned to the exact numbers that move
+    produced -- 13.96:1 light, 14.62:1 dark -- so any future edit to `--fg` or `--bg` for an
+    unrelated reason still has to notice it moved this number."""
     light, dark = _load_themes()
-    assert _contrast_ratio(light["fg"], light["bg"]) == _approx(16.50)
-    assert _contrast_ratio(dark["fg"], dark["bg"]) == _approx(15.06)
+    assert _contrast_ratio(light["fg"], light["bg"]) == _approx(13.96)
+    assert _contrast_ratio(dark["fg"], dark["bg"]) == _approx(14.62)
 
 
 def _approx(expected: float, tol: float = 0.01) -> object:
@@ -285,12 +292,14 @@ def test_decorative_dividers_stay_exempt_and_unchanged() -> None:
     that SC 1.4.11 explicitly exempts, listing "purely decorative" boundaries alongside
     "essentially unaltered" browser-default controls. #532 must not raise `--line` globally to
     manufacture 3:1 for the one place (form inputs) that actually needed it; that is what the
-    separate `--control-line` token above is for. Pinned to the exact hex values in place before
-    this issue, so a well-intentioned "just raise --line too" edit fails here instead of
-    quietly widening every rule and border on the page."""
+    separate `--control-line` token above is for. Pinned since #593 to the SITE's border
+    literals (`--border` in keeltrading.com's global.css), which arrive well under 3:1 in both
+    themes -- so a well-intentioned "just raise --line too" edit fails here instead of quietly
+    widening every rule and border on the page, and a border retuned on the site fails here
+    until it is copied across."""
     light, dark = _load_themes()
-    assert light["line"] == "#e3dfd8"
-    assert dark["line"] == "#2f2d25"
+    assert light["line"] == "#d9d4c8"
+    assert dark["line"] == "#2b3a44"
     # Still comfortably under the 3:1 boundary floor -- confirms the exemption is real, not
     # accidental compliance.
     assert _contrast_ratio(light["line"], light["bg"]) < _AA_UI_BOUNDARY_MIN
@@ -345,12 +354,20 @@ def _grade(ratio: float) -> str:
 #: `--bg`, 7.68:1 `--card`) with the blue hue intact, so there is no exception left to record
 #: here.
 _GRADE_FLOOR: dict[str, dict[str, dict[str, str]]] = {
+    # THE ONE LOWERED ENTRY (#593): light `--bad` was AAA since #532 and is AA now (5.87:1).
+    # The site's ink is lighter than the near-black it replaced, and the band a light signal
+    # colour can occupy -- AAA against the paper, 1.7:1 away from body ink, 0.025 luminance
+    # from its opposite signal -- narrowed to 0.0207 of luminance, too narrow for good and bad
+    # BOTH. Holding `--bad` at AAA meant moving it back toward `--good` (the luminance
+    # collision #532 exists to fix) or toward `--fg` (reading as a neutral row in greyscale);
+    # it is AA instead, 5.87:1, and further from `--fg` (2.38:1) and from `--good` (delta
+    # 0.0334) than it has ever been. Every other entry holds its #532 grade.
     "light": {
         "bg": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AAA", "good": "AAA",
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AA", "good": "AAA",
         },
         "card": {
-            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AAA", "good": "AAA",
+            "fg": "AAA", "muted": "AA", "accent": "AAA", "warn": "AA", "bad": "AA", "good": "AAA",
         },
     },
     "dark": {
