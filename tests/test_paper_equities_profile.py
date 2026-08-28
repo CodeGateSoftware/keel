@@ -503,20 +503,67 @@ def test_runbook_notes_what_is_deliberately_not_here():
 
 
 def test_runbook_states_the_cash_no_margin_pdt_posture():
-    """PRD 5/6.4's account posture, operator-facing half: cash accounts ONLY (margin
-    borrowing is riba; a cash account also sidesteps the PDT rule's $25k margin-account
-    threshold), the PDT rule explained (what it is; why a cash account on keel's daily
-    cadence is not that pattern), the T+1 interplay CROSS-REFERENCED rather than duplicated,
-    and the fence that enforcement-in-code is #372's scope."""
+    """PRD 5/6.4's account posture: cash accounts ONLY (margin borrowing is riba; a cash
+    account also sidesteps the PDT rule's $25k margin-account threshold), the PDT rule
+    explained (what it is; why a cash account on keel's daily cadence is not that pattern),
+    the T+1 interplay CROSS-REFERENCED rather than duplicated, and -- since #372 landed --
+    the ENFORCEMENT stated as code, not as scope-fenced future work."""
     text = RUNBOOK.read_text()
     assert "cash account" in text.lower()
     assert "margin" in text.lower()
     assert "pattern day trader" in text.lower() or "PDT" in text
     assert "25,000" in text or "$25k" in text
-    # The scope fence: config refusing a margin posture is #372's work, not undocumented.
     assert "#372" in text
     # And the posture cross-references the T+1 section instead of restating it.
     assert "T+1 settlement" in text
+
+
+def test_runbook_states_what_the_cash_posture_enforces_versus_what_it_demands():
+    """#372's core demand, operator-facing: the ENFORCED facts (broker build reads the
+    venue's own account classification and refuses a margin one, fail-closed on an
+    unreadable answer) and the OPERATOR's obligations (set the multiplier, keep it set)
+    must be stated as two different things, never blended into one vague posture note --
+    plus the honest API fact the enforcement rests on (the classification field, and the
+    venue's margin-by-default behavior that makes the obligation real on day one)."""
+    text = RUNBOOK.read_text()
+    section = text[text.index("### Account posture") : text.index("### Operator-verified")]
+    # What the code enforces, named where an auditor can grep for it.
+    assert "verify_cash_account" in section
+    assert "multiplier" in section
+    assert "refuses" in section
+    # The operator's half, with the venue's default called out honestly: a fresh paper
+    # account is NOT cash-postured by default (its $100k paper equity crosses the $2,000
+    # threshold, so the venue classifies it margin).
+    assert "max margin multiplier" in section
+    assert "default" in section
+    # And the enforce/document split is explicit, not implied.
+    assert "Enforced in code" in section
+    assert "Operator" in section
+
+
+def test_runbook_states_the_t_plus_1_split_enforced_surface_vs_operator_duty():
+    """The T+1 section must carry #372's honest split: settlement itself is VENUE-SIDE
+    (nothing keel can enforce), what keel enforces/surfaces is the spendable figure (the
+    balances read reports `available` as the settlement-clamped cash) and rail 13's
+    spend-only-what-is-spendable veto, and what the OPERATOR must respect (cadence choices
+    that would re-spend unsettled proceeds -- outside the engine's daily cycle, which
+    cannot meet the constraint by construction)."""
+    text = RUNBOOK.read_text()
+    section = text[text.index("### T+1 settlement") : text.index("### Account posture")]
+    assert "venue-side" in section or "venue side" in section
+    assert "available" in section
+    assert "rail 13" in section.lower()
+    assert "operator" in section.lower()
+
+
+def test_config_states_the_cash_posture_next_to_the_venue_selection():
+    """The profile's `broker:` block is where the next operator meets the venue; the
+    cash-account posture (and that it is enforced, not a knob) must be stated there, so
+    nobody reads `endpoint: paper` as the only venue-side obligation."""
+    text = CONFIG.read_text()
+    assert "CASH-ACCOUNT POSTURE" in text
+    assert "multiplier" in text
+    assert "#372" in text
 
 
 def test_runbook_fences_dividend_purification_as_phase_b3():
@@ -649,11 +696,55 @@ def test_build_broker_default_resolves_coinbase_through_the_registry(tmp_path, m
     assert caps.session_bound is False
 
 
-def test_build_broker_selects_alpaca_paper_iex(tmp_path, monkeypatch):
+def _stub_alpaca_transport(get_account: object) -> type:
+    """A `keel_broker_alpaca.transport.AlpacaTransport` stand-in answering ONE canned
+    `/v2/account` read, for driving `_build_broker`'s alpaca branch without a network.
+
+    Since #372 the build seam VERIFIES the account posture (one `get_account()` call), so
+    the real transport class can no longer be constructed here -- its paper host would be
+    reached with fake credentials. The stub keeps the constructor surface `_build_broker`
+    touches (`trading_host` derived from `endpoint`, the declared feed) and answers the
+    posture read however the caller canned it (a dict, or a raising callable's exception),
+    exactly as the adapter's own FakeTransport does one layer down.
+    """
+    from keel_broker_alpaca.transport import TRADING_HOSTS
+
+    class _StubTransport:
+        def __init__(
+            self,
+            key_id: str,
+            secret_key: str,
+            *,
+            endpoint: str = "paper",
+            data_feed: str = "iex",
+            timeout: float = 10.0,
+        ) -> None:
+            self.trading_host = TRADING_HOSTS[endpoint]
+            self.data_feed = data_feed
+
+        def get_account(self) -> object:
+            if callable(get_account):
+                return get_account()
+            return get_account
+
+    return _StubTransport
+
+
+#: The venue's cash-postured account: `/v2/account`'s `multiplier` is the account margin
+#: classification, and `1` is the cash-equivalent posture (buying power equals cash).
+_CASH_ACCOUNT = {"multiplier": "1", "currency": "USD", "cash": "100000.00"}
+
+#: The venue's DEFAULT for any account over $2,000 equity -- including the $100k paper
+#: account this profile runs against -- is the reg T margin classification (multiplier 2).
+_MARGIN_ACCOUNT = {"multiplier": "2", "currency": "USD", "cash": "100000.00"}
+
+
+def test_build_broker_selects_alpaca_paper_iex_and_verifies_the_cash_posture(tmp_path, monkeypatch):
     """The new path: `broker: {name: alpaca, endpoint: paper, data_feed: iex}` resolves
     through the `keel.brokers` entry points and constructs the adapter against the PAPER
-    trading host with the IEX feed. No network happens at construction -- the assertion is
-    on the built object's own declared properties."""
+    trading host with the IEX feed -- after #372, construction is followed by the account
+    POSTURE read (one `get_account()`), which a cash classification (`multiplier: 1`)
+    passes. No network happens: the transport is stubbed at the module the seam imports."""
     from keel_broker_alpaca import AlpacaAdapter
     from keel_broker_alpaca.transport import PAPER_TRADING_HOST
 
@@ -665,6 +756,10 @@ def test_build_broker_selects_alpaca_paper_iex(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
     monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+    monkeypatch.setattr(
+        "keel_broker_alpaca.transport.AlpacaTransport",
+        _stub_alpaca_transport(_CASH_ACCOUNT),
+    )
 
     config = load_config(str(_write_config(tmp_path, ALPACA_BROKER_YAML)))
     broker = _build_broker(config)
@@ -673,6 +768,66 @@ def test_build_broker_selects_alpaca_paper_iex(tmp_path, monkeypatch):
     assert broker.endpoint == "paper"
     assert broker._transport.trading_host == PAPER_TRADING_HOST
     assert broker._transport.data_feed == "iex"
+
+
+def test_build_broker_refuses_a_margin_postured_alpaca_account(tmp_path, monkeypatch):
+    """#372 / PRD §5 "Cash-account discipline": the seam refuses to hand the engine a
+    MARGIN-postured account, loudly, with the named posture -- no margin borrowing (riba),
+    the PDT $25k margin-account threshold it sidesteps, and the fix (set the account's max
+    margin multiplier to 1). Notably this is the venue's own DEFAULT for the $100k paper
+    account (equity over $2,000 opens as reg T margin), so the refusal is not theoretical:
+    an operator who never touches the setting meets it on the first cycle."""
+    from keel_broker_alpaca import CashAccountRequired
+
+    from keel.commands._common import _build_broker
+
+    (tmp_path / ".env").write_text(
+        "ALPACA_API_KEY_ID=paper-key-id\nALPACA_API_SECRET_KEY=paper-secret\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+    monkeypatch.setattr(
+        "keel_broker_alpaca.transport.AlpacaTransport",
+        _stub_alpaca_transport(_MARGIN_ACCOUNT),
+    )
+
+    config = load_config(str(_write_config(tmp_path, ALPACA_BROKER_YAML)))
+    with pytest.raises(CashAccountRequired) as excinfo:
+        _build_broker(config)
+
+    message = str(excinfo.value)
+    assert "multiplier=2" in message
+    assert "riba" in message
+    assert "multiplier to 1" in message, "the refusal names the operator's next action"
+
+
+def test_build_broker_refuses_an_unverifiable_alpaca_posture(tmp_path, monkeypatch):
+    """The fail-closed half: a posture the venue will not or cannot report refuses the
+    build too -- silence is not consent to borrow (the rails 12/13 rule), and every command
+    that builds the broker (agent cycle, fetch, monitor, the order commands) inherits the
+    refusal rather than trading on an unknown posture."""
+    from keel_broker_alpaca import CashAccountRequired
+    from keel_broker_alpaca.transport import AlpacaAPIError
+
+    from keel.commands._common import _build_broker
+
+    def _unreachable() -> object:
+        raise AlpacaAPIError(503, "account endpoint unavailable")
+
+    (tmp_path / ".env").write_text(
+        "ALPACA_API_KEY_ID=paper-key-id\nALPACA_API_SECRET_KEY=paper-secret\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+    monkeypatch.setattr(
+        "keel_broker_alpaca.transport.AlpacaTransport", _stub_alpaca_transport(_unreachable)
+    )
+
+    config = load_config(str(_write_config(tmp_path, ALPACA_BROKER_YAML)))
+    with pytest.raises(CashAccountRequired, match="could not"):
+        _build_broker(config)
 
 
 def test_build_broker_alpaca_missing_secrets_names_the_venue_and_env_vars(tmp_path, monkeypatch):

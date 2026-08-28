@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_broker_alpaca import AlpacaAdapter
+from keel_broker_alpaca import AlpacaAdapter, CashAccountRequired
 from keel_broker_alpaca.fees import estimate_regulatory_fees
 from keel_broker_alpaca.transport import (
     LIVE_TRADING_HOST,
@@ -231,6 +231,124 @@ class TestCapabilities:
     def test_get_fee_summary_raises_as_declared(self) -> None:
         with pytest.raises(NotImplementedError):
             AlpacaAdapter().get_fee_summary()
+
+    def test_the_cash_posture_is_declared(self) -> None:
+        """#372 / PRD §5 "Cash-account discipline": cash-only is this adapter's declared
+        posture -- the DECLARED half of a pair whose ENFORCED half is `verify_cash_account`
+        refusing a margin-postured account at broker build. `cash_only` is required on
+        `BrokerCapabilities` (no default: a default would be an answer to a question only
+        the adapter's own build can vouch for), so this pin is the vocabulary's alpaca row."""
+        assert AlpacaAdapter().capabilities().cash_only is True
+
+
+# ---------------------------------------------------------------------------------------------
+# Cash-account posture (#372, PRD §5 "Cash-account discipline")
+# -----------------------------------------------------------------------------
+
+
+class TestCashPosture:
+    """`verify_cash_account` -- the venue-reported account posture, enforced fail-closed.
+
+    Alpaca has NO `account_type` field: `/v2/account`'s `multiplier` IS the account margin
+    classification (docs.alpaca.markets, "Trading Account") -- `1` a "standard limited
+    margin account with 1x BP" where "buying_power = cash" (the venue's cash-equivalent
+    posture: Alpaca opens every account as margin, and a true cash designation does not
+    exist -- multiplier 1 is as cash as the venue gets), `2` a reg T margin account (the
+    venue's DEFAULT for any account with $2,000 or more equity, which a $100k paper account
+    always is), `4` a 4x-intraday day-trading account. The posture check reads that one
+    field and refuses everything that is not the cash posture -- no margin borrowing
+    (riba), which also keeps the account outside the PDT rule's $25,000 margin-account
+    threshold. Everything the venue cannot or will not tell us fails closed: an unreadable
+    posture is not a cash posture (rails 12/13's rule -- silence is not consent).
+    """
+
+    def test_a_multiplier_of_one_is_the_cash_posture_and_passes(self) -> None:
+        """The fixture account carries `multiplier: "1"` -- the posture this adapter is
+        scoped to. Passing is the absence of a raise, nothing else: there is no certificate
+        to return, the caller (broker build) only needed the refusal not to fire."""
+        AlpacaAdapter(_full_transport()).verify_cash_account()
+
+    def test_a_reg_t_margin_classification_is_refused_naming_the_posture(self) -> None:
+        account = load_fixture("alpaca_account.json")
+        account["multiplier"] = "2"
+        with pytest.raises(CashAccountRequired) as excinfo:
+            AlpacaAdapter(FakeTransport(account=account)).verify_cash_account()
+
+        message = str(excinfo.value)
+        assert "multiplier=2" in message, "the refusal names the observed classification"
+        assert "riba" in message, "the refusal names WHY margin is refused"
+        assert "PDT" in message or "$25,000" in message, "and the PDT adjacency it sidesteps"
+        assert "multiplier to 1" in message, "and the operator's next action"
+
+    def test_the_pdt_daytrading_classification_is_refused_too(self) -> None:
+        """`4` is the 4x-intraday classification the PDT regime itself hands a flagged
+        margin account -- the most margin postured shape the venue answers, refused by the
+        same rule as `2` (this adapter does not grade degrees of borrowing)."""
+        account = load_fixture("alpaca_account.json")
+        account["multiplier"] = "4"
+        with pytest.raises(CashAccountRequired, match="multiplier=4"):
+            AlpacaAdapter(FakeTransport(account=account)).verify_cash_account()
+
+    def test_the_classification_is_parsed_as_a_number_not_string_matched(self) -> None:
+        """The account object QUOTES its money-ish fields but the adapter must not depend
+        on that: an unquoted `2` (parsed by `json.loads` into an int or, with the
+        transport's `parse_float=Decimal`, a `Decimal`) is the same margin classification
+        as `"2"`, and an unquoted `1.0` is the same cash posture as `"1"`."""
+        passing = load_fixture("alpaca_account.json")
+        passing["multiplier"] = 1.0
+        AlpacaAdapter(FakeTransport(account=passing)).verify_cash_account()
+
+        refusing = load_fixture("alpaca_account.json")
+        refusing["multiplier"] = 2
+        with pytest.raises(CashAccountRequired, match="multiplier=2"):
+            AlpacaAdapter(FakeTransport(account=refusing)).verify_cash_account()
+
+    @pytest.mark.parametrize(
+        "bad",
+        [None, "", "unlimited", "cash", float("nan")],
+        ids=["null", "empty", "word", "venue-word", "nan"],
+    )
+    def test_an_unparseable_classification_fails_closed(self, bad: Any) -> None:
+        """A `multiplier` the adapter cannot read as a number is not the cash posture --
+        it is NO posture, and `None`/garbage must refuse exactly like rail 12 treats an
+        unset kill-switch and rail 13 an unreadable balance. `NaN` rides JSON's
+        `parse_constant` path (the `_decimal_or_none` lesson), so it lands here too."""
+        account = load_fixture("alpaca_account.json")
+        account["multiplier"] = bad
+        with pytest.raises(CashAccountRequired, match="could not"):
+            AlpacaAdapter(FakeTransport(account=account)).verify_cash_account()
+
+    def test_an_absent_classification_fails_closed(self) -> None:
+        """No `multiplier` key at all (a stripped or future account shape): the venue said
+        nothing about the posture, and nothing is not cash."""
+        account = load_fixture("alpaca_account.json")
+        del account["multiplier"]
+        with pytest.raises(CashAccountRequired, match="could not"):
+            AlpacaAdapter(FakeTransport(account=account)).verify_cash_account()
+
+    def test_an_account_read_that_returns_nothing_fails_closed(self) -> None:
+        with pytest.raises(CashAccountRequired, match="could not"):
+            AlpacaAdapter(FakeTransport(account=None)).verify_cash_account()
+
+    def test_a_transport_failure_is_a_refusal_not_a_silent_pass(self) -> None:
+        """A venue outage mid-verification is not a cash posture either -- and the cause
+        rides along (`raise ... from`), so the operator sees WHY it could not be read
+        rather than a bare refusal over a swallowed network error."""
+
+        class _Exploding(FakeTransport):
+            def get_account(self) -> Any:
+                self._record("get_account")
+                raise AlpacaAPIError(503, "account endpoint unavailable")
+
+        with pytest.raises(CashAccountRequired, match="could not") as excinfo:
+            AlpacaAdapter(_Exploding()).verify_cash_account()
+        assert isinstance(excinfo.value.__cause__, AlpacaAPIError)
+
+    def test_a_transport_less_adapter_does_not_silently_pass(self) -> None:
+        """The no-transport construction (offline `capabilities()`) cannot verify anything,
+        and the constructor's own contract error -- not a quiet pass -- is the answer."""
+        with pytest.raises(RuntimeError, match="without a transport"):
+            AlpacaAdapter().verify_cash_account()
 
 
 # ---------------------------------------------------------------------------------------------
