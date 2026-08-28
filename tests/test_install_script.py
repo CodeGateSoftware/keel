@@ -258,6 +258,37 @@ def test_an_existing_database_is_never_touched(script: str) -> None:
     assert "not touched" in script
 
 
+# -- the config the release ships: confirm-mode production, never "paper" (#556) ------------------
+
+
+def test_the_config_is_called_what_it_is_in_both_places(script: str) -> None:
+    """The release's config.yaml is `keel/templates/config.live.yaml` shipped as
+    `config.yaml` -- the PRODUCTION config in `auto_trade.mode: confirm`: keel previews
+    every order and waits for explicit approval, and with credentials present it CAN
+    place live orders. Calling it "the paper profile" (#556) printed a cannot-place-a-
+    live-order reassurance directly above the line asking for a Coinbase CDP key -- wrong
+    in the direction that costs money. BOTH places that describe the config (the step 6
+    copy line and the closing next-steps block) must say what it is.
+    """
+    assert script.count("auto_trade.mode: confirm") >= 2, (
+        "the step 6 copy line and the next-steps block must both name auto_trade.mode: confirm"
+    )
+    assert "paper profile" not in script, (
+        'the installed config is still described as "the paper profile" (#556)'
+    )
+
+
+def test_the_next_steps_point_at_the_real_paper_template(script: str) -> None:
+    """`mode: paper` IS a real thing in keel -- the dev template `keel init-config` writes
+    WITHOUT `--live` (`keel/cli.py`: "the dev template in `mode: paper`, which places
+    nothing at all") -- so the honest fix is not to stop mentioning paper but to say how
+    to GET it: the next-steps block must name `init-config --force` as the swap-in."""
+    assert "init-config --force" in script, (
+        "the next-steps block does not say how to obtain the paper template"
+    )
+    assert "auto_trade.mode: paper" in script or "mode: paper" in script
+
+
 # -- the published one-liner, qualified where it is advertised (#557) -----------------------------
 
 

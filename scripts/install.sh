@@ -261,7 +261,9 @@ fi
 if [ -e "${KEEL_DIR}/config.yaml" ]; then
   say "  ${KEEL_DIR}/config.yaml already exists: keeping it (not overwritten)"
 else
-  say "  installing the release's default config.yaml beside the venv (the paper profile)"
+  say "  installing the release's production config.yaml beside the venv (auto_trade.mode: confirm:
+        keel previews every order and waits for your explicit approval -- the production
+        template, not the paper one)"
   cp "${TMP_DIR}/config.yaml" "${KEEL_DIR}/config.yaml"
 fi
 for db in "${KEEL_DIR}"/keel*.db; do
@@ -284,9 +286,15 @@ say "installed keel ${TAG} (verified)"
 printf '\nNext steps:\n'
 printf '  run it:      cd ~/.keel && ./.venv/bin/keel versions\n'
 printf '               (or: source ~/.keel/.venv/bin/activate, then: keel versions)\n'
-printf '  paper:       config.yaml beside the venv is the default paper profile -- nothing in\n'
-printf '               it can place a live order. To fetch candles you will want a free,\n'
-printf '               read-only Coinbase Developer Platform (CDP) API key in ~/.keel/.env.\n'
+printf '  config:      config.yaml beside the venv is the PRODUCTION config shipped with the\n'
+printf '               release, in auto_trade.mode: confirm -- keel previews every order and\n'
+printf '               waits for your explicit approval, and with credentials in ~/.keel/.env\n'
+printf '               it CAN place live orders, each gated by that approval. To fetch candles\n'
+printf '               you will want a free, read-only Coinbase Developer Platform (CDP) API\n'
+printf '               key in ~/.keel/.env.\n'
+printf '               For a config that simulates instead -- the dev template in\n'
+printf '               auto_trade.mode: paper, which places nothing at all -- run from\n'
+printf '               ~/.keel: ./.venv/bin/keel init-config --force\n'
 printf '  guide:       https://keeltrading.com\n'
 printf '  updates:     re-run this installer to move to a later release (#439, option A), or\n'
 printf '               run: keel update   (from ~/.keel -- it serves this venv layout).\n'
