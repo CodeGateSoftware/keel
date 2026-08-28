@@ -14,6 +14,22 @@ construction path to a trading host (no constructor parameter accepts a host URL
 there is no configuration path from a paper credential to
 `https://api.alpaca.markets`, by construction.
 
+## Cash-account posture (#372)
+
+The cash half of the scope is **enforced, not just declared**. Alpaca has no
+`account_type` field; `/v2/account`'s `multiplier` is the venue's account margin
+classification (`1` cash-equivalent — buying power equals cash, shorts refused; `2` reg T
+margin; `4` PDT day-trading margin), and the venue's *default* for any account over
+$2,000 of equity — a $100k paper account included — is margin. Every broker build calls
+`AlpacaAdapter.verify_cash_account()`: multiplier 1 passes, anything else raises
+`CashAccountRequired` (margin borrowing is riba; the refusal names the PDT $25k
+margin-account threshold the posture sidesteps and the fix — set the account's max margin
+multiplier to 1), and a classification that cannot be read at all raises the same
+fail-closed refusal, cause chained. The declared half is
+`BrokerCapabilities.cash_only=True`, rendered as "cash only" in `keel brokers list`. The
+operator-facing walk (including the T+1 settlement and opt-out obligations) is the
+runbook's "Account posture" and "T+1 settlement" sections.
+
 ## What works
 
 | Capability    | Detail                                                                       |
@@ -25,6 +41,7 @@ there is no configuration path from a paper credential to
 | Order status  | `get_order` maps Alpaca's status enum to the port's vocabulary; unknown statuses stay `PENDING`. |
 | Cancel        | 204 from `DELETE /v2/orders/{id}` is the venue confirmation; 404/422 and any transport failure answer `False`. |
 | Session       | `is_market_open()` reads the venue's clock (`/v2/clock`) — no local calendar. |
+| Posture       | `verify_cash_account()` at broker build: `/v2/account`'s `multiplier` must be the cash classification (1); margin (2/4) and unreadable answers refuse, fail-closed (#372). |
 | Rate limits   | 429 retried with `Retry-After` when sent, exponential backoff otherwise, bounded attempt budget (FR-11). |
 
 ## Fees (FR-7)

@@ -63,6 +63,16 @@ risk_pct: 0.01
 # subscribed tier — the choice is declared, never assumed, because the venue's server-side
 # default silently fails for keys without the subscription). Omitting the section entirely
 # selects Coinbase, byte-compatibly with every other profile.
+#
+# CASH-ACCOUNT POSTURE (#372): this venue is traded CASH-ONLY — margin borrowing is riba
+# and the cash posture keeps the account outside the PDT rule's $25k margin-account
+# threshold — and it is ENFORCED, not a knob here: every broker build reads the venue's own
+# account classification (/v2/account's `multiplier`) and refuses a margin-postured account
+# (fail-closed on an unreadable one). Note the venue's default cuts against the posture: a
+# fresh paper account's $100k equity classifies it reg T MARGIN (multiplier 2), so the
+# account's max margin multiplier must be set to 1 in the Alpaca dashboard before the first
+# cycle will run. See the runbook's "Account posture" section for the full split of what is
+# enforced in code versus what the operator must keep verified.
 broker:
   name: alpaca
   endpoint: paper
