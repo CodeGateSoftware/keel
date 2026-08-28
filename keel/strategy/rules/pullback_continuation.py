@@ -376,14 +376,16 @@ class PullbackContinuation(Rule):
         "trail_atr_mult": (
             "ratchet-only trailing stop this many ATRs below each bar's close, once the "
             "trade is open. Default off: measured WORSE than the static exit at the 120 bp "
-            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
-            "engines only -- live stop management is issue #502."
+            "fee (docs/experiments/2026-08-22-trailing-vs-static-exits.md). Applied by the "
+            "sim/backtest engines and, since #502, by the agent's live per-cycle stop "
+            "management -- off until a rule opts in."
         ),
         "be_roll_rr": (
             "roll the stop to the entry once the trade has been up this many R. Default "
             "off: measured no-better than the static exit at the 120 bp fee "
-            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Sim/backtest "
-            "engines only -- live stop management is issue #502."
+            "(docs/experiments/2026-08-22-trailing-vs-static-exits.md). Applied by the "
+            "sim/backtest engines and, since #502, by the agent's live per-cycle stop "
+            "management -- off until a rule opts in."
         ),
     }
 

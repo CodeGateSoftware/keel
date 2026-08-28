@@ -61,7 +61,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -77,6 +77,7 @@ from keel.execution import executor, guards, reconcile, streak
 from keel.execution.executor import ExecutionResult, _fetch_available_quote
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
+from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
 from keel.strategy.rules.dca import Dca
@@ -817,6 +818,122 @@ def _close_tranches(
             now_ts=now_ts,
         )
         repo.close_position(position["id"], closed_at=now_ts)
+
+
+def _manage_stops(
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    rules: list[Rule],
+    candles_by_tf_by_product: dict[str, dict[Granularity, list[Any]]],
+    now_ts: int,
+) -> None:
+    """The per-cycle live stop-management step (#502 stage 2): ratchet each held tranche's
+    resting bracket according to its OWNING rule's exit policy.
+
+    DEFAULT OFF, exactly like the sim wiring. The knobs are per-rule-family params
+    (`trail_atr_mult` / `be_roll_rr` on `pullback_continuation` and `rsi_meanrev`), a rule
+    whose params carry neither gets `EXIT_POLICY_OFF` and its position is not touched -- so
+    every rule row that has not opted in trades exactly as before this step existed. The
+    #442 experiment (docs/experiments/2026-08-22-trailing-vs-static-exits.md) measured
+    trailing WORSE and the break-even roll no better than the static exit at the 120 bp fee,
+    so the capability ships dark and the operator opts in per rule; `turtle_breakout` offers
+    the knobs nowhere at all (its exit is the Donchian channel by choice).
+
+    The decision is DELEGATED, not re-derived: `policy_for` + `next_stop` are the same
+    functions the sim/backtest engines apply, so the live level and the simulated level come
+    from one place. The bar is the latest COMPLETED one on the rule's trading timeframe
+    (`market_feed.poll_once` stores closed candles only), so the no-lookahead contract holds:
+    during the bar the venue's bracket rested at the old level, and the new level binds from
+    the next bar. A punctual cycle sees exactly one new bar per run; a MISSED cycle reads only
+    the newest bar, which is conservative in the one arm where it differs -- a break-even
+    trigger on an older bar's high goes unobserved and leaves the stop lower, never looser.
+
+    The ROLL itself is `executor.roll_stop_to`: ONE cancel-and-replace per tranche per cycle
+    (#519's cancel-before-place protocol, the crash ledger, the ratchet and at/above-target
+    refusals -- all in the executor, none re-invented here). Paper cycles never call this:
+    paper entries place no exchange-side brackets, so there is nothing to roll.
+    """
+    rules_by_name = {rule.name: rule for rule in rules}
+    for tranche in repo.get_open_positions():
+        rule = rules_by_name.get(tranche["rule_name"])
+        if rule is None:
+            continue  # the owning rule is not on this cycle's set (demoted/retired): no policy
+        policy = policy_for(rule)
+        if policy is EXIT_POLICY_OFF:
+            continue  # the default: the rule never asked for stop management
+
+        bracket_id = tranche["bracket_order_id"]
+        if bracket_id is None:
+            continue  # no bracket recorded: the unbracketed sweep owns this position (#195)
+        old_order = repo.get_order(bracket_id)
+        if old_order is None or old_order["status"] not in executor.RESTING_STATUSES:
+            continue  # filled or dead: reconciliation owns that bracket, not this step
+        current_stop = repo.get_state(f"open_stop:{tranche['product_id']}")
+        if current_stop is None:
+            continue  # no recorded level to ratchet from -- nothing this step may act on
+
+        # `initial_stop` is the tranche's ORIGINAL setup stop (#520) -- the denominator of the
+        # break-even threshold. NULL means "nobody recorded it" (pre-ledger tranche, DCA), and
+        # the ledger's own contract is that the BE arm switches OFF rather than substitutes the
+        # current stop, which is a different (and on a ratcheted position, stale) policy.
+        initial_stop = tranche["initial_stop"]
+        if initial_stop is None:
+            policy = replace(policy, be_roll_rr=None)
+
+        candles_by_tf = candles_by_tf_by_product.get(tranche["product_id"])
+        if not candles_by_tf:
+            continue  # stale product this cycle: no completed bar to manage on
+        series = candles_by_tf.get(_management_timeframe(rule, candles_by_tf)) or []
+        if not series:
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.stop_management_skipped",
+                product=tranche["product_id"],
+                rule=rule.name,
+                reason="no candles on the rule's trading timeframe",
+            )
+            continue
+
+        atr = trailing_atr(series, policy.atr_period)
+        level = next_stop(
+            policy,
+            tranche["entry_fill"],
+            # `initial_stop` is only read by the BE arm, which is OFF above when it is NULL;
+            # the entry is the neutral stand-in for the unreachable denominator.
+            initial_stop if initial_stop is not None else tranche["entry_fill"],
+            current_stop,
+            series[-1],
+            atr,
+        )
+        if level <= current_stop:
+            continue  # the ratchet: nothing proposed toward profit this cycle
+
+        executor.roll_stop_to(
+            broker,
+            repo,
+            config,
+            product_id=tranche["product_id"],
+            old_stop_order_id=bracket_id,
+            new_stop=level,
+            qty=tranche["qty"],
+            rule_name=tranche["rule_name"],
+            now_ts=now_ts,
+        )
+
+
+def _management_timeframe(rule: Rule, candles_by_tf: dict[Granularity, list[Any]]) -> Granularity:
+    """The series stop management reads: the rule's own trading timeframe when it declares one
+    (`granularity` on `TurtleBreakout`/`PullbackContinuation`, `timeframe` on `RsiMeanReversion`
+    -- the same attribute order `engine._trading_granularity` and `backtest._rule_trading_tf`
+    use), else the finest series this cycle actually has. Every knob-carrying family declares
+    its timeframe, so the fallback is a bound, not a path anyone trades on."""
+    for attr in ("granularity", "timeframe"):
+        value = getattr(rule, attr, None)
+        if isinstance(value, Granularity):
+            return value
+    return min(candles_by_tf, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
 
 
 # -- venue session (FR-9: a closed market is not a stale feed) --------------------------------
@@ -1661,6 +1778,17 @@ def run_once(
                         # stop by design.
                         initial_stop=signal.setup.stop if signal.setup is not None else None,
                     )
+
+        # == STOP MANAGEMENT: ratchet held positions' brackets per the owning rule's policy ==
+        #
+        # AFTER the trading decisions (a rule exit this cycle already closed its tranches, so
+        # they are no longer `open` and cannot be managed; a fresh entry's bracket rests at its
+        # own setup stop and may trail from this same completed bar, mirroring the sim's
+        # bar-end sequencing) and BEFORE cycle end. LIVE cycles only: paper entries place no
+        # exchange-side brackets, so there is nothing to roll and the paper path must not touch
+        # the real order book. Default-off per rule -- see `_manage_stops`.
+        if paper_trader is None:
+            _manage_stops(broker, repo, config, rules, candles_by_tf_by_product, now_ts)
 
         cycle_result = LoopResult(
             ts=now_ts,

@@ -22,10 +22,11 @@ back out (via `Repository.get_orders(mode='paper')`, P3 Task 1) to reconstruct `
 aggregates them via the shared `strategy.stats.summarize` helper into the same `BacktestResult`
 shape `backtest.py` produces, so paper and historical stats are directly comparable.
 
-**Exit-policy knobs are engine-only (#442/#502):** the `trail_atr_mult`/`be_roll_rr` knobs run in
-the sim/backtest engines (`strategy.exit_policy`); this trader does not manage stops -- its exits
-are the signal's own static stop/target touches (via `backtest.py`'s shared touch helpers) and
-signal-driven closes. The knobs' PARAM_DOCS say so outright.
+**Exit-policy knobs are not applied here (#442/#502):** the `trail_atr_mult`/`be_roll_rr` knobs
+run in the sim/backtest engines and, since #502 stage 2, in the agent's LIVE stop-management
+step; this trader does not manage stops -- a paper-forward's exits are the signal's own static
+stop/target touches (via `backtest.py`'s shared touch helpers) and signal-driven closes, so its
+results stay comparable with the static-exit baseline the knobs were measured against.
 """
 
 from __future__ import annotations

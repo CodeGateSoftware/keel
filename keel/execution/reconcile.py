@@ -30,10 +30,11 @@ recorded before this change, which is the gap itself. That rarity changes the pr
 auto-remediation, not the validity of recognizing the state.
 
 What is deliberately NOT done here: resizing or amending the bracket when a partially-filled
-entry leaves it oversized for what is held. The broker port has no bracket/OCO kind (#502); the
-live bracket bypasses it with a raw dict, and auto-cancelling live protective orders on the
-strength of a possibly-still-settling partial snapshot is strictly worse than a loud warning.
-This module records and surfaces; the amend-vs-cancel-and-replace policy is #502's.
+entry leaves it oversized for what is held. The port can express the cancel-and-replace
+(`BracketGTC`, #502 stage 1) and `executor._roll_stop` performs one, but a RESIZE is a
+re-place at a different size, and auto-cancelling live protective orders on the strength of a
+possibly-still-settling partial snapshot is strictly worse than a loud warning. This module
+records and surfaces; the resize policy rides with `scale_out`'s remaining #502 scope.
 """
 
 from __future__ import annotations
@@ -588,6 +589,6 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
         return None
     try:
         data = json.loads(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return data.get("order_id")

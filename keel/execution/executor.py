@@ -825,11 +825,12 @@ def _record_observed_fill_quantity(
     the exit-side over-booking is #502's to flag. The observation itself is recorded for
     BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
 
-    DELIBERATELY detect-and-surface only. Resizing the bracket means either amending a live
-    native trigger-bracket or cancel-and-replace, and the broker port carries no bracket/OCO
-    kind at all (#502) -- the live bracket already bypasses the port as a raw dict. Auto-cancelling
-    a protective order on the strength of a snapshot that may still be settling is a wrong
-    auto-action on live money; a loud warning is the safe half, and it is what this does.
+    DELIBERATELY detect-and-surface only. The port can EXPRESS the replacement since #502
+    stage 1 (`BracketGTC` -- every order is a spec now), and `_roll_stop` cancels-and-replaces
+    through it; what does not exist yet is the RESIZE policy (a roll re-places the SAME size).
+    Auto-cancelling a protective order on the strength of a snapshot that may still be
+    settling is a wrong auto-action on live money; a loud warning is the safe half, and the
+    automated resize policy remains #502's open half (with `scale_out`).
     """
     filled = observed.get("filled_size")
     if not filled or filled <= 0:
