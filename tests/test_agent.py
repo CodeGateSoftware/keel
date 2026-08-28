@@ -1649,6 +1649,8 @@ def _seed_bracketed_tranche(
     repo: Repository,
     *,
     rule_name: str = "pullback_continuation",
+    product: str = PRODUCT,
+    bracket_ref: str = "cb-bracket-1",
     entry: Decimal = Decimal("50000"),
     initial_stop: Decimal | None = Decimal("49000"),
     qty: Decimal = Decimal("0.01"),
@@ -1659,13 +1661,15 @@ def _seed_bracketed_tranche(
     order id. `initial_stop=None` seeds the pre-#520 TRANCHE shape the ledger documents as "BE
     arm disabled", not "zero" -- while the resting bracket's own stop (`open_stop:` state and
     the order row's `expected_fill`) stays a real number, because it always is: the bracket
-    exists, so it rests at some level."""
+    exists, so it rests at some level. `bracket_ref` is the broker-side order id the cancel
+    path reads out of `raw_response` -- distinct per product so a multi-product test can tell
+    whose cancel was whose."""
     stop = initial_stop if initial_stop is not None else Decimal("49000")
-    _seed_open_position(repo, PRODUCT, qty, entry, ts=ts)
+    _seed_open_position(repo, product, qty, entry, ts=ts)
     bracket_id = repo.insert_order(
         dict(
             mode="live",
-            product_id=PRODUCT,
+            product_id=product,
             side=Side.SELL.value,
             order_type="market",
             qty=qty,
@@ -1674,14 +1678,14 @@ def _seed_bracketed_tranche(
             fee=None,
             expected_fill=stop,
             actual_fill=None,
-            raw_response='{"order_id": "cb-bracket-1"}',
+            raw_response=f'{{"order_id": "{bracket_ref}"}}',
             created_at=ts,
             updated_at=ts,
         )
     )
-    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": rule_name, "opened_at": ts})
+    repo.set_state(f"position_rule:{product}", {"rule_name": rule_name, "opened_at": ts})
     repo.open_position(
-        product_id=PRODUCT,
+        product_id=product,
         rule_name=rule_name,
         opened_at=ts,
         qty=qty,
@@ -1690,8 +1694,8 @@ def _seed_bracketed_tranche(
         initial_stop=initial_stop,
         bracket_order_id=bracket_id,
     )
-    repo.set_state(f"open_stop:{PRODUCT}", stop)
-    repo.set_state(f"open_target:{PRODUCT}", target)
+    repo.set_state(f"open_stop:{product}", stop)
+    repo.set_state(f"open_target:{product}", target)
     return bracket_id
 
 
@@ -1730,12 +1734,12 @@ def _rising_series(
     ]
 
 
-def _seed_history(repo: Repository, series: list[Candle]) -> None:
+def _seed_history(repo: Repository, series: list[Candle], product: str = PRODUCT) -> None:
     """Pre-store the series in the candles table. `market_feed.poll_once` cold-starts an EMPTY
     table with only the newest closed bar (its catch-up start is `latest_closed`), so a test
     that means "a deployment with ATR history" must seed the table itself -- the cycle's poll
     then finds the tail current and stores nothing new."""
-    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, series)
+    repo.upsert_candles(product, Granularity.ONE_DAY, series)
 
 
 def test_run_once_leaves_stops_alone_when_the_rule_carries_no_exit_knobs(repo: Repository) -> None:
@@ -1969,6 +1973,52 @@ def test_paper_cycles_do_not_manage_exchange_brackets(repo: Repository) -> None:
     assert broker.place_calls == []
     assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
     assert repo.get_order(bracket_id)["status"] == "pending"
+
+
+def test_a_family_row_only_manages_the_tranches_of_its_own_product(repo: Repository) -> None:
+    """PRODUCT-SCOPED ownership (#502 review): the rules table holds ONE row per
+    (kind, product) and `Rule.name` is the FAMILY name, so resolving a tranche's policy by
+    name alone governed a multi-product family's every tranche under whichever same-family
+    row loaded last -- here the ETH row (id 1, knob-less) loses a name-only dict to the BTC
+    row (id 2, opted in), and BTC's trail policy would have rolled ETH's bracket on a climb
+    ETH never asked for. The step keys rows by `(product_id, name)` -- the same product
+    scoping `_handle_exits` uses -- so each product's tranche answers to its OWN row."""
+    eth = "ETH-USD"
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": eth, "granularity": "ONE_DAY"},
+        status="live",
+    )
+    repo.insert_rule(
+        "pullback_continuation",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+        status="live",
+    )
+    btc_bracket = _seed_bracketed_tranche(
+        repo, bracket_ref="btc-bracket-1", target=Decimal("60000")
+    )
+    eth_bracket = _seed_bracketed_tranche(repo, product=eth, bracket_ref="eth-bracket-1", ts=2_000)
+    # The SAME climb on both products: under a name-only key this series rolls ETH too.
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    _seed_history(repo, series, product=eth)
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): series,
+            (eth, Granularity.ONE_DAY): series,
+        }
+    )
+
+    run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert "eth-bracket-1" not in broker.cancel_calls, (
+        "the knob-less product's tranche was managed under the opted-in row's policy"
+    )
+    assert repo.get_order(eth_bracket)["status"] == "pending"
+    assert repo.get_state(f"open_stop:{eth}") == Decimal("49000")
+    assert "btc-bracket-1" in broker.cancel_calls, "the opted-in product's tranche was not managed"
+    assert repo.get_order(btc_bracket)["status"] == "canceled"
+    assert repo.get_state(f"open_stop:{PRODUCT}") > Decimal("49000")
 
 
 def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:

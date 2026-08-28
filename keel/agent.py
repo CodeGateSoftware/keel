@@ -829,7 +829,12 @@ def _manage_stops(
     now_ts: int,
 ) -> None:
     """The per-cycle live stop-management step (#502 stage 2): ratchet each held tranche's
-    resting bracket according to its OWNING rule's exit policy.
+    resting bracket according to its OWNING rule's exit policy -- the rule row that owns the
+    tranche's PRODUCT, never merely a row sharing its family name (the rules table holds one
+    row per (kind, product), so a name-only key would govern a multi-product family's every
+    tranche under whichever same-family row loaded last: an opted-in BTC row managing a
+    knob-less ETH tranche's bracket, or the reverse; `_handle_exits` scopes ownership by
+    product for the same reason).
 
     DEFAULT OFF, exactly like the sim wiring. The knobs are per-rule-family params
     (`trail_atr_mult` / `be_roll_rr` on `pullback_continuation` and `rsi_meanrev`), a rule
@@ -854,11 +859,11 @@ def _manage_stops(
     refusals -- all in the executor, none re-invented here). Paper cycles never call this:
     paper entries place no exchange-side brackets, so there is nothing to roll.
     """
-    rules_by_name = {rule.name: rule for rule in rules}
+    rules_by_owner = {(getattr(rule, "product_id", None), rule.name): rule for rule in rules}
     for tranche in repo.get_open_positions():
-        rule = rules_by_name.get(tranche["rule_name"])
+        rule = rules_by_owner.get((tranche["product_id"], tranche["rule_name"]))
         if rule is None:
-            continue  # the owning rule is not on this cycle's set (demoted/retired): no policy
+            continue  # the owning row is not on this cycle's set (demoted/retired): no policy
         policy = policy_for(rule)
         if policy is EXIT_POLICY_OFF:
             continue  # the default: the rule never asked for stop management
