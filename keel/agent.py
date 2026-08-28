@@ -67,7 +67,13 @@ from typing import Any, Literal
 
 from keel_broker_api.results import MarketSchedule, SessionState
 from keel_core.products import quote_currency_of
-from keel_core.telemetry import bind_cycle, log_event, new_cycle_id, unbind_cycle
+from keel_core.telemetry import (
+    bind_cycle,
+    log_event,
+    log_exception,
+    new_cycle_id,
+    unbind_cycle,
+)
 
 from keel.config import Config
 from keel.data import freshness, market_feed
@@ -858,6 +864,15 @@ def _manage_stops(
     (#519's cancel-before-place protocol, the crash ledger, the ratchet and at/above-target
     refusals -- all in the executor, none re-invented here). Paper cycles never call this:
     paper entries place no exchange-side brackets, so there is nothing to roll.
+
+    A failed roll is LOUD and ISOLATED, never a dead cycle. The roll's cancel half is a
+    live-money action with ordinary failure modes (`CancelPending` / `CancelUnavailable` are
+    what Coinbase's batch-cancel answers when a fill lands during the roll), so each
+    tranche's roll is wrapped: a raise is logged at CRITICAL -- a possibly-half-completed
+    action on live money must be loud -- and the step CONTINUES to the next tranche. Letting
+    it propagate would abort `run_once` AFTER entries were placed: no `LoopResult`, no
+    post-cycle notify, a nonzero CLI exit, and the live-run wrapper declining to stamp the
+    UTC day -- so the next trigger re-runs the whole cycle into the duplicate-entry window.
     """
     rules_by_owner = {(getattr(rule, "product_id", None), rule.name): rule for rule in rules}
     for tranche in repo.get_open_positions():
@@ -915,17 +930,36 @@ def _manage_stops(
         if level <= current_stop:
             continue  # the ratchet: nothing proposed toward profit this cycle
 
-        executor.roll_stop_to(
-            broker,
-            repo,
-            config,
-            product_id=tranche["product_id"],
-            old_stop_order_id=bracket_id,
-            new_stop=level,
-            qty=tranche["qty"],
-            rule_name=tranche["rule_name"],
-            now_ts=now_ts,
-        )
+        try:
+            executor.roll_stop_to(
+                broker,
+                repo,
+                config,
+                product_id=tranche["product_id"],
+                old_stop_order_id=bracket_id,
+                new_stop=level,
+                qty=tranche["qty"],
+                rule_name=tranche["rule_name"],
+                now_ts=now_ts,
+            )
+        except Exception:
+            # Per-tranche isolation, deliberately BROAD: `CancelPending`/`CancelUnavailable`
+            # from the fill-during-roll race is the expected raise, but a possibly-
+            # half-completed action on live money must not be graded by exception type
+            # here. The position may be unprotected RIGHT NOW (the cancel may have landed
+            # before the raise), so this is CRITICAL with the traceback attached -- and the
+            # cycle SURVIVES, per the docstring: a dead `run_once` after entries were
+            # placed re-runs the cycle into the duplicate-entry window.
+            log_exception(
+                logger,
+                "agent.stop_management_roll_failed",
+                level=logging.CRITICAL,
+                product=tranche["product_id"],
+                rule=rule.name,
+                old_stop_order_id=bracket_id,
+                attempted_stop=level,
+            )
+            continue
 
 
 def _management_timeframe(rule: Rule, candles_by_tf: dict[Granularity, list[Any]]) -> Granularity:

@@ -2021,6 +2021,66 @@ def test_a_family_row_only_manages_the_tranches_of_its_own_product(repo: Reposit
     assert repo.get_state(f"open_stop:{PRODUCT}") > Decimal("49000")
 
 
+def test_a_failed_roll_is_loud_and_isolated_never_a_dead_cycle(repo: Repository, caplog) -> None:
+    """PER-TRANCHE ISOLATION (#502 review): a cancel that raises mid-roll -- `CancelPending`/
+    `CancelUnavailable` are ordinary Coinbase batch-cancel outcomes when a fill lands during
+    the roll -- must not abort `run_once`. A dead cycle AFTER entries were placed costs the
+    `LoopResult`, the post-cycle notify, and the live-run wrapper's UTC day-stamp, so the
+    next trigger re-runs the whole cycle into the duplicate-entry window. The failure is
+    CRITICAL (the roll may be half-completed on live money), the crash-ledger record stands
+    for the sweep to heal from, and the LATER tranche is still managed."""
+    eth = "ETH-USD"
+    for product in (PRODUCT, eth):
+        repo.insert_rule(
+            "pullback_continuation",
+            {"product_id": product, "granularity": "ONE_DAY", "trail_atr_mult": "1.5"},
+            status="live",
+        )
+    btc_bracket = _seed_bracketed_tranche(
+        repo, bracket_ref="btc-bracket-1", target=Decimal("60000")
+    )
+    eth_bracket = _seed_bracketed_tranche(
+        repo, product=eth, bracket_ref="eth-bracket-2", ts=2_000, target=Decimal("60000")
+    )
+    series = _rising_series(57)
+    _seed_history(repo, series)
+    _seed_history(repo, series, product=eth)
+
+    class _CancelDeniedBroker(FakeBroker):
+        def cancel_order(self, order_id: str) -> bool:
+            if order_id == "btc-bracket-1":
+                raise RuntimeError("batch cancel unavailable (fill in flight)")
+            return super().cancel_order(order_id)
+
+    broker = _CancelDeniedBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): series,
+            (eth, Granularity.ONE_DAY): series,
+        }
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        result = run_once(broker, repo, _config(), now_ts=_management_now_ts(57))
+
+    assert result.skipped is False, "a failed roll killed the whole cycle"
+    failures = [
+        (record.getMessage(), getattr(record, _FIELDS_ATTR, {}))
+        for record in caplog.records
+        if record.getMessage() == "agent.stop_management_roll_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0][1]["product"] == PRODUCT
+    assert failures[0][1]["old_stop_order_id"] == btc_bracket
+    # The raise lands inside the executor's cancel, BEFORE the local `canceled` mark, so
+    # the old bracket still rests and the crash ledger stands for the next cycle's sweep.
+    assert repo.get_order(btc_bracket)["status"] == "pending"
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is not None
+    # The LATER tranche was still managed -- isolation, not abandonment.
+    assert "eth-bracket-2" in broker.cancel_calls
+    assert repo.get_order(eth_bracket)["status"] == "canceled"
+    assert repo.get_state(f"open_stop:{eth}") > Decimal("49000")
+
+
 def test_a_rule_exit_records_one_outcome_per_tranche(repo: Repository) -> None:
     """The other half of the per-tranche ledger, and the half the plan originally left behind.
 
