@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import OrderSpec
-from keel_broker_api.results import Balance, PlaceResult, Preview
+from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 
 from keel.config import Caps, Config, MarketDataConfig, MoneyMgmtConfig
 from keel.data.db import connect, migrate
@@ -26,6 +26,24 @@ from keel.types import Side
 
 NOW = 1_800_000_000
 PRODUCT = "BTC-USD"
+
+
+def _observed_from(payload: dict[str, Any]) -> OrderStatus:
+    """An `OrderStatus` from the dict shape these tests have always described an observation in.
+
+    Kept as a dict at the call sites deliberately (the same reasoning as the executor suite's
+    `_preview_from`): dozens of tests construct a bespoke observation to exercise one field --
+    a missing status, a zero fill, a partly-filled size -- and this is the one place the
+    translation into the port's type happens. The broker's answer has been `OrderStatus` since
+    #524; the fixtures stay dicts so each test says only the field it means.
+    """
+    return OrderStatus(
+        order_id=str(payload.get("order_id", "")),
+        status=str(payload.get("status") or ""),
+        filled_size=Decimal(str(payload.get("filled_size") or "0")),
+        average_filled_price=Decimal(str(payload.get("average_filled_price") or "0")),
+        total_fees=Decimal(str(payload.get("total_fees") or "0")),
+    )
 
 
 def _config(**overrides: Any) -> Config:
@@ -60,9 +78,9 @@ class _Broker:
         self._orders = orders or {}
         self.get_order_calls: list[str] = []
 
-    def get_order(self, order_id: str) -> dict[str, Any]:
+    def get_order(self, order_id: str) -> OrderStatus:
         self.get_order_calls.append(order_id)
-        return self._orders[order_id]
+        return _observed_from(self._orders[order_id])
 
 
 class _RebracketingBroker(_Broker):
@@ -73,9 +91,7 @@ class _RebracketingBroker(_Broker):
         self.placed: list[dict[str, Any]] = []
 
     def get_balances(self) -> list[Balance]:
-        return [
-            Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000"))
-        ]
+        return [Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000"))]
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         return Preview(
@@ -429,7 +445,7 @@ def test_a_broker_error_on_one_order_does_not_abandon_the_rest(repo):
     )
 
     class _PartlyBroken(_Broker):
-        def get_order(self, order_id: str) -> dict[str, Any]:
+        def get_order(self, order_id: str) -> OrderStatus:
             if order_id == "cb-broken":
                 raise RuntimeError("broker blew up")
             return super().get_order(order_id)
@@ -1123,9 +1139,7 @@ class _RejectingRebracketBroker(_RebracketingBroker):
 
     def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
         self.placed.append({"spec": spec})
-        return PlaceResult(
-            success=False, broker_order_id=None, reason="PREVIEW_INVALID_BASE_SIZE"
-        )
+        return PlaceResult(success=False, broker_order_id=None, reason="PREVIEW_INVALID_BASE_SIZE")
 
 
 def _seed_unbracketed_tranche(

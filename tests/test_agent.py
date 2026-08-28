@@ -24,6 +24,7 @@ from keel_broker_api.orders import OrderSpec
 from keel_broker_api.results import (
     Balance,
     MarketSchedule,
+    OrderStatus,
     PlaceResult,
     Preview,
     SessionState,
@@ -1561,14 +1562,14 @@ def test_run_once_reconciles_a_filled_bracket(repo: Repository) -> None:
     )
 
     class _ReconcilingBroker(FakeBroker):
-        def get_order(self, order_id: str) -> dict[str, Any]:
-            return {
-                "order_id": order_id,
-                "status": "FILLED",
-                "filled_size": Decimal("0.01"),
-                "average_filled_price": Decimal("48900"),
-                "total_fees": Decimal("2.93"),
-            }
+        def get_order(self, order_id: str) -> OrderStatus:
+            return OrderStatus(
+                order_id=order_id,
+                status="FILLED",
+                filled_size=Decimal("0.01"),
+                average_filled_price=Decimal("48900"),
+                total_fees=Decimal("2.93"),
+            )
 
     broker = _ReconcilingBroker(
         series={(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}

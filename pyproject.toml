@@ -25,8 +25,12 @@ dependencies = [
     # `version`, and `tests/test_packaging.py` fails the build if a pin is left behind.
     "keel-core==0.11.2",
     "keel-broker-api==0.11.2",
-    # keel/cli.py and keel/data/cb_client.py still import the Coinbase SDK directly; depending
-    # on the adapter keeps it available transitively. Phase B deletes those imports and this.
+    # The default venue resolves through the keel.brokers entry points (#524), so the adapter
+    # is a hard runtime dependency, not a convenience: without it installed, every config --
+    # including one with no `broker:` section -- fails at broker construction. The CLI also
+    # imports the SDK directly to build the adapter's RESTClient transport
+    # (`keel/commands/_common.py`); moving that construction into the adapter package is
+    # Phase B's, with cb_client.py's deletion.
     "keel-broker-coinbase==0.11.2",
 ]
 

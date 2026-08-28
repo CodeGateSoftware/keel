@@ -1,22 +1,15 @@
 """Thin, injectable wrapper around the Coinbase Advanced Trade REST API.
 
-`cb_client` is the **only** module in `keel` that talks to the network. It never
-instantiates its own transport -- a `transport` (duck-typed like `coinbase.rest.RESTClient`,
-or any fake with matching method signatures) is injected by the caller, so tests exercise it
-against canned JSON fixtures with zero live network calls.
-
-In production, inject the real client:
-
-    from coinbase.rest import RESTClient
-    from keel.config import load_secrets
-
-    secrets = load_secrets()
-    transport = RESTClient(api_key=secrets["api_key"], api_secret=secrets["api_secret"])
-    client = CoinbaseClient(transport)
-
-`place_order` talks to the live order-creation endpoint. It performs **no halal/risk checks
-itself** -- callers (the Phase-3 executor + guards) must run rails and any confirm-mode gate
-before calling it; `cb_client` stays a thin, dumb transport wrapper.
+LEGACY SINCE #524: nothing in production constructs this client any more -- `_build_broker`
+resolves coinbase through the `keel.brokers` entry points like every other venue, and the
+class the registry hands back (`keel_broker_coinbase.CoinbaseAdapter`) is the one on the
+live path. This module is retained because its methods answer in the port\'s shapes
+(`Preview`, `PlaceResult`, `list[Balance]`, `Instrument`, `OrderStatus`, `CancelOutcome`)
+and its tests pin Coinbase response-parsing behaviour against the same fixtures the adapter
+suite uses; Phase B deletes it outright. It never instantiates its own transport -- a
+`transport` (duck-typed like `coinbase.rest.RESTClient`, or any fake with matching method
+signatures) is injected by the caller, so tests exercise it against canned JSON fixtures
+with zero live network calls.
 """
 
 from __future__ import annotations
@@ -31,6 +24,7 @@ from keel_broker_api.results import (
     Balance,
     CancelOutcome,
     Instrument,
+    OrderStatus,
     PlaceResult,
     Preview,
 )
@@ -181,38 +175,6 @@ class CoinbaseClient:
             raise ValueError(f"get_spot({product_id!r}): response has no 'price' field")
         return Decimal(price)
 
-    def list_products(self, product_type: str = "SPOT") -> list[dict]:
-        """Every tradable product on the venue, as plain dicts. READ-ONLY market metadata.
-
-        Used only by the allowlist DISCOVERY stage (`keel assets discover`), which proposes
-        candidates for human attestation -- it decides nothing. Per §5's asymmetry, a proposal
-        may come from anywhere; admission goes through `compliance/screen.py`.
-        """
-        raw = self._transport.get_products(product_type=product_type)
-        products = raw["products"] if isinstance(raw, dict) else raw.products
-        out: list[dict] = []
-        for product in products:
-            fields = product if isinstance(product, dict) else vars(product)
-            out.append(
-                {
-                    "product_id": fields.get("product_id"),
-                    "base_name": fields.get("base_name"),
-                    "quote_currency_id": fields.get("quote_currency_id"),
-                    "status": fields.get("status"),
-                    "trading_disabled": bool(fields.get("trading_disabled")),
-                    "is_disabled": bool(fields.get("is_disabled")),
-                    "view_only": bool(fields.get("view_only")),
-                    "quote_24h_volume": fields.get("approximate_quote_24h_volume"),
-                    # #516. The venue has always sent these; this projection dropped them, which
-                    # is why `_order_configuration` had nothing to quantize a SELL against and
-                    # emitted `str(Decimal)` -- the defect #513 fixed for the BUY half only.
-                    # Kept as the venue's own strings; the caller decides what is a Decimal.
-                    "base_increment": fields.get("base_increment"),
-                    "quote_increment": fields.get("quote_increment"),
-                }
-            )
-        return out
-
     def get_accounts(self) -> list[dict]:
         """Return authenticated account balances, keyed by currency.
 
@@ -247,8 +209,8 @@ class CoinbaseClient:
         The same bridge `get_balances` is: this client predates `keel-broker-api`, and
         `executor._base_increment_for` had to read `list_products()` and pick through raw dicts
         because that was the only catalogue read this client offered. Answering `Instrument` here
-        means the executor asks one question whether it holds this client or a real adapter, and
-        the flip needs no further change on this path.
+        meant the executor asked one question whether it held this client or a real adapter, so
+        #524's flip of `_build_broker` to the registry needed no change on this path.
 
         `get_product`, not `get_products`. The caller needs ONE product; `list_products` returns
         about 900 and stays where it belongs -- `keel assets discover`, which genuinely wants the
@@ -264,7 +226,7 @@ class CoinbaseClient:
             return None
         try:
             value = Decimal(str(increment))
-        except (ArithmeticError, TypeError, ValueError):
+        except ArithmeticError, TypeError, ValueError:
             return None
         if value <= 0:
             return None
@@ -279,10 +241,9 @@ class CoinbaseClient:
         had to probe for BOTH shapes, dict key or attribute, because it did not know which kind of
         broker it held.
 
-        Teaching this client the port's shape removes that fork without flipping anything: the
-        executor now asks one question, and the answer is the same type whether it is talking to
-        this pre-port client or to a real adapter. When `_build_broker` finally resolves through
-        `load_broker`, this path needs no further change.
+        Teaching this client the port's shape removed the executor's fork: one question, one
+        answer type, on this client and on a real adapter alike -- which is why #524's flip
+        of `_build_broker` to the registry needed no further change on this path.
 
         `total` is `available + hold`, matching `keel_broker_coinbase.adapter.get_balances`
         exactly -- Coinbase exposes no single "total" field, and the two implementations must not
@@ -373,14 +334,17 @@ class CoinbaseClient:
             ),
         )
 
-    def get_order(self, order_id: str) -> dict:
-        """Observed state of a previously placed order, normalized to `Decimal` money fields.
+    def get_order(self, order_id: str) -> OrderStatus:
+        """Observed state of a previously placed order, in the PORT's shape (#524).
 
         This is what makes exit reconciliation possible at all. A placement response only says
         the order was ACCEPTED; nothing in it reveals that a resting bracket later filled, at
         what price, or for what fee. Without this the executor has to record the *expected*
         price and the *previewed* commission, so realized P&L is modelled rather than observed --
         and a stop-out closes a position the loop never notices.
+
+        The port's `OrderStatus` is the answer since the flip's consumers were migrated; the
+        dict this used to return was the last pre-port shape on the order path.
 
         `filled_size`/`average_filled_price`/`total_fees` are absent (not zero) on an order with
         no fills yet, so they are defaulted to `Decimal("0")`: callers do arithmetic on these and
@@ -389,15 +353,13 @@ class CoinbaseClient:
         """
         response = self._transport.get_order(order_id=order_id)
         order = _field(response, "order") or {}
-        return {
-            "order_id": _field(order, "order_id", order_id),
-            "product_id": _field(order, "product_id"),
-            "side": _field(order, "side"),
-            "status": _field(order, "status"),
-            "filled_size": Decimal(_field(order, "filled_size", "0") or "0"),
-            "average_filled_price": Decimal(_field(order, "average_filled_price", "0") or "0"),
-            "total_fees": Decimal(_field(order, "total_fees", "0") or "0"),
-        }
+        return OrderStatus(
+            order_id=str(_field(order, "order_id", order_id)),
+            status=str(_field(order, "status", "")),
+            filled_size=Decimal(_field(order, "filled_size", "0") or "0"),
+            average_filled_price=Decimal(_field(order, "average_filled_price", "0") or "0"),
+            total_fees=Decimal(_field(order, "total_fees", "0") or "0"),
+        )
 
     def cancel_order(self, order_id: str) -> CancelOutcome:
         """Cancel one resting order and report what the exchange said about THIS id.

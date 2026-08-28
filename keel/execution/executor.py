@@ -50,10 +50,11 @@ bracket above and a rule EXIT signal, nothing that ratchets. Why unwired, establ
 #442: (1) ratchet-only is rail-9-safe BY CONSTRUCTION (`_roll_stop` refuses a widening
 proposal before `guards.check` ever runs; pinned by `tests/execution/
 test_executor.py::test_a_ratchet_only_trail_can_never_trip_rail_9`); (2) live wiring needs
-a cancel-and-replace of the native bracket, and the broker port has NO bracket/OCO
-`OrderSpec` kind -- the bracket reaches the venue only because this module bypasses the
-port with a raw configuration dict -- so live stop management is split out to issue #502
-rather than solved here; (3) the exit POLICY those primitives encode (the same
+a cancel-and-replace of the native bracket, and that policy -- amending a live protective
+order versus cancelling and re-placing it -- is unsettled, so live stop management is split
+out to issue #502 rather than solved here (the bracket itself has been an `OrderSpec`
+(`BracketGTC`) since #569, reaching the venue through `place_order` like every other order,
+so the port is no longer the blocker); (3) the exit POLICY those primitives encode (the same
 ratchet-only ATR trail and break-even roll) IS wired where exits are driven per bar: the
 sim/backtest engines, via `strategy/exit_policy.py` and the per-family `trail_atr_mult` /
 `be_roll_rr` params on `pullback_continuation` and `rsi_meanrev`. `turtle_breakout`
@@ -108,7 +109,13 @@ from keel_broker_api.orders import (
     MarketIOCByQuote,
     OrderSpec,
 )
-from keel_broker_api.results import CancelOutcome, PlaceResult, Preview, coerce_cancel_outcome
+from keel_broker_api.results import (
+    CancelOutcome,
+    OrderStatus,
+    PlaceResult,
+    Preview,
+    coerce_cancel_outcome,
+)
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
@@ -441,7 +448,7 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     except Exception:
         # `log_venue_failure`, not `log_exception`: an unreachable venue outside a trade cycle
         # is a dashboard balance refresh on a sleeping laptop, and this line is the SECOND
-        # record for that one failure (`cb_client.get_accounts` logs it first) -- two full
+        # record for that one failure (`cb_client.get_balances` logs it first) -- two full
         # tracebacks per poll, every 30s, for as long as the machine is offline. Inside a cycle
         # it escalates back to ERROR on its own: there it means rail 13 failed closed and an
         # order did not go out. Kept as its own event rather than dropped because it carries
@@ -800,8 +807,8 @@ def _upgrade_to_observed_economics(
         log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
         return
 
-    fill = observed.get("average_filled_price")
-    fees = observed.get("total_fees")
+    fill = observed.average_filled_price
+    fees = observed.total_fees
     if not fill or fill <= 0:
         return
     repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
@@ -812,7 +819,7 @@ def _upgrade_to_observed_economics(
 def _record_observed_fill_quantity(
     repo: Repository,
     order_id: int,
-    observed: dict[str, Any],
+    observed: OrderStatus,
     intent: OrderIntent | None,
     now_ts: int,
 ) -> None:
@@ -830,12 +837,12 @@ def _record_observed_fill_quantity(
     BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
 
     DELIBERATELY detect-and-surface only. Resizing the bracket means either amending a live
-    native trigger-bracket or cancel-and-replace, and the broker port carries no bracket/OCO
-    kind at all (#502) -- the live bracket already bypasses the port as a raw dict. Auto-cancelling
-    a protective order on the strength of a snapshot that may still be settling is a wrong
-    auto-action on live money; a loud warning is the safe half, and it is what this does.
+    native trigger-bracket or cancel-and-replace, and the resize policy is #502's to settle.
+    Auto-cancelling a protective order on the strength of a snapshot that may still be
+    settling is a wrong auto-action on live money; a loud warning is the safe half, and it is
+    what this does.
     """
-    filled = observed.get("filled_size")
+    filled = observed.filled_size
     if not filled or filled <= 0:
         return
     row = repo.get_order(order_id) or {}
@@ -1144,9 +1151,9 @@ def _entry_spread_gate(
     than swallowed here because this is a money gate) is refused with the DISTINCT
     `book_unreadable` token: "cannot know" is a different fact from "too wide", and a gate
     that guessed a spread from half a book would be a gate that sometimes trades on fiction.
-    The real venue's preview carries both sides for market orders (`cb_client.preview_order`
-    maps `best_bid`/`best_ask` to `Decimal`), so an unreadable book on the live path means a
-    degraded response -- exactly the moment not to spend.
+    The real venue's preview carries both sides for market orders (the Coinbase adapter maps
+    `best_bid`/`best_ask` into `Preview.detail`), so an unreadable book on the live path means
+    a degraded response -- exactly the moment not to spend.
 
     Every BUY routes market today (#258), so "every live BUY" and "every market-routed live
     BUY" are the same set; if #260's remediation ever lands resting BUY orders, revisit the
@@ -1377,9 +1384,8 @@ class CancelUnavailable(RuntimeError):
     SELL on the exchange that our own records said was gone.
 
     `CoinbaseClient.cancel_order` exists now, but the guard still matters and now covers a
-    second case: it returns `False` when the exchange REFUSES a cancel (already filled, unknown
-    id), and a refusal recorded as a success is the same lie by a different route. The
-    `keel-broker-api` port and the Coinbase adapter still have no cancel method.
+    second case: the port's `cancel_order` answers `CancelOutcome`, and a REFUSED (already
+    filled, unknown id) recorded as a success is the same lie by a different route.
 
     Failing loudly is the safe direction: our state must never claim a cancel that did not
     happen. A caller that cannot tolerate the raise must reconcile with the exchange, not
@@ -1488,7 +1494,7 @@ def _bracket_spec(
     **This used to render Coinbase's wire dict itself.** #502 stage 1 added `BracketGTC` to the
     port and shipped a test pinning the two byte-identical, because two renderers of one order
     existed and had to be kept in agreement. #524 removed the second one: the spec goes to
-    `CoinbaseClient.place_order`, which renders it through the adapter's own
+    the broker's `place_order`, which renders it through the adapter package's own
     `to_order_configuration`, and the parity test goes with the duplicate it was pinning.
 
     What the port adds beyond a shared renderer is REFUSAL. `BracketGTC.__post_init__` rejects a

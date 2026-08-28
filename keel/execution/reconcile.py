@@ -30,10 +30,9 @@ recorded before this change, which is the gap itself. That rarity changes the pr
 auto-remediation, not the validity of recognizing the state.
 
 What is deliberately NOT done here: resizing or amending the bracket when a partially-filled
-entry leaves it oversized for what is held. The broker port has no bracket/OCO kind (#502); the
-live bracket bypasses it with a raw dict, and auto-cancelling live protective orders on the
-strength of a possibly-still-settling partial snapshot is strictly worse than a loud warning.
-This module records and surfaces; the amend-vs-cancel-and-replace policy is #502's.
+entry leaves it oversized for what is held. The amend-vs-cancel-and-replace policy is #502's to
+settle, and auto-cancelling live protective orders on the strength of a possibly-still-settling
+partial snapshot is strictly worse than a loud warning. This module records and surfaces.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ import logging
 from decimal import Decimal
 from typing import Any
 
+from keel_broker_api.results import OrderStatus
 from keel_core.telemetry import log_event, log_exception
 
 from keel.config import Config
@@ -108,7 +108,7 @@ def reconcile_open_orders(broker: Any, repo: Repository, config: Config, now_ts:
             )
             continue
 
-        status = (observed.get("status") or "").upper()
+        status = (observed.status or "").upper()
 
         if status in _DEAD:
             # A CANCELLED/EXPIRED order can still have SOLD something: Coinbase reports
@@ -117,7 +117,7 @@ def reconcile_open_orders(broker: Any, repo: Repository, config: Config, now_ts:
             # floor -- `_held_position` sums only `filled` rows, so it would keep reporting the
             # FULL position held, and the realized P&L on the sold portion would never reach
             # rails 11 or 16. Record what actually sold, then stop tracking the order.
-            if (observed.get("filled_size") or Decimal("0")) > 0:
+            if (observed.filled_size or Decimal("0")) > 0:
                 _try_record_fill(broker, repo, config, row, observed, now_ts)
             else:
                 repo.update_order(row["id"], status="canceled", updated_at=now_ts)
@@ -158,7 +158,7 @@ def _polled_rows(repo: Repository) -> list[dict[str, Any]]:
 
 
 def _record_partial_fill(
-    repo: Repository, row: dict[str, Any], observed: dict[str, Any], now_ts: int
+    repo: Repository, row: dict[str, Any], observed: OrderStatus, now_ts: int
 ) -> bool:
     """Record `0 < filled_size < ordered qty` as the distinct non-terminal `partially_filled`
     state. Returns whether anything changed.
@@ -175,12 +175,12 @@ def _record_partial_fill(
     free position in the rail-8 basis.
     """
     ordered = row["qty"] or Decimal("0")
-    filled = observed.get("filled_size") or Decimal("0")
+    filled = observed.filled_size or Decimal("0")
     if not (Decimal("0") < filled < ordered):
         return False
 
-    average = observed.get("average_filled_price") or Decimal("0")
-    fees = observed.get("total_fees") or Decimal("0")
+    average = observed.average_filled_price or Decimal("0")
+    fees = observed.total_fees or Decimal("0")
     previously = row.get("filled_quantity")
 
     fields: dict[str, Any] = {
@@ -445,7 +445,7 @@ def _try_record_fill(
     repo: Repository,
     config: Config,
     row: dict[str, Any],
-    observed: dict[str, Any],
+    observed: OrderStatus,
     now_ts: int,
 ) -> None:
     """`_record_fill` with the SAME per-order isolation the status fetch gets.
@@ -471,13 +471,13 @@ def _record_fill(
     repo: Repository,
     config: Config,
     row: dict[str, Any],
-    observed: dict[str, Any],
+    observed: OrderStatus,
     now_ts: int,
 ) -> None:
     """Mark `row` filled from OBSERVED economics and, for an exit, close out the position."""
-    exit_fill = observed.get("average_filled_price") or Decimal("0")
-    fees = observed.get("total_fees") or Decimal("0")
-    filled_qty = observed.get("filled_size") or row["qty"]
+    exit_fill = observed.average_filled_price or Decimal("0")
+    fees = observed.total_fees or Decimal("0")
+    filled_qty = observed.filled_size or row["qty"]
 
     if exit_fill <= 0:
         # A FILLED order that reports no price. Feeding 0 to the producer computes
@@ -588,6 +588,6 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
         return None
     try:
         data = json.loads(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return data.get("order_id")

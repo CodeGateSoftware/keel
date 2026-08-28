@@ -6,12 +6,11 @@ Two things are pinned here, and they ship together because one cannot run withou
    .plist` + `paper-equities-run.sh` + `keel-equities` -- tracked in-repo exactly like the
    paperforward/live/paper-hourly ones. Nothing about them is executed by the suite's code
    paths, so like `tests/test_paper_hourly_profile.py` this file pins them against drift.
-2. The MINIMAL engine wiring the profile needs: config-driven venue selection. Today
-   `_build_broker` constructs a `CoinbaseClient` unconditionally; this profile is the first
-   that must reach a different adapter (`keel-broker-alpaca`, paper host, IEX feed). The
-   `broker:` config section is that surface, and its ABSENCE must leave the Coinbase
-   construction path byte-identical -- pinned here by construction, not by assertion of
-   intent, because every existing profile and test depends on that default.
+2. The MINIMAL engine wiring the profile needs: config-driven venue selection. Every name,
+   coinbase included (#524), resolves through the `keel.brokers` entry points; the `broker:`
+   config section selects one, and the CLI's per-venue wiring is the TRANSPORT it hands the
+   resolved adapter (alpaca: paper/live host, IEX/SIP feed). An adapter that resolves but
+   has no wiring is refused by name rather than constructed credential-less.
 
 The runner tests execute the REAL script verbatim through a harness that shims `date` (so
 they do not depend on, or wait on, the wall clock) and stubs the deployment's `.venv/bin/keel`.
@@ -249,11 +248,7 @@ def _sandbox(tmp_path: Path, keel_exit_code: int) -> tuple[Path, Path, Path, dic
     stub_dir.mkdir(parents=True, exist_ok=True)
     invocations = stub_dir / "keel.invocations"
     stub = stub_dir / "keel"
-    stub.write_text(
-        "#!/bin/bash\n"
-        f'printf "%s\\n" "$*" >> "{invocations}"\n'
-        f"exit {keel_exit_code}\n"
-    )
+    stub.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{invocations}"\nexit {keel_exit_code}\n')
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
     date_bin = tmp_path / "shim-bin"
@@ -267,9 +262,7 @@ def _sandbox(tmp_path: Path, keel_exit_code: int) -> tuple[Path, Path, Path, dic
 def _run(script: Path, env: dict[str, str], now: datetime) -> subprocess.CompletedProcess[str]:
     run_env = dict(env)
     run_env["KEEL_TEST_NOW"] = str(int(now.astimezone(UTC).timestamp()))
-    return subprocess.run(
-        ["/bin/bash", str(script)], capture_output=True, text=True, env=run_env
-    )
+    return subprocess.run(["/bin/bash", str(script)], capture_output=True, text=True, env=run_env)
 
 
 def _count_lines(path: Path) -> int:
@@ -596,18 +589,14 @@ def test_broker_endpoint_is_validated_at_load(tmp_path):
     at config load, not at first request -- and live/paper is the whole vocabulary because
     the trading host is derived from it, never configured as a URL."""
     with pytest.raises(ConfigError, match="broker.endpoint"):
-        load_config(
-            str(_write_config(tmp_path, "\nbroker:\n  name: alpaca\n  endpoint: prod\n"))
-        )
+        load_config(str(_write_config(tmp_path, "\nbroker:\n  name: alpaca\n  endpoint: prod\n")))
 
 
 def test_broker_data_feed_is_validated_at_load(tmp_path):
     """The data tier is a DECLARED capability (FR-5): iex or sip, nothing else, refused at
     load rather than silently falling back to the venue's server-side default."""
     with pytest.raises(ConfigError, match="broker.data_feed"):
-        load_config(
-            str(_write_config(tmp_path, "\nbroker:\n  name: alpaca\n  data_feed: cows\n"))
-        )
+        load_config(str(_write_config(tmp_path, "\nbroker:\n  name: alpaca\n  data_feed: cows\n")))
 
 
 def test_coinbase_rejects_the_alpaca_only_knobs(tmp_path):
@@ -617,17 +606,18 @@ def test_coinbase_rejects_the_alpaca_only_knobs(tmp_path):
         load_config(str(_write_config(tmp_path, "\nbroker:\n  endpoint: live\n")))
 
 
-def test_build_broker_default_is_byte_compatible_coinbase(
-    tmp_path, monkeypatch
-):
-    """THE default pin, by construction: no `broker:` section -> `_build_broker` takes the
-    unchanged Coinbase path -- `load_secrets()` from `.env`, a `RESTClient` built from those
-    CDP values, wrapped in `CoinbaseClient`. The kwargs and the wrapping are asserted, so a
-    refactor that changed any of it for the default config fails here."""
+def test_build_broker_default_resolves_coinbase_through_the_registry(tmp_path, monkeypatch):
+    """THE default pin, post-flip (#524): no `broker:` section -> the venue name resolves
+    through the `keel.brokers` entry points exactly like every other name, and the CLI's
+    coinbase wiring is the TRANSPORT it hands the resolved adapter -- `load_secrets()` from
+    `.env`, a `RESTClient` built from those CDP values. The resolved class, the kwargs and
+    the wrapping are all asserted, so a refactor that changed any of it for the default
+    config fails here. The direct `CoinbaseClient` construction this test used to pin is the
+    thing #524 deleted; there is no second coinbase path left to drift against."""
     import coinbase.rest
 
     from keel.commands._common import _build_broker
-    from keel.data import cb_client
+    from keel_broker_coinbase import CoinbaseAdapter
 
     (tmp_path / ".env").write_text("CDP_API_KEY=cb-key\nCDP_API_SECRET=cb-secret\n")
     monkeypatch.chdir(tmp_path)
@@ -638,23 +628,18 @@ def test_build_broker_default_is_byte_compatible_coinbase(
         def __init__(self, **kwargs: object) -> None:
             calls["rest_kwargs"] = kwargs
 
-    def _fake_coinbase_client(transport: object) -> object:
-        calls["transport"] = transport
-        return object()
-
     monkeypatch.setattr(coinbase.rest, "RESTClient", _FakeRESTClient)
-    monkeypatch.setattr(cb_client, "CoinbaseClient", _fake_coinbase_client)
 
     config = load_config(str(_write_config(tmp_path)))
     broker = _build_broker(config)
 
-    assert broker is not None
+    assert isinstance(broker, CoinbaseAdapter)
     assert calls["rest_kwargs"] == {
         "api_key": "cb-key",
         "api_secret": "cb-secret",
         "timeout": None,
     }
-    assert isinstance(calls["transport"], _FakeRESTClient)
+    assert isinstance(broker._transport, _FakeRESTClient)
 
 
 def test_build_broker_selects_alpaca_paper_iex(tmp_path, monkeypatch):
