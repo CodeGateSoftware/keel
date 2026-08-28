@@ -4,49 +4,114 @@
  * opens in devtools is this file, byte for byte, which is the same property the JavaScript is
  * held to and for the same reason (§4 of the design spec's Philosophy).
  *
- * ── THE PALETTE IS A COPY, AND A TEST PINS THAT IT STAYS ONE ──────────────────────────────────
+ * ── THE PALETTE IS A COPY OF keeltrading.com'S, AND A TEST PINS THE TWO LITERALS ───────────────
  *
- * Every `--token: #hex` below is byte-identical to the corresponding declaration in
- * `keel/web/render.py`'s `_STYLE`, which is where #532 chose these values and where
- * `tests/web/test_palette_contrast.py` measures their WCAG ratios. A copy is a second source of
- * truth, so `tests/web/test_client_assets.py::test_the_client_palette_is_byte_identical_to_the_
- * rendered_one` parses BOTH stylesheets with that test module's own parser and fails on any
- * divergence -- which means the contrast gate that guards render.py's palette transitively
- * guards this one, without a second copy of the WCAG arithmetic.
+ * Every `--token: #hex` below that has a counterpart in keeltrading.com's
+ * `src/styles/global.css` is byte-identical to it (#593): the app and its public face are one
+ * product, and a reader who meets the site and then opens this console meets the same warm
+ * paper and the same teal, not a second identity. That file lives in a SIBLING repository CI
+ * cannot read, so no test can compare the copy against its source the way the old render.py pin
+ * compared two files in this one. What stands in its place:
+ * `tests/web/test_client_assets.py::test_the_palette_wears_keeltrading_coms_identity` pins the
+ * literals that carry the identity -- `--accent`, `--bg` and `--link`, in both themes -- and
+ * names the site file as the upstream, and `tests/web/test_palette_contrast.py` still measures
+ * every pair's WCAG ratio straight off this file. (Until #540 the copy was of `render.py`'s
+ * `_STYLE`, held identical by a test that died with it, exactly as its own docstring said it
+ * would.)
  *
- * REJECTED: extracting the palette to a shared file that `render.py` reads at import time and
- * inlines into `_STYLE`. It would remove the duplication, but it adds a file read to module
- * import for a module the build order (§"Build order", step 7 / #540) deletes outright, and it
- * would put the stylesheet's single source of truth outside the package's Python at the exact
- * moment the Python is going away. The duplication has a known end date and a test that makes it
- * loud until then; the extraction would outlive its own reason.
+ * ── THE STATE TOKENS HAVE NO SITE COUNTERPART, AND EACH RETUNE IS DOCUMENTED ───────────────────
  *
- * The reversal condition is stated for the same reason: when #540 deletes `render.py`'s HTML,
- * this file becomes the only palette, the pin test is deleted, and
- * `tests/web/test_palette_contrast.py::_load_themes` re-points at this file. That is a
- * three-line change and it is the whole migration.
+ * The site has no warn, bad or good: it is a brochure, not a console. Those three, and
+ * `--control-line`, keep #532's semantics untouched -- warn is a real difference where nothing
+ * is broken, bad is loss, good is gain -- and are re-tuned onto the site's warmer paper and
+ * lighter ink, each choice documented beside its declaration. The constraint that shaped the
+ * light set: the site's ink (#1d2833) is LIGHTER than the near-black it replaces, which narrows
+ * the band a light signal colour can occupy (AAA against the paper, 1.7:1 away from body ink,
+ * 0.025 luminance away from each other) to 0.0207 -- too narrow for good and bad BOTH. `--bad`
+ * is the one that gives: it drops the AAA grade it has held since #532 (it is AA at 5.87:1, and
+ * further from `--fg` than it has ever been), because the alternative was shrinking the
+ * good/bad separation back toward the collision #532 exists to fix. The trade is recorded in
+ * `_GRADE_FLOOR`, not made quietly.
  *
  * ── THE STATE CLASSES ARE #532'S, NOT A SECOND CONVENTION ─────────────────────────────────────
  *
- * `.good` / `.warn` / `.bad` / `.muted` are spelled exactly as `render.py` spells them, so the
- * two front-ends style the same judgement the same way and the merge at #540 is a deletion
- * rather than a reconciliation. The API's `state` vocabulary has five words to these four
- * classes; `js/render.js`'s `STATE_CLASS` table holds that mapping and explains it.
+ * `.good` / `.warn` / `.bad` / `.muted` are spelled exactly as they have been since #532, so
+ * the judgement a state carries and the class that carries it have never drifted. The API's
+ * `state` vocabulary has five words to these four classes; `js/render.js`'s `STATE_CLASS` table
+ * holds that mapping and explains it.
  */
 
 :root {
-  --bg: #fbfaf8; --fg: #1c1b19; --muted: #6b6862; --line: #e3dfd8;
-  --card: #ffffff; --accent: #1a5578; --warn: #8a5a00; --bad: #7b2915; --good: #1f5f4f;
+  /* keeltrading.com global.css, light `:root` -- byte-identical copies (#593). */
+  --bg: #f8f7f3;      /* site --bg: the warm paper */
+  --fg: #1d2833;      /* site --ink */
+  --muted: #4b5b69;   /* site --muted */
+  --line: #d9d4c8;    /* site --border: decorative only, exempt from 1.4.11 (see --control-line) */
+  --card: #fffefb;    /* site --surface */
+  --accent: #0c5d52;  /* site --accent: the teal */
+  --link: #0c5d52;    /* site --link: light links ARE the accent teal on the site; declared apart
+                         so dark can differ below, as it does there */
+
+  /* The app's semantic tokens, on the site's paper -- no site counterpart, each retuned (#593). */
+  --warn: #7a5c15;
+  --bad: #a63e26;
+  --good: #1c5c47;
   --control-line: #84817c;
 }
 :root:not([data-theme="light"]) { color-scheme: light dark; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #16150f; --fg: #ecead5; --muted: #9a968a; --line: #2f2d25;
-    --card: #1d1c15; --accent: #86b1e5; --warn: #d9a441; --bad: #e07a6a; --good: #83d3b2;
-    --control-line: #706d66;
+    /* keeltrading.com global.css, dark `@media` block -- byte-identical copies (#593). */
+    --bg: #0f171d; --fg: #e9e7e0; --muted: #a4b4be; --line: #2b3a44;
+    --card: #162128; --accent: #57c5af; --link: #6fd0bb;
+
+    /* The app's semantic tokens, on the site's slate -- no site counterpart (#593). */
+    --warn: #d4af37; --bad: #e07a6a; --good: #7cd69f;
+    --control-line: #606f7a;
   }
 }
+
+/* ── the semantic retunes, one note each (#593) ────────────────────────────────────────────────
+ *
+ * LIGHT `--warn: #7a5c15` is the site's own `--gold-4`. The site's gold set is its warm-ink
+ * family, and gold-4 is the member whose luminance (0.1185) sits closest to the amber this
+ * token already wore (#8a5a00, 0.1272): same hue, same job, now the site's literal rather than
+ * a near neighbour of it. AA on both surfaces (5.81:1 / 6.18:1).
+ *
+ * LIGHT `--bad: #a63e26` is the old brick (#7b2915) lightened within its hue. The old value
+ * cleared every floor against the OLD near-black ink; against the site's lighter #1d2833 it sat
+ * at 1.55:1 from body text, under the 1.7:1 floor `test_signal_tokens_stay_distinguishable_
+ * from_fg` pins. Lightening buys distance from `--fg` (2.38:1) and from `--good` (luminance
+ * delta 0.0334, over the 0.025 floor with room) at the cost of one grade -- AA at 5.87:1, the
+ * one entry `_GRADE_FLOOR` lowers, with the reason stated there.
+ *
+ * LIGHT `--good: #1c5c47` is the old green (#1f5f4f) darkened a step and leaned away from blue,
+ * because the site's accent is a teal and a gain that read as a second brand teal would repeat
+ * the link-versus-gain confusion #532 split these tokens to end. AAA on both surfaces (7.33:1 /
+ * 7.79:1), 1.90:1 from `--fg`.
+ *
+ * LIGHT `--control-line: #84817c` is KEPT: a warm neutral that already sits between the site's
+ * border and its muted ink in lightness, and clears the 3:1 boundary minimum against the new
+ * paper at 3.62:1.
+ *
+ * DARK `--warn: #d4af37` is the site's dark `--gold-3`. The closer sibling of the light choice
+ * -- dark `--gold-1` (#c9a43a) -- lands at 6.91:1 on `--card`, a hair under this palette's AAA
+ * working standard; gold-3 is the same ink one step lighter and clears it (8.60:1 / 7.79:1).
+ *
+ * DARK `--bad: #e07a6a` is KEPT: it clears every dark floor against the site's slate exactly as
+ * it cleared them against the old warm black (AA 6.17:1 / 5.58:1, 2.37:1 from `--fg`, 0.2407
+ * luminance from `--good`).
+ *
+ * DARK `--good: #7cd69f` is the old mint (#83d3b2) leaned green at the same luminance (0.5488
+ * against 0.5463), for the same reason as the light retune: the site's dark accent (#57c5af)
+ * is a mint teal, and gain must not render as a second link colour. AAA on both surfaces
+ * (10.32:1 / 9.34:1), 1.42:1 from `--fg` -- over the 1.4:1 dark floor, as its predecessor was.
+ *
+ * DARK `--control-line: #606f7a` is the site's dark border (`#2b3a44`) at the lightness the
+ * 3:1 boundary minimum demands: the site's own border is 1.54:1 against its dark bg -- fine
+ * for the decorative rules it draws, not fine for the only cue marking where an input is. The
+ * hue moves from the old warm gray to the site's slate because the page under it did.
+ */
 
 * { box-sizing: border-box; }
 
@@ -419,7 +484,10 @@ details .card { border: none; padding: 0; margin: 0 0 0.6rem; background: none; 
 .action { margin: 0.6rem 0 0; }
 .action .inputs { margin: 0.3rem 0; padding-left: 1.2rem; }
 .action .choices { margin: 0.2rem 0; padding-left: 1.2rem; color: var(--muted); }
-a.runlink { color: var(--accent); }
+/* The one anchor this page colours: `--link`, not `--accent` -- they are the same teal in
+ * light but split in dark (#6fd0bb beside #57c5af), and a dark tab running this app beside the
+ * site must not show two link teals (#593). */
+a.runlink { color: var(--link); }
 
 pre.joblines {
   background: var(--bg);
@@ -530,7 +598,7 @@ footer {
    forms is deleted. The rules below are the ones that page carried, moved rather than reinvented.
 
    `--control-line`, NOT `--line`. WCAG 1.4.11 asks 3:1 for the boundary of a component you can
-   interact with, and `--line` is 1.27:1 against the page -- fine for a decorative divider, which
+   interact with, and `--line` is 1.38:1 against the page -- fine for a decorative divider, which
    is exempt, and not fine for the only thing marking where an input is. A control whose border is
    the only cue that it IS a control, drawn at a ratio a divider may use, is the exact failure
    `test_field_input_border_uses_the_control_line_token_not_line` exists to catch. */

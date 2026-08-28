@@ -33,6 +33,7 @@ import re
 import pytest
 
 from keel.web import staticfiles
+from tests.web.test_palette_contrast import _load_themes
 
 
 def _P(rest: str) -> str:
@@ -365,7 +366,7 @@ def test_the_arithmetic_scanner_can_fail() -> None:
     everything would make it impossible to write the file at all, and the first author to hit
     that would loosen the scan rather than the code."""
     # It catches arithmetic in code.
-    assert "+" in _code_only('const total = a + b;\n')
+    assert "+" in _code_only("const total = a + b;\n")
     assert "Math" in _code_only("const x = Math.round(y);\n")
     assert "/" in _code_only("const half = whole / two;\n")
 
@@ -525,6 +526,47 @@ def test_the_event_stream_carries_no_figures() -> None:
 # duplication has an end date. At #540 `render.py` goes, this test goes with it, and
 # `test_palette_contrast._load_themes` re-points at this file." It does. There is one stylesheet
 # now, the contrast gate measures it directly, and there is nothing left to hold in agreement.
+#
+# #593 puts a DIFFERENT pin in the same spot: the palette's upstream is no longer inside this
+# repository at all.
+
+
+def test_the_palette_wears_keeltrading_coms_identity() -> None:
+    """**The literals that make the app look like keeltrading.com (#593), pinned.**
+
+    The palette's upstream is `../keeltrading.com/src/styles/global.css` -- a SIBLING repository
+    this CI cannot read, so a test cannot compare the copy against its source the way the old
+    render.py pin could. What it can do is refuse to let the values that CARRY the identity
+    drift: `--accent` is the teal every button and equity curve on the site wears, `--bg` is the
+    warm paper both products sit on, and `--link` is the teal the site colours its anchors with
+    -- which is NOT the dark accent (#6fd0bb beside #57c5af), so an app that styled its links
+    with `--accent` showed two link teals the moment somebody opened it beside the site in a
+    dark tab. Both themes are pinned, not just the light one: the stylesheet's header claims
+    byte-identity for every token with a site counterpart, and half a claim is not a claim.
+    Change any of these here without changing the site and the app and its public face are two
+    products again -- which is the exact regression #593 exists to close.
+    """
+    light, dark = _load_themes()
+    assert light["accent"] == "#0c5d52", (
+        "light --accent is not keeltrading.com's teal (global.css --accent); the identity has "
+        "drifted from the site"
+    )
+    assert light["bg"] == "#f8f7f3", (
+        "light --bg is not keeltrading.com's paper (global.css --bg); the identity has drifted "
+        "from the site"
+    )
+    assert dark["accent"] == "#57c5af", (
+        "dark --accent is not keeltrading.com's dark teal (global.css dark --accent); the "
+        "identity has drifted from the site"
+    )
+    assert dark["bg"] == "#0f171d", (
+        "dark --bg is not keeltrading.com's dark slate (global.css dark --bg); the identity "
+        "has drifted from the site"
+    )
+    assert (light["link"], dark["link"]) == ("#0c5d52", "#6fd0bb"), (
+        "--link is not keeltrading.com's link teal (global.css --link, both themes); dark links "
+        "would render in a teal the site never shows"
+    )
 
 
 def test_the_python_and_javascript_route_tables_agree() -> None:
