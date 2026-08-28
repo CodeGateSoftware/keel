@@ -28,6 +28,12 @@ Shape of the honesty:
   imported lazily inside `run_study` ONLY, and `import keel.research.tuning` succeeds
   without it — shipped wheels stay clean, and so does every runtime path.
 
+Since #528 this module is also where the trials budget becomes DERIVED rather than
+remembered: `SEARCH_SPACES` reads the rules' own `param_space()` declarations (one source
+of truth — the hand-maintained table is gone), `declared_cells` counts the grid a full
+sweep would visit, and `explored_vs_declared` refuses a sweep whose explored range exceeds
+the declaration. None of that searches anything; it prices the searching.
+
 `Decimal` for every price-derived quantity (they are money); `float` appears only where
 optuna's API demands it — inside the objective's return value — exactly as `deflate.py`
 documents its probabilities.
@@ -35,15 +41,16 @@ documents its probabilities.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from types import ModuleType
 from typing import Protocol
 
-from keel.agent import build_rule_from_params
+from keel.agent import RULE_REGISTRY, build_rule_from_params
 from keel.research.cscv import pbo as cscv_pbo
 from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT, TAKER_FEE_PCT, backtest
+from keel.strategy.rules.base import ParamSpec
 from keel.strategy.stats import BacktestResult
 from keel.types import Candle
 
@@ -53,11 +60,14 @@ __all__ = [
     "PBO_BLOCKS",
     "SEARCH_SPACES",
     "TRAIN_FRAC",
+    "ExplorationCheck",
     "OverfittingGate",
     "StudyReport",
     "TrialSummary",
+    "declared_cells",
     "evaluate_gate",
     "evaluate_params",
+    "explored_vs_declared",
     "params_from_trial",
     "proposal_verdict",
     "run_study",
@@ -84,32 +94,33 @@ MIN_TRADES_PER_COLUMN = 10
 #: plausibly luck than edge, and the harness refuses to propose it.
 OVERFITTING_CEILING = Decimal("0.5")
 
+
+def _declared_space(kind: str) -> tuple[ParamSpec, ...]:
+    """The rule's own declaration for `kind`, off a defaults-constructed instance.
+
+    `build_rule_from_params` raises `ValueError` for an unknown kind, which is the same
+    loud refusal `params_from_trial` owes -- a study over a kind with no rule is a study
+    over nothing. A kind that declares nothing (dca) yields the empty tuple, and its
+    family is simply absent from `SEARCH_SPACES`: an empty space is a truthful statement,
+    not a missing one.
+    """
+    return build_rule_from_params(kind, {"product_id": "BTC-USD"}).param_space()
+
+
 #: Pinned per-family search spaces, small enough to defend in review: a handful of knobs
 #: a trader can name a reason for, not a grid-search carpet. Bounds are `(lo, hi)`; INTEGRAL
 #: bounds are suggested as ints, fractional ones as floats (the dispatch
 #: `params_from_trial` performs). `granularity`/`product_id` are deliberately absent: the
 #: clock and the product are fixed by the caller, never searched.
+#:
+#: DERIVED, not hand-maintained (issue #528): every bound below is READ off the rule's own
+#: `Rule.param_space()` declaration at import, so this dict cannot disagree with the rule --
+#: a bound moves where the rule declares it and nowhere else. The literal this used to be
+#: is gone on purpose; `tests/research/test_tuning.py` pins the equivalence.
 SEARCH_SPACES: dict[str, dict[str, tuple]] = {
-    "turtle_breakout": {
-        "entry_lookback": (20, 60),  # Donchian-high entry channel, bars
-        "exit_lookback": (10, 30),  # asymmetric Donchian-low exit channel, bars
-        "adx_threshold": (20.0, 35.0),  # trend-strength gate
-        "atr_stop_mult": (1.5, 3.0),  # stop distance in ATRs ("N")
-        "target_rr": (3, 8),  # nominal take-profit distance in R
-    },
-    "rsi_meanrev": {
-        "oversold": (15.0, 30.0),  # RSI bounce trigger
-        "overbought": (70.0, 85.0),  # RSI exit for a held long
-        "atr_mult": (1.0, 2.5),  # ATR multiple for the 'atr' stop method
-        "fixed_rr": (1, 3),  # reward:risk multiple for the 'fixed_rr' target
-        "rsi_period": (10, 21),  # RSI length
-    },
-    "pullback_continuation": {
-        "ema_fast": (5, 12),  # \
-        "ema_mid": (15, 30),  # > the EMA fan, three searched periods
-        "ema_slow": (40, 70),  # /
-        "buffer_ticks": (0.01, 0.05),  # price buffer around the entry zone, quote units
-    },
+    kind: space
+    for kind in RULE_REGISTRY
+    if (space := {spec.name: spec.bounds for spec in _declared_space(kind)})
 }
 
 
@@ -166,6 +177,104 @@ def params_from_trial(family: str, suggest: Suggest) -> dict[str, object]:
         return {"ema_periods": (fast, mid, slow), "buffer_ticks": buffer_ticks}
 
     return {name: _suggest_value(suggest, name, bounds) for name, bounds in space.items()}
+
+
+# -- the trials budget, derived from the declaration (issue #528) --------------------------------
+#
+# `n_trials` -- the input to `research.deflate.expected_max_sharpe` -- used to be a number
+# a human remembered to record. These two helpers are the smallest honest step past that:
+# the SIZE of the explorable space is read off the rule, and a sweep that explored beyond
+# it is refused rather than silently exceeded. The ledger itself is untouched -- this FEEDS
+# its rows, it does not replace them.
+
+
+def declared_cells(rule_kind: str) -> int:
+    """The number of cells a FULL sweep of `rule_kind`'s declared space would visit.
+
+    The derivable budget: the product over the declared dimensions of each one's grid size
+    at its declared step, so an experiment record can state "explored N trials of a
+    declared space of M cells" without anyone remembering M by hand. A kind that declares
+    nothing sweepable (dca) is the honest `0`, not an error; an unregistered kind raises
+    `ValueError` (`build_rule_from_params`'s own refusal), because there is no declaration
+    to read and a plausible `0` would be a lie.
+
+    This counts the space, it does not license searching it: the #476 harness samples a
+    few dozen points inside it precisely BECAUSE the whole grid is thousands of trials the
+    multiple-comparison budget cannot afford.
+    """
+    specs = _declared_space(rule_kind)
+    if not specs:
+        return 0
+    cells = 1
+    for spec in specs:
+        cells *= spec.cells
+    return cells
+
+
+@dataclass(frozen=True)
+class ExplorationCheck:
+    """What a sweep explored, measured against what its rule declared (#528).
+
+    `declared_cells` is the size of the whole declared space; `explored_cells` is the part
+    of it the explored box covers at the same steps -- the denominator and numerator of
+    "explored N of a declared space of M cells". Both are properties of the inputs, so the
+    same sweep always yields the same check.
+    """
+
+    rule_kind: str
+    declared_cells: int
+    explored_cells: int
+
+
+def explored_vs_declared(
+    explored: Mapping[str, tuple[float, float]], rule_kind: str
+) -> ExplorationCheck:
+    """Honesty check for a sweep's ranges against the rule's declaration (#528).
+
+    `explored` is the box actually swept: `{dimension: (min, max)}` in the declaration's
+    own dimension names (for `pullback_continuation`, the fan slots `ema_fast`/`ema_mid`/
+    `ema_slow`, not the packed `ema_periods`). Returns the check when every explored range
+    sits inside its declared one; REFUSES -- `ValueError` naming the parameter and BOTH
+    ranges -- otherwise, because an explored range that silently exceeds the declared one
+    spends trials budget the count above never included, which is exactly the asymmetry
+    #528 exists to close. A dimension the rule never declared is the worse drift (no
+    denominator exists for it at all) and is refused in the same breath.
+
+    PURE: reads only its arguments and the rule's own declaration -- no clock, no RNG, no
+    ledger -- so a driver can call it per cell and get identical answers for identical
+    sweeps.
+    """
+    specs = {spec.name: spec for spec in _declared_space(rule_kind)}
+
+    violations: list[str] = []
+    for name, (low, high) in sorted(explored.items()):
+        spec = specs.get(name)
+        if spec is None:
+            violations.append(
+                f"{name} swept {low}..{high} but {rule_kind} declares no such dimension "
+                "-- an undeclared knob has no trials budget to spend from"
+            )
+            continue
+        declared_lo, declared_hi = spec.bounds
+        if Decimal(str(low)) < Decimal(str(declared_lo)) or Decimal(str(high)) > Decimal(
+            str(declared_hi)
+        ):
+            violations.append(
+                f"{name} swept {low}..{high} exceeds the declared {declared_lo}..{declared_hi}"
+            )
+    if violations:
+        raise ValueError("; ".join(violations))
+
+    covered = 1
+    for name, (low, high) in explored.items():
+        spec = specs[name]
+        span = Decimal(str(high)) - Decimal(str(low))
+        covered *= int(span / spec.step) + 1
+    return ExplorationCheck(
+        rule_kind=rule_kind,
+        declared_cells=declared_cells(rule_kind),
+        explored_cells=covered,
+    )
 
 
 def split_chronologically(

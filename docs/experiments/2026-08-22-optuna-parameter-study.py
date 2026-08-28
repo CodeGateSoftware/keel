@@ -80,7 +80,14 @@ from pathlib import Path
 from typing import TypedDict
 
 from keel.research.ledger import append_trial
-from keel.research.tuning import OverfittingGate, proposal_verdict, run_study
+from keel.research.tuning import (
+    SEARCH_SPACES,
+    OverfittingGate,
+    declared_cells,
+    explored_vs_declared,
+    proposal_verdict,
+    run_study,
+)
 from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT, TAKER_FEE_PCT
 from keel.types import Candle, Granularity
 
@@ -124,6 +131,7 @@ class CellRow(TypedDict):
     fee_pct: str
     slippage_pct: str
     n_trials: int
+    declared_cells: int
     seed: int
     best_params: dict[str, object]
     best_train_expectancy: str
@@ -163,6 +171,24 @@ def load_candles(db_path: str, product_id: str) -> list[Candle]:
     ]
 
 
+def _explored_box(family: str, trials: list[TrialRow]) -> dict[str, tuple[float, float]]:
+    """The (min, max) box the study's own trials actually drew in, per DECLARED dimension
+    (#528): the sampler's observed range, in the declaration's own names -- pullback's
+    packed `ema_periods` unpacked into its three searched slots. Caller-fixed params
+    (`granularity`) are filtered out by intersecting the declaration's names."""
+    values: dict[str, list[float]] = {name: [] for name in SEARCH_SPACES[family]}
+    for trial in trials:
+        params = trial["params"]
+        slots = (
+            dict(zip(("ema_fast", "ema_mid", "ema_slow"), params["ema_periods"], strict=True))
+            if family == "pullback_continuation"
+            else params
+        )
+        for name in values:
+            values[name].append(float(slots[name]))
+    return {name: (min(seen), max(seen)) for name, seen in values.items()}
+
+
 def _one(job: tuple[str, str, str, int, int]) -> CellRow:
     """One (db, family, product, window, n_trials) cell: run_study, gate, JSONL row.
 
@@ -171,6 +197,12 @@ def _one(job: tuple[str, str, str, int, int]) -> CellRow:
     `main()` would not arrive. One study per cell; the study's own trials are sequential
     (TPE needs each trial's result to suggest the next), so the pool's parallelism is ACROSS
     cells.
+
+    #528: the row records the DECLARED size of the space it sampled, and the explored box
+    is checked against that declaration before the row is written — the sampler draws inside
+    `SEARCH_SPACES` by construction (now itself derived from the rules' declarations), so
+    the check passing is the point: it is the assertion that makes an out-of-declaration
+    sweep impossible to record silently rather than a fact this driver promises.
     """
     db_path, family, product_id, window, n_trials = job
     candles = load_candles(db_path, product_id)[-window:]
@@ -184,6 +216,17 @@ def _one(job: tuple[str, str, str, int, int]) -> CellRow:
         slippage_pct=SLIPPAGE_FLOOR_PCT,
         fixed_params=FIXED_PARAMS[family],
     )
+    trials: list[TrialRow] = [
+        {
+            "number": t.number,
+            "params": t.params,
+            "train_expectancy": str(t.train_expectancy),
+            "n_trades": t.n_trades,
+        }
+        for t in report.trials
+    ]
+    # Refuses (ValueError) if any trial drew outside the rule's declared space.
+    explored_vs_declared(_explored_box(family, trials), family)
     return {
         "family": report.family,
         "product": report.product_id,
@@ -191,6 +234,7 @@ def _one(job: tuple[str, str, str, int, int]) -> CellRow:
         "fee_pct": str(report.fee_pct),
         "slippage_pct": str(report.slippage_pct),
         "n_trials": len(report.trials),
+        "declared_cells": declared_cells(family),
         "seed": report.seed,
         "best_params": report.best_params,
         "best_train_expectancy": str(report.best_train_expectancy),
@@ -208,24 +252,19 @@ def _one(job: tuple[str, str, str, int, int]) -> CellRow:
         "held_out_per_trade_pnl": [
             str(t.pnl) for t in report.held_out_result.trades if t.outcome != "open"
         ],
-        "trials": [
-            {
-                "number": t.number,
-                "params": t.params,
-                "train_expectancy": str(t.train_expectancy),
-                "n_trades": t.n_trades,
-            }
-            for t in report.trials
-        ],
+        "trials": trials,
     }
 
 
 def _render_cell(row: CellRow) -> list[str]:
     """Report lines for one cell: the winner, the degradation, the gate, the verdict."""
+    share = row["n_trials"] / row["declared_cells"] * 100 if row["declared_cells"] else 0.0
     return [
         f"{row['family']} @ {row['product']} "
         f"({row['bars']} bars, {row['n_trials']} trials, seed {row['seed']}, "
         f"fee {row['fee_pct']}/leg, slippage {row['slippage_pct']}/leg):",
+        f"  {row['n_trials']} trials of a declared space of {row['declared_cells']} cells "
+        f"({share:.1f}%) -- the budget the multiple-comparison correction must assume",
         f"  best params {row['best_params']}",
         f"  train expectancy {row['best_train_expectancy']} -> held-out "
         f"{row['held_out_expectancy']} over {row['held_out_n_trades']} closed trades",
@@ -346,6 +385,7 @@ def main() -> None:
             summary={
                 "bars": winner["bars"],
                 "n_trials": winner["n_trials"],
+                "declared_cells": winner["declared_cells"],
                 "seed": winner["seed"],
                 "fee_pct": Decimal(winner["fee_pct"]),
                 "slippage_pct": Decimal(winner["slippage_pct"]),
