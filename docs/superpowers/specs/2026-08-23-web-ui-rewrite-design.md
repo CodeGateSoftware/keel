@@ -1,6 +1,7 @@
 # Technical Specification: keel's web UI
 
-**Date:** 2026-08-23 · **Status:** specification for the target state
+**Date:** 2026-08-23 · **Status:** shipped. Every step of §"Build order" landed (#533–#541, v0.12.0);
+kept unrewritten as the design record.
 
 This document describes the browser interface keel serves from the operator's own machine: what the
 server does, what the client does, and why each decision was made the way it was. It follows the
@@ -8,10 +9,23 @@ shape of [youperiod.app's SPECS.md](https://github.com/getify/youperiod.app/blob
 the decision rules of
 [its technical philosophy](https://github.com/getify/youperiod.app/discussions/36).
 
-**It describes a target, not the present.** Today `keel serve` renders HTML in Python
-(`keel/web/render.py`, 872 lines) and ships no JavaScript. What follows replaces that layer. Where a
-thing already exists it is marked as such, because the existing security model in particular must be
-preserved rather than rebuilt.
+**It described a target, not the present — and the target is now the present.** When this was
+written `keel serve` rendered HTML in Python (`keel/web/render.py`, 872 lines) and shipped no
+JavaScript. What follows replaced that layer, in the order §"Build order" gives: #533 the
+serialisation contract, #534 the JSON API, #535 static serving and headers, #536 the client shell,
+#537 the remaining views, #538 the PWA, #539 the documentation links, #540 the deletion of
+`render.py` and the HTML routes, #541 the deletion of the curses TUI.
+
+The present tense below is the tense it was written in, and it is left standing: this is a record of
+why the decisions were made, not a manual for the code as it stands. **Three consequences for a
+reader arriving now.** The file it cites most, `keel/web/render.py`, no longer exists — it was
+deleted at #540, which is what this document asked for, so a line-number citation to it is a
+citation to the state being argued against, and is marked as such where it occurs. Likewise
+`keel/commands/tui.py` (#541) and `keel/commands/help_console.py`. The palette lives in
+`keel/web/static/css/keel.css` and the client in `keel/web/static/js/`. And the two contrast
+failures §"Accessibility" measures were fixed at #532 rather than merely noted; the fix is pinned by
+`tests/web/test_palette_contrast.py`, so the measurement below is the reason a test exists, not an
+outstanding defect.
 
 ---
 
@@ -292,7 +306,8 @@ with no dependencies; every foreground/background pair asserts its minimum ratio
 regression fails the build. This is §2 of the philosophy applied to design: no tooling, no
 dependency, just the arithmetic in a readable test.
 
-Measured against the palette in use today (`render.py:41-49`), text contrast is already good — every
+Measured against the palette in use when this was written (`render.py:41-49` — the file deleted at
+#540; the tokens now live in `keel/web/static/css/keel.css`), text contrast is already good — every
 foreground passes AA on both surfaces in both themes, and most pass AAA (`fg` on `bg` is 16.50:1
 light, 15.06:1 dark). Two failures must be fixed in the rewrite:
 
@@ -313,6 +328,12 @@ with a `--line` border at **1.27:1**, so the border is the only thing marking th
 WCAG 1.4.11 *Non-text Contrast* (3:1 for component boundaries). Decorative dividers at 1.27:1 are
 exempt and stay; form controls are not, and this lands squarely on the first-run wizard, which is
 almost entirely forms.
+
+*Both failures were fixed at #532 and are now asserted rather than argued.*
+`tests/web/test_palette_contrast.py` measures every foreground/background pair with the twenty lines
+of WCAG arithmetic described above, and #597 extended it to hold the pinned-dark token block equal to
+the `prefers-color-scheme` block and to refuse any hex literal declared outside those blocks — so the
+palette cannot regress past a token that was never measured.
 
 ---
 
@@ -340,16 +361,17 @@ declares itself "the only writer of `src/content/engine-docs/`", exiting non-zer
 document disappears. Deleting `docs/` from keel would fail the website build, loudly, by design.
 
 What changes is that the **application code** stops carrying documentation prose — which also fixes a
-bug already in every release. As `keel/commands/help_console.py:138-146` notes in its own docstring,
+bug already in every release. As `keel/commands/help_console.py:138-146` noted in its own docstring,
 "an installed deployment has no docs/ checkout, and the help screen renders that notice as its empty
-state."
+state." *(That file went with the TUI at #541; the outbound links it argued for ship in
+`keel/web/static/js/docs.js`.)*
 
 **The reason is structural, and stronger than a packaging oversight.** `uv_build` packages the module
 root — `keel/` — and everything under it: 140 entries, the `.py` files plus
 `keel/templates/*.yaml`. `docs/` lives at the *repository* root, outside that tree, so no wheel can
 carry it.
 
-`pyproject.toml`'s `artifacts = ["keel/templates/*.yaml"]` is **inert on the pinned backend**
+`pyproject.toml`'s `artifacts` key is **inert on the pinned backend**
 (`uv_build>=0.10.4,<0.13.0`), which was measured rather than assumed: building with that list and
 building with `artifacts = []` produce wheels whose contents are identical, both including the two
 YAML templates. The adjacent source comment — "the wheel otherwise contains only .py files" — is
@@ -375,6 +397,8 @@ sitemap; a query parameter and a banner cost one small change and no new routes.
 ---
 
 ## What this deletes
+
+*All three were carried out — the first two at #540, the third at #541.*
 
 | deleted | lines | why |
 |---|---|---|
@@ -436,7 +460,15 @@ user.
 
 ## Open questions
 
+*Answered by what shipped; left in place because the answers are part of the record.*
+
 1. Do the manifest, icons and service worker ship in the wheel as well, or only in the desktop
-   bundle? The static assets themselves ship in both.
+   bundle? The static assets themselves ship in both. — **Both.**
+   `tests/test_packaging.py::test_static_assets_survive_being_built_into_a_wheel` builds a wheel and
+   asserts every file under `keel/web/static/` is inside it — the manifest, the icons and `sw.js`
+   included — so the installable app is installable from PyPI too. It checks the built artefact
+   rather than `pyproject.toml`'s `artifacts` key for the reason § Documentation gives: that key is
+   inert on the pinned backend.
 2. Will keeltrading.com take the `?v=` banner, and does it want to pin to the latest tag rather than
-   `main`?
+   `main`? — **Still open**, and it is work in the other repository. keel emits `?v=` from
+   `/api/config` regardless; an unread query parameter costs the reader nothing.
