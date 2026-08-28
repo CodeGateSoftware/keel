@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -202,13 +203,33 @@ def test_the_no_python_failure_names_remedies(script: str) -> None:
 
 
 def test_no_development_tree_floor_remains_in_code(code: list[str]) -> None:
-    """The dev tree's floor (3.14 when #557 was filed) must not survive anywhere the
-    script ENFORCES or states it -- comments may cite the history, only code can apply
-    the wrong floor (the same split the absence tests above make)."""
-    offenders = [line for line in code if "3.14" in line]
+    """The dev tree's floor must not survive anywhere the script ENFORCES or states it,
+    outside the one sanctioned constant -- comments may cite the history, only code can
+    apply the wrong floor (the same split the absence tests above make).
+
+    `FALLBACK_FLOOR` is the one line allowed to hold this number: it names the SHIPPED
+    floor, kept in sync by hand with the last release (#557), and it can legitimately
+    equal the dev tree's floor when the two happen to agree -- as they do right now,
+    since v0.12.0 already shipped #546's raised floor (#595). Anywhere else, this number
+    hardcoded into enforcement logic means the fetch-from-the-release mechanism was
+    bypassed.
+
+    The forbidden value is parsed fresh from the root `pyproject.toml`, never hardcoded,
+    so this test keeps working the day `requires-python` moves again."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    match = re.match(r">=\s*(\d+\.\d+)", pyproject["project"]["requires-python"])
+    assert match, "could not parse the dev tree's floor out of requires-python"
+    dev_floor = match.group(1)
+
+    offenders = [
+        line
+        for line in code
+        if dev_floor in line and not line.strip().startswith("FALLBACK_FLOOR=")
+    ]
     assert not offenders, (
-        f"the dev-tree 3.14 floor is hardcoded in installer code: {offenders} -- the floor "
-        "must be derived from the release being installed (#557)"
+        f"the dev-tree {dev_floor} floor is hardcoded in installer code outside "
+        f"FALLBACK_FLOOR: {offenders} -- the floor must be derived from the release "
+        "being installed (#557)"
     )
 
 
@@ -316,19 +337,21 @@ def test_the_published_one_liner_is_qualified_for_linux(script: str) -> None:
     """README.md publishes the one-liner and docs/desktop-install.md mirrors it, both
     without qualification; on Linux the script stops at its Python step unless a
     supported interpreter is already on PATH (#557). Both places must say so and state
-    the CURRENT SHIPPED floor (3.11) -- not the development tree's floor, which is what
-    broke the Linux leg in the first place. The DMG's first-mount note (written by
-    packaging/macos_app.sh, above the pip-install-the-wheels escape hatch) tells the same
-    truth. Checked against whitespace-normalized text: the qualifier must survive the
-    repo's line wrapping, not sit on one lucky line. The README's stated floor is then
-    checked against the script's FALLBACK_FLOOR constant, so the two numbers that are
-    maintained by hand cannot drift apart silently."""
+    the CURRENT SHIPPED floor (3.14) -- not the development tree's floor, which is what
+    broke the Linux leg in the first place (the two happen to be the same number right
+    now -- see tests/test_python_floor.py -- but this pin checks the four hand-maintained
+    copies against EACH OTHER, not against that coincidence). The DMG's first-mount note
+    (written by packaging/macos_app.sh, above the pip-install-the-wheels escape hatch)
+    tells the same truth. Checked against whitespace-normalized text: the qualifier must
+    survive the repo's line wrapping, not sit on one lucky line. The README's stated
+    floor is then checked against the script's FALLBACK_FLOOR constant, so the two
+    numbers that are maintained by hand cannot drift apart silently."""
     readme = " ".join((_ROOT / "README.md").read_text(encoding="utf-8").split())
-    assert "On Linux" in readme and "wheels declare" in readme and "3.11" in readme, (
+    assert "On Linux" in readme and "wheels declare" in readme and "3.14" in readme, (
         "README.md does not qualify the installer one-liner for Linux with the shipped floor"
     )
     desktop = " ".join((_ROOT / "docs" / "desktop-install.md").read_text(encoding="utf-8").split())
-    assert "wheels declare" in desktop and "3.11" in desktop, (
+    assert "wheels declare" in desktop and "3.14" in desktop, (
         "docs/desktop-install.md does not state the shipped floor beside the one-liner"
     )
     assert "Python 3.14 or later" not in desktop, (
@@ -336,7 +359,7 @@ def test_the_published_one_liner_is_qualified_for_linux(script: str) -> None:
         "requirement -- exactly the confusion #557 is about"
     )
     dmg = " ".join((_ROOT / "packaging" / "macos_app.sh").read_text(encoding="utf-8").split())
-    assert "wheels declare" in dmg and "3.11" in dmg, (
+    assert "wheels declare" in dmg and "3.14" in dmg, (
         "packaging/macos_app.sh's DMG note does not state the shipped floor beside the "
         "pip-install-the-wheels alternative"
     )

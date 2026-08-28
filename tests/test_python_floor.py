@@ -183,3 +183,65 @@ def test_mypy_checks_against_the_floor_it_promises():
         f"(minor {floor_minor!r}); mypy must check what the floor promises -- set "
         "[tool.mypy].python_version in the root pyproject.toml to match requires-python"
     )
+
+
+def test_the_wheels_floor_stated_in_release_facing_docs_matches_requires_python():
+    """The floor a READER sees before running the wheels one-liner must be the floor pip
+    will actually enforce (#595).
+
+    `tests/test_install_script.py::test_the_published_one_liner_is_qualified_for_linux`
+    already cross-checks README.md, docs/desktop-install.md, packaging/macos_app.sh and
+    scripts/install.sh's `FALLBACK_FLOOR` against EACH OTHER -- so all four move together.
+    None of those four is `pyproject.toml`, which is the one none of them derive from
+    automatically. #546 raised `requires-python` to 3.14 and that release shipped
+    (v0.12.0), but `docs/desktop-install.md` and the v0.12.0 release notes' Desktop
+    section still said "3.11": every doc agreed with every other doc, and all of them
+    were wrong, because nothing checked them against the metadata pip actually reads.
+    Anyone on 3.11-3.13 who read "you qualify" and ran the installer got refused by pip
+    mid-install.
+
+    The floor is parsed fresh from the root `pyproject.toml` here -- not imported from
+    this module's `_FLOOR` constant -- so a mistake in `_FLOOR` itself cannot mask a real
+    drift between the metadata and the docs.
+
+    This module's docstring records why the wheels' floor and the dev tree's floor are
+    allowed, BY DESIGN, to differ across a release boundary (`scripts/install.sh` reads
+    the floor of the release it is installing, not of `main`). They are not different
+    right now: the release that carries #546's raised floor has already shipped. When
+    they next genuinely diverge -- `requires-python` raised again ahead of a release --
+    this test will fail and require a deliberate call: either the docs are still correct
+    (they describe the last SHIPPED floor, not `main`'s) and this test's scope needs
+    revisiting, or they are stale and need the same fix #595 needed. Either way the
+    disagreement gets a decision instead of sitting published.
+    """
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    requires = pyproject["project"]["requires-python"]
+    parsed = re.match(r">=\s*(\d+)\.(\d+)", requires)
+    assert parsed, f"could not parse a floor out of requires-python {requires!r}"
+    floor = f"{parsed.group(1)}.{parsed.group(2)}"
+
+    wheels_pattern = re.compile(r"wheels declare `?>=\s*(\d+\.\d+)")
+    for relpath in ("README.md", "docs/desktop-install.md", "packaging/macos_app.sh"):
+        text = " ".join((_ROOT / relpath).read_text(encoding="utf-8").split())
+        found = wheels_pattern.search(text)
+        assert found, f"{relpath} no longer states the wheels floor beside 'wheels declare'"
+        assert found.group(1) == floor, (
+            f"{relpath} states the wheels floor as {found.group(1)!r}, but pyproject.toml's "
+            f"requires-python is {requires!r} (floor {floor!r}) -- this is the exact drift "
+            "#595 was filed over"
+        )
+
+    install_sh = (_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    fallback = re.search(r'FALLBACK_FLOOR="(\d+\.\d+)"', install_sh)
+    assert fallback, "scripts/install.sh's FALLBACK_FLOOR constant is gone"
+    assert fallback.group(1) == floor, (
+        f"scripts/install.sh's FALLBACK_FLOOR is {fallback.group(1)!r}, but pyproject.toml's "
+        f"requires-python is {requires!r} (floor {floor!r})"
+    )
+
+    release_yml = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert f"Python {floor}+." in release_yml, (
+        f"the Desktop section of the NEXT release's notes (.github/workflows/release.yml) "
+        f"does not state the floor as {floor!r} -- it will publish a stale floor the moment "
+        "the next release runs, exactly as the v0.12.0 notes did (#595)"
+    )

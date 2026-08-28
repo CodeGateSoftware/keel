@@ -60,7 +60,7 @@ No terminal? The macOS/Windows app is on the [releases page](https://github.com/
 person, no cloning? The installer does this from the published wheels instead:
 `curl -fsSL https://raw.githubusercontent.com/CodeGateSoftware/keel/main/scripts/install.sh | bash`.
 On Linux it needs a supported Python on your PATH first — the current release's wheels
-declare `>= 3.11` — and the script names the remedies (deadsnakes, pyenv, uv) if it finds
+declare `>= 3.14` — and the script names the remedies (deadsnakes, pyenv, uv) if it finds
 none.
 
 Everything here is read-only and paper-side: no funds, and nothing in this path can place an

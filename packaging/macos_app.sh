@@ -122,7 +122,7 @@ PREFER NO WARNING AT ALL?
 
 Install from the release wheels instead. Nothing is downloaded as an application, so
 nothing objects -- but it needs a terminal and a supported Python on your PATH (the
-current release's wheels declare >= 3.11):
+current release's wheels declare >= 3.14):
 
   pip install --find-links . ./keel_trader-<version>-py3-none-any.whl
 
