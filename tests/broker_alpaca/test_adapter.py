@@ -257,9 +257,11 @@ class TestCashPosture:
     venue's DEFAULT for any account with $2,000 or more equity, which a $100k paper account
     always is), `4` a 4x-intraday day-trading account. The posture check reads that one
     field and refuses everything that is not the cash posture -- no margin borrowing
-    (riba), which also keeps the account outside the PDT rule's $25,000 margin-account
-    threshold. Everything the venue cannot or will not tell us fails closed: an unreadable
-    posture is not a cash posture (rails 12/13's rule -- silence is not consent).
+    (riba), which is the posture's whole claim: it sidesteps NOTHING on PDT (per Alpaca
+    staff even at multiplier 1 the account remains a margin account to which pattern day
+    trading rules apply), so keel's PDT safety is the CADENCE, not the posture. Everything
+    the venue cannot or will not tell us fails closed: an unreadable posture is not a cash
+    posture (rails 12/13's rule -- silence is not consent).
     """
 
     def test_a_multiplier_of_one_is_the_cash_posture_and_passes(self) -> None:
@@ -277,7 +279,11 @@ class TestCashPosture:
         message = str(excinfo.value)
         assert "multiplier=2" in message, "the refusal names the observed classification"
         assert "riba" in message, "the refusal names WHY margin is refused"
-        assert "PDT" in message or "$25,000" in message, "and the PDT adjacency it sidesteps"
+        # The PDT adjacency is stated HONESTLY: the posture claims no exemption, and the
+        # safety is attributed to the cadence -- never "the posture keeps you outside PDT".
+        assert "PDT" in message or "$25,000" in message, "and the PDT adjacency"
+        assert "sidesteps NOTHING" in message, "the posture claims no PDT exemption"
+        assert "CADENCE" in message, "keel's PDT safety is attributed to the cadence"
         assert "multiplier to 1" in message, "and the operator's next action"
 
     def test_the_pdt_daytrading_classification_is_refused_too(self) -> None:
@@ -332,8 +338,9 @@ class TestCashPosture:
 
     def test_a_transport_failure_is_a_refusal_not_a_silent_pass(self) -> None:
         """A venue outage mid-verification is not a cash posture either -- and the cause
-        rides along (`raise ... from`), so the operator sees WHY it could not be read
-        rather than a bare refusal over a swallowed network error."""
+        rides INSIDE the message (not only chained): `keel assets holdings` renders these
+        refusals through `ClickException(f"...{exc}")`, which never walks `__cause__`, so
+        a chained-only cause would read as a bare refusal on every CLI surface."""
 
         class _Exploding(FakeTransport):
             def get_account(self) -> Any:
@@ -343,12 +350,52 @@ class TestCashPosture:
         with pytest.raises(CashAccountRequired, match="could not") as excinfo:
             AlpacaAdapter(_Exploding()).verify_cash_account()
         assert isinstance(excinfo.value.__cause__, AlpacaAPIError)
+        message = str(excinfo.value)
+        assert "AlpacaAPIError" in message, "the cause's type is in the message itself"
+        assert "account endpoint unavailable" in message, "and so is the cause's text"
 
     def test_a_transport_less_adapter_does_not_silently_pass(self) -> None:
         """The no-transport construction (offline `capabilities()`) cannot verify anything,
         and the constructor's own contract error -- not a quiet pass -- is the answer."""
         with pytest.raises(RuntimeError, match="without a transport"):
             AlpacaAdapter().verify_cash_account()
+
+    def test_the_wire_shapes_through_the_real_transport_decode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The composition the FakeTransport rows above only infer: they hand the adapter
+        ALREADY-PARSED dicts, so "an unquoted JSON number and a quoted string are the same
+        classification" is stitched from unit rows rather than observed end to end. This
+        row drives the REAL `AlpacaTransport` -- `_send` into `_request_json`'s
+        `json.loads(..., parse_float=Decimal)` decode -- into `verify_cash_account`, so
+        the production path from wire to refusal is what runs: unquoted `1` and `1.0`
+        (the latter a `Decimal` the moment the parser touches it) both pass, and a
+        quoted `"2"` refuses. That is also the drift guard for the class of Alpaca's
+        July 2026 multiplier incident: a venue-side change to how the account read
+        spells the classification on the wire answers through the real decode, not
+        through hand-parsed dicts that can silently diverge from it."""
+
+        class _FakeResponse:
+            """The slice of `requests.Response` `AlpacaTransport._send` touches (the
+            transport suite's `_FakeResponse`, local so this suite owns its composition
+            row). `json.dumps` keeps numbers UNQUOTED on the wire, as the venue does."""
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                self.status_code = 200
+                self.text = json.dumps(payload)
+                self.headers: dict[str, str] = {}
+
+        def _verify(payload: dict[str, Any]) -> None:
+            import requests
+
+            response = _FakeResponse(payload)
+            monkeypatch.setattr(requests, "request", lambda *args, **kwargs: response)
+            AlpacaAdapter(AlpacaTransport("key-id", "secret")).verify_cash_account()
+
+        _verify({"multiplier": 1})  # unquoted int
+        _verify({"multiplier": 1.0})  # unquoted decimal -> Decimal("1.0") == Decimal("1")
+        with pytest.raises(CashAccountRequired, match="multiplier=2"):
+            _verify({"multiplier": "2"})
 
 
 # ---------------------------------------------------------------------------------------------

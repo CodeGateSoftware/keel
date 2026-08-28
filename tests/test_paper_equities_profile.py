@@ -503,10 +503,11 @@ def test_runbook_notes_what_is_deliberately_not_here():
 
 
 def test_runbook_states_the_cash_no_margin_pdt_posture():
-    """PRD 5/6.4's account posture: cash accounts ONLY (margin borrowing is riba; a cash
-    account also sidesteps the PDT rule's $25k margin-account threshold), the PDT rule
-    explained (what it is; why a cash account on keel's daily cadence is not that pattern),
-    the T+1 interplay CROSS-REFERENCED rather than duplicated, and -- since #372 landed --
+    """PRD 5/6.4's account posture: the cash-equivalent posture ONLY (margin borrowing
+    is riba -- the posture's whole claim; it sidesteps nothing on PDT: keel's PDT safety
+    is the cadence, per the Alpaca-staff caveat the section carries), the PDT rule
+    explained (what it is; what actually keeps a keel account clear of it), the T+1
+    interplay CROSS-REFERENCED rather than duplicated, and -- since #372 landed --
     the ENFORCEMENT stated as code, not as scope-fenced future work."""
     text = RUNBOOK.read_text()
     assert "cash account" in text.lower()
@@ -772,8 +773,9 @@ def test_build_broker_selects_alpaca_paper_iex_and_verifies_the_cash_posture(tmp
 
 def test_build_broker_refuses_a_margin_postured_alpaca_account(tmp_path, monkeypatch):
     """#372 / PRD §5 "Cash-account discipline": the seam refuses to hand the engine a
-    MARGIN-postured account, loudly, with the named posture -- no margin borrowing (riba),
-    the PDT $25k margin-account threshold it sidesteps, and the fix (set the account's max
+    MARGIN-postured account, loudly, with the named posture -- no margin borrowing
+    (riba), the honest PDT note (the posture buys no exemption; the cadence is the
+    safety), and the fix (set the account's max
     margin multiplier to 1). Notably this is the venue's own DEFAULT for the $100k paper
     account (equity over $2,000 opens as reg T margin), so the refusal is not theoretical:
     an operator who never touches the setting meets it on the first cycle."""

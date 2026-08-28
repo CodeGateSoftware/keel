@@ -338,6 +338,7 @@ class _BrokerInfo:
     venue: str = "coinbase"
     deployment: str = "spot"
     session_bound: bool = False
+    cash_only: bool = True
     quote_currencies: tuple[str, ...] = ("USD",)
     asset_classes: tuple[str, ...] = ("crypto",)
     supported_orders: tuple[str, ...] = ("market", "limit")

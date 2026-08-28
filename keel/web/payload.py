@@ -1663,6 +1663,11 @@ def _venue_payload(info: Any) -> dict[str, Any]:
         "package_version": info.package_version or "",
         "preview": info.preview,
         "session_bound": flag(info.session_bound, on="session-bound", off="stateless"),
+        # The #372 funding posture, beside the session one: "cash only" is the declaration
+        # every first-party adapter makes, and the off word is the loud one for the day a
+        # row ever carries it -- the venueCard's funding cell mirrors `capability_facts`'s
+        # "MARGIN-CAPABLE" declaration without inheriting its shout.
+        "cash_only": flag(info.cash_only, on="cash only", off="margin-capable"),
         "supports_fee_summary": flag(
             info.supports_fee_summary, on="fee summary", off="no fee summary"
         ),

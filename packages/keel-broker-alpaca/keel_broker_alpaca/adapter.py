@@ -146,11 +146,15 @@ _CASH_MULTIPLIER = Decimal("1")
 
 #: The fail-closed half of the posture check: a classification the venue will not or
 #: cannot report. Wording shared by the no-body and transport-failure branches so the
-#: operator reads one reason, not two phrasings of it.
+#: operator reads one reason, not two phrasings of it. The transport-failure branch
+#: appends the cause INLINE (a `(TypeName: message)` suffix), because the surfaces that
+#: render these refusals -- `keel assets holdings` pretty-prints via
+#: `ClickException(f"...{exc}")` -- print the message and never walk `__cause__`: a
+#: chained-only cause is invisible exactly where an operator reads it.
 _UNREADABLE_POSTURE = (
     "alpaca account posture could not be verified: the account read itself failed -- "
-    "refusing to trade on an unknown posture; silence is not consent to borrow. The "
-    "cause is chained below; check the venue and retry."
+    "refusing to trade on an unknown posture; silence is not consent to borrow. "
+    "Check the venue and retry."
 )
 
 
@@ -247,10 +251,12 @@ class AlpacaAdapter:
         cash designation; multiplier 1 is as cash as it gets: shorts are refused and
         buying power cannot exceed cash) -- `2` a reg T margin account, and `4` a 4x
         day-trading account. One field, one question, and this method refuses every
-        answer that is not the cash posture: margin borrowing is *riba*, and the cash
-        posture is also what keeps the account outside the PDT rule's $25,000
-        margin-account threshold (a consequence, not an enforcement -- documented in the
-        runbook).
+        answer that is not the cash posture: margin borrowing is *riba*, and that is the
+        posture's whole claim -- it SIDESTEPS nothing on PDT (per Alpaca staff, at
+        max_margin_multiplier 1 "the account remains a margin account" and "pattern day
+        trading rules apply"; a true cash account is not on offer). What keeps keel
+        clear of the PDT rule's $25,000 threshold is the CADENCE -- one evaluation per
+        session bar, holds overnight by construction (documented in the runbook).
 
         **Fail-closed on the unreadable, exactly like rails 12/13.** An absent,
         unparseable or unreachable classification raises too -- silence is not consent to
@@ -274,7 +280,13 @@ class AlpacaAdapter:
         try:
             account = transport.get_account()
         except Exception as exc:
-            raise CashAccountRequired(_UNREADABLE_POSTURE) from exc
+            # The cause is folded INTO the message (and chained below): `keel assets
+            # holdings` renders this refusal through `ClickException(f"...{exc}")`, which
+            # never walks `__cause__`, so a chained-only cause would read as a bare
+            # refusal on every CLI surface.
+            raise CashAccountRequired(
+                f"{_UNREADABLE_POSTURE} ({type(exc).__name__}: {exc})"
+            ) from exc
         if account is None:
             raise CashAccountRequired(_UNREADABLE_POSTURE)
 
@@ -291,8 +303,12 @@ class AlpacaAdapter:
             raise CashAccountRequired(
                 f"alpaca venue answered a MARGIN account classification (multiplier="
                 f"{_render(multiplier)}): this adapter trades the cash posture only -- no "
-                "margin borrowing (riba), which also keeps the account outside the PDT "
-                "rule's $25,000 margin-account threshold. Alpaca opens accounts as margin "
+                "margin borrowing (riba), and that is the posture's whole claim: it "
+                "sidesteps NOTHING on PDT (Alpaca offers no true cash accounts; per "
+                "Alpaca staff, at max margin multiplier 1 the account remains a margin "
+                "account to which pattern day trading rules apply). keel's PDT safety "
+                "is the CADENCE (one evaluation per session bar, holds overnight by "
+                "construction), not the posture. Alpaca opens accounts as margin "
                 "by default (any account with $2,000 or more equity, which the $100k "
                 "paper account always is); set the account's max margin multiplier to 1 "
                 "-- the dashboard's trading-configuration setting -- so buying power "

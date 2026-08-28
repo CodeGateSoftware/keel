@@ -58,8 +58,9 @@ class BrokerCapabilities:
     #: `market_clock()` from the venue's own clock, never a locally maintained calendar.
     session_bound: bool
     #: Whether this adapter spends settled cash only and has NO borrowing path (#372, PRD
-    #: §5 "Cash-account discipline": margin borrowing is riba, and the cash posture also
-    #: keeps an account outside the PDT rule's $25,000 margin-account threshold).
+    #: §5 "Cash-account discipline": margin borrowing is riba -- the posture's whole
+    #: claim; it sidesteps nothing on PDT, where keel's safety is the CADENCE -- one
+    #: evaluation per session bar, holds overnight by construction -- not the posture).
     #: Deliberately REQUIRED, not defaulted -- same rule as `session_bound`: the borrowing
     #: question has no default answer, and the likeliest default (silently reading as
     #: compliant) is exactly the posture violation this field exists to name. Every

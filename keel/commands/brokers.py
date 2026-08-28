@@ -224,8 +224,12 @@ NO_KEY_INFERENCE_LINE = (
 
 
 def capability_facts(info: BrokerInfo) -> str:
-    """The row's capability facts as one " · "-joined phrase -- the SHARED wording the CLI
-    prints and the Venues browser wraps, so the two front-ends cannot drift. PURE."""
+    """The row's capability facts as one " · "-joined phrase -- the wording
+    `render_brokers_lines` prints for `keel brokers list`. (The console Venues browser
+    that once wrapped this same phrase is gone -- #541 deleted the console layer -- so
+    "the shared wording two front-ends render" describes nothing today; the phrase stays
+    a single PURE function so the next front-end inherits it rather than re-deriving
+    it.)"""
     hours = "session-bound (opens and closes)" if info.session_bound else "24/7"
     funding = "cash only" if info.cash_only else "MARGIN-CAPABLE"
     facts = [
@@ -246,9 +250,9 @@ def capability_facts(info: BrokerInfo) -> str:
 
 def adapter_error_block(info: BrokerInfo) -> list[str]:
     """The honest block a raising adapter's row renders as: its name and installed
-    version, then the construction error wrapped to the 78-column budget -- the SAME
-    wording both front-ends render (the one-phrase rule `capability_facts` keeps), so a
-    broken adapter reads identically everywhere. PURE, and deliberately states NO
+    version, then the construction error wrapped to the 78-column budget -- spelled
+    once here so a broken adapter reads the same everywhere (the one-phrase discipline
+    `capability_facts` keeps). PURE, and deliberately states NO
     capability fact: an adapter that could not be constructed has declared nothing."""
     return [
         f"{info.name} ({info.package_version or 'unknown version'}) -- unavailable",

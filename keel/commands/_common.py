@@ -178,9 +178,9 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     `verify_cash_account()` read of the venue's own account classification, refusing a
     margin-postured account (and failing closed on an unreadable one) so no engine path
     ever sees a broker on a venue posture keel does not trade -- cash only, no margin
-    borrowing (riba), which also keeps the account outside the PDT rule's $25k
-    margin-account threshold. The refusal names the posture and the fix; the runbook's
-    "Account posture" section is the operator-facing half.
+    borrowing (riba), which is the posture's whole claim: it sidesteps nothing on PDT
+    (keel's PDT safety is the cadence, not the posture). The refusal names the posture
+    and the fix; the runbook's "Account posture" section is the operator-facing half.
 
     `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no
     timeout), matching every existing caller (the agent/executor broker path) exactly.

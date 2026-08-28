@@ -13,9 +13,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from dataclasses import replace as dataclasses_replace
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
@@ -141,6 +143,25 @@ def test_every_first_party_adapter_declares_the_cash_only_posture() -> None:
     and this test is what makes its appearance a DECISION rather than a drift."""
     for info in brokers.list_installed_brokers():
         assert info.cash_only is True, info.name
+
+
+@pytest.mark.parametrize(
+    ("cash_only", "funding_word"),
+    [(True, "cash only"), (False, "MARGIN-CAPABLE")],
+    ids=["cash-only-row", "margin-capable-row"],
+)
+def test_capability_facts_names_the_funding_posture_loudly_in_both_directions(
+    cash_only: bool, funding_word: str
+) -> None:
+    """The `cash_only=False` branch of `capability_facts` is dead in practice -- every
+    installed adapter declares True (the uniformity test above) -- which is exactly the
+    state in which a wording regression ships unnoticed. The PR's own rationale calls
+    that branch the LOUD declaration: an adapter announcing a borrowing path must read
+    as "MARGIN-CAPABLE", never as a quieter synonym that a skimming operator misses.
+    Pinned on a synthesized row (a `replace` of a real one) because no installed adapter
+    carries `False`, and that is the point."""
+    row = dataclasses_replace(_infos()["coinbase"], cash_only=cash_only)
+    assert funding_word in brokers.capability_facts(row).split(" · ")
 
 
 def test_the_classification_constant_names_exactly_the_wired_venues() -> None:

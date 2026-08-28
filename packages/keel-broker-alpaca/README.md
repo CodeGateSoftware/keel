@@ -22,10 +22,11 @@ classification (`1` cash-equivalent — buying power equals cash, shorts refused
 margin; `4` PDT day-trading margin), and the venue's *default* for any account over
 $2,000 of equity — a $100k paper account included — is margin. Every broker build calls
 `AlpacaAdapter.verify_cash_account()`: multiplier 1 passes, anything else raises
-`CashAccountRequired` (margin borrowing is riba; the refusal names the PDT $25k
-margin-account threshold the posture sidesteps and the fix — set the account's max margin
-multiplier to 1), and a classification that cannot be read at all raises the same
-fail-closed refusal, cause chained. The declared half is
+`CashAccountRequired` (margin borrowing is riba — the posture's whole claim: it sidesteps
+nothing on PDT, where the cadence, not the posture, is the safety; the refusal says so and
+names the fix — set the account's max margin multiplier to 1), and a classification that
+cannot be read at all raises the same
+fail-closed refusal, cause chained and folded into the message. The declared half is
 `BrokerCapabilities.cash_only=True`, rendered as "cash only" in `keel brokers list`. The
 operator-facing walk (including the T+1 settlement and opt-out obligations) is the
 runbook's "Account posture" and "T+1 settlement" sections.
