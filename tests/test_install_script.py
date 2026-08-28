@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import re
 import stat
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -40,9 +39,7 @@ def code(script: str) -> list[str]:
     lines, the same split `tests/test_desktop_packaging.py` makes for the macOS packer.
     """
     return [
-        line
-        for line in script.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+        line for line in script.splitlines() if line.strip() and not line.lstrip().startswith("#")
     ]
 
 
@@ -105,31 +102,94 @@ def test_no_credentials_or_auth(script: str) -> None:
         assert secret not in script, f"{secret} appears in the installer"
 
 
-# -- Python: the floor is checked, and stated when it fails ----------------------------------------
+# -- Python: the floor is the RELEASE's, derived at install time (#557) ----------------------------
 
 
-def test_the_python_floor_is_checked_and_stated(script: str) -> None:
-    """The interpreter's own `version_info` must be compared against the floor every
-    distribution declares, and the failure must NAME it -- a bare 'wrong python' sends the
-    user nowhere.
-
-    The floor is DERIVED from `requires-python` rather than written here, because this is the
-    one place it is stated in shell rather than in metadata, and shell is not resolved by pip.
-    Hardcoded, a raised floor leaves the installer building a venv keel then refuses to run in,
-    and the mismatch surfaces as an import error after a successful-looking install.
+def test_the_floor_comes_from_the_release_being_installed(script: str) -> None:
+    """The installer must enforce the `requires-python` of the RELEASE it installs, not the
+    development tree's floor (#557): main required 3.14 while the wheels being downloaded
+    declared >= 3.11, so the script refused -- at its own step 2 -- the very Pythons the
+    wheels support, and every Linux leg of install-smoke went red. The floor is fetched
+    from the resolved tag's own pyproject.toml, parsed out of its `requires-python`, and
+    the interpreter check compares against THAT derived floor, never a hardcoded minor.
     """
-    root = tomllib.loads((_ROOT / "pyproject.toml").read_text())
-    requires = root["project"]["requires-python"]
-    assert requires.startswith(">="), requires
-    floor = requires[2:].strip()
-    major, minor = (int(part) for part in floor.split("."))
-
-    assert re.search(rf"sys\.version_info >= \({major}, ?{minor}\)", script), (
-        f"the >= {floor} check via sys.version_info is gone or has drifted from "
-        f"requires-python ({requires!r}) -- the installer would build a venv keel refuses "
-        "to run in"
+    assert "https://raw.githubusercontent.com/${REPO}/${TAG}/pyproject.toml" in script, (
+        "the installer no longer fetches the installed release's pyproject.toml -- the "
+        "floor would silently become a hardcoded one again"
     )
-    assert floor in script, "the failure message must state the floor"
+    assert "requires-python" in script, "the requires-python parse is gone from the installer"
+    assert "sys.version_info >= (${FLOOR_MAJOR}, ${FLOOR_MINOR})" in script, (
+        "the version check no longer compares against the derived floor -- a literal minor "
+        "here is how #557 happened"
+    )
+
+
+def test_the_floor_fetch_precedes_the_python_search(script: str) -> None:
+    """The floor depends on the release tag, so the tag must be resolved and its floor
+    read BEFORE any Python candidate is tried -- a refactor that swaps the order back
+    cannot know the floor it is checking against."""
+    assert script.index("${TAG}/pyproject.toml") < script.index("for candidate in"), (
+        "the release's floor is fetched after the Python search already ran -- the "
+        "chicken-and-egg #557 fixed is back"
+    )
+
+
+def test_a_failed_floor_fetch_falls_back_to_a_commented_constant(script: str) -> None:
+    """If the pyproject fetch or the parse fails, the script must fall back to a
+    conservative constant whose comment NAMES what it stands for and where it must be
+    updated -- a bare constant would rot the first time a release raises its floor."""
+    match = re.search(r'^FALLBACK_FLOOR="(\d+\.\d+)"', script, re.MULTILINE)
+    assert match, "the FALLBACK_FLOOR constant is gone from scripts/install.sh"
+    above = script[: match.start()].splitlines()[-4:]
+    assert any(line.lstrip().startswith("#") and "shipped" in line.lower() for line in above), (
+        "the fallback constant's comment no longer names the shipped-wheel floor it stands "
+        "for and where it must be updated"
+    )
+
+
+def test_the_enforced_floor_and_its_source_are_printed(script: str) -> None:
+    """Auditable: the run must say WHICH floor it enforces and WHERE it came from, so an
+    operator (or a red CI leg) can see the release the number was read from."""
+    assert ">= ${FLOOR}" in script, "the enforced floor is not stated"
+    assert "${FLOOR_SOURCE}" in script, "the floor's source is not stated beside it"
+    assert "fallback" in script, "a fallback happens but is never named"
+
+
+def test_the_candidate_names_are_built_from_the_floor(script: str) -> None:
+    """`python3 python3.14` was a fixed pair tied to the old fixed floor; the candidate
+    names must be BUILT from the derived floor (a 3.11 floor tries 3.14 down to 3.11, so a
+    pyenv or deadsnakes Python without a `python3` shim is still found) -- a moved floor
+    must move the search with it."""
+    assert "for candidate in python3 python3.14" not in script, (
+        "the pre-#557 fixed candidate pair is back"
+    )
+    assert 'CANDIDATES+=("python${FLOOR_MAJOR}.${minor}")' in script, (
+        "candidate names are no longer constructed from the floor's minor versions"
+    )
+
+
+def test_the_no_python_failure_names_remedies(script: str) -> None:
+    """'install a newer Python' sends a Linux user nowhere (#557): the failure must name
+    the three real roads -- the deadsnakes PPA on Ubuntu, pyenv, and uv's own interpreter
+    installer."""
+    die_at = script.find('[ -n "$PY" ] || die')
+    assert die_at != -1, "the no-Python failure path is gone"
+    window = script[die_at : die_at + 900]
+    for remedy in ("deadsnakes", "pyenv install", "uv python install"):
+        assert remedy in window, (
+            f"the no-Python failure message does not name the {remedy!r} remedy"
+        )
+
+
+def test_no_development_tree_floor_remains_in_code(code: list[str]) -> None:
+    """The dev tree's floor (3.14 when #557 was filed) must not survive anywhere the
+    script ENFORCES or states it -- comments may cite the history, only code can apply
+    the wrong floor (the same split the absence tests above make)."""
+    offenders = [line for line in code if "3.14" in line]
+    assert not offenders, (
+        f"the dev-tree 3.14 floor is hardcoded in installer code: {offenders} -- the floor "
+        "must be derived from the release being installed (#557)"
+    )
 
 
 # -- the wheels: exactly the five, never by name from an index -----------------------------------
@@ -196,6 +256,31 @@ def test_an_existing_database_is_never_touched(script: str) -> None:
     directory is acknowledged and left alone."""
     assert "keel*.db" in script
     assert "not touched" in script
+
+
+# -- the published one-liner, qualified where it is advertised (#557) -----------------------------
+
+
+def test_the_published_one_liner_is_qualified_for_linux() -> None:
+    """README.md publishes the one-liner and docs/desktop-install.md mirrors it, both
+    without qualification; on Linux the script stops at its Python step unless a
+    supported interpreter is already on PATH (#557). Both places must say so and state
+    the CURRENT SHIPPED floor (3.11) -- not the development tree's floor, which is what
+    broke the Linux leg in the first place. Checked against whitespace-normalized text:
+    the qualifier must survive the repo's line wrapping, not sit on one lucky line.
+    """
+    readme = " ".join((_ROOT / "README.md").read_text(encoding="utf-8").split())
+    assert "On Linux" in readme and "wheels declare" in readme and "3.11" in readme, (
+        "README.md does not qualify the installer one-liner for Linux with the shipped floor"
+    )
+    desktop = " ".join((_ROOT / "docs" / "desktop-install.md").read_text(encoding="utf-8").split())
+    assert "wheels declare" in desktop and "3.11" in desktop, (
+        "docs/desktop-install.md does not state the shipped floor beside the one-liner"
+    )
+    assert "Python 3.14 or later" not in desktop, (
+        "docs/desktop-install.md still publishes the DEV tree's floor as the installer's "
+        "requirement -- exactly the confusion #557 is about"
+    )
 
 
 def test_destructive_cleanup_targets_only_the_temp_dir(code: list[str]) -> None:

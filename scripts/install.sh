@@ -60,42 +60,100 @@ case "$(uname -s)" in
 esac
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH"
 
-# -- step 2/7: Python, with the floor stated ------------------------------------------------------
-
-# keel requires Python 3.14+ (tests/test_python_floor.py); the check is the interpreter's
-# own version_info, not a parsed string, and the failure names the floor and what to do.
+# -- step 2/7: the latest release ------------------------------------------------------------------
 #
-# The candidate list keeps `python3` first and then names 3.14 explicitly: on a machine where
-# `python3` is an older system Python, the loop must still find a newer one installed alongside
-# it rather than stopping at the first interpreter it can execute. Versions below the floor are
-# no longer listed -- naming them would only produce a candidate the check must then reject.
-say "step 2/7: finding Python >= 3.14"
-PY=""
-for candidate in python3 python3.14; do
-  command -v "$candidate" >/dev/null 2>&1 || continue
-  if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/dev/null; then
-    PY="$(command -v "$candidate")"
-    break
-  fi
-done
-[ -n "$PY" ] || die "no Python >= 3.14 found on PATH -- keel requires 3.14 or later. Check
-                     'python3 --version', install a newer Python, and re-run this script."
-say "  ok: ${PY} ($("$PY" -c 'import platform; print(platform.python_version())'))"
-
-# -- step 3/7: the latest release ----------------------------------------------------------------
-
-say "step 3/7: resolving the latest release from the GitHub API"
+# This step runs BEFORE the Python search, and the order is the point (#557): the Python
+# floor the installer enforces is the floor of the RELEASE BEING INSTALLED, read from that
+# release's own pyproject.toml in the next step -- so the tag has to be known first. The
+# tag is extracted with sed, not Python: no interpreter has been found yet, and macOS
+# ships no jq either. `tag_name` is a single quoted scalar in the payload; the full
+# manifest parse runs in step 4, once a Python is in hand.
+say "step 2/7: resolving the latest release from the GitHub API"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/keel-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 RELEASE_JSON="${TMP_DIR}/release.json"
 printf '  GET %s\n' "$LATEST_API"
 curl -fsSL "$LATEST_API" -o "$RELEASE_JSON" || die "could not reach the GitHub releases API"
-MANIFEST="${TMP_DIR}/manifest.tsv"
+TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELEASE_JSON" | head -n 1)"
+[ -n "$TAG" ] || die "the latest release payload carries no tag_name -- the Python floor and the wheel names are both derived from it"
+say "  latest release: ${TAG}"
 
-# Parsing uses the Python we just found: macOS does not ship jq, and we already require
+# -- step 3/7: Python, at the floor the RELEASE declares --------------------------------------------
+
+# The floor that matters to an installer is the floor of the artifact being installed,
+# not the floor of the development tree (#557): this script installs the latest release's
+# wheels, and a release's `requires-python` can be lower than main's -- v0.11.2 shipped
+# wheels declaring >=3.11 while the repo's own pyproject had already moved to a newer
+# floor, so the installer refused, at this very step, Pythons the wheels it was about to
+# install fully support, and every Linux leg of install-smoke went red. So the floor is
+# FETCHED from the tag resolved above and enforced from that. The check itself is the
+# interpreter's own version_info, not a parsed string.
+say "step 3/7: finding Python -- at the floor the release being installed declares"
+FLOOR_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/pyproject.toml"
+printf '  GET %s\n' "$FLOOR_URL"
+FLOOR_TOML="${TMP_DIR}/release-pyproject.toml"
+
+#: The fallback floor, used only if the fetch or the parse below fails: the floor the
+#: SHIPPED WHEELS declare -- the releases this installer can pick currently ship
+#: `requires-python = ">=3.11"`. UPDATE THIS CONSTANT when a GitHub Release raises the
+#: floor its wheels declare (check the oldest release still installable, never the
+#: development tree -- enforcing the dev tree's floor here is exactly bug #557).
+FALLBACK_FLOOR="3.11"
+
+FLOOR=""
+if curl -fsSL "$FLOOR_URL" -o "$FLOOR_TOML" 2>/dev/null; then
+  FLOOR="$(sed -n 's/^[[:space:]]*requires-python[[:space:]]*=[[:space:]]*">=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\)\(\.[0-9][0-9]*\)*"[[:space:]]*$/\1/p' "$FLOOR_TOML" | head -n 1)"
+fi
+if [ -n "$FLOOR" ]; then
+  FLOOR_SOURCE="${TAG}/pyproject.toml (requires-python)"
+else
+  FLOOR="$FALLBACK_FLOOR"
+  FLOOR_SOURCE="the FALLBACK constant -- the shipped-wheel floor; the fetch or parse failed"
+fi
+FLOOR_MAJOR="${FLOOR%%.*}"
+FLOOR_MINOR="${FLOOR#*.}"
+say "  enforcing Python >= ${FLOOR} (from ${FLOOR_SOURCE})"
+
+# Candidates: `python3` first, then one `python3.X` name per minor from the newest minor
+# we know down to the floor's -- DERIVED from the floor, never a fixed list, so a floor of
+# 3.11 tries python3 then 3.14, 3.13, 3.12, 3.11. On a machine whose `python3` is an
+# older system Python, the loop must still find a newer one installed alongside it -- a
+# pyenv or deadsnakes interpreter that never shims `python3` is found by its own name.
+NEWEST_KNOWN_MINOR=14
+if [ "$FLOOR_MINOR" -gt "$NEWEST_KNOWN_MINOR" ]; then NEWEST_KNOWN_MINOR="$FLOOR_MINOR"; fi
+CANDIDATES=("python${FLOOR_MAJOR}")
+minor="$NEWEST_KNOWN_MINOR"
+while [ "$minor" -ge "$FLOOR_MINOR" ]; do
+  CANDIDATES+=("python${FLOOR_MAJOR}.${minor}")
+  minor=$((minor - 1))
+done
+PY=""
+for candidate in "${CANDIDATES[@]}"; do
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (${FLOOR_MAJOR}, ${FLOOR_MINOR}) else 1)" 2>/dev/null; then
+    PY="$(command -v "$candidate")"
+    break
+  fi
+done
+[ -n "$PY" ] || die "no Python >= ${FLOOR} found on PATH -- the wheels of ${TAG} require ${FLOOR}
+                     or later. Check 'python3 --version', then install one and re-run:
+                     - Ubuntu: the deadsnakes PPA (add-apt-repository ppa:deadsnakes/ppa)
+                       packages minors Ubuntu itself does not carry yet
+                     - pyenv:  'pyenv install ${FLOOR}', then put its shims on PATH
+                     - uv:     'uv python install ${FLOOR}' (uv-managed interpreters install
+                       to ~/.local and appear on PATH; this script then uses them as-is)"
+say "  ok: ${PY} ($("$PY" -c 'import platform; print(platform.python_version())'))"
+
+# -- step 4/7: download, printing every URL -------------------------------------------------------
+
+# Parsing uses the Python just found: macOS does not ship jq, and we already require
 # Python, so we add no dependency. This mirrors keel's own selector -- exact
 # `<prefix>-<version>-...whl` names, one asset per prefix, and a loud refusal naming
 # every prefix the release does not carry (a release missing a wheel cannot be deployed).
+# The tag is re-derived here from the same saved payload (its stdout, as before) -- the
+# sed extraction in step 2 was only the bootstrap copy needed before any Python existed.
+say "step 4/7: downloading the five production wheels and config.yaml to ${TMP_DIR}"
+MANIFEST="${TMP_DIR}/manifest.tsv"
 TAG="$("$PY" -c '
 import json, sys
 try:
@@ -126,11 +184,6 @@ if missing:
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print(tag)
 ' "$RELEASE_JSON" "$MANIFEST" "$WHEEL_PREFIXES")" || die "the latest release is not installable (see above)"
-say "  latest release: ${TAG}"
-
-# -- step 4/7: download, printing every URL -------------------------------------------------------
-
-say "step 4/7: downloading the five production wheels and config.yaml to ${TMP_DIR}"
 WHEEL_PATHS=()
 while read -r name url; do
   printf '  GET %s\n' "$url"

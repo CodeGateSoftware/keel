@@ -59,6 +59,9 @@ No terminal? The macOS/Windows app is on the [releases page](https://github.com/
 (with [`docs/desktop-install.md`](docs/desktop-install.md) for the first launch). Terminal
 person, no cloning? The installer does this from the published wheels instead:
 `curl -fsSL https://raw.githubusercontent.com/CodeGateSoftware/keel/main/scripts/install.sh | bash`.
+On Linux it needs a supported Python on your PATH first — the current release's wheels
+declare `>= 3.11` — and the script names the remedies (deadsnakes, pyenv, uv) if it finds
+none.
 
 Everything here is read-only and paper-side: no funds, and nothing in this path can place an
 order. Verified on a clean clone. You need [uv](https://docs.astral.sh/uv/) and a **free,
