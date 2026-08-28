@@ -139,9 +139,7 @@ class FakeBroker:
         """
         self.get_balances_calls += 1
         if self._balances is not None:
-            return [
-                Balance(currency=c, available=b, total=b) for c, b in self._balances.items()
-            ]
+            return [Balance(currency=c, available=b, total=b) for c, b in self._balances.items()]
         if self._usdc_balance is None:
             return []
         return [
@@ -429,10 +427,7 @@ def test_rule_id_is_purely_additive_metadata_placement_and_guards_are_unchanged(
     assert result_a.vetoed_by == result_b.vetoed_by == []
     assert len(broker_a.preview_calls) == len(broker_b.preview_calls)
     assert len(broker_a.place_calls) == len(broker_b.place_calls)
-    assert (
-        broker_a.place_calls[0]["spec"]
-        == broker_b.place_calls[0]["spec"]
-    )
+    assert broker_a.place_calls[0]["spec"] == broker_b.place_calls[0]["spec"]
 
     order_a = repo.get_order(result_a.order_id)
     order_b = repo.get_order(result_b.order_id)
@@ -765,10 +760,7 @@ def test_live_execute_sizing_is_immune_to_reward_income_through_the_public_entry
         == expected * signal.setup.entry
     )
     # The order actually sent to the venue is identical -- same sized base_size.
-    assert (
-        reward_broker.place_calls[0]["spec"]
-        == clean_broker.place_calls[0]["spec"]
-    )
+    assert reward_broker.place_calls[0]["spec"] == clean_broker.place_calls[0]["spec"]
 
 
 # -- DCA sizing --------------------------------------------------------------------------------
@@ -2500,6 +2492,24 @@ def _quoted_preview(best_ask: str) -> dict[str, Any]:
     }
 
 
+def _quoted_quote(intent: Any, best_ask: str) -> Preview:
+    """`_quoted_preview`'s payload as the port's `Preview` -- the ONE shape the warning and the
+    spread gate read since #524 deleted their dict arms. Same `detail`-as-strings the real
+    adapter carries, so the safety paths exercise the same parsing they do live."""
+    return _preview_from(intent, _quoted_preview(best_ask))
+
+
+def test_preview_book_reads_the_ports_shape_only() -> None:
+    """#524's deletion proof: the dict arm of `_preview_book` is gone. A dict is no longer a
+    shape anything on the live path produces -- every constructible broker answers
+    `preview_order` with the port's `Preview` -- so the helper must read NO book out of one,
+    fail-closed exactly like a preview whose `detail` carries no sides."""
+    from keel.execution.executor import _preview_book
+
+    legacy_dict = _quoted_preview("50000")
+    assert _preview_book(legacy_dict) == (None, None)
+
+
 class TestEntryOverrideWarningAtRouting:
     """#260's minimum viable mitigation, at ROUTING time (the divergence class above reports
     after the fill; this warns before/at placement).
@@ -2581,9 +2591,10 @@ class TestEntryOverrideWarningAtRouting:
         market = Decimal("50000")
         at_the_line = market * (Decimal(1) + ENTRY_OVERRIDE_WARN_BP / Decimal(10_000))
 
+        at_the_line_intent = self._intent(entry=str(at_the_line))
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry=str(at_the_line)), _quoted_preview("50000")
+                at_the_line_intent, _quoted_quote(at_the_line_intent, "50000")
             )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
@@ -2597,10 +2608,9 @@ class TestEntryOverrideWarningAtRouting:
         """
         from keel.execution.executor import _warn_if_market_routing_overrides_entry
 
+        below = self._intent(entry="49700")
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(
-                self._intent(entry="49700"), _quoted_preview("50000")
-            )
+            _warn_if_market_routing_overrides_entry(below, _quoted_quote(below, "50000"))
 
         fields = _override_fields(caplog)
         assert fields["deviation_bps"] == "-60.00"
@@ -2624,10 +2634,14 @@ class TestEntryOverrideWarningAtRouting:
             "warning": [],
         }
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(self._intent(entry="50300"), bookless)
+            _warn_if_market_routing_overrides_entry(
+                self._intent(entry="50300"), _preview_from(self._intent(), bookless)
+            )
             _warn_if_market_routing_overrides_entry(
                 self._intent(entry="50300"),
-                {**_quoted_preview("50000"), "best_ask": "not-a-number"},
+                _preview_from(
+                    self._intent(), {**_quoted_preview("50000"), "best_ask": "not-a-number"}
+                ),
             )
             # "nan" PARSES -- Decimal('NaN') constructs fine, and NaN > 0 raises
             # InvalidOperation. cb_client does Decimal(value) on venue strings with no
@@ -2636,11 +2650,11 @@ class TestEntryOverrideWarningAtRouting:
             # hazard inside its try).
             _warn_if_market_routing_overrides_entry(
                 self._intent(entry="50300"),
-                {**_quoted_preview("50000"), "best_ask": "nan"},
+                _preview_from(self._intent(), {**_quoted_preview("50000"), "best_ask": "nan"}),
             )
             # A zero/unusable intended entry has no meaningful deviation either.
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry="0"), _quoted_preview("50000")
+                self._intent(entry="0"), _quoted_quote(self._intent(), "50000")
             )
             # An extreme-but-finite exponent (a rule bug, not venue data): parses, is_finite,
             # and compares fine -- the DIVISION is what raises (Decimal Overflow, an
@@ -2693,7 +2707,9 @@ class TestEntryOverrideWarningAtRouting:
         )
 
         with caplog.at_level(logging.WARNING):
-            _warn_if_market_routing_overrides_entry(sell_intent, _quoted_preview("50000"))
+            _warn_if_market_routing_overrides_entry(
+                sell_intent, _quoted_quote(sell_intent, "50000")
+            )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]
 
@@ -2714,7 +2730,9 @@ class TestEntryOverrideWarningAtRouting:
 
         with caplog.at_level(logging.WARNING):
             _warn_if_market_routing_overrides_entry(
-                self._intent(entry="50300"), _quoted_preview("50000"), resting
+                self._intent(entry="50300"),
+                _quoted_quote(self._intent(entry="50300"), "50000"),
+                resting,
             )
 
         assert not [r for r in caplog.records if r.getMessage() == _OVERRIDE_EVENT]

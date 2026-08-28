@@ -9,7 +9,7 @@ behavior, not a re-implementation of it).
 
 It is click-COUPLED by design: the ask is a terminal prompt (`click.confirm`/`click.prompt`),
 and the fail-closed TTY check goes through `keel.commands._common._is_interactive` -- the single
-patch point every other gate uses. Everything else here (reading either preview shape, deciding
+patch point every other gate uses. Everything else here (reading the preview shape, deciding
 degradedness, rendering the lines) is pure, so a front-end that renders previews itself can
 still reuse `read_preview`/`preview_lines` and get byte-identical banners.
 
@@ -20,8 +20,6 @@ objects.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import click
@@ -44,35 +42,16 @@ _RULE_NATIVE = "  " + "=" * 72
 _RULE_ALARM = "  " + "!" * 72
 
 
-def _preview_decimal(value: Any) -> Decimal | None:
-    """Best-effort `Decimal` for a money field that may be a `Decimal`, a string or junk."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+def _read_preview(
+    preview: Preview | None,
+) -> tuple[bool, dict[str, Any], tuple[str, ...], bool, bool]:
+    """Normalize the port's `Preview` into `(synthetic, fields, errors, unpriced, ok)`.
 
-
-def _read_preview(preview: Any) -> tuple[bool, dict[str, Any], tuple[str, ...], bool, bool]:
-    """Normalize either accepted preview shape into `(synthetic, fields, errors, unpriced, ok)`.
-
-    **Why two shapes.** The port's `Preview` is where this is going; the raw dict is where the
-    live path still is. `executor.py` calls `broker.preview_order(product_id, side,
-    order_configuration)` and `keel/commands/_common.py` builds a `CoinbaseClient`, so every
-    preview a human sees TODAY is `cb_client.preview_order`'s dict. Phase B has not landed.
-    Accepting only `Preview` would break the one venue that actually trades; accepting only
-    `dict` is the bug this exists to fix. So the gate accepts both and this function is the seam
-    -- deliberately transitional, and deletable the day `preview_order` returns `Preview`.
-
-    **Why a dict is read as native.** The dict shape *is* the Coinbase native-preview response
-    (`supports_native_preview=True`), so treating it as a broker quote is accurate rather than
-    optimistic. But "accurate today" is not "safe forever": if some future adapter returns a dict
-    while synthesizing, silently labelling it a broker quote is exactly the failure this issue is
-    about. So a dict that carries a truthy `synthetic` key is believed over the default. Any new
-    adapter should return `Preview` and not rely on that.
-
-    `ok=False` means neither shape was recognized -- which is itself a warning, not a blank.
+    ONE shape since #524 finished the broker-port migration: every broker the live path can
+    construct answers `preview_order` with a `Preview`, so the legacy Coinbase dict arm is
+    deleted, not dormant. Anything else -- including a dict, the pre-port shape -- is
+    unreadable (`ok=False`), which renders as its own alarm and demands the typed phrase
+    rather than guessing at numbers this gate cannot vouch for.
     """
     if isinstance(preview, Preview):
         fields: dict[str, Any] = {
@@ -93,42 +72,16 @@ def _read_preview(preview: Any) -> tuple[bool, dict[str, Any], tuple[str, ...], 
         unpriced = preview.est_quote_size <= 0 or preview.est_base_size <= 0
         return preview.synthetic, fields, tuple(preview.errors), unpriced, True
 
-    if isinstance(preview, Mapping) and preview:
-        errors = preview.get("errs") or preview.get("errors") or ()
-        sized = next(
-            (
-                _preview_decimal(preview[key])
-                for key in ("order_total", "quote_size", "est_quote_size")
-                if key in preview
-            ),
-            None,
-        )
-        # `== 0`, NOT `<= 0`, and the difference is deliberate. A zero size is unambiguous: the
-        # order has no size and its cost is unknown. A NEGATIVE one is not -- it could just as
-        # easily be Coinbase reporting a SELL's `order_total` as signed proceeds, and that
-        # convention has not been verified against a real sell preview. Guessing wrong in the
-        # `<= 0` direction would demand a typed phrase on EVERY live sell, which trains the
-        # operator to type it by reflex and destroys the signal on the previews that need it.
-        # Sign-agnostic here until a live probe settles it; the `Preview` branch above owns its
-        # own types and can afford to be stricter.
-        return (
-            bool(preview.get("synthetic", False)),
-            dict(preview),
-            tuple(str(error) for error in errors),
-            sized is None or sized == 0,
-            True,
-        )
-
     return False, {}, (), True, False
 
 
-def _preview_lines(preview: Any) -> tuple[list[str], bool]:
+def _preview_lines(preview: Preview | None) -> tuple[list[str], bool]:
     """Render `preview` for a human; return `(lines, degraded)`.
 
     `degraded` is true when the preview is unpriced, carries errors, or could not be read at all
     -- the three cases where the numbers on screen do not mean what they appear to mean.
 
-    Provenance is rendered ABOVE the numbers, not below them, because a footnote under a tidy
+    Provenance is rendered ABOVE the numbers, not below, because a footnote under a tidy
     key/value block is read after the decision has already been made.
     """
     synthetic, fields, errors, unpriced, readable = _read_preview(preview)
@@ -203,13 +156,13 @@ def _ask_to_place(degraded: bool) -> bool:
             default="",
             show_default=False,
         )
-    except (click.Abort, EOFError):
+    except click.Abort, EOFError:
         click.echo("aborted -- declining.", err=True)
         return False
     return str(typed).strip().lower() == DEGRADED_PREVIEW_PHRASE
 
 
-def _interactive_confirm(preview: Preview | Mapping[str, Any] | None) -> bool:
+def _interactive_confirm(preview: Preview | None) -> bool:
     """Human-in-the-loop order confirmation for `mode="confirm"`.
 
     Called by the executor ONLY after the intent has already passed every hard rail -- this is
@@ -219,8 +172,8 @@ def _interactive_confirm(preview: Preview | Mapping[str, Any] | None) -> bool:
     "approving an estimate must never look identical to approving a broker's own quote." A
     venue that has a preview endpoint returns numbers it is willing to stand behind; a venue
     without one gets an estimate keel computed from a price lookup that validated nothing and
-    reserved nothing. Those two screens used to be byte-identical, because this function took a
-    raw dict and had nowhere to put `Preview.synthetic`. They are now visually unmistakable, and
+    reserved nothing. Those two screens used to be byte-identical, because this function took
+    a raw dict and had nowhere to put `Preview.synthetic`. They are now visually unmistakable, and
     the distinction sits ABOVE the numbers rather than under them.
 
     Three further states get their own alarm block: `Preview.errors` (the adapter or the venue
@@ -229,22 +182,13 @@ def _interactive_confirm(preview: Preview | Mapping[str, Any] | None) -> bool:
     Each of those also upgrades the question from `[y/N]` to a typed phrase -- see `_ask_to_place`
     for why that is friction and not a refusal.
 
-    Accepts both the port's `Preview` and the legacy Coinbase dict; `_read_preview` documents why
-    both, and which one the live path actually sends today.
-
     Fails closed: a non-TTY invocation (a script, a cron job, a headless run) declines rather
     than blocking on stdin, so `mode="confirm"` never trades unattended.
     """
     lines, degraded = _preview_lines(preview)
-    # The legacy header names Coinbase because the dict shape IS the Coinbase client's response.
-    # A `Preview` can come from any venue, so it gets the venue-neutral header.
-    # An unreadable preview is not "Coinbase's" either -- naming a venue over a shape this gate
-    # could not parse asserts a provenance it does not have.
-    legacy_coinbase_dict = (
-        isinstance(preview, Mapping) and bool(preview) and not preview.get("synthetic", False)
-    )
-    header = "Coinbase order preview" if legacy_coinbase_dict else "Order preview"
-    click.echo(f"\nRails PASSED. {header}:")
+    # Venue-neutral on purpose: a `Preview` can come from any venue, and an unreadable preview
+    # is not any venue's either -- naming one would assert a provenance this gate does not have.
+    click.echo("\nRails PASSED. Order preview:")
     for line in lines:
         click.echo(line)
     if not _common._is_interactive():

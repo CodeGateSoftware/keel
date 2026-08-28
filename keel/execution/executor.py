@@ -97,7 +97,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -138,10 +138,10 @@ class ExecutionResult:
     placed: bool
     order_id: int | None
     vetoed_by: list[str]
-    # Whatever `broker.preview_order` handed back, verbatim. A dict from the pre-port
-    # `CoinbaseClient` today; a `Preview` once Phase B migrates the call. Anything reading money
-    # out of this must branch on the shape -- see `ConfirmFn` below and `_run_order`'s `fee`.
-    preview: Preview | dict[str, Any] | None
+    # Whatever `broker.preview_order` handed back, verbatim -- the port's `Preview` since #524
+    # finished the broker-port migration: every broker the live path can construct answers in
+    # that type, so there is no second shape to branch on anywhere downstream.
+    preview: Preview | None
     reason: str
     # The local `orders.id` of the exit bracket this entry left resting, when one was placed.
     # `execute` places the bracket itself, so this is the ONLY way a caller can learn its id --
@@ -152,13 +152,12 @@ class ExecutionResult:
     bracket_order_id: int | None = None
 
 
-#: The human confirm gate for `mode="confirm"`. Takes BOTH shapes on purpose: `broker` here is
-#: still the pre-port `CoinbaseClient`, whose `preview_order` returns a dict, but the port's
-#: `Preview` is what carries `synthetic` -- the flag that tells a human whether they are
-#: approving a venue's quote or an estimate keel computed. A gate typed to `dict` alone has
-#: nowhere to render that (issue #199), and one typed to `Preview` alone breaks the only venue
-#: that trades today. Both, until Phase B makes `preview_order` return `Preview` everywhere.
-ConfirmFn = Callable[[Preview | Mapping[str, Any]], bool]
+#: The human confirm gate for `mode="confirm"`. One shape: the port's `Preview`, the only thing
+#: `broker.preview_order` returns since the migration finished. `Preview` is what carries
+#: `synthetic` -- the flag that tells a human whether they are approving a venue's quote or an
+#: estimate keel computed (issue #199) -- so a gate typed to anything less has nowhere to
+#: render that distinction.
+ConfirmFn = Callable[[Preview], bool]
 
 
 # -- main entry point -----------------------------------------------------------------------
@@ -411,7 +410,7 @@ def _coerce_increment(raw: object) -> Decimal | None:
         return None
     try:
         value = Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
     return value if value > 0 else None
 
@@ -899,7 +898,7 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
         if expected <= 0:
             return
         divergence_bps = (actual - expected) / expected * Decimal(10_000)
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         log_exception(logger, "executor.intent_divergence_uncomputable", order_id=order_id)
         return
 
@@ -942,16 +941,14 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 ENTRY_OVERRIDE_WARN_BP = Decimal("50")
 
 
-def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
-    """The venue's book out of a preview response, as `(best_bid, best_ask)`, each field read
-    INDEPENDENTLY and safely, in whichever of the preview's two shapes.
+def _preview_book(preview: Preview) -> tuple[Decimal | None, Decimal | None]:
+    """The venue's book out of a preview, as `(best_bid, best_ask)`, each field read
+    INDEPENDENTLY and safely.
 
     One helper, two consumers (#350): #332's entry-override warning needs only the ask, and
-    the routing-time max-spread gate needs both sides plus their midpoint. Both shapes
-    already cross this module (`ConfirmFn`'s docstring explains why they coexist): the
-    pre-port `CoinbaseClient.preview_order` dict, which maps `best_bid`/`best_ask` to
-    `Decimal`s, and the port's `Preview`, whose Coinbase adapter carries the same book as
-    strings inside `detail`.
+    the routing-time max-spread gate needs both sides plus their midpoint. The book lives in
+    `Preview.detail` as strings -- the port's one shape since #524 finished the migration, so
+    there is no dict arm to keep in agreement with it.
 
     Each side is `None` when THE VENUE returned no usable value for that field -- absent key,
     non-numeric string, or a non-finite/non-positive number -- a degraded response, not an
@@ -964,13 +961,14 @@ def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, De
     RAISES InvalidOperation, and a venue string of "nan" parses into exactly that
     (`cb_client` does `Decimal(value)` on venue strings with no finiteness check, so the
     input is reachable). A non-finite side is a degraded preview, not a routing failure.
+
+    `getattr` rather than `preview.detail`, because this helper feeds #332's warning whose
+    contract is NEVER-RAISES: an object without a `detail` -- a contract-violating broker, a
+    stale dict from a pre-port fake -- reads as no book at all, which is already this
+    function's answer to "cannot know". No shape is probed back into existence; garbage just
+    falls into the same fail-closed arm as an absent key.
     """
-    raw: dict[str, Any] = {}
-    if isinstance(preview, Mapping):
-        raw = {"best_bid": preview.get("best_bid"), "best_ask": preview.get("best_ask")}
-    else:
-        detail = getattr(preview, "detail", None)
-        raw = detail if detail is not None else {}
+    raw = getattr(preview, "detail", None) or {}
 
     def _side(key: str) -> Decimal | None:
         value = raw.get(key)
@@ -978,17 +976,17 @@ def _preview_book(preview: Preview | dict[str, Any]) -> tuple[Decimal | None, De
             return None
         try:
             parsed = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError):
+        except InvalidOperation, TypeError, ValueError:
             return None
         return parsed if parsed.is_finite() and parsed > 0 else None
 
     return _side("best_bid"), _side("best_ask")
 
 
-def _preview_best_ask(preview: Preview | dict[str, Any]) -> Decimal | None:
-    """The venue's best ask out of a preview response, in whichever of its two shapes.
+def _preview_best_ask(preview: Preview) -> Decimal | None:
+    """The venue's best ask out of a preview.
 
-    A thin consumer of `_preview_book` (above): same shapes, same per-field safety, ask only.
+    A thin consumer of `_preview_book` (above): same read, same per-field safety, ask only.
     """
     return _preview_book(preview)[1]
 
@@ -1048,7 +1046,7 @@ def _warn_if_market_routing_overrides_entry(
         return
     try:
         expected = Decimal(str(intent.entry))
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return
     if not expected.is_finite() or expected <= 0:
         return
@@ -1106,7 +1104,7 @@ class _SpreadGateRefusal:
 
 def _entry_spread_gate(
     intent: OrderIntent,
-    preview: Preview | dict[str, Any] | None,
+    preview: Preview | None,
     max_entry_spread_pct: Decimal,
 ) -> _SpreadGateRefusal | None:
     """Refuse a live BUY whose previewed book is too wide to enter (#350). `None` = proceed.
@@ -1309,9 +1307,7 @@ def _order_spec(intent: OrderIntent) -> OrderSpec:
                 f"{intent.product_id!r} notional {intent.notional} quantizes to {notional} at "
                 f"increment {increment} -- refusing to send a zero-size order"
             )
-        return MarketIOCByQuote(
-            product_id=intent.product_id, side=Side.BUY, quote_size=notional
-        )
+        return MarketIOCByQuote(product_id=intent.product_id, side=Side.BUY, quote_size=notional)
     return MarketIOCByBase(
         product_id=intent.product_id, side=Side.SELL, base_size=_sell_base_size(intent)
     )
@@ -1475,7 +1471,7 @@ def _native_order_id(order_row: dict[str, Any]) -> str | None:
         return None
     try:
         data = json.loads(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return data.get("order_id")
 
