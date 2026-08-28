@@ -1700,6 +1700,7 @@ function venueCard(info) {
     gridCard([
       kv("preview", plain(info.preview)),
       kv("session", info.session_bound),
+      kv("funding", info.cash_only),
       kv("fee summary", info.supports_fee_summary),
       kv("package version", plain(info.package_version) || "—"),
     ]),

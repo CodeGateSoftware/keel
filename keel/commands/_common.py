@@ -174,6 +174,14 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     the real (network-free at construction) Alpaca and Coinbase classes by
     `tests/test_paper_equities_profile.py`.
 
+    **The alpaca branch verifies the account posture before returning** (#372): one
+    `verify_cash_account()` read of the venue's own account classification, refusing a
+    margin-postured account (and failing closed on an unreadable one) so no engine path
+    ever sees a broker on a venue posture keel does not trade -- cash only, no margin
+    borrowing (riba), which is the posture's whole claim: it sidesteps nothing on PDT
+    (keel's PDT safety is the cadence, not the posture). The refusal names the posture
+    and the fix; the runbook's "Account posture" section is the operator-facing half.
+
     `timeout` (seconds) is optional and defaults to `None` -- the SDK's own default (no
     timeout), matching every existing caller (the agent/executor broker path) exactly.
     Callers that cannot tolerate a hung network call pass an explicit bound.
@@ -233,6 +241,17 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     )
     # `adapter_cls` IS the class the entry point registered -- constructed through discovery
     # (not a direct import) so the installed adapter, not a hard dependency, is what runs.
-    return adapter_cls(
+    broker = adapter_cls(
         transport, endpoint=config.broker.endpoint, data_feed=config.broker.data_feed
     )
+    # Cash-account posture (#372, PRD §5): the one venue-state check this seam makes. The
+    # adapter reads the venue's own account classification and refuses a margin-postured
+    # account (`CashAccountRequired`, a RuntimeError like this function's other refusals),
+    # fail-closed on a classification it cannot read. Refusing HERE -- rather than at order
+    # time -- is what makes it a posture and not a rail: guards are broker-less by design,
+    # and a per-order raise could fire on an exit path, where a refusal can trap a
+    # position. Every command that builds a broker (agent cycle, fetch, monitor, the order
+    # paths) inherits it; one extra `/v2/account` read per build sits far inside FR-11's
+    # rate budget at the daily equities cadence.
+    broker.verify_cash_account()
+    return broker

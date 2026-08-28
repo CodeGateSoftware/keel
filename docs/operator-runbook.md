@@ -622,34 +622,84 @@ considered, and it lapses weekly like every deployment's attestation.
 
 ### T+1 settlement × daily cadence
 
-US equities settle T+1: sale proceeds become spendable the next business day. On a **daily**
-cadence this is immaterial for entries — the next entry attempt is at least a day after the
-previous buy, by which time it has settled (a weekend makes it longer, never shorter).
-**Exits are never T+1-blocked**: a SELL produces cash rather than spending it, and the engine
-never needs to spend sale proceeds within a cycle. The documented cash-crunch case: on a cash
-account you cannot spend *unsettled* proceeds, so an operator manually redeploying same-day
-sale proceeds (outside the engine, which cycles daily) is the one way to meet the constraint
-— and it is an operator act, not an engine one. The paper profile's synthetic cash does not
-model settlement at all; that honesty is on record for any future live consideration.
+US equities settle T+1: sale proceeds become spendable the next business day. Settlement is
+**venue-side** — nothing keel can enforce about *when* the venue settles, so this section is
+the documented half of a split whose enforced half already exists:
+
+- **What keel enforces/surfaces**: the balances read reports the spendable figure honestly —
+  `available` is the account's buying power clamped at cash, so unsettled T+1 proceeds show
+  up as the gap between `available` and `total` rather than as spendable money (FR-6, the
+  #562 balance work) — and **rail 13** (the spend rail) vetoes any BUY whose notional
+  exceeds the reported available quote balance, failing closed when the balance is
+  unreadable. The engine cannot spend what it cannot see.
+- **What the operator must respect**: cadence choices that would re-spend unsettled
+  proceeds. On the profile's **daily** cadence the constraint is met by construction — the
+  next entry attempt is at least a day after the previous buy, by which time it has settled
+  (a weekend makes it longer, never shorter), and **exits are never T+1-blocked**: a SELL
+  produces cash rather than spending it. The one documented cash-crunch case is an operator
+  manually redeploying same-day sale proceeds *outside* the engine — an operator act, not an
+  engine one. The same `interval_sec` that makes this true also scales the feed-staleness
+  window (B1), so any future tighter equities cadence must re-answer settlement and
+  staleness together; a sub-daily cadence is not merely a staleness question.
+
+The paper profile's synthetic cash does not model settlement at all; that honesty is on
+record for any future live consideration.
 
 ### Account posture: cash only — never margin — and the PDT rule
 
-The equities profile runs against a **cash account, never a margin account**. Margin
+The equities profile runs against a **cash-equivalent posture, never borrowed funds**. Margin
 borrowing is a loan that charges interest — *riba* — so the posture is categorical, not a
-preference; a cash account also sidesteps the pattern day trader (PDT) rule's $25,000
-minimum-equity requirement, which applies to **margin** accounts only. The PDT rule: FINRA
-flags a **margin** account as a pattern day trader when it executes four or more day trades
-within five business days, and such an account then needs $25,000 of equity to keep day
-trading. A cash account running keel's daily cadence is not that pattern — the rule does not
-bind cash accounts, and in any case keel evaluates a session's bar once and holds overnight
-by construction, so it does not day-trade in the first place; settled-cash funding is what
-makes entries wait for settlement, and that interplay is the T+1 section above (not repeated
-here).
+preference; **no-borrowing is the posture's whole claim, and it sidesteps nothing on PDT.**
+The PDT rule: FINRA flags a **margin** account as a pattern day trader when it executes four
+or more day trades within five business days, and such an account then needs $25,000 of
+equity to keep day trading — the rule binds margin accounts, and a true cash account would be
+exempt, but **Alpaca offers no true cash accounts**: per Alpaca staff on the cash-account
+option (forum.alpaca.markets/t/dan-wheres-the-cash-only-account-option/18353), "currently all
+Alpaca accounts are margin accounts" — at `max_margin_multiplier=1` "the account remains a
+margin account" and "pattern day trading rules apply". What actually keeps keel clear of PDT
+is the **cadence**: keel evaluates a session's bar once and holds overnight by construction,
+so it does not day-trade in the first place; settled-cash funding is what makes entries wait
+for settlement, and that interplay is the T+1 settlement section above (not repeated here).
 
-Enforcement in code — the config refusing a margin posture where the venue reports one — is
-issue **#372**'s scope; this runbook carries the operator-facing half now: **create and keep
-the Alpaca account a cash account** (the paper account is one by default), and treat any
-offer to "upgrade" to margin as a posture violation to decline, not a capability to use.
+**Enforced in code since #372, not just documented.** Alpaca has no `account_type` field;
+`/v2/account`'s `multiplier` is the venue's account margin classification, and it is as
+cash as the venue gets: Alpaca opens every account as margin and offers no true cash
+designation — multiplier **1** is the cash-equivalent posture (buying power equals cash,
+shorts refused), **2** reg T margin, **4** PDT day-trading margin. At broker build — every
+command that constructs one: the agent cycle, `fetch`, `monitor`, the order paths —
+`AlpacaAdapter.verify_cash_account` reads that classification and **refuses** a margin
+postured account (`CashAccountRequired`, naming riba, the honest PDT note — the posture
+buys no exemption; the cadence is the PDT safety — and the fix), and refuses fail-closed
+when the classification cannot be read: silence is not
+consent to borrow. The engine never sees a broker on a margin account.
+
+**The operator's half — set the multiplier, and expect to.** The venue's *default* for any
+account with $2,000 or more equity is reg T margin (multiplier 2) — and a fresh Alpaca
+paper account carries $100,000 of paper equity, so the default classification is MARGIN:
+the first cycle against an untouched paper account refuses until the setting is changed.
+Set the account's **max margin multiplier to 1** (the dashboard's trading-configuration
+setting; at 1 the venue refuses orders beyond available cash and blocks shorts), keep it
+there, and treat any offer to "upgrade" to margin as a posture violation to decline, not a
+capability to use. **Confirm the classification took** before moving on: re-run
+`keel assets holdings` — a cash classification builds the broker and lists balances, a
+margin one still refuses — or read `GET /v2/account`'s `multiplier` directly, which must
+answer `1`. If the refusal persists with the setting saved, that is a question for Alpaca
+support, not something to work around: the setting you changed lives on the venue's
+account-configurations object (`max_margin_multiplier`, `PATCH /v2/account/configurations`)
+while the classification keel reads lives on the account object itself, and the venue
+implies but does not document the linkage between the two.
+
+The posture is one system with the rest of the engine's constraints — where each piece
+lives:
+
+| Constraint | Where it lives | Why there |
+| --- | --- | --- |
+| No margin borrowing (riba) | **Enforced in code**: `verify_cash_account` at broker build refuses any multiplier ≠ 1, fail-closed on unreadable | The venue reports the classification; refusing at build covers every path before one sees a broker |
+| Cash-only declared | `BrokerCapabilities.cash_only` — every adapter declares it, `keel brokers list` shows "cash only" | The port's declaration seam: vocabulary for the day an adapter announces a borrowing path |
+| Long-only, no shorting | **Enforced in code**, pre-existing: `Setup.direction` is `Literal["long"]` (a short entry cannot be constructed), exits only close held longs, rails 18/19 refuse non-spot shapes in every mode | Not new in #372 — cited so the posture reads as one system, not three |
+| T+1 settlement churn | **Documented** (the section above): settlement is venue-side; keel surfaces the spendable figure and rail 13 spends only that | Nothing keel can enforce about when the venue settles |
+| PDT $25k threshold | **Documented** (this section): keel's CADENCE — one evaluation per session bar, holds overnight by construction — is the PDT safety; the posture claims no exemption (at multiplier 1 the account remains a margin account under PDT rules) | The safety is the cadence, not the posture; there is no separate rule to enforce |
+| Stock lending / cash sweep OFF | **Operator-verified** (the section below) | No order is placed; no rail can see account settings |
 
 ### Operator-verified opt-outs (Alpaca account level)
 

@@ -19,7 +19,12 @@ Scope posture (the PRD's Phase A, FR-1-FR-8, plus the FR-11 rate-limit and host 
   hours -- `extended_hours: False` is pinned on every order body, and the session's
   open/closed state comes from the venue's own clock (`market_clock`, the port method
   `is_market_open` now delegates to), never a locally maintained calendar that drifts
-  (FR-9's posture, wired ahead of the staleness rails).
+  (FR-9's posture, wired ahead of the staleness rails). The cash half is ENFORCED, not
+  just declared (#372): `verify_cash_account` reads `/v2/account`'s `multiplier` -- the
+  venue's account margin classification, which Alpaca answers for every account, so
+  there is no API gap to work around -- and refuses a margin-postured account
+  (`CashAccountRequired`) fail-closed, at the broker-build seam, before any engine path
+  sees a broker.
 * **Preview is synthesized** (`synthesizes_preview=True`, `supports_native_preview=
   False`): Alpaca has no preview endpoint, so `preview_order` reads the venue's latest
   quote (best bid/ask, FR-4) and prices the order itself, with the regulatory fee model
@@ -106,6 +111,11 @@ _CAPABILITIES = BrokerCapabilities(
     # exist here, so the engine must consult `market_clock()` before trading -- unlike the
     # 24/7 crypto venues, whose always-open answer is a constant.
     session_bound=True,
+    # The cash-account posture (#372, PRD §5): this adapter spends settled cash only. The
+    # DECLARED half is this flag; the ENFORCED half is `verify_cash_account` below, which
+    # the broker-build seam calls once per construction to refuse a margin-postured
+    # account before any engine path sees a broker.
+    cash_only=True,
 )
 
 #: Alpaca's own page caps a bars query at 10,000 rows per page; twenty pages is already
@@ -129,6 +139,39 @@ _PLACEMENT_REJECTED_STATUSES: frozenset[str] = frozenset(
 #: placement is an UNKNOWN outcome -- mapping it to a refusal would invite a caller to
 #: place again while the first order may be live.
 _VENUE_REFUSAL_STATUSES: frozenset[int] = frozenset({403, 422})
+
+#: `/v2/account`'s cash-posture classification: multiplier 1 ("buying_power = cash",
+#: shorts refused). The one value `verify_cash_account` accepts.
+_CASH_MULTIPLIER = Decimal("1")
+
+#: The fail-closed half of the posture check: a classification the venue will not or
+#: cannot report. Wording shared by the no-body and transport-failure branches so the
+#: operator reads one reason, not two phrasings of it. The transport-failure branch
+#: appends the cause INLINE (a `(TypeName: message)` suffix), because the surfaces that
+#: render these refusals -- `keel assets holdings` pretty-prints via
+#: `ClickException(f"...{exc}")` -- print the message and never walk `__cause__`: a
+#: chained-only cause is invisible exactly where an operator reads it.
+_UNREADABLE_POSTURE = (
+    "alpaca account posture could not be verified: the account read itself failed -- "
+    "refusing to trade on an unknown posture; silence is not consent to borrow. "
+    "Check the venue and retry."
+)
+
+
+class CashAccountRequired(RuntimeError):
+    """The venue's account is not -- or cannot be established as -- the cash posture this
+    adapter is scoped to (#372, PRD §5 "Cash-account discipline").
+
+    Raised by `AlpacaAdapter.verify_cash_account` for BOTH halves of the refusal: a
+    margin classification the venue actually reported (`multiplier` 2 or 4 -- riba, and
+    the PDT $25k margin-account regime that comes with it), and a classification that
+    could not be read at all (absent, unparseable, or the account endpoint unreachable).
+    The two are the same decision -- no cash posture, no broker -- which is why they share
+    one exception, with the message and the chained cause saying which half fired.
+
+    A `RuntimeError` subclass deliberately: the broker-build seam's existing refusals are
+    `RuntimeError`s, so a caller catches nothing new -- the refusal IS the loud failure.
+    """
 
 
 def _optional_unix_seconds(clock: Any, field: str) -> int | None:
@@ -197,6 +240,81 @@ class AlpacaAdapter:
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
+
+    def verify_cash_account(self) -> None:
+        """Refuse a margin-postured account, loudly, naming the posture (#372, PRD §5).
+
+        Alpaca has NO `account_type` field; `/v2/account`'s `multiplier` IS the account
+        margin classification (docs.alpaca.markets, "Trading Account"): `1` a "standard
+        limited margin account with 1x BP" where "buying_power = cash" -- the venue's
+        cash-EQUIVALENT posture (Alpaca opens every account as margin and offers no true
+        cash designation; multiplier 1 is as cash as it gets: shorts are refused and
+        buying power cannot exceed cash) -- `2` a reg T margin account, and `4` a 4x
+        day-trading account. One field, one question, and this method refuses every
+        answer that is not the cash posture: margin borrowing is *riba*, and that is the
+        posture's whole claim -- it SIDESTEPS nothing on PDT (per Alpaca staff, at
+        max_margin_multiplier 1 "the account remains a margin account" and "pattern day
+        trading rules apply"; a true cash account is not on offer). What keeps keel
+        clear of the PDT rule's $25,000 threshold is the CADENCE -- one evaluation per
+        session bar, holds overnight by construction (documented in the runbook).
+
+        **Fail-closed on the unreadable, exactly like rails 12/13.** An absent,
+        unparseable or unreachable classification raises too -- silence is not consent to
+        borrow -- with the cause chained so a venue outage reads as an outage, never as a
+        bare refusal. `_decimal_or_none` does the parsing, so the venue's quoted
+        (`"2"`) and unquoted (`2`, `2.0`, `Decimal("2")`) shapes are the same
+        classification and JSON's `NaN`/`Infinity` tokens land in the unreadable branch
+        instead of comparing as numbers.
+
+        Called once per broker construction by the build seam
+        (`keel.commands._common._build_broker`), so every command that builds a broker --
+        the agent cycle, fetch, monitor, the order paths -- inherits the refusal. A
+        passing answer is the absence of a raise: there is no certificate to hand back,
+        only the refusal that must not fire.
+        """
+        # `_require_transport` sits OUTSIDE the try on purpose: a missing transport is a
+        # programming error with its own contract message (every network-backed method
+        # raises it), not a venue answer to interpret -- only the venue's own failure to
+        # answer becomes "posture unknown".
+        transport = self._require_transport()
+        try:
+            account = transport.get_account()
+        except Exception as exc:
+            # The cause is folded INTO the message (and chained below): `keel assets
+            # holdings` renders this refusal through `ClickException(f"...{exc}")`, which
+            # never walks `__cause__`, so a chained-only cause would read as a bare
+            # refusal on every CLI surface.
+            raise CashAccountRequired(
+                f"{_UNREADABLE_POSTURE} ({type(exc).__name__}: {exc})"
+            ) from exc
+        if account is None:
+            raise CashAccountRequired(_UNREADABLE_POSTURE)
+
+        raw = _field(account, "multiplier")
+        multiplier = _decimal_or_none(raw)
+        if multiplier is None:
+            raise CashAccountRequired(
+                "alpaca account posture could not be verified: /v2/account answered no "
+                f"usable multiplier classification (got {raw!r}) -- refusing to trade on "
+                "an unknown posture; silence is not consent to borrow. Check the venue's "
+                "account read and retry."
+            )
+        if multiplier != _CASH_MULTIPLIER:
+            raise CashAccountRequired(
+                f"alpaca venue answered a MARGIN account classification (multiplier="
+                f"{_render(multiplier)}): this adapter trades the cash posture only -- no "
+                "margin borrowing (riba), and that is the posture's whole claim: it "
+                "sidesteps NOTHING on PDT (Alpaca offers no true cash accounts; per "
+                "Alpaca staff, at max margin multiplier 1 the account remains a margin "
+                "account to which pattern day trading rules apply). keel's PDT safety "
+                "is the CADENCE (one evaluation per session bar, holds overnight by "
+                "construction), not the posture. Alpaca opens accounts as margin "
+                "by default (any account with $2,000 or more equity, which the $100k "
+                "paper account always is); set the account's max margin multiplier to 1 "
+                "-- the dashboard's trading-configuration setting -- so buying power "
+                "equals cash and shorts are refused, then re-run. keel refuses to build "
+                "a broker on a margin account."
+            )
 
     def market_clock(self) -> SessionState:
         """The regular session's state, from the venue's own `/v2/clock` (the port method).
@@ -644,4 +762,4 @@ def _terminal_unknown(order_id: str) -> OrderStatus:
     )
 
 
-__all__ = ["AlpacaAdapter"]
+__all__ = ["AlpacaAdapter", "CashAccountRequired"]

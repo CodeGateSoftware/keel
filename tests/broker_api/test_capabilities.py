@@ -22,6 +22,7 @@ def _caps(**overrides: object) -> BrokerCapabilities:
         quote_currencies=frozenset({"USD"}),
         asset_classes=frozenset({"spot"}),
         session_bound=False,
+        cash_only=True,
     )
     base.update(overrides)
     return BrokerCapabilities(**base)  # type: ignore[arg-type]
@@ -74,4 +75,28 @@ def test_session_bound_is_a_required_declaration() -> None:
         asset_classes=frozenset({"spot"}),
     )
     with pytest.raises(TypeError, match="session_bound"):
+        BrokerCapabilities(**base)  # type: ignore[arg-type]
+
+
+def test_cash_only_is_a_required_declaration() -> None:
+    """#372 / PRD §5: the borrowing question has no default answer either. A REQUIRED bool
+    field means an adapter author must state whether their adapter can borrow -- and every
+    first-party adapter states `True`, because keel's charter is settled cash, no leverage.
+    That uniformity is the contract, not a useless constant: the one adapter that someday
+    declares `False` (a hedging venue, say) is declaring a posture the engine can then
+    refuse AT LOAD TIME, rather than the omission quietly reading as compliance. The
+    ENFORCED half of the pair lives adapter-side (`keel_broker_alpaca`'s
+    `verify_cash_account` refusing a margin-postured account at broker build) -- this
+    field is the declared vocabulary, and it must not pretend to gate anything."""
+    base: dict[str, object] = dict(
+        venue="test",
+        supported_orders=frozenset({"market_ioc_quote"}),
+        supports_native_preview=True,
+        synthesizes_preview=False,
+        supports_fee_summary=True,
+        quote_currencies=frozenset({"USD"}),
+        asset_classes=frozenset({"spot"}),
+        session_bound=False,
+    )
+    with pytest.raises(TypeError, match="cash_only"):
         BrokerCapabilities(**base)  # type: ignore[arg-type]

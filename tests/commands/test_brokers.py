@@ -13,9 +13,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from dataclasses import replace as dataclasses_replace
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
@@ -29,6 +31,7 @@ PAYLOAD_FIELDS = {
     "venue",
     "deployment",
     "session_bound",
+    "cash_only",
     "quote_currencies",
     "asset_classes",
     "supported_orders",
@@ -90,6 +93,7 @@ def test_alpaca_is_the_wired_session_bound_equities_venue() -> None:
     assert al.venue == "alpaca"
     assert al.deployment == "wired-for-deployment"
     assert al.session_bound is True  # the regular session binds equities
+    assert al.cash_only is True  # #372: the cash-account posture, declared and enforced at build
     assert al.quote_currencies == ("USD",)
     assert al.asset_classes == ("equity",)
     assert al.preview == "synthesized"  # no native preview endpoint
@@ -120,6 +124,7 @@ def test_every_field_derives_from_the_adapters_own_declarations() -> None:
         row = rows[name]
         assert row.venue == cap.venue
         assert row.session_bound == cap.session_bound
+        assert row.cash_only == cap.cash_only
         assert row.supports_fee_summary == cap.supports_fee_summary
         assert row.quote_currencies == tuple(sorted(cap.quote_currencies))
         assert row.asset_classes == tuple(sorted(cap.asset_classes))
@@ -129,6 +134,34 @@ def test_every_field_derives_from_the_adapters_own_declarations() -> None:
             if cap.supports_native_preview
             else "synthesized" if cap.synthesizes_preview else "none"
         )
+
+
+def test_every_first_party_adapter_declares_the_cash_only_posture() -> None:
+    """#372: the borrowing question is answered by every installed adapter, and the answer
+    is uniform -- cash only. That uniformity is the charter, made visible: the one adapter
+    that someday declares `False` is declaring a posture the engine can refuse at load,
+    and this test is what makes its appearance a DECISION rather than a drift."""
+    for info in brokers.list_installed_brokers():
+        assert info.cash_only is True, info.name
+
+
+@pytest.mark.parametrize(
+    ("cash_only", "funding_word"),
+    [(True, "cash only"), (False, "MARGIN-CAPABLE")],
+    ids=["cash-only-row", "margin-capable-row"],
+)
+def test_capability_facts_names_the_funding_posture_loudly_in_both_directions(
+    cash_only: bool, funding_word: str
+) -> None:
+    """The `cash_only=False` branch of `capability_facts` is dead in practice -- every
+    installed adapter declares True (the uniformity test above) -- which is exactly the
+    state in which a wording regression ships unnoticed. The PR's own rationale calls
+    that branch the LOUD declaration: an adapter announcing a borrowing path must read
+    as "MARGIN-CAPABLE", never as a quieter synonym that a skimming operator misses.
+    Pinned on a synthesized row (a `replace` of a real one) because no installed adapter
+    carries `False`, and that is the point."""
+    row = dataclasses_replace(_infos()["coinbase"], cash_only=cash_only)
+    assert funding_word in brokers.capability_facts(row).split(" · ")
 
 
 def test_the_classification_constant_names_exactly_the_wired_venues() -> None:
@@ -194,6 +227,7 @@ def _capabilities() -> SimpleNamespace:
     return SimpleNamespace(
         venue="ok-venue",
         session_bound=False,
+        cash_only=True,
         quote_currencies=("USD",),
         asset_classes=("spot",),
         supported_orders=("market",),

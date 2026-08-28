@@ -5,6 +5,6 @@ implementation of keel's broker port against Alpaca's publicly documented Tradin
 Market Data APIs -- no Alpaca SDK, no third-party adapter code.
 """
 
-from keel_broker_alpaca.adapter import AlpacaAdapter
+from keel_broker_alpaca.adapter import AlpacaAdapter, CashAccountRequired
 
-__all__ = ["AlpacaAdapter"]
+__all__ = ["AlpacaAdapter", "CashAccountRequired"]

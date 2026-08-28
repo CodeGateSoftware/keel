@@ -64,6 +64,8 @@ _CAPABILITIES = BrokerCapabilities(
     quote_currencies=frozenset({"USD"}),
     asset_classes=frozenset({"spot"}),
     session_bound=False,
+    # #372: the deterministic dev venue spends synthetic cash only.
+    cash_only=True,
 )
 
 

@@ -57,6 +57,24 @@ class BrokerCapabilities:
     #: closed equities venue as a stale feed. An adapter declaring `True` must answer
     #: `market_clock()` from the venue's own clock, never a locally maintained calendar.
     session_bound: bool
+    #: Whether this adapter spends settled cash only and has NO borrowing path (#372, PRD
+    #: §5 "Cash-account discipline": margin borrowing is riba -- the posture's whole
+    #: claim; it sidesteps nothing on PDT, where keel's safety is the CADENCE -- one
+    #: evaluation per session bar, holds overnight by construction -- not the posture).
+    #: Deliberately REQUIRED, not defaulted -- same rule as `session_bound`: the borrowing
+    #: question has no default answer, and the likeliest default (silently reading as
+    #: compliant) is exactly the posture violation this field exists to name. Every
+    #: first-party adapter declares `True`, and that uniformity is the contract: the one
+    #: adapter that someday declares `False` is declaring a posture the engine can refuse
+    #: AT LOAD TIME rather than an omission quietly reading as compliance.
+    #:
+    #: ⚠️ Like `asset_classes`, this is a DECLARATION, not a gate: no engine path reads it
+    #: today, and the ENFORCED half of the posture lives adapter-side where the venue's
+    #: own account state is reachable -- `keel_broker_alpaca.verify_cash_account` refuses
+    #: a margin-postured account at broker build, fail-closed on an unreadable one. A rail
+    #: cannot do that (guards are broker-less by design), and this field must not pretend
+    #: one does.
+    cash_only: bool
 
     def __post_init__(self) -> None:
         unknown = self.supported_orders - ORDER_KINDS
