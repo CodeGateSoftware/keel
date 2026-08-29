@@ -34,8 +34,10 @@ entry leaves it oversized for what is held. The port migration is done and the
 cancel-and-replace is expressible (`BracketGTC` since #569; `executor._roll_stop` performs
 one through `place_order`), but a RESIZE is a re-place at a different size, and
 auto-cancelling live protective orders on the strength of a possibly-still-settling partial
-snapshot is strictly worse than a loud warning. This module records and surfaces; the
-resize policy rides with `scale_out`'s remaining #502 scope.
+snapshot is strictly worse than a loud warning. This module records and surfaces. #502 built
+the resize mechanism for the case where the size is known in advance (`executor.scale_out`
+re-places at the remainder), and deliberately did not point it at this one: a rule asking to
+sell half is not a snapshot suggesting the entry filled short.
 """
 
 from __future__ import annotations

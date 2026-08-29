@@ -667,6 +667,60 @@ class Repository:
         )
         self._conn.commit()
 
+    def reduce_position(
+        self,
+        position_id: int,
+        *,
+        remaining_qty: Decimal,
+        realized_qty: Decimal,
+        realized_proceeds: Decimal,
+        realized_fees: Decimal,
+    ) -> None:
+        """Shrink an OPEN tranche to `remaining_qty` and carry the legs already sold (#502).
+
+        The `positions.qty` UPDATE that did not exist until now. Every other writer treated a
+        tranche as immutable in size -- `open_position` inserted it and `close_position` retired
+        it whole -- because until `scale_out` and #446's short exit there was no way for a
+        tranche to be part-sold and still held.
+
+        `qty` means WHAT IS STILL HELD, and every reader already reads it that way:
+        `reconcile_unbracketed_positions` sizes the healing bracket from it ("the ledger is what
+        is actually held now"), `exit_policy` manages the stop for it. Leaving it at the original
+        size after a partial sale would have the sweep re-place a bracket committing more base
+        than the account holds -- rejected on spot, and the position then naked behind a
+        CRITICAL. Shrinking it is not bookkeeping tidiness; it is what keeps the healer correct.
+
+        The accumulators are absolute, not deltas: the caller reads the tranche, adds this leg,
+        and writes the total. A delta-shaped `UPDATE ... = ... + ?` would look safer and be
+        worse -- it makes a retried call double-count, and the one caller here has the prior
+        values in hand already.
+
+        Refuses a non-positive `remaining_qty`: a tranche with nothing left is CLOSED, and it
+        must go through `close_position` so its `trade_outcomes` row is written. Silently
+        allowing a zero-quantity open tranche would strand a trade that never books an outcome
+        and leave rail 16 blind to it.
+        """
+        if remaining_qty <= 0:
+            raise ValueError(
+                f"reduce_position: remaining_qty must be positive, got {remaining_qty} -- a "
+                "fully-consumed tranche closes through close_position so its outcome is recorded"
+            )
+        self._conn.execute(
+            """
+            UPDATE positions
+               SET qty = ?, realized_qty = ?, realized_proceeds = ?, realized_fees = ?
+             WHERE id = ? AND status = 'open'
+            """,
+            (
+                _dec_to_text(remaining_qty),
+                _dec_to_text(realized_qty),
+                _dec_to_text(realized_proceeds),
+                _dec_to_text(realized_fees),
+                position_id,
+            ),
+        )
+        self._conn.commit()
+
     def close_position(self, position_id: int, *, closed_at: int) -> None:
         self._conn.execute(
             "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ?",
@@ -687,6 +741,15 @@ class Repository:
         # `_text_to_dec` is not asked to invent a zero.
         raw_initial_stop = d.get("initial_stop")
         d["initial_stop"] = None if raw_initial_stop is None else _text_to_dec(raw_initial_stop)
+        # The partial-exit accumulators (#502) decode NULL to ZERO, deliberately unlike
+        # `initial_stop` immediately above. There is no difference between "this tranche has
+        # never been partially exited" and "it has realized nothing", so zero invents nothing --
+        # whereas a `None` here would force every arithmetic reader (`record_closed_trade`'s
+        # summation) to spell the same `or Decimal("0")` and would make forgetting it a
+        # TypeError on live money rather than a no-op.
+        for accumulator in ("realized_qty", "realized_proceeds", "realized_fees"):
+            raw = d.get(accumulator)
+            d[accumulator] = Decimal("0") if raw is None else _text_to_dec(raw)
         return d
 
     # -- profile (the user's own settings) ------------------------------------

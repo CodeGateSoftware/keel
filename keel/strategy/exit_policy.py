@@ -9,8 +9,10 @@ then rolls the resting exchange-side bracket through the executor's single-roll 
 Live management is DEFAULT OFF exactly like the sim wiring -- a rule whose params carry
 neither knob gets `EXIT_POLICY_OFF` and nothing ever moves its stop (#442 measured trailing
 WORSE and the break-even roll no better than the static exit at the 120 bp fee, so the
-operator opts in per rule). `scale_out` remains without a live caller, pinned by its tripwire
-test until its two prerequisites (bracket resize, `trade_outcomes` for a partial exit) exist.
+operator opts in per rule). `scale_out`'s two prerequisites -- bracket resize and a
+`trade_outcomes` row for a partial exit -- were built in #502 and its tripwire retired, but no
+policy here drives it yet: deciding WHEN to take half off is rule-side work this module does
+not do.
 
 What this module IS: the exit POLICY itself -- an ATR-multiple trailing stop and a
 break-even roll, both strictly ratchet-only (a stop may move toward profit, never away from

@@ -4266,3 +4266,122 @@ def test_a_warn_state_cycle_emits_exactly_the_opted_in_events(repo, monkeypatch)
     assert len(sink.calls) == 1
     assert sink.calls[0][0] == "https://alerts.example/hook"
     assert json.loads(sink.calls[0][1])["event"] == "attestation.expiring"
+
+
+# -- #446's exit-side sibling: a market exit the venue filled SHORT ---------------------------
+
+
+class _ShortFillingBroker(FakeBroker):
+    """Fills every SELL at `fill_ratio` of what was ordered, and reports it the way the venue
+    does -- through `get_order`, which is what `_record_observed_fill_quantity` reads."""
+
+    def __init__(self, fill_ratio: Decimal, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.fill_ratio = fill_ratio
+        self._last_sell_size: Decimal | None = None
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        size = getattr(spec, "base_size", None)
+        if size is not None and getattr(spec, "side", None) == Side.SELL:
+            self._last_sell_size = Decimal(size)
+        return super().place_order(spec, idempotency_key=idempotency_key)
+
+    def get_order(self, order_id: str) -> OrderStatus:
+        ordered = self._last_sell_size or Decimal("0")
+        return OrderStatus(
+            order_id=order_id,
+            status="FILLED",
+            filled_size=ordered * self.fill_ratio,
+            average_filled_price=Decimal("51000"),
+            total_fees=Decimal("0.50"),
+        )
+
+
+def test_a_short_filled_exit_books_only_what_sold_and_keeps_the_remainder(
+    repo: Repository, caplog
+) -> None:
+    """#446's exit-side sibling, which #502 was asked to settle in the same pass.
+
+    `_close_tranches` booked `exit_qty=position["qty"]` and then closed the tranche, for every
+    open tranche of the product, on the strength of the order having been PLACED. Nothing in
+    that path ever consulted how much the venue actually sold. A market exit filled short
+    therefore wrote a `trade_outcomes` row for quantity that was never sold, marked a tranche
+    closed while its base was still held, and -- worse than either -- cleared `position_rule:`,
+    `open_stop`, `open_target` and the crash ledger, so the surviving remainder had no owning
+    rule to manage it, no levels to re-place from, and nothing saying it was unprotected. Its
+    bracket had already been cancelled to place the exit. That is a live, naked, SILENT
+    position: exactly the state #519 built the crash ledger to make impossible.
+
+    Here the venue sells 60% of a 0.2 position. The correct outcome is: nothing booked (the
+    trade is not over), the tranche reduced to what is still held, every piece of position state
+    RETAINED, the crash ledger written so the next cycle's sweep re-places, and a CRITICAL.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.2"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
+    repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
+    repo.set_state(f"open_target:{PRODUCT}", Decimal("53000"))
+    broker = _ShortFillingBroker(
+        Decimal("0.6"), series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]}
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        run_once(broker, repo, _config(), now_ts=90_000)
+
+    positions = repo.get_open_positions(PRODUCT)
+    assert len(positions) == 1, "the tranche was closed on the strength of a SHORT fill"
+    assert positions[0]["qty"] == Decimal("0.08"), (
+        "the tranche must be reduced to what is still held: the sweep sizes its healing bracket "
+        "from this number, and an over-sized bracket is refused for insufficient base"
+    )
+    assert positions[0]["realized_qty"] == Decimal("0.12")
+    assert repo.get_trade_outcomes() == [], (
+        "an outcome row was written for a trade that is not over -- and for quantity the venue "
+        "never sold"
+    )
+
+    assert repo.get_state(f"position_rule:{PRODUCT}") is not None, (
+        "the remainder was left with no owning rule, so no later cycle would ever manage it"
+    )
+    assert repo.get_state(f"open_stop:{PRODUCT}") == Decimal("49000")
+    assert repo.get_state(f"open_target:{PRODUCT}") == Decimal("53000")
+    assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}{PRODUCT}") == {
+        "stop": Decimal("49000"),
+        "target": Decimal("53000"),
+        "qty": Decimal("0.08"),
+    }, "the naked remainder is not in the crash ledger, so the sweep will never heal it"
+    assert [
+        r for r in caplog.records if r.getMessage() == "agent.exit_left_an_unprotected_remainder"
+    ], "an unprotected remainder was left behind SILENTLY"
+
+
+def test_a_fully_filled_exit_still_closes_everything_and_clears_the_state(
+    repo: Repository,
+) -> None:
+    """The other side of the pin above, and the reason `observed_sold_qty` returns `None` for a
+    full fill rather than the number it observed.
+
+    A full fill closes EVERY open tranche, which is not the same as consuming the order's
+    quantity FIFO: `_build_intent` sizes an exit from the filled-orders history while the
+    tranches come from the `positions` ledger, and the two legitimately disagree for inventory
+    that predates the ledger. Consuming FIFO would strand those tranches open forever, so the
+    only behaviour #446's fix changes is the short-fill one.
+    """
+    repo.insert_rule("fake_exit", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(
+        repo, PRODUCT, Decimal("0.2"), Decimal("50000"), ts=1_000, rule_name="fake_exit"
+    )
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": "fake_exit", "opened_at": 1_000})
+    repo.set_state(f"open_stop:{PRODUCT}", Decimal("49000"))
+    broker = _ShortFillingBroker(
+        Decimal("1"), series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]}
+    )
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_open_positions(PRODUCT) == []
+    assert len(repo.get_trade_outcomes()) == 1
+    assert repo.get_state(f"position_rule:{PRODUCT}") is None
+    assert repo.get_state(f"open_stop:{PRODUCT}") is None

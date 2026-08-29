@@ -795,6 +795,78 @@ def test_shown_count_is_read_from_the_report_not_measured_here() -> None:
     assert built["shown_count"]["value"] == "2"
 
 
+def test_point_index_skips_an_entry_with_no_recorded_net_and_still_finds_its_point() -> None:
+    """#602's join key: a journal row's `point_index` must name the position its OWN trade lands
+    at in `curve.points` -- not its position in `entries`, which differs the moment a row has no
+    recorded net (`build_equity_curve` skips it; `entries` does not).
+
+    Three rows, the middle one with `pnl_net=None`: a serialiser that used the entry's own list
+    position (`str(i)`) would give the third row `"2"`, and one that counted the skipped row
+    anyway would give it `"2"` too -- both wrong, because the curve only ever drew two points.
+    The right answer, `"1"`, is reachable only by skipping exactly what `build_equity_curve`
+    skips, in the same order.
+    """
+    entries = [
+        JournalEntry(
+            closed_at=NOW_TS - 10800,
+            opened_at=NOW_TS - 96400,
+            rule_name="turtle_breakout",
+            product_id="BTC-USD",
+            qty=Decimal("0.01000000"),
+            entry_fill=Decimal("50000.00"),
+            exit_fill=Decimal("50100.00"),
+            pnl_net=Decimal("10.00"),
+            fees=Decimal("0.10"),
+            r_multiple=Decimal("0.20"),
+            is_dca=False,
+            outcome="win",
+        ),
+        JournalEntry(
+            # Still open, or otherwise never recorded a net -- `build_equity_curve` draws no
+            # point for this row, so there is nothing for a hover to highlight.
+            closed_at=None,
+            opened_at=NOW_TS - 50000,
+            rule_name="turtle_breakout",
+            product_id="ETH-USD",
+            qty=Decimal("0.50000000"),
+            entry_fill=Decimal("2000.00"),
+            exit_fill=None,
+            pnl_net=None,
+            fees=None,
+            r_multiple=None,
+            is_dca=False,
+            outcome="open",
+        ),
+        JournalEntry(
+            closed_at=NOW_TS - 1800,
+            opened_at=NOW_TS - 90000,
+            rule_name="turtle_breakout",
+            product_id="SOL-USD",
+            qty=Decimal("1.00000000"),
+            entry_fill=Decimal("100.00"),
+            exit_fill=Decimal("95.00"),
+            pnl_net=Decimal("-5.00"),
+            fees=Decimal("0.05"),
+            r_multiple=Decimal("-0.10"),
+            is_dca=False,
+            outcome="loss",
+        ),
+    ]
+    built = _journal_json(entries=entries, total_count=3)
+
+    first, skipped, third = built["entries"]
+    assert first["point_index"] == "0"
+    assert skipped["point_index"] is None
+    assert third["point_index"] == "1"
+
+    points = built["curve"]["points"]
+    assert len(points) == 2
+    # The join actually lands on the SAME trade, not merely on a plausible-looking index: cross
+    # referencing by `point_index` must recover the exact `pnl` the row itself carries.
+    assert points[int(first["point_index"])]["pnl"]["value"] == first["pnl"]["value"] == "10.00"
+    assert points[int(third["point_index"])]["pnl"]["value"] == third["pnl"]["value"] == "-5.00"
+
+
 def test_every_field_carries_all_three_keys_always() -> None:
     """Schema uniformity is itself part of the contract: a client that has to test whether `state`
     is present is branching on payload SHAPE, which is inference by another route. Every field
