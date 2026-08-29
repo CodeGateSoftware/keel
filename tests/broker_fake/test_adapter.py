@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import TradeScopeDenied, UnsupportedOrder
 from keel_broker_api.results import Balance, CancelOutcome, OrderStatus, PlaceResult, SessionState
 from keel_broker_fake import FakeAdapter
 from keel_broker_fake.adapter import MAX_CANDLES_PER_CALL
@@ -200,3 +200,60 @@ def test_cancel_order_drops_the_stops_trigger_too() -> None:
     assert adapter.cancel_order(placed.broker_order_id) is CancelOutcome.CONFIRMED
 
     assert adapter.triggers == []
+
+
+# --- #233: the trade-scope refusal knob -----------------------------------------------------
+
+
+def test_by_default_the_fake_venue_places_and_touches_no_scope() -> None:
+    """The knob is OFF unless asked for. Every existing caller -- the conformance run, the
+    paper-hourly profile, the dev venue -- constructs `FakeAdapter()` with no arguments, and a
+    default that refused would turn this fake from a stand-in into a fault injector."""
+    adapter = FakeAdapter()
+
+    assert adapter.place_order(
+        MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+    ).success
+
+
+def test_the_knob_raises_the_venues_words_verbatim() -> None:
+    """The one venue in this repo that can be MADE to refuse. Every real adapter needs a live
+    credential without trade scope to exercise its refusal path, and the executor's confirm/refute
+    write needs something it can drive end to end without one."""
+    adapter = FakeAdapter(
+        trade_scope_denied="You do not have permission to perform this action."
+    )
+
+    with pytest.raises(TradeScopeDenied) as caught:
+        adapter.place_order(
+            MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+        )
+
+    assert str(caught.value) == "You do not have permission to perform this action."
+
+
+def test_the_refusal_leaves_no_resting_order_behind() -> None:
+    """A refused placement is not a placement. If the fake appended to `resting` and then raised,
+    it would model a venue that accepted an order it says it refused -- and the executor's
+    refute path would be tested against a state no venue produces."""
+    adapter = FakeAdapter(trade_scope_denied="nope")
+
+    with pytest.raises(TradeScopeDenied):
+        adapter.place_order(
+            MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+        )
+
+    assert adapter.resting == []
+    assert adapter.triggers == []
+
+
+def test_an_unsupported_kind_is_still_refused_as_unsupported_first() -> None:
+    """Order of refusals. A spec this venue cannot express is `UnsupportedOrder` whatever the
+    knob says -- the adapter never reached the point of asking the venue for permission, so
+    reporting a scope refusal would write `REFUTED` over a bug in the caller's spec."""
+    adapter = FakeAdapter(trade_scope_denied="nope")
+
+    with pytest.raises(UnsupportedOrder):
+        adapter.place_order(
+            MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
+        )

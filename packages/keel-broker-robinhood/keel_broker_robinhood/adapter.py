@@ -50,6 +50,7 @@ The other three gaps, stated once here and again in the package README:
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -59,6 +60,7 @@ from typing import Any
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, OrderSpec, StopLimitGTC
 from keel_broker_api.port import (
+    TradeScopeDenied,
     UnsupportedOrder,
     default_market_schedule,
     resolve_client_order_id,
@@ -246,6 +248,53 @@ class _PairRules:
     asset_increment: Decimal | None
     #: BASE units. The ceiling a single order may not exceed.
     max_order_size: Decimal | None
+
+
+def _trade_scope_refusal(exc: BaseException) -> str | None:
+    """The venue's own words when `exc` is Robinhood's permission refusal, else `None` (#233).
+
+    **This is the case the whole design was written from, and it is the one observed shape.** A
+    live probe on 2026-08-19 placed an order under a credential whose reads all succeeded and got
+    back `403 {"detail": "You do not have permission to perform this action."}`. Nothing recorded
+    it, so the next run could not tell a read-only credential from a working venue.
+
+    Keyed on the status alone, unlike the Coinbase sibling. That asymmetry is deliberate rather
+    than sloppy: Coinbase is known to answer `403` for PRODUCT entitlement as well (observed
+    2026-08-05 against an un-onboarded futures product), so there the status has to be narrowed
+    by the venue's own `Missing required scopes` predicate before it can mean anything about the
+    credential. This venue has exactly one observed 403 and it is this one. Narrowing on
+    `"permission"` appearing in the body would be a guess about wording nobody has verified is
+    stable, and it would fail OPEN -- silently stopping the record's second writer the day
+    Robinhood rephrases the sentence, which is the one failure mode with no symptom.
+
+    The `detail` field is preferred for the message because it is what Robinhood wrote; an
+    unparseable body (an HTML error page, an empty response) falls back to naming the status, so
+    the record is honest about having no detail rather than carrying a fabricated one.
+
+    ⚠️ `401` is deliberately absent. `API credential is not active.` -- this venue's own 401 body
+    for a revoked key -- is not a scope fact: reads fail too, and the fix is a new credential,
+    not an attestation. Nor is `429`, nor any 5xx: those are the network, and a refusal here
+    latches `REFUTED` until an operator clears it at a terminal.
+
+    Shape-typed rather than `isinstance(exc, requests.HTTPError)`: the transport imports
+    `requests` lazily, inside the request method, precisely so importing this adapter does not
+    drag an HTTP stack in. Two `getattr`s answer the question without undoing that.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    if getattr(response, "status_code", None) != 403:
+        return None
+    body = str(getattr(response, "text", "") or "")
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        decoded = None
+    if isinstance(decoded, dict):
+        detail = decoded.get("detail")
+        if isinstance(detail, str) and detail:
+            return detail
+    return f"robinhood refused the placement with HTTP 403 and no readable detail: {body[:200]}"
 
 
 class RobinhoodAdapter:
@@ -976,7 +1025,18 @@ class RobinhoodAdapter:
         if isinstance(sized, PlaceResult):
             return sized
         body = to_order_body(sized, client_order_id=resolve_client_order_id(idempotency_key))
-        response = self._require_transport().create_order(body)
+        try:
+            response = self._require_transport().create_order(body)
+        except Exception as exc:
+            # #233: the venue's half of the trade-scope record. ONLY a 403 becomes
+            # `TradeScopeDenied` -- see `_trade_scope_refusal`. Everything else re-raises
+            # unchanged, so a 5xx, a 429 or a timeout reaches the executor exactly as it did
+            # before and touches the record not at all. A transient failure that marked a
+            # working venue `refuted` would halt live entries on a healthy deployment.
+            refusal = _trade_scope_refusal(exc)
+            if refusal is None:
+                raise
+            raise TradeScopeDenied(refusal) from exc
 
         order_id = _field(response, "id")
         if order_id is None:

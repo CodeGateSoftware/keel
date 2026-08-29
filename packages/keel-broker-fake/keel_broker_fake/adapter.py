@@ -29,7 +29,11 @@ from decimal import Decimal
 
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder, default_market_schedule
+from keel_broker_api.port import (
+    TradeScopeDenied,
+    UnsupportedOrder,
+    default_market_schedule,
+)
 from keel_broker_api.results import (
     Balance,
     CancelOutcome,
@@ -90,10 +94,29 @@ class _Trigger:
 class FakeAdapter:
     """An in-memory venue whose shape differs from Coinbase's in five deliberate ways."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, trade_scope_denied: str | None = None) -> None:
+        """`trade_scope_denied` makes every placement raise `TradeScopeDenied` carrying that
+        message (#233).
+
+        The knob exists because the refusal it simulates cannot otherwise be exercised without a
+        live credential that lacks trade scope at a real venue -- and #233's own record notes
+        that the 403 it is built around has been observed exactly once, by hand, on a probe run.
+        The executor's confirm/refute write is a money-path branch; something has to be able to
+        drive it end to end offline.
+
+        Keyword-only and `None` by default, so `FakeAdapter()` behaves exactly as it always has.
+        Every existing construction site -- the conformance run, the paper-hourly profile, the
+        dev venue -- passes no arguments, and a fake that refused by default would stop being a
+        stand-in for a venue and start being a fault injector.
+
+        A STRING rather than a bool because the message is the payload: it is written verbatim
+        into `venue_trade_scopes.refuted_reason`, so a test driving this knob is testing the
+        real path only if it can supply the venue's own words the way a real adapter does.
+        """
         self._ids = itertools.count(1)
         self.resting: list[_RestingOrder] = []
         self.triggers: list[_Trigger] = []
+        self._trade_scope_denied = trade_scope_denied
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
@@ -180,6 +203,13 @@ class FakeAdapter:
         """
         if spec.kind not in _CAPABILITIES.supported_orders:
             raise UnsupportedOrder(f"fake venue does not support order kind {spec.kind!r}")
+
+        # AFTER the kind check and BEFORE any state is mutated (#233). Order matters twice: a
+        # spec this venue cannot express never reached the point of asking for permission, so it
+        # must stay `UnsupportedOrder`; and a refused placement must leave nothing resting, or
+        # the fake would model a venue that accepted the order it says it refused.
+        if self._trade_scope_denied is not None:
+            raise TradeScopeDenied(self._trade_scope_denied)
 
         order_id = f"fake-{next(self._ids)}"
         self.resting.append(

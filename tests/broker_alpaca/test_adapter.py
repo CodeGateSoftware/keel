@@ -32,7 +32,7 @@ from keel_broker_api.orders import (
     MarketIOCByQuote,
     StopLimitGTC,
 )
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import TradeScopeDenied, UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
     CancelOutcome,
@@ -1108,3 +1108,62 @@ def test_without_a_key_alpaca_still_mints_one_id_per_attempt() -> None:
     adapter.place_order(spec)
 
     assert transport.calls["create_order"]["body"]["client_order_id"] != first
+
+
+class TestTradeScopeIsDeliberatelyUnmapped:
+    """#233 maps each venue's PERMISSION refusal to `TradeScopeDenied`. **This venue has none to
+    map, and this class is the pin that keeps it that way.**
+
+    The design asks every adapter to translate its venue's permission refusal. Alpaca's answer to
+    that request is that no such refusal is distinguishable here:
+
+    * `403` is already spoken for. This adapter documents it, and
+      `test_a_buying_power_refusal_maps_to_a_failed_place_result` pins it, as INSUFFICIENT BUYING
+      POWER -- a fact about the account's cash at this instant, not about the credential. Routing
+      it to `TradeScopeDenied` would write `REFUTED`, and rail 20 would then veto every live entry
+      on this venue until an operator typed `yes` at a terminal. An ordinary cash shortfall would
+      have manufactured an outage requiring physical presence to clear.
+    * `422` is an invalid order body -- a bug in the caller, fixed by a different spec.
+    * `401` is a credential the venue does not recognise. Reads fail too, so the fix is a new key,
+      not an attestation; that state belongs to #233's readiness display, not to this record.
+    * every other status is the network, and `test_an_infra_error_propagates...` already pins that
+      those do not even become a `PlaceResult`.
+
+    No permission-refusal shape has ever been observed from this venue in this repository, and
+    #233's own design is explicit that a classification must not be invented from documentation:
+    "the design must not pre-classify it from documentation, and must record it when it finally
+    arrives". So this venue records nothing, and says so out loud rather than guessing.
+
+    ⚠️ This is a REFUSAL, not an oversight. If someone later obtains a real Alpaca permission
+    refusal, delete this class and map that observed shape -- do not map a status because the
+    other adapters map one.
+    """
+
+    def test_a_403_does_not_raise_trade_scope_denied(self) -> None:
+        transport = _RejectingCreateTransport(
+            AlpacaAPIError(403, "insufficient buying power"),
+            placed=load_fixture("alpaca_order_placed.json"),
+        )
+        result = AlpacaAdapter(transport).place_order(
+            MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+        )
+        assert isinstance(result, PlaceResult)
+        assert result.success is False
+
+    @pytest.mark.parametrize("status", [401, 422, 429, 500, 503])
+    def test_no_other_status_raises_trade_scope_denied_either(self, status: int) -> None:
+        transport = _RejectingCreateTransport(
+            AlpacaAPIError(status, "whatever the venue said"),
+            placed=load_fixture("alpaca_order_placed.json"),
+        )
+        spec = MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+        try:
+            AlpacaAdapter(transport).place_order(spec)
+        except TradeScopeDenied:  # pragma: no cover - the failure this class exists to catch
+            pytest.fail(
+                f"alpaca mapped HTTP {status} to a trade-scope refusal. Nothing observed from "
+                "this venue justifies that, and a false refusal halts live entries until an "
+                "operator clears it at a terminal."
+            )
+        except AlpacaAPIError:
+            pass
