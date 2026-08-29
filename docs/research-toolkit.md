@@ -28,28 +28,19 @@ carefully as the "answers" column — that column is the actual product.
 
 | module | answers | cannot answer | run it with |
 | :--- | :--- | :--- | :--- |
-| `significance.py` | is a family's edge distinguishable from its break-even, priced at the fee actually paid | whether the edge will hold going forward, or which family/regime to report — you name both | `keel research index --module significance`\* |
+| `significance.py` | is a family's edge distinguishable from its break-even, priced at the fee actually paid | whether the edge will hold going forward, or which family/regime to report — you name both | `keel research significance` |
 | `montecarlo.py` | was the equity curve's *path* (drawdown, time underwater) unusual for this set of trades, in some order or under resampled price history | whether the *final equity* was luck — that percentile is exactly 1/2 by construction, always | `keel research monte-carlo` (`keel trials monte-carlo`) |
 | `cscv.py` | the probability a configuration selected in-sample degrades out-of-sample, over a matrix of configurations already tried | which configuration is the best one — it never returns that, by construction | `keel research pbo` (`keel trials pbo`) |
 | `deflate.py` | given N trials tried, the Sharpe bar the winner had to clear, and how much data that needs | what N and correlation to assume — it reports a band across assumptions rather than guess one | `keel research deflate` (`keel trials deflate`) |
 | `walkforward.py` | does a GIVEN fixed parameter set hold up across rolling train/test windows, and does it degrade | which parameter set, fold or window is best — none is ever computed | `keel research walk-forward` (`keel trials walk-forward`) |
-| `independence.py` | how much two rules' (or two horizons') signals overlap in time, position and P&L | whether either rule is profitable, or which one to keep | `keel research index --module independence`\* |
-| `throughput.py` | how much volume a fee-free allowance can honestly carry this month, and how long evidence takes to accumulate | it never enlarges an allowance to fit a plan — a product that doesn't fit is deferred, not squeezed in | `keel research index --module throughput`\* |
-| `cts_factors.py` | do the 11 CTS confluence factors carry independent evidence, or is one momentum read counted three times | the biased ("obvious") conditional sample is computed but never allowed to carry the headline | `keel research index --module cts_factors`\* |
-| `tuning.py` | for a declared parameter space, does a train/held-out study produce a candidate clearing held-out sign AND PBO ≤ 0.5 | it never auto-tunes a live/paper profile, and a pass is a hypothesis, not a promotion | `keel research index --module tuning`\* |
+| `independence.py` | how much two rules' (or two horizons') signals overlap in time, position and P&L | whether either rule is profitable, or which one to keep | `keel research independence` |
+| `throughput.py` | how much volume a fee-free allowance can honestly carry this month, and how long evidence takes to accumulate | it never enlarges an allowance to fit a plan — a product that doesn't fit is deferred, not squeezed in | `keel research throughput` |
+| `cts_factors.py` | do the 11 CTS confluence factors carry independent evidence, or is one momentum read counted three times | the biased ("obvious") conditional sample is computed but never allowed to carry the headline | `keel research factors` |
+| `tuning.py` | for a declared parameter space, does a train/held-out study produce a candidate clearing held-out sign AND PBO ≤ 0.5 | it never auto-tunes a live/paper profile, and a pass is a hypothesis, not a promotion | `keel research tuning` |
 | `bias.py` | does a rule's decision at bar N change when bars after N become visible (lookahead / recursive drift) | whether the rule is profitable — this is about information leakage only | `keel research lookahead` (`keel rules lookahead`) |
 | `ledger.py` | what experiments were run, in what order, tamper-evidently | it is tamper-*evident*, not tamper-*proof*, and it never touches money | `keel trials record` / `list` / `verify` (no `research` alias — see below) |
 | `matrix.py` | assembles the T×N matrix `cscv.py` needs from ledger trials, enforcing the "true matrix" condition | anything about performance itself — it is plumbing, not a question of its own | no direct command — runs inside `keel research pbo` |
-| `pooled_review.py` | the #427 pooled-review machinery: descriptive n_eff-corrected intervals, never a verdict on the edge | it renders no pass/fail on the edge, ever — see [the 2026-09-30 review](#the-2026-09-30-pooled-review-427) below | `keel research index --module pooled_review`\* |
-
-\* These six modules have no dedicated `keel research` subcommand of their own yet — only
-`keel research index`, which names every module, and the five aliases above, are wired as of
-this writing. Asking the index for one module by name (`--module NAME`, the bare filename minus
-`.py`) prints its `runs as` line, which today names the pre-registered `docs/experiments/`
-driver that exercises it — e.g. `keel research index --module significance` names
-`docs/experiments/2026-08-21-rule-family-significance.py`. Until each of these six gets its own
-subcommand, that driver (or a direct `import keel.research.<module>` call, as this page does
-below) is how you actually run one.
+| `pooled_review.py` | the #427 pooled-review machinery: descriptive n_eff-corrected intervals, never a verdict on the edge | it renders no pass/fail on the edge, ever — see [the 2026-09-30 review](#the-2026-09-30-pooled-review-427) below | `keel research pooled-review` |
 
 `ledger.py` and `matrix.py` are the two modules that were never going to get a `keel research`
 alias in the first place: `ledger.py`'s record-keeping commands (`record`/`list`/`verify`) stay
@@ -78,9 +69,10 @@ every subcommand run names both explicitly. It also will not manufacture power a
 have: an underpowered result is reported as "not distinguishable from zero," not massaged into
 significance by choosing a friendlier n.
 
-Run: no dedicated subcommand yet — `keel research index --module significance` names the
-pre-registered driver, `docs/experiments/2026-08-21-rule-family-significance.py`; the transcript
-below calls the module directly.
+Run: `keel research significance` — `--from deployment` (the default) reads this db's own
+`trade_outcomes` ledger, `--from rule --rule ID` backtests one stored rule instead; either way
+`--fee-regime` restricts to one regime, and omitting it runs both, never an average. The
+transcript below was captured by calling the module directly, before this subcommand existed.
 
 ### `montecarlo.py` — trade reshuffling and candle bootstrap, and the invariant Jesse's marketing skips
 
@@ -249,16 +241,22 @@ report: `is_refused`/`descriptive_review` in `keel/research/pooled_review.py` pr
 `DescriptiveReview` whose `refusal` is a tuple of reasons instead of a report, and
 `render_report` raises if asked to render one anyway — a refused review has no report to print.
 
-That refusal is exactly where the standalone driver is the prior art any future
-`keel research pooled-review` subcommand must deliberately break with, not the pattern to copy:
-`docs/experiments/2026-09-30-pooled-review.py` prints its refusal to **stderr** and calls
-`sys.exit(2)` when a pre-registered profile database isn't reachable. A front-door command must
-not repeat that — under the rule stated above, a refusal belongs on stdout at exit 0, because
-"nothing to review" is this command answering a well-formed question honestly, not the command
-failing to run.
+That refusal is exactly where the standalone driver is the prior art `keel research
+pooled-review` deliberately broke with, not the pattern to copy: `docs/experiments/2026-09-30-
+pooled-review.py` prints its refusal to **stderr** and calls `sys.exit(2)` when a pre-registered
+profile database isn't reachable. The front-door command does not repeat that — under the rule
+stated above, a refusal belongs on stdout at exit 0, because "nothing to review" is this command
+answering a well-formed question honestly, not the command failing to run.
 
-As of this writing `pooled_review.py` has no dedicated `keel research` subcommand either —
-`keel research index --module pooled_review` names the same driver, and running the review
-today still means running `docs/experiments/2026-09-30-pooled-review.py` directly, stderr/exit-2
-refusal included. Before 2026-09-30 it runs the same machinery as a labelled preview, and it
-says so.
+`keel research pooled-review` is that front door: `--db` (repeatable, defaulting to the same
+three pre-registered profiles the driver defaults to), `--run-date`, and optional `--out`/
+`--jsonl` to also write the artifacts. It shares its `_connect_ro`/`read_orders`/`read_ledger`
+readers with the driver — moved into `keel/commands/research.py` and imported back by the
+driver — so there is exactly one reader of a deployment database and the two structurally
+cannot diverge on what "the pool" means. The driver's own stderr/exit-2 contract is unchanged
+and stays that way: it was pre-registered before the review event and is frozen, while the
+command is new surface that gets the right behaviour — stdout, exit 0 — from the start. Before
+2026-09-30 both run the same machinery as a labelled preview, and both say so.
+
+Running the review directly against `docs/experiments/2026-09-30-pooled-review.py` still works
+unchanged, stderr/exit-2 refusal included — it remains the pre-registered driver of record.
