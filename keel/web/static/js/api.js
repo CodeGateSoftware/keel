@@ -264,7 +264,7 @@ function isField(value) {
  * ── WHAT MAKES THIS SAFE IS NOT IN THIS FILE ────────────────────────────────────────────────
  * `key` reaches the server as a path segment and is looked up in `keel.commands.setup.ACTIONS`,
  * a closed registry of idempotent, non-destructive, `MECHANICAL` steps that a test asserts is
- * disjoint from the eleven capability-increasing actions. Nothing this function is called with
+ * disjoint from the eight capability-increasing actions. Nothing this function is called with
  * can widen that: an unknown key is a 404, and a known one runs the same step `keel setup` runs.
  * The client cannot arm a rule, attest an asset or enable autonomy, and it is the SERVER that
  * makes that true.

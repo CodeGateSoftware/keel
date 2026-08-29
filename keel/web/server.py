@@ -24,7 +24,7 @@ terminal has to be able to create a deployment somehow.
 
 So `do_POST` exists, and it routes ONLY through `keel.commands.setup.ACTIONS`: three idempotent,
 non-destructive steps, every one of them declared `MECHANICAL` in the same module's step list.
-The guarantee is now that **not one of the eleven capability-increasing actions in
+The guarantee is now that **not one of the eight capability-increasing actions in
 `keel/capabilities.py` is reachable from this package**, asserted by a test that scans this
 source rather than by inspection. "No POST" said the server could not write; this says it cannot
 arm, release or spend -- which is the property anyone actually cares about.
@@ -177,7 +177,7 @@ EVENTS_PATH = "/api/events"
 #:
 #: The action SET is unchanged by all of this, and that is the invariant that matters more than the
 #: path: `keel.commands.setup.ACTIONS` still contains only idempotent, non-destructive,
-#: `MECHANICAL` steps, and a test still asserts it is disjoint from the eleven capability-
+#: `MECHANICAL` steps, and a test still asserts it is disjoint from the eight capability-
 #: increasing actions in `keel/capabilities.py`. A browser can set a deployment up. It still cannot
 #: arm a rule, attest an asset or enable autonomy.
 API_SETUP_PREFIX = "/api/setup/"

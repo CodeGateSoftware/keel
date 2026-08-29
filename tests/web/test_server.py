@@ -172,7 +172,7 @@ def test_the_write_surface_reaches_no_capability_increasing_action() -> None:
     capability registry already protects the dangerous ones. It only made a terminal-free paper
     deployment impossible, which is the entire point of the milestone.
 
-    What must never be reachable is the eleven. `withdrawals attest --enabled` is among them and
+    What must never be reachable is the eight. `withdrawals attest --enabled` is among them and
     is therefore not an action, and this asserts that by IDENTITY rather than by taste."""
     from keel.capabilities import CAPABILITIES
     from keel.commands.setup import ACTIONS, STEPS
@@ -186,7 +186,7 @@ def test_the_write_surface_reaches_no_capability_increasing_action() -> None:
                 f"the {action.key} action runs {invocation!r}, which is behind the TTY gate"
             )
 
-    # The one judgement step that IS among the eleven must have no action.
+    # The one judgement step that IS among the eight must have no action.
     assert "withdrawals_attested" in by_key
     assert "withdrawals_attested" not in {action.key for action in ACTIONS}
 
@@ -240,7 +240,7 @@ def test_promotion_offers_no_force_field() -> None:
     """`attempt_promotion`'s own docstring: force "carries no gate HERE ... the O3 contract is the
     front-end's to keep, never the service's to assume". The console keeps it with a typed
     terminal confirmation. A browser cannot keep it that way, so this front-end simply has no
-    force path -- and force-promote is itself one of the eleven."""
+    force path -- and force-promote is itself one of the eight."""
     import inspect as inspect_mod
 
     from keel.commands import setup as setup_mod
@@ -278,7 +278,7 @@ def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> No
 
     "No POST" said the server could not write -- and was also satisfied by a server that could
     not set anything up, which is the problem #437 exists to solve. This says the server cannot
-    ARM, RELEASE or SPEND anything: not one of the eleven capability-increasing actions in
+    ARM, RELEASE or SPEND anything: not one of the eight capability-increasing actions in
     `keel/capabilities.py` is named anywhere under `keel/web/`, nor is the TTY gate they all pass
     through.
 
@@ -342,6 +342,75 @@ def test_the_scan_for_capability_increasing_actions_can_fail() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert victim.function in called
+
+
+def test_the_disjointness_comments_state_the_actual_capability_count() -> None:
+    """`test_no_capability_increasing_action_is_reachable_from_the_web_layer` above proves the
+    disjointness; it says nothing about whether the prose a reviewer actually reads -- "not one of
+    the N capability-increasing actions ... is reachable" -- names the right N. That number has
+    drifted twice already (eleven to seven when the TUI was deleted, seven to eight at #233), and
+    a stale one is worse than no comment: it is the sentence a reviewer checks this very test
+    against.
+
+    So this reads the count back out of the prose itself, in every `keel/web/` source that makes
+    the claim, and compares it to `len(CAPABILITIES)` -- never a literal written here, which would
+    only move the drift into this file instead of catching it."""
+    import glob
+    import os
+    import re
+
+    from keel.capabilities import CAPABILITIES
+
+    number_words = {
+        "zero": 0,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+    }
+    #: Matches the prose across a line wrap too: `security.py` and `server.py:180` both break the
+    #: line between "eleven" and "capability-increasing", with a comment marker (`#:` or ` *`) and
+    #: leading whitespace in between.
+    pattern = re.compile(r"(\w+)\s+capability-[\s#:*]*increasing actions", re.IGNORECASE)
+
+    web_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "keel",
+        "web",
+    )
+    sources = sorted(glob.glob(os.path.join(web_dir, "**", "*.py"), recursive=True)) + sorted(
+        glob.glob(os.path.join(web_dir, "static", "js", "*.js"))
+    )
+    assert sources, "the scan found no sources, which would make this vacuous"
+
+    stated: list[tuple[str, str]] = []
+    for path in sources:
+        text = open(path, encoding="utf-8").read()
+        rel = os.path.relpath(path, web_dir)
+        for word in pattern.findall(text):
+            stated.append((rel, word.lower()))
+
+    #: Five files state the claim today (`server.py` twice) -- if the scan found none, the
+    #: assertions below would pass on an empty list and prove nothing.
+    assert stated, "no source under keel/web states the capability count in prose"
+
+    for rel, word in stated:
+        assert word in number_words, f"{rel} states an unrecognised count word: {word!r}"
+        assert number_words[word] == len(CAPABILITIES), (
+            f"{rel} says {word!r} ({number_words[word]}) capability-increasing actions, but "
+            f"keel/capabilities.py's CAPABILITIES has {len(CAPABILITIES)} rows -- prose is stale"
+        )
 
 
 # -- CSRF -------------------------------------------------------------------------------------

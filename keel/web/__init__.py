@@ -18,7 +18,7 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   non-destructive steps -- so a first-run user on a machine with no terminal can create a
   deployment. "No POST at all" was a clean property that was also satisfied by a server which
   could not set anything up.
-* **Not one of the eleven capability-increasing actions in `keel/capabilities.py` is reachable
+* **Not one of the eight capability-increasing actions in `keel/capabilities.py` is reachable
   from this package**, asserted by a test that scans this source rather than by inspection. The
   server cannot arm, release or spend. Attesting, promoting, releasing a halt and arming autonomy
   remain CLI-only, behind the TTY gate; D3 (#436) is where a browser gate for those would go.
