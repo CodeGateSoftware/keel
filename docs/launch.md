@@ -72,7 +72,7 @@ the Arabic README.
 > I built an open-source Shariah-compliance **engine** for spot crypto trading — not a
 > trading bot with a halal coat of paint, but the compliance machinery: allowlist
 > admission where Shariah classifications are attested with a source and never inferred
-> from market data, a fails-closed screen, eighteen un-overridable safety rails including
+> from market data, a fails-closed screen, nineteen un-overridable safety rails including
 > §65.4 *qabd* (constructive possession) encoded as an executable check, and an
 > audit trail of who attested what.
 >

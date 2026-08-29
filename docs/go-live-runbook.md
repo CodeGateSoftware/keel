@@ -38,7 +38,7 @@ landing page shows instead of an empty dashboard.
 | ☐ | `keel --version` reports `[release]`, no `DIRTY`, no `[checkout]` | a build that matches no commit is not reproducible; do not run it against funds |
 | ☐ | `keel versions` exits **0** | `--version` speaks for the `keel-trader` distribution alone. This one checks every keel distribution in the venv and fails on a partial upgrade — new engine, old libraries — which `--version` cannot see |
 | ☐ | you have a **trade-enabled** CDP key (the read-only one cannot place orders) | |
-| ☐ | `.env` holds `CDP_API_KEY` / `CDP_API_SECRET`, and `.env` is git-ignored | credentials live only here — there is no vault |
+| ☐ | `CDP_API_KEY` / `CDP_API_SECRET` are set — in `.env` (git-ignored) or via `keel credentials set NAME` | resolved in this order: **environment → `.env` → OS keychain** (`keel_core.secrets`). A `.env` beside your deployment outranks the keychain deliberately — every deployment that predates `keel credentials` keeps behaving byte-identically — but that means a `.env` value silently SHADOWS anything you store with `keel credentials set` afterwards. `keel credentials show` names which of the three is actually in use; trust that over your memory of which one you last touched |
 | ☐ | you are at a real terminal | confirmation and every halt-releasing command fail closed off a TTY |
 | ☐ | settled funds are in the **quote leg of the product you trade** (`BTC-USD` → **USD**) | rail 13 checks the balance of the currency the ORDER spends, derived from the product — not `config.quote_currency` — and never draws from a bank/ACH |
 
@@ -70,11 +70,24 @@ unattested venue or asset is treated as unknown, not as fine.
 keel assets list                       # what is attested, and what is not
 keel subscription show                 # rail 14's spend allowance comes from this record
 keel withdrawals show                  # rail 17: withdrawal capability is a compliance precondition
+keel scope show                        # rail 20: can this venue's credential place a live ENTRY?
 ```
 
 Attest anything missing (`keel assets attest`, `keel subscription attest`,
-`keel withdrawals attest`) before continuing. If a rail vetoes later, its message names the
-command that fixes it.
+`keel withdrawals attest`, `keel scope attest --trading`) before continuing. If a rail vetoes
+later, its message names the command that fixes it.
+
+Rail 20 exists because a credential that *reads* fine is not evidence it can *trade*: a
+well-formed `ROBINHOOD_API_KEY` passed every read this deployment ever made, and the first live
+order still 403'd with "You do not have permission to perform this action." That is a fact about
+the credential, not about the asset — attesting `BTC` in Section 2's other checks says nothing
+about whether the venue behind it will let this credential place a live order — so `keel scope
+attest --trading` is its own, separate step, per venue. Like rail 17's withdrawal gate, it vetoes
+ENTRIES ONLY: an existing position is already yours, so a rail that also blocked exits, stop
+rolls or DCA exits over a fact about the credential rather than the position would strand a
+holding nobody could get out of. And it fails closed — a venue nobody has attested keeps every
+live entry vetoed until `keel scope attest` runs, deliberately, rather than assuming an untested
+credential is fine.
 
 ## 3. Promote exactly one rule
 
@@ -125,7 +138,7 @@ exists to accumulate the live evidence the promotion gate demands and cannot its
 Demoting these rules would end that experiment without putting anything in its place.
 
 **What bounds the risk instead.** Not the promotion gate, which never ran. The caps
-(`max_exposure_usd` 200 total at once, `max_per_order_usd` 100), the eighteen un-overridable
+(`max_exposure_usd` 200 total at once, `max_per_order_usd` 100), the nineteen un-overridable
 `guards.py` rails, rail 1's allowlist, and rail 14's monthly allowance. **The bypass is of the
 evidence gate, not the safety rails** — separate mechanisms, and only the first was skipped.
 

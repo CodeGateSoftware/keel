@@ -138,7 +138,7 @@ account level is the operator's obligation, listed first in
 
 ### The remaining rails — prudential, not fiqh
 
-Eighteen rails exist (1–14, 16, 17, 18, 19 — there is no rail 15). Of these, only rail 17
+Nineteen rails exist (1–14, 16, 17, 18, 19, 20 — there is no rail 15). Of these, only rail 17
 encodes a fiqh ruling, and rails 1/18/19 enforce what the screen and the charter admit. The
 rest are PRUDENTIAL — risk and discipline, justified by trading evidence, carrying no
 religious claim:
@@ -153,6 +153,7 @@ religious claim:
 | 11, 16 | drawdown and consecutive-loss breakers | risk discipline |
 | 12 | stale-feed + kill-switch, fails closed | operational safety |
 | 13, 14 | spend only the settled quote currency; monthly allowance cap | operational safety |
+| 20 | trade-scope veto on live entries for a venue credential nobody has attested for trading | operational safety |
 
 Beside the rails — not among them, and not numbered — sits one routing-time check with the
 same prudential character: the **max-spread entry gate** (#350, `keel/execution/executor.py`)
