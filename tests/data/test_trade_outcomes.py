@@ -39,7 +39,7 @@ def test_schema_is_at_version_13() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 13
+    assert version == db.SCHEMA_VERSION == 14
 
 
 def test_fresh_database_has_no_outcomes() -> None:

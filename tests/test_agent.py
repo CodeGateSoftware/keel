@@ -50,7 +50,7 @@ from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Candle, Granularity, Side
-from tests.conftest import attest_subscription
+from tests.conftest import attest_subscription, attest_trade_scope
 
 PRODUCT = "BTC-USD"
 
@@ -192,6 +192,9 @@ def repo() -> Repository:
     # default; attest a very large allowance so pre-existing tests here (none of which exercise
     # rail 14) aren't incidentally tripped by it.
     attest_subscription(r, now_ts=0, free_volume_usd=Decimal("10000000"))
+    # Rail 20 (#233) fails closed without a trade-scope record; confirm coinbase here for the
+    # same reason -- these tests are not ABOUT rail 20.
+    attest_trade_scope(r, now_ts=0)
     return r
 
 

@@ -47,7 +47,7 @@ from keel.execution.executor import (
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
-from tests.conftest import attest_subscription
+from tests.conftest import attest_subscription, attest_trade_scope
 
 NOW_TS = 1_700_000_000
 
@@ -217,6 +217,10 @@ def repo() -> Repository:
     # A very large, attested monthly allowance so pre-existing (non-rail-14) tests aren't
     # incidentally tripped by it; rail-14-specific tests below override with `_attest(...)`.
     _attest(r, free_volume_usd=Decimal("10000000"))
+    # Rail 20 (#233) fails closed without a trade-scope record, so every test that is not ABOUT
+    # rail 20 gets the CONFIRMED shape the v13 backfill produces for an already-live venue --
+    # same reason this fixture seeds withdrawals and the subscription above.
+    attest_trade_scope(r, now_ts=NOW_TS)
     return r
 
 

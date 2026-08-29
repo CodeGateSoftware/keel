@@ -158,6 +158,7 @@ from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
 from keel.commands.research import research_group
 from keel.commands.rules import rules_group, rules_seed
+from keel.commands.scope import scope_group
 from keel.commands.serve import serve_cmd
 from keel.commands.setup import setup_cmd, template_config_text
 from keel.commands.simulate import (
@@ -1325,6 +1326,12 @@ def simulate(
 
 # The `subscription` group is defined in `keel.commands.subscription`; register it here.
 cli.add_command(subscription_group)
+
+
+# -- scope (rail 20, per-venue trade-scope attestation, #233) -------------------------------------
+
+# The `scope` group is defined in `keel.commands.scope`; register it here.
+cli.add_command(scope_group)
 
 
 # -- status (interim operator-observability dashboard, no broker call) --------------------------

@@ -30,11 +30,12 @@ from typing import Any
 
 import click
 from keel_core import paths as _paths
-from keel_core.telemetry import bind_venue
+from keel_core.telemetry import bind_venue, current_venue
 
 from keel.config import Config, load_config
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
 
 DISCLAIMER = (
@@ -154,6 +155,30 @@ def _load_cfg(ctx: click.Context) -> Config:
     # changes.
     bind_venue(config.broker.name)
     return config
+
+
+# -- venue resolution --------------------------------------------------------------------------
+
+
+def _bound_venue_or_default(venue: str | None) -> str:
+    """An explicit `--venue` wins; otherwise the venue THIS deployment trades.
+
+    That is the same binding rail 14 and rail 20 gate every order on -- the one `_load_cfg` makes
+    at process entry for telemetry (`bind_venue(config.broker.name)`) -- with coinbase when
+    nothing is bound. A `--venue` default frozen at coinbase would make an alpaca operator type
+    `--venue alpaca` on every invocation or silently write a record nothing reads.
+
+    Must be called AFTER `_load_cfg(ctx)` has run, or there is nothing bound to read.
+
+    Shared here (rather than kept local to `keel.commands.subscription`, where it was first
+    written) the same way `_default_sim_products` lives in `keel.commands._products`: more than
+    one command group needs the identical venue-resolution rule, and a second, independently
+    maintained copy in `keel.commands.scope` is exactly the kind of silent drift this module
+    exists to prevent.
+    """
+    if venue is not None:
+        return venue
+    return current_venue() or DEFAULT_VENUE
 
 
 def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
