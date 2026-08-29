@@ -8,7 +8,11 @@
 safety rails, attested asset screening that fails closed, and §65.4 *qabd* (constructive
 possession) encoded as an executable check — with a reference auto-trading agent built on top
 of it for Coinbase. Plenty of people have a trading bot; almost nobody has this compliance
-machinery, which is the part worth reading.
+machinery, which is the part worth reading. There is also a fourth way to read all of this:
+`keel mcp` speaks [MCP](docs/mcp-server.md) over stdio, so Claude Code, Cursor, Codex or any
+other assistant can ask keel the same questions the browser view and the TUI answer — and,
+by construction rather than promise, cannot attest a subscription, promote a rule, arm
+autonomy, or place an order, because the write surface does not exist in that package at all.
 
 **The honest result, stated by us first:** no shipped rule family is net-positive at the
 taker fee actually paid on this venue — cost is the binding constraint, and the viable
@@ -124,6 +128,15 @@ applies the confirm/autonomy gate, then places and logs. There is deliberately n
 - **Confirm vs. autonomy** — by default keel previews each order and asks at the terminal;
   headless, it declines. `keel autonomy on` changes **who is asked, never what is allowed**.
   To stop trading, `keel kill` — the kill-switch fails closed.
+- **The MCP server** (`keel/mcp/tools.py`, [`docs/mcp-server.md`](docs/mcp-server.md)) —
+  `keel mcp` exposes eight read-only tools over stdio JSON-RPC, so an assistant can ask what a
+  terminal would otherwise have to: `doctor` (the same health findings `keel doctor`
+  computes), `capabilities` (the #453 gate inventory), `profiles` (the loaded config files),
+  `orders` and `veto_log` (the audit log and recent rail vetoes), `purification` (the §65.9
+  report), `trials` (the research ledger), and `reports` (the research corpora). None of
+  them can act: `query_only` is on at the engine level, and `tests/mcp/test_readonly.py`
+  scans the package for write verbs so a tool that could attest, promote, arm autonomy, or
+  place an order fails CI rather than review.
 
 keel ships **inert**: nothing trades until you promote a rule, attest the venue subscription
 (rail 14 refuses live BUYs otherwise), fund the account, and — in confirm mode — type `y`.
@@ -178,6 +191,9 @@ adapter, deliberately divergent, that the conformance suite runs against.
   modules behind `keel research`: what each answers, what it refuses to answer even when
   asked nicely, and the Strathern rail that stops a diagnostic score from becoming a
   sweep's ranking key.
+- [`docs/mcp-server.md`](docs/mcp-server.md) — the read-only MCP server: the eight tools
+  `keel mcp` exposes, the stdio wiring, and the six-wall proof (not a promise) that it
+  cannot attest, promote, arm autonomy, or place an order.
 - [`docs/launch.md`](docs/launch.md) — the pre-launch gate and the announcement plan:
   what must be true before anything is announced, where, in what order, and what the
   post says (the honest result included).

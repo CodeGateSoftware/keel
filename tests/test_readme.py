@@ -138,3 +138,71 @@ def test_the_readme_is_no_longer_a_runbook():
     assert "com.keel.paperforward" not in text, (
         "the launchd/deployment table belongs in docs/operator-runbook.md, not the README"
     )
+
+
+_MCP_DOC = "docs/mcp-server.md"
+
+
+def test_mcp_is_named_in_the_opening_description_with_a_link():
+    """#600: the README's first screen must say keel speaks MCP, and link the doc.
+
+    Before this fix the README mentioned MCP zero times in any of its 212-then-216 lines —
+    a visitor living in Claude Code, Cursor or Codex had no way to learn keel has a read-only
+    assistant surface without already knowing to look in `docs/`.
+    """
+    first = _readme_first_screen()
+    assert "MCP" in first, (
+        "the opening description must name MCP — it is the third reader (besides the "
+        "browser view and the TUI) and belongs beside the other headline claims"
+    )
+    assert _MCP_DOC in first, f"the opening description must link {_MCP_DOC}"
+
+
+def test_mcp_feature_bullet_names_the_handlers_and_the_boundary():
+    """#600: the feature list names the eight handlers and states the write boundary.
+
+    Jesse's MCP can write strategy code; keel's must not grow that, because the promotion
+    ladder and the compliance gate are the product. The boundary is pinned here as an
+    ENFORCED fact (a guard/test), not a promise, matching `docs/mcp-server.md`'s own framing.
+    """
+    text = _readme()
+    for handler in (
+        "doctor",
+        "capabilities",
+        "profiles",
+        "orders",
+        "veto_log",
+        "purification",
+        "trials",
+        "reports",
+    ):
+        assert f"`{handler}`" in text, (
+            f"the README's MCP section must name the {handler!r} handler"
+        )
+    assert "keel/mcp/tools.py" in text, "the README must say where the handlers live"
+    assert _MCP_DOC in text, f"the feature section must link {_MCP_DOC}"
+    lowered = text.lower()
+    for forbidden in ("attest", "promote", "arm autonomy", "place an order"):
+        assert forbidden in lowered, (
+            f"the README must state the MCP boundary in terms of {forbidden!r} — an "
+            "assistant that could do this would route around the promotion ladder and the "
+            "compliance gate"
+        )
+    assert "query_only" in text or "cannot" in lowered, (
+        "the boundary must be stated as enforced (a guard), not merely intended"
+    )
+
+
+def test_documentation_map_lists_the_mcp_server_doc():
+    """#600: the Documentation map must carry `docs/mcp-server.md`, like every other doc."""
+    text = _readme()
+    doc_map = text.split("## Documentation map", 1)[1].split("## Asking questions", 1)[0]
+    assert _MCP_DOC in doc_map, "the Documentation map must list docs/mcp-server.md"
+
+
+def test_mcp_server_doc_links_back_to_the_readme():
+    """#600: the cross-link runs both ways, so the two pages cannot quietly drift apart."""
+    mcp_doc = (_ROOT / _MCP_DOC).read_text()
+    assert "README.md" in mcp_doc, (
+        f"{_MCP_DOC} must link back to the README — a one-way link is how the two drift"
+    )

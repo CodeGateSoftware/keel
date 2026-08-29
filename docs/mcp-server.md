@@ -1,5 +1,8 @@
 # The read-only MCP server (`keel mcp`)
 
+*Named in the [README](../README.md#how-keel-works) alongside the browser view and the
+TUI — this page is the detail, that one is the map.*
+
 A research assistant is the third reader the browser view and the TUI never reached: no
 window, no terminal, one JSON-RPC stream and a model on the other end of it. `keel mcp`
 serves that reader keel's state, logs and research record — and nothing it could act on.
