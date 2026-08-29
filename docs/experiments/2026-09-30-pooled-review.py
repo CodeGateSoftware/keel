@@ -77,15 +77,19 @@ import json
 import sqlite3
 import sys
 from datetime import UTC, datetime
-from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
+# `_connect_ro`/`read_orders`/`read_ledger` used to be defined here; #601 moved them into
+# `keel.commands.research` (the new `keel research pooled-review` front door) and this driver
+# now IMPORTS them, so there is exactly one reader of a deployment database and the CLI and this
+# pre-registered driver structurally cannot diverge on what "the pool" means. `DEFAULT_DBS` moves
+# with them for the same reason -- one literal, not two copies that could drift apart.
+from keel.commands.research import DEFAULT_POOLED_REVIEW_DBS as DEFAULT_DBS
+from keel.commands.research import _connect_ro, read_ledger, read_orders
 from keel.research.pooled_review import (
     EVENT_DATE,
     DescriptiveReview,
     LedgerRow,
-    OrderRow,
     OrdersRead,
     build_sample,
     descriptive_review,
@@ -95,79 +99,8 @@ from keel.research.pooled_review import (
 )
 from keel.research.throughput import design_effect
 
-DEFAULT_DBS = (
-    str(Path.home() / "keel" / "keel.db"),
-    str(Path.home() / "keel" / "keel-live.db"),
-    str(Path.home() / "keel" / "keel-paperhourly.db"),
-)
 DEFAULT_OUT = "docs/experiments/2026-09-30-pooled-review.md"
 DEFAULT_JSONL = "docs/experiments/2026-09-30-pooled-review.jsonl"
-
-
-def _connect_ro(db_path: str) -> sqlite3.Connection:
-    """The house read-only connection (`mode=ro`); the deployment dbs are never written."""
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def read_orders(db_path: str) -> tuple[list[OrderRow], dict[int, str]]:
-    """The profile's `orders` rows (money as Decimal) and its `rule_id -> rules.kind` map.
-
-    Ascending id — the ledger's own event sequencing, which the matcher relies on because
-    the live `created_at` values demonstrably disagree with it.
-    """
-    connection = _connect_ro(db_path)
-    try:
-        order_rows = connection.execute(
-            "SELECT id, mode, product_id, side, qty, status, actual_fill, fee, rule_id, "
-            "created_at FROM orders ORDER BY id"
-        ).fetchall()
-        rule_rows = connection.execute("SELECT id, kind FROM rules ORDER BY id").fetchall()
-    finally:
-        connection.close()
-    orders = [
-        OrderRow(
-            id=int(row["id"]),
-            mode=str(row["mode"]),
-            product_id=str(row["product_id"]),
-            side=str(row["side"]),
-            qty=Decimal(str(row["qty"])),
-            status=str(row["status"]),
-            actual_fill=None if row["actual_fill"] is None else Decimal(str(row["actual_fill"])),
-            fee=None if row["fee"] is None else Decimal(str(row["fee"])),
-            rule_id=None if row["rule_id"] is None else int(row["rule_id"]),
-            created_at=int(row["created_at"]),
-        )
-        for row in order_rows
-    ]
-    return orders, {int(row["id"]): str(row["kind"]) for row in rule_rows}
-
-
-def read_ledger(db_path: str) -> list[LedgerRow]:
-    """The profile's `trade_outcomes` rows, oldest first (the ledger reader's convention)."""
-    connection = _connect_ro(db_path)
-    try:
-        rows = connection.execute(
-            "SELECT product_id, rule_name, opened_at, closed_at, qty, entry_fill, "
-            "exit_fill, fees, pnl_net FROM trade_outcomes ORDER BY closed_at, id"
-        ).fetchall()
-    finally:
-        connection.close()
-    return [
-        LedgerRow(
-            product_id=str(row["product_id"]),
-            rule_name=str(row["rule_name"]),
-            opened_at=int(row["opened_at"]),
-            closed_at=int(row["closed_at"]),
-            qty=Decimal(str(row["qty"])),
-            entry_fill=Decimal(str(row["entry_fill"])),
-            exit_fill=Decimal(str(row["exit_fill"])),
-            fees=Decimal(str(row["fees"])),
-            pnl_net=Decimal(str(row["pnl_net"])),
-        )
-        for row in rows
-    ]
 
 
 def jsonl_row(review: DescriptiveReview) -> dict[str, Any]:
