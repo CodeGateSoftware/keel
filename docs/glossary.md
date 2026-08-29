@@ -23,10 +23,10 @@ Each entry is a `## term` heading, a definition, and a `Source:` line.
 ## rail
 
 One of keel's numbered hard guards that every order passes through -- spend caps, drawdown
-breakers, the allowlist, settlement-currency and spot-shape checks. Eighteen exist (1-14,
-16, 17, 18, 19 -- there is no rail 15); each is un-overridable and audit-logged.
+breakers, the allowlist, settlement-currency, spot-shape and trade-scope checks. Nineteen exist
+(1-14, 16, 17, 18, 19, 20 -- there is no rail 15); each is un-overridable and audit-logged.
 
-Source: keel's own vocabulary -- docs/fiqh-basis.md's rails table (the prudential rails 2-14, 16) plus its prose sections for rails 1, 17, 18 and 19
+Source: keel's own vocabulary -- docs/fiqh-basis.md's rails table (the prudential rails 2-14, 16, 20) plus its prose sections for rails 1, 17, 18 and 19
 
 ## attestation
 

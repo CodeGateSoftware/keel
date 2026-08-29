@@ -62,7 +62,18 @@ CANDLES_TABLE = "candles"
 ASSET_ATTESTATIONS_TABLE = "asset_attestations"
 SUBSCRIPTIONS_TABLE = "broker_subscriptions"
 STATE_TABLE = "agent_state"
+#: Rail 20's record (#233, merged the morning this step was added). Verified against the v14
+#: migration in `keel/data/db.py` -- an operator who completes `keel scope attest --trading`
+#: is still vetoed on their first live entry by a checklist that never named the command, and
+#: that is exactly the invisible failure this constants block exists to prevent: a wrong name
+#: here would make a COMPLETED step report as missing, not raise.
+VENUE_TRADE_SCOPES_TABLE = "venue_trade_scopes"
 WITHDRAWALS_STATE_KEY = "withdrawals_enabled"
+#: The venue-interest acknowledgement (#437 D4 part 2) -- who said they turned it off, and when.
+#: Never read by any rail and never makes `venue_interest_off.done` `True`; see the `ACTIONS`
+#: comment block for why recording the statement is still worth doing.
+VENUE_INTEREST_ACK_BY_KEY = "venue_interest_off_acknowledged_by"
+VENUE_INTEREST_ACK_AT_KEY = "venue_interest_off_acknowledged_at"
 
 #: Every table name above, for the pin to iterate.
 READ_TABLES: tuple[str, ...] = (
@@ -71,6 +82,7 @@ READ_TABLES: tuple[str, ...] = (
     ASSET_ATTESTATIONS_TABLE,
     SUBSCRIPTIONS_TABLE,
     STATE_TABLE,
+    VENUE_TRADE_SCOPES_TABLE,
 )
 
 
@@ -127,6 +139,17 @@ class StepState:
     done: bool | None
     #: What was actually observed, in the operator's words rather than a boolean.
     detail: str
+    #: An `OFF_VENUE` acknowledgement's provenance -- who said so, and when. `None`/`""` means
+    #: nobody has. Defaulted so `payload._step_payload`'s explicit field list needs no change:
+    #: the acknowledgement reaches the browser through `detail`'s PROSE, not through a new
+    #: payload key, which is what keeps this addition invisible to `keel/web/payload.py`.
+    #:
+    #: Deliberately NOT read by `StepState.blocking` or anywhere `done` is computed: recording an
+    #: acknowledgement must never make `done` `True` for an `OFF_VENUE` step -- see the long
+    #: comment above `ACTIONS` for why that invariant is the one this module defends hardest.
+    #: Only `DeploymentState.live_blockers` reads these, and only for `OFF_VENUE` steps.
+    acknowledged_at: int | None = None
+    acknowledged_by: str = ""
 
     @property
     def blocking(self) -> bool:
@@ -262,6 +285,22 @@ STEPS: tuple[Step, ...] = (
         how="keel withdrawals attest --enabled   (needs an interactive terminal)",
     ),
     Step(
+        key="scope_attested",
+        title="This venue's credential attested for live trading (rail 20)",
+        kind=StepKind.JUDGEMENT,
+        stage=Stage.LIVE,
+        why=(
+            "Rail 20 is a fact about the CREDENTIAL, not the asset, and it merged this morning "
+            "(#233): a key that reads fine is not evidence it can trade -- a well-formed "
+            "ROBINHOOD_API_KEY passed every read and the first live order still 403'd with 'You "
+            "do not have permission to perform this action.' Only you can verify a credential "
+            "actually places orders, so the rail fails closed on an unattested venue and keeps "
+            "failing closed until a human says otherwise. Entries only -- it never blocks an "
+            "exit, a stop roll, a cancel or a DCA exit."
+        ),
+        how="keel scope attest --trading   (needs an interactive terminal)",
+    ),
+    Step(
         key="confirm_cycle",
         title="One supervised cycle in confirm mode, verified at the venue",
         kind=StepKind.JUDGEMENT,
@@ -332,6 +371,26 @@ class DeploymentState:
                 return state
         return None
 
+    @property
+    def live_blockers(self) -> tuple[StepState, ...]:
+        """Every outstanding step blocking live, in `STEPS` order -- paper steps first, because
+        live is downstream of paper and #437's acceptance criterion says "in order".
+
+        An `OFF_VENUE` step is satisfied by ACKNOWLEDGEMENT, never by `done`: `done` can never be
+        `True` for one (see `venue_interest_off`'s doctrine, enforced above `ACTIONS`), so using
+        `.blocking` here would make this property permanently non-empty the moment a deployment
+        adds its first off-venue step -- exactly the trap `ready_for` avoids by returning `False`
+        outright instead. Every other step is satisfied only when `done is True`, unchanged.
+        """
+        blockers = []
+        for state in self.states:
+            if state.step.kind is StepKind.OFF_VENUE:
+                if state.acknowledged_at is None:
+                    blockers.append(state)
+            elif state.done is not True:
+                blockers.append(state)
+        return tuple(blockers)
+
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute(
@@ -388,6 +447,13 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
     if db_file.exists():
         try:
             conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            # `Repository` reads rows by COLUMN NAME (`row["value"]`, `row["state"]`, ...), which
+            # `_scope_observation`/`_venue_interest_observation` now call straight into for the
+            # same reason `_withdrawals_observation` stayed on raw SQL: one place to decode a
+            # `venue_trade_scopes` row (`_trade_scope_from_row`) rather than a second copy of it
+            # here. Without this, every such call raises `TypeError: tuple indices must be
+            # integers`, the default row shape this connection would otherwise have.
+            conn.row_factory = sqlite3.Row
         except sqlite3.Error as exc:
             observations["database"] = (None, f"{db_file} could not be opened: {exc}")
     else:
@@ -403,13 +469,16 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
             "assets_attested",
             "subscription_attested",
             "withdrawals_attested",
+            "scope_attested",
             "confirm_cycle",
         ):
             observations[key] = (False, "no database yet")
 
+    acks: dict[str, tuple[int | None, str]] = {}
     if conn is not None:
         try:
-            observations.update(_database_observations(conn, config, db_file))
+            db_observations, acks = _database_observations(conn, config, db_file)
+            observations.update(db_observations)
         except sqlite3.Error as exc:
             # `None`, not False: an unreadable database is not an unseeded one, and telling an
             # operator to re-run steps that may already be done is its own kind of wrong.
@@ -425,7 +494,16 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
             if step.kind is not StepKind.OFF_VENUE
             else (False, "keel cannot observe this; see below"),
         )
-        states.append(StepState(step=step, done=done, detail=detail))
+        acknowledged_at, acknowledged_by = acks.get(step.key, (None, ""))
+        states.append(
+            StepState(
+                step=step,
+                done=done,
+                detail=detail,
+                acknowledged_at=acknowledged_at,
+                acknowledged_by=acknowledged_by,
+            )
+        )
     return DeploymentState(
         root=config_file.parent, config_path=config_file, db_path=db_file, states=tuple(states)
     )
@@ -433,13 +511,18 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
 
 def _database_observations(
     conn: sqlite3.Connection, config: Any, db_file: Path
-) -> dict[str, tuple[bool | None, str]]:
-    """Everything the database can answer, as (done, detail) per step key."""
+) -> tuple[dict[str, tuple[bool | None, str]], dict[str, tuple[int | None, str]]]:
+    """Everything the database can answer, as (done, detail) per step key -- plus a second,
+    narrower map of (acknowledged_at, acknowledged_by) for whichever `OFF_VENUE` steps carry an
+    acknowledgement. Two maps rather than one because the two have different TYPES and different
+    OWNERS: the first is what `done` means, re-derived fresh on every call; the second is
+    provenance nothing here computes, only reads back."""
     out: dict[str, tuple[bool | None, str]] = {}
+    acks: dict[str, tuple[int | None, str]] = {}
 
     if not _table_exists(conn, RULES_TABLE):
         out["database"] = (False, f"{db_file} has no schema yet")
-        return out
+        return out, acks
     out["database"] = (True, f"{db_file}")
 
     rule_count = _count(conn, RULES_TABLE)
@@ -479,10 +562,12 @@ def _database_observations(
         out["subscription_attested"] = (False, "no subscription attested")
 
     out["withdrawals_attested"] = _withdrawals_observation(conn)
+    out["scope_attested"] = _scope_observation(conn, config)
+    out["venue_interest_off"], acks["venue_interest_off"] = _venue_interest_observation(conn)
     # Never observable: keel cannot see whether a human watched one order go through, and
     # inferring it from a filled row would report a supervised cycle that nobody supervised.
     out["confirm_cycle"] = (False, "keel cannot observe this -- it is yours to do and to judge")
-    return out
+    return out, acks
 
 
 #: The pair `keel fetch` needs. Both must be present: a key with no secret authenticates nothing.
@@ -556,6 +641,116 @@ def _withdrawals_observation(conn: sqlite3.Connection) -> tuple[bool | None, str
     return (True, "attested at some point -- keel status reports whether it is still fresh")
 
 
+def _utc_date(ts: int) -> str:
+    """An epoch second as a plain UTC date, for operator-facing provenance.
+
+    Mirrors `keel.commands.scope._utc_date` exactly -- a raw epoch is unreadable at the moment it
+    matters most, which for this module is an operator reading "who said they did this, and
+    when" off a checklist. Not imported from `scope.py`: this module is a pure READ of the
+    database and the config, and importing a CLI-facing command module into it for one date
+    format would be the wrong direction of dependency for a two-line function.
+    """
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d")
+
+
+def _resolved_venue(config: Any) -> str:
+    """The venue rail 20 actually gates THIS deployment on: `config.broker.name`, the same field
+    `keel.commands._common._load_cfg` binds via `bind_venue()` at process entry, defaulting to
+    coinbase exactly as `BrokerConfig` does when a config omits `broker:` entirely.
+
+    Deliberately NOT `_bound_venue_or_default` (`keel.commands._common`): that helper reads the
+    CURRENTLY BOUND venue from `keel_core.telemetry`, and `inspect` has no click context to have
+    run `_load_cfg` through -- nothing is bound here to read. Reading the field directly off the
+    config this function ALREADY has is the read-only equivalent: the same source field, with
+    the same default, resolved without a process-global side effect. Getting this wrong -- e.g.
+    hard-coding coinbase -- would report an alpaca deployment's scope step against a coinbase
+    record nothing writes, which is exactly the kind of wrongly-missing step this module's
+    constants-block comment already warns about for table names.
+    """
+    from keel.execution.guards import DEFAULT_VENUE
+
+    if config is None:
+        return DEFAULT_VENUE
+    name = getattr(getattr(config, "broker", None), "name", None)
+    return name or DEFAULT_VENUE
+
+
+def _scope_observation(conn: sqlite3.Connection, config: Any) -> tuple[bool | None, str]:
+    """Rail 20's record (#233), read through the ONE method that owns the policy.
+
+    Does not re-derive `may_place_live_entry`'s state machine: `scope.py`'s own module docstring
+    is explicit that `VenueTradeScope.may_place_live_entry()` is the one place allowed to decide
+    what `CONFIRMED`/`ATTESTED`/`REFUTED`/`UNVERIFIED` mean, and a second implementation here --
+    even a read-only one -- would be a second place to get that meaning wrong.
+
+    Distinguishes the three operator-facing cases rail 20's own guard message distinguishes: no
+    record at all, REFUTED (naming `refuted_reason` when the venue gave one), and attested
+    read-only. A `CONFIRMED` or `ATTESTED`-for-`TRADING` record is the only way this reports
+    `True`.
+    """
+    from keel_core.trade_scope import TradeScopeState
+
+    from keel.data.repository import Repository
+
+    venue = _resolved_venue(config)
+    if not _table_exists(conn, VENUE_TRADE_SCOPES_TABLE):
+        return (False, f"{venue}: no trade scope attested -- rail 20 vetoes live entries")
+
+    record = Repository(conn).get_venue_trade_scope(venue)
+    if record is None:
+        return (False, f"{venue}: no trade scope attested -- rail 20 vetoes live entries")
+    if record.may_place_live_entry():
+        return (True, f"{venue}: attested for TRADING (state={record.state.value})")
+    if record.state is TradeScopeState.REFUTED:
+        reason = f" ({record.refuted_reason})" if record.refuted_reason else ""
+        return (
+            False,
+            f"{venue}: the venue REFUSED a live placement on this credential{reason} -- "
+            "re-attest with `keel scope attest --trading` once the credential is fixed",
+        )
+    # ATTESTED-for-READ_ONLY, or UNVERIFIED -- the same pairing rail 20's own guard message uses.
+    return (
+        False,
+        f"{venue}: attested READ_ONLY (or unverified) -- rail 20 vetoes live entries until it "
+        "is attested for trading",
+    )
+
+
+def _venue_interest_observation(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[bool | None, str], tuple[int | None, str]]:
+    """Whether an acknowledgement has been recorded for `venue_interest_off` -- and, doctrinally,
+    this NEVER makes `done` `True`. `keel` cannot observe USDC Rewards/lending enrolment at
+    either venue (the module docstring's `OFF_VENUE` kind), so the first element of the return is
+    always `False`; only the wording and the second element (provenance) change once someone has
+    acknowledged.
+
+    "On <date>, <name> stated they had done this at the venue" is a TRUE statement -- about a
+    STATEMENT, not about the venue -- which is the whole argument the comment above `ACTIONS`
+    makes for why this is worth recording at all despite never being allowed to tick the box.
+    """
+    if not _table_exists(conn, STATE_TABLE):
+        return (False, "keel cannot observe this; see below"), (None, "")
+
+    from keel.data.repository import Repository
+
+    repo = Repository(conn)
+    acknowledged_by = repo.get_state(VENUE_INTEREST_ACK_BY_KEY, default=None)
+    acknowledged_at = repo.get_state(VENUE_INTEREST_ACK_AT_KEY, default=None)
+    if not acknowledged_by or acknowledged_at is None:
+        return (False, "keel cannot observe this; see below"), (None, "")
+
+    at_int = int(acknowledged_at)
+    detail = (
+        f"{acknowledged_by} stated on {_utc_date(at_int)} that this was done at the venue -- "
+        "keel did NOT and CANNOT verify it; this is why the step above is still not shown as "
+        "done"
+    )
+    return (False, detail), (at_int, str(acknowledged_by))
+
+
 def render_lines(state: DeploymentState) -> list[str]:
     """The checklist as text. ONE renderer, so the CLI and the browser cannot disagree about
     what a deployment needs."""
@@ -577,7 +772,7 @@ def render_lines(state: DeploymentState) -> list[str]:
 # -- the command ---------------------------------------------------------------------------
 
 
-@click.command("setup")
+@click.group("setup", invoke_without_command=True)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
 @click.pass_context
 def setup_cmd(ctx: click.Context, as_json: bool) -> None:
@@ -595,7 +790,18 @@ def setup_cmd(ctx: click.Context, as_json: bool) -> None:
     required because that interest is riba and accrues with no order placed, where no rail can
     see it. Those steps are therefore never shown as done -- a green check that verifies nothing
     would turn an open risk into a false assurance.
+
+    **A group since #437 part 2, and `invoke_without_command=True` so the bare command is
+    UNCHANGED.** `keel setup` with no subcommand still runs exactly this body, exactly as it did
+    when this was a plain `@click.command` -- `tests/commands/test_setup.py` pins that the
+    checklist text and the `--json` payload a bare invocation produces are identical to calling
+    `inspect`/`render_lines`/`_state_as_json` directly, which is what a silent regression in the
+    group conversion (losing `invoke_without_command`, or click's default "Missing command"
+    usage error) would break first. `setup acknowledge-venue-interest-off` is the one subcommand
+    -- see it below for why the CLI needs a write path the browser's `Action` already has.
     """
+    if ctx.invoked_subcommand is not None:
+        return
     obj = ctx.obj or {}
     state = inspect(
         obj.get("config_path") or default_config_path(),
@@ -608,6 +814,46 @@ def setup_cmd(ctx: click.Context, as_json: bool) -> None:
         click.echo(line)
 
 
+@setup_cmd.command("acknowledge-venue-interest-off")
+@click.option("--by", "acknowledged_by", required=True, help="Your name, for the record.")
+@click.option(
+    "--did-it/--not-yet",
+    "did_it",
+    required=True,
+    help=(
+        "Did you actually turn off USDC Rewards (Coinbase) and stock-lending/cash-sweep "
+        "interest (Alpaca) at the venue? keel cannot verify this either way -- see "
+        "`venue_interest_off` in `keel setup`."
+    ),
+)
+@click.pass_context
+def setup_acknowledge_venue_interest_off(
+    ctx: click.Context, acknowledged_by: str, did_it: bool
+) -> None:
+    """Record that you say you turned off venue interest/rewards. Gives the CLI the same write
+    the browser's `Action` has (#437 part 2), so a terminal-only deployment is not second-class.
+
+    **Deliberately NOT behind the TTY gate** `withdrawals attest --enabled` and `scope attest
+    --trading` use. That gate exists to stop a cron line releasing a rail veto with nobody at a
+    terminal; this command releases no rail and no capability -- `keel/capabilities.py` has no
+    entry for it, and adding `_require_interactive_confirmation` here with no capability to
+    release would be ceremony buying nothing, the same objection the withdrawal/scope gates
+    exist to avoid paying when it WOULD buy something.
+
+    This can never make the step `done`. A blank `--by` or `--not-yet` records nothing at all --
+    see `acknowledge_venue_interest_off`'s own docstring for why.
+    """
+    obj = ctx.obj or {}
+    config_path = Path(obj.get("config_path") or default_config_path())
+    db_path = Path(obj.get("db_path") or default_db_path())
+    result = acknowledge_venue_interest_off(
+        config_path,
+        db_path,
+        {"acknowledged_by": acknowledged_by, "did_it": "yes" if did_it else "no"},
+    )
+    click.echo(result.message)
+
+
 def _state_as_json(state: DeploymentState) -> dict[str, Any]:
     return {
         "root": str(state.root),
@@ -615,6 +861,9 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
         "db_path": str(state.db_path),
         "is_new": state.is_new,
         "ready_for_paper": state.ready_for(Stage.PAPER),
+        # Every outstanding step blocking live, in `STEPS` order -- see `DeploymentState.
+        # live_blockers` for the `OFF_VENUE`-is-satisfied-by-acknowledgement rule this honours.
+        "live_blockers": [item.step.key for item in state.live_blockers],
         "steps": [
             {
                 "key": item.step.key,
@@ -635,10 +884,11 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #
 # Everything below WRITES. Read the rules before adding to it:
 #
-# 1. THE INVARIANT IS THE CAPABILITY REGISTRY, not the step kind. Not one of the eleven actions
+# 1. THE INVARIANT IS THE CAPABILITY REGISTRY, not the step kind. Not one of the eight actions
 #    in `keel/capabilities.py` may be reachable from `keel/web/`, and a test scans that package
 #    to prove it. That is what stops the browser arming autonomy, releasing a halt, rebasing the
-#    high-water mark or replacing the binary.
+#    high-water mark, replacing the binary, or -- since #233 -- releasing rail 20's veto on a
+#    venue's credential.
 #
 #    `StepKind` was tried as the rule ("MECHANICAL only", then "MECHANICAL or OPERATOR_INPUT")
 #    and it was the wrong axis. Two JUDGEMENT steps -- attesting an asset, promoting a rule --
@@ -649,12 +899,34 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #    So the step-kind rule is now the SECONDARY policy it should always have been: **a wizard may
 #    record what the operator supplies; it may never supply it.** An action over a JUDGEMENT step
 #    must therefore declare inputs, every one of them required, with no defaults and nothing
-#    pre-selected -- and `OFF_VENUE` steps stay unreachable, because there is nothing there to
-#    record that would be true.
+#    pre-selected.
+#
+#    `OFF_VENUE` steps were held to be permanently unreachable for the same reason, on the theory
+#    that "there is nothing there to record that would be true". That theory does not survive
+#    contact with #437's own acceptance criterion -- "reaching live mode requires ... the
+#    venue-side checklist explicitly acknowledged" has no meaning if no action anywhere can ever
+#    record an acknowledgement -- and the module's OWN docstring already disagreed with it: "keel
+#    can show the checklist and record that you say you did it" is right there at the top of this
+#    file, three lines above "it cannot verify". The fix is not to add an exception, it is to
+#    notice that "record that you say you did it" and "there is nothing there to record" were
+#    never describing the same fact. "On <date>, <name> stated they had done this at the venue"
+#    is a statement ABOUT A STATEMENT, and it is TRUE the moment the operator makes it -- keel
+#    witnessed the claim even though it cannot witness the venue dashboard behind it. What keel
+#    may never do is let that true statement stand in for a DIFFERENT, unverifiable one ("this is
+#    actually off"), and `venue_interest_off.done` staying permanently non-`True` -- acknowledged
+#    or not -- is what keeps those two statements from merging into one. That invariant is what
+#    the runbook's "a green check verifying nothing is worse than an honest manual step" line is
+#    actually defending: a property of the CHECK MARK, not of whether a record exists behind it.
+#    So `venue_interest_off` now has an action, built to the same rule every JUDGEMENT action
+#    follows -- required inputs, no defaults, nothing pre-selected, see rule 2 -- and it writes
+#    provenance (who, when) through `detail`, never through `done`.
 #
 #    What remains CLI-only is decided by the registry, not by taste: `withdrawals attest
-#    --enabled` is one of the eleven and stays behind the TTY gate. `confirm_cycle` is not an
-#    action because it cannot be observed at all.
+#    --enabled` and `scope attest --trading` are two of the eight and stay behind the TTY gate --
+#    `scope_attested` is exactly the case this rule was written for: a JUDGEMENT step in the LIVE
+#    stage, with a capability-registry entry, and therefore no `Action` despite being a step a
+#    wizard could otherwise "collect and record". `confirm_cycle` is not an action because it
+#    cannot be observed at all.
 #
 # 2. An action with `inputs` records ONLY what was submitted. It has no defaults, no fallbacks and
 #    no "sensible guess" -- an action that could fill in a field the operator left blank is one
@@ -665,11 +937,13 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #    outcome that changed nothing -- never an overwrite, and there is deliberately no `force`
 #    parameter for any web caller to pass.
 #
-# 4. Nothing here increases what keel can DO. Not one of the eleven capability-increasing actions
+# 4. Nothing here increases what keel can DO. Not one of the eight capability-increasing actions
 #    in `keel/capabilities.py` is reachable from this module, and a test asserts the two sets are
 #    disjoint. Creating a config, a schema and a library of CANDIDATE rules leaves an engine that
 #    still places nothing: candidates trade nothing until a human promotes them, and promotion is
-#    a judgement step.
+#    a judgement step. Recording that an operator SAYS they flipped a venue dashboard switch is
+#    the same shape of non-increase: it releases no rail, and `venue_interest_off.done` never
+#    becomes `True` to make it look otherwise.
 
 
 def template_config_text(live: bool = False) -> str:
@@ -1024,6 +1298,62 @@ def promote_rule(config_path: Path, db_path: Path, values: dict[str, str]) -> Ac
     return ActionResult("rule_promoted", True, "running the backtest and gate -- progress is above")
 
 
+def acknowledge_venue_interest_off(
+    _config_path: Path, db_path: Path, values: dict[str, str]
+) -> ActionResult:
+    """Record that the operator SAYS they turned off venue interest/rewards -- never that keel
+    verified it, and never anything that makes `venue_interest_off.done` `True`. See the long
+    comment above `ACTIONS` for the doctrine this defends: "on <date>, <name> stated they had
+    done this at the venue" is a true statement about a STATEMENT, which is what makes it safe
+    to record despite keel having no way to check the venue dashboard behind it.
+
+    Shared verbatim between the browser `Action` and `keel setup acknowledge-venue-interest-off`
+    -- one implementation, so the CLI and the web cannot silently disagree about what "blank"
+    or "no" mean here.
+
+    Required inputs, no defaults and nothing pre-selected (rule 2 above), and the two failure
+    cases are both REFUSALS to write, not softened into a default:
+
+    - A blank `acknowledged_by` records nothing. Defaulting it to e.g. `"operator"` would let an
+      empty form field silently attribute an acknowledgement nobody actually made.
+    - `did_it` answering anything other than exactly `"yes"` records nothing. This is a
+      yes/no question with NO pre-selection for the same reason `pays_yield` has none in
+      `attest_asset`: an unticked box must not default to the permissive answer, and here the
+      permissive answer is "yes, I did it".
+    """
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    acknowledged_by = values.get("acknowledged_by", "").strip()
+    did_it = values.get("did_it", "").strip().lower()
+    if not acknowledged_by:
+        return ActionResult(
+            "venue_interest_off", False, "nothing recorded -- your name was blank"
+        )
+    if did_it != "yes":
+        return ActionResult(
+            "venue_interest_off",
+            False,
+            "nothing recorded -- you said you have not done this at the venue yet",
+        )
+
+    now_ts = int(time.time())
+    conn = connect(str(db_path))
+    try:
+        repo = Repository(conn)
+        repo.set_state(VENUE_INTEREST_ACK_BY_KEY, acknowledged_by)
+        repo.set_state(VENUE_INTEREST_ACK_AT_KEY, now_ts)
+        conn.commit()
+    finally:
+        conn.close()
+    return ActionResult(
+        "venue_interest_off",
+        True,
+        f"recorded: {acknowledged_by} said on {_utc_date(now_ts)} that this was done at the "
+        "venue. keel did NOT and CANNOT verify it -- this step is still never shown as done.",
+    )
+
+
 #: THE closed set of steps a machine may perform on the operator's behalf.
 ACTIONS: tuple[Action, ...] = (
     Action(
@@ -1114,6 +1444,25 @@ ACTIONS: tuple[Action, ...] = (
             "and takes minutes on a first run; the page shows its progress."
         ),
         run=fetch_market_data,
+    ),
+    Action(
+        key="venue_interest_off",
+        title="Record that you turned this off at the venue",
+        detail=(
+            "Records only that you said so, with your name and today's date. keel has no way to "
+            "see USDC Rewards or stock-lending enrolment and does not verify this -- it is never "
+            "shown as done, here or anywhere else, acknowledged or not."
+        ),
+        run=acknowledge_venue_interest_off,
+        inputs=(
+            ActionInput("acknowledged_by", "Your name", hint="who is acknowledging this"),
+            ActionInput(
+                "did_it",
+                "Did you turn off USDC Rewards / lending / cash-sweep interest at the venue?",
+                choices=("yes", "no"),
+                hint="answering anything but yes records nothing",
+            ),
+        ),
     ),
 )
 

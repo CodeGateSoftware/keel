@@ -12,20 +12,30 @@ missing one.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
+from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel.commands.setup import (
     READ_TABLES,
     STEPS,
+    VENUE_INTEREST_ACK_AT_KEY,
+    VENUE_INTEREST_ACK_BY_KEY,
+    VENUE_TRADE_SCOPES_TABLE,
     WITHDRAWALS_STATE_KEY,
+    DeploymentState,
     Stage,
     StepKind,
+    StepState,
+    acknowledge_venue_interest_off,
+    action_for,
     inspect,
     render_lines,
 )
 from keel.data.db import connect, migrate
+from keel.data.repository import Repository
 from tests.conftest import VALID_CONFIG_YAML
 
 
@@ -270,3 +280,299 @@ def test_ready_for_paper_does_not_claim_a_fresh_install_is_ready(fresh: tuple[Pa
     conflated them would call a deployment ready on the strength of a rule the gate refused."""
     config_path, db_path = fresh
     assert inspect(config_path, db_path).ready_for(Stage.PAPER) is False
+
+
+# -- the scope step (rail 20, #233) -----------------------------------------------------------
+
+
+def _upsert_scope(
+    db_path: Path,
+    *,
+    venue: str = "coinbase",
+    state: TradeScopeState = TradeScopeState.ATTESTED,
+    attested_scope: str | None = TRADING,
+    refuted_ts: int | None = None,
+    refuted_reason: str | None = None,
+) -> None:
+    conn = connect(str(db_path))
+    try:
+        Repository(conn).upsert_venue_trade_scope(
+            VenueTradeScope(
+                venue=venue,
+                state=state,
+                attested_scope=attested_scope,
+                attested_ts=1,
+                confirmed_ts=None,
+                refuted_ts=refuted_ts,
+                refuted_reason=refuted_reason,
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_venue_trade_scopes_is_a_read_table() -> None:
+    """Rail 20 merged this morning (#233): an operator who completes `keel scope attest
+    --trading` must not still be reported as blocking by a checklist that never learned the
+    table's name -- the exact invisible failure this module's constants block exists to catch."""
+    assert VENUE_TRADE_SCOPES_TABLE in READ_TABLES
+
+
+def test_scope_step_sits_between_withdrawals_and_confirm_cycle() -> None:
+    """The attestations that release rails come before the supervised cycle that exercises
+    them -- the runbook's own order."""
+    keys = [step.key for step in STEPS]
+    assert "scope_attested" in keys
+    i_withdrawals = keys.index("withdrawals_attested")
+    i_scope = keys.index("scope_attested")
+    i_confirm = keys.index("confirm_cycle")
+    assert i_withdrawals < i_scope < i_confirm
+
+    step = next(s for s in STEPS if s.key == "scope_attested")
+    assert step.stage is Stage.LIVE
+    assert step.kind is StepKind.JUDGEMENT
+    assert "scope attest" in step.how
+
+
+def test_a_venue_attested_read_only_is_reported_blocking(fresh: tuple[Path, Path]) -> None:
+    """A credential attested `--read-only` must not satisfy rail 20's step -- it is exactly the
+    record rail 20 vetoes a live entry against."""
+    config_path, db_path = fresh
+    _upsert_scope(db_path, attested_scope=READ_ONLY)
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "scope_attested")
+    assert item.done is False
+    assert item.blocking
+
+
+def test_a_venue_attested_trading_is_reported_done(fresh: tuple[Path, Path]) -> None:
+    """The positive case, guarding a pin that could pass by always reporting `False`."""
+    config_path, db_path = fresh
+    _upsert_scope(db_path, attested_scope=TRADING)
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "scope_attested")
+    assert item.done is True
+    assert not item.blocking
+
+
+def test_a_refuted_venue_is_not_reported_as_attested_and_names_the_reason(
+    fresh: tuple[Path, Path],
+) -> None:
+    config_path, db_path = fresh
+    _upsert_scope(
+        db_path,
+        state=TradeScopeState.REFUTED,
+        attested_scope=None,
+        refuted_ts=1,
+        refuted_reason="You do not have permission to perform this action.",
+    )
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "scope_attested")
+    assert item.done is False
+    assert "You do not have permission to perform this action." in item.detail
+
+
+def test_scope_observation_names_the_default_bound_venue(fresh: tuple[Path, Path]) -> None:
+    """`VALID_CONFIG_YAML` has no `broker:` section, so the bound venue is coinbase -- and the
+    detail should say so, for an operator deciding which venue's record to check."""
+    config_path, db_path = fresh
+    _upsert_scope(db_path, venue="alpaca", attested_scope=TRADING)
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "scope_attested")
+    assert item.done is False
+    assert "coinbase" in item.detail
+
+
+def test_scope_observation_follows_an_explicitly_bound_venue_not_the_default(
+    tmp_path: Path,
+) -> None:
+    """The stronger version of the pin above: a config bound to a NON-default venue must resolve
+    to THAT venue, not fall back to coinbase -- `_resolved_venue` reading `config.broker.name`
+    rather than hard-coding `DEFAULT_VENUE` is exactly what this distinguishes. Getting this
+    wrong would report an alpaca deployment against a coinbase record nothing writes (or, with
+    the hard-coded mutation, simply never resolve anything but coinbase at all)."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML + "\nbroker:\n  name: alpaca\n")
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    conn.close()
+
+    # A TRADING record on the OTHER venue (coinbase) must not satisfy an alpaca-bound deployment.
+    _upsert_scope(db_path, venue="coinbase", attested_scope=TRADING)
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "scope_attested")
+    assert item.done is False
+    assert "alpaca" in item.detail
+
+    # The matching record, on alpaca itself, does satisfy it.
+    _upsert_scope(db_path, venue="alpaca", attested_scope=TRADING)
+    state2 = inspect(config_path, db_path)
+    item2 = next(s for s in state2.states if s.step.key == "scope_attested")
+    assert item2.done is True
+    assert "alpaca" in item2.detail
+
+
+def test_no_action_exists_for_a_capability_gated_step(fresh: tuple[Path, Path]) -> None:
+    """`withdrawals attest --enabled` and `scope attest --trading` are two of the eight gated
+    actions in `keel/capabilities.py` (#436/#233) and stay CLI-only, behind the TTY gate -- a
+    browser `Action` over either would let the browser release a rail veto with nobody at a
+    terminal. `confirm_cycle` has no action because it cannot be observed at all."""
+    for key in ("withdrawals_attested", "scope_attested", "confirm_cycle"):
+        assert action_for(key) is None, key
+
+
+# -- the venue-interest acknowledgement ---------------------------------------------------------
+
+
+def test_venue_interest_off_is_never_done_before_acknowledgement(fresh: tuple[Path, Path]) -> None:
+    config_path, db_path = fresh
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "venue_interest_off")
+    assert item.done is False
+
+
+def test_venue_interest_off_is_never_done_after_acknowledgement(fresh: tuple[Path, Path]) -> None:
+    """The doctrinal pin. An acknowledgement is a record that a human SAID they did this, not a
+    verified fact about the venue, and `done` must stay permanently non-`True` regardless --
+    that is what stops a green check here from turning an open risk into a false assurance."""
+    config_path, db_path = fresh
+    result = acknowledge_venue_interest_off(
+        config_path, db_path, {"acknowledged_by": "Elmehdi", "did_it": "yes"}
+    )
+    assert result.changed is True
+
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "venue_interest_off")
+    assert item.done is not True
+    assert item.done is False
+
+
+def test_acknowledging_with_a_blank_name_records_nothing(fresh: tuple[Path, Path]) -> None:
+    config_path, db_path = fresh
+    result = acknowledge_venue_interest_off(
+        config_path, db_path, {"acknowledged_by": "   ", "did_it": "yes"}
+    )
+    assert result.changed is False
+
+    conn = connect(str(db_path))
+    try:
+        repo = Repository(conn)
+        assert repo.get_state(VENUE_INTEREST_ACK_BY_KEY) is None
+        assert repo.get_state(VENUE_INTEREST_ACK_AT_KEY) is None
+    finally:
+        conn.close()
+
+
+def test_acknowledging_no_records_nothing(fresh: tuple[Path, Path]) -> None:
+    config_path, db_path = fresh
+    result = acknowledge_venue_interest_off(
+        config_path, db_path, {"acknowledged_by": "Elmehdi", "did_it": "no"}
+    )
+    assert result.changed is False
+
+    conn = connect(str(db_path))
+    try:
+        repo = Repository(conn)
+        assert repo.get_state(VENUE_INTEREST_ACK_BY_KEY) is None
+    finally:
+        conn.close()
+
+
+def test_acknowledged_detail_carries_provenance_and_a_non_verification_clause(
+    fresh: tuple[Path, Path],
+) -> None:
+    config_path, db_path = fresh
+    before = int(time.time())
+    result = acknowledge_venue_interest_off(
+        config_path, db_path, {"acknowledged_by": "Elmehdi", "did_it": "yes"}
+    )
+    assert result.changed is True
+
+    state = inspect(config_path, db_path)
+    item = next(s for s in state.states if s.step.key == "venue_interest_off")
+    assert item.acknowledged_by == "Elmehdi"
+    assert item.acknowledged_at is not None
+    assert item.acknowledged_at >= before
+    assert item.done is not True
+    assert "Elmehdi" in item.detail
+    lowered = item.detail.lower()
+    assert "did not" in lowered and "verify" in lowered
+
+
+# -- live_blockers -------------------------------------------------------------------------------
+
+
+def test_live_blockers_is_in_steps_order_and_scope_precedes_confirm_cycle(
+    fresh: tuple[Path, Path],
+) -> None:
+    config_path, db_path = fresh
+    state = inspect(config_path, db_path)
+    blockers = state.live_blockers
+    keys = [b.step.key for b in blockers]
+    assert keys == [step.key for step in STEPS if step.key in set(keys)]
+    assert keys.index("scope_attested") < keys.index("confirm_cycle")
+
+
+def test_live_blockers_is_exactly_the_off_venue_step_until_acknowledged() -> None:
+    """Pure `DeploymentState.live_blockers`, built from hand-made `StepState`s: `inspect()` can
+    never put `confirm_cycle` at `done=True` (it is never observable), so reaching "every LIVE
+    step done except the acknowledgement" through a real deployment is impossible -- exercising
+    the property directly is the only way to check it against that precondition."""
+    states = tuple(
+        StepState(step=step, done=(step.key != "venue_interest_off"), detail="")
+        for step in STEPS
+    )
+    deployment = DeploymentState(
+        root=Path("."), config_path=Path("config.yaml"), db_path=Path("keel.db"), states=states
+    )
+    assert [b.step.key for b in deployment.live_blockers] == ["venue_interest_off"]
+
+    acknowledged = tuple(
+        s
+        if s.step.key != "venue_interest_off"
+        else StepState(
+            step=s.step, done=False, detail="ack", acknowledged_at=1, acknowledged_by="Elmehdi"
+        )
+        for s in states
+    )
+    deployment2 = DeploymentState(
+        root=deployment.root,
+        config_path=deployment.config_path,
+        db_path=deployment.db_path,
+        states=acknowledged,
+    )
+    assert deployment2.live_blockers == ()
+
+
+# -- the CLI wiring (setup became a group for the acknowledgement subcommand) -------------------
+
+
+def test_bare_setup_invocation_is_unchanged_by_becoming_a_group(fresh: tuple[Path, Path]) -> None:
+    """`setup_cmd` became a `click.Group(invoke_without_command=True)` so `acknowledge-venue-
+    interest-off` has somewhere to live. This pins that the bare invocation -- text and `--json`
+    -- still matches calling `inspect`/`render_lines`/`_state_as_json` directly: the exact thing
+    losing `invoke_without_command`, or click's default "Missing command" usage error, would
+    break."""
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    config_path, db_path = fresh
+    runner = CliRunner()
+
+    text_result = runner.invoke(cli, ["--config", str(config_path), "--db", str(db_path), "setup"])
+    assert text_result.exit_code == 0, text_result.output
+    expected_text = "\n".join(render_lines(inspect(config_path, db_path))) + "\n"
+    assert text_result.output == expected_text
+
+    json_result = runner.invoke(
+        cli, ["--config", str(config_path), "--db", str(db_path), "setup", "--json"]
+    )
+    assert json_result.exit_code == 0, json_result.output
+    import json as json_mod
+
+    from keel.commands.setup import _state_as_json
+
+    assert json_mod.loads(json_result.output) == _state_as_json(inspect(config_path, db_path))

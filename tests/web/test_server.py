@@ -191,15 +191,39 @@ def test_the_write_surface_reaches_no_capability_increasing_action() -> None:
     assert "withdrawals_attested" not in {action.key for action in ACTIONS}
 
 
-def test_no_off_venue_step_is_ever_an_action() -> None:
-    """There is nothing there to record that would be true. keel cannot see whether USDC Rewards
-    is off, and a form that recorded "I turned it off" would record what was asserted, not what
-    is -- which the operator runbook names as worse than an honest manual step."""
+def test_an_off_venue_action_never_makes_its_step_done(
+    running: web_server.ServeConfig,
+) -> None:
+    """`venue_interest_off` gained an action (#437 part 2): "on <date>, <name> stated they had
+    done this at the venue" is a true statement about a STATEMENT, and keel can record it without
+    claiming to have verified the venue dashboard behind it. What must still never happen -- the
+    doctrine this replaces was defending exactly this -- is the step reading `done=True` as a
+    result. Run the action through the real write path (CSRF, session, the lot) and check the
+    step state it leaves behind, rather than asserting the old, stronger "no action at all" rule
+    that #437 needed to relax."""
     from keel.commands.setup import ACTIONS, STEPS, StepKind
 
     off_venue = {s.key for s in STEPS if s.kind is StepKind.OFF_VENUE}
     assert off_venue, "no off-venue steps exist, so this proves nothing"
-    assert not (off_venue & {a.key for a in ACTIONS})
+    gated = off_venue & {a.key for a in ACTIONS}
+    assert gated == {"venue_interest_off"}, gated
+
+    cookie = _session(running)
+    csrf = _csrf(running)
+    status, _headers, _body = _request(
+        running,
+        "/api/setup/venue_interest_off",
+        method="POST",
+        cookie=cookie,
+        form={"acknowledged_by": "Elmehdi", "did_it": "yes"},
+        csrf=csrf,
+    )
+    assert status == 200
+
+    _status, _headers, body = _request(running, "/api/setup", cookie=cookie)
+    envelope = json.loads(body)
+    step = next(s for s in envelope["data"]["steps"] if s["key"] == "venue_interest_off")
+    assert step["done"]["value"] == "false", step
 
 
 def test_the_backing_choices_match_the_screens_own_vocabulary() -> None:
@@ -231,12 +255,21 @@ def test_promotion_offers_no_force_field() -> None:
 def test_an_action_declares_inputs_exactly_when_its_step_needs_them() -> None:
     """So a mechanical action cannot quietly start accepting operator data, and an operator-input
     action cannot quietly stop requiring it -- either drift would move a step across the line the
-    test above draws, without touching that test."""
+    test above draws, without touching that test.
+
+    `StepKind.OFF_VENUE` joined the set with `venue_interest_off`'s acknowledgement (#437 part
+    2): recording "who, and when" is exactly as much an operator-supplied fact as a judgement's
+    source, and the action declaring it without required inputs would be the thing that could
+    fill the field in on the operator's behalf."""
     from keel.commands.setup import ACTIONS, STEPS, StepKind
 
     by_key = {step.key: step for step in STEPS}
     for action in ACTIONS:
-        needs = by_key[action.key].kind in (StepKind.OPERATOR_INPUT, StepKind.JUDGEMENT)
+        needs = by_key[action.key].kind in (
+            StepKind.OPERATOR_INPUT,
+            StepKind.JUDGEMENT,
+            StepKind.OFF_VENUE,
+        )
         assert action.needs_input is needs, action.key
 
 
