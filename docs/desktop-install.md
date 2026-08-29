@@ -126,8 +126,16 @@ If you have [GitHub CLI](https://cli.github.com) installed:
 gh attestation verify <the file you downloaded> --repo CodeGateSoftware/keel
 ```
 
-A `SHA256SUMS.txt` file is attached to every release as well, if you prefer to compare checksums
-by hand.
+One `SHA256SUMS-<platform>-<arch>.txt` file **per build** is attached to every release as well
+(`SHA256SUMS-macOS-arm64.txt`, `SHA256SUMS-macOS-x86_64.txt`, `SHA256SUMS-Windows-x86_64.txt`),
+if you prefer to compare checksums by hand — there is no single file shared across all three
+builds, because one shared name would leave only the last build's sums on the release. Pick
+the file matching what you downloaded (an Apple Silicon Mac wants the `arm64` file; an Intel
+Mac or Windows wants `x86_64`) and check it from the same directory as the artifact:
+
+```
+sha256sum -c SHA256SUMS-macOS-arm64.txt   # or the file matching your platform
+```
 
 **If either check fails, do not open the file.** A failing check means the file is not the one we
 built, and no amount of clicking "Open Anyway" makes that safe.
