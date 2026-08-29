@@ -30,11 +30,13 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import click
 from keel_core.telemetry import current_venue
+from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel.data.freshness import Freshness
 from keel.execution import sizing
@@ -166,6 +168,114 @@ def attestation_findings(
                     "-",
                 )
             )
+    return findings
+
+
+def _utc_date(ts: int) -> str:
+    """`YYYY-MM-DD` -- an operator judging whether a refusal is old news cannot read a raw
+    epoch like `1750000000`; `keel scope attest`'s own doctor-facing rendering uses this same
+    shape, so a refusal date reads identically everywhere an operator sees one."""
+    return datetime.fromtimestamp(ts, tz=UTC).date().isoformat()
+
+
+def trade_scope_findings(record: VenueTradeScope | None, venue: str) -> list[Finding]:
+    """Rail 20 (#233) -- whether `venue`'s credential has proven (or can at least claim) it may
+    place a live entry. Takes the record directly, like `attestation_findings` takes
+    `subscription`, so this is unit-testable without a database.
+
+    Two independent findings can come back: the primary ok/fail verdict rail 20 itself enforces,
+    and -- only when a record has been re-attested but still carries `refuted_ts` -- a WARN
+    alongside it. That second finding is the specific operator surface the design calls out: a
+    re-attestation is how an operator reports "I rotated the credential", and the record keeps
+    `refuted_ts` through it (rather than clearing it) precisely so doctor can still say "you
+    re-attested a venue that refuted a credential on <date>" instead of the history silently
+    vanishing.
+    """
+    attest_fix = f"keel scope attest --trading --venue {venue}"
+
+    if record is None:
+        return [
+            Finding(
+                "scope.trade",
+                FAIL,
+                "no trade scope attested",
+                f"rail 20 vetoes every live entry on {venue} until the credential is attested "
+                "or the venue itself confirms one",
+                attest_fix,
+            )
+        ]
+
+    findings: list[Finding] = []
+
+    if record.state is TradeScopeState.REFUTED:
+        reason = f" ({record.refuted_reason})" if record.refuted_reason else ""
+        findings.append(
+            Finding(
+                "scope.trade",
+                FAIL,
+                "trade scope refuted",
+                f"{venue} refused a live placement on this credential{reason}; rail 20 vetoes "
+                "every live entry until it is re-attested with a working credential",
+                attest_fix,
+            )
+        )
+    elif record.state is TradeScopeState.CONFIRMED:
+        findings.append(
+            Finding(
+                "scope.trade",
+                OK,
+                "trade scope confirmed",
+                f"{venue} itself proved this credential can place live entries",
+                "-",
+            )
+        )
+    elif record.state is TradeScopeState.ATTESTED and record.attested_scope == TRADING:
+        findings.append(
+            Finding(
+                "scope.trade",
+                OK,
+                "trade scope attested for trading",
+                f"{venue}'s credential is attested for trading, but not yet confirmed by the "
+                "venue itself -- this is an unconfirmed operator claim",
+                "-",
+            )
+        )
+    elif record.state is TradeScopeState.ATTESTED and record.attested_scope == READ_ONLY:
+        findings.append(
+            Finding(
+                "scope.trade",
+                FAIL,
+                "trade scope attested read-only",
+                f"{venue}'s credential is attested read-only; rail 20 vetoes every live entry "
+                "until it is attested for trading",
+                attest_fix,
+            )
+        )
+    else:
+        # UNVERIFIED, or any other combination `may_place_live_entry()` fails closed on.
+        findings.append(
+            Finding(
+                "scope.trade",
+                FAIL,
+                "trade scope unverified",
+                f"{venue} has a trade-scope row but it is unverified; rail 20 vetoes every "
+                "live entry",
+                attest_fix,
+            )
+        )
+
+    if record.refuted_ts is not None and record.state is not TradeScopeState.REFUTED:
+        findings.append(
+            Finding(
+                "scope.trade_reattested",
+                WARN,
+                "re-attested after a refutation",
+                "you re-attested a venue that refuted a credential on "
+                f"{_utc_date(record.refuted_ts)}",
+                "-",
+            )
+        )
+
     return findings
 
 
@@ -757,6 +867,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         withdrawals_attested_at=int(repo.get_state("withdrawals_attested_at", default=0) or 0),
         now_ts=now_ts,
     )
+    findings += trade_scope_findings(repo.get_venue_trade_scope(venue), venue)
     findings += rail_state_findings(
         kill_switch=bool(repo.get_state("kill_switch", default=False)),
         streak_halt_until=int(repo.get_state("streak_halt_until", default=0) or 0),

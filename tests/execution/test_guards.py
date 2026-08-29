@@ -17,6 +17,7 @@ import pytest
 from keel_core.products import parse_spot_product_id
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import bind_venue, unbind_venue
+from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState
 
 from keel.config import (
     DEFAULT_SETTLEMENT_CURRENCIES,
@@ -32,7 +33,7 @@ from keel.data.repository import Repository
 from keel.execution import guards
 from keel.execution.guards import LIVE_STATE_RAILS, GuardResult, OrderIntent, check
 from keel.types import Side
-from tests.conftest import attest_subscription
+from tests.conftest import attest_subscription, attest_trade_scope
 
 NOW_TS = 1_700_000_000  # 2023-11-14T22:13:20Z -- well inside its UTC day for boundary tests
 
@@ -54,6 +55,10 @@ def repo() -> Repository:
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
     attest_subscription(r, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE)
+    # Rail 20 (#233) fails closed without a trade-scope record, so every test that is not ABOUT
+    # rail 20 gets the CONFIRMED shape the v13 backfill produces for an already-live venue --
+    # same reason this fixture seeds the kill-switch, feed timestamp and subscription.
+    attest_trade_scope(r, now_ts=NOW_TS)
     return r
 
 
@@ -755,6 +760,8 @@ def test_rail12_missing_feed_timestamp_treated_as_stale(repo):
     # last_feed_ts intentionally never recorded
     # attested so only rail 12 (not rail 14's unattested-fallback) trips
     _attest(fresh_repo, free_volume_usd=_LARGE_ALLOWANCE)
+    # confirmed so only rail 12 (not rail 20's missing-record fallback) trips
+    attest_trade_scope(fresh_repo, now_ts=NOW_TS)
 
     result = check(_intent(), fresh_repo, _config(), NOW_TS)
 
@@ -990,6 +997,9 @@ def _unattested_repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
+    # This helper is about rail 14 (no subscription), not rail 20 -- seed a CONFIRMED trade
+    # scope so these tests aren't incidentally vetoed by the rail this module isn't testing.
+    attest_trade_scope(r, now_ts=NOW_TS)
     return r
 
 
@@ -1155,6 +1165,9 @@ def test_rail14_reads_the_bound_venues_record_not_the_default_constants() -> Non
     repo = _unattested_repo()
     # Alpaca is attested and roomy; coinbase (the rail's historical key) is NOT.
     attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE, venue="alpaca")
+    # `_unattested_repo()` only seeds coinbase's trade scope (rail 20 is not what this test is
+    # about) -- attest alpaca's too, or rail 20 vetoes the bound venue for an unrelated reason.
+    attest_trade_scope(repo, now_ts=NOW_TS, venue="alpaca")
     token = bind_venue("alpaca")
     try:
         result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
@@ -1590,6 +1603,216 @@ def test_rail19_violation_names_the_product_and_says_what_shape_is_required(
     violation = next(v for v in result.violations if v.startswith("spot_instrument"))
     assert DERIVATIVE_SHAPED_USD_ID in violation
     assert "BASE-QUOTE" in violation
+
+
+# -- rail 20: trade scope (#233) -----------------------------------------------------------------
+#
+# A credential that reads fine is not evidence it can trade: `ROBINHOOD_API_KEY` was
+# well-formed, every read succeeded, and the first live order still 403'd with "You do not have
+# permission to perform this action." The policy that decides whether that matters lives on the
+# record itself (`VenueTradeScope.may_place_live_entry`, `keel_core/trade_scope.py`); this rail's
+# job is only to call it on the bound venue's record and fail closed when there is not one.
+
+
+def _repo_no_trade_scope() -> Repository:
+    """A compliant repo like `repo`, but with NO `venue_trade_scopes` row anywhere -- the
+    pre-#233 state every existing deployment upgrades from, and the state rail 20 must fail
+    closed on. Rail-20-specific tests build their own record with `attest_trade_scope` rather
+    than use the shared `repo` fixture, which seeds a CONFIRMED coinbase record by default."""
+    conn = connect(":memory:")
+    migrate(conn)
+    r = Repository(conn)
+    r.set_state("kill_switch", False)
+    r.set_state("last_feed_ts", NOW_TS)
+    attest_subscription(r, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE)
+    return r
+
+
+def test_rail20_vetoes_a_buy_when_the_venue_has_never_attested_or_confirmed() -> None:
+    """THE SAFETY-CRITICAL PIN. No record means nobody has ever attested or confirmed this
+    venue's credential -- unknown is not evidence it can trade, same fail-closed posture as
+    rails 12/13/17."""
+    result = check(_intent(), _repo_no_trade_scope(), _config(), NOW_TS)
+
+    assert result.ok is False
+    assert "trade_scope" in _keys(result)
+
+
+def test_rail20_does_NOT_veto_the_v13_backfilled_CONFIRMED_coinbase_record() -> None:
+    """THE PRODUCTION-INCIDENT PIN. v13 backfills a CONFIRMED record for the running Coinbase
+    deployment with no attestation in the loop at all (`attested_scope=None`) -- rail 20
+    vetoing this on upgrade would be a self-inflicted incident on a venue that has been trading
+    live the whole time."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(repo, now_ts=NOW_TS)  # CONFIRMED, attested_scope=None -- the backfill shape
+
+    result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert result.ok is True, (
+        f"rail 20 vetoed the v13-backfilled CONFIRMED coinbase record: {result.violations}"
+    )
+
+
+def test_rail20_passes_when_attested_for_trading() -> None:
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(repo, now_ts=NOW_TS, state=TradeScopeState.ATTESTED, attested_scope=TRADING)
+
+    result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_vetoes_when_attested_read_only() -> None:
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.ATTESTED, attested_scope=READ_ONLY
+    )
+
+    result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" in _keys(result)
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "read" in violation.lower()
+
+
+def test_rail20_vetoes_when_refuted_and_names_the_venues_own_reason() -> None:
+    """The refused case is a more useful operator message than a bare read-only veto: the
+    venue itself refused, and `refuted_reason` carries its own words."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.REFUTED,
+        attested_scope=None,
+        refuted_ts=NOW_TS - 1000,
+        refuted_reason="insufficient permissions",
+    )
+
+    result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" in _keys(result)
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "insufficient permissions" in violation
+    assert "refus" in violation.lower()
+
+
+def test_rail20_read_only_and_refuted_messages_are_distinguishable() -> None:
+    """'never attested' and 'attested read-only/refuted' are different operator situations
+    (rail 17's own distinction, `None` vs `False`) -- the two messages here must not read
+    identically, or an operator cannot tell which state they are actually in."""
+    never_attested = check(_intent(), _repo_no_trade_scope(), _config(), NOW_TS)
+    never_attested_violation = next(
+        v for v in never_attested.violations if v.startswith("trade_scope")
+    )
+
+    refused_repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        refused_repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.REFUTED,
+        attested_scope=None,
+        refuted_ts=NOW_TS - 1000,
+        refuted_reason="insufficient permissions",
+    )
+    refused = check(_intent(), refused_repo, _config(), NOW_TS)
+    refused_violation = next(v for v in refused.violations if v.startswith("trade_scope"))
+
+    assert never_attested_violation != refused_violation
+
+
+def test_rail20_is_ENTRIES_ONLY_sells_are_never_blocked() -> None:
+    """THE DOCTRINE PIN. Existing holdings are already ours; vetoing an EXIT over a fact about
+    the credential would strand a position that wanted out -- rails 11/16/17's own reasoning."""
+    no_record_repo = _repo_no_trade_scope()
+    sell_intent = _intent(side=Side.SELL, stop=None, rule_kind="target_harvest")
+    result = check(sell_intent, no_record_repo, _config(), NOW_TS)
+    assert "trade_scope" not in _keys(result), "no record at all must still not veto a SELL"
+
+    refused_repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        refused_repo, now_ts=NOW_TS, state=TradeScopeState.REFUTED, attested_scope=None
+    )
+    result = check(sell_intent, refused_repo, _config(), NOW_TS)
+    assert "trade_scope" not in _keys(result), "a refuted record must still not veto a SELL"
+
+
+def test_rail20_is_skipped_in_paper_mode_and_the_skip_is_recorded() -> None:
+    """Paper has no live account to verify a credential's trade scope against -- but the skip
+    is RECORDED, same contract as rails 13/17. A paper track record that silently omitted this
+    check would promote a strategy on BUYs live trading would have vetoed for lacking any
+    trade-scope evidence at all."""
+    repo = _repo_no_trade_scope()
+    intent = _intent()
+
+    live = check(intent, repo, _config(), NOW_TS)
+    assert "trade_scope" in _keys(live)
+
+    offline = check(intent, repo, _config(), NOW_TS, offline=True)
+    assert "trade_scope" not in _keys(offline)
+    assert "trade_scope" in offline.skipped_rails
+    assert "trade_scope" in LIVE_STATE_RAILS
+
+
+def test_rail20_reads_the_bound_venues_record_not_a_hardcoded_default() -> None:
+    """Venue-keyed exactly like rail 14 (#386): anything else would gate an alpaca deployment
+    on a coinbase record nothing writes. Alpaca is confirmed here; coinbase (the rail's
+    historical/default key) is NOT."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(repo, now_ts=NOW_TS, venue="alpaca")
+    token = bind_venue("alpaca")
+    try:
+        result = check(_intent(), repo, _config(), NOW_TS)
+    finally:
+        unbind_venue(token)
+
+    assert "trade_scope" not in _keys(result), (
+        f"rail 20 read a venue other than the bound one: {result.violations}"
+    )
+
+
+def test_rail20_unattested_veto_names_the_bound_venue_not_coinbase() -> None:
+    """The veto's advice is actionable only if it names the venue the operator must attest."""
+    repo = _repo_no_trade_scope()
+    token = bind_venue("alpaca")
+    try:
+        result = check(_intent(), repo, _config(), NOW_TS)
+    finally:
+        unbind_venue(token)
+
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "alpaca" in violation
+    assert "coinbase" not in violation
+
+
+def test_rail20_with_no_venue_bound_still_reads_coinbase() -> None:
+    """The compatibility pin: nothing bound (every in-process caller, every pre-existing test)
+    keeps coinbase as the answer, even when some OTHER venue's record exists in the repo."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(repo, now_ts=NOW_TS, venue="alpaca")
+
+    result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" in _keys(result)
+
+
+def test_rail20_never_vetoes_a_sell_on_an_unattested_venue_even_with_alpaca_bound() -> None:
+    """Belt-and-braces combination of the entries-only and venue-keying pins."""
+    repo = _repo_no_trade_scope()
+    token = bind_venue("alpaca")
+    try:
+        sell_intent = _intent(side=Side.SELL, stop=None, rule_kind="target_harvest")
+        result = check(sell_intent, repo, _config(), NOW_TS)
+    finally:
+        unbind_venue(token)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_violation_names_the_attest_command() -> None:
+    result = check(_intent(), _repo_no_trade_scope(), _config(), NOW_TS)
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "keel scope attest --trading" in violation
+    assert "coinbase" in violation
 
 
 # -- `_asset` and the history walk are total ---------------------------------------------------
