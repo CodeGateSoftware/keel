@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
 from keel.types import Candle, Granularity, Profile
 
@@ -98,6 +99,24 @@ def _subscription_from_row(row: sqlite3.Row) -> BrokerSubscription:
         status=SubscriptionStatus(row["status"]),
         attested_at=int(row["attested_at"]),
         attest_due_ts=int(row["attest_due_ts"]),
+    )
+
+
+def _trade_scope_from_row(row: sqlite3.Row) -> VenueTradeScope:
+    """Map a `venue_trade_scopes` row to the domain record.
+
+    `attested_scope`, `attested_ts`, `confirmed_ts`, and `refuted_ts` are all nullable: the
+    record may hold only a subset of them depending on `state` (e.g. a backfilled `CONFIRMED`
+    row has no attestation at all).
+    """
+    return VenueTradeScope(
+        venue=row["venue"],
+        state=TradeScopeState(row["state"]),
+        attested_scope=row["attested_scope"],
+        attested_ts=None if row["attested_ts"] is None else int(row["attested_ts"]),
+        confirmed_ts=None if row["confirmed_ts"] is None else int(row["confirmed_ts"]),
+        refuted_ts=None if row["refuted_ts"] is None else int(row["refuted_ts"]),
+        refuted_reason=row["refuted_reason"],
     )
 
 
@@ -457,6 +476,53 @@ class Repository:
         renders."""
         rows = self._conn.execute("SELECT * FROM broker_subscriptions ORDER BY venue").fetchall()
         return [_subscription_from_row(row) for row in rows]
+
+    # -- venue trade scope (per-venue, rail 20) ----------------------------
+
+    def get_venue_trade_scope(self, venue: str) -> VenueTradeScope | None:
+        """Return `venue`'s trade-scope record, or `None` if it has never been recorded.
+
+        `None` is meaningful, not an error: no row means nobody has attested this venue's
+        credential and nothing has confirmed it either, so callers must treat it as unknown and
+        therefore closed -- the same convention `get_broker_subscription` uses.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM venue_trade_scopes WHERE venue = ?", (venue,)
+        ).fetchone()
+        return None if row is None else _trade_scope_from_row(row)
+
+    def upsert_venue_trade_scope(self, record: VenueTradeScope) -> None:
+        """Insert or replace `record`, keyed on venue. One trade-scope record per venue."""
+        self._conn.execute(
+            """
+            INSERT INTO venue_trade_scopes (
+                venue, state, attested_scope, attested_ts, confirmed_ts, refuted_ts,
+                refuted_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(venue) DO UPDATE SET
+                state = excluded.state,
+                attested_scope = excluded.attested_scope,
+                attested_ts = excluded.attested_ts,
+                confirmed_ts = excluded.confirmed_ts,
+                refuted_ts = excluded.refuted_ts,
+                refuted_reason = excluded.refuted_reason
+            """,
+            (
+                record.venue,
+                record.state.value,
+                record.attested_scope,
+                record.attested_ts,
+                record.confirmed_ts,
+                record.refuted_ts,
+                record.refuted_reason,
+            ),
+        )
+        self._conn.commit()
+
+    def list_venue_trade_scopes(self) -> list[VenueTradeScope]:
+        """Every recorded trade scope, ordered by venue."""
+        rows = self._conn.execute("SELECT * FROM venue_trade_scopes ORDER BY venue").fetchall()
+        return [_trade_scope_from_row(row) for row in rows]
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 

@@ -4,7 +4,8 @@ Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` re
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
 enabled. `migrate()` idempotently creates the §6 tables (`transactions`, `candles`,
 `orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
-`trade_outcomes`, `positions`, `journal`) plus their indexes and a `schema_version` marker table.
+`trade_outcomes`, `positions`, `journal`, `venue_trade_scopes`) plus their indexes and a
+`schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -19,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -189,6 +190,17 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         status                  TEXT NOT NULL,
         attested_at             INTEGER NOT NULL,
         attest_due_ts           INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS venue_trade_scopes (
+        venue           TEXT PRIMARY KEY,
+        state           TEXT NOT NULL,
+        attested_scope  TEXT,
+        attested_ts     INTEGER,
+        confirmed_ts    INTEGER,
+        refuted_ts      INTEGER,
+        refuted_reason  TEXT
     )
     """,
     """
@@ -502,6 +514,67 @@ def _migrate_v12_positions_initial_stop(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE positions ADD COLUMN initial_stop TEXT")
 
 
+def _migrate_v13_venue_trade_scopes(conn: sqlite3.Connection) -> None:
+    """v13 adds `venue_trade_scopes` (#233). Table creation is handled by `_SCHEMA_STATEMENTS`;
+    this step backfills `'coinbase'` from order history so an upgrade does not retroactively
+    de-authorise a venue that has been trading live all along.
+
+    **The evidence.** `orders` carries no venue column, but `executor.py` writes
+    `status = 'rejected'` only when the broker REFUSED the placement -- every other status means
+    the venue ACCEPTED it -- and `reconcile.py` never writes `rejected` onto a row that was
+    accepted (it only ever arrives there from `_initial_status`, at insert time). A vetoed intent
+    never becomes a row at all: the insert happens after the guard gate. So:
+
+        SELECT 1 FROM orders WHERE mode = 'live' AND status <> 'rejected' LIMIT 1
+
+    is exactly "has this deployment ever had a live placement the venue accepted" -- proof the
+    credential can trade, supplied by the venue itself, which is why the backfilled record is
+    `CONFIRMED` rather than `ATTESTED`.
+
+    **Why `'coinbase'`, when the row carries no venue.** Follows the v2 `broker_subscriptions`
+    precedent: attribute the evidence to `'coinbase'`, today's only broker. This cannot
+    over-permit any OTHER venue, because the record is read by venue key. A deployment configured
+    for a different venue looks up ITS OWN row, finds none, and fails closed exactly as a fresh
+    install does -- a `coinbase` row is only ever read by a deployment whose `broker.name` is
+    `coinbase`, which is the deployment whose history wrote those `orders` rows in the first
+    place.
+
+    **Why this matters.** Without the backfill, the user's live Coinbase deployment -- trading
+    unattended, daily -- would upgrade into a database with no `venue_trade_scopes` row, rail 20's
+    predicate would fail closed on the missing record, and the very next live ENTRY would be
+    vetoed: a self-inflicted incident on a venue that has been working the whole time. The design
+    intends "the running deployment sees zero behaviour change"; this backfill is what delivers
+    that for an already-live venue, exactly as v2's backfill did for the subscription cap.
+
+    Idempotent the v2 way, venue-scoped rather than table-wide: skip once a `'coinbase'` row
+    exists, so an operator who has since attested (e.g. after rotating the credential) is never
+    reset. A table-wide guard would be wrong for the same reason v2's comment gives -- it would
+    skip a SECOND venue's backfill just because `coinbase` already has a row.
+    """
+    already_migrated = conn.execute(
+        "SELECT 1 FROM venue_trade_scopes WHERE venue = 'coinbase' LIMIT 1"
+    ).fetchone()
+    if already_migrated is not None:
+        return
+
+    row = conn.execute(
+        "SELECT created_at FROM orders WHERE mode = 'live' AND status <> 'rejected' "
+        "ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return
+
+    confirmed_ts = int(row["created_at"]) if row["created_at"] is not None else int(time.time())
+    conn.execute(
+        """
+        INSERT INTO venue_trade_scopes (
+            venue, state, attested_scope, attested_ts, confirmed_ts, refuted_ts, refuted_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("coinbase", "confirmed", None, None, confirmed_ts, None, None),
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -514,6 +587,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: _migrate_v10_instrument_attestations,
     11: _migrate_v11_orders_filled_quantity,
     12: _migrate_v12_positions_initial_stop,
+    13: _migrate_v13_venue_trade_scopes,
 }
 
 

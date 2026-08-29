@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 import pytest
 
 from keel.data import db
+from keel.data.repository import Repository
 
 
 def _v1_database() -> sqlite3.Connection:
@@ -46,7 +48,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 12
+    assert version == db.SCHEMA_VERSION == 13
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -288,3 +290,257 @@ def test_an_existing_orders_table_gains_filled_quantity_by_ALTER() -> None:
     assert row["filled_quantity"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert stamped == db.SCHEMA_VERSION
+
+
+# -- v13: venue_trade_scopes, and the #233 coinbase backfill -----------------
+
+
+def _v12_database() -> sqlite3.Connection:
+    """A database stamped at v12, with the `orders` table exactly as today's schema (unchanged
+    since v11) so rows inserted here are what the v13 migration's backfill reads."""
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (12)")
+    conn.execute(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_type TEXT,
+            qty TEXT NOT NULL,
+            limit_price TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            fee TEXT,
+            expected_fill TEXT,
+            actual_fill TEXT,
+            filled_quantity TEXT,
+            raw_response TEXT,
+            confirmation TEXT,
+            rule_id INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _insert_order(
+    conn: sqlite3.Connection,
+    *,
+    mode: str,
+    status: str,
+    created_at: int | None,
+    product_id: str = "BTC-USD",
+) -> None:
+    conn.execute(
+        "INSERT INTO orders (mode, product_id, side, qty, status, created_at, updated_at) "
+        "VALUES (?, ?, 'BUY', '0.01', ?, ?, ?)",
+        (mode, product_id, status, created_at, created_at),
+    )
+    conn.commit()
+
+
+def _trade_scope_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute("SELECT * FROM venue_trade_scopes").fetchall())
+
+
+def _create_venue_trade_scopes_table(conn: sqlite3.Connection) -> None:
+    """Calling `_migrate_v13_venue_trade_scopes` directly (to reach its own early-return guard,
+    bypassing `db.migrate()`'s version gate) skips the `_SCHEMA_STATEMENTS` pass that normally
+    creates this table first -- so direct-call tests must create it themselves."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS venue_trade_scopes (
+            venue           TEXT PRIMARY KEY,
+            state           TEXT NOT NULL,
+            attested_scope  TEXT,
+            attested_ts     INTEGER,
+            confirmed_ts    INTEGER,
+            refuted_ts      INTEGER,
+            refuted_reason  TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def test_v13_backfill_keeps_a_live_coinbase_deployment_trading() -> None:
+    """THE test that matters most here. A running Coinbase deployment that has already placed a
+    live order must come out of this migration still able to trade -- if it does not, rail 20's
+    next cycle vetoes a live ENTRY on a venue that has been working the whole time, on an
+    unattended deployment that trades daily. That is the production incident this backfill
+    exists to prevent."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+
+    db.migrate(conn)
+
+    scope = Repository(conn).get_venue_trade_scope("coinbase")
+    assert scope is not None, (
+        "no venue_trade_scopes row after upgrading a database with a live accepted order -- "
+        "rail 20 will fail closed on the next live ENTRY and veto a venue that already works"
+    )
+    assert scope.may_place_live_entry() is True, (
+        "backfilled coinbase record must permit a live entry, or upgrading breaks a venue that "
+        "was already trading unattended"
+    )
+
+
+def test_v13_creates_the_venue_trade_scopes_table() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
+    assert cols >= {
+        "venue", "state", "attested_scope", "attested_ts", "confirmed_ts", "refuted_ts",
+        "refuted_reason",
+    }
+
+
+def test_v13_fresh_database_gets_no_trade_scope_row() -> None:
+    """keel ships inert: no order history means no backfill evidence, by design."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    assert _trade_scope_rows(conn) == []
+
+
+def test_v13_backfill_is_confirmed_not_attested() -> None:
+    """The venue proved this, nobody attested it: attested_scope/attested_ts stay NULL."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+    db.migrate(conn)
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["venue"] == "coinbase"
+    assert row["state"] == "confirmed"
+    assert row["attested_scope"] is None
+    assert row["attested_ts"] is None
+    assert row["confirmed_ts"] == 1_700_000_000
+    assert row["refuted_ts"] is None
+
+
+def test_v13_backfill_uses_the_most_recent_qualifying_order() -> None:
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_600_000_000)
+    _insert_order(conn, mode="live", status="canceled", created_at=1_700_000_000)
+    db.migrate(conn)
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["confirmed_ts"] == 1_700_000_000
+
+
+def test_v13_backfill_falls_back_to_now_when_created_at_is_null() -> None:
+    """Old rows may have no `created_at` at all; the fallback must still produce a usable
+    timestamp rather than NULL."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=None)
+    before = int(time.time())
+
+    db.migrate(conn)
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["confirmed_ts"] is not None
+    assert row["confirmed_ts"] >= before
+
+
+def test_v13_paper_only_database_gets_no_backfill() -> None:
+    """Mutation-relevant: the `mode = 'live'` filter must exclude paper orders, or a
+    paper-trading-only database would be wrongly marked as having a confirmed live venue."""
+    conn = _v12_database()
+    _insert_order(conn, mode="paper", status="filled", created_at=1_700_000_000)
+    db.migrate(conn)
+    assert _trade_scope_rows(conn) == []
+
+
+def test_v13_rejected_only_database_gets_no_backfill() -> None:
+    """Mutation-relevant: a venue whose only live order was REFUSED must not be marked
+    confirmed -- `rejected` means the broker declined the placement, not accepted it."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="rejected", created_at=1_700_000_000)
+    db.migrate(conn)
+    assert _trade_scope_rows(conn) == []
+
+
+def test_v13_migration_is_idempotent() -> None:
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+    db.migrate(conn)
+    db.migrate(conn)
+    db.migrate(conn)
+    assert len(_trade_scope_rows(conn)) == 1
+
+
+def test_v13_migration_does_not_overwrite_an_existing_attestation() -> None:
+    """`db.migrate()` itself is idempotent across repeated calls (it never re-invokes a step
+    once the stored version reaches that step's target), which this also pins. It is NOT,
+    however, a test of the migration function's own early-return guard -- see the direct-call
+    test below for that."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+    db.migrate(conn)
+    conn.execute(
+        "UPDATE venue_trade_scopes SET state = 'attested', attested_scope = 'trading', "
+        "attested_ts = 1800000000 WHERE venue = 'coinbase'"
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["state"] == "attested"
+    assert row["attested_scope"] == "trading"
+
+
+def test_v13_migration_step_does_not_overwrite_an_existing_attestation_when_rerun() -> None:
+    """Exercises `_migrate_v13_venue_trade_scopes`'s own early-return guard directly.
+
+    `db.migrate()`'s version gate (`if current < target`) means this step is never invoked a
+    second time through the public API once a database is stamped at 13 -- so a test that only
+    calls `db.migrate()` twice (the test above) would stay green even if the guard were deleted
+    outright. Calling the migration function itself, twice, is the only way to actually reach it.
+    """
+    conn = _v12_database()
+    _create_venue_trade_scopes_table(conn)
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+    db._migrate_v13_venue_trade_scopes(conn)
+    conn.commit()
+    conn.execute(
+        "UPDATE venue_trade_scopes SET state = 'attested', attested_scope = 'trading', "
+        "attested_ts = 1800000000 WHERE venue = 'coinbase'"
+    )
+    conn.commit()
+
+    db._migrate_v13_venue_trade_scopes(conn)
+    conn.commit()
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["state"] == "attested"
+    assert row["attested_scope"] == "trading"
+
+
+def test_v13_migration_bumps_the_stored_version() -> None:
+    conn = _v12_database()
+    db.migrate(conn)
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 13
+
+
+def test_v13_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
+    """The guard is scoped to `venue = 'coinbase'`, not the whole table: a pre-existing row for
+    some OTHER venue must not suppress coinbase's own backfill. Calls the migration function
+    directly, for the same reason as the guard test above -- there is no present-day path that
+    writes a non-coinbase row before v13 runs through `db.migrate()`."""
+    conn = _v12_database()
+    _create_venue_trade_scopes_table(conn)
+    _insert_order(conn, mode="live", status="filled", created_at=1_700_000_000)
+    conn.execute("INSERT INTO venue_trade_scopes (venue, state) VALUES ('kraken', 'unverified')")
+    conn.commit()
+
+    db._migrate_v13_venue_trade_scopes(conn)
+    conn.commit()
+
+    rows = {r["venue"]: r["state"] for r in _trade_scope_rows(conn)}
+    assert rows == {"coinbase": "confirmed", "kraken": "unverified"}

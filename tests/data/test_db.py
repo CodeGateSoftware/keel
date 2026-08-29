@@ -107,7 +107,7 @@ def test_schema_version_is_12():
     """Deliberate tripwire: bump this literal consciously on every schema change."""
     from keel.data.db import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
 
 
 def test_a_v6_database_migrates_up_and_gains_the_profile_table(tmp_path):
