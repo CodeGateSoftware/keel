@@ -95,10 +95,10 @@ FLOOR_TOML="${TMP_DIR}/release-pyproject.toml"
 
 #: The fallback floor, used only if the fetch or the parse below fails: the floor the
 #: SHIPPED WHEELS declare -- the releases this installer can pick currently ship
-#: `requires-python = ">=3.11"`. UPDATE THIS CONSTANT when a GitHub Release raises the
+#: `requires-python = ">=3.14"`. UPDATE THIS CONSTANT when a GitHub Release raises the
 #: floor its wheels declare (check the oldest release still installable, never the
 #: development tree -- enforcing the dev tree's floor here is exactly bug #557).
-FALLBACK_FLOOR="3.11"
+FALLBACK_FLOOR="3.14"
 
 FLOOR=""
 if curl -fsSL "$FLOOR_URL" -o "$FLOOR_TOML" 2>/dev/null; then

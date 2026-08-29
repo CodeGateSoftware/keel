@@ -240,7 +240,7 @@ jobs:
               echo
               echo "**Prefer no warning at all?** Install from the wheels above instead — nothing"
               echo "is downloaded as an application, so nothing objects. Needs a terminal and"
-              echo "Python 3.11+."
+              echo "Python 3.14+."
               echo
               echo "Full explanation, including how to check what you downloaded:"
               echo "<https://github.com/${{ github.repository }}/blob/main/docs/desktop-install.md>"

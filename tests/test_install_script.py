@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -202,13 +203,38 @@ def test_the_no_python_failure_names_remedies(script: str) -> None:
 
 
 def test_no_development_tree_floor_remains_in_code(code: list[str]) -> None:
-    """The dev tree's floor (3.14 when #557 was filed) must not survive anywhere the
-    script ENFORCES or states it -- comments may cite the history, only code can apply
-    the wrong floor (the same split the absence tests above make)."""
-    offenders = [line for line in code if "3.14" in line]
+    """The dev tree's floor must not survive anywhere the script ENFORCES or states it,
+    outside the one sanctioned constant -- comments may cite the history, only code can
+    apply the wrong floor (the same split the absence tests above make).
+
+    `FALLBACK_FLOOR` is the one line allowed to hold this number: it names the SHIPPED
+    floor, kept in sync by hand with the last release (#557), and it can legitimately
+    equal the dev tree's floor when the two happen to agree -- as they do right now,
+    since v0.12.0 already shipped #546's raised floor (#595). Anywhere else, this number
+    hardcoded into enforcement logic means the fetch-from-the-release mechanism was
+    bypassed.
+
+    The forbidden value is parsed fresh from the root `pyproject.toml`, never hardcoded,
+    so this test keeps working the day `requires-python` moves again.
+
+    The exemption matches the WHOLE line (`re.fullmatch`), not merely its start: a
+    `startswith("FALLBACK_FLOOR=")` check exempts everything after a `;` too, so a
+    compound line like `FALLBACK_FLOOR="3.14"; FLOOR="3.14"` would smuggle a second,
+    real assignment past the check under the sanctioned constant's cover -- the second
+    `FLOOR="3.14"` is exactly the enforcement-code hardcode this test exists to catch."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    match = re.match(r">=\s*(\d+\.\d+)", pyproject["project"]["requires-python"])
+    assert match, "could not parse the dev tree's floor out of requires-python"
+    dev_floor = match.group(1)
+
+    sanctioned = re.compile(r'FALLBACK_FLOOR="\d+\.\d+"')
+    offenders = [
+        line for line in code if dev_floor in line and not sanctioned.fullmatch(line.strip())
+    ]
     assert not offenders, (
-        f"the dev-tree 3.14 floor is hardcoded in installer code: {offenders} -- the floor "
-        "must be derived from the release being installed (#557)"
+        f"the dev-tree {dev_floor} floor is hardcoded in installer code outside "
+        f"FALLBACK_FLOOR: {offenders} -- the floor must be derived from the release "
+        "being installed (#557)"
     )
 
 
@@ -316,40 +342,94 @@ def test_the_published_one_liner_is_qualified_for_linux(script: str) -> None:
     """README.md publishes the one-liner and docs/desktop-install.md mirrors it, both
     without qualification; on Linux the script stops at its Python step unless a
     supported interpreter is already on PATH (#557). Both places must say so and state
-    the CURRENT SHIPPED floor (3.11) -- not the development tree's floor, which is what
-    broke the Linux leg in the first place. The DMG's first-mount note (written by
-    packaging/macos_app.sh, above the pip-install-the-wheels escape hatch) tells the same
-    truth. Checked against whitespace-normalized text: the qualifier must survive the
-    repo's line wrapping, not sit on one lucky line. The README's stated floor is then
-    checked against the script's FALLBACK_FLOOR constant, so the two numbers that are
-    maintained by hand cannot drift apart silently."""
+    the floor of the LATEST RELEASE's wheels -- never `main`'s `requires-python`, which
+    is what broke the Linux leg in the first place: `main` can move the floor ahead of
+    the last shipped release, and a doc that follows `main` instead overstates the
+    wheels' actual requirement, turning away Pythons the release genuinely supports.
+    The DMG's first-mount note (written by packaging/macos_app.sh, above the
+    pip-install-the-wheels escape hatch) tells the same truth. Checked against
+    whitespace-normalized text: the qualifier must survive the repo's line wrapping, not
+    sit on one lucky line. The README's stated floor is then checked against the
+    script's FALLBACK_FLOOR constant, so the two numbers that are maintained by hand
+    cannot drift apart silently.
+
+    Two floors are parsed fresh here, never hardcoded, and never used for each other's
+    job:
+
+    - `release_floor` (`tests.test_python_floor._latest_release_floor`, read from the
+      latest git tag's own `pyproject.toml`) is what README.md, docs/desktop-install.md
+      and packaging/macos_app.sh must EQUAL -- it is the actual floor of the wheels a
+      reader following the one-liner right now will receive. An earlier version of this
+      test compared against `main`'s `requires-python` instead. That was only correct
+      by coincidence -- the release carrying #546's raised floor had already shipped
+      (v0.12.2, verified) -- and the day `main` next moves the floor ahead of a release,
+      that version would fail with a message reading as an instruction to bump these
+      docs to match `main`, restoring #557 by way of the pin meant to prevent #595.
+    - `dev_floor` (`main`'s `requires-python`) is used ONLY as a ceiling below: a doc's
+      stated floor may never exceed it, because no release's wheels can require MORE
+      than what `main` -- from which every release is eventually cut -- currently
+      requires. That is always true, so it does not need tags and cannot itself flag a
+      false #557; it is a cheap, hermetic sanity bound, not the equality check.
+
+    Skips (rather than fails) when no release tags are reachable locally -- a shallow
+    clone without fetch-tags -- since the absence of a tag says nothing about whether
+    the docs are correct; `ci.yml`'s checkout fetches tags so this runs for real there.
+    """
+    from tests.test_python_floor import _latest_release_floor
+
+    dev_pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    dev_match = re.match(r">=\s*(\d+)\.(\d+)", dev_pyproject["project"]["requires-python"])
+    assert dev_match, "could not parse a floor out of pyproject.toml's requires-python"
+    dev_floor = (int(dev_match.group(1)), int(dev_match.group(2)))
+
+    release_floor_str = _latest_release_floor()
+    if release_floor_str is None:
+        pytest.skip(
+            "no release tags reachable locally -- cannot determine the latest shipped "
+            "floor without them"
+        )
+
     readme = " ".join((_ROOT / "README.md").read_text(encoding="utf-8").split())
-    assert "On Linux" in readme and "wheels declare" in readme and "3.11" in readme, (
+    assert "On Linux" in readme and "wheels declare" in readme and release_floor_str in readme, (
         "README.md does not qualify the installer one-liner for Linux with the shipped floor"
     )
     desktop = " ".join((_ROOT / "docs" / "desktop-install.md").read_text(encoding="utf-8").split())
-    assert "wheels declare" in desktop and "3.11" in desktop, (
+    assert "wheels declare" in desktop and release_floor_str in desktop, (
         "docs/desktop-install.md does not state the shipped floor beside the one-liner"
     )
-    assert "Python 3.14 or later" not in desktop, (
-        "docs/desktop-install.md still publishes the DEV tree's floor as the installer's "
-        "requirement -- exactly the confusion #557 is about"
-    )
     dmg = " ".join((_ROOT / "packaging" / "macos_app.sh").read_text(encoding="utf-8").split())
-    assert "wheels declare" in dmg and "3.11" in dmg, (
+    assert "wheels declare" in dmg and release_floor_str in dmg, (
         "packaging/macos_app.sh's DMG note does not state the shipped floor beside the "
         "pip-install-the-wheels alternative"
     )
-    assert "Python 3.14 or later" not in dmg, (
-        "the DMG's first-mount note still publishes the DEV tree's floor as the wheels' "
-        "requirement -- the same confusion #557 is about, one mount screen later"
-    )
+
+    # The equality check above is the real invariant (matched against the latest
+    # release). This ceiling is a second, independent, tag-free guard: whatever these
+    # docs say, it can never be STRICTER than what main itself currently requires --
+    # a release cannot need more than the dev tree it was cut from currently needs.
+    wheels_pattern = re.compile(r"wheels declare `?>=\s*(\d+)\.(\d+)")
+    for name, text in (
+        ("README.md", readme),
+        ("docs/desktop-install.md", desktop),
+        ("packaging/macos_app.sh's DMG note", dmg),
+    ):
+        stated = wheels_pattern.search(text)
+        assert stated, f"{name} no longer states the wheels floor beside 'wheels declare'"
+        stated_floor = (int(stated.group(1)), int(stated.group(2)))
+        assert stated_floor <= dev_floor, (
+            f"{name} states the wheels floor as {stated.group(1)}.{stated.group(2)}, "
+            f"stricter than pyproject.toml's requires-python floor "
+            f"{dev_floor[0]}.{dev_floor[1]} -- that overstates the wheels' actual "
+            "requirement, the #557 confusion"
+        )
+
     fallback = re.search(r'^FALLBACK_FLOOR="(\d+\.\d+)"', script, re.MULTILINE)
     assert fallback, "the FALLBACK_FLOOR constant is gone from scripts/install.sh"
-    stated = re.search(r"wheels declare `?>=\s*(\d+\.\d+)", readme)
-    assert stated, "README.md no longer states the shipped floor beside the one-liner"
-    assert fallback.group(1) == stated.group(1), (
-        f"README.md states the shipped floor as {stated.group(1)!r} while the installer's "
+    stated_readme = wheels_pattern.search(readme)
+    assert stated_readme, "README.md no longer states the shipped floor beside the one-liner"
+    stated_readme_str = f"{stated_readme.group(1)}.{stated_readme.group(2)}"
+    assert fallback.group(1) == stated_readme_str, (
+        f"README.md states the shipped floor as {stated_readme_str!r} while the installer's "
         f"FALLBACK_FLOOR is {fallback.group(1)!r} -- two manual constants that must be one"
     )
 
