@@ -13,29 +13,12 @@ from decimal import Decimal, InvalidOperation
 
 import click
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
-from keel_core.telemetry import current_venue
 
-from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
+from keel.commands._common import _bound_venue_or_default, _load_cfg, _open_repo, with_disclaimer
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.execution.guards import DEFAULT_VENUE
 
 ATTESTATION_PERIOD_SEC = 365 * 24 * 3600
-
-
-def _bound_venue_or_default(venue: str | None) -> str:
-    """An explicit `--venue` wins; otherwise the venue THIS deployment trades.
-
-    That is the same binding rail 14 gates every BUY on -- the one `_load_cfg` makes at
-    process entry for telemetry (`bind_venue(config.broker.name)`) -- with coinbase when
-    nothing is bound. A `--venue` default frozen at coinbase would make an alpaca operator
-    type `--venue alpaca` on every invocation or silently write a record nothing reads.
-
-    Must be called AFTER `_load_cfg(ctx)` has run, or there is nothing bound to read.
-    """
-    if venue is not None:
-        return venue
-    return current_venue() or DEFAULT_VENUE
 
 
 @click.group("subscription")

@@ -166,6 +166,16 @@ CAPABILITIES: tuple[Capability, ...] = (
         ),
     ),
     Capability(
+        module="keel.commands.scope",
+        function="scope_attest",
+        surface="cli",
+        invocation="keel scope attest --trading",
+        increases=(
+            "rail 20 may place a live ENTRY order against this venue's credential -- it was "
+            "refused that until the credential was attested to trade"
+        ),
+    ),
+    Capability(
         module="keel.commands.update",
         function="typed_update_gate",
         surface="cli",
