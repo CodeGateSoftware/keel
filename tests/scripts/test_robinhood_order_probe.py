@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from keel_broker_api.port import TradeScopeDenied
 
 from scripts import robinhood_order_probe as probe
 from scripts.robinhood_order_probe import (
@@ -200,6 +201,25 @@ def test_a_403_is_reported_as_a_scope_finding_and_certainly_no_order() -> None:
 
     assert result["outcome"] == "refused"
     assert "no TRADE scope" in result["note"]
+
+
+def test_the_adapters_TradeScopeDenied_is_the_same_finding_as_the_raw_403() -> None:
+    """#233 PR3 made the adapter translate this venue's 403 into `TradeScopeDenied` before it
+    ever reaches this script -- and that exception carries no `.response`, so without this branch
+    the probe would fall through to UNKNOWN and tell an operator to go hunting the venue's order
+    history for an order that certainly does not exist.
+
+    Getting this backwards is worse than a wrong label. UNKNOWN means "an order may be resting
+    right now"; it is the outcome that makes a human stop and look, and spending that on a
+    refusal the venue was explicit about would teach the operator to discount the one signal this
+    script exists to raise honestly.
+    """
+    result = _classify_placement_error(TradeScopeDenied("no permission"), "coid-1")
+
+    assert result["outcome"] == "refused"
+    assert result["status"] == 403
+    assert "no TRADE scope" in result["note"]
+    assert "no permission" in result["detail"]
 
 
 def test_a_5xx_is_reported_as_UNKNOWN_because_the_order_may_exist() -> None:

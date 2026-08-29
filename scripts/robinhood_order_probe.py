@@ -73,6 +73,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from keel_broker_api.port import TradeScopeDenied
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: Fraction below the best bid the limit price is placed at, unless `--discount` says otherwise.
@@ -299,6 +301,15 @@ def plan_order(
 _CERTAIN_NO_ORDER_STATUSES = {400, 401, 403, 404, 422}
 
 
+#: The 403 finding, module-level so the raw-`HTTPError` path and the `TradeScopeDenied` path
+#: below report it with the SAME words. Two phrasings of one finding is how a reader ends up
+#: believing they are two different findings.
+_NO_TRADE_SCOPE_NOTE = (
+    "403 -- this credential has no TRADE scope. Reads succeed on it and placement "
+    "does not, which is the exact state #233 exists about. No order was created."
+)
+
+
 def _classify_placement_error(exc: Exception, client_order_id: str) -> dict[str, Any]:
     """What a failed placement actually tells us, which is not always "no order exists".
 
@@ -311,6 +322,20 @@ def _classify_placement_error(exc: Exception, client_order_id: str) -> dict[str,
     the operator it did not. So the unknown case names the `client_order_id` and says to go and
     look, because that id is the only handle anyone has on an order this process never saw.
     """
+    # #233 PR3: the adapter now translates this venue's 403 into `TradeScopeDenied` before it
+    # reaches here, and that exception carries no `.response` to read a status off. Without this
+    # branch the refusal would fall through to UNKNOWN -- "an order may be resting right now, go
+    # and look" -- for an order the venue was explicit about never creating. UNKNOWN is the
+    # outcome that makes a human stop and search the order history, and spending it on a refusal
+    # teaches the operator to discount the one signal this script exists to raise honestly.
+    if isinstance(exc, TradeScopeDenied):
+        return {
+            "outcome": "refused",
+            "status": 403,
+            "detail": str(exc)[:400],
+            "note": _NO_TRADE_SCOPE_NOTE,
+        }
+
     status = getattr(getattr(exc, "response", None), "status_code", None)
     detail = ""
     response = getattr(exc, "response", None)
@@ -321,10 +346,7 @@ def _classify_placement_error(exc: Exception, client_order_id: str) -> dict[str,
         note = (
             "the venue refused this request; no order was created"
             if status != 403
-            else (
-                "403 -- this credential has no TRADE scope. Reads succeed on it and placement "
-                "does not, which is the exact state #233 exists about. No order was created."
-            )
+            else _NO_TRADE_SCOPE_NOTE
         )
         return {"outcome": "refused", "status": status, "detail": detail, "note": note}
 
