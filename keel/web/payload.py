@@ -894,6 +894,10 @@ def _journal_entry_payload(entry: JournalEntry) -> dict[str, Any]:
     serialised without this layer deriving anything. `None` stays absent rather than becoming
     `0.00` -- a trade with no recorded net is not a break-even trade, which is the same
     distinction `render_insights` protects in HTML.
+
+    `point_index` (#602) is NOT set here -- it depends on every entry BEFORE this one in the same
+    list, which a function given one entry at a time cannot see. `journal_payload` sets it once it
+    has the whole list, right beside the loop that decides it.
     """
     return {
         "closed_at": moment(entry.closed_at),
@@ -1007,7 +1011,29 @@ def journal_payload(report: JournalReport, *, curve: EquityCurve) -> dict[str, A
     and one whose guard passed only by coincidence (the fixture happened to set
     `total_count == len(entries)`). It is now a property of the report, and Rule 6e of
     `test_console_thinness.py` bans `len()` here so the shortcut cannot be taken again.
+
+    **`point_index` (#602) is the one place this function counts rather than copies**, and the
+    count is position bookkeeping, not a figure: `build_equity_curve` draws one point per entry
+    whose `pnl_net` is not `None`, oldest first, so the position a kept entry lands at in
+    `curve.points` is exactly how many kept entries came before it -- the SAME list, in the SAME
+    order, `equity_curve_payload` below serialises `curve.points` from. Walking `report.entries`
+    here with the same skip condition gives each entry the array index of its own point in
+    `curve.points`, or `None` for a row the curve skipped (no net recorded -- nothing to
+    highlight). This mirrors `build_equity_curve`'s skip rule rather than re-deriving a figure
+    from one, and `js/main.js` trusts the mirror rather than re-deriving it a third time: it reads
+    `curve.points[Number(entry.point_index)]` directly, with no lookup of its own.
     """
+    entries = []
+    plotted = 0
+    for entry in report.entries:
+        built = _journal_entry_payload(entry)
+        if entry.pnl_net is None:
+            built["point_index"] = None
+        else:
+            built["point_index"] = str(plotted)
+            plotted += 1
+        entries.append(built)
+
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
@@ -1017,7 +1043,7 @@ def journal_payload(report: JournalReport, *, curve: EquityCurve) -> dict[str, A
         # The query echoed back. Open-ended by shape (`limit` and `since_ts` are ints), so it
         # crosses as strings -- see `stringify`.
         "filters": {str(key): stringify(value) for key, value in sorted(report.filters.items())},
-        "entries": [_journal_entry_payload(e) for e in report.entries],
+        "entries": entries,
         "curve": equity_curve_payload(curve),
     }
 

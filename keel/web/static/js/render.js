@@ -1434,42 +1434,72 @@ export function insightsView(insights, journal, sort, onSort, journalSort, onJou
   fragment.append(shown);
 
   const chart = equityChart(journal.curve, "h-curve");
-  if (chart) fragment.append(chart);
-  else fragment.append(el("p", "empty", plain(journal.curve.reading.display)));
+  if (chart) {
+    fragment.append(chart);
+    // #602: wired in `main.js`, which owns the arithmetic both actions need (resetting a
+    // `viewBox`, reading a pointer position and sizing a canvas -- see `chart.js`'s own note on
+    // why that cannot live here). `data-chart-action` is the whole interface between the two
+    // files; this one never imports `main.js`, which would be circular (`main.js` imports this
+    // module already).
+    const actions = el("div", "chartactions");
+    const reset = el("button", "chartaction", "Reset view");
+    reset.setAttribute("type", "button");
+    reset.setAttribute("data-chart-action", "reset-view");
+    const save = el("button", "chartaction", "Save as image");
+    save.setAttribute("type", "button");
+    save.setAttribute("data-chart-action", "save-image");
+    actions.append(reset, save);
+    fragment.append(actions);
+  } else {
+    fragment.append(el("p", "empty", plain(journal.curve.reading.display)));
+  }
 
-  fragment.append(
-    table(
-      "h-journal",
-      [
-        { label: "closed (UTC)", numeric: false, key: "closed_at" },
-        { label: "product", numeric: false, key: "product_id" },
-        { label: "rule", numeric: false, key: "rule_name" },
-        { label: "qty", numeric: true, key: "qty" },
-        { label: "entry", numeric: true, key: "entry_fill" },
-        { label: "exit", numeric: true, key: "exit_fill" },
-        { label: "net p&l", numeric: true, key: "pnl" },
-        { label: "fees", numeric: true, key: "fees" },
-        { label: "r", numeric: true, key: "r_multiple" },
-        { label: "outcome", numeric: false, key: "outcome" },
+  const entries = journal.entries || [];
+  const journalTable = table(
+    "h-journal",
+    [
+      { label: "closed (UTC)", numeric: false, key: "closed_at" },
+      { label: "product", numeric: false, key: "product_id" },
+      { label: "rule", numeric: false, key: "rule_name" },
+      { label: "qty", numeric: true, key: "qty" },
+      { label: "entry", numeric: true, key: "entry_fill" },
+      { label: "exit", numeric: true, key: "exit_fill" },
+      { label: "net p&l", numeric: true, key: "pnl" },
+      { label: "fees", numeric: true, key: "fees" },
+      { label: "r", numeric: true, key: "r_multiple" },
+      { label: "outcome", numeric: false, key: "outcome" },
+    ],
+    entries.map(
+      /** @param {any} entry */ (entry) => [
+        entry.closed_at,
+        plain(entry.product_id),
+        plain(entry.rule_name) || "—",
+        entry.qty,
+        entry.entry_fill,
+        entry.exit_fill,
+        entry.pnl,
+        entry.fees,
+        entry.r_multiple,
+        entry.outcome,
       ],
-      (journal.entries || []).map(
-        /** @param {any} entry */ (entry) => [
-          entry.closed_at,
-          plain(entry.product_id),
-          plain(entry.rule_name) || "—",
-          entry.qty,
-          entry.entry_fill,
-          entry.exit_fill,
-          entry.pnl,
-          entry.fees,
-          entry.r_multiple,
-          entry.outcome,
-        ],
-      ),
-      "No closed trades.",
-      { sort: journalSort, onSort: onJournalSort },
     ),
+    "No closed trades.",
+    { sort: journalSort, onSort: onJournalSort },
   );
+
+  // #602: a row whose trade has a point on the curve above is both hoverable and focusable, so
+  // `main.js` can highlight that point for a mouse user and a keyboard user alike --
+  // `tbody tr[data-point-index]:focus-within` in `keel.css` is the visible half.
+  // `entries()` pairs each built `<tr>` with the entry that produced it by POSITION, which is
+  // exactly the order `table()` renders them in -- it builds one `<tr>` per row, in the order
+  // `rows` (built from `entries` just above) gave them.
+  for (const [index, row] of journalTable.querySelectorAll("tbody tr").entries()) {
+    const entry = entries[index];
+    if (!entry || entry.point_index === null) continue;
+    row.setAttribute("data-point-index", entry.point_index);
+    row.setAttribute("tabindex", "0");
+  }
+  fragment.append(journalTable);
   return fragment;
 }
 
