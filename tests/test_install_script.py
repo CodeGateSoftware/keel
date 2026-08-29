@@ -337,42 +337,71 @@ def test_the_published_one_liner_is_qualified_for_linux(script: str) -> None:
     """README.md publishes the one-liner and docs/desktop-install.md mirrors it, both
     without qualification; on Linux the script stops at its Python step unless a
     supported interpreter is already on PATH (#557). Both places must say so and state
-    the CURRENT SHIPPED floor (3.14) -- not the development tree's floor, which is what
-    broke the Linux leg in the first place (the two happen to be the same number right
-    now -- see tests/test_python_floor.py -- but this pin checks the four hand-maintained
-    copies against EACH OTHER, not against that coincidence). The DMG's first-mount note
-    (written by packaging/macos_app.sh, above the pip-install-the-wheels escape hatch)
-    tells the same truth. Checked against whitespace-normalized text: the qualifier must
-    survive the repo's line wrapping, not sit on one lucky line. The README's stated
-    floor is then checked against the script's FALLBACK_FLOOR constant, so the two
-    numbers that are maintained by hand cannot drift apart silently."""
+    the CURRENT SHIPPED floor -- never a floor STRICTER than pyproject.toml's
+    requires-python, which is what broke the Linux leg in the first place: a doc
+    overstating the wheels' requirement turns away Pythons the wheels actually support.
+    The DMG's first-mount note (written by packaging/macos_app.sh, above the
+    pip-install-the-wheels escape hatch) tells the same truth. Checked against
+    whitespace-normalized text: the qualifier must survive the repo's line wrapping, not
+    sit on one lucky line. The README's stated floor is then checked against the
+    script's FALLBACK_FLOOR constant, so the two numbers that are maintained by hand
+    cannot drift apart silently.
+
+    The expected floor is parsed fresh from `pyproject.toml`'s `requires-python` here,
+    the same derivation `tests/test_python_floor.py` uses -- never hardcoded. Before
+    #595 this compared against a literal `"3.14"`: a second pin over the same four
+    files, independent of the derived one, that would go stale and fail pointing at
+    ITSELF on the next floor bump instead of at the docs that actually need editing.
+    """
+    dev_pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    dev_match = re.match(r">=\s*(\d+)\.(\d+)", dev_pyproject["project"]["requires-python"])
+    assert dev_match, "could not parse a floor out of pyproject.toml's requires-python"
+    dev_floor = (int(dev_match.group(1)), int(dev_match.group(2)))
+    floor = f"{dev_floor[0]}.{dev_floor[1]}"
+
     readme = " ".join((_ROOT / "README.md").read_text(encoding="utf-8").split())
-    assert "On Linux" in readme and "wheels declare" in readme and "3.14" in readme, (
+    assert "On Linux" in readme and "wheels declare" in readme and floor in readme, (
         "README.md does not qualify the installer one-liner for Linux with the shipped floor"
     )
     desktop = " ".join((_ROOT / "docs" / "desktop-install.md").read_text(encoding="utf-8").split())
-    assert "wheels declare" in desktop and "3.14" in desktop, (
+    assert "wheels declare" in desktop and floor in desktop, (
         "docs/desktop-install.md does not state the shipped floor beside the one-liner"
     )
-    assert "Python 3.14 or later" not in desktop, (
-        "docs/desktop-install.md still publishes the DEV tree's floor as the installer's "
-        "requirement -- exactly the confusion #557 is about"
-    )
     dmg = " ".join((_ROOT / "packaging" / "macos_app.sh").read_text(encoding="utf-8").split())
-    assert "wheels declare" in dmg and "3.14" in dmg, (
+    assert "wheels declare" in dmg and floor in dmg, (
         "packaging/macos_app.sh's DMG note does not state the shipped floor beside the "
         "pip-install-the-wheels alternative"
     )
-    assert "Python 3.14 or later" not in dmg, (
-        "the DMG's first-mount note still publishes the DEV tree's floor as the wheels' "
-        "requirement -- the same confusion #557 is about, one mount screen later"
-    )
+
+    # #557's actual complaint was never the STRING "Python 3.14 or later" -- it was the
+    # PROPERTY that a doc's stated wheels floor must never exceed what pyproject.toml
+    # actually requires, or a reader gets turned away from Pythons the wheels genuinely
+    # support. A literal-string guard against "Python 3.14 or later" broke the day the
+    # shipped floor and the dev floor became the same number (#595): it would have
+    # started forbidding an accurate sentence. This guards the property instead, which
+    # survives the two floors diverging again -- exactly when it would earn its keep.
+    wheels_pattern = re.compile(r"wheels declare `?>=\s*(\d+)\.(\d+)")
+    for name, text in (
+        ("README.md", readme),
+        ("docs/desktop-install.md", desktop),
+        ("packaging/macos_app.sh's DMG note", dmg),
+    ):
+        stated = wheels_pattern.search(text)
+        assert stated, f"{name} no longer states the wheels floor beside 'wheels declare'"
+        stated_floor = (int(stated.group(1)), int(stated.group(2)))
+        assert stated_floor <= dev_floor, (
+            f"{name} states the wheels floor as {stated.group(1)}.{stated.group(2)}, "
+            f"stricter than pyproject.toml's requires-python floor {floor!r} -- that "
+            "overstates the wheels' actual requirement, the #557 confusion"
+        )
+
     fallback = re.search(r'^FALLBACK_FLOOR="(\d+\.\d+)"', script, re.MULTILINE)
     assert fallback, "the FALLBACK_FLOOR constant is gone from scripts/install.sh"
-    stated = re.search(r"wheels declare `?>=\s*(\d+\.\d+)", readme)
-    assert stated, "README.md no longer states the shipped floor beside the one-liner"
-    assert fallback.group(1) == stated.group(1), (
-        f"README.md states the shipped floor as {stated.group(1)!r} while the installer's "
+    stated_readme = wheels_pattern.search(readme)
+    assert stated_readme, "README.md no longer states the shipped floor beside the one-liner"
+    stated_readme_str = f"{stated_readme.group(1)}.{stated_readme.group(2)}"
+    assert fallback.group(1) == stated_readme_str, (
+        f"README.md states the shipped floor as {stated_readme_str!r} while the installer's "
         f"FALLBACK_FLOOR is {fallback.group(1)!r} -- two manual constants that must be one"
     )
 
