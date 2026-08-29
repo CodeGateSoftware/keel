@@ -193,6 +193,28 @@ edge of 57.6 points or larger at 80% power in the first place. `render_family` p
 rather than the bare verdict, so the reader sees exactly why the answer is no, and the command
 still exits 0 — the question was well-formed and the evidence answered it honestly.
 
+## ⚠️ Which of these open your database read-write
+
+Worth knowing before you point one of these at a live deployment, because the toolkit is not
+consistent about it and the inconsistency is not obvious from the command names.
+
+`keel research pooled-review` opens every profile database **read-only**
+(`sqlite3.connect(f"file:{db}?mode=ro", uri=True)`) and goes out of its way to do so, because
+it is designed to be pointed at live and paper ledgers on the review date.
+
+`keel research significance --from deployment`, `factors` and `independence` do **not**. They
+reach their data through `_open_repo` (`keel/commands/_common.py:128-131`), which calls
+`migrate(conn)`, and `migrate` commits unconditionally (`keel/data/db.py:595`). So a
+nominally read-only research command opens the database read-write, and — if the binary you
+are running is newer than the file — will migrate its schema as a side effect of answering a
+question about it.
+
+This is pre-existing behaviour that every other read-only `keel` command shares, and WAL mode
+makes it survivable alongside a running agent. It is called out here rather than left implicit
+because this page is what invites you to run these against a deployment. **If that matters for
+your case, copy the database first and point the command at the copy.** The read-only seam is
+filed as its own issue; `pooled-review` shows what the fix looks like.
+
 ## What is NOT here
 
 This front door is surfacing, not new statistics. `keel research` assembles inputs, calls a
@@ -258,5 +280,20 @@ and stays that way: it was pre-registered before the review event and is frozen,
 command is new surface that gets the right behaviour — stdout, exit 0 — from the start. Before
 2026-09-30 both run the same machinery as a labelled preview, and both say so.
 
-Running the review directly against `docs/experiments/2026-09-30-pooled-review.py` still works
-unchanged, stderr/exit-2 refusal included — it remains the pre-registered driver of record.
+Running the review directly against `docs/experiments/2026-09-30-pooled-review.py` still
+behaves exactly as pre-registered — same pool definition, same dedup, same stderr/exit-2
+refusal — and it remains the driver of record.
+
+**The file, though, is not unchanged, and the trade is worth stating plainly rather than
+hiding behind "still works".** It lost 81 lines, and the reading it used to own now lives in
+`keel/commands/research.py`, which it imports across a module boundary — including
+`_connect_ro`, a private name. So a pre-registered measurement now depends on an actively
+developed CLI module, and the pre-registration's own guarantee ("the pool definition, frozen
+before the first forward trade closes") is enforced by that module's tests rather than by the
+driver being a sealed artifact.
+
+That was a deliberate choice and the alternative was worse: two readers of the same three
+tables, drifting apart silently, with the CLI and the pre-registered event disagreeing about
+what "the pool" means on the one date it matters. One reader, tested, is the safer failure
+mode. But a reader auditing the review on 2026-09-30 should know the driver is no longer
+self-contained, and should read `keel/commands/research.py` alongside it.

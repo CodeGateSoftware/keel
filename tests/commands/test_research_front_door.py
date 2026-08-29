@@ -185,6 +185,26 @@ def test_research_module_never_sorts_ranks_or_maxes():
     """AST scan over `keel/commands/research.py` itself (see the module docstring for why
     the ban is blanket, not field-aware).
 
+    **What this pin does NOT do**, stated here because an overclaim about a rail is worse
+    than no claim. It is a SHAPE check over ONE file, and two gaps follow from that:
+
+    * It sees only ranking written in `keel/commands/research.py`. A ranking computed in a
+      module this file merely prints is invisible to it -- and one exists:
+      `cts_factors.pair_stats` and `holm_adjust` both `return sorted(..., key=abs(phi),
+      reverse=True)`, so `_render_factors` prints a strict |phi|-descending table. That is
+      the compute module's own ordering of an aggregate, not this front door selecting a
+      configuration, which is why it is allowed -- but it is not something this scan
+      verified.
+    * It matches on syntax, so ranking without a `key=` slips through:
+      `sorted([(s.p_value, s.a, s.b) for s in stats])[0]` and `max(zip(scores, configs))`
+      both rank perfectly and neither trips this test.
+
+    What it DOES do is make the cheap, idiomatic way to introduce a ranking here fail
+    loudly, and force anything else to be written conspicuously enough that a reader
+    notices. The rail's real enforcement lives where the scores do -- `PBOResult` carrying
+    no configuration field (`tests/research/test_cscv.py`), `walkforward.py`'s own source
+    and field scans -- and this is a third line, not the whole defence.
+
     Mutation-verified: inserting `sorted(RESEARCH_INDEX, key=lambda r: r.module)` into the
     module made this fail with `AssertionError: sorted()/max()/min() called with key= at
     keel/commands/research.py:<line>` before being removed again; see the commit message
@@ -433,7 +453,12 @@ _REFUSAL_ARGS: dict[str, tuple[str, ...]] = {
     "significance": ("--from", "deployment"),
     "pooled-review": ("--db", "{db}"),
     "throughput": ("--venues-json", "[]"),
-    "tuning": ("--run",),
+    # An EVIDENCE refusal, deliberately not `--run`. `--run` refuses too, but for a
+    # CAPABILITY reason (optuna is a dev-only dependency this command must not import), which
+    # satisfies this pin's letter while testing nothing about the criterion it states. An
+    # explored range outside turtle_breakout's own declared bounds is the real thing: a
+    # well-formed question the declared space answers "no" to.
+    "tuning": ("--rule-kind", "turtle_breakout", "--explored-json", '{"entry": [2, 9999]}'),
     "factors": ("--product", "NO-SUCH-PRODUCT"),
     "independence": ("--rule-a", "1", "--rule-b", "2", "--granularity", "ONE_DAY"),
     "pbo": ("--ledger", "{tmp}/empty-trials.jsonl"),
@@ -486,8 +511,14 @@ def test_every_evidence_subcommand_can_refuse_on_stdout_and_exit_zero(tmp_path):
             "one (or a named exclusion in _REFUSAL_PIN_EXCLUDED) before this subcommand can "
             "be trusted to refuse rather than crash on thin evidence"
         )
+        # Only the two declared placeholders are substituted, by plain replace rather than
+        # str.format: a fixture argument can legitimately be a JSON literal, and `{"entry":
+        # [2, 9999]}` is not a format string -- `.format` read `{"entry"` as a field name and
+        # raised KeyError, which is how the tuning fixture broke when it was swapped for a
+        # real evidence refusal.
         argv = [
-            arg.format(db=str(db_path), tmp=str(tmp_path)) for arg in _REFUSAL_ARGS[name]
+            arg.replace("{db}", str(db_path)).replace("{tmp}", str(tmp_path))
+            for arg in _REFUSAL_ARGS[name]
         ]
         result = CliRunner().invoke(
             cli,

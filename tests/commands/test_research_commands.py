@@ -28,6 +28,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
@@ -56,6 +57,13 @@ def _invoke(runner: CliRunner, db: Path, tmp_path: Path, *args: str):
 
 
 # -- shared candle fixtures -------------------------------------------------------------------
+
+
+#: Jaccard for the 40-bar shared window in
+#: `test_independence_does_not_stretch_a_trade_past_the_shared_history`. A measured
+#: constant, not a derivation: it is pinned so a change in how trades are projected onto
+#: the common index shows up as a failing number rather than as a quietly different report.
+_EXPECTED_DEPTH_JACCARD = 0.3333333333333333
 
 
 def _sawtooth_candles(n: int, *, start: int = 1_700_000_000) -> list[Candle]:
@@ -495,6 +503,67 @@ def test_independence_renders_overlap_and_correlation_figures(tmp_path):
     assert re.search(r"entry distances \(n=\d+\):", result.output)
 
 
+def test_independence_does_not_stretch_a_trade_past_the_shared_history(tmp_path):
+    """Characterises `keel research independence` when the two rules' cached series differ,
+    so the common bar index has INTERIOR GAPS rather than being total.
+
+    Every other fixture here puts both rules on the same product, which makes the
+    intersection total and leaves `_vectors`' off-index branch unexercised. This one puts
+    rule 1 on BTC-USD (192 bars) and rule 2 on ETH-USD (every other one of those bars), so
+    the intersection is 96 gapped bars and trades routinely exit on a timestamp that is in
+    one rule's cache and not in the shared index.
+
+    **What this does NOT do, stated because the surrounding commit changes that branch.**
+    `_vectors` used to map an off-index exit to `n - 1` and now walks back to the previous
+    shared bar; the difference is real on the merits (`n - 1` asserts occupancy on bars the
+    shared history never observed, which can only inflate Jaccard, never deflate it) but
+    **this fixture does not distinguish the two** -- restoring the old defaulting leaves the
+    number below unchanged at 0.333..., which was verified rather than assumed. So this is a
+    characterisation pin, not a proof of the fix: it holds the gapped path executing and its
+    output stable, and it would catch a future change that moves the number. The correctness
+    argument for the projection lives in `_vectors`' own docstring, not here.
+    """
+    db = tmp_path / "indep-depth.db"
+    conn = connect(str(db))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule(
+        "turtle_breakout", {**_TURTLE_A_PARAMS, "product_id": "BTC-USD"},
+        status="candidate", now_ts=1_800_000_000,
+    )
+    repo.insert_rule(
+        "turtle_breakout", {**_TURTLE_A_PARAMS, "product_id": "ETH-USD"},
+        status="candidate", now_ts=1_800_000_000,
+    )
+    btc = _sawtooth_candles(192)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, btc)
+    # ETH keeps only every OTHER bar, so the intersection has INTERIOR gaps rather than a
+    # truncated tail. That distinction is the whole point: for a trade whose exit lies beyond
+    # the shared window, `n - 1` is the right answer (it really was held throughout). The bug
+    # is a trade whose exit falls in a HOLE -- present in one cache, absent from the
+    # intersection -- which the old code stretched to the end of the window instead of back to
+    # the previous shared bar.
+    repo.upsert_candles("ETH-USD", Granularity.ONE_DAY, btc[::2])
+    conn.close()
+
+    result = _invoke(
+        CliRunner(), db, tmp_path,
+        "research", "independence", "--rule-a", "1", "--rule-b", "2",
+    )
+    assert result.exit_code == 0, result.output
+    assert "over 96 common bars" in result.output, result.output
+
+    match = re.search(r"jaccard overlap[^0-9]*([0-9.]+)", result.output)
+    assert match, result.output
+    jaccard = float(match.group(1))
+    assert 0.0 <= jaccard <= 1.0, jaccard
+    assert jaccard == pytest.approx(_EXPECTED_DEPTH_JACCARD, abs=1e-6), (
+        f"jaccard over a gapped 96-bar shared window came out {jaccard}, expected "
+        f"{_EXPECTED_DEPTH_JACCARD} -- a change here means trades are being projected onto "
+        "the common index differently; check _vectors before updating this number"
+    )
+
+
 # == the rail, at the rendered surface ==========================================================
 #
 # The Strathern rail (cscv.py/deflate.py/walkforward.py) is pinned at the SOURCE level in
@@ -547,11 +616,25 @@ def _deflate_ledger(tmp_path: Path) -> Path:
 
 
 def test_no_evidence_subcommand_names_a_winner(tmp_path):
-    """Run `keel research pbo`/`deflate`/`walk-forward` -- the three rail-bearing aliases --
-    against fixtures that make each SUCCEED, and assert none of their rendered stdout
-    contains ranking vocabulary. Word list mirrors
-    `tests/research/test_walkforward.py::test_refusal_to_rank_enforced_by_source_scan`
-    exactly (`best`, `winner`, `optimal`), plus `top-ranked` per this issue's own ask.
+    """Run the evidence subcommands against fixtures that make each SUCCEED -- a refusal has
+    nothing to rank, so it would not exercise a renderer's word choice -- and assert none of
+    their rendered stdout names a winner.
+
+    Covers the three rail-bearing aliases (`pbo`, `deflate`, `walk-forward`) AND the four new
+    subcommands that render a report of their own (`significance`, `throughput`, `tuning`,
+    `factors`). The first version of this test drove only the three aliases while its name
+    claimed "no evidence subcommand", which was an overclaim; the six new subcommands are the
+    newest renderers on this surface and so the likeliest place a ranking phrase gets written.
+
+    The word list starts from `tests/research/test_walkforward.py::
+    test_refusal_to_rank_enforced_by_source_scan` (`best`, `winner`, `optimal`) and is widened
+    here, because that list is a source-scan vocabulary and this is an OUTPUT scan: a renderer
+    can name a winner without ever using the word "best". `highest`/`lowest`/`top-ranked`/
+    `strongest`/`ranked #` are the phrasings a report actually reaches for.
+
+    Still not a proof. A renderer could name a winner in words none of these match, and this
+    only sees the fixtures it happens to run. It is a tripwire on the obvious phrasings, and
+    it is stated as one.
 
     Mutation-verified: see the commit message for the exact renderer edit (a `best: ...`
     line added to `walkforward.render_lines`), the failure it produced here, and the revert.
@@ -592,10 +675,56 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
     assert "walk-forward:" in wf_result.output
     outputs["walk-forward"] = wf_result.output
 
+    sig_db = _turtle_db(tmp_path, name="winner-sig.db")
+    sig_result = _invoke(
+        runner, sig_db, tmp_path, "research", "significance", "--from", "rule", "--rule", "1"
+    )
+    assert sig_result.exit_code == 0, sig_result.output
+    outputs["significance"] = sig_result.output
+
+    thr_result = runner.invoke(
+        cli,
+        [
+            "research", "throughput",
+            "--venues-json",
+            json.dumps([{
+                "venue": "coinbase", "monthly_allowance": "5000",
+                "mean_trade_notional": "100", "expected_signals_per_month": "10",
+            }]),
+        ],
+    )
+    assert thr_result.exit_code == 0, thr_result.output
+    outputs["throughput"] = thr_result.output
+
+    tun_result = runner.invoke(cli, ["research", "tuning"])
+    assert tun_result.exit_code == 0, tun_result.output
+    outputs["tuning"] = tun_result.output
+
+    fac_db = tmp_path / "winner-fac.db"
+    fac_conn = connect(str(fac_db))
+    migrate(fac_conn)
+    Repository(fac_conn).upsert_candles(
+        "BTC-USD", Granularity.ONE_DAY, _factor_candles(400, seed=7)
+    )
+    fac_conn.close()
+    fac_result = _invoke(
+        runner, fac_db, tmp_path,
+        "research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY",
+    )
+    assert fac_result.exit_code == 0, fac_result.output
+    outputs["factors"] = fac_result.output
+
+    banned = (
+        "best", "winner", "optimal", "top-ranked", "top ranked",
+        "highest", "lowest", "strongest", "ranked #",
+    )
     for name, output in outputs.items():
         lowered = output.lower()
-        for word in ("best", "winner", "optimal", "top-ranked"):
-            assert word not in lowered, f"keel research {name} printed ranking word {word!r}"
+        for word in banned:
+            assert word not in lowered, (
+                f"keel research {name} printed ranking word {word!r} -- a score may report "
+                "and may gate, but naming a leader is the Strathern rail's one prohibition"
+            )
 
 
 def test_backtest_failure_during_a_fold_is_not_a_refusal(tmp_path, monkeypatch):
@@ -645,3 +774,82 @@ def test_backtest_failure_during_a_fold_is_not_a_refusal(tmp_path, monkeypatch):
     )
     assert isinstance(result.exception, ValueError), result.exception
     assert "engine bug" in str(result.exception)
+
+
+def test_operator_mistakes_in_throughput_are_not_refusals(tmp_path):
+    """`keel research throughput` must report an OPERATOR mistake as an error, not as a
+    refusal at exit 0 -- the same boundary
+    `test_backtest_failure_during_a_fold_is_not_a_refusal` pins for walk-forward.
+
+    `throughput.py` raises `ValueError` in five places and only ONE of them is
+    evidence-shaped (`InsufficientThroughput`: nothing is flowing, so no time-to-detection
+    can be stated). The other four report a caller mistake. Two are reachable from this
+    command and are pinned here:
+
+    * a non-positive `mean_trade_notional` in `--venues-json`, which
+      `VenueThroughput.trades_per_month` raises on -- a typo in an option value;
+    * a product eligible on no listed venue, which `allocate` raises on and whose own
+      docstring calls "an error the caller must fix in the eligibility table, not silently
+      droppable inventory" -- so printing it as `refused:` would be this command overruling
+      the callee's stated claim about itself.
+
+    Both were exit-0 `refused:` lines until #601 review caught them. The third assertion
+    keeps the honest refusal honest: an empty `--venues-json` still refuses at exit 0, so
+    this pin cannot be satisfied by turning every failure into an error.
+
+    Mutation-verified: see the commit message for the restored wide `except ValueError`,
+    the failures it produced here, and the revert.
+    """
+    runner = CliRunner()
+
+    typo = runner.invoke(
+        cli,
+        [
+            "research", "throughput",
+            "--venues-json",
+            json.dumps([{
+                "venue": "coinbase",
+                "monthly_allowance": "500",
+                "mean_trade_notional": "0",
+                "expected_signals_per_month": "1",
+            }]),
+        ],
+    )
+    assert typo.exit_code != 0, (
+        "a zero mean_trade_notional exited 0 -- an operator typo in --venues-json is being "
+        f"reported as an evidence refusal: {typo.output!r}"
+    )
+    assert "refused:" not in typo.output, typo.output
+
+    ineligible = runner.invoke(
+        cli,
+        [
+            "research", "throughput",
+            "--venues-json",
+            json.dumps([{
+                "venue": "coinbase",
+                "monthly_allowance": "5000",
+                "mean_trade_notional": "100",
+                "expected_signals_per_month": "10",
+            }]),
+            "--products-json",
+            json.dumps([{
+                "symbol": "AAPL",
+                "venues": ["alpaca"],
+                "mean_trade_notional": "100",
+                "expected_signals_per_month": "5",
+            }]),
+            "--allowances-json", json.dumps({"coinbase": "5000"}),
+        ],
+    )
+    assert ineligible.exit_code != 0, (
+        "a product eligible on no listed venue exited 0 -- `allocate` calls that an error "
+        f"the caller must fix, and this command relabelled it a refusal: {ineligible.output!r}"
+    )
+    assert "refused:" not in ineligible.output, ineligible.output
+
+    # ...and the one genuine refusal still refuses, so this pin cannot be satisfied by
+    # making everything an error.
+    nothing_flowing = runner.invoke(cli, ["research", "throughput", "--venues-json", "[]"])
+    assert nothing_flowing.exit_code == 0, nothing_flowing.output
+    assert "refused:" in nothing_flowing.output, nothing_flowing.output

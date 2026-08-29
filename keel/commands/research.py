@@ -47,6 +47,7 @@ or a number always lives in the module it fronts, never here.
 
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -744,9 +745,16 @@ def research_throughput(
 
     Pure arithmetic -- no db, no candles, no rule. `--venues-json` states what
     `render_report`/`months_to_target` need to know about each venue; `--products-json` +
-    `--allowances-json`, when both given, additionally run the allocator. `allocate()` raises
-    `ValueError` when a product is eligible on no listed venue: caught here and printed as a
-    refusal (#601's second bullet), never a traceback, and `throughput.py` itself is unchanged.
+    `--allowances-json`, when both given, additionally run the allocator.
+
+    ONE failure here is evidence-shaped and prints as a refusal at exit 0 (#601): nothing is
+    flowing, so no time-to-detection can be stated. It is caught by its own named type,
+    `throughput.InsufficientThroughput`. Everything else this command can hit is an OPERATOR
+    MISTAKE and exits non-zero: a non-positive `mean_trade_notional` (validated below, before
+    the module is called at all), a `--target-edge` outside (0, 1), and a product eligible on
+    no listed venue -- which `throughput.allocate`'s own docstring calls "an error the caller
+    must fix in the eligibility table, not silently droppable inventory". Reporting that as a
+    refusal would be this command overruling the callee's stated claim about itself.
     """
     try:
         venues = [
@@ -761,16 +769,30 @@ def research_throughput(
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise click.ClickException(f"--venues-json is malformed: {exc}") from exc
 
+    # An operator mistake, checked HERE rather than left to surface from inside the module:
+    # `VenueThroughput.trades_per_month` raises a bare ValueError for this, and a typo in
+    # --venues-json is a wrong request, not thin evidence. Same shape as the --target-edge
+    # check below, which this file already validated this way.
+    for venue in venues:
+        if venue.monthly_allowance is not None and venue.mean_trade_notional <= 0:
+            raise click.ClickException(
+                f"--venues-json: {venue.venue} has mean_trade_notional "
+                f"{venue.mean_trade_notional} -- must be > 0 to divide an allowance by it"
+            )
+
     edge = Decimal(str(target_edge))
     if not (Decimal(0) < edge < Decimal(1)):
         raise click.ClickException("--target-edge must be a fraction in (0, 1), e.g. 0.05")
 
     try:
         lines = throughput_mod.render_report(venues, edge)
-    except ValueError as exc:
-        # render_report's own months_to_target refuses on zero pooled trades/month (an empty
-        # --venues-json, or every venue's allowance-bound throughput rounding to nothing) --
-        # a well-formed plan the data cannot answer, not an operator mistake. Print it, exit 0.
+    except throughput_mod.InsufficientThroughput as exc:
+        # The ONE evidence-shaped failure in throughput.py, caught by its own named type
+        # rather than by a bare `except ValueError` around the whole call. render_report also
+        # reaches `trades_per_month` and `required_n_eff`, and every ValueError THOSE raise is
+        # an operator mistake; a wide catch here would print an operator's typo as `refused:`
+        # and exit 0, which is the failure `trials.py`'s walk-forward comment forbids and
+        # which this command committed until #601 review caught it.
         click.echo(f"refused: {exc}")
         return
     for line in lines:
@@ -800,8 +822,12 @@ def research_throughput(
     try:
         plans = throughput_mod.allocate(products, allowances)
     except ValueError as exc:
-        click.echo(f"refused: {exc}")
-        return
+        # NOT a refusal. `allocate` raises only for a product eligible on no listed venue,
+        # and its own docstring calls that "an error the caller must fix in the eligibility
+        # table, not silently droppable inventory". The callee states what its failure means;
+        # a front door that relabels it "refused: ..." and exits 0 is the caller overruling
+        # that claim, and would hide a mismatched --products-json/--allowances-json pair.
+        raise click.ClickException(str(exc)) from exc
 
     click.echo("")
     click.echo("allocation:")
@@ -878,9 +904,21 @@ def research_tuning(rule_kind: str | None, explored_json: str | None, run: bool)
 
     if explored_json is not None:
         assert rule_kind is not None  # guarded above
-        explored = {
-            name: (bounds[0], bounds[1]) for name, bounds in json.loads(explored_json).items()
-        }
+        try:
+            explored = {
+                name: (bounds[0], bounds[1])
+                for name, bounds in json.loads(explored_json).items()
+            }
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError, IndexError) as exc:
+            # Same treatment the sibling --venues-json/--products-json options already get: a
+            # malformed option value is an OPERATOR mistake and exits non-zero with a clean
+            # message, never a traceback. Without this, 'not json' raised JSONDecodeError,
+            # '{"period": 5}' TypeError, and '{"period": [5]}' IndexError, each straight
+            # through to the user as a stack trace.
+            raise click.ClickException(
+                f"--explored-json is malformed: {exc} -- expected an object mapping a "
+                'parameter name to a [low, high] pair, e.g. \'{"entry": [20, 40]}\''
+            ) from exc
         try:
             check = tuning_mod.explored_vs_declared(explored, rule_kind)
         except ValueError as exc:
@@ -1041,9 +1079,12 @@ def research_independence(
     """Are two rules (or two horizons of one rule) actually independent (independence.py,
     §80.16)? Correlated rules inflate N without adding independent evidence (§73.5).
 
-    Position and per-bar P&L vectors are built here over the two rules' COMMON bar index --
-    mechanical bookkeeping, not a statistic: `compare()` has no opinion on how its input
-    vectors are assembled, only on what to compute once they are aligned onto one calendar.
+    Position and per-bar P&L vectors are built here over the two rules' COMMON bar index.
+    `compare()` has no opinion on how its input vectors are assembled, only on what to compute
+    once they are aligned onto one calendar -- but "just bookkeeping" undersold it, so
+    `_vectors` below now states the two choices it makes (closed trades only; a timestamp off
+    the common index maps to the nearest bar INSIDE the trade, never to the end of history)
+    and why each is the conservative one.
     """
     repo = _open_repo(ctx)
     config = rules_mod._optional_cfg(ctx)
@@ -1083,18 +1124,46 @@ def research_independence(
             "-- nothing to compare"
         )
         return
-    index_of = {ts: i for i, ts in enumerate(common_ts)}
     n = len(common_ts)
 
     def _vectors(trades: list[Any]) -> tuple[list[int], list[Decimal], list[int]]:
+        """Project CLOSED trades onto the common index. Bookkeeping only -- but bookkeeping
+        with two decisions in it, both made the conservative way after #601 review:
+
+        * **Closed trades only**, the same population the emptiness guard above tests. An
+          open trade has no realised P&L, so it would add occupied bars to `positions` while
+          contributing nothing to `pnl`, and `compare()` correlates those two series against
+          each other -- they must describe the same set of trades or the correlation is
+          between mismatched populations. It would also have no exit bar, so counting it
+          would mean asserting occupancy through the end of history on the strength of a
+          position that has not resolved.
+        * **A timestamp missing from the common index is mapped to the nearest common bar
+          INSIDE the trade, never to the end of history.** The two rules' caches can differ
+          in depth or have gaps, so `index_of` can miss either end. Defaulting a missing
+          exit to `n - 1` (as this did before review) marks the position occupied to the
+          last bar of the common window, which inflates the Jaccard overlap `compare()`
+          reports whenever the caches disagree -- a fabricated agreement, in the one
+          direction that flatters the answer. `bisect` instead: the entry becomes the first
+          common bar at or after it, the exit the last common bar at or before it, and a
+          trade whose whole span falls outside the common window is dropped rather than
+          stretched to fill it.
+        """
         positions = [0] * n
         pnl = [Decimal(0)] * n
         entries: list[int] = []
         for trade in trades:
-            start = index_of.get(trade.entry_ts)
-            if start is None:
+            # First common bar at or after the entry; past the end means the trade opened
+            # after the shared history stops, so there is nothing to place.
+            start = bisect.bisect_left(common_ts, trade.entry_ts)
+            if start >= n:
                 continue
-            end = n - 1 if trade.exit_ts is None else index_of.get(trade.exit_ts, n - 1)
+            # Last common bar at or before the exit. A closed trade always has an exit_ts
+            # (only an open trade omits one, and those are excluded above).
+            end = bisect.bisect_right(common_ts, trade.exit_ts) - 1
+            if end < start:
+                # The trade opened and closed between two common bars, or entirely before
+                # the window: no common bar observes it.
+                continue
             entries.append(start)
             for i in range(start, end + 1):
                 positions[i] = 1
@@ -1102,8 +1171,8 @@ def research_independence(
                 pnl[end] += trade.pnl
         return positions, pnl, entries
 
-    pos_a, pnl_a, entries_a = _vectors(result_a.trades)
-    pos_b, pnl_b, entries_b = _vectors(result_b.trades)
+    pos_a, pnl_a, entries_a = _vectors(closed_a)
+    pos_b, pnl_b, entries_b = _vectors(closed_b)
 
     if not any(pos_a) or not any(pos_b):
         click.echo(

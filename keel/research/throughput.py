@@ -195,12 +195,31 @@ def allocate(products: list[Product], allowances: dict[str, Decimal | None]) -> 
     return plans
 
 
+class InsufficientThroughput(ValueError):
+    """No trades are flowing, so no time-to-detection can be stated (#601).
+
+    A NAMED type, and the only evidence-shaped failure in this module: every other
+    ``raise`` here reports a caller mistake -- a negative n, an edge outside (0, 1), a
+    non-positive mean notional, a product eligible on no listed venue -- which a front
+    door must report as an error, not as a refusal. A front end that wants to print
+    "the plan is well-formed but there is nothing to measure" as a RESULT needs to catch
+    exactly this and nothing else; catching bare ``ValueError`` around a call into this
+    module would swallow all four of the caller mistakes with it.
+
+    Subclasses ``ValueError`` so existing callers and tests that catch the broader type
+    keep working unchanged -- the narrowing is additive, not a break.
+    """
+
+
 def months_to_target(target_effective_n: Decimal, pooled_trades_per_month: Decimal) -> Decimal:
     """Months for pooled trades to accumulate ``target_effective_n`` INDEPENDENT
-    observations, applying the design effect -- never raw n."""
+    observations, applying the design effect -- never raw n.
+
+    Raises `InsufficientThroughput` (a `ValueError`) when nothing is flowing: that is the
+    one failure here a caller may honestly report as a refusal rather than an error."""
     per_month = n_eff(pooled_trades_per_month)
     if per_month <= 0:
-        raise ValueError("pooled trades per month must be > 0")
+        raise InsufficientThroughput("pooled trades per month must be > 0")
     return target_effective_n / per_month
 
 
