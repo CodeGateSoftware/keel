@@ -59,7 +59,7 @@ from typing import Any
 import click
 
 from keel.commands import rules as rules_mod
-from keel.commands._common import _open_repo
+from keel.commands._common import _open_repo_ro
 from keel.commands.rules import rules_group
 from keel.commands.trials import trials_group
 from keel.research import cts_factors as cts_factors_mod
@@ -449,7 +449,7 @@ def research_significance(
     if source == "rule" and rule_id is None:
         raise click.ClickException("--from rule requires --rule ID")
 
-    repo = _open_repo(ctx)
+    repo = _open_repo_ro(ctx)
     outcomes: list[significance_mod.OutcomeRow]
     if source == "deployment":
         rows = repo.get_trade_outcomes()
@@ -1018,7 +1018,7 @@ def research_factors(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    repo = _open_repo(ctx)
+    repo = _open_repo_ro(ctx)
     candles = repo.get_candles(product_id, gran)
     if not candles:
         click.echo(f"refused: no cached candles for {product_id} {gran.value} -- nothing to replay")
@@ -1086,7 +1086,7 @@ def research_independence(
     the common index maps to the nearest bar INSIDE the trade, never to the end of history)
     and why each is the conservative one.
     """
-    repo = _open_repo(ctx)
+    repo = _open_repo_ro(ctx)
     config = rules_mod._optional_cfg(ctx)
     try:
         resolved_a = rules_mod.resolve_rule_backtest(
