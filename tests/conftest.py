@@ -70,7 +70,7 @@ def attest_trade_scope(
     """Write a venue trade-scope record -- rail 20's baseline, the `attest_subscription`
     counterpart for #233.
 
-    Defaults to `CONFIRMED` with `attested_scope=None`: the exact shape the v13 backfill
+    Defaults to `CONFIRMED` with `attested_scope=None`: the exact shape the v14 backfill
     produces for an already-live venue, and the state that lets rail 20 admit a live entry --
     the quiet default every test not ABOUT rail 20 needs so it is not incidentally vetoed, same
     reason `attest_subscription` defaults to a roomy allowance.

@@ -56,7 +56,7 @@ def repo() -> Repository:
     r.set_state("last_feed_ts", NOW_TS)
     attest_subscription(r, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE)
     # Rail 20 (#233) fails closed without a trade-scope record, so every test that is not ABOUT
-    # rail 20 gets the CONFIRMED shape the v13 backfill produces for an already-live venue --
+    # rail 20 gets the CONFIRMED shape the v14 backfill produces for an already-live venue --
     # same reason this fixture seeds the kill-switch, feed timestamp and subscription.
     attest_trade_scope(r, now_ts=NOW_TS)
     return r
@@ -1639,7 +1639,7 @@ def test_rail20_vetoes_a_buy_when_the_venue_has_never_attested_or_confirmed() ->
 
 
 def test_rail20_does_NOT_veto_the_v13_backfilled_CONFIRMED_coinbase_record() -> None:
-    """THE PRODUCTION-INCIDENT PIN. v13 backfills a CONFIRMED record for the running Coinbase
+    """THE PRODUCTION-INCIDENT PIN. v14 backfills a CONFIRMED record for the running Coinbase
     deployment with no attestation in the loop at all (`attested_scope=None`) -- rail 20
     vetoing this on upgrade would be a self-inflicted incident on a venue that has been trading
     live the whole time."""

@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
-from keel_broker_api.port import UnsupportedOrder
+from keel_broker_api.port import TradeScopeDenied, UnsupportedOrder
 from keel_broker_api.results import (
     Balance,
     CancelOutcome,
@@ -2141,3 +2141,128 @@ def test_without_a_key_robinhood_still_mints_one_id_per_attempt() -> None:
     adapter.place_order(spec)
 
     assert transport.calls["create_order"]["body"]["client_order_id"] != first
+
+
+# --- #233: the venue's half of the trade-scope record ---------------------------------------
+
+
+class _ScopeResponse:
+    """The three attributes `requests.HTTPError.response` exposes that the classifier reads."""
+
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+class _ScopeHTTPError(Exception):
+    """Shaped like the `requests.HTTPError` `raise_for_status()` produces in the transport."""
+
+    def __init__(self, message: str, response: _ScopeResponse) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+#: **The motivating case of #233, verbatim from a live probe.** `ROBINHOOD_API_KEY` was
+#: well-formed, every read on it succeeded, and the first live order came back exactly this.
+#: Nothing recorded it, so the next run could not tell a read-only credential from a working
+#: venue -- which is the entire cost the record's second writer exists to stop paying.
+_NO_PERMISSION_BODY = '{"detail": "You do not have permission to perform this action."}'
+
+
+class _ScopeRaisingTransport(FakeTransport):
+    def __init__(self, exc: Exception, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._scope_exc = exc
+
+    def create_order(self, body: dict[str, Any]) -> Any:
+        raise self._scope_exc
+
+
+def _scope_adapter(exc: Exception) -> RobinhoodAdapter:
+    """An adapter whose reads all succeed and whose PLACEMENT raises `exc`.
+
+    The read fixtures are load-bearing, not scaffolding: `place_order` pre-flights through
+    `/trading_pairs/` and `/estimated_price/` before it ever posts. A read-only credential
+    passes every one of those, which is the whole shape of the failure -- the venue looks
+    healthy right up to the order.
+    """
+    return RobinhoodAdapter(
+        _ScopeRaisingTransport(
+            exc,
+            trading_pairs=load_fixture("rh_trading_pairs.json"),
+            estimated_price=load_fixture("rh_estimated_price.json"),
+            best_bid_ask=load_fixture("rh_best_bid_ask.json"),
+        )
+    )
+
+
+_SCOPE_SELL = MarketIOCByBase(
+    product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.001")
+)
+
+
+def test_the_observed_403_is_a_trade_scope_refusal_carrying_the_venues_own_words() -> None:
+    exc = _ScopeHTTPError("403 Client Error", _ScopeResponse(403, _NO_PERMISSION_BODY))
+
+    with pytest.raises(TradeScopeDenied) as caught:
+        _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+    # `detail` verbatim, not the JSON envelope and not a paraphrase: this string is written into
+    # `venue_trade_scopes.refuted_reason` and read back to the operator by `doctor` and
+    # `keel scope show`. Throwing the venue's own sentence away is what the 2026-08-19 incident
+    # actually cost, so reconstructing a worse one here would rebuild it a layer up.
+    assert str(caught.value) == "You do not have permission to perform this action."
+    assert caught.value.__cause__ is exc
+
+
+def test_a_403_with_an_unparseable_body_still_refutes_but_reports_what_it_has() -> None:
+    """The classification is the STATUS; the body only supplies the wording. A venue that
+    answers 403 with an HTML error page has still refused this credential, and the record must
+    learn it -- with an honest "no detail" rather than a fabricated sentence."""
+    exc = _ScopeHTTPError("403 Client Error", _ScopeResponse(403, "<html>Forbidden</html>"))
+
+    with pytest.raises(TradeScopeDenied) as caught:
+        _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+    assert "403" in str(caught.value)
+
+
+def test_a_500_does_NOT_refute_the_scope() -> None:
+    """THE constraint. `TradeScopeDenied` latches `REFUTED` and rail 20 then vetoes every live
+    ENTRY until a human types `yes` at a terminal. A transient outage that manufactured that
+    would be a worse failure than the one this design exists to fix."""
+    exc = _ScopeHTTPError("500 Server Error", _ScopeResponse(500, _NO_PERMISSION_BODY))
+
+    with pytest.raises(_ScopeHTTPError):
+        _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+
+def test_a_503_does_NOT_refute_the_scope() -> None:
+    exc = _ScopeHTTPError("503 Server Error", _ScopeResponse(503, "upstream unavailable"))
+
+    with pytest.raises(_ScopeHTTPError):
+        _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+
+def test_a_429_does_NOT_refute_the_scope() -> None:
+    """Rate limiting is the venue asking for patience, not withdrawing permission."""
+    exc = _ScopeHTTPError("429 Too Many Requests", _ScopeResponse(429, "slow down"))
+
+    with pytest.raises(_ScopeHTTPError):
+        _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+
+def test_a_timeout_does_NOT_refute_the_scope() -> None:
+    with pytest.raises(TimeoutError):
+        _scope_adapter(TimeoutError("connection timed out")).place_order(_SCOPE_SELL)
+
+
+def test_a_401_does_NOT_refute_the_scope() -> None:
+    """The 2026-08-19 incident's own signature was a 401, and it is deliberately NOT mapped
+    here. A 401 means the venue has no record of this credential -- the fix is a new key, not an
+    attestation -- and it is the state #233's readiness display names `malformed credentials`.
+    Sending that operator to `keel scope attest` would be advice that cannot work."""
+    exc = _ScopeHTTPError("401 Unauthorized", _ScopeResponse(401, "API credential is not active."))
+
+    with pytest.raises(_ScopeHTTPError):
+        _scope_adapter(exc).place_order(_SCOPE_SELL)

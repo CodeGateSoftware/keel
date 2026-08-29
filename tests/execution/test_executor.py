@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from decimal import Decimal
 from typing import Any
 
 import pytest
 from keel_broker_api.orders import BracketGTC, LimitGTC, OrderSpec
+from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 from keel_core.subscription import SubscriptionStatus
+from keel_core.telemetry import bind_venue, unbind_venue
+from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState
 
 from keel.config import (
     AutoTradeConfig,
@@ -218,7 +222,7 @@ def repo() -> Repository:
     # incidentally tripped by it; rail-14-specific tests below override with `_attest(...)`.
     _attest(r, free_volume_usd=Decimal("10000000"))
     # Rail 20 (#233) fails closed without a trade-scope record, so every test that is not ABOUT
-    # rail 20 gets the CONFIRMED shape the v13 backfill produces for an already-live venue --
+    # rail 20 gets the CONFIRMED shape the v14 backfill produces for an already-live venue --
     # same reason this fixture seeds withdrawals and the subscription above.
     attest_trade_scope(r, now_ts=NOW_TS)
     return r
@@ -3472,3 +3476,665 @@ def test_a_registry_resolved_fake_venue_serves_the_executors_port_reads(repo) ->
         fake.preview_order(
             MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("50"))
         )
+
+
+# -- #233: the venue's half of the trade-scope record ------------------------------------------
+#
+# The record has two writers. `keel scope attest` is the operator's; everything below is the
+# venue's. Before this, `_run_order` stood exactly where venue truth arrived and threw it away --
+# `place_order` failures were `log_exception` + re-raise, recorded nowhere -- so a confidently
+# wrong attestation stayed wrong forever and a working venue was indistinguishable from a
+# read-only key on the next run. That is the 2026-08-19 incident's actual cost, and these tests
+# are the whole of the fix.
+#
+# ⚠️ The negative cases below matter MORE than the positive ones. `REFUTED` latches: rail 20 then
+# vetoes every live ENTRY on this venue until a human types `yes` at a terminal. A transient 5xx
+# classified as a refusal would take a healthy live deployment off the market and require
+# physical presence to restore it -- strictly worse than the failure this design exists to fix.
+
+
+class _RefusingBroker(FakeBroker):
+    """A broker whose PLACEMENT raises `exc`; its reads and preview all succeed.
+
+    That asymmetry is the shape of the failure being modelled: a credential without trade scope
+    reads balances, prices and books perfectly and is refused only at the order.
+    """
+
+    def __init__(self, exc: Exception, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._exc = exc
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.events.append("place")
+        self.place_calls.append({"spec": spec})
+        raise self._exc
+
+
+class _PreviewRefusingBroker(FakeBroker):
+    """A broker whose PREVIEW raises `exc` -- Coinbase's shape, where preview is a real call
+    under the same scope and the executor previews before it places."""
+
+    def __init__(self, exc: Exception, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._exc = exc
+
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        self.preview_calls.append({"spec": spec})
+        raise self._exc
+
+
+def _scope(repo: Repository, venue: str = "coinbase"):
+    return repo.get_venue_trade_scope(venue)
+
+
+def test_a_successful_live_placement_is_recorded_as_confirmed_by_the_venue(repo):
+    """The venue proving the operator right. A placement the venue ACCEPTED is the strongest
+    evidence available that this credential can trade -- stronger than the attestation, because
+    the venue supplied it -- so the record moves from the operator's claim to the venue's fact."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+    broker = FakeBroker()
+
+    result = execute(_enter_signal(), broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.CONFIRMED
+    assert record.confirmed_ts == NOW_TS
+
+
+def test_confirming_keeps_the_operators_attestation_and_the_refusal_history(repo):
+    """`confirmed` is a NEW fact, not a reset. `attested_scope`/`attested_ts` say what a human
+    claimed and `refuted_ts` says a credential on this venue was once refused -- doctor renders
+    both, and `apply_scope_attest` deliberately carries them forward for the same reason."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS - 500,
+        confirmed_ts=None,
+        refuted_ts=NOW_TS - 9000,
+        refuted_reason="an older credential was refused here",
+    )
+
+    execute(_enter_signal(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.attested_scope == TRADING
+    assert record.attested_ts == NOW_TS - 500
+    assert record.refuted_ts == NOW_TS - 9000
+    assert record.refuted_reason == "an older credential was refused here"
+
+
+def test_a_venue_rejecting_the_ORDER_does_not_confirm_the_scope(repo):
+    """`PlaceResult(success=False)` is the venue refusing THIS ORDER -- no funds, a bad size, a
+    price out of band. It is not the venue accepting a placement, so it proves nothing about the
+    credential and must not move the record forward."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+
+    result = execute(
+        _enter_signal(),
+        FakeBroker(place_success=False),
+        repo,
+        _config(),
+        mode="autonomous",
+        now_ts=NOW_TS,
+    )
+
+    assert result.placed is False
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.ATTESTED
+    assert record.confirmed_ts is None
+
+
+def test_a_permission_refusal_at_placement_writes_refuted_with_the_venues_own_words(repo):
+    """The motivating case, end to end. Observed live: `403 {"detail": "You do not have
+    permission to perform this action."}` under a credential whose every read succeeded."""
+    denial = "You do not have permission to perform this action."
+    broker = _RefusingBroker(TradeScopeDenied(denial))
+
+    with pytest.raises(TradeScopeDenied):
+        execute(_enter_signal(), broker, repo, _config(), mode="autonomous", now_ts=NOW_TS + 77)
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED
+    assert record.refuted_ts == NOW_TS + 77
+    assert record.refuted_reason == denial
+    assert record.may_place_live_entry() is False
+
+
+def test_a_permission_refusal_at_PREVIEW_also_writes_refuted(repo):
+    """Coinbase's preview is a real venue call under the same scope, and this deployment's venue
+    IS coinbase. Handling only placement would leave the record's second writer unreachable on
+    the one venue that trades live."""
+    broker = _PreviewRefusingBroker(TradeScopeDenied("Missing required scopes"))
+
+    with pytest.raises(TradeScopeDenied):
+        execute(_enter_signal(), broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED
+    assert record.refuted_reason == "Missing required scopes"
+
+
+def test_refuting_keeps_what_the_operator_attested_and_any_earlier_confirmation(repo):
+    """The refutation is what changed; the attestation is what a human said, and a past
+    confirmation is what the venue once did. Doctor's most useful sentence -- "you attested this
+    for trading and the venue then refused it" -- needs both to survive."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS - 100,
+        confirmed_ts=NOW_TS - 4000,
+    )
+
+    with pytest.raises(TradeScopeDenied):
+        execute(
+            _enter_signal(),
+            _RefusingBroker(TradeScopeDenied("nope")),
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.attested_scope == TRADING
+    assert record.attested_ts == NOW_TS - 100
+    assert record.confirmed_ts == NOW_TS - 4000
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("503 Server Error: Service Unavailable"),
+        TimeoutError("connection timed out"),
+        ConnectionError("connection reset by peer"),
+        OSError("Network is unreachable"),
+        ValueError("could not decode the venue's response"),
+    ],
+    ids=["5xx", "timeout", "connection-reset", "unreachable", "unparseable"],
+)
+def test_a_transport_failure_at_placement_NEVER_touches_the_record(repo, exc):
+    """**THE constraint of this PR.** Anything not classified by the ADAPTER as a permission
+    refusal stays a plain raise and leaves the record exactly as it found it.
+
+    A `refuted` row written here would veto every live ENTRY on a healthy deployment through rail
+    20 and stay vetoed until an operator re-attested at a terminal -- an outage manufactured out
+    of a dropped packet, on a deployment that trades unattended and daily. The order row is still
+    written and the exception still propagates: only the SCOPE record is untouched, because a
+    network failure is evidence about the network and about nothing else.
+    """
+    before = _scope(repo)
+    assert before is not None
+
+    with pytest.raises(type(exc)):
+        execute(
+            _enter_signal(),
+            _RefusingBroker(exc),
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS + 500,
+        )
+
+    after = _scope(repo)
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError("500 Server Error"), TimeoutError("connection timed out")],
+    ids=["5xx", "timeout"],
+)
+def test_a_transport_failure_at_PREVIEW_never_touches_the_record_either(repo, exc):
+    before = _scope(repo)
+
+    with pytest.raises(type(exc)):
+        execute(
+            _enter_signal(),
+            _PreviewRefusingBroker(exc),
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS + 500,
+        )
+
+    assert _scope(repo) == before
+
+
+def test_a_guard_veto_never_touches_the_record(repo):
+    """Rail 20 reads this record; the executor writes it. A vetoed intent never reaches the
+    venue, so there is no venue truth to record -- and a write here would let a rail's own veto
+    feed back into the record the rail reads."""
+    repo.set_state("kill_switch", True)
+    before = _scope(repo)
+
+    result = execute(
+        _enter_signal(), NoNetworkBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is False
+    assert result.vetoed_by
+    assert _scope(repo) == before
+
+
+def test_the_record_is_written_against_the_BOUND_venue_not_a_frozen_default(repo):
+    """Keyed exactly like rail 20 (`current_venue() or DEFAULT_VENUE`). Writing coinbase's row
+    from an alpaca deployment would refute a venue that refused nothing and leave the venue that
+    did refuse still permitted -- wrong in both directions at once."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        venue="alpaca",
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+    )
+    # Rail 14 is venue-keyed too, so an alpaca-bound cycle needs alpaca's subscription row or it
+    # is vetoed before it ever reaches the venue -- which would pass this test for the wrong
+    # reason (no placement, hence no refusal, hence no write).
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=Decimal("10000000"), venue="alpaca")
+    token = bind_venue("alpaca")
+    try:
+        with pytest.raises(TradeScopeDenied):
+            execute(
+                _enter_signal(),
+                _RefusingBroker(TradeScopeDenied("alpaca said no")),
+                repo,
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+    finally:
+        unbind_venue(token)
+
+    assert _scope(repo, "alpaca").state is TradeScopeState.REFUTED
+    # coinbase's row -- the fixture's -- is untouched.
+    assert _scope(repo, "coinbase").state is TradeScopeState.CONFIRMED
+
+
+def test_a_refusal_on_an_EXIT_writes_a_row_where_there_was_none(repo):
+    """The path rail 20 deliberately cannot reach, and the one that makes the design converge.
+
+    Rail 20 is ENTRIES-ONLY, so a venue with no trade-scope row is vetoed on every BUY and never
+    placed -- the record could never learn anything from an entry it prevented. An EXIT is not
+    gated (vetoing one would strand a position that wanted out), so it reaches the venue, and a
+    read-only credential is refused there. THAT is where the venue's answer comes from on a
+    deployment that has attested nothing, and the row this writes is what turns the next
+    `doctor` run from "nobody has attested" into "the venue refused this credential, saying X".
+    """
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+    attest_subscription(
+        repo, now_ts=NOW_TS, free_volume_usd=Decimal("10000000"), venue="someplace"
+    )
+    signal = Signal(
+        rule_name="target_harvest",
+        product_id="BTC-USD",
+        action=Action.EXIT,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+
+    token = bind_venue("someplace")
+    try:
+        assert repo.get_venue_trade_scope("someplace") is None
+        with pytest.raises(TradeScopeDenied):
+            execute(
+                signal,
+                _RefusingBroker(TradeScopeDenied("no permission")),
+                repo,
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+    finally:
+        unbind_venue(token)
+
+    record = _scope(repo, "someplace")
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED
+    assert record.refuted_reason == "no permission"
+    assert record.attested_scope is None
+    assert record.confirmed_ts is None
+
+
+def test_an_enormous_refusal_body_is_truncated_before_it_reaches_the_record(repo):
+    """A venue that answers with an HTML error page must not put a page into a column `doctor`
+    and `keel scope show` print to a terminal. Truncated, and marked as truncated, so nobody
+    reads the cut as the venue's full answer."""
+    with pytest.raises(TradeScopeDenied):
+        execute(
+            _enter_signal(),
+            _RefusingBroker(TradeScopeDenied("x" * 5000)),
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    reason = _scope(repo).refuted_reason
+    assert reason is not None
+    assert len(reason) < 1000
+    assert reason.endswith("...")
+
+
+def test_the_refusal_is_logged_at_ERROR_with_the_venues_words(repo, caplog):
+    """Loud, once, at the moment the venue said it. This event is the only place the refusal
+    appears in the log stream, and an operator grepping for why entries stopped needs it above
+    INFO."""
+    with pytest.raises(TradeScopeDenied):
+        with caplog.at_level(logging.DEBUG):
+            execute(
+                _enter_signal(),
+                _RefusingBroker(TradeScopeDenied("You do not have permission")),
+                repo,
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+
+    refusals = [r for r in caplog.records if r.message == "executor.trade_scope_refuted"]
+    assert len(refusals) == 1
+    assert refusals[0].levelno == logging.ERROR
+    assert refusals[0].exc_info is not None
+
+
+# -- #233: only an ENTRY confirms, because only an ENTRY is what the record claims -------------
+#
+# `_run_order` is shared by entries, exits, brackets, scale-outs and stop rolls. Rail 20 is
+# ENTRIES-ONLY, so every one of those SELL-side paths reaches the venue on a credential the rail
+# would have refused an entry on -- and if a successful placement of any kind confirmed, the
+# engine would clear its own safety latch with no human in the loop.
+#
+# `_manage_stops` makes that concrete rather than theoretical: it rolls stops EVERY CYCLE on any
+# open position, through this same pipeline. A latched REFUTED would survive exactly until the
+# next successful roll.
+#
+# The record's own question is `may_place_live_entry`. A successful SELL is evidence about SELL
+# scope and says nothing about BUY scope, so treating it as proof is a category error -- and it
+# is the category error that happens to unlatch the safety state.
+
+
+def _exit_signal_for(product_id: str = "BTC-USD") -> Signal:
+    return Signal(
+        rule_name="target_harvest",
+        product_id=product_id,
+        action=Action.EXIT,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+
+
+def test_a_successful_EXIT_does_not_confirm_a_credential_attested_READ_ONLY(repo):
+    """`keel scope attest --read-only` is UNGATED precisely because it only ever REDUCES
+    capability -- it needs no typed `yes` at a terminal because it cannot release anything. If a
+    successful exit confirmed, the engine would hand back the capability the operator had just
+    given up, from a cron line, and leave a self-contradictory row saying both `state=confirmed`
+    and `attested_scope=read_only`."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=READ_ONLY,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+
+    result = execute(
+        _exit_signal_for(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is True, "the exit itself must still go through -- rail 20 is entries-only"
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.ATTESTED
+    assert record.attested_scope == READ_ONLY
+    assert record.confirmed_ts is None
+    assert record.may_place_live_entry() is False
+
+
+def test_a_successful_EXIT_does_not_clear_a_LATCHED_REFUSAL(repo):
+    """The latch is the whole safety property. `_manage_stops` rolls stops every cycle on any
+    open position through this same pipeline, so a refutation cleared by a successful SELL would
+    survive until the next cycle and no further -- the venue's own refusal erased by the engine,
+    unattended, hours later."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.REFUTED,
+        refuted_ts=NOW_TS - 60,
+        refuted_reason="Missing required scopes",
+    )
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+
+    result = execute(
+        _exit_signal_for(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is True
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED
+    assert record.refuted_reason == "Missing required scopes"
+    assert record.may_place_live_entry() is False
+
+
+def test_the_bracket_placed_alongside_an_entry_is_not_a_second_confirmation(repo):
+    """One entry, one confirmation. `execute` on a stop+target setup places TWO orders through
+    `_run_order` -- the BUY, then the protective bracket, which is SELL-side -- and only the
+    first is evidence about entry scope."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+    broker = FakeBroker()
+
+    result = execute(_enter_signal(), broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True
+    assert len(broker.place_calls) == 2, "entry + bracket both go through _run_order"
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.CONFIRMED
+    assert record.confirmed_ts == NOW_TS
+
+
+def test_a_stop_ROLL_on_a_refuted_venue_does_not_clear_the_refusal(repo):
+    """The path `_manage_stops` actually walks every cycle, exercised through its own public
+    entry point rather than inferred from the exit test above."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.REFUTED,
+        refuted_ts=NOW_TS - 60,
+        refuted_reason="Missing required scopes",
+    )
+    broker = FakeBroker()
+    old_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.1"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="test",
+        now_ts=NOW_TS,
+    )
+    assert old_id is not None
+
+    rolled = roll_stop_to(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=old_id,
+        new_stop=Decimal("50500"),
+        qty=Decimal("0.1"),
+        rule_name="test",
+        now_ts=NOW_TS + 60,
+    )
+
+    assert rolled is not None, "the roll itself must still work -- rail 20 never gated it"
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED
+    assert record.may_place_live_entry() is False
+
+
+# -- #233: the scope record is metadata and must never outrank the money path ------------------
+
+
+class _ScopeWriteFailsRepo:
+    """A `Repository` whose trade-scope UPSERT raises, and whose everything-else works.
+
+    `upsert_venue_trade_scope` commits (`repository.py`), so it is a real write against a file the
+    live agent may be mid-cycle on -- `sqlite3.OperationalError: database is locked` is its
+    ordinary failure, not an exotic one.
+    """
+
+    def __init__(self, inner: Repository) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def upsert_venue_trade_scope(self, record: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_a_failed_confirm_write_does_not_cost_the_position_its_bracket(repo, caplog):
+    """The hazard is the ORDER of what happens after a live fill: the entry fills, then
+    `_upgrade_to_observed_economics` runs, then the CALLER places the protective bracket. An
+    unguarded metadata write between them turns a locked database into an unprotected position.
+
+    Every other write on this path is an audit record of money that actually moved. This one
+    describes the credential that moved it, and metadata must never outrank a bracket.
+    """
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+    broker = FakeBroker()
+
+    with caplog.at_level(logging.DEBUG):
+        result = execute(
+            _enter_signal(),
+            broker,
+            _ScopeWriteFailsRepo(repo),
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is True, "a metadata write must not abort a placement that succeeded"
+    assert len(broker.place_calls) == 2, "the protective bracket must still have been placed"
+    assert any(
+        r.message == "executor.trade_scope_confirm_write_failed" and r.levelno == logging.ERROR
+        for r in caplog.records
+    ), "the lost confirmation must still be loud"
+
+
+def test_a_failed_refute_write_does_not_replace_the_venues_own_refusal(repo, caplog):
+    """`TradeScopeDenied` is the one signal an operator needs out of this path. If the write that
+    records it raises, the database error would propagate IN ITS PLACE -- and the ERROR log
+    naming the refusal would never fire either, because it sits after the write.
+
+    Failing to record costs one repeated refusal next cycle, which is exactly the pre-#233
+    behaviour. Losing the venue's answer is not survivable in the same way.
+    """
+    broker = _RefusingBroker(TradeScopeDenied("You do not have permission"))
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TradeScopeDenied):
+            execute(
+                _enter_signal(),
+                broker,
+                _ScopeWriteFailsRepo(repo),
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+
+    assert any(r.message == "executor.trade_scope_refute_write_failed" for r in caplog.records)
+    assert any(r.message == "executor.trade_scope_refuted" for r in caplog.records)
+
+
+def test_it_is_the_ENTRY_placement_that_confirms_not_the_bracket_that_follows_it(repo):
+    """Which placement wrote the confirmation, not merely that one did.
+
+    `execute` on a stop+target setup runs `_run_order` TWICE -- the BUY, then the SELL-side
+    protective bracket -- and both end with a CONFIRMED-shaped record, so asserting the final
+    state cannot tell the two apart. An implementation that confirmed only from SELLs would leave
+    exactly the same row behind and pass every other test in this file.
+
+    So this records how many placements the broker had seen at the moment of each scope write.
+    One write, and it happened when exactly one order had been placed: the entry.
+    """
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+    )
+    broker = FakeBroker()
+    writes_at: list[int] = []
+
+    class _SpyRepo:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(repo, name)
+
+        def upsert_venue_trade_scope(self, record: Any) -> None:
+            writes_at.append(len(broker.place_calls))
+            repo.upsert_venue_trade_scope(record)
+
+    result = execute(
+        _enter_signal(), broker, _SpyRepo(), _config(), mode="autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is True
+    assert len(broker.place_calls) == 2, "entry + bracket, both through _run_order"
+    assert writes_at == [1], (
+        "exactly one scope write, taken after the ENTRY and before the bracket -- "
+        f"got writes after placement counts {writes_at}"
+    )

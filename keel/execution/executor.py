@@ -112,6 +112,7 @@ from keel_broker_api.orders import (
     MarketIOCByQuote,
     OrderSpec,
 )
+from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import (
     CancelOutcome,
     OrderStatus,
@@ -120,7 +121,8 @@ from keel_broker_api.results import (
     coerce_cancel_outcome,
 )
 from keel_core.products import quote_currency_of
-from keel_core.telemetry import log_event, log_exception, log_venue_failure
+from keel_core.telemetry import current_venue, log_event, log_exception, log_venue_failure
+from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -577,6 +579,153 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
 # -- shared guard -> preview -> confirm/autonomous -> place -> log pipeline ------------------------
 
 
+# -- #233: the venue's half of the trade-scope record ------------------------------------------
+#
+# `keel scope attest` is the operator's writer. These two functions are the VENUE's, and they are
+# the reason the record can ever correct itself. Before them this module stood exactly where
+# venue truth arrived and threw it away: a `place_order` failure was `log_exception` + re-raise,
+# recorded nowhere, so a confidently wrong attestation stayed wrong forever and the next cycle
+# could not tell a read-only credential from a healthy venue. That was the 2026-08-19 incident's
+# real cost -- not the 403 itself, which moved no money, but that nothing wrote it down.
+#
+# Both are reached ONLY from `_run_order`, which is the live path by construction (`_order_row`
+# hardcodes `mode="live"`; paper fills synthetically through `_paper_enter` and never previews or
+# places). So there is no mode check here: a paper fill cannot reach these lines to record a
+# confirmation the venue never gave.
+
+#: How much of a venue's refusal survives into `venue_trade_scopes.refuted_reason`.
+#:
+#: The message is the venue's own words and is printed to a terminal by `doctor` and
+#: `keel scope show`. Robinhood's is one sentence and Coinbase's is a short JSON object, but a
+#: venue answering a 403 with an HTML error page is an ordinary thing for a venue to do, and a
+#: page in this column would be a page in that output. Truncated, and MARKED truncated with an
+#: ellipsis, so nobody reads the cut as the venue's complete answer.
+_REFUTED_REASON_MAX = 500
+
+
+def _trade_scope_venue() -> str:
+    """The venue key both writers and rail 20 agree on.
+
+    Identical to rail 20's own `current_venue() or DEFAULT_VENUE` (`guards.py`), and that
+    identity is load-bearing rather than tidy: a writer keyed differently from the reader would
+    refute a venue that refused nothing while leaving the venue that did refuse still permitted
+    -- wrong in both directions at once, and silent in both.
+    """
+    return current_venue() or guards.DEFAULT_VENUE
+
+
+def _record_trade_scope_confirmed(repo: Repository, now_ts: int) -> None:
+    """The venue proved this credential can trade, by accepting a placement.
+
+    Stronger evidence than the attestation it replaces, because the venue supplied it. Every
+    accepted live placement re-confirms, which is why this record needs no TTL: the subscription
+    record expires on a clock because nothing observes it, and this one is observed by every
+    order that lands.
+
+    `attested_scope`/`attested_ts` and the refusal history are carried FORWARD unchanged.
+    Confirmation is a new fact, not a reset: what a human claimed and what a previous credential
+    on this venue once did are both still true, and `doctor` renders both. `apply_scope_attest`
+    carries the same fields forward in the other direction for the same reason.
+    """
+    venue = _trade_scope_venue()
+    existing = repo.get_venue_trade_scope(venue)
+    repo.upsert_venue_trade_scope(
+        VenueTradeScope(
+            venue=venue,
+            state=TradeScopeState.CONFIRMED,
+            attested_scope=existing.attested_scope if existing is not None else None,
+            attested_ts=existing.attested_ts if existing is not None else None,
+            confirmed_ts=now_ts,
+            refuted_ts=existing.refuted_ts if existing is not None else None,
+            refuted_reason=existing.refuted_reason if existing is not None else None,
+        )
+    )
+
+
+def _record_trade_scope_refuted(repo: Repository, reason: str, now_ts: int) -> None:
+    """The venue refused a placement on permission grounds. Rail 20 vetoes live ENTRIES on this
+    venue from here until a human re-attests at a terminal.
+
+    **"Until a human" is literal, and it is the confirm side that has to keep it true.** Nothing
+    on the SELL side of this pipeline can clear this row -- exits, brackets, scale-outs and stop
+    rolls all run through `_run_order` on a credential rail 20 never gated, and `_manage_stops`
+    walks it every cycle on any open position, so a confirmation from any of them would erase the
+    venue's own refusal unattended within hours. `_run_order` therefore confirms only from a BUY.
+    The one path that CAN move this row forward automatically is a successful live ENTRY, and
+    rail 20 refuses to let an entry be placed while this row stands -- so the loop is closed:
+    a refutation is cleared by `keel scope attest`, or not at all.
+
+    ⚠️ **Only ever called for a `TradeScopeDenied`.** Every adapter that raises it has already
+    narrowed to that venue's observed permission refusal, and everything else -- a 5xx, a
+    timeout, a 429, a 401, an unparseable body -- reaches `_run_order` as a plain exception and
+    never arrives here. That is the single most important property of this PR: this write LATCHES,
+    and a transient network failure that latched it would take a healthy live deployment off the
+    market and require an operator at a terminal to restore it. A missed refusal costs one more
+    refused order; a false one costs an outage.
+
+    `attested_scope`/`attested_ts` and any earlier `confirmed_ts` survive, so `doctor` can say
+    the sentence that actually helps -- "you attested this for trading and the venue then refused
+    it" -- rather than presenting a bare refusal with no history behind it.
+    """
+    venue = _trade_scope_venue()
+    existing = repo.get_venue_trade_scope(venue)
+    if len(reason) > _REFUTED_REASON_MAX:
+        reason = reason[: _REFUTED_REASON_MAX - 3] + "..."
+    repo.upsert_venue_trade_scope(
+        VenueTradeScope(
+            venue=venue,
+            state=TradeScopeState.REFUTED,
+            attested_scope=existing.attested_scope if existing is not None else None,
+            attested_ts=existing.attested_ts if existing is not None else None,
+            confirmed_ts=existing.confirmed_ts if existing is not None else None,
+            refuted_ts=now_ts,
+            refuted_reason=reason,
+        )
+    )
+
+
+def _try_record_trade_scope_refuted(
+    repo: Repository, reason: str, now_ts: int, intent: OrderIntent, order_id: int | None
+) -> None:
+    """`_record_trade_scope_refuted`, but a failed WRITE must never replace the venue's REFUSAL.
+
+    Without this, a `sqlite3.OperationalError` raised while recording the refusal would propagate
+    in place of the `TradeScopeDenied` the caller is in the middle of re-raising -- so the one
+    signal an operator needs ("the venue says this credential may not trade") would be swapped
+    for a database error, and the ERROR log below would never fire either.
+
+    Failing to record costs one repeated refusal next cycle, which is exactly the pre-#233
+    behaviour and survivable. Losing the venue's answer is not.
+    """
+    try:
+        _record_trade_scope_refuted(repo, reason, now_ts)
+    except Exception:
+        log_exception(
+            logger,
+            "executor.trade_scope_refute_write_failed",
+            product=intent.product_id,
+            venue=_trade_scope_venue(),
+            order_id=order_id,
+        )
+
+
+def _log_trade_scope_refusal(intent: OrderIntent, order_id: int | None) -> None:
+    """The refusal, once, at ERROR with the traceback.
+
+    ERROR because this is the event an operator greps for when entries stop: rail 20 will veto
+    every live entry on this venue from the next cycle, and the reason must not be filed at INFO
+    among the ordinary vetoes it causes.
+    """
+    log_exception(
+        logger,
+        "executor.trade_scope_refuted",
+        product=intent.product_id,
+        side=intent.side,
+        venue=_trade_scope_venue(),
+        order_id=order_id,
+    )
+
+
 def _run_order(
     intent: OrderIntent,
     broker: Any,
@@ -633,6 +782,14 @@ def _run_order(
             )
     try:
         preview = broker.preview_order(spec)
+    except TradeScopeDenied as exc:
+        # #233. Coinbase's preview IS a trade-scoped venue call, and this deployment's venue is
+        # coinbase -- a credential with View but not Trade is refused HERE and never reaches
+        # `place_order`. Handling only placement would leave the record's second writer
+        # unreachable on the one venue that trades live.
+        _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, None)
+        _log_trade_scope_refusal(intent, None)
+        raise
     except Exception:
         log_exception(
             logger, "executor.preview_failed", product=intent.product_id, side=intent.side
@@ -704,6 +861,25 @@ def _run_order(
 
     try:
         place_result = broker.place_order(spec)
+    except TradeScopeDenied as exc:
+        # #233's whole point: the venue has just falsified the record, and this is the only place
+        # in the engine that hears it.
+        #
+        # Written BEFORE the re-raise, and that ordering is the whole mechanism. NOTHING upstream
+        # catches this: `agent.run_once` does not wrap `executor.execute`, and neither does the
+        # `run_loop` above it, so the exception leaves the process. (#233's design says a
+        # "cycle-survival handler" catches it -- that handler is `_manage_stops`' per-tranche
+        # one, which this path does not pass through. Verified against `agent.py`.) A write
+        # deferred to a caller would therefore never happen at all, which is precisely the state
+        # before this PR: the venue answered and nothing wrote it down.
+        #
+        # The refusal still aborts the cycle, exactly as every other placement failure has
+        # always done -- deliberately unchanged here. But it now aborts it ONCE: the row this
+        # writes means the next cycle is vetoed cleanly by rail 20, with the venue's own words in
+        # `doctor`, instead of walking into the same refusal again every day.
+        _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, order_id)
+        _log_trade_scope_refusal(intent, order_id)
+        raise
     except Exception:
         log_exception(
             logger,
@@ -738,6 +914,43 @@ def _run_order(
         raw_response=json.dumps({"order_id": place_result.broker_order_id}),
         updated_at=now_ts,
     )
+
+    # #233. AFTER `update_order`: the order row is the audit record of money that moved and is
+    # written first; the scope record is metadata about the credential that moved it.
+    #
+    # TWO gates, and the second one is a safety property rather than a nicety.
+    #
+    # `success`, not merely "no exception": `PlaceResult(success=False)` is the venue refusing
+    # THIS ORDER -- no funds, a size out of band -- which proves nothing about permissions.
+    #
+    # `intent.side == Side.BUY`, spelled exactly as rail 20's own `is_buy`, because THIS PIPELINE
+    # IS SHARED. `_run_order` serves entries, exits, brackets, scale-outs and stop rolls, and
+    # rail 20 gates only entries -- so every SELL-side path here reaches the venue on a credential
+    # the rail would have refused an ENTRY on. Confirming from one of those would let the engine
+    # clear its own safety latch with nobody in the loop: a venue that REFUSED a placement, or a
+    # credential an operator deliberately attested `--read-only` (ungated precisely because it
+    # only ever REDUCES capability), would be silently promoted back to CONFIRMED by the next
+    # successful exit -- and `_manage_stops` rolls a stop through here EVERY CYCLE on any open
+    # position, so "the next successful exit" is hours away, not hypothetical.
+    #
+    # It is also simply what the record means. `may_place_live_entry` is the question; a
+    # successful SELL is evidence about SELL scope and says nothing about BUY scope. Reading it
+    # as proof is a category error that happens to unlatch the safety state.
+    if success and intent.side == Side.BUY:
+        # Unguarded, this would abort the cycle AFTER a live fill and BEFORE the caller places
+        # the protective bracket -- a locked database costing a real position its stop. Every
+        # other write on this path is an audit record of money that moved; this one is metadata
+        # about the credential that moved it, and metadata must never outrank a bracket.
+        try:
+            _record_trade_scope_confirmed(repo, now_ts)
+        except Exception:
+            log_exception(
+                logger,
+                "executor.trade_scope_confirm_write_failed",
+                product=intent.product_id,
+                venue=_trade_scope_venue(),
+                order_id=order_id,
+            )
 
     if success and status == "filled":
         _upgrade_to_observed_economics(broker, repo, order_id, place_result, now_ts, intent)

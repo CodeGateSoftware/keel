@@ -31,6 +31,34 @@ class UnsupportedOrder(Exception):
     """
 
 
+class TradeScopeDenied(Exception):
+    """Raised when the VENUE refuses a placement because THIS CREDENTIAL may not trade.
+
+    The one channel the venue has for writing its half of #233's trade-scope record. The record
+    has two writers -- the operator attests (`keel scope attest`), and the venue falsifies -- and
+    this is the second one. `executor._run_order` catches exactly this type, writes `REFUTED` plus
+    the message below into `venue_trade_scopes`, and re-raises; rail 20 then vetoes live ENTRIES
+    on that venue until a human re-attests. Nothing else in the codebase writes `REFUTED`.
+
+    **Not a subclass of `UnsupportedOrder`, and not a superclass of it.** The two answer different
+    questions. `UnsupportedOrder` is a fact about the ADAPTER -- it cannot express this spec --
+    and the fix is a different spec. This is a fact about the CREDENTIAL, and no spec fixes it.
+
+    **Raise it ONLY for a permission refusal, and construct it with the venue's own words.** The
+    message is written verbatim into `refuted_reason` and read back by `doctor` and
+    `keel scope show`; the 2026-08-19 incident's entire cost was that the venue's answer
+    (`"You do not have permission to perform this action."`) was thrown away, so a paraphrase here
+    would rebuild the same blindness one layer up.
+
+    ⚠️ **A 5xx, a timeout, a DNS failure or an unparseable body must NEVER raise this.** They are
+    not evidence about the credential -- they are evidence about the network -- and this exception
+    is a latch that halts live entries until a human clears it. Classifying a transient outage as
+    a refusal would take a healthy deployment off the market and require a terminal to put it
+    back. When in doubt, raise the plain error: the cost of failing to record a real refusal is
+    one more refused order, and the cost of recording a fake one is an outage.
+    """
+
+
 #: The namespace every derived `client_order_id` is minted under.
 #:
 #: A fixed, arbitrary UUID -- it exists only so that `uuid5` has a stable seed, and so that two
@@ -206,6 +234,7 @@ __all__ = [
     "CLIENT_ORDER_ID_NAMESPACE",
     "Broker",
     "CancelOutcome",
+    "TradeScopeDenied",
     "UnsupportedOrder",
     "default_market_schedule",
     "resolve_client_order_id",

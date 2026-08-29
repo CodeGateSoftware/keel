@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote
+from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import (
     Balance,
     CancelOutcome,
@@ -514,3 +515,161 @@ def test_list_products_serves_the_discovery_sweep() -> None:
         }
     ]
     assert transport.calls["get_products"] == {"product_type": "SPOT"}
+
+
+# --- #233: the venue's half of the trade-scope record ---------------------------------------
+
+
+class _Response:
+    """The two attributes `requests.HTTPError.response` exposes that the classifier reads.
+
+    Not a `requests.Response`: the adapter must classify on shape, not on a type it would have
+    to import. `keel-broker-coinbase` depends on `coinbase-advanced-py`, which depends on
+    `requests` -- but the adapter reaching past its SDK to `isinstance`-check the HTTP library
+    underneath it would couple this package to a transitive dependency it never declared.
+    """
+
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+class _HTTPError(Exception):
+    """Shaped like `requests.HTTPError`: a message, and the response that produced it."""
+
+    def __init__(self, message: str, response: _Response) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+#: The body Coinbase returns when the presented CDP key lacks the Trade scope. Not invented:
+#: `coinbase.rest.rest_base.handle_exception` special-cases this exact substring on a 403,
+#: ahead of every other 4xx, and rewrites the error message to "Missing Required Scopes.
+#: Please verify your API keys include the necessary permissions." The SDK would not carry a
+#: hard-coded branch for a body the venue does not send.
+_MISSING_SCOPES_BODY = (
+    '{"error":"PERMISSION_DENIED","error_details":"Missing required scopes",'
+    '"message":"Missing required scopes"}'
+)
+
+#: A 403 from the SAME venue that is NOT about the credential's scope: observed live on
+#: 2026-08-05 (`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`, the
+#: `preview_order` row) against a futures product on a portfolio that had not been onboarded
+#: for FCM. The account was not entitled to the PRODUCT; the key's scopes were never in
+#: question, and refuting the trade scope over it would take a working spot deployment off the
+#: market for a fact about futures.
+_FCM_NOT_ONBOARDED_BODY = (
+    '{"error":"PERMISSION_DENIED","error_details":"",'
+    '"message":"FCM preview orders are only enabled for onboarded users"}'
+)
+
+_MARKET_BUY = MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
+
+
+class _RaisingTransport(FakeTransport):
+    """A transport whose order-path calls raise `exc` the way the Coinbase SDK does."""
+
+    def __init__(self, exc: Exception, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._exc = exc
+
+    def create_order(self, **kwargs: Any) -> Any:
+        raise self._exc
+
+    def preview_order(self, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+def _adapter(exc: Exception) -> CoinbaseAdapter:
+    return CoinbaseAdapter(_RaisingTransport(exc, products=load_fixture("cb_product.json")))
+
+
+def test_a_403_missing_required_scopes_on_placement_is_a_trade_scope_refusal() -> None:
+    """The credential half of #233, in the one shape Coinbase actually signals it in.
+
+    This is the whole point of the record's second writer: a CDP key minted with View but not
+    Trade reads every endpoint happily and refuses exactly here. Without this mapping the
+    executor sees an anonymous `HTTPError`, re-raises it, and the next cycle knows nothing --
+    which is the 2026-08-19 incident's actual cost, restated on a different venue.
+    """
+    exc = _HTTPError("403 Client Error", _Response(403, _MISSING_SCOPES_BODY))
+
+    with pytest.raises(TradeScopeDenied) as caught:
+        _adapter(exc).place_order(_MARKET_BUY)
+
+    assert "Missing required scopes" in str(caught.value)
+    assert caught.value.__cause__ is exc
+
+
+def test_a_403_missing_required_scopes_on_PREVIEW_is_also_a_trade_scope_refusal() -> None:
+    """Coinbase's preview is a real venue call under the same scope, and the executor previews
+    BEFORE it places.
+
+    So on this venue a scope-less key is refused at preview and `place_order` is never reached.
+    Classifying only placement would ship a gate that can never fire on the one venue this
+    deployment actually trades -- `keel/capabilities.py` records that a gate nothing reaches is
+    worse than no gate, because it reads as a defence.
+    """
+    exc = _HTTPError("403 Client Error", _Response(403, _MISSING_SCOPES_BODY))
+
+    with pytest.raises(TradeScopeDenied):
+        _adapter(exc).preview_order(_MARKET_BUY)
+
+
+def test_a_500_does_NOT_refute_the_scope() -> None:
+    """THE constraint. A `TradeScopeDenied` latches: it writes `REFUTED`, and rail 20 then vetoes
+    every live ENTRY until a human types `yes` at a terminal. A venue outage that took a healthy
+    deployment off the market and required physical presence to restore would be a far worse
+    failure than the one this whole design exists to fix."""
+    exc = _HTTPError("500 Server Error", _Response(500, "upstream unavailable"))
+
+    with pytest.raises(_HTTPError):
+        _adapter(exc).place_order(_MARKET_BUY)
+
+
+def test_a_503_does_NOT_refute_the_scope() -> None:
+    exc = _HTTPError("503 Server Error", _Response(503, _MISSING_SCOPES_BODY))
+
+    with pytest.raises(_HTTPError):
+        _adapter(exc).place_order(_MARKET_BUY)
+
+
+def test_a_timeout_does_NOT_refute_the_scope() -> None:
+    """No response object at all -- the classifier must answer "not a refusal" rather than
+    raise a second error while handling the first."""
+    with pytest.raises(TimeoutError):
+        _adapter(TimeoutError("connection timed out")).place_order(_MARKET_BUY)
+
+
+def test_a_403_that_is_not_about_scopes_does_NOT_refute_the_scope() -> None:
+    """The live-observed near miss. Coinbase answers 403 `PERMISSION_DENIED` for product
+    entitlement too, and that says nothing about the key's scopes -- which is exactly why the
+    classifier keys on the SDK's own `Missing required scopes` predicate and not on the status
+    code, and not on `PERMISSION_DENIED`."""
+    exc = _HTTPError("403 Client Error", _Response(403, _FCM_NOT_ONBOARDED_BODY))
+
+    with pytest.raises(_HTTPError):
+        _adapter(exc).place_order(_MARKET_BUY)
+
+
+def test_a_401_does_NOT_refute_the_scope() -> None:
+    """A rejected credential is not a scoped one. The fix for a 401 is a new key, and the
+    readiness display (#233 PR4) is where an absent or malformed credential belongs -- refuting
+    the trade scope would send the operator to `keel scope attest` to fix a key that cannot
+    read either."""
+    exc = _HTTPError("401 Client Error", _Response(401, "Unauthorized"))
+
+    with pytest.raises(_HTTPError):
+        _adapter(exc).place_order(_MARKET_BUY)
+
+
+def test_a_venue_rejection_returned_as_a_result_does_NOT_refute_the_scope() -> None:
+    """`success: false` with `INSUFFICIENT_FUND` is the venue refusing THIS ORDER, on a
+    credential that plainly reached the trading endpoint. It stays a `PlaceResult`, and the
+    record is not touched."""
+    transport = FakeTransport(placed=load_fixture("cb_place_order_error.json"))
+
+    result = CoinbaseAdapter(transport).place_order(_MARKET_BUY)
+
+    assert result.success is False
+    assert result.reason == "Insufficient balance in source account"

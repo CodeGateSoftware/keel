@@ -19,6 +19,7 @@ from typing import Any
 from keel_broker_api.capabilities import BrokerCapabilities
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.port import (
+    TradeScopeDenied,
     UnsupportedOrder,
     default_market_schedule,
     resolve_client_order_id,
@@ -68,6 +69,67 @@ def _candle_from_raw(raw: object) -> Candle:
         close=Decimal(_field(raw, "close")),
         volume=Decimal(_field(raw, "volume")),
     )
+
+
+#: Coinbase's own predicate for "this key lacks the Trade scope", copied from the SDK rather
+#: than inferred from documentation. `coinbase.rest.rest_base.handle_exception` branches on
+#: `status_code == 403 and '"error_details":"Missing required scopes"' in response.text` AHEAD of
+#: every other 4xx and rewrites the message to name the permissions. A hard-coded branch in the
+#: venue's own client is the strongest evidence available offline that this is the shape the
+#: venue sends, and #233's design is explicit that the classification must not be invented from
+#: docs -- "one more reason the design must not pre-classify it from documentation".
+#:
+#: Matched case-insensitively on the body so a change in the SDK's message wording, or a caller
+#: that re-raises with its own text, does not silently stop the record's second writer.
+_MISSING_SCOPES = "missing required scopes"
+
+
+def _trade_scope_refusal(exc: BaseException) -> str | None:
+    """The venue's own words when `exc` is a CREDENTIAL-scope refusal, else `None`.
+
+    Total on any input, and deliberately narrow. Three separate gates have to agree before this
+    answers anything but `None`:
+
+    1. the error carries a response object at all -- a timeout, a DNS failure or a socket reset
+       has none, and those are facts about the network, not the credential;
+    2. its status is exactly `403` -- a 5xx is an UNKNOWN outcome, and a 401 is a credential the
+       venue does not recognise at all (whose fix is a new key, not an attestation);
+    3. the body carries Coinbase's `Missing required scopes`.
+
+    Gate 3 is what makes this safe on the live deployment, and it is not belt-and-braces on gate
+    2. Coinbase answers `403 PERMISSION_DENIED` for PRODUCT entitlement as well -- observed live
+    on 2026-08-05 against a futures product on a portfolio not onboarded for FCM
+    (`docs/experiments/2026-08-05-coinbase-asset-class-feasibility.md`). That 403 says nothing
+    about the key's scopes, and classifying it as one would write `REFUTED`, veto every live
+    ENTRY through rail 20, and require an operator at a terminal to clear it -- an outage
+    manufactured out of a fact about an asset class keel does not trade.
+
+    ⚠️ **A residual this cannot see, recorded deliberately.** It only ever inspects an EXCEPTION.
+    Advanced Trade also answers HTTP 200 with `success: false` and an `error_response` for a
+    class of order errors, and `place_order` maps those to `PlaceResult(success=False)` without
+    consulting this function -- so a scope refusal that ever arrived that way would be reported
+    as an ordinary rejected order and would never refute the record. That is the design's stated
+    trade: `error_response.error` is an open enum whose values are not documented as stable, and
+    pre-classifying an unobserved body from documentation is exactly what #233 forbids. The cost
+    of missing such a refusal is one more refused order; the cost of inventing one is an outage.
+
+    Shape-typed, not `isinstance`-typed: the exception is a `requests.HTTPError` raised by
+    `coinbase-advanced-py`, and `requests` is a TRANSITIVE dependency this package has never
+    declared. Reaching past the SDK to import it would couple the adapter to a library it does
+    not depend on, for a check two `getattr`s already answer.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    if getattr(response, "status_code", None) != 403:
+        return None
+    body = str(getattr(response, "text", "") or "")
+    if _MISSING_SCOPES not in body.lower():
+        return None
+    # The venue's own words, verbatim -- they land in `venue_trade_scopes.refuted_reason` and are
+    # what `doctor` and `keel scope show` read back to the operator. The body is preferred over
+    # `str(exc)` because the body is what Coinbase said; the message is what the SDK made of it.
+    return body
 
 
 class CoinbaseAdapter:
@@ -210,11 +272,21 @@ class CoinbaseAdapter:
     def preview_order(self, spec: OrderSpec) -> Preview:
         """Preview via Coinbase's own endpoint -- hence `synthetic=False`."""
         self._reject_unsupported(spec)
-        response = self._require_transport().preview_order(
-            product_id=spec.product_id,
-            side=spec.side.value,
-            order_configuration=to_order_configuration(spec),
-        )
+        # #233: classified HERE and not only in `place_order`, because on THIS venue preview is a
+        # real call under the same scope and the executor previews first. A key with View but not
+        # Trade is refused at this line and `place_order` is never reached -- so classifying only
+        # placement would ship a gate that cannot fire on the one venue this deployment trades.
+        try:
+            response = self._require_transport().preview_order(
+                product_id=spec.product_id,
+                side=spec.side.value,
+                order_configuration=to_order_configuration(spec),
+            )
+        except Exception as exc:
+            refusal = _trade_scope_refusal(exc)
+            if refusal is None:
+                raise
+            raise TradeScopeDenied(refusal) from exc
         errs = tuple(str(e) for e in (_field(response, "errs", []) or []))
         return Preview(
             product_id=spec.product_id,
@@ -241,12 +313,23 @@ class CoinbaseAdapter:
         default for the reasons `resolve_client_order_id` sets out.
         """
         self._reject_unsupported(spec)
-        response = self._require_transport().create_order(
-            client_order_id=resolve_client_order_id(idempotency_key),
-            product_id=spec.product_id,
-            side=spec.side.value,
-            order_configuration=to_order_configuration(spec),
-        )
+        try:
+            response = self._require_transport().create_order(
+                client_order_id=resolve_client_order_id(idempotency_key),
+                product_id=spec.product_id,
+                side=spec.side.value,
+                order_configuration=to_order_configuration(spec),
+            )
+        except Exception as exc:
+            # #233: the venue's half of the trade-scope record. ONLY a `Missing required scopes`
+            # 403 becomes `TradeScopeDenied` -- see `_trade_scope_refusal` for the three gates
+            # and why the near-miss 403 this venue really sends must not trip it. Everything
+            # else re-raises unchanged, so a 5xx or a timeout reaches the executor exactly as it
+            # did before and touches the record not at all.
+            refusal = _trade_scope_refusal(exc)
+            if refusal is None:
+                raise
+            raise TradeScopeDenied(refusal) from exc
         success = bool(_field(response, "success", False))
         if success:
             success_response = _field(response, "success_response") or {}
