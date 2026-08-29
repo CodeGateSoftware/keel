@@ -22,6 +22,7 @@ from click.testing import CliRunner
 
 from keel.cli import cli
 from keel.commands import brokers
+from keel.venue_readiness import VenueReadiness
 
 #: Every field the payload may carry -- the closed capability vocabulary. A field outside
 #: this set (an env read, a key-presence probe, a config content) is a scope violation,
@@ -327,8 +328,17 @@ def test_brokers_list_help_carries_the_readme_trademark_line() -> None:
 def test_no_key_inference_line_is_unchanged_text() -> None:
     """A pin against silent rewording, independent of where it appears."""
     assert brokers.NO_KEY_INFERENCE_LINE == (
-        "capability display only -- no key presence is read or implied, and no secret is shown"
+        "the declarations above are a capability display only -- no key presence is read or "
+        "implied, and no secret is shown"
     )
+
+
+def test_the_no_key_inference_line_scopes_itself_to_its_own_block() -> None:
+    """It is no longer the last line of the command, only of its own block -- a readiness block
+    that DOES read key presence now follows it about twenty lines later. A line that still said a
+    bare "capability display only" would read, mid-output, as a claim about everything below it,
+    which is the blur #233 exists to remove. So it must name what it is scoping."""
+    assert "the declarations above" in brokers.NO_KEY_INFERENCE_LINE
 
 
 def test_render_brokers_lines_ends_on_the_no_key_inference_line() -> None:
@@ -364,11 +374,23 @@ def test_brokers_list_prints_declarations_before_readiness_in_that_order() -> No
     honesty_idx = text.index(brokers.READINESS_HONESTY_LINE)
     assert decl_idx < header_idx < honesty_idx
 
-    # Every readiness row name must appear strictly after the declarations' honesty line --
-    # not merely after the readiness header, which a mutant could rename without moving rows.
+    # ⚠️ This assertion used to be `text.index(f"{name}: ", decl_idx) > decl_idx`, which is
+    # TAUTOLOGICAL: `str.index` with a start offset can never return a position below it, so it
+    # held against every possible output. Split the text at the header instead and make two
+    # claims that can actually fail.
+    declarations_block, readiness_block = text[:header_idx], text[header_idx:]
+
     for name in _INSTALLED:
-        row_idx = text.index(f"{name}: ", decl_idx)
-        assert row_idx > decl_idx
+        assert f"{name}: " in readiness_block, (
+            f"{name} has no readiness row after the header -- rows are being rendered into the "
+            "declarations block, or not at all"
+        )
+
+    for state in VenueReadiness:
+        assert state.value not in declarations_block, (
+            f"the readiness state {state.value!r} leaked into the declarations block, which "
+            "NO_KEY_INFERENCE_LINE terminates and claims reads no key presence"
+        )
 
 
 def test_brokers_list_json_still_carries_no_readiness_vocabulary() -> None:

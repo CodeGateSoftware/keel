@@ -86,26 +86,48 @@ def test_an_empty_string_secret_counts_as_absent() -> None:
     assert row.state is VenueReadiness.NO_CREDENTIALS
 
 
-def test_only_one_of_two_declared_names_present_is_not_no_credentials() -> None:
-    """`NO_CREDENTIALS` requires EVERY declared name absent, not merely one -- a mutant that
-    weakens the `all(...)` check to `any(...)` would call this `no_credentials` too, which is
-    wrong: one value is actually set. With no defect hook to catch the partial pair (see the
-    module docstring's residual) and no record, this falls through to `not_permitted`."""
+def test_only_one_of_two_declared_names_present_is_PARTIAL_not_no_credentials() -> None:
+    """`NO_CREDENTIALS` requires EVERY declared name absent -- one value IS set here, so saying
+    "none is set" would be false.
+
+    But falling through was worse than the wrong label. With no defect hook to catch the partial
+    pair, this used to reach the trade-scope question and, on a permitting record, render
+    "credentials are in place" -- a green check verifying nothing, over a pair that cannot
+    authenticate a single request. It also read differently per venue for identical input:
+    robinhood's hook called the same thing `malformed_credentials`, labelling a MISSING
+    credential malformed.
+    """
     registry = {"v": _NeedsCreds}
     row = venue_readiness("v", registry, {"X_KEY": "present", "X_SECRET": None}, None)
-    assert row.state is not VenueReadiness.NO_CREDENTIALS
-    assert row.state is VenueReadiness.NOT_PERMITTED
+    assert row.state is VenueReadiness.PARTIAL_CREDENTIALS
+    assert "X_SECRET" in row.explanation
+    assert row.next_step == "keel credentials set X_SECRET"
 
 
-def test_an_adapter_declaring_no_credential_names_can_never_be_no_credentials() -> None:
-    """`fake`/`kraken`'s case: the `()` default means there is nothing to be missing, so a
-    credential-less adapter with no trade-scope record lands on `not_permitted`, never
-    `no_credentials` -- it would be a category error to say "no credentials" about a venue that
-    needs none."""
+def test_a_partial_pair_never_claims_credentials_are_in_place_even_on_a_permitting_record() -> None:
+    """The false green, pinned directly. A CONFIRMED record used to carry this all the way to
+    READY -- "credentials are in place and v's trade-scope record permits a live entry" -- on
+    half a credential pair."""
+    registry = {"v": _NeedsCreds}
+    record = _record(TradeScopeState.CONFIRMED)
+    row = venue_readiness("v", registry, {"X_KEY": "present", "X_SECRET": None}, record)
+    assert row.state is VenueReadiness.PARTIAL_CREDENTIALS
+    assert "in place" not in row.explanation
+
+
+def test_an_adapter_declaring_no_credential_names_is_NOT_TRADEABLE_not_no_credentials() -> None:
+    """`fake`/`kraken`'s case. Saying "no credentials" about a venue that needs none is a
+    category error -- but so was the answer this used to give.
+
+    It fell through to the trade-scope question and came out `not_permitted` with
+    `fix: keel scope attest --trading --venue kraken`: advice that cannot work, because there is
+    no credential behind it to attest ABOUT, on a stub with no network path at all. It also put
+    a permanent red row on the venues card for a venue nobody was ever going to trade.
+    """
     registry = {"v": _NoCreds}
     row = venue_readiness("v", registry, {}, None)
-    assert row.state is not VenueReadiness.NO_CREDENTIALS
-    assert row.state is VenueReadiness.NOT_PERMITTED
+    assert row.state is VenueReadiness.NOT_TRADEABLE
+    assert row.next_step is None, "no advice is better than advice that cannot work"
 
 
 # -- state 3: malformed_credentials ------------------------------------------------------------
@@ -188,9 +210,14 @@ def test_a_length_check_alone_would_not_have_caught_the_incident_here_either() -
 # -- state 4: not_permitted, via may_place_live_entry() ------------------------------------------
 
 
+#: A venue whose credentials are complete and undisputed, so every test below reaches the
+#: trade-scope question rather than stopping at a credential one.
+_OK_CREDS = {"X_KEY": "present", "X_SECRET": "present"}
+
+
 def test_no_record_at_all_is_not_permitted() -> None:
-    registry = {"v": _NoCreds}
-    row = venue_readiness("v", registry, {}, None)
+    registry = {"v": _NeedsCreds}
+    row = venue_readiness("v", registry, _OK_CREDS, None)
     assert row.state is VenueReadiness.NOT_PERMITTED
     assert "never attested" in row.explanation
     assert row.next_step == "keel scope attest --trading --venue v"
@@ -206,16 +233,16 @@ def test_no_record_at_all_is_not_permitted() -> None:
 def test_an_unverified_or_read_only_record_is_not_permitted(
     state: TradeScopeState, attested_scope: str | None
 ) -> None:
-    registry = {"v": _NoCreds}
+    registry = {"v": _NeedsCreds}
     record = _record(state, attested_scope=attested_scope)
-    row = venue_readiness("v", registry, {}, record)
+    row = venue_readiness("v", registry, _OK_CREDS, record)
     assert row.state is VenueReadiness.NOT_PERMITTED
 
 
 def test_a_refuted_record_names_the_refutation_reason() -> None:
-    registry = {"v": _NoCreds}
+    registry = {"v": _NeedsCreds}
     record = _record(TradeScopeState.REFUTED, refuted_reason="insufficient permission")
-    row = venue_readiness("v", registry, {}, record)
+    row = venue_readiness("v", registry, _OK_CREDS, record)
     assert row.state is VenueReadiness.NOT_PERMITTED
     assert "refused" in row.explanation
     assert "insufficient permission" in row.explanation
@@ -225,10 +252,10 @@ def test_calls_may_place_live_entry_rather_than_re_deriving_it() -> None:
     """Mutation-target proof: a record whose `may_place_live_entry()` is monkeypatched to return
     True must reach READY even though its `state` (REFUTED) would normally veto -- proving this
     module reads the METHOD'S answer and does not re-inspect `.state`/`.attested_scope` itself."""
-    registry = {"v": _NoCreds}
+    registry = {"v": _NeedsCreds}
     record = _record(TradeScopeState.REFUTED, refuted_reason="whatever")
     object.__setattr__(record, "may_place_live_entry", lambda: True)
-    row = venue_readiness("v", registry, {}, record)
+    row = venue_readiness("v", registry, _OK_CREDS, record)
     assert row.state is VenueReadiness.READY
 
 
@@ -251,9 +278,9 @@ def test_confirmed_or_attested_trading_with_fine_credentials_is_ready(
     assert row.next_step is None
 
 
-def test_a_credential_less_adapter_confirmed_by_the_venue_is_ready() -> None:
-    registry = {"v": _NoCreds}
-    row = venue_readiness("v", registry, {}, _record(TradeScopeState.CONFIRMED))
+def test_a_credentialed_adapter_confirmed_by_the_venue_is_ready() -> None:
+    registry = {"v": _NeedsCreds}
+    row = venue_readiness("v", registry, _OK_CREDS, _record(TradeScopeState.CONFIRMED))
     assert row.state is VenueReadiness.READY
 
 
@@ -312,9 +339,9 @@ def test_gather_readiness_reads_secrets_through_read_secret(
     rows = gather_readiness(registry, db_path=None)
     by_venue = {row.venue: row for row in rows}
     assert "X_KEY" in seen and "X_SECRET" in seen
-    # X_SECRET resolved to None -> not "all absent" is false (X_KEY present) -> no_credentials
-    # is NOT the verdict; with no defect hook and no record, not_permitted is.
-    assert by_venue["v"].state is VenueReadiness.NOT_PERMITTED
+    # X_KEY resolved present and X_SECRET absent -- half a pair, which is `partial_credentials`
+    # and stops there rather than going on to claim anything about the trade-scope record.
+    assert by_venue["v"].state is VenueReadiness.PARTIAL_CREDENTIALS
 
 
 def test_gather_readiness_with_no_db_path_never_touches_the_repo(
@@ -332,25 +359,69 @@ def test_gather_readiness_with_no_db_path_never_touches_the_repo(
 
 
 def test_gather_readiness_degrades_to_none_when_the_repo_read_raises(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A db file that exists but is not usable (missing table, wrong schema, locked) must not
-    turn a display command into a crash -- the record degrades to `None`, rail 20's own
-    "unknown"."""
-    import keel.data.db as db_mod
+    """A db file that exists but is not usable (missing table, wrong schema, locked, a WAL
+    database whose `-shm` sidecar is gone) must not turn a display command into a crash -- and
+    must not be reported as "nothing is attested" either, which is a claim about contents nobody
+    read. It answers `record_unreadable`, and carries NO `keel scope attest` advice, because that
+    command would overwrite the very row that could not be read."""
+    monkeypatch.setattr(
+        "keel_core.secrets.read_secret", lambda name, **_k: type("R", (), {"value": "present"})()
+    )
+    # A file that EXISTS and is not a readable database -- which is the distinction that
+    # matters. A path that simply is not there means "no deployment", and "no record" is a true
+    # statement about it; only a file present-but-unreadable makes the display ignorant.
+    junk = tmp_path / "keel.db"
+    junk.write_bytes(b"this is not a sqlite database")
 
-    class _BrokenConn:
-        pass
-
-    monkeypatch.setattr(db_mod, "connect", lambda _path: _BrokenConn())
-    registry = {"v": _NoCreds}
-    rows = gather_readiness(registry, db_path="/dev/null/not-a-real-path")
+    registry = {"v": _NeedsCreds}
+    rows = gather_readiness(registry, db_path=str(junk))
     by_venue = {row.venue: row for row in rows}
-    assert by_venue["v"].state is VenueReadiness.NOT_PERMITTED
-    assert "never attested" in by_venue["v"].explanation
+    assert by_venue["v"].state is VenueReadiness.RECORD_UNREADABLE
+    assert "could not be read" in by_venue["v"].explanation
+    assert "NOT a statement" in by_venue["v"].explanation
+    assert "scope attest" not in (by_venue["v"].next_step or "")
 
 
-def test_gather_readiness_reads_a_real_record_when_the_db_is_usable(tmp_path: Path) -> None:
+def test_a_wal_database_without_its_shm_sidecar_is_unreadable_not_unattested(tmp_path) -> None:
+    """The reproduction that motivated splitting these two answers.
+
+    `mode=ro` cannot open a WAL database whose `-shm` sidecar is absent: SQLite would have to
+    CREATE that file, and read-only forbids it. Every copied or restored backup has exactly that
+    shape -- `~/keel` carries fourteen `keel-live.db.bak-before-*` copies. Reported as unattested,
+    the display would have advised `keel scope attest --trading`, overwriting a CONFIRMED record
+    with a weaker ATTESTED one on a deployment whose record was fine all along.
+    """
+    from keel.data.db import connect, migrate
+    from keel.venue_readiness import _read_only_trade_scope
+
+    db = tmp_path / "keel.db"
+    conn = connect(str(db))
+    migrate(conn)
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    conn.close()
+    for sidecar in ("keel.db-shm", "keel.db-wal"):
+        (tmp_path / sidecar).unlink(missing_ok=True)
+    # Simulate the copied-backup shape: a WAL-mode main file with no sidecars beside it.
+    copied = tmp_path / "copy.db"
+    copied.write_bytes(db.read_bytes())
+
+    record, unreadable = _read_only_trade_scope(str(copied), "coinbase")
+
+    assert record is None
+    if unreadable:
+        row = venue_readiness("v", {"v": _NeedsCreds}, _OK_CREDS, None, record_unreadable=True)
+        assert row.state is VenueReadiness.RECORD_UNREADABLE
+        assert "scope attest" not in (row.next_step or "")
+
+
+def test_gather_readiness_reads_a_real_record_when_the_db_is_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "keel_core.secrets.read_secret", lambda name, **_k: type("R", (), {"value": "present"})()
+    )
     from keel.data.db import connect, migrate
     from keel.data.repository import Repository
 
@@ -371,7 +442,7 @@ def test_gather_readiness_reads_a_real_record_when_the_db_is_usable(tmp_path: Pa
     conn.commit()
     conn.close()
 
-    registry = {"v": _NoCreds}
+    registry = {"v": _NeedsCreds}
     rows = gather_readiness(registry, db_path=str(db_path))
     by_venue = {row.venue: row for row in rows}
     assert by_venue["v"].state is VenueReadiness.READY
@@ -420,6 +491,6 @@ def test_the_trade_scope_read_opens_the_database_READ_ONLY(tmp_path) -> None:
     # main file's bytes, which a read-only reader must not touch.
     before = hashlib.sha256(db.read_bytes()).hexdigest()
 
-    assert _read_only_trade_scope(str(db), "coinbase") is None
+    assert _read_only_trade_scope(str(db), "coinbase") == (None, False)
 
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before

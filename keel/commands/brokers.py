@@ -221,7 +221,8 @@ def list_installed_brokers() -> list[BrokerInfo]:
 #: The posture line both front-ends carry, spelled once: what these screens show is the
 #: adapter's own declarations, never an inference about the operator's keys.
 NO_KEY_INFERENCE_LINE = (
-    "capability display only -- no key presence is read or implied, and no secret is shown"
+    "the declarations above are a capability display only -- no key presence is read or "
+    "implied, and no secret is shown"
 )
 
 
@@ -347,13 +348,20 @@ def _readiness_rows(ctx: click.Context) -> list[VenueReadinessRow]:
 
 @click.group("brokers")
 def brokers_group() -> None:
-    """Venues/brokers visibility: what every installed adapter declares it can do.
+    """Venues/brokers visibility: what every installed adapter declares, and whether THIS
+    deployment could actually trade on it.
 
     Lists the installed broker adapters (the `keel.brokers` entry points) with their
     capabilities -- wired-for-deployment vs optional-dev-venue, session-bound or 24/7,
     quote currencies, asset classes, order kinds, preview synthesis, declared endpoints
-    and data feeds -- capability display only: never key-presence inference, never a
-    secret value. One service behind `keel brokers list` and the console's Venues browser.
+    and data feeds. That block is a capability display only: never key-presence inference,
+    never a secret value.
+
+    A SECOND, separate block follows it (#233): venue readiness, which DOES read credential
+    PRESENCE and run local well-formedness arithmetic, and answers a different question --
+    can a live entry be placed here right now. The two are never merged, because "what the
+    adapter can do" and "what this deployment can do" are exactly the pair #233 exists to
+    keep apart. One service behind `keel brokers list` and the console's Venues browser.
 
     Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
     """

@@ -1745,7 +1745,7 @@ def _venue_payload(info: Any) -> dict[str, Any]:
     }
 
 
-#: GOOD/WARN/BAD for each readiness state (#233 PR4). `ready` is the success state. `not_
+#: GOOD/WARN/BAD/NEUTRAL for each readiness state (#233 PR4). `ready` is the success state. `not_
 #: permitted` and `malformed_credentials` are genuine faults: a live entry is blocked TODAY by
 #: a record rail 20 will veto, or by a credential LOCALLY proven wrong -- the same BAD judgement
 #: `_venue_payload`'s own `error` field gives a construction failure, because both describe
@@ -1755,8 +1755,19 @@ def _venue_payload(info: Any) -> dict[str, Any]:
 #: present and provably wrong, or a venue that has actively refused a placement.
 _READINESS_STATE: dict[VenueReadiness, str] = {
     VenueReadiness.READY: GOOD,
+    # A dev/stub adapter with no credentials to present is not a FAULT, it is a venue this
+    # deployment was never going to trade -- `fake` and `kraken` are always installed, so any
+    # non-neutral colour here would put a permanent warning on every venues card for a row whose
+    # honest answer is "not applicable".
+    VenueReadiness.NOT_TRADEABLE: NEUTRAL,
     VenueReadiness.NOT_INSTALLED: WARN,
     VenueReadiness.NO_CREDENTIALS: WARN,
+    # Ignorance, not a fault: the database could not be read, so nothing here is a claim about
+    # the venue at all. WARN says "look at this" without asserting anything about the record.
+    VenueReadiness.RECORD_UNREADABLE: WARN,
+    # Present-and-provably-wrong, unlike the two WARNs above which are absences. Half a
+    # credential pair cannot authenticate a single request.
+    VenueReadiness.PARTIAL_CREDENTIALS: BAD,
     VenueReadiness.MALFORMED_CREDENTIALS: BAD,
     VenueReadiness.NOT_PERMITTED: BAD,
 }

@@ -701,18 +701,23 @@ def test_venues_carries_a_sibling_readiness_key_never_merged_into_venues(
         assert "state" not in row  # the readiness vocabulary must not leak onto a venues row
 
 
-def test_readiness_reflects_a_confirmed_trade_scope_record(
+def test_a_credential_less_dev_venue_stays_not_tradeable_even_with_a_confirmed_record(
     running: web_server.ServeConfig,
 ) -> None:
-    """End to end through the real route, not just `gather_readiness` in isolation: a CONFIRMED
-    trade-scope record written straight to this deployment's database must turn a venue's
-    readiness row `ready` the next time `/api/venues` is read.
+    """End to end through the real route: a venue that presents NO credentials stays
+    `not_tradeable` EVEN WITH a CONFIRMED trade-scope record sitting in this deployment's
+    database.
 
-    `fake` is used rather than `coinbase`/`alpaca`/`robinhood` deliberately: those three declare
-    credential env names, and whether THIS test process happens to have any of them set is not
-    under this test's control -- asserting against one would make the result depend on the
-    machine running it. `fake` declares none, so its readiness is governed ONLY by the
-    trade-scope record this test writes.
+    This test used to assert the opposite -- that the record alone turned `fake` `ready` -- and
+    that was the defect. `fake` is the deterministic dev venue and `kraken` is a stub with no
+    network path at all; neither is something this deployment can trade, whatever a row says
+    about it. Grading them on trade scope produced `not_permitted` with
+    `fix: keel scope attest --trading --venue kraken`, advice that cannot work because there is
+    no credential behind it to attest ABOUT, and put a permanent red row on the venues card for
+    a venue nobody was going to trade.
+
+    The record is written anyway, and asserted NOT to resurrect the row, because a credential
+    question that stopped being asked once a record existed would reintroduce exactly that.
     """
     from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
@@ -735,8 +740,11 @@ def test_readiness_reflects_a_confirmed_trade_scope_record(
 
     _status, _headers, document = _json(running, "/api/venues")
     rows = {row["venue"]: row for row in document["data"]["readiness"]}
-    assert rows["fake"]["state"]["value"] == "ready"
-    assert rows["fake"]["state"]["state"] == "good"
+    assert rows["fake"]["state"]["value"] == "not_tradeable"
+    # NEUTRAL, not warn/bad: an adapter that was never a trading venue is not a fault to fix.
+    assert rows["fake"]["state"]["state"] == "neutral"
+    assert rows["fake"]["next_step"] == "", "no advice is better than advice that cannot work"
+    assert "scope attest" not in rows["fake"]["explanation"]
 
 
 def test_setup_is_answerable_with_nothing_set_up(empty_machine: web_server.ServeConfig) -> None:
