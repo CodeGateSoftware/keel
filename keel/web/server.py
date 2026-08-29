@@ -485,7 +485,12 @@ class KeelHandler(BaseHTTPRequestHandler):
                 403,
                 "Not authorised",
                 "Open the address keel printed when it started -- it carries a one-time token "
-                "for this session. The token is new every run and is never written to disk.",
+                "for this session. The token is new every run and is never written to disk. "
+                "If you opened that address and still see this, an installed service worker "
+                "from a build before this one is answering the page from its cache, so the "
+                "token never reached the server: unregister it once (browser devtools, "
+                "Application, Service Workers, Unregister) or reload with the cache emptied, "
+                "then open the printed address again.",
             )
             return False
         return True

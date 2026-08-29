@@ -59,6 +59,20 @@ const BASE = "/";
 /** The path prefix that is never cached, never stored, never served from a cache. */
 const API_PREFIX = "/api/";
 
+//: The one query parameter that MUST reach the server, and the reason this worker has an
+//: exception at all. `keel serve` prints `http://127.0.0.1:8765/?token=...`; `server.do_GET`
+//: reads that token and answers the SAME navigation with `Set-Cookie`, and every `/api/*` read
+//: afterwards is gated on the cookie (`server._admitted`). The exchange happens once, on one
+//: request, and it is a navigation -- which is precisely the request this worker was answering
+//: out of its cache.
+//:
+//: A cached answer there means the server never sees the token. The shell loads, every read it
+//: makes is refused, and the page reads "Not authorised -- open the address keel printed when it
+//: started" at an operator who did exactly that. There is no way out from inside the page: the
+//: update offer that would replace this worker lives in a footer the refused page never fills.
+//: The worker ends up holding the door shut against the only key.
+const SESSION_TOKEN_PARAM = "token";
+
 /** The document every in-scope navigation resolves to -- `staticfiles.CLIENT_ENTRY`. */
 const SHELL = `${BASE}index.html`;
 
@@ -188,6 +202,17 @@ self.addEventListener("fetch", (event) => {
   // the server answers it with the shell (`staticfiles.resolve_client_route`). Matching that here
   // is what makes a deep link work with the engine stopped.
   if (request.mode === "navigate") {
+    // The session hand-off goes to the network, always. Not `respondWith(fetch(...))` -- a bare
+    // return, which declines the request and lets the browser make it exactly as it would with
+    // no worker installed, redirect and cookie handling included. Nothing here is better placed
+    // to do that than the browser is.
+    //
+    // No cache fallback on this branch either, deliberately. If the server is unreachable the
+    // honest answer is the browser's own failure page; a shell served from cache would look
+    // like it had worked and then refuse every read, which is the failure this whole exception
+    // exists to prevent.
+    if (url.searchParams.has(SESSION_TOKEN_PARAM)) return;
+
     event.respondWith(
       caches.match(SHELL, { cacheName: CACHE }).then((hit) => hit || fetch(request)),
     );
