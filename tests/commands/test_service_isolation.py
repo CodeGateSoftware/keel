@@ -50,6 +50,7 @@ SERVICE_MODULES = [
     "keel.commands.monitor",
     "keel.commands.pnl",
     "keel.commands.purification",
+    "keel.commands.research",
     "keel.commands.rules",
     "keel.commands.simulate",
     "keel.commands.status",

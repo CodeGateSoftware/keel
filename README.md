@@ -174,6 +174,10 @@ adapter, deliberately divergent, that the conformance suite runs against.
 - [`docs/experiments/`](docs/experiments) — the experiment record, including the honest
   result linked above; every document states what was measured, on what engine, with the
   defect that forced a restatement.
+- [`docs/research-toolkit.md`](docs/research-toolkit.md) — the thirteen `keel/research/`
+  modules behind `keel research`: what each answers, what it refuses to answer even when
+  asked nicely, and the Strathern rail that stops a diagnostic score from becoming a
+  sweep's ranking key.
 - [`docs/launch.md`](docs/launch.md) — the pre-launch gate and the announcement plan:
   what must be true before anything is announced, where, in what order, and what the
   post says (the honest result included).

@@ -130,7 +130,9 @@ def test_pbo_refuses_when_every_trial_is_series_missing(tmp_path):
     _record(runner, path, "backfilled")
 
     result = runner.invoke(cli, ["trials", "pbo", "--ledger", str(path), "--blocks", "4"])
-    assert result.exit_code != 0
+    # #601: an evidence-shaped refusal is a result, not an error -- exit 0, on stdout.
+    assert result.exit_code == 0, result.output
+    assert "refused" in result.output
     assert "no usable columns" in result.output
 
 
@@ -175,7 +177,10 @@ def test_deflate_refuses_on_too_few_decision_trials(tmp_path):
     result = runner.invoke(
         cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
     )
-    assert result.exit_code != 0
+    # #601: an evidence-shaped refusal is a result, not an error -- exit 0, on stdout.
+    assert result.exit_code == 0, result.output
+    assert "refused" in result.output
+    assert "need >= 2" in result.output
 
 
 # -- trials monte-carlo (#441): is the equity curve an outlier? -----------------------------------
@@ -412,8 +417,10 @@ def test_monte_carlo_refuses_when_no_closed_trades_and_writes_no_row(tmp_path):
     result = _invoke_mc(CliRunner(), db, ledger, "--seed", "3")
     # The mechanism: dca declares no granularity, the fallback chain resolves ONE_HOUR, and
     # nothing is cached there -- so the observed backtest runs over ZERO candles and closes
-    # nothing. A refusal, not a degenerate row.
-    assert result.exit_code != 0
+    # nothing. A refusal, not a degenerate row -- and per #601 a refusal is a printed
+    # result, exit 0, not a ClickException.
+    assert result.exit_code == 0, result.output
+    assert "refused" in result.output
     assert "no closed trades" in result.output
     assert not ledger.exists()
 
@@ -465,7 +472,9 @@ def test_monte_carlo_refuses_when_every_trade_is_genuinely_open(tmp_path):
 
     ledger = tmp_path / "trials.jsonl"
     result = _invoke_mc(CliRunner(), tmp_path / "open-only.db", ledger, "--seed", "3")
-    assert result.exit_code != 0
+    # #601: an evidence-shaped refusal is a result, not an error -- exit 0, on stdout.
+    assert result.exit_code == 0, result.output
+    assert "refused" in result.output
     assert "no closed trades" in result.output
     assert not ledger.exists()
 

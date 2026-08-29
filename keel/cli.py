@@ -62,7 +62,7 @@ in `tests/test_paper_equities_profile.py`).
 broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
 `_build_broker` seam, and the remaining top-level commands. The broker-free command groups live
 in `keel/commands/*` and are registered here via `cli.add_command(...)`: `db`, `trials`,
-`withdrawals`, `autonomy`, `rules`, `subscription`, `versions`. The shared seams
+`withdrawals`, `autonomy`, `rules`, `research`, `subscription`, `versions`. The shared seams
 (`with_disclaimer`, the confirmation gate, `_open_repo`/`_load_cfg`/`_build_broker`) live in
 `keel.commands._common` and are re-imported here; `_is_interactive` is reached as
 `_common._is_interactive()` so a single patch point in `keel.commands._common` drives every gate
@@ -156,6 +156,7 @@ from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
 from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
+from keel.commands.research import research_group
 from keel.commands.rules import rules_group, rules_seed
 from keel.commands.serve import serve_cmd
 from keel.commands.setup import setup_cmd, template_config_text
@@ -1130,6 +1131,15 @@ cli.add_command(autonomy_group)
 # The `rules` group is defined in `keel.commands.rules`; register it here. `rules_seed` is also
 # imported by `init` below, which invokes it to seed candidate rules on a fresh install.
 cli.add_command(rules_group)
+
+
+# -- research (the front door over keel/research/*, issue #601) -----------------------------
+
+# The `research` group is defined in `keel.commands.research`: an index over all thirteen
+# evidence modules plus aliases of the five commands `trials`/`rules` already register (the
+# same objects, not copies -- see that module's docstring). Registered here, after both
+# groups it aliases into, so the objects it reaches into already exist.
+cli.add_command(research_group)
 
 
 # -- pnl ------------------------------------------------------------------------------

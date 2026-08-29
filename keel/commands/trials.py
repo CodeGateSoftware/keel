@@ -166,7 +166,16 @@ def trials_deflate(
     trials = trials_ledger.read_trials(_ledger_path(ledger))
     m_total, n_decisions = trials_ledger.trial_counts(trials)
     if n_decisions < 2:
-        raise click.ClickException(f"only {n_decisions} decision trials -- need >= 2")
+        # Evidence-shaped, not an operator error (#601): the ledger is readable and the
+        # question is well-formed, there is simply not yet enough recorded evidence to
+        # form a trial count for E[max SR_n]/MinBTL. A refusal is this command working,
+        # not this command failing -- print it on stdout and exit 0.
+        click.echo(
+            f"refused: only {n_decisions} decision trial(s) recorded -- need >= 2 to form "
+            "a trial count for E[max SR_n]/MinBTL; record more trials with `trials record` "
+            "and retry"
+        )
+        return
 
     click.echo("inputs")
     click.echo(f"  M (all ledger rows)      : {m_total}")
@@ -221,7 +230,13 @@ def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
     trials = trials_ledger.read_trials(_ledger_path(ledger))
     build = matrix_mod.build_matrix(trials, session=session)
     if not build.columns:
-        raise click.ClickException("no usable columns (all trials are series_missing?)")
+        # Evidence-shaped (#601): a readable, well-formed ledger with nothing to build a
+        # CSCV matrix from is a refusal, not an operator mistake -- print it and exit 0.
+        click.echo(
+            "refused: no usable columns -- every recorded trial is series_missing, so "
+            "there is no per-bar P&L to assemble a CSCV matrix from"
+        )
+        return
     for warning in build.warnings:
         click.echo(f"warning: {warning}", err=True)
     if build.refused:
@@ -369,9 +384,11 @@ def trials_monte_carlo(
 
     if mode == "trades":
         if not pnls:
-            raise click.ClickException(
-                "no closed trades in the observed backtest -- nothing to reshuffle"
-            )
+            # Evidence-shaped (#601): the rule resolved and the observed backtest ran; it
+            # simply closed nothing to resample. Print the refusal and stop -- exit 0, no
+            # ledger row, because there is nothing to diagnostic_only-record either.
+            click.echo("refused: no closed trades in the observed backtest -- nothing to reshuffle")
+            return
         resampled = mc_mod.reshuffle(pnls, paths, seed)
     else:
         if not resolved.candles:
@@ -556,14 +573,35 @@ def trials_walk_forward(
             test_bars=test_bars,
             step_bars=step_bars,
         )
-        report = wf_mod.walk_forward(
-            resolved.rule,
-            resolved.candles,
-            folds_bounds=folds_bounds,
-            fee_pct=resolved.fee_pct,
-        )
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        # Evidence-shaped (#601), and the catch is deliberately around `folds` ALONE.
+        # Every one of the seven ValueErrors `wf_mod.folds` raises names a train/test
+        # window against the available bars -- a well-formed request the cached history
+        # cannot answer, not an operator mistake. Print it and stop; no ledger rows,
+        # exit 0.
+        #
+        # ⚠️ Do NOT widen this to cover the `walk_forward` call below. That call runs the
+        # backtest engine twice per fold and reaches `deflate`; a ValueError from in
+        # there is a BUG (a Decimal conversion, a malformed candle, `_closed_pnl`'s
+        # poisoned-row guard), and swallowing it as `refused:` would exit 0 on a failure
+        # -- making a genuine defect quieter than it was before #601 touched this
+        # command, and indistinguishable from "the history cannot answer this". The one
+        # ValueError `walk_forward` raises for itself (an empty `folds_bounds`) is
+        # unreachable from here: `folds` refuses `train_bars + test_bars > n_bars` before
+        # its loop, so it never returns an empty list. If some walk_forward failure is
+        # ever genuinely evidence-shaped, give it a named exception in walkforward.py and
+        # catch THAT -- a type is a claim the callee makes about itself; a bare
+        # ValueError catch is the caller guessing on the callee's behalf, and the guess
+        # is what goes stale.
+        click.echo(f"refused: {exc}")
+        return
+
+    report = wf_mod.walk_forward(
+        resolved.rule,
+        resolved.candles,
+        folds_bounds=folds_bounds,
+        fee_pct=resolved.fee_pct,
+    )
 
     for line in wf_mod.render_lines(report):
         click.echo(line)

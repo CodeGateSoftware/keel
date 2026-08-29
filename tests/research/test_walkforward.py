@@ -744,9 +744,11 @@ def test_cli_refusals_write_no_rows(tmp_path):
     db = _wf_db(tmp_path, candles=True)
     ledger = tmp_path / "trials.jsonl"
 
-    # window larger than the cached series: ValueError -> ClickException, no rows.
+    # window larger than the cached series: evidence-shaped ValueError from `folds()`, no
+    # rows -- and per #601 a refusal is a printed result (exit 0), not a ClickException.
     too_big = _invoke_wf(CliRunner(), db, ledger, "--train-bars", "90", "--test-bars", "90")
-    assert too_big.exit_code != 0
+    assert too_big.exit_code == 0, too_big.output
+    assert "refused" in too_big.output
     assert "exceeds" in too_big.output
     assert not ledger.exists() or trials_ledger.read_trials(ledger) == []
 
