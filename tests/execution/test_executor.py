@@ -890,25 +890,11 @@ def test_execute_attaches_oco_bracket_after_a_stop_target_entry_fills(repo):
 # they protected (never sell an already-closed position twice) is now the exchange's to enforce.
 
 
-def test_scale_out_places_a_partial_sell_and_logs_it(repo):
-    _seed_open_position(repo, "BTC-USD", Decimal("0.2"), Decimal("50000"))
-    broker = FakeBroker()
-
-    result = scale_out(
-        broker,
-        repo,
-        _config(),
-        product_id="BTC-USD",
-        qty=Decimal("0.1"),
-        exit_price=Decimal("53000"),
-        rule_name="partial_target",
-        now_ts=NOW_TS,
-    )
-
-    assert result.placed is True
-    order = repo.get_order(result.order_id)
-    assert order["side"] == "SELL"
-    assert order["qty"] == Decimal("0.1")
+# NOTE: `test_scale_out_places_a_partial_sell_and_logs_it` moved to
+# `tests/execution/test_scale_out.py` and grew into a module. #502 turned `scale_out` from a
+# bare SELL into a four-step sequence -- crash ledger, cancel, sell, re-place at the remainder,
+# with the sold fraction booked against the `positions` ledger -- and a single "it placed a
+# SELL" assertion no longer describes it.
 
 
 # -- break-even roll -------------------------------------------------------------------------
@@ -2187,33 +2173,26 @@ def test_an_unobservable_immediate_fill_keeps_the_estimate_rather_than_failing(r
     assert order["fee"] == Decimal("0.30")  # the previewed commission, as before
 
 
-def test_scale_out_has_no_production_caller(repo):
-    """A TRIPWIRE, not a style check. `scale_out` is unreachable today, and in the
-    single-bracket world it is actively wrong if wired: a partial SELL runs against a bracket
-    committing the FULL position (so it is rejected, or fills and leaves an oversized bracket
-    able to sell more than is held), it never resizes or re-places the bracket, and it records
-    no `trade_outcomes` row -- so a scaled-out winner's profit is dropped and rail 16 can count
-    a net winner as a loss.
-
-    The ledger adjudicated this as "accept and document", which is only safe while it stays
-    unreachable. This test fails the moment someone wires it, which is the point: fix the three
-    problems above first.
-    """
-    import pathlib
-    import re
-
-    keel_root = pathlib.Path(__file__).resolve().parents[2] / "keel"
-    callers: list[str] = []
-    for path in keel_root.rglob("*.py"):
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            if re.search(r"\bscale_out\s*\(", line) and "def scale_out" not in line:
-                callers.append(f"{path.relative_to(keel_root.parent)}:{lineno}")
-
-    assert callers == [], (
-        "scale_out has gained a production caller. Before wiring it: cancel/resize the resting "
-        "bracket, and record a trade outcome for the partial exit -- otherwise rail 16 will "
-        f"count net winners as losses. Call sites: {callers}"
-    )
+# `test_scale_out_has_no_production_caller` is RETIRED, not weakened, and it is worth recording
+# what it was for and why it stopped being true.
+#
+# It scanned `keel/` for any call to `scale_out` and failed if one appeared. Its stated bar was
+# three things a caller would have had to do first: cancel/resize the resting bracket, record a
+# `trade_outcomes` row for the partial exit, and not let rail 16 count a scaled-out net winner
+# as a loss. All three are discharged in #502 -- and discharged INSIDE `scale_out` rather than
+# handed to its caller as obligations, which is the part that makes retiring it safe. A caller
+# cannot forget an obligation it does not carry: `scale_out` cancels the bracket itself, books
+# the sale itself, and re-places the remainder's bracket itself, behind #519's crash ledger.
+#
+# What replaces it is `tests/execution/test_scale_out.py` -- fourteen pins over the sequence,
+# the two load-bearing ones being that the crash ledger is written before the FIRST venue touch
+# and that a scaled-out net winner produces ONE outcome row that rail 16 reads as a win.
+#
+# What the tripwire also did, incidentally, was assert that nothing in `keel/` drives a
+# scale-out. That is STILL true and is not pinned any more, deliberately: it was a statement
+# about an unfinished capability, and the capability is finished. Deciding when to take half off
+# is rule-side work, and a rule that does it will be reviewed on its own merits rather than by
+# tripping a test written about a different problem.
 
 
 # -- rail 13 guards the PRODUCT's quote leg, not config.quote_currency ----------
@@ -2995,6 +2974,22 @@ class TestMaxSpreadEntryGate:
         spread and places anyway. Trapping an exit in a wide book would strand the position
         exactly when the rule says leave."""
         broker = FakeBroker(preview=_book_preview(Decimal("48000"), Decimal("50000")))  # 400bp
+        # `scale_out` is used here only because it is the shortest SELL through this pipeline.
+        # Since #502 it resizes a bracket, so it needs a held, bracketed position to scale out
+        # of; the setup below is the state, not the subject.
+        _seed_open_position(repo, "BTC-USD", Decimal("0.002"), Decimal("50000"))
+        place_bracket(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            qty=Decimal("0.002"),
+            stop=Decimal("49000"),
+            target=Decimal("53000"),
+            rule_name="position_rule",
+            now_ts=NOW_TS,
+        )
+        broker.place_calls.clear()
 
         with caplog.at_level(logging.WARNING):
             result = scale_out(
@@ -3010,7 +3005,8 @@ class TestMaxSpreadEntryGate:
 
         assert result.placed is True
         assert result.vetoed_by == []
-        assert len(broker.place_calls) == 1
+        # The partial SELL and the remainder's replacement bracket; neither was spread-gated.
+        assert len(broker.place_calls) == 2
         assert not [r for r in caplog.records if r.getMessage() == _SPREAD_REFUSED_EVENT]
         assert not [r for r in caplog.records if r.getMessage() == _BOOK_UNREADABLE_EVENT]
 

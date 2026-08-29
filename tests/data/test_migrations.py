@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from decimal import Decimal
 
 import pytest
 
 from keel.data import db
+from keel.data.repository import Repository
 
 
 def _v1_database() -> sqlite3.Connection:
@@ -46,7 +48,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 12
+    assert version == db.SCHEMA_VERSION == 13
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -286,5 +288,65 @@ def test_an_existing_orders_table_gains_filled_quantity_by_ALTER() -> None:
     assert "filled_quantity" in cols
     row = conn.execute("SELECT qty, status, filled_quantity FROM orders").fetchone()
     assert row["filled_quantity"] is None
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
+
+
+def test_migration_to_v13_adds_the_partial_exit_accumulators() -> None:
+    """The three columns a tranche closed in PIECES needs (#502): what has been sold, what it
+    fetched gross, and the exit-leg fees already charged. `positions.qty` becomes what is STILL
+    HELD; these carry the legs behind it until the one `trade_outcomes` row is written."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
+    assert {"realized_qty", "realized_proceeds", "realized_fees"} <= cols
+
+
+def test_an_existing_positions_table_gains_the_accumulators_by_ALTER() -> None:
+    """The v8 lesson again: a `CREATE TABLE IF NOT EXISTS` addition is invisible to a database
+    already stamped past v4, so the v13 step must ALTER the live table. Existing rows read back
+    NULL, which the repository decodes to ZERO -- unlike `initial_stop`, because there is no
+    difference between "never partially exited" and "partially exited nothing"."""
+    conn = db.connect(":memory:")
+    # A v12 database: `positions` exactly as v12 shipped it.
+    conn.execute(
+        """
+        CREATE TABLE positions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id        TEXT    NOT NULL,
+            rule_name         TEXT    NOT NULL,
+            opened_at         INTEGER NOT NULL,
+            closed_at         INTEGER,
+            qty               TEXT    NOT NULL,
+            entry_fill        TEXT    NOT NULL,
+            entry_fee         TEXT    NOT NULL,
+            initial_stop      TEXT,
+            bracket_order_id  INTEGER,
+            status            TEXT    NOT NULL DEFAULT 'open'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO positions (product_id, rule_name, opened_at, qty, entry_fill, entry_fee)
+        VALUES ('BTC-USD', 'r', 1, '0.1', '50000', '1')
+        """
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (12)")
+    conn.execute("CREATE TABLE agent_state (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+
+    db.migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
+    assert {"realized_qty", "realized_proceeds", "realized_fees"} <= cols
+    row = conn.execute(
+        "SELECT realized_qty, realized_proceeds, realized_fees FROM positions"
+    ).fetchone()
+    assert row["realized_qty"] is None
+    assert row["realized_proceeds"] is None
+    assert row["realized_fees"] is None
+    assert Repository(conn).get_open_positions("BTC-USD")[0]["realized_qty"] == Decimal("0")
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert stamped == db.SCHEMA_VERSION
