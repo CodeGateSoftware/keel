@@ -9,6 +9,7 @@ identity, or no templates.
 
 from __future__ import annotations
 
+import re
 import stat
 import tomllib
 from pathlib import Path
@@ -202,6 +203,89 @@ def test_the_release_notes_say_the_builds_are_unsigned_and_how_to_verify_them() 
     assert "Open Anyway" in text
     assert "gh attestation verify" in text
     assert "SHA256SUMS" in text
+
+
+# -- #605: the docs must name the files the Checksums step ACTUALLY emits -----------------------
+
+#: `runner.os`, GitHub's own built-in context -- not the `matrix.os` runner image name -- is
+#: what the Checksums step interpolates. The mapping is GitHub's, not this repo's: every
+#: `macos-*` image reports `runner.os == 'macOS'`, every `windows-*` image reports 'Windows'.
+_RUNNER_OS_PREFIXES = {"macos": "macOS", "windows": "Windows", "ubuntu": "Linux"}
+
+
+def _runner_os(matrix_os: str) -> str:
+    prefix = matrix_os.split("-", 1)[0]
+    assert prefix in _RUNNER_OS_PREFIXES, f"unmapped runner image {matrix_os!r}"
+    return _RUNNER_OS_PREFIXES[prefix]
+
+
+def _expected_checksum_filenames(desktop_job: dict) -> set[str]:
+    """Read the real source of truth: the matrix legs, and the literal naming TEMPLATE the
+    Checksums step uses -- so a future rename of the template (delimiter, order, prefix) fails
+    this test rather than leaving it silently checking a frozen guess."""
+    steps = desktop_job["steps"]
+    checksums_step = next(s for s in steps if s.get("name") == "Checksums")
+    run = str(checksums_step["run"])
+    match = re.search(r'CKSUM_FILE="([^"]+)"', run)
+    assert match, "the Checksums step no longer sets CKSUM_FILE -- update this test's regex"
+    template = match.group(1)
+    assert template == "SHA256SUMS-${{ runner.os }}-${{ matrix.arch }}.txt", (
+        f"the checksum filename template changed to {template!r} -- the docs and the "
+        "release-notes wording may need to change with it, not just this test"
+    )
+    legs = desktop_job["strategy"]["matrix"]["include"]
+    assert legs, "expected at least one matrix leg"
+    return {f"SHA256SUMS-{_runner_os(leg['os'])}-{leg['arch']}.txt" for leg in legs}
+
+
+def test_desktop_install_docs_name_the_real_per_platform_checksum_files(
+    desktop_job: dict,
+) -> None:
+    """#605: the docs promised a singular `SHA256SUMS.txt`; the Checksums step has always
+    emitted one file per matrix leg (`SHA256SUMS-<runner.os>-<arch>.txt`). Anyone following
+    the old wording into `sha256sum -c SHA256SUMS.txt` got a missing-file error -- this test
+    computes the REAL filenames from the workflow's own matrix and template, so the docs
+    cannot drift back to the singular claim without failing here.
+    """
+    expected = _expected_checksum_filenames(desktop_job)
+    docs_path = _ROOT / "docs" / "desktop-install.md"
+    docs = docs_path.read_text(encoding="utf-8")
+    for filename in expected:
+        assert filename in docs, (
+            f"docs/desktop-install.md must name {filename!r} -- it is one of the files the "
+            "release workflow actually attaches"
+        )
+    assert "SHA256SUMS.txt" not in docs, (
+        "docs/desktop-install.md must not promise a singular SHA256SUMS.txt -- the release "
+        "workflow attaches one file per platform, never one combined file"
+    )
+
+
+def test_release_notes_template_names_the_real_per_platform_checksum_files(
+    desktop_job: dict, release_job: dict
+) -> None:
+    """#605, the other stale copy: the release-notes wording composed in the `release` job
+    (shown to anyone who downloads a `publish-unsigned` release) made the same singular
+    promise as the docs. Fixed the same way: named against the workflow's own matrix.
+
+    Found by NAME, not by slicing the raw file text around a step title -- that title
+    also appears inside an earlier permissions COMMENT ("pull-requests: read # 'Compose
+    release notes' reads merged PRs..."), which is not the step and does not contain the
+    wording under test.
+    """
+    expected = _expected_checksum_filenames(desktop_job)
+    notes_step = next(
+        s for s in release_job["steps"] if s.get("name") == "Compose release notes"
+    )
+    notes_section = str(notes_step["run"])
+    for filename in expected:
+        assert filename in notes_section, (
+            f"the release-notes template must name {filename!r} -- one of the real "
+            "per-platform checksum files the desktop job attaches"
+        )
+    assert "SHA256SUMS.txt" not in notes_section, (
+        "the release-notes template must not promise a singular SHA256SUMS.txt"
+    )
 
 
 def test_the_desktop_job_runs_after_the_release_and_builds_that_tag(desktop_job: dict) -> None:

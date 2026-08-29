@@ -258,7 +258,10 @@ jobs:
               echo
               echo "    gh attestation verify <file> --repo ${{ github.repository }}"
               echo
-              echo "\`SHA256SUMS.txt\` is attached as well. If either check fails, do not run it."
+              echo "A \`SHA256SUMS-<platform>-<arch>.txt\` file per build is attached as well"
+              echo "(\`SHA256SUMS-macOS-arm64.txt\`, \`SHA256SUMS-macOS-x86_64.txt\`,"
+              echo "\`SHA256SUMS-Windows-x86_64.txt\`) -- pick the one matching what you"
+              echo "downloaded. If either check fails, do not run it."
               echo
               echo "The app opens keel in your browser; there is no terminal involved. Your"
               echo "config, database and credentials live in your user Application Support /"
