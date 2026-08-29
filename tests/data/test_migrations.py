@@ -90,15 +90,39 @@ def test_migration_bumps_the_stored_version() -> None:
 
 
 def test_migration_is_idempotent() -> None:
+    """Exercises `_migrate_v2_broker_subscriptions`'s own early-return guard directly (#615).
+
+    The original shape of this test called `db.migrate(conn)` three times and asserted one
+    row. That proves only that `migrate()`'s version gate (`if current < target`) skips a
+    step once the stored version reaches its target -- true, and already stated by
+    `migrate()`'s own docstring, but not a claim about THIS step. After the first call the
+    database is stamped at `SCHEMA_VERSION`, so calls two and three run zero migration
+    steps; the one-row assertion held no matter what `_migrate_v2_broker_subscriptions` did
+    with an existing row, including nothing at all. Calling the migration function itself, a
+    second time, directly, against state it has already touched, is the only way to
+    actually reach its guard -- the same pattern
+    `test_v14_migration_step_does_not_overwrite_an_existing_attestation_when_rerun` below
+    uses for the v14 backfill.
+    """
     conn = _v1_database()
     db.migrate(conn)
-    db.migrate(conn)
-    db.migrate(conn)
+    assert len(_subscription_rows(conn)) == 1
+
+    db._migrate_v2_broker_subscriptions(conn)
+    conn.commit()
+
     assert len(_subscription_rows(conn)) == 1
 
 
 def test_migration_does_not_overwrite_an_existing_row() -> None:
-    """A user who already attested must not be silently reset by a re-run."""
+    """A user who already attested must not be silently reset by a re-run.
+
+    Calls `_migrate_v2_broker_subscriptions` directly a second time, not `db.migrate(conn)`
+    again (#615's audit finding: the same vacuous shape as `test_migration_is_idempotent`
+    above). `migrate()`'s version gate means a second public-API call runs zero steps once
+    the database is stamped at `SCHEMA_VERSION`, so this would stay green even if the guard
+    below were deleted outright -- calling the function directly is what actually reaches it.
+    """
     conn = _v1_database()
     db.migrate(conn)
     conn.execute(
@@ -106,7 +130,8 @@ def test_migration_does_not_overwrite_an_existing_row() -> None:
     )
     conn.commit()
 
-    db.migrate(conn)
+    db._migrate_v2_broker_subscriptions(conn)
+    conn.commit()
 
     row = _subscription_rows(conn)[0]
     assert row["tier_name"] == "Preferred"
