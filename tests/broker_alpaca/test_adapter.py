@@ -1167,3 +1167,18 @@ class TestTradeScopeIsDeliberatelyUnmapped:
             )
         except AlpacaAPIError:
             pass
+# -- credential declaration (#233 PR4) ------------------------------------------------------------
+
+
+def test_declares_its_credential_env_names() -> None:
+    """Matches `keel_core.config.load_alpaca_secrets`'s own names -- the two headers Alpaca's
+    API documents -- the same discipline `DECLARED_ENDPOINTS`/`DECLARED_DATA_FEEDS` already
+    keep for the capability-display surfaces."""
+    assert AlpacaAdapter.DECLARED_CREDENTIAL_ENV == ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
+
+
+def test_declares_no_credential_defect_hook() -> None:
+    """Only Robinhood implements `credential_defect` (#233 PR4); Alpaca's key id/secret pair has
+    no locally-provable shape worth checking, so the readiness derivation reads the
+    `getattr(..., None)` default here rather than a stub."""
+    assert getattr(AlpacaAdapter, "credential_defect", None) is None

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -309,6 +310,42 @@ class RobinhoodAdapter:
     adapter written against v1 would have to guess at all three, and guessing is the thing the
     port exists to prevent.
     """
+
+    #: Where this adapter's credentials live (#233 PR4), for the capability-display surfaces --
+    #: `keel brokers list`'s readiness block and `/api/venues`' `readiness` rows -- never read
+    #: here for anything but PRESENCE. Matches `keel/commands/credentials.py`'s `KNOWN` tuple and
+    #: `keel_broker_robinhood.credentials`' own constants; kept as the literal strings (rather
+    #: than importing the constants) so this declaration reads the same way
+    #: `AlpacaAdapter.DECLARED_ENDPOINTS` does -- a plain tuple a capability-display reader can
+    #: `getattr` with no import of this package at all.
+    DECLARED_CREDENTIAL_ENV: tuple[str, str] = (
+        "ROBINHOOD_API_KEY_CREDENTIAL",
+        "ROBINHOOD_PRIVATE_KEY",
+    )
+
+    @staticmethod
+    def credential_defect(values: Mapping[str, str | None]) -> str | None:
+        """A one-line, SECRET-FREE description of a LOCALLY provable defect in this adapter's
+        credential pair, or `None` when nothing provable is wrong -- #233 PR4's `malformed_
+        credentials` readiness state, and the exact case the 2026-08-19 incident motivates: a
+        credential that reads fine and signs every request is not evidence it can trade.
+
+        `values` is keyed by `DECLARED_CREDENTIAL_ENV`'s own names, the same convention every
+        caller of this hook follows (`keel.venue_readiness.venue_readiness` builds it that way).
+        The actual arithmetic -- decode, length-check, derive the public key and compare -- lives
+        in `keel_broker_robinhood.credentials.find_credential_defect`, the ONE place
+        `scripts/robinhood_smoke.py`'s operator-facing `SystemExit` messages and this one-line
+        summary both call, so there is exactly one derivation to get wrong rather than two that
+        could silently disagree.
+        """
+        from keel_broker_robinhood.credentials import (
+            API_KEY_ENV,
+            PRIVATE_KEY_ENV,
+            find_credential_defect,
+        )
+
+        defect = find_credential_defect(values.get(API_KEY_ENV), values.get(PRIVATE_KEY_ENV))
+        return defect.summary if defect else None
 
     def __init__(self, transport: Transport | None = None) -> None:
         self._transport = transport

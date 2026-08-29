@@ -2266,3 +2266,63 @@ def test_a_401_does_NOT_refute_the_scope() -> None:
 
     with pytest.raises(_ScopeHTTPError):
         _scope_adapter(exc).place_order(_SCOPE_SELL)
+# -- credential declaration and defect detection (#233 PR4) --------------------------------------
+
+
+def test_declares_its_credential_env_names() -> None:
+    """Matches `keel/commands/credentials.py`'s `KNOWN` tuple (#437) and
+    `keel_broker_robinhood.credentials`'s own constants -- pinned here too so a rename of either
+    cannot drift silently away from the other two."""
+    assert RobinhoodAdapter.DECLARED_CREDENTIAL_ENV == (
+        "ROBINHOOD_API_KEY_CREDENTIAL",
+        "ROBINHOOD_PRIVATE_KEY",
+    )
+
+
+def test_credential_defect_is_none_for_a_wellformed_pair() -> None:
+    import base64
+
+    import nacl.signing
+
+    seed_b64 = base64.b64encode(bytes(range(32))).decode()
+    values = {
+        "ROBINHOOD_API_KEY_CREDENTIAL": "rh-api-1e2d3c4b-5a69-4788-9f01-23456789abcd",
+        "ROBINHOOD_PRIVATE_KEY": seed_b64,
+    }
+    assert RobinhoodAdapter.credential_defect(values) is None
+    # Sanity on the fixture itself: a real Ed25519 signing key really does derive from it.
+    assert nacl.signing.SigningKey(bytes(range(32))).verify_key is not None
+
+
+def test_credential_defect_delegates_to_the_shared_derivation() -> None:
+    """`RobinhoodAdapter.credential_defect` must not re-derive the check -- it is a thin wrapper
+    over `keel_broker_robinhood.credentials.find_credential_defect`, keyed by
+    `DECLARED_CREDENTIAL_ENV`'s own names. This proves the wrapper reads the RIGHT keys out of
+    the mapping it is handed, by giving it a defect `find_credential_defect` can only report if
+    both values were passed through correctly."""
+    import base64
+
+    import nacl.signing
+
+    seed_raw = bytes(range(32))
+    seed_b64 = base64.b64encode(seed_raw).decode()
+    public_b64 = base64.b64encode(bytes(nacl.signing.SigningKey(seed_raw).verify_key)).decode()
+    values = {
+        "ROBINHOOD_API_KEY_CREDENTIAL": public_b64,
+        "ROBINHOOD_PRIVATE_KEY": seed_b64,
+        # A third, unrelated key: proves the wrapper reads only the two DECLARED names, not
+        # every key in the mapping it is handed.
+        "SOME_OTHER_VAR": "ignored",
+    }
+    defect = RobinhoodAdapter.credential_defect(values)
+    assert defect is not None
+    assert "PUBLIC key" in defect
+    assert seed_b64 not in defect and public_b64 not in defect  # never the value itself
+
+
+def test_credential_defect_treats_absent_values_as_missing() -> None:
+    defect = RobinhoodAdapter.credential_defect({})
+    assert defect is not None
+    assert "missing" in defect
+    assert "ROBINHOOD_API_KEY_CREDENTIAL" in defect
+    assert "ROBINHOOD_PRIVATE_KEY" in defect

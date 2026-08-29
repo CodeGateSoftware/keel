@@ -91,7 +91,6 @@ request on it.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import sys
 from collections import Counter
@@ -127,31 +126,16 @@ PROBES: tuple[tuple[str, str], ...] = (
 #: "that account cannot trade that asset".
 PROBE_SYMBOL = "BTC-USD"
 
-#: A raw Ed25519 seed is 32 bytes, which is 44 base64 characters with padding.
-#:
-#: ⚠️ **A raw Ed25519 PUBLIC key is ALSO 32 bytes, hence also 44 characters.** This constant used
-#: to be described as the check that catches "pasting the public key"; it cannot be, and never
-#: was. The two values are indistinguishable by length, by alphabet and by decoded size -- the
-#: only thing that separates them is that one is derived from the other, which is what
-#: `_public_key_b64` below actually tests. The length check still earns its place against a PEM,
-#: a hex string, or a truncated paste; it just never covered the case it claimed to.
-#:
-#: This is not hypothetical. On 2026-08-19 an operator pasted the public key into
-#: `ROBINHOOD_API_KEY`, this script's guards passed it, and every request came back 401 -- which
-#: is indistinguishable from a bad key, a stale clock or a signing bug, and cost an afternoon to
-#: tell apart. The guards below name it in one line instead.
-_SEED_B64_LEN = 44
-
-#: A raw Ed25519 key, seed or public, before base64.
-_KEY_RAW_LEN = 32
-
-#: The shape Robinhood issues for an API key, from the one credential observed to authenticate:
-#: `rh-api-` followed by a UUID, 43 characters. Quoted in the error messages as guidance, and
-#: deliberately NOT enforced -- it is an observation about one credential, not a documented
-#: contract, and a hard gate on it would reject a valid key the day Robinhood changes the format.
-#: The two checks that DO gate are the ones that cannot be wrong: an API key slot holding a
-#: 32-byte Ed25519 key is never right, whatever the identifier format turns out to be.
-_API_KEY_HINT = "rh-api-<uuid>"
+#: The credential-shape checks this script's `load_credentials` guards with -- including the
+#: 2026-08-19 incident (an operator pasted their Ed25519 PUBLIC key, also 32 bytes and hence also
+#: 44 base64 characters, into `ROBINHOOD_API_KEY`) -- now live in ONE place,
+#: `keel_broker_robinhood.credentials.find_credential_defect` (#233 PR4), so there is exactly one
+#: derivation rather than this script and the venue readiness display each carrying their own.
+#: `load_credentials` imports it lazily, from inside the function, not at module scope -- so
+#: `--help` (which never calls it) still needs nothing installed. Calling `load_credentials`
+#: itself now requires the optional adapter package, same as the next line of `main()` already
+#: did for `RobinhoodTransport`; this is a narrower property than `load_credentials` used to
+#: have, and it is the trade-off #233 PR4 accepts for there being one derivation rather than two.
 
 #: The keys `RobinhoodTransport._paginate` consumes and does not pass on.
 #:
@@ -404,40 +388,6 @@ def compare_shapes(live: Any, fixture: Any, path: str = "") -> list[str]:
     return diffs
 
 
-def _raw_key_bytes(value: str) -> bytes | None:
-    """The 32 raw bytes `value` encodes, or `None` if it is not base64 of an Ed25519-sized key.
-
-    Total by construction: this runs against operator-pasted text, so every way base64 decoding
-    can fail -- wrong alphabet, bad padding, plain prose -- has to mean "not a key" rather than a
-    traceback. `validate=True` matters: without it `b64decode` silently DISCARDS characters
-    outside the alphabet, so `rh-api-0f1e...` would decode to something rather than being
-    rejected, and a real API key could be mistaken for a malformed one.
-    """
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (ValueError, TypeError):
-        return None
-    return raw if len(raw) == _KEY_RAW_LEN else None
-
-
-def _public_key_b64(seed_b64: str) -> str | None:
-    """The base64 PUBLIC key derived from a base64 Ed25519 seed, or `None` if it cannot be.
-
-    `None` covers both "the seed is not a seed" and "pynacl is not installed", and both degrade
-    to skipping one check rather than failing the run: this is a diagnostic, and a diagnostic
-    that crashes on the malformed input it exists to describe is worse than one that stays quiet.
-    The neighbouring length check still fires on a malformed seed, and a missing pynacl surfaces
-    with its own clear ImportError at the first signature.
-    """
-    try:
-        import nacl.signing
-
-        raw = base64.b64decode(seed_b64, validate=True)
-        return base64.b64encode(bytes(nacl.signing.SigningKey(raw).verify_key)).decode()
-    except Exception:
-        return None
-
-
 def load_credentials(
     env_path: Path,
     *,
@@ -454,71 +404,72 @@ def load_credentials(
     editing their `.env` first -- and every diagnostic below still names the variable it read,
     so the messages stay actionable whichever slot was chosen.
 
-    Three checks, and the ORDER is the design: each one only runs when the more specific check
-    above it did not fire, so the operator is told the most actionable thing true of their file
-    rather than the most generic.
-
-    1. Absent values, named individually.
-    2. A private key that is not seed-shaped -- a PEM, a hex string, a truncated paste.
-    3. An API key slot holding an Ed25519 key, with the case where it is THIS seed's own public
-       key called out by name, because that is the one an operator can act on without going
-       back to Robinhood at all: the value is already exactly what the credential page wants.
+    The ARITHMETIC -- which of the three shapes the pair is in, in the order that gives the most
+    actionable message first -- is `keel_broker_robinhood.credentials.find_credential_defect`
+    (#233 PR4); this function owns only the `.env` read and the exact wording of each message,
+    which stayed unchanged across that move on purpose (every existing test in
+    `tests/scripts/test_robinhood_smoke.py` still matches on it verbatim).
 
     Everything here runs BEFORE the first request, because every one of these mistakes produces
     the same 401 the venue returns for a revoked key, a stale clock or a genuine signing bug --
     and a 401 is the least informative failure this integration can hand back.
     """
+    from keel_broker_robinhood.credentials import (
+        API_KEY_HINT,
+        SEED_B64_LEN,
+        CredentialDefectKind,
+        find_credential_defect,
+    )
+
     values = dotenv_values(env_path)
     api_key = (values.get(api_key_var) or "").strip()
     private_key = (values.get(private_key_var) or "").strip()
 
-    missing = [
-        name
-        for name, val in ((api_key_var, api_key), (private_key_var, private_key))
-        if not val
-    ]
-    if missing:
+    defect = find_credential_defect(
+        api_key, private_key, api_key_var=api_key_var, private_key_var=private_key_var
+    )
+    if defect is None:
+        return api_key, private_key
+
+    if defect.kind is CredentialDefectKind.MISSING:
         raise SystemExit(
-            f"missing {' and '.join(missing)} in {env_path}.\n\n"
+            f"missing {' and '.join(defect.missing_names)} in {env_path}.\n\n"
             "Robinhood signs EVERY request, including read-only ones, so an API key alone "
             "cannot make a single call.\n"
             f"{private_key_var} is the base64 of the raw 32-byte Ed25519 seed generated "
             "locally -- not the base64 public key pasted into Robinhood's credential page.\n"
             "See packages/keel-broker-robinhood/README.md for the pynacl snippet."
         )
-    if len(private_key) != _SEED_B64_LEN:
+    if defect.kind is CredentialDefectKind.BAD_SEED_LENGTH:
         raise SystemExit(
             f"{private_key_var} is {len(private_key)} characters; a base64-encoded 32-byte "
-            f"Ed25519 seed is {_SEED_B64_LEN}.\n"
+            f"Ed25519 seed is {SEED_B64_LEN}.\n"
             "That usually means a PEM, a hex string, or a truncated paste. (It does NOT mean the "
             "public key -- a public key is also 32 bytes and passes this check; see below.) "
             "Sending it would produce a 401 indistinguishable from a signing bug."
         )
-
-    if _raw_key_bytes(api_key) is not None:
-        if api_key == _public_key_b64(private_key):
-            raise SystemExit(
-                f"{api_key_var} holds the base64 PUBLIC key of {private_key_var}, not an "
-                "API key.\n\n"
-                "The public key is what you paste INTO Robinhood's credential page. What belongs "
-                f"here is the identifier Robinhood issues back once the credential exists "
-                f"({_API_KEY_HINT}).\n"
-                "Every request would sign correctly and be rejected 401, because the venue has no "
-                "record of this key.\n\n"
-                "Fix: sign in to web classic, open https://robinhood.com/account/crypto, choose "
-                f"Add key, paste the value currently in {api_key_var} as the public key, tick "
-                f"the API actions this credential needs, and put the identifier it returns here. "
-                f"{private_key_var} stays as it is -- the keypair is already correct."
-            )
+    if defect.kind is CredentialDefectKind.KEY_IS_OWN_PUBLIC_KEY:
         raise SystemExit(
-            f"{api_key_var} decodes as a 32-byte base64 value, which is an Ed25519 KEY -- an "
-            f"API key is an identifier issued by Robinhood ({_API_KEY_HINT}).\n"
-            f"It does not match {private_key_var}'s public key either, so it is most likely a "
-            "public key from a different credential.\n"
-            "See packages/keel-broker-robinhood/README.md, 'Credentials'."
+            f"{api_key_var} holds the base64 PUBLIC key of {private_key_var}, not an "
+            "API key.\n\n"
+            "The public key is what you paste INTO Robinhood's credential page. What belongs "
+            f"here is the identifier Robinhood issues back once the credential exists "
+            f"({API_KEY_HINT}).\n"
+            "Every request would sign correctly and be rejected 401, because the venue has no "
+            "record of this key.\n\n"
+            "Fix: sign in to web classic, open https://robinhood.com/account/crypto, choose "
+            f"Add key, paste the value currently in {api_key_var} as the public key, tick "
+            f"the API actions this credential needs, and put the identifier it returns here. "
+            f"{private_key_var} stays as it is -- the keypair is already correct."
         )
-
-    return api_key, private_key
+    # CredentialDefectKind.KEY_IS_A_KEY -- the only remaining case `find_credential_defect` names.
+    raise SystemExit(
+        f"{api_key_var} decodes as a 32-byte base64 value, which is an Ed25519 KEY -- an "
+        f"API key is an identifier issued by Robinhood ({API_KEY_HINT}).\n"
+        f"It does not match {private_key_var}'s public key either, so it is most likely a "
+        "public key from a different credential.\n"
+        "See packages/keel-broker-robinhood/README.md, 'Credentials'."
+    )
 
 
 def run_probes(transport: _ReadOnly, symbol: str) -> dict[str, Any]:

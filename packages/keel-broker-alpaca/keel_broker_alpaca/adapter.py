@@ -200,6 +200,12 @@ class AlpacaAdapter:
     DECLARED_ENDPOINTS: frozenset[str] = frozenset(TRADING_HOSTS)
     DECLARED_DATA_FEEDS: frozenset[str] = frozenset(SUPPORTED_DATA_FEEDS)
 
+    #: Where this adapter's credentials live (#233 PR4), for the capability-display readiness
+    #: surfaces -- matches `keel_core.config.load_alpaca_secrets`'s own names (the two headers
+    #: Alpaca's API documents), read with `getattr` and never imported, the same discipline
+    #: `DECLARED_ENDPOINTS`/`DECLARED_DATA_FEEDS` above already keep.
+    DECLARED_CREDENTIAL_ENV: tuple[str, str] = ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
+
     def __init__(
         self, transport: Transport | None = None, *, endpoint: str = "paper", data_feed: str = "iex"
     ) -> None:

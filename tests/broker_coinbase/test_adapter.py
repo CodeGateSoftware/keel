@@ -673,3 +673,18 @@ def test_a_venue_rejection_returned_as_a_result_does_NOT_refute_the_scope() -> N
 
     assert result.success is False
     assert result.reason == "Insufficient balance in source account"
+# -- credential declaration (#233 PR4) ------------------------------------------------------------
+
+
+def test_declares_its_credential_env_names() -> None:
+    """The capability-display readiness surfaces (`keel brokers list`, `/api/venues`) read this
+    with `getattr`, never by importing this package -- pinned against
+    `keel_core.config.load_secrets`'s own names so the two cannot silently drift apart."""
+    assert CoinbaseAdapter.DECLARED_CREDENTIAL_ENV == ("CDP_API_KEY", "CDP_API_SECRET")
+
+
+def test_declares_no_credential_defect_hook() -> None:
+    """Only Robinhood implements `credential_defect` (#233 PR4) -- Coinbase's credential is an
+    opaque pair with no locally-provable shape to check, so the `getattr(..., None)` default is
+    what the readiness derivation actually reads here, not a stub that always says "fine"."""
+    assert getattr(CoinbaseAdapter, "credential_defect", None) is None
