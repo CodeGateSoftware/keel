@@ -729,6 +729,7 @@ def _handle_exits(
     )
     if result.placed:
         exit_order = repo.get_order(result.order_id) if result.order_id is not None else None
+        booked = False
         if (
             exit_order is not None
             # An exit with no observed fill price cannot be valued. Unreachable today (exits are
@@ -750,6 +751,53 @@ def _handle_exits(
                 is_dca=owning_rule.name == "dca",
                 now_ts=now_ts,
             )
+            booked = True
+
+        # AN EXIT THAT DID NOT SELL EVERYTHING LEAVES A NAKED, UNOWNED REMAINDER (#446/#502).
+        #
+        # `execute` cancelled the resting bracket before placing this SELL, so between that
+        # cancel and this line the position's protection is gone by design -- fine when the sale
+        # takes the whole position, and NOT fine when the venue fills it short. Clearing the
+        # four keys below on a short fill would retire `position_rule:` (so `_handle_exits`
+        # never looks at this product again -- it returns early with no owning rule),
+        # `open_stop`/`open_target` (so no level survives to re-place from) and the crash ledger
+        # (so `reconcile_unbracketed_positions` has nothing to heal with). The remainder would
+        # then sit unprotected and INVISIBLE, indistinguishable from a DCA holding that carries
+        # no stop by design -- the precise silence #519 exists to eliminate.
+        #
+        # The `positions` ledger is the authority on whether anything is left, exactly as it is
+        # for the sweep: `book_exit` closed every tranche the sale consumed and reduced the one
+        # it stopped inside, so an open row here means base is still held. `_held_position`
+        # cannot answer this -- it subtracts the order's ORDERED `qty`, not its short fill.
+        if booked and repo.get_open_positions(product_id):
+            stop = repo.get_state(f"open_stop:{product_id}")
+            target = repo.get_state(f"open_target:{product_id}")
+            remainder = sum(
+                (p["qty"] for p in repo.get_open_positions(product_id)), Decimal("0")
+            )
+            if stop is not None and target is not None:
+                repo.set_state(
+                    f"{executor.UNBRACKETED_PREFIX}{product_id}",
+                    {"stop": stop, "target": target, "qty": remainder},
+                )
+            log_event(
+                logger,
+                logging.CRITICAL,
+                "agent.exit_left_an_unprotected_remainder",
+                product=product_id,
+                order_id=exit_order["id"] if exit_order else None,
+                remainder=str(remainder),
+                healable=stop is not None and target is not None,
+                detail=(
+                    "the venue filled this exit SHORT: part of the position is still held, its "
+                    "protective bracket was cancelled to place the exit, and nothing is resting "
+                    "at the exchange for it right now. The position state is retained so the "
+                    "next cycle can re-place from it; if `healable` is false there are no "
+                    "recorded levels and a human must close or protect the remainder"
+                ),
+            )
+            return [result]
+
         # Clear the bracket's state alongside the position. These describe an exchange-side
         # bracket that no longer exists once the position is out; left behind they poison the
         # NEXT trade in this product -- rail 9 would veto a legitimate entry whose stop sits
@@ -773,57 +821,34 @@ def _close_tranches(
     is_dca: bool,
     now_ts: int,
 ) -> None:
-    """Record ONE outcome per open tranche and close them all, oldest first.
+    """Book this exit against the `positions` ledger, oldest tranche first.
 
-    A rule exit sells the whole held position (`_build_intent` sizes from `_held_position`), so
-    every open tranche of this product is closed by it. Booking a single aggregate outcome
-    against one blob of entry context is precisely the mis-attribution the `positions` ledger
-    exists to end: with two tranches, the older one's P&L would be computed against the newer
-    one's entry price.
+    The FIFO attribution itself moved to `execution.streak.book_exit` (#502), because a second
+    caller appeared that is not the agent: `executor.scale_out` sells a fraction of a position
+    and must book the same way, and the executor cannot import this module (the agent imports
+    the executor, not the reverse). Splitting "decrement the tranche" from "record the outcome"
+    across two layers would have been the version of this that goes wrong quietly -- one caller
+    remembering both halves and the next remembering one.
 
-    The exit order carries ONE fee for the whole sale, so it is apportioned pro-rata by qty. The
-    last tranche takes the rounding remainder rather than letting the parts fail to sum to the
-    whole -- understating total cost would flatter `pnl_net`, whose SIGN is what rail 16 counts.
+    What stays here is the ONE decision this layer owns: **how much was actually sold**.
 
-    A product with no ledger rows (opened before the v4 ledger, or a tranche whose entry context
-    was unreadable) records nothing rather than guessing an entry price.
+    `sold_qty=None` means the whole held position and closes every open tranche, which is what a
+    rule exit has always done. `observed_sold_qty` returns a number only when the venue reported
+    a SHORT fill (#446's exit-side sibling): until now this booked `exit_qty=position["qty"]`
+    for every tranche regardless of what the order filled, so a market exit that sold half the
+    position still recorded the whole of it as closed -- a `trade_outcomes` row for quantity
+    that was never sold, a `positions` row marked closed while the base was still held, and the
+    remainder left with no bracket and no ledger entry saying so.
     """
-    positions = repo.get_open_positions(product_id)
-    if not positions:
-        log_event(
-            logger,
-            logging.WARNING,
-            "agent.exit_without_ledger_tranche",
-            product=product_id,
-            order_id=exit_order["id"],
-        )
-        return
-
-    exit_fill = exit_order["actual_fill"]
-    total_fee = exit_order["fee"] or Decimal("0")
-    total_qty = sum((p["qty"] for p in positions), Decimal("0"))
-    apportioned = Decimal("0")
-
-    for index, position in enumerate(positions):
-        is_last = index == len(positions) - 1
-        if is_last or total_qty <= 0:
-            fee_share = total_fee - apportioned
-        else:
-            fee_share = (total_fee * position["qty"] / total_qty).quantize(Decimal("0.00000001"))
-            apportioned += fee_share
-
-        streak.record_closed_trade(
-            repo,
-            config,
-            product_id=product_id,
-            position=position,
-            exit_fill=exit_fill,
-            exit_qty=position["qty"],
-            fees=fee_share,
-            is_dca=is_dca,
-            now_ts=now_ts,
-        )
-        repo.close_position(position["id"], closed_at=now_ts)
+    streak.book_exit(
+        repo,
+        config,
+        product_id=product_id,
+        exit_order=exit_order,
+        sold_qty=streak.observed_sold_qty(exit_order),
+        is_dca=is_dca,
+        now_ts=now_ts,
+    )
 
 
 #: Products whose young-table warmup notice has already been logged THIS PROCESS (#502). The

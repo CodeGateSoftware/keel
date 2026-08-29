@@ -57,11 +57,14 @@ experiment (docs/experiments/2026-08-22-trailing-vs-static-exits.md) measured tr
 WORSE and the break-even roll no better than the static exit at the 120 bp fee, so the
 capability ships and the operator opts in per rule; `turtle_breakout` deliberately offers
 neither knob (its real exit is the Donchian channel, and a trail would cut the long winners
-the system exists to let run). `scale_out` is the one primitive still WITHOUT a live
-caller: it stays unwired (pinned by
-`tests/execution/test_executor.py::test_scale_out_has_no_production_caller`) until its two
-prerequisites are built -- bracket resize for a partial SELL, and a `trade_outcomes` row so
-rail 16 does not count a scaled-out winner as a loss.
+the system exists to let run). `scale_out` is the partial profit-take, and since #502 it is
+COMPLETE rather than merely present: it cancels the resting bracket, sells the fraction,
+books it against the `positions` ledger and re-places a bracket for the remainder, all
+behind #519's crash ledger. It carried a tripwire test for as long as those two
+prerequisites were unbuilt -- a partial SELL beside a bracket committing the full position,
+and a scaled-out winner rail 16 counted as a loss; both are now discharged INSIDE the
+function, where no future caller can forget them. It still has no live rule driving it: the
+rule-side "sell half at T1" knob is separate work.
 
 **USDC-funding balance (rail 13, Issue #59).** For a BUY `_build_intent` fetches the live
 available balance of the PRODUCT's quote leg from `broker.get_balances()` and hands
@@ -121,7 +124,7 @@ from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.execution import guards, sizing
+from keel.execution import guards, sizing, streak
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Signal
 from keel.types import Side
@@ -273,9 +276,12 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
     reproduces the same base-locked rejection (or post-fill oversell) this function exists to
     prevent. Pre-#446 the partial case was caught only because a partial stayed `pending`.
 
-    This lives in `execute` rather than in `agent._handle_exits` so every SELL path -- the rule
-    exit today, `scale_out` or any future one -- gets it by construction rather than by each
-    caller remembering. Failing closed (refuse the exit) is right: an uncancellable bracket means
+    This lives in the executor rather than in `agent._handle_exits` so every SELL path gets it
+    by construction rather than by each caller remembering: `execute` calls it for the rule
+    exit, and `scale_out` calls it directly for the partial one (it runs `_run_order`, the
+    pipeline BELOW `execute`, and bypassing this was exactly the defect #502 closed).
+
+    Failing closed (refuse the exit) is right: an uncancellable bracket means
     we do not know what the exchange will do with that inventory, and adding a second order to
     that uncertainty is strictly worse than waiting a cycle.
     """
@@ -836,12 +842,13 @@ def _record_observed_fill_quantity(
     the exit-side over-booking is #502's to flag. The observation itself is recorded for
     BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
 
-    DELIBERATELY detect-and-surface only. The port migration is done and the replacement
-    itself is expressible (`BracketGTC` since #569; `_roll_stop` cancels-and-replaces
-    through `place_order`); what does not exist yet is the RESIZE policy (a roll re-places
-    the SAME size). Auto-cancelling a protective order on the strength of a snapshot that
-    may still be settling is a wrong auto-action on live money; a loud warning is the safe
-    half, and the automated resize policy remains #502's open half (with `scale_out`).
+    DELIBERATELY detect-and-surface only, and it stays that way even now that a resize EXISTS
+    (`scale_out` re-places a bracket at a smaller size since #502). The two are not the same
+    decision: a scale-out resizes because a RULE asked to sell a fraction, so the quantity is
+    known before the venue is touched. Here the only evidence is a post-placement snapshot of
+    an ENTRY, and auto-cancelling a protective order on the strength of a snapshot that may
+    still be settling is a wrong auto-action on live money. The loud warning is the safe half,
+    and the entry-side policy is still nobody's.
     """
     filled = observed.filled_size
     if not filled or filled <= 0:
@@ -1643,11 +1650,133 @@ def scale_out(
     rule_name: str,
     now_ts: int,
 ) -> ExecutionResult:
-    """Partially close `qty` of an open position at `exit_price` (a rule-driven profit-take,
-    e.g. "sell half at the first target") -- runs the same guard+preview+place+log pipeline as
-    `execute()` for a plain SELL leg, system-initiated so it proceeds in autonomous mode (still
-    subject to every guard rail, still fully logged).
+    """Sell `qty` of an open position and RESIZE its protective bracket down to the remainder.
+
+    The rule-driven profit-take -- "sell half at the first target, let the rest run" -- and the
+    one primitive in this module that changes how much a position is worth AND how much of it is
+    protected in the same breath. Both halves happen here, because a caller that did one without
+    the other would be worse than a caller that did neither.
+
+    **Why the sell alone was never enough.** Until #502 this function placed the SELL through
+    `_run_order` and stopped. `_run_order` is the pipeline BELOW `execute`, so the partial sell
+    skipped `_clear_resting_bracket` -- and the resting native bracket commits the ENTIRE base
+    position. On spot the base is locked and the partial SELL is simply rejected; if it did fill,
+    a bracket sized for the whole position is left able to sell inventory no longer held. Nor
+    was any outcome recorded, so the profit taken here vanished and the runner's eventual
+    break-even stop-out was booked as the trade's only result: rail 16 counting a net winner as
+    a loss. `test_scale_out_has_no_production_caller` was the tripwire holding the door shut on
+    all of that, and it is retired with this change rather than by it.
+
+    **The choreography, and why it is in this order.**
+
+    1. The crash ledger is written FIRST, before any venue call (#519's pattern -- see
+       `_roll_stop`, which this deliberately mirrors line for line). Everything after it can die
+       mid-flight, and the cancel below removes the position's only protection.
+    2. The resting bracket is CANCELLED. It has to go first: it already commits the whole
+       position, so a partial SELL placed beside it is the base-locked rejection above.
+    3. The partial SELL is placed, through the same guard -> preview -> place -> log pipeline as
+       every other order (autonomous because it is system-initiated, never guard-exempt).
+    4. The sold fraction is BOOKED against the `positions` ledger -- FIFO, the tranche it stops
+       inside reduced rather than closed (`streak.book_exit`). This must happen before the
+       re-place, because the sweep sizes a healing bracket from the tranche's `qty`.
+    5. A bracket for the REMAINDER is placed at the levels the position already had.
+
+    **Re-placing SMALLER is the genuinely new behaviour.** `_roll_stop` cancels and re-places at
+    the SAME quantity at a new price; this re-places at the same price at a NEW quantity. The
+    order itself needs nothing new -- `BracketGTC` has expressed it since #569 -- but no path
+    before this one asked the venue to protect less than it did a moment ago.
+
+    **Refusals, all before the venue is touched.** A non-positive `qty`; a `qty` at or above what
+    is held (that is a full exit, and a full exit is `execute`'s EXIT path, which also retires
+    `position_rule:` and the rest of the per-position state this function does not own); and a
+    position with no recorded `open_stop`/`open_target`. The last is the subtle one: without
+    levels there is nothing to re-place, so cancelling would leave the remainder naked with no
+    ledger entry saying so -- and that silence is worse than not scaling out at all.
     """
+    if qty <= 0:
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=f"scale_out: qty must be positive, got {qty}",
+        )
+
+    held, _avg_cost = _held_position(repo, product_id)
+    if qty >= held:
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=(
+                f"scale_out: {qty} is not a fraction of the {held} held in {product_id} -- a "
+                "full exit must go through execute()'s EXIT path, which also retires the "
+                "position's rule ownership and levels"
+            ),
+        )
+    remainder = held - qty
+
+    stop = repo.get_state(f"open_stop:{product_id}")
+    target = repo.get_state(f"open_target:{product_id}")
+    if stop is None or target is None:
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=(
+                f"scale_out: no open_stop/open_target recorded for {product_id} -- refusing to "
+                "cancel a bracket that could not then be re-placed for the remainder, which "
+                "would leave the rest of the position unprotected and with no levels to heal "
+                "from"
+            ),
+        )
+
+    log_event(
+        logger,
+        logging.INFO,
+        "executor.scale_out_requested",
+        product=product_id,
+        qty=qty,
+        exit_price=exit_price,
+        rule=rule_name,
+        remainder=remainder,
+    )
+
+    # THE CRASH LEDGER, written BEFORE the venue is touched (#519), for the same reason and with
+    # the same key as `_roll_stop`: the cancel below is not atomic with the re-place at the end,
+    # and a process that dies in the gap must leave behind something the next cycle's sweep can
+    # converge -- not a live position that looks exactly like a DCA holding with no stop.
+    #
+    # The `qty` recorded is the REMAINDER, the size this sequence intends to end at. Note the
+    # sweep does not read it: `reconcile_unbracketed_positions` sizes from the TRANCHE ("the
+    # ledger is what is actually held now") and takes only the levels from here. That is what
+    # makes the record correct in BOTH crash windows rather than only one -- die before the sell
+    # and the tranche still says the full size, so the sweep heals the full position; die after
+    # the sell is booked and the tranche says the remainder, so it heals the remainder.
+    repo.set_state(
+        f"{UNBRACKETED_PREFIX}{product_id}",
+        {"stop": stop, "target": target, "qty": remainder},
+    )
+
+    if not _clear_resting_bracket(broker, repo, product_id, now_ts):
+        # Nothing was cancelled, so the bracket is still resting and the position is still fully
+        # protected. The ledger record just written is LEFT STANDING and is harmless for exactly
+        # the reason `_roll_stop` documents: the sweep skips any product whose bracket is still
+        # resting, and the levels it holds are the ones already in force.
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=(
+                f"could not cancel the resting exit bracket for {product_id} -- refusing to "
+                "place a partial SELL that would be rejected for insufficient funds, or would "
+                "fill and leave a live bracket able to sell inventory we no longer hold"
+            ),
+        )
+
     intent = OrderIntent(
         product_id=product_id,
         side=Side.SELL,
@@ -1658,16 +1787,127 @@ def scale_out(
         is_dca=False,
         rule_kind=rule_name,
     )
-    log_event(
-        logger,
-        logging.INFO,
-        "executor.scale_out_requested",
-        product=product_id,
-        qty=qty,
-        exit_price=exit_price,
-        rule=rule_name,
+    result = _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
+
+    if not result.placed:
+        # The bracket is already cancelled and the sell did not happen, so the FULL position is
+        # naked right now. The ledger record stays standing -- it is what the sweep re-places
+        # from -- and the sweep will size it from the tranche, which still says the full
+        # quantity because nothing was booked. The CRITICAL is not downgraded on the strength of
+        # that automatic recovery: this deployment cycles once per UTC day.
+        log_event(
+            logger,
+            logging.CRITICAL,
+            "executor.position_unprotected",
+            product=product_id,
+            reason=result.reason,
+            attempted_qty=str(qty),
+            detail=(
+                "the resting bracket was cancelled for a partial scale-out and the SELL was "
+                "then REJECTED -- the whole position currently has no protective stop at the "
+                "exchange. The unbracketed record is retained so the next cycle's sweep "
+                "re-places it at the full held size."
+            ),
+        )
+        return result
+
+    _book_scale_out(repo, config, product_id, result.order_id, now_ts)
+
+    # The remainder's bracket, at the levels the position already had. `place_bracket` owns the
+    # rest of the protocol on both outcomes: it writes `open_stop`/`open_target` and clears the
+    # crash ledger on success, and re-writes the ledger (now sized from the tranche the booking
+    # just shrank) and warns on a veto or rejection.
+    bracket_order_id = place_bracket(
+        broker,
+        repo,
+        config,
+        product_id=product_id,
+        qty=remainder,
+        stop=stop,
+        target=target,
+        rule_name=rule_name,
+        now_ts=now_ts,
     )
-    return _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
+    if bracket_order_id is None:
+        log_event(
+            logger,
+            logging.CRITICAL,
+            "executor.position_unprotected",
+            product=product_id,
+            attempted_qty=str(remainder),
+            detail=(
+                "the partial SELL filled but the REMAINDER's bracket was vetoed or rejected -- "
+                "the rest of the position has no protective stop at the exchange. The "
+                "unbracketed record is retained so the next cycle's sweep re-places it."
+            ),
+        )
+    else:
+        # Repoint the surviving tranche at the new bracket, for the reason `_roll_stop`
+        # documents: `get_position_for_bracket` is the ONE linkage direction reconciliation has,
+        # and a tranche still naming the bracket cancelled above would orphan this one's
+        # eventual fill -- dropping the `trade_outcomes` row that closes the scaled-out trade,
+        # which is the very row this function exists to make correct.
+        for position in repo.get_open_positions(product_id):
+            repo.set_position_bracket(position["id"], bracket_order_id)
+
+    return replace(result, bracket_order_id=bracket_order_id)
+
+
+def _book_scale_out(
+    repo: Repository,
+    config: Config,
+    product_id: str,
+    order_id: int | None,
+    now_ts: int,
+) -> None:
+    """Attribute a filled partial SELL to the `positions` ledger (#502).
+
+    Booking lives INSIDE `scale_out` rather than in its caller so that wiring a rule to this
+    primitive cannot get half of it. The tripwire that used to stand here said "before wiring
+    it: cancel/resize the resting bracket, AND record a trade outcome" -- two obligations on a
+    caller that does not exist yet. A caller cannot forget an obligation it does not carry.
+
+    The quantity booked is the VENUE's (`filled_quantity`, falling back to the ordered size when
+    the status endpoint said nothing), never the requested one: a scale-out the venue filled
+    short must reduce the tranche by what actually sold, or the ledger claims base was released
+    that the account still holds.
+
+    A sell with no observed fill PRICE is not booked, matching `_handle_exits` and
+    `record_closed_trade`: inventing an exit price would fabricate the P&L that feeds rail 16.
+    The tranche then keeps its full size, which is the conservative direction -- the sweep will
+    size a healing bracket for MORE than is held and be refused loudly, rather than for less and
+    leave part of the position quietly unprotected.
+    """
+    exit_order = repo.get_order(order_id) if order_id is not None else None
+    if exit_order is None or exit_order["actual_fill"] is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.scale_out_unbooked",
+            product=product_id,
+            order_id=order_id,
+            detail=(
+                "the partial SELL was placed but carries no observed fill price, so no ledger "
+                "attribution was made -- the tranche keeps its full size and its outcome will "
+                "be computed against a quantity larger than is now held"
+            ),
+        )
+        return
+
+    sold = exit_order.get("filled_quantity") or exit_order["qty"]
+    streak.book_exit(
+        repo,
+        config,
+        product_id=product_id,
+        exit_order=exit_order,
+        sold_qty=sold,
+        # A scale-out is a rule-driven profit-take and never DCA: the `OrderIntent` above already
+        # commits to that (`is_dca=False`), so deriving a different answer here would have the
+        # rails and the streak disagree about the same order. DCA accumulates on a fixed budget
+        # and has no target to take half off at.
+        is_dca=False,
+        now_ts=now_ts,
+    )
 
 
 # -- stop management: break-even roll + ATR trailing -------------------------------------------

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -85,6 +85,21 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         entry_fill        TEXT    NOT NULL,
         entry_fee         TEXT    NOT NULL,
         initial_stop      TEXT,
+        -- Partial-exit accumulators (#502). `qty` is the quantity STILL HELD, and it is now
+        -- mutable: `scale_out` sells a fraction of a tranche and leaves the rest running, so
+        -- the legs of one trade land at different prices and different times. These three
+        -- carry the legs already sold -- quantity, gross proceeds, and exit-leg fees -- so the
+        -- ONE `trade_outcomes` row this tranche finally produces sums them all.
+        --
+        -- One row per TRADE, not per leg, is the approved definition (§2 of the trade-outcomes
+        -- design: "a half-off-at-target that later stops out at breakeven is ONE trade, not
+        -- two. Its P&L is the sum across all partial exits"). Booking each leg separately
+        -- would hand rail 16 a fee-sized loss for every runner that ends at break-even, and a
+        -- consecutive-loss breaker fed one loss per profitable scale-out is a breaker that
+        -- trips on a working strategy.
+        realized_qty      TEXT,
+        realized_proceeds TEXT,
+        realized_fees     TEXT,
         bracket_order_id  INTEGER,
         status            TEXT    NOT NULL DEFAULT 'open',
         FOREIGN KEY (bracket_order_id) REFERENCES orders(id)
@@ -502,6 +517,35 @@ def _migrate_v12_positions_initial_stop(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE positions ADD COLUMN initial_stop TEXT")
 
 
+
+def _migrate_v13_positions_realized_legs(conn: sqlite3.Connection) -> None:
+    """v13 adds the partial-exit accumulators to `positions` (#502).
+
+    Until now a tranche closed in ONE piece: `_close_tranches` booked `exit_qty=position.qty`
+    and called `close_position`, and `positions.qty` had no UPDATE anywhere in the codebase.
+    `scale_out` breaks that assumption by design -- it sells a fraction and leaves the rest
+    running -- and #446's partially-filled market exit breaks it by accident, booking the whole
+    tranche against a sale that only partly happened.
+
+    Both need the same two things: a mutable `qty` (what is still held) and somewhere to keep
+    the legs already sold until the tranche finally closes. `realized_qty`, `realized_proceeds`
+    (gross, price x quantity) and `realized_fees` (exit-leg only -- the entry fee belongs to the
+    whole tranche and is charged once, on the closing row) are that somewhere.
+
+    Idempotent by the v8/v11/v12 `PRAGMA table_info` guard: a database stamped at v12 got
+    `positions` from v4's DDL, and `CREATE TABLE IF NOT EXISTS` never adds a column.
+
+    **NO BACKFILL, and none is needed.** Every pre-v13 tranche closed whole or is still whole,
+    so the honest value is zero realized -- which is exactly what NULL decodes to here. That is
+    deliberately UNLIKE `initial_stop`, where NULL means "nobody recorded it" and readers must
+    disable a policy arm rather than substitute a number: there is no difference between "never
+    partially exited" and "partially exited nothing", so decoding NULL to zero invents nothing.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+    for column in ("realized_qty", "realized_proceeds", "realized_fees"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {column} TEXT")
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -514,6 +558,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: _migrate_v10_instrument_attestations,
     11: _migrate_v11_orders_filled_quantity,
     12: _migrate_v12_positions_initial_stop,
+    13: _migrate_v13_positions_realized_legs,
 }
 
 

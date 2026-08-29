@@ -143,3 +143,58 @@ def test_get_open_positions_without_a_product_spans_every_product(repo: Reposito
 
     assert len(repo.get_open_positions()) == 2
     assert len(repo.get_open_positions("BTC-USD")) == 1
+
+
+# -- the mutable quantity (#502) -------------------------------------------------------------
+
+
+def test_reduce_position_shrinks_the_tranche_and_carries_the_legs_sold(repo: Repository) -> None:
+    """`qty` means WHAT IS STILL HELD, and until #502 it had no UPDATE anywhere in the codebase.
+
+    `reconcile_unbracketed_positions` sizes its healing bracket from this number -- "the ledger
+    is what is actually held now". A partial sale that left it at the original size would have
+    the sweep commit more base than the account holds: refused on spot, and the position then
+    naked behind a CRITICAL. The accumulators alongside it are what let the one `trade_outcomes`
+    row this tranche eventually writes span every leg of the trade.
+    """
+    position_id = repo.open_position(
+        product_id=PRODUCT, rule_name="r", opened_at=1_000,
+        qty=Decimal("0.2"), entry_fill=Decimal("50000"), entry_fee=Decimal("1"),
+    )
+    assert repo.get_open_positions(PRODUCT)[0]["realized_qty"] == Decimal("0")
+
+    repo.reduce_position(
+        position_id,
+        remaining_qty=Decimal("0.12"),
+        realized_qty=Decimal("0.08"),
+        realized_proceeds=Decimal("4240"),
+        realized_fees=Decimal("0.30"),
+    )
+
+    row = repo.get_open_positions(PRODUCT)[0]
+    assert row["qty"] == Decimal("0.12")
+    assert row["realized_qty"] == Decimal("0.08")
+    assert row["realized_proceeds"] == Decimal("4240")
+    assert row["realized_fees"] == Decimal("0.30")
+    assert row["status"] == "open"
+
+
+def test_reduce_position_refuses_to_leave_a_tranche_holding_nothing(repo: Repository) -> None:
+    """A tranche with nothing left is CLOSED, and it must go through `close_position` so its
+    `trade_outcomes` row is written. A zero-quantity OPEN tranche would be a trade that never
+    books an outcome -- invisible to rail 16, and re-bracketed for zero by the sweep."""
+    position_id = repo.open_position(
+        product_id=PRODUCT, rule_name="r", opened_at=1_000,
+        qty=Decimal("0.2"), entry_fill=Decimal("50000"), entry_fee=Decimal("0"),
+    )
+
+    with pytest.raises(ValueError, match="remaining_qty must be positive"):
+        repo.reduce_position(
+            position_id,
+            remaining_qty=Decimal("0"),
+            realized_qty=Decimal("0.2"),
+            realized_proceeds=Decimal("10000"),
+            realized_fees=Decimal("0"),
+        )
+
+    assert repo.get_open_positions(PRODUCT)[0]["qty"] == Decimal("0.2")
