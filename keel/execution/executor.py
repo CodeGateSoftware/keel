@@ -829,10 +829,20 @@ def _run_order(
         place_result = broker.place_order(spec)
     except TradeScopeDenied as exc:
         # #233's whole point: the venue has just falsified the record, and this is the only place
-        # in the engine that hears it. Written BEFORE the re-raise -- the caller above is
-        # `agent.run_once`'s cycle-survival handler, which logs and moves on, so a write deferred
-        # to it would never happen and the next cycle would learn nothing. Which is exactly the
-        # state before this PR.
+        # in the engine that hears it.
+        #
+        # Written BEFORE the re-raise, and that ordering is the whole mechanism. NOTHING upstream
+        # catches this: `agent.run_once` does not wrap `executor.execute`, and neither does the
+        # `run_loop` above it, so the exception leaves the process. (#233's design says a
+        # "cycle-survival handler" catches it -- that handler is `_manage_stops`' per-tranche
+        # one, which this path does not pass through. Verified against `agent.py`.) A write
+        # deferred to a caller would therefore never happen at all, which is precisely the state
+        # before this PR: the venue answered and nothing wrote it down.
+        #
+        # The refusal still aborts the cycle, exactly as every other placement failure has
+        # always done -- deliberately unchanged here. But it now aborts it ONCE: the row this
+        # writes means the next cycle is vetoed cleanly by rail 20, with the venue's own words in
+        # `doctor`, instead of walking into the same refusal again every day.
         _record_trade_scope_refuted(repo, str(exc), now_ts)
         _log_trade_scope_refusal(intent, order_id)
         raise
