@@ -52,8 +52,11 @@ reason.
 from __future__ import annotations
 
 import re
+import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -185,63 +188,131 @@ def test_mypy_checks_against_the_floor_it_promises():
     )
 
 
+def _latest_release_floor() -> str | None:
+    """The floor of the wheels most recently published as a GitHub Release, read from
+    THAT TAG's own `pyproject.toml` -- not `main`'s. This is the floor README.md,
+    docs/desktop-install.md, packaging/macos_app.sh and scripts/install.sh's
+    `FALLBACK_FLOOR` all actually describe (#557): the shipped artifact, which can
+    legitimately trail `main` when `requires-python` has moved but no release carrying
+    the move has shipped yet.
+
+    Reads local tags only -- no network call, matching how the rest of this test suite
+    stays hermetic. `ci.yml`'s checkout fetches tags (`fetch-depth: 0`, the same reason
+    `release.yml`'s checkout already does) so this resolves in CI; a shallow local clone
+    without tags returns `None`, and callers must skip rather than fail, since an absent
+    tag says nothing about whether the docs are correct.
+    """
+    tags = subprocess.run(
+        ["git", "tag", "--list", "v*.*.*", "--sort=-creatordate"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    names = [line for line in tags.stdout.splitlines() if line.strip()]
+    if tags.returncode != 0 or not names:
+        return None
+    latest = names[0]
+
+    show = subprocess.run(
+        ["git", "show", f"{latest}:pyproject.toml"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if show.returncode != 0:
+        return None
+    try:
+        data = tomllib.loads(show.stdout)
+        requires = data["project"]["requires-python"]
+    except (tomllib.TOMLDecodeError, KeyError):
+        return None
+    match = re.match(r">=\s*(\d+)\.(\d+)", requires)
+    return f"{match.group(1)}.{match.group(2)}" if match else None
+
+
 def test_the_wheels_floor_stated_in_release_facing_docs_matches_requires_python():
     """The floor a READER sees before running the wheels one-liner must be the floor pip
-    will actually enforce (#595).
+    will actually enforce (#595) -- checked against the RIGHT reference, so the pin
+    cannot hand back the bug it exists to prevent.
 
-    `tests/test_install_script.py::test_the_published_one_liner_is_qualified_for_linux`
-    already cross-checks README.md, docs/desktop-install.md, packaging/macos_app.sh and
-    scripts/install.sh's `FALLBACK_FLOOR` against EACH OTHER -- so all four move together.
-    None of those four is `pyproject.toml`, which is the one none of them derive from
-    automatically. #546 raised `requires-python` to 3.14 and that release shipped
-    (v0.12.0), but `docs/desktop-install.md` and the v0.12.0 release notes' Desktop
-    section still said "3.11": every doc agreed with every other doc, and all of them
-    were wrong, because nothing checked them against the metadata pip actually reads.
-    Anyone on 3.11-3.13 who read "you qualify" and ran the installer got refused by pip
+    Two different floors, two different jobs, and this test must not blur them:
+
+    - `pyproject.toml`'s `requires-python` on `main` -- the DEV TREE's floor. The ONLY
+      doc that must equal it is `.github/workflows/release.yml`'s Desktop template,
+      because that template generates the text of the NEXT release, which is built from
+      whatever `main` says at tag time. Equality there is not a coincidence; it is what
+      "generated from this commit" means.
+    - The floor of the most recently PUBLISHED release (`_latest_release_floor`,
+      above) -- what README.md, docs/desktop-install.md, packaging/macos_app.sh and
+      `FALLBACK_FLOOR` all describe: Pythons the WHEELS SITTING ON THE RELEASES PAGE
+      right now actually require. `scripts/install.sh` says why in its own comment
+      (#557): "never the development tree -- enforcing the dev tree's floor here is
+      exactly bug #557." An earlier version of this test compared all four to `main`'s
+      floor instead. That is true today only because the release carrying #546's raised
+      floor has already shipped (v0.12.2, verified) -- and false the next time `main`
+      moves the floor ahead of a release, at which point that version would have failed
+      with a message reading as an instruction to bump `FALLBACK_FLOOR` to match `main`,
+      i.e. to reintroduce #557 by way of the test meant to prevent #595. Comparing
+      against the actual latest release closes that gap: right after `main` moves, the
+      docs correctly still show the OLD release's floor and this test stays green, the
+      same way `scripts/install.sh` itself would still enforce the old floor.
+
+    #546 raised `requires-python` to 3.14 and that release shipped (v0.12.0), but
+    `docs/desktop-install.md` and the v0.12.0 release notes' Desktop section still said
+    "3.11": every hand-maintained copy agreed with every other one, and all of them were
+    wrong, because nothing checked them against a release's actual metadata. Anyone on
+    3.11-3.13 who read "you qualify" and ran the installer got refused by pip
     mid-install.
 
-    The floor is parsed fresh from the root `pyproject.toml` here -- not imported from
-    this module's `_FLOOR` constant -- so a mistake in `_FLOOR` itself cannot mask a real
-    drift between the metadata and the docs.
-
-    This module's docstring records why the wheels' floor and the dev tree's floor are
-    allowed, BY DESIGN, to differ across a release boundary (`scripts/install.sh` reads
-    the floor of the release it is installing, not of `main`). They are not different
-    right now: the release that carries #546's raised floor has already shipped. When
-    they next genuinely diverge -- `requires-python` raised again ahead of a release --
-    this test will fail and require a deliberate call: either the docs are still correct
-    (they describe the last SHIPPED floor, not `main`'s) and this test's scope needs
-    revisiting, or they are stale and need the same fix #595 needed. Either way the
-    disagreement gets a decision instead of sitting published.
+    Both floors are parsed fresh here -- from `main`'s `pyproject.toml` and from the
+    latest tag's -- never hardcoded and never read from this module's `_FLOOR` constant,
+    so a mistake in `_FLOOR` itself cannot mask a real drift.
     """
     pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text())
     requires = pyproject["project"]["requires-python"]
     parsed = re.match(r">=\s*(\d+)\.(\d+)", requires)
     assert parsed, f"could not parse a floor out of requires-python {requires!r}"
-    floor = f"{parsed.group(1)}.{parsed.group(2)}"
+    dev_floor = f"{parsed.group(1)}.{parsed.group(2)}"
+
+    release_floor = _latest_release_floor()
+    if release_floor is None:
+        pytest.skip(
+            "no release tags reachable locally -- cannot determine the latest shipped "
+            "floor without them (a shallow clone without fetch-tags); ci.yml fetches "
+            "tags, so this runs for real in CI"
+        )
 
     wheels_pattern = re.compile(r"wheels declare `?>=\s*(\d+\.\d+)")
     for relpath in ("README.md", "docs/desktop-install.md", "packaging/macos_app.sh"):
         text = " ".join((_ROOT / relpath).read_text(encoding="utf-8").split())
         found = wheels_pattern.search(text)
         assert found, f"{relpath} no longer states the wheels floor beside 'wheels declare'"
-        assert found.group(1) == floor, (
-            f"{relpath} states the wheels floor as {found.group(1)!r}, but pyproject.toml's "
-            f"requires-python is {requires!r} (floor {floor!r}) -- this is the exact drift "
-            "#595 was filed over"
+        assert found.group(1) == release_floor, (
+            f"{relpath} states the wheels floor as {found.group(1)!r}, but the latest "
+            f"release actually ships {release_floor!r} -- this is the exact drift #595 "
+            "was filed over. (If main's requires-python has moved ahead of the latest "
+            "release, that is fine and expected -- do NOT bump this doc to match main; "
+            "it should keep stating the latest RELEASE's floor until a release ships "
+            "that raises it.)"
         )
 
     install_sh = (_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
     fallback = re.search(r'FALLBACK_FLOOR="(\d+\.\d+)"', install_sh)
     assert fallback, "scripts/install.sh's FALLBACK_FLOOR constant is gone"
-    assert fallback.group(1) == floor, (
-        f"scripts/install.sh's FALLBACK_FLOOR is {fallback.group(1)!r}, but pyproject.toml's "
-        f"requires-python is {requires!r} (floor {floor!r})"
+    assert fallback.group(1) == release_floor, (
+        f"scripts/install.sh's FALLBACK_FLOOR is {fallback.group(1)!r}, but the latest "
+        f"release actually ships {release_floor!r}. (If main's requires-python has moved "
+        "ahead of the latest release, do NOT bump FALLBACK_FLOOR to match main -- that is "
+        "bug #557. FALLBACK_FLOOR tracks the oldest still-installable release, never main.)"
     )
 
     release_yml = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    assert f"Python {floor}+." in release_yml, (
+    assert f"Python {dev_floor}+." in release_yml, (
         f"the Desktop section of the NEXT release's notes (.github/workflows/release.yml) "
-        f"does not state the floor as {floor!r} -- it will publish a stale floor the moment "
-        "the next release runs, exactly as the v0.12.0 notes did (#595)"
+        f"does not state the floor as {dev_floor!r} -- it will publish a stale floor the "
+        "moment the next release runs, exactly as the v0.12.0 notes did (#595). This one "
+        "DOES compare against main's requires-python, on purpose: the template generates "
+        "the next release from whatever main says at tag time."
     )
