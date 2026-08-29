@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 from keel_core import telemetry
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
 if TYPE_CHECKING:
     from keel.data.repository import Repository
@@ -52,6 +53,47 @@ def attest_subscription(
             ),
         )
     )
+
+
+def attest_trade_scope(
+    repo: Repository,
+    *,
+    now_ts: int,
+    state: TradeScopeState = TradeScopeState.CONFIRMED,
+    attested_scope: str | None = None,
+    venue: str = "coinbase",
+    attested_ts: int | None = None,
+    confirmed_ts: int | None = None,
+    refuted_ts: int | None = None,
+    refuted_reason: str | None = None,
+) -> None:
+    """Write a venue trade-scope record -- rail 20's baseline, the `attest_subscription`
+    counterpart for #233.
+
+    Defaults to `CONFIRMED` with `attested_scope=None`: the exact shape the v13 backfill
+    produces for an already-live venue, and the state that lets rail 20 admit a live entry --
+    the quiet default every test not ABOUT rail 20 needs so it is not incidentally vetoed, same
+    reason `attest_subscription` defaults to a roomy allowance.
+
+    `now_ts` is required rather than defaulted, like `attest_subscription`: each caller module
+    defines its own clock, and a default here would silently bind the wrong one.
+    """
+    if confirmed_ts is None and state is TradeScopeState.CONFIRMED:
+        confirmed_ts = now_ts
+    if attested_ts is None and state is TradeScopeState.ATTESTED:
+        attested_ts = now_ts
+    repo.upsert_venue_trade_scope(
+        VenueTradeScope(
+            venue=venue,
+            state=state,
+            attested_scope=attested_scope,
+            attested_ts=attested_ts,
+            confirmed_ts=confirmed_ts,
+            refuted_ts=refuted_ts,
+            refuted_reason=refuted_reason,
+        )
+    )
+
 
 VALID_CONFIG_YAML = """
 allowlist:

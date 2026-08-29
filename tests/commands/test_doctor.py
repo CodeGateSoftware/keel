@@ -15,6 +15,8 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
+
 from keel.commands.doctor import (
     AdmissibilityRow,
     Finding,
@@ -29,6 +31,7 @@ from keel.commands.doctor import (
     partial_fill_findings,
     rail_state_findings,
     render_json,
+    trade_scope_findings,
     veto_findings,
 )
 from keel.config import load_config
@@ -104,6 +107,116 @@ def test_rail14_attestation_due_soon_warns_with_days() -> None:
     (rail14,) = [f for f in findings if f.name == "attest.subscription"]
     assert rail14.status == "warn"
     assert "2 day" in rail14.detail
+
+
+# -- rail 20: trade scope (#233) -----------------------------------------------------------------
+#
+# `trade_scope_findings` takes the record directly (like `attestation_findings` takes
+# `subscription`), so it is unit-testable without a database.
+
+
+def _scope(
+    state: TradeScopeState,
+    *,
+    attested_scope: str | None = None,
+    attested_ts: int | None = None,
+    confirmed_ts: int | None = None,
+    refuted_ts: int | None = None,
+    refuted_reason: str | None = None,
+    venue: str = "coinbase",
+) -> VenueTradeScope:
+    return VenueTradeScope(
+        venue=venue,
+        state=state,
+        attested_scope=attested_scope,
+        attested_ts=attested_ts,
+        confirmed_ts=confirmed_ts,
+        refuted_ts=refuted_ts,
+        refuted_reason=refuted_reason,
+    )
+
+
+def test_trade_scope_absent_fails_naming_the_venue_and_the_attest_command() -> None:
+    findings = trade_scope_findings(None, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "fail"
+    assert "keel scope attest --trading --venue coinbase" in finding.fix
+
+
+def test_trade_scope_confirmed_is_ok_and_names_the_venue() -> None:
+    record = _scope(TradeScopeState.CONFIRMED, confirmed_ts=NOW - DAY)
+    findings = trade_scope_findings(record, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "ok"
+    assert "coinbase" in finding.detail
+
+
+def test_trade_scope_attested_trading_is_ok_but_flags_it_as_unconfirmed() -> None:
+    record = _scope(TradeScopeState.ATTESTED, attested_scope=TRADING, attested_ts=NOW - DAY)
+    findings = trade_scope_findings(record, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "ok"
+    assert "unconfirmed" in finding.detail.lower()
+
+
+def test_trade_scope_attested_read_only_fails() -> None:
+    record = _scope(TradeScopeState.ATTESTED, attested_scope=READ_ONLY, attested_ts=NOW - DAY)
+    findings = trade_scope_findings(record, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "fail"
+    assert "read" in (finding.headline + finding.detail).lower()
+
+
+def test_trade_scope_refuted_fails_and_names_the_venues_reason() -> None:
+    record = _scope(
+        TradeScopeState.REFUTED, refuted_ts=NOW - DAY, refuted_reason="insufficient permissions"
+    )
+    findings = trade_scope_findings(record, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "fail"
+    assert "insufficient permissions" in finding.detail
+
+
+def test_trade_scope_unverified_fails() -> None:
+    record = _scope(TradeScopeState.UNVERIFIED)
+    findings = trade_scope_findings(record, "coinbase")
+    (finding,) = [f for f in findings if f.name == "scope.trade"]
+    assert finding.status == "fail"
+
+
+def test_trade_scope_reattested_after_refutation_warns_with_the_refusal_date() -> None:
+    """THE SPECIFIC OPERATOR SURFACE THE DESIGN CALLS OUT (#233): a record that has been
+    re-attested still carries `refuted_ts`, and doctor must say so -- that is the entire reason
+    the record keeps it through a re-attestation instead of clearing it."""
+    record = _scope(
+        TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW,
+        refuted_ts=1_700_000_000,  # 2023-11-14T22:13:20Z
+    )
+    findings = trade_scope_findings(record, "coinbase")
+    names = {f.name for f in findings}
+    assert "scope.trade" in names  # the OK finding is still there too
+    (reattested,) = [f for f in findings if f.name != "scope.trade"]
+    assert reattested.status == "warn"
+    assert "2023-11-14" in reattested.detail
+    assert "refut" in reattested.detail.lower()
+
+
+def test_trade_scope_confirmed_record_with_a_past_refutation_also_warns() -> None:
+    """The WARN fires for ANY non-REFUTED state carrying a `refuted_ts`, not just ATTESTED -- a
+    CONFIRMED record (the venue accepted a later placement) can carry the same history."""
+    record = _scope(TradeScopeState.CONFIRMED, confirmed_ts=NOW, refuted_ts=1_700_000_000)
+    findings = trade_scope_findings(record, "coinbase")
+    assert any(f.status == "warn" for f in findings)
+
+
+def test_trade_scope_currently_refuted_does_not_ALSO_get_the_reattested_warn() -> None:
+    """A record that is STILL refuted (never re-attested) gets the one FAIL, not a second
+    finding repeating the same fact under a different name."""
+    record = _scope(TradeScopeState.REFUTED, refuted_ts=NOW - DAY, refuted_reason="bad creds")
+    findings = trade_scope_findings(record, "coinbase")
+    assert len(findings) == 1
 
 
 def test_kill_switch_is_halted_not_broken() -> None:
@@ -457,6 +570,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "install.identity",
         "attest.subscription",
         "attest.withdrawals",
+        "scope.trade",
         "rail.kill_switch",
         "rail.streak_halt",
         "rail.drawdown",

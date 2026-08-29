@@ -1,13 +1,13 @@
 """THE HARD RAILS (§14) — enforced before every order, un-overridable.
 
-`check()` runs the twelve safety rails from the main spec's §14, plus six later, equally
+`check()` runs the twelve safety rails from the main spec's §14, plus seven later, equally
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
 16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, 18, the
-settlement-currency rail, and 19, the spot-instrument rail — eighteen in all, since there is no
-rail 15. They run before any order is placed, in every `auto_trade` mode (confirm *and*
-autonomous) and for both rule-trading and DCA order classes. It never short-circuits: every
-violated rail is collected and reported so an operator (or the executor, Task 4) sees the full
-picture, not just the first trip-wire.
+settlement-currency rail, 19, the spot-instrument rail, and 20, the trade-scope rail (#233) —
+nineteen in all, since there is no rail 15. They run before any order is placed, in every
+`auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA order classes. It
+never short-circuits: every violated rail is collected and reported so an operator (or the
+executor, Task 4) sees the full picture, not just the first trip-wire.
 
 Design notes on rails that need state this repo doesn't compute anywhere else yet (Task 3 lands
 before the executor/money_mgmt modules that would normally produce some of these numbers):
@@ -98,6 +98,20 @@ OR MORE segments. It does not for two-segment ones -- `BTC-PERP` passes this gra
 stopped by rail 18 alone -- so there spot-only remains a property of `settlement_currencies`. See
 the rail's own comment for that residual in full. Every mode, both sides, DCA included, and no
 config field to widen -- spot-only is this agent's charter, not an operator preference.
+
+Rail 20 (trade scope, #233, safety-critical, un-overridable) closes a hole rails 1-19 cannot see:
+a credential that reads fine is not evidence it can place a live trade.
+`ROBINHOOD_API_KEY` was well-formed and every read succeeded, and the first live order still
+403'd with "You do not have permission to perform this action." The policy deciding whether a
+live entry may proceed lives on the record itself (`VenueTradeScope.may_place_live_entry`,
+`keel_core/trade_scope.py`), not here -- this rail only calls it on the bound venue's record
+(`repo.get_venue_trade_scope`, keyed exactly like rail 14's `current_venue() or DEFAULT_VENUE`)
+so the state machine has exactly one place to disagree with itself. Fails CLOSED on a missing
+record, like rails 12/13/17: a never-recorded venue is not evidence it can trade. ENTRIES ONLY,
+like rails 11/16/17 -- existing holdings are already ours, and vetoing an EXIT over a fact about
+the credential would strand a position that wanted out. Listed in `LIVE_STATE_RAILS`: paper has
+no live account to verify a credential's trade scope against, so it is skipped there, and the
+skip is recorded like rails 13/17's.
 """
 
 from __future__ import annotations
@@ -112,6 +126,7 @@ from typing import Any
 from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import current_venue, log_event
+from keel_core.trade_scope import TradeScopeState
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -126,14 +141,14 @@ CORRELATED_SIZE_SCALE = Decimal("0.5")  # rail 5: half-size when correlated expo
 UNCORRELATED_ASSETS = frozenset({"PAXG"})  # gold-backed; not "long crypto beta" (§4.1)
 FEED_STALENESS_CYCLES = 3  # rail 12: 3 missed polling cycles = stale feed
 
-# Rail 14's venue when nothing is bound. The bound venue arrives through the SAME
+# Rails 14 and 20's venue when nothing is bound. The bound venue arrives through the SAME
 # ContextVar binding the CLI makes for telemetry (`_load_cfg` -> `bind_venue(config.broker.name)`,
 # read here via `current_venue()`): one binding at process entry serves both the stamped events
-# and the rail, so they can never disagree about which venue this process is trading -- and
+# and the rails, so they can never disagree about which venue this process is trading -- and
 # guards stays broker-less and config-shape-agnostic (the venue is binding state, not broker
 # state). Unbound (every in-process caller, every pre-existing test) keeps coinbase, the
-# engine's single-venue answer since the rail was born; this constant is that fallback, not
-# the rail's key.
+# engine's single-venue answer since rail 14 was born; this constant is that fallback, not
+# either rail's key.
 DEFAULT_VENUE = "coinbase"
 
 #: The statuses whose rows carry OBSERVED fills, and therefore count at observed economics
@@ -207,14 +222,15 @@ class OrderIntent:
 
 #: Rails whose inputs describe the LIVE ACCOUNT and therefore cannot be evaluated offline:
 #: rail 13 needs a broker-fetched quote balance, rail 17 needs the account's real withdrawal
-#: state. Paper trading has no live account, so these are SKIPPED there -- and RECORDED as
-#: skipped, never silently omitted, so a paper track record is honest about its own gaps.
-LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability")
+#: state, rail 20 needs the venue's own attested/confirmed trade-scope record. Paper trading has
+#: no live account, so these are SKIPPED there -- and RECORDED as skipped, never silently
+#: omitted, so a paper track record is honest about its own gaps.
+LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability", "trade_scope")
 
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all eighteen rails: `ok` iff `violations` is empty."""
+    """The outcome of running all nineteen rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -418,7 +434,7 @@ def check(
     now_ts: int,
     offline: bool = False,
 ) -> GuardResult:
-    """Run all eighteen §14 (+ Issue #59, Task 4) hard rails against `intent`. Never
+    """Run all nineteen §14 (+ Issue #59, Task 4, #233) hard rails against `intent`. Never
     short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
@@ -855,6 +871,55 @@ def check(
             f"(BASE-DDMMMYY-CDE), equities (an opaque 64-char hash) and any other instrument "
             f"shape are refused here regardless of what they settle in."
         )
+
+    # 20. Trade scope (#233) — a credential that reads fine is not evidence it can place a live
+    #     trade: `ROBINHOOD_API_KEY` was well-formed, every read succeeded, and the first live
+    #     order still 403'd with "You do not have permission to perform this action." The policy
+    #     lives on the record itself (`VenueTradeScope.may_place_live_entry`,
+    #     `keel_core/trade_scope.py`) -- this rail does not re-derive the state machine, it only
+    #     calls the one method that owns it, so there is exactly one place to get it wrong.
+    #
+    #     Venue-keyed exactly like rail 14 (`current_venue() or DEFAULT_VENUE`): anything else
+    #     would gate an alpaca deployment on a coinbase record nothing writes and veto with
+    #     advice that sends the operator to attest the wrong venue -- so every message below
+    #     names the RESOLVED venue.
+    #
+    #     ENTRIES ONLY, exactly like rails 11/16/17: existing holdings are already ours, and a
+    #     rail that blocked exits, stop rolls, cancels or DCA exits over a fact about the
+    #     CREDENTIAL (not the position) would strand a position that wanted out.
+    #
+    #     Fails CLOSED on a missing record, like rails 12/13/17: `None` means nobody has ever
+    #     attested or confirmed this venue's credential, and unknown is not evidence it can
+    #     trade. A REFUTED record gets its own message naming the venue's own `refuted_reason`
+    #     (when present) -- "the venue refused a placement" is a more useful operator fact than
+    #     a bare "attested read-only", and rail 17 draws the same None-vs-False distinction.
+    if is_buy and not offline:
+        venue = current_venue() or DEFAULT_VENUE
+        trade_scope = repo.get_venue_trade_scope(venue)
+        if trade_scope is None:
+            violations.append(
+                f"trade_scope: {venue} has never attested or confirmed a live trade scope for "
+                "this credential -- unknown is not evidence it can trade, so new ENTRIES are "
+                "vetoed. Exits, stop rolls, cancels and DCA exits are unaffected. Run "
+                f"`keel scope attest --trading --venue {venue}` once the credential is verified."
+            )
+        elif not trade_scope.may_place_live_entry():
+            if trade_scope.state is TradeScopeState.REFUTED:
+                reason = f" ({trade_scope.refuted_reason})" if trade_scope.refuted_reason else ""
+                violations.append(
+                    f"trade_scope: {venue} REFUSED a live placement on this credential{reason} "
+                    "-- new ENTRIES are vetoed until it is re-attested with a working "
+                    "credential. Exits, stop rolls, cancels and DCA exits are unaffected. "
+                    f"Re-attest with `keel scope attest --trading --venue {venue}` once the "
+                    "credential is fixed."
+                )
+            else:
+                violations.append(
+                    f"trade_scope: {venue}'s credential is attested read-only (or unverified) "
+                    "-- new ENTRIES are vetoed until it is attested for trading. Exits, stop "
+                    "rolls, cancels and DCA exits are unaffected. Run `keel scope attest "
+                    f"--trading --venue {venue}` once the credential can place live orders."
+                )
 
     for violation in violations:
         log_event(
