@@ -495,12 +495,24 @@ def test_a_token_bearing_navigation_never_answers_from_cache() -> None:
     assert branch is not None, "the navigation branch is not in the shape this test understands"
     body = branch.group(1)
 
-    guard = body.find("searchParams.has(")
-    cache = body.find("caches.match(")
-    assert guard != -1, (
-        "the navigation branch does not check for the session token -- a token-bearing "
-        "navigation answered from cache locks the operator out with no way back"
+    # The WHOLE line, not a substring anywhere in the branch. A substring search passes
+    # against an inverted condition (`!has(...)`), a guard that falls through instead of
+    # returning, a dead guard (`false && has(...)`), and a guard reading a different
+    # parameter than the constant -- four mutations that each restore the bug this test
+    # exists to prevent. Asserted as an exact line so none of them can pass.
+    guard_line = re.search(
+        r"^\s*if \(url\.searchParams\.has\(SESSION_TOKEN_PARAM\)\) return;\s*$",
+        body,
+        re.MULTILINE,
     )
+    assert guard_line is not None, (
+        "the navigation branch does not decline a token-bearing navigation with exactly "
+        "`if (url.searchParams.has(SESSION_TOKEN_PARAM)) return;` -- an inverted, dead, "
+        "fall-through or differently-parameterised guard reads like a check and restores "
+        "the lockout"
+    )
+    guard = guard_line.start()
+    cache = body.find("caches.match(")
     assert cache != -1, "the navigation branch no longer consults the cache at all"
     assert guard < cache, (
         "the token check must come BEFORE the cache lookup; after it, the cached shell has "
