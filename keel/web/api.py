@@ -297,10 +297,27 @@ def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> di
     return payload.rules_payload(rows)
 
 
-def read_venues(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    from keel.commands.brokers import list_installed_brokers
+def read_venues(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dict[str, Any]:
+    """Capability declarations (unchanged), plus this deployment's venue readiness (#233 PR4).
 
-    return payload.venues_payload(list_installed_brokers())
+    `needs_database=False` on this route (`API_ROUTES`) is UNCHANGED: this still answers with
+    nothing set up at all, which is why `state` is read rather than re-probed -- `state` is
+    `None` on a machine dispatch could not even build a `DeploymentState` for, and
+    `has_usable_database` is `False` on a fresh one, both of which mean "do not open the repo at
+    all" here, same as `read_setup` already reads `state` instead of re-inspecting the
+    deployment a second time. `gather_readiness` then degrades every record to `None` (rail 20's
+    own "unknown") on anything it cannot read, so a database that exists but predates the #233
+    PR1 migration still answers 200 rather than 500.
+    """
+    from keel_broker_api.registry import discover_brokers
+
+    from keel.commands.brokers import list_installed_brokers
+    from keel.venue_readiness import gather_readiness
+
+    infos = list_installed_brokers()
+    usable = bool(getattr(state, "has_usable_database", False))
+    readiness = gather_readiness(discover_brokers(), db_path=cfg.db_path if usable else None)
+    return payload.venues_payload(infos, readiness)
 
 
 def read_gates(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:

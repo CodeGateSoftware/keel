@@ -22,6 +22,7 @@ from click.testing import CliRunner
 
 from keel.cli import cli
 from keel.commands import brokers
+from keel.venue_readiness import VenueReadiness
 
 #: Every field the payload may carry -- the closed capability vocabulary. A field outside
 #: this set (an env read, a key-presence probe, a config content) is a scope violation,
@@ -321,3 +322,125 @@ def test_brokers_list_help_carries_the_readme_trademark_line() -> None:
 # longer asserted is a second rendering of it, because there is no second rendering.
 
 
+# -- venue readiness (#233 PR4): a SEPARATE block, never merged into the declarations one ---------
+
+
+def test_no_key_inference_line_is_unchanged_text() -> None:
+    """A pin against silent rewording, independent of where it appears."""
+    assert brokers.NO_KEY_INFERENCE_LINE == (
+        "the declarations above are a capability display only -- no key presence is read or "
+        "implied, and no secret is shown"
+    )
+
+
+def test_the_no_key_inference_line_scopes_itself_to_its_own_block() -> None:
+    """It is no longer the last line of the command, only of its own block -- a readiness block
+    that DOES read key presence now follows it about twenty lines later. A line that still said a
+    bare "capability display only" would read, mid-output, as a claim about everything below it,
+    which is the blur #233 exists to remove. So it must name what it is scoping."""
+    assert "the declarations above" in brokers.NO_KEY_INFERENCE_LINE
+
+
+def test_render_brokers_lines_ends_on_the_no_key_inference_line() -> None:
+    """`render_brokers_lines` -- called DIRECTLY, not through the CLI -- must still end on the
+    declarations' own honesty line. This is the half of the pin a merge-readiness-in mutant that
+    inserts rows BEFORE the line (keeping it last) would still pass; see the test below for the
+    half that catches exactly that mutant."""
+    lines = brokers.render_brokers_lines(brokers.list_installed_brokers())
+    assert lines[-1] == brokers.NO_KEY_INFERENCE_LINE
+
+
+def test_render_brokers_lines_never_emits_readiness_vocabulary() -> None:
+    """The other half: `render_brokers_lines` must not contain the readiness block's header or
+    its own honesty line ANYWHERE in its output, regardless of position. A mutant that merges
+    `render_readiness_lines`' rows into `render_brokers_lines` -- even if it is careful to insert
+    them before the last line, so the pin above still passes -- fails HERE, because the
+    readiness header/honesty-line text would then appear inside this function's own output."""
+    text = "\n".join(brokers.render_brokers_lines(brokers.list_installed_brokers()))
+    assert brokers.READINESS_HEADER not in text
+    assert brokers.READINESS_HONESTY_LINE not in text
+
+
+def test_brokers_list_prints_declarations_before_readiness_in_that_order() -> None:
+    """End to end through the CLI: the declarations' honesty line and the readiness block's
+    header both appear, in that order, with every venue's readiness row strictly after the
+    declarations' honesty line -- not merely "somewhere after some other string"."""
+    result = CliRunner().invoke(cli, ["brokers", "list"])
+    assert result.exit_code == 0, result.output
+    text = result.output
+
+    decl_idx = text.index(brokers.NO_KEY_INFERENCE_LINE)
+    header_idx = text.index(brokers.READINESS_HEADER)
+    honesty_idx = text.index(brokers.READINESS_HONESTY_LINE)
+    assert decl_idx < header_idx < honesty_idx
+
+    # ⚠️ This assertion used to be `text.index(f"{name}: ", decl_idx) > decl_idx`, which is
+    # TAUTOLOGICAL: `str.index` with a start offset can never return a position below it, so it
+    # held against every possible output. Split the text at the header instead and make two
+    # claims that can actually fail.
+    declarations_block, readiness_block = text[:header_idx], text[header_idx:]
+
+    for name in _INSTALLED:
+        assert f"{name}: " in readiness_block, (
+            f"{name} has no readiness row after the header -- rows are being rendered into the "
+            "declarations block, or not at all"
+        )
+
+    for state in VenueReadiness:
+        assert state.value not in declarations_block, (
+            f"the readiness state {state.value!r} leaked into the declarations block, which "
+            "NO_KEY_INFERENCE_LINE terminates and claims reads no key presence"
+        )
+
+
+def test_brokers_list_json_still_carries_no_readiness_vocabulary() -> None:
+    """`--json` stays the declarations-only shape (unchanged by #233): no `readiness` key, no
+    state word, no honesty line -- proving the machine surface was not quietly widened."""
+    result = CliRunner().invoke(cli, ["brokers", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    assert "readiness" not in result.output
+    assert brokers.READINESS_HEADER not in result.output
+
+
+def test_brokers_list_shows_a_readiness_row_for_every_installed_adapter() -> None:
+    result = CliRunner().invoke(cli, ["brokers", "list"])
+    assert result.exit_code == 0, result.output
+    for name in _INSTALLED:
+        assert f"{name}: " in result.output
+
+
+def test_brokers_list_still_works_with_no_deployment_readiness_included() -> None:
+    """The existing no-deployment contract (`test_brokers_list_renders_the_service_rows`) must
+    keep holding even though the command now also gathers readiness -- no crash, no "no such
+    file", on a run with nothing set up."""
+    result = CliRunner().invoke(cli, ["--db", "/nonexistent/keel.db", "brokers", "list"])
+    assert result.exit_code == 0, result.output
+    assert "no such file" not in result.output.lower()
+    assert brokers.READINESS_HEADER in result.output
+
+
+def test_render_readiness_lines_names_state_explanation_and_fix() -> None:
+    from keel.venue_readiness import VenueReadiness, VenueReadinessRow
+
+    rows = [
+        VenueReadinessRow(
+            venue="acme",
+            state=VenueReadiness.NOT_PERMITTED,
+            explanation="acme has never attested or confirmed a live trade scope",
+            next_step="keel scope attest --trading --venue acme",
+        ),
+        VenueReadinessRow(
+            venue="zen", state=VenueReadiness.READY, explanation="all clear", next_step=None
+        ),
+    ]
+    lines = brokers.render_readiness_lines(rows)
+    text = "\n".join(lines)
+    assert "acme: not_permitted" in text
+    assert "acme has never attested" in text
+    assert "fix: keel scope attest --trading --venue acme" in text
+    assert "zen: ready" in text
+    assert "all clear" in text
+    assert lines[-1] == brokers.READINESS_HONESTY_LINE
+    # READY carries no "fix:" line -- there is nothing left to do.
+    zen_idx = text.index("zen: ready")
+    assert "fix:" not in text[zen_idx:]

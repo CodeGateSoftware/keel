@@ -32,11 +32,13 @@ import textwrap
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as dist_version
+from pathlib import Path
 from typing import Any
 
 import click
 
 from keel.commands._common import DISCLAIMER
+from keel.venue_readiness import VenueReadinessRow, gather_readiness
 
 #: The venues a SHIPPED deployment selects -- the whole wired/optional classification, in
 #: ONE explicit place:
@@ -219,7 +221,8 @@ def list_installed_brokers() -> list[BrokerInfo]:
 #: The posture line both front-ends carry, spelled once: what these screens show is the
 #: adapter's own declarations, never an inference about the operator's keys.
 NO_KEY_INFERENCE_LINE = (
-    "capability display only -- no key presence is read or implied, and no secret is shown"
+    "the declarations above are a capability display only -- no key presence is read or "
+    "implied, and no secret is shown"
 )
 
 
@@ -281,18 +284,84 @@ def render_brokers_lines(infos: list[BrokerInfo]) -> list[str]:
     return lines
 
 
+# -- venue readiness (#233 PR4): a SEPARATE block, never merged into the one above -----------------
+#
+# `render_brokers_lines` answers "what does the adapter DECLARE" and ends on `NO_KEY_INFERENCE_LINE`
+# -- a statement that is true of THAT block and must stay true of it. Readiness answers a different
+# question ("can THIS deployment actually place a live entry on this venue, right now"), and it is
+# rendered as its own headed block, AFTER the declarations block, with its own honesty line. Merging
+# the two would re-blur exactly the distinction #233 exists to draw -- see `keel.venue_readiness`'s
+# module docstring.
+
+#: What the readiness block reads, spelled out because `NO_KEY_INFERENCE_LINE` above it does NOT
+#: cover this block (that line is deliberately scoped to the declarations it terminates). Unlike
+#: the declarations block, this one genuinely reads credential PRESENCE and runs LOCAL
+#: well-formedness arithmetic on the value -- e.g. deriving a public key in-process to compare it
+#: against what is in the identifier slot (the 2026-08-19 incident) -- but it never displays a
+#: secret and never makes a network call.
+READINESS_HONESTY_LINE = (
+    "readiness reads credential PRESENCE (environment, .env, keychain) and runs LOCAL "
+    "well-formedness arithmetic on the value -- no secret is ever shown, and no network call "
+    "is ever made"
+)
+
+#: The header text that OPENS the readiness block -- distinctive enough that a test can assert
+#: it never appears inside `render_brokers_lines`' own output, proving the two blocks are built
+#: by two different functions rather than merely printed in a hopeful order.
+READINESS_HEADER = "venue readiness (this deployment, #233):"
+
+
+def render_readiness_lines(rows: list[VenueReadinessRow]) -> list[str]:
+    """The readiness block's human rendering -- one block per venue, PURE over
+    `VenueReadinessRow`s the caller already gathered. Never called from inside
+    `render_brokers_lines`; always printed after it, by `brokers_list` below."""
+    lines: list[str] = ["", READINESS_HEADER]
+    for row in rows:
+        lines.append(f"{row.venue}: {row.state.value}")
+        lines.append(f"  {row.explanation}")
+        if row.next_step is not None:
+            lines.append(f"  fix: {row.next_step}")
+    lines.append(READINESS_HONESTY_LINE)
+    return lines
+
+
+def _readiness_rows(ctx: click.Context) -> list[VenueReadinessRow]:
+    """Gathers this deployment's readiness rows for `keel brokers list` -- `gather_readiness`'s
+    CLI wiring, the same service `/api/venues` wires to a repo it knows is migrated.
+
+    `keel brokers list` must keep working with NO deployment at all (pinned by
+    `test_brokers_list_renders_the_service_rows`): `db_path` is passed to `gather_readiness`
+    only when a file already exists there, so this never CREATES a database as a side effect of
+    a display command -- a `brokers list` on a fresh checkout reads exactly as much of the
+    filesystem as it always has, plus the credential env/`.env`/keychain reads readiness needs.
+    """
+    from keel_broker_api.registry import discover_brokers
+
+    obj = ctx.obj or {}
+    db_path = obj.get("db_path")
+    usable = db_path is not None and Path(db_path).exists()
+    return gather_readiness(discover_brokers(), db_path=db_path if usable else None)
+
+
 # -- the CLI ---------------------------------------------------------------------------------------
 
 
 @click.group("brokers")
 def brokers_group() -> None:
-    """Venues/brokers visibility: what every installed adapter declares it can do.
+    """Venues/brokers visibility: what every installed adapter declares, and whether THIS
+    deployment could actually trade on it.
 
     Lists the installed broker adapters (the `keel.brokers` entry points) with their
     capabilities -- wired-for-deployment vs optional-dev-venue, session-bound or 24/7,
     quote currencies, asset classes, order kinds, preview synthesis, declared endpoints
-    and data feeds -- capability display only: never key-presence inference, never a
-    secret value. One service behind `keel brokers list` and the console's Venues browser.
+    and data feeds. That block is a capability display only: never key-presence inference,
+    never a secret value.
+
+    A SECOND, separate block follows it (#233): venue readiness, which DOES read credential
+    PRESENCE and run local well-formedness arithmetic, and answers a different question --
+    can a live entry be placed here right now. The two are never merged, because "what the
+    adapter can do" and "what this deployment can do" are exactly the pair #233 exists to
+    keep apart. One service behind `keel brokers list` and the console's Venues browser.
 
     Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
     """
@@ -302,18 +371,28 @@ def brokers_group() -> None:
 @click.option(
     "--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON."
 )
-def brokers_list(as_json: bool) -> None:
-    """Every installed adapter with its declared capabilities (read-only, offline).
+@click.pass_context
+def brokers_list(ctx: click.Context, as_json: bool) -> None:
+    """Every installed adapter with its declared capabilities (read-only, offline), followed by
+    this deployment's venue readiness (#233 PR4): can a live entry actually be placed, right now.
 
-    `--json` follows `keel status --json`'s convention: the service payload verbatim,
-    with no disclaimer footer after it, for scripting and the TUI. The human rendering
-    carries the disclaimer like every other keel command.
+    `--json` follows `keel status --json`'s convention: the service payload verbatim -- the
+    DECLARATIONS only, UNCHANGED by #233 -- with no disclaimer footer after it, for scripting and
+    the TUI. Readiness is not in `--json` here: turning this into a dict, or adding readiness
+    fields to these rows, would both break existing consumers of this exact shape and re-merge
+    the two facts #233 keeps apart (see `render_readiness_lines`'s module comment). The machine
+    surface for readiness is the web payload (`/api/venues`'s `readiness` key), not this flag.
+
+    The human rendering carries the disclaimer, and the readiness block, like every other keel
+    command; `render_brokers_lines`'s own block ends unchanged at `NO_KEY_INFERENCE_LINE`.
     """
     infos = list_installed_brokers()
     if as_json:
         click.echo(json.dumps([info.as_json() for info in infos], indent=2))
         return
     for line in render_brokers_lines(infos):
+        click.echo(line)
+    for line in render_readiness_lines(_readiness_rows(ctx)):
         click.echo(line)
     click.echo("")
     click.echo(DISCLAIMER)

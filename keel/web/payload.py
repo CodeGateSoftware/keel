@@ -112,6 +112,12 @@ from typing import TYPE_CHECKING, Any, TypedDict
 # read; the compute trees (`keel.strategy`, `keel.execution.*`, `keel.analysis`) are not.
 from keel.commands.status import _human_age, _human_remaining
 
+# A real import, not `TYPE_CHECKING`-only: `_readiness_payload` reads the ENUM MEMBERS at
+# runtime to build `_READINESS_STATE`, not just the type. `keel.venue_readiness` is the #233
+# PR4 module both `keel/commands/brokers.py` and this file read, so the CLI and the web cannot
+# disagree about what each readiness state means.
+from keel.venue_readiness import VenueReadiness
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
     from keel.commands.insights import (
@@ -134,6 +140,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         SubscriptionStatusRow,
         WithdrawalAttestationStatus,
     )
+    from keel.venue_readiness import VenueReadinessRow
 
 
 class Field(TypedDict):
@@ -1738,9 +1745,63 @@ def _venue_payload(info: Any) -> dict[str, Any]:
     }
 
 
-def venues_payload(infos: Sequence[Any]) -> dict[str, Any]:
-    """`keel.commands.brokers.list_installed_brokers`'s rows, as JSON."""
-    return {"venues": [_venue_payload(info) for info in infos]}
+#: GOOD/WARN/BAD/NEUTRAL for each readiness state (#233 PR4). `ready` is the success state. `not_
+#: permitted` and `malformed_credentials` are genuine faults: a live entry is blocked TODAY by
+#: a record rail 20 will veto, or by a credential LOCALLY proven wrong -- the same BAD judgement
+#: `_venue_payload`'s own `error` field gives a construction failure, because both describe
+#: something actively wrong rather than merely unset. `no_credentials` and `not_installed` are
+#: WARN: neither is a deployment FAULT so much as an absence an operator has simply not gotten
+#: to yet (an uninstalled optional venue, a credential never set) -- milder than a value that is
+#: present and provably wrong, or a venue that has actively refused a placement.
+_READINESS_STATE: dict[VenueReadiness, str] = {
+    VenueReadiness.READY: GOOD,
+    # A dev/stub adapter with no credentials to present is not a FAULT, it is a venue this
+    # deployment was never going to trade -- `fake` and `kraken` are always installed, so any
+    # non-neutral colour here would put a permanent warning on every venues card for a row whose
+    # honest answer is "not applicable".
+    VenueReadiness.NOT_TRADEABLE: NEUTRAL,
+    VenueReadiness.NOT_INSTALLED: WARN,
+    VenueReadiness.NO_CREDENTIALS: WARN,
+    # Ignorance, not a fault: the database could not be read, so nothing here is a claim about
+    # the venue at all. WARN says "look at this" without asserting anything about the record.
+    VenueReadiness.RECORD_UNREADABLE: WARN,
+    # Present-and-provably-wrong, unlike the two WARNs above which are absences. Half a
+    # credential pair cannot authenticate a single request.
+    VenueReadiness.PARTIAL_CREDENTIALS: BAD,
+    VenueReadiness.MALFORMED_CREDENTIALS: BAD,
+    VenueReadiness.NOT_PERMITTED: BAD,
+}
+
+
+def _readiness_payload(row: VenueReadinessRow) -> dict[str, Any]:
+    """One venue's readiness verdict (#233 PR4), as JSON -- a SIBLING of `_venue_payload`, never
+    merged into it. `_venue_payload`'s own docstring says a row there "is not a claim that the
+    venue is configured or reachable" -- THIS is that claim, kept in its own collection so a
+    client reading `venues` alone still gets that #233 guarantee unchanged."""
+    return {
+        "venue": row.venue,
+        "state": label(
+            row.state.value,
+            display=row.state.value.replace("_", " "),
+            state=_READINESS_STATE[row.state],
+        ),
+        "explanation": row.explanation,
+        "next_step": row.next_step or "",
+    }
+
+
+def venues_payload(
+    infos: Sequence[Any], readiness: Sequence[VenueReadinessRow] = ()
+) -> dict[str, Any]:
+    """`keel.commands.brokers.list_installed_brokers`'s rows, plus this deployment's venue
+    readiness (#233 PR4) -- two SIBLING top-level keys, `venues` and `readiness`, never merged
+    into one row (see `_readiness_payload`). `readiness` defaults to empty so every existing
+    caller of this function keeps working unchanged; `keel/web/api.py::read_venues` is the one
+    caller that supplies it for real."""
+    return {
+        "venues": [_venue_payload(info) for info in infos],
+        "readiness": [_readiness_payload(row) for row in readiness],
+    }
 
 
 # -- gates (#534) --------------------------------------------------------------------------------

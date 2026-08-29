@@ -61,6 +61,7 @@ from keel.commands.status import (
     SubscriptionStatusRow,
     WithdrawalAttestationStatus,
 )
+from keel.venue_readiness import VenueReadiness, VenueReadinessRow
 from keel.web import payload
 
 NOW_TS = 1_756_000_000
@@ -350,6 +351,41 @@ class _BrokerInfo:
     error: str | None = None
 
 
+#: One row per state (#233 PR4), so `_every_payload`'s walkers (money-never-a-number, the
+#: `state` vocabulary, the no-custom-encoder check) actually exercise every `_READINESS_STATE`
+#: branch `_readiness_payload` can take -- not just whichever state an empty list would have
+#: left untested.
+_READINESS_ROWS = [
+    VenueReadinessRow(
+        venue="coinbase", state=VenueReadiness.READY, explanation="all clear", next_step=None
+    ),
+    VenueReadinessRow(
+        venue="ghost",
+        state=VenueReadiness.NOT_INSTALLED,
+        explanation="no adapter for 'ghost' is installed",
+        next_step="uv add keel-broker-ghost",
+    ),
+    VenueReadinessRow(
+        venue="alpaca",
+        state=VenueReadiness.NO_CREDENTIALS,
+        explanation="none of ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY is set",
+        next_step="keel credentials set <name>",
+    ),
+    VenueReadinessRow(
+        venue="robinhood",
+        state=VenueReadiness.MALFORMED_CREDENTIALS,
+        explanation="ROBINHOOD_API_KEY_CREDENTIAL holds the base64 PUBLIC key",
+        next_step="fix the value and re-set it",
+    ),
+    VenueReadinessRow(
+        venue="kraken",
+        state=VenueReadiness.NOT_PERMITTED,
+        explanation="kraken has never attested or confirmed a live trade scope",
+        next_step="keel scope attest --trading --venue kraken",
+    ),
+]
+
+
 def _every_payload() -> dict[str, Any]:
     """Every payload builder at once. The guards below run over the whole surface, because a
     contract that holds for `status` and leaks on `journal` is not a contract.
@@ -400,7 +436,8 @@ def _every_payload() -> dict[str, Any]:
             ]
         ),
         "venues": payload.venues_payload(
-            [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")]
+            [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")],
+            _READINESS_ROWS,
         ),
         "gates": payload.gates_payload(GATES, CAPABILITIES),
     }
@@ -1102,6 +1139,73 @@ def test_the_config_payload_names_the_deployment_without_judging_it() -> None:
     assert document["config_path"] == "/tmp/keel/config.yaml"
     # And every new key is a string, so the no-JSON-numbers walk holds over the growth.
     assert not _json_numbers(document)
+
+
+# -- venue readiness (#233 PR4) --------------------------------------------------------------------
+
+
+def test_readiness_is_a_sibling_key_never_a_field_on_a_venues_row() -> None:
+    """The separation `keel.venue_readiness`'s module docstring states: `venues` stays exactly
+    the capability-declaration shape `_venue_payload` always built; `readiness` is a second,
+    top-level key, never merged onto a `venues` row."""
+    document = payload.venues_payload([_BrokerInfo()], _READINESS_ROWS)
+    assert set(document) == {"venues", "readiness"}
+    for row in document["venues"]:
+        assert "state" not in row
+        assert "readiness" not in row
+        assert "explanation" not in row
+
+
+def test_readiness_defaults_to_empty_so_every_existing_caller_keeps_working() -> None:
+    """`venues_payload(infos)` with no second argument -- the call every caller made before
+    #233 PR4 -- must still answer, with `readiness: []` rather than a `TypeError`."""
+    document = payload.venues_payload([_BrokerInfo()])
+    assert document["readiness"] == []
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_tone"),
+    [
+        (VenueReadiness.READY, "good"),
+        (VenueReadiness.NOT_INSTALLED, "warn"),
+        (VenueReadiness.NO_CREDENTIALS, "warn"),
+        (VenueReadiness.MALFORMED_CREDENTIALS, "bad"),
+        (VenueReadiness.NOT_PERMITTED, "bad"),
+    ],
+)
+def test_each_readiness_state_carries_the_brief_s_good_warn_bad_judgement(
+    state: VenueReadiness, expected_tone: str
+) -> None:
+    """Pinned exactly as the brief states it: `ready` good; `malformed_credentials` and
+    `not_permitted` bad; `no_credentials` and `not_installed` warn."""
+    row = VenueReadinessRow(venue="v", state=state, explanation="x", next_step=None)
+    document = payload.venues_payload([], [row])
+    assert document["readiness"][0]["state"]["state"] == expected_tone
+
+
+def test_a_readiness_row_names_its_state_explanation_and_next_step() -> None:
+    row = VenueReadinessRow(
+        venue="robinhood",
+        state=VenueReadiness.MALFORMED_CREDENTIALS,
+        explanation="ROBINHOOD_API_KEY_CREDENTIAL holds the base64 PUBLIC key",
+        next_step="fix the value and re-set it",
+    )
+    document = payload.venues_payload([], [row])
+    carried = document["readiness"][0]
+    assert carried["venue"] == "robinhood"
+    assert carried["state"]["value"] == "malformed_credentials"
+    assert carried["state"]["display"] == "malformed credentials"
+    assert carried["explanation"] == "ROBINHOOD_API_KEY_CREDENTIAL holds the base64 PUBLIC key"
+    assert carried["next_step"] == "fix the value and re-set it"
+
+
+def test_a_ready_row_carries_an_empty_next_step_not_null() -> None:
+    """`next_step` is `None` on the dataclass for `READY` (nothing left to do); on the wire it
+    is `""`, the same absent-but-a-string convention `_venue_payload`'s own `package_version`
+    uses -- never a JSON `null` a client would have to special-case."""
+    row = VenueReadinessRow(venue="v", state=VenueReadiness.READY, explanation="x", next_step=None)
+    document = payload.venues_payload([], [row])
+    assert document["readiness"][0]["next_step"] == ""
 
 
 # -- totality ------------------------------------------------------------------------------------

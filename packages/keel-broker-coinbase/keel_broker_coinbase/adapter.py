@@ -135,6 +135,12 @@ def _trade_scope_refusal(exc: BaseException) -> str | None:
 class CoinbaseAdapter:
     """Implements the `Broker` port against Coinbase Advanced Trade."""
 
+    #: Where this adapter's credentials live (#233 PR4), for the capability-display readiness
+    #: surfaces (`keel brokers list`, `/api/venues`) -- matches
+    #: `keel_core.config.load_secrets`'s own names, read with `getattr` and never imported: a
+    #: second list keyed by venue name would be the thing #233's display exists to avoid.
+    DECLARED_CREDENTIAL_ENV: tuple[str, str] = ("CDP_API_KEY", "CDP_API_SECRET")
+
     def __init__(self, transport: Transport | None = None) -> None:
         self._transport = transport
 

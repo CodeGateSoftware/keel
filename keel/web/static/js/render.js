@@ -1710,6 +1710,41 @@ export function venuesView(data, sort, onSort) {
     fragment.append(heading("h-declared", "Full declaration"));
     for (const info of venues) fragment.append(venueCard(info));
   }
+
+  // A SEPARATE section, not a column added to the table above (#233). `venues` above answers
+  // "what does the adapter declare"; `readiness` answers "can a live entry actually be placed
+  // on THIS deployment, right now" -- `payload.py`'s own `_readiness_payload` docstring keeps
+  // the two collections apart for the same reason, and merging them back together here would
+  // undo it at the one layer nothing else checks.
+  const readiness = data.readiness || [];
+  fragment.append(heading("h-readiness", "Venue readiness"));
+  const readinessSub = el("p", "sub");
+  readinessSub.append(
+    "can a live entry actually be placed on this deployment, right now — ",
+    "not what the adapter merely declares",
+  );
+  fragment.append(readinessSub);
+  fragment.append(
+    table(
+      "h-readiness",
+      [
+        { label: "venue", numeric: false },
+        { label: "state", numeric: false },
+        { label: "explanation", numeric: false },
+        { label: "fix", numeric: false },
+      ],
+      readiness.map(
+        /** @param {any} row */ (row) => [
+          plain(row.venue),
+          field(row.state),
+          plain(row.explanation),
+          plain(row.next_step) || "—",
+        ],
+      ),
+      "No readiness rows.",
+    ),
+  );
+
   return fragment;
 }
 

@@ -665,8 +665,12 @@ def test_a_stopped_engine_is_a_200_not_an_error(empty_machine: web_server.ServeC
 def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    """`/api/config`, `/api/venues` and `/api/gates` read no deployment at all -- they describe the
-    binary that is answering -- so they carry data even with nothing set up. They still report
+    """`/api/config` and `/api/gates` read no deployment at all -- they describe the binary that
+    is answering. `/api/venues` is `needs_database=False` for the same reason (still answers
+    with nothing set up) but, since #233 PR4, DOES attempt a best-effort read of this
+    deployment's venue readiness -- `read_venues` checks `state.has_usable_database` first and
+    skips the repo entirely here, where it is `False`, so the property this test actually cares
+    about (200 with data, nothing required to exist first) still holds. All three still report
     `engine`, because a client showing the "keel isn't running" banner should not have to fetch a
     different endpoint to know whether to show it."""
     for path in ("/api/config", "/api/venues", "/api/gates"):
@@ -675,6 +679,72 @@ def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
         assert status == 200, path
         assert document["engine"]["value"] == "stopped", path
         assert document["data"] is not None, path
+
+
+# -- venue readiness (#233 PR4) -------------------------------------------------------------------
+
+
+def test_venues_carries_a_sibling_readiness_key_never_merged_into_venues(
+    running: web_server.ServeConfig,
+) -> None:
+    """`venues` stays exactly the capability-declaration shape it always was; `readiness` is a
+    SIBLING top-level key, never a field added onto a `venues` row -- the same separation
+    `keel/commands/brokers.py` keeps between its declarations block and its readiness block."""
+    status, _headers, document = _json(running, "/api/venues")
+    assert status == 200
+    data = document["data"]
+    assert "readiness" in data
+    assert isinstance(data["readiness"], list)
+    assert data["readiness"]  # at least the CREDENTIALED_VENUES catalog
+    for row in data["venues"]:
+        assert "readiness" not in row
+        assert "state" not in row  # the readiness vocabulary must not leak onto a venues row
+
+
+def test_a_credential_less_dev_venue_stays_not_tradeable_even_with_a_confirmed_record(
+    running: web_server.ServeConfig,
+) -> None:
+    """End to end through the real route: a venue that presents NO credentials stays
+    `not_tradeable` EVEN WITH a CONFIRMED trade-scope record sitting in this deployment's
+    database.
+
+    This test used to assert the opposite -- that the record alone turned `fake` `ready` -- and
+    that was the defect. `fake` is the deterministic dev venue and `kraken` is a stub with no
+    network path at all; neither is something this deployment can trade, whatever a row says
+    about it. Grading them on trade scope produced `not_permitted` with
+    `fix: keel scope attest --trading --venue kraken`, advice that cannot work because there is
+    no credential behind it to attest ABOUT, and put a permanent red row on the venues card for
+    a venue nobody was going to trade.
+
+    The record is written anyway, and asserted NOT to resurrect the row, because a credential
+    question that stopped being asked once a record existed would reintroduce exactly that.
+    """
+    from keel_core.trade_scope import TradeScopeState, VenueTradeScope
+
+    from keel.data.repository import Repository
+
+    conn = connect(running.db_path)
+    Repository(conn).upsert_venue_trade_scope(
+        VenueTradeScope(
+            venue="fake",
+            state=TradeScopeState.CONFIRMED,
+            attested_scope=None,
+            attested_ts=None,
+            confirmed_ts=1_700_000_000,
+            refuted_ts=None,
+            refuted_reason=None,
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    _status, _headers, document = _json(running, "/api/venues")
+    rows = {row["venue"]: row for row in document["data"]["readiness"]}
+    assert rows["fake"]["state"]["value"] == "not_tradeable"
+    # NEUTRAL, not warn/bad: an adapter that was never a trading venue is not a fault to fix.
+    assert rows["fake"]["state"]["state"] == "neutral"
+    assert rows["fake"]["next_step"] == "", "no advice is better than advice that cannot work"
+    assert "scope attest" not in rows["fake"]["explanation"]
 
 
 def test_setup_is_answerable_with_nothing_set_up(empty_machine: web_server.ServeConfig) -> None:
