@@ -391,6 +391,146 @@ def test_the_arithmetic_scanner_can_fail() -> None:
     assert "+" not in _code_only('const s = "he said \\" a + b";\n')
 
 
+# -- #602: the chart gains a cursor legend, a trade highlight, and local export -----------------
+
+
+def _comments_only(source: str) -> str:
+    """`source` with `//` and `/* */` comments removed, but STRING LITERALS LEFT INTACT.
+
+    The same four-state walk `_code_only` runs, with the one difference this test needs: a string
+    is copied through rather than blanked. `_code_only` exists to make the arithmetic scan
+    impossible to fool with an operator quoted in a string or a comment, and blanking strings is
+    right for that job -- but it means `"data-point-index"` cannot be found in its output at all,
+    which is exactly the literal this test is checking for. Comments still have to go: the
+    `#602` comment directly above the loop this test scans NAMES both attributes in prose, and a
+    raw substring search would find that sentence instead of the code it is describing -- the
+    same trap `_markup_only` exists for on `index.html`.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "'\"":
+            quote = ch
+            start = i
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            out.append(source[start:i])
+            continue
+        if ch == "/" and source.startswith("//", i):
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _insights_view_body() -> str:
+    """`insightsView`'s code, comments stripped but string literals intact -- see `_view_keys`'s
+    own note on why a region bounded at the next top-level export is needed rather than a scan of
+    the whole file."""
+    source = _comments_only(_source("render.js"))
+    start = source.index("export function insightsView(")
+    next_export = source.find("\nexport function ", start + 1)
+    end = len(source) if next_export == -1 else next_export
+    return source[start:end]
+
+
+def test_a_journal_row_with_a_point_finds_it_before_it_is_marked_hoverable() -> None:
+    """**The shape that matters, not the mere presence of the two attributes.**
+
+    A row is only worth hovering or tabbing to if the chart has something to show for it, which
+    is exactly the property `entry.point_index === null` (#602's join -- see
+    `payload.journal_payload`'s own note on why a skipped trade gets `None`) exists to gate. A
+    pin that only checked `"data-point-index" in source` and `"tabindex" in source` would pass a
+    version that marks EVERY row hoverable regardless of whether the curve drew anything for it --
+    a real regression (a focus ring and a pointer cursor promising an interaction that does
+    nothing), caught below only because the null check is asserted to come FIRST in the loop body,
+    not merely to exist somewhere in the file.
+    """
+    body = _insights_view_body()
+
+    assert "point_index" in body
+    null_check = body.find("point_index")
+    assert null_check != -1
+
+    point_index_attr = body.find('"data-point-index"')
+    tabindex_attr = body.find('"tabindex"')
+    assert point_index_attr != -1, "insightsView never sets data-point-index on a journal row"
+    assert tabindex_attr != -1, "insightsView never makes a journal row keyboard-focusable"
+
+    # The join is CHECKED before the row is marked interactive, not after -- the ordering a
+    # `continue`-on-no-point guard relies on to skip the two calls below it.
+    assert null_check < point_index_attr, (
+        "the point_index check must come before data-point-index is set, or every row -- "
+        "including one the curve drew no point for -- is marked hoverable"
+    )
+    assert null_check < tabindex_attr, (
+        "the point_index check must come before tabindex is set, or a row with no point on the "
+        "curve is still added to the keyboard tab order"
+    )
+
+
+def test_a_losing_trade_is_marked_by_shape_and_dash_not_only_colour() -> None:
+    """#602's accessibility constraint, checked on both sides of the join: `chart.js` must pick a
+    DIFFERENT marker glyph for a loss than for a gain (not merely a different fill), and
+    `keel.css` must give a losing segment a different stroke PATTERN, not merely a different
+    `--bad`/`--good` token. Either half alone would leave colour as the only signal for a reader
+    who cannot see it -- the exact failure #532 already fixed once for the figures beside this
+    chart (`payload.py`'s ▲/▼ glyphs)."""
+    # The RAW source, not `_code_only`'s residue: the marker ids and the ternary below are string
+    # literals, which `_code_only` blanks out on purpose (see its own docstring) so the arithmetic
+    # scan cannot be fooled by an operator quoted in one. This test wants exactly what that scan
+    # throws away.
+    chart_code = _source("chart.js")
+    assert '"#mk-down"' in chart_code and '"#mk-up"' in chart_code
+    # The two markers are chosen by the trade's OWN outcome, not by which element happens to be
+    # drawn first -- a ternary keyed on `outcome`, the value `outcomeOf` derives from
+    # `point.pnl.state`.
+    assert re.search(r'outcome\s*===\s*"bad"\s*\?\s*"#mk-down"\s*:\s*"#mk-up"', chart_code), (
+        "the entry/exit markers must be chosen by the trade's outcome, not drawn identically"
+    )
+
+    css = staticfiles.STATIC_ROOT.joinpath("css", "keel.css").read_text(encoding="utf-8")
+    bad_rule = re.search(r"\.chart \.highlight \.segment\.bad\s*\{([^}]*)\}", css)
+    good_rule = re.search(r"\.chart \.highlight \.segment\.good\s*\{([^}]*)\}", css)
+    assert bad_rule is not None and good_rule is not None
+    assert "stroke-dasharray" in bad_rule.group(1), (
+        "a losing segment must be dashed, not merely --bad-coloured, so it survives greyscale"
+    )
+    assert "stroke-dasharray" not in good_rule.group(1), (
+        "a winning segment must stay solid -- if it is ALSO dashed, dash is no longer the signal "
+        "that tells the two outcomes apart without colour"
+    )
+
+
+def test_the_chart_is_keyboard_operable_not_only_pointer_operable() -> None:
+    """The wheel-zoom and drag-to-pan `main.js` owns (#602) have a keyboard equivalent, because
+    the issue's own accessibility constraint says a new control needs one: arrow keys pan,
+    `+`/`-` zoom, `0`/`Home` reset. None of it is reachable unless `chart.js` also makes
+    `svg.curve` focusable -- a keyboard listener on an element nothing can Tab to is as
+    unreachable as no listener at all, which is why this test pins both halves rather than either
+    alone."""
+    assert re.search(r'tabindex:\s*"0"', _source("chart.js")), "svg.curve must be focusable"
+
+    main_code = _source("main.js")
+    assert '"keydown"' in main_code, "no keyboard handler for the chart's pan/zoom"
+    for key in ('"ArrowLeft"', '"ArrowRight"', '"ArrowUp"', '"ArrowDown"', '"Home"'):
+        assert key in main_code, f"the chart's keyboard controls are missing {key}"
+
+
 def test_no_client_module_can_write_markup() -> None:
     """No `innerHTML`, anywhere in the client.
 

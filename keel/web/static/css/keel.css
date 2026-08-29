@@ -408,6 +408,17 @@ th {
 }
 td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 1.1rem; }
 
+/* A journal row with a point on the equity curve (#602): `main.js` highlights that point on
+ * hover OR focus, and `tabindex="0"` (set in `render.js`, only on rows that have one) is what
+ * makes "focus" reachable without a mouse -- the same pairing `.tablewrap` above uses for the
+ * scroll region. The row carries no `role` change: it is not a button, nothing activates, and a
+ * screen reader announcing "chart updated" on every focus move would be exactly the alert
+ * fatigue `index.html`'s one `aria-live` region is scoped to avoid. This is for a keyboard user
+ * who can see the chart and not the mouse, not for one using a screen reader. */
+tbody tr[data-point-index] { cursor: pointer; }
+tbody tr[data-point-index]:hover,
+tbody tr[data-point-index]:focus-within { background: var(--bg); }
+
 .pill {
   display: inline-block;
   padding: 0.05rem 0.5rem;
@@ -642,6 +653,11 @@ pre.joblines {
  * the figure that carries it, `curve.net`, is in the caption underneath in words.
  */
 .chart {
+  /* `position: relative` is what anchors the cursor legend (#602): it is an HTML overlay, not an
+   * SVG one (see `chart.js`'s module note on why its text cannot live inside the viewBox-scaled
+   * `<svg>`), and an absolutely positioned child without a positioned ancestor would place itself
+   * against the page rather than against the card. */
+  position: relative;
   margin: 0 0 1rem;
   padding: 0.9rem 1.1rem;
   background: var(--card);
@@ -653,6 +669,12 @@ pre.joblines {
   width: 100%;
   height: 14rem;
   overflow: visible;
+  /* #602: wheel-zoom and drag-to-pan change the `viewBox`, both owned by `main.js` (see its own
+   * note on why -- scaling a series is arithmetic, and this file is one of the two the client
+   * performs none of). `touch-action: none` stops the browser's own pinch-zoom and scroll
+   * gestures from fighting a pointer-based pan on a touchscreen. */
+  touch-action: none;
+  cursor: crosshair;
 }
 .chart .line {
   fill: none;
@@ -670,6 +692,84 @@ pre.joblines {
 }
 .chart .dot { fill: var(--accent); opacity: 0.55; }
 .chart figcaption { margin: 0.6rem 0 0; }
+
+/* ── the cursor legend and the trade highlight (#602) ────────────────────────────────────────
+ *
+ * Every colour below is one of the tokens `tests/web/test_palette_contrast.py` already measures
+ * (`--good`, `--bad`, `--muted`, `--control-line`, `--card`, `--line`) -- no new token, so no new
+ * pair for that suite to learn. Profit and loss are never colour alone: a losing segment is also
+ * dashed and its end markers point down rather than up (`chart.js::outcomeOf`), the same
+ * ▲/▼ convention `payload.py` already uses for the figures beside the chart (#532).
+ */
+.chart .hide { display: none; }
+
+.chart .cursor-line {
+  stroke: var(--control-line);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.chart .highlight .segment {
+  fill: none;
+  stroke-width: 3;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+.chart .highlight .segment.good { stroke: var(--good); }
+.chart .highlight .segment.bad { stroke: var(--bad); stroke-dasharray: 7 5; }
+.chart .highlight .segment.neutral { stroke: var(--muted); stroke-dasharray: 2 3; }
+
+.chart .highlight .marker {
+  stroke: var(--card);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+.chart .highlight .marker.good { fill: var(--good); }
+.chart .highlight .marker.bad { fill: var(--bad); }
+.chart .highlight .marker.neutral { fill: var(--muted); }
+
+.chart .legend {
+  position: absolute;
+  top: 1.3rem;
+  right: 1.4rem;
+  max-width: 60%;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.chart .legend p { margin: 0; overflow-wrap: anywhere; }
+.chart .legend-at,
+.chart .legend-where { color: var(--muted); }
+.chart .legend-pnl.good { color: var(--good); }
+.chart .legend-pnl.bad { color: var(--bad); }
+
+.chartactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+button.chartaction {
+  background: none;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  min-height: 24px;
+}
+button.chartaction:hover,
+button.chartaction:focus-visible { color: var(--accent); border-color: var(--accent); }
 
 footer {
   border-top: 1px solid var(--line);
