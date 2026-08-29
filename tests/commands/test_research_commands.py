@@ -35,6 +35,7 @@ from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
 from keel.research import tuning as tuning_mod
+from keel.research import walkforward as wf_mod
 from keel.types import Candle, Granularity
 
 MISSING_CONFIG_NAME = "missing-config.yaml"  # never created: config degrades to the default
@@ -595,3 +596,52 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
         lowered = output.lower()
         for word in ("best", "winner", "optimal", "top-ranked"):
             assert word not in lowered, f"keel research {name} printed ranking word {word!r}"
+
+
+def test_backtest_failure_during_a_fold_is_not_a_refusal(tmp_path, monkeypatch):
+    """A `ValueError` escaping the backtest engine mid-fold must NOT become an exit-0
+    refusal.
+
+    `keel research walk-forward` catches `ValueError` to turn "no train/test window fits
+    this candle series" into a printed refusal at exit 0 (#601). That catch is deliberately
+    wrapped around `wf_mod.folds` ALONE, and this test is why. `wf_mod.walk_forward` runs
+    `backtest` twice per fold and reaches `deflate`; a `ValueError` raised in there is a
+    BUG -- a Decimal conversion, a malformed candle, `walkforward._closed_pnl`'s
+    poisoned-row guard -- and a wider catch would print it as `refused: ...` and exit 0,
+    making a genuine engine defect indistinguishable from an honest "the cached history
+    cannot answer this" AND invisible to anything downstream checking the exit code. That
+    is the one shape where #601's new contract could make a failure quieter than it was
+    before, so it is pinned rather than trusted.
+
+    The fixture reaches `walk_forward` for real: 96 bars with train 40 / test 20 is a
+    window `folds` accepts, so the narrow catch is passed cleanly and the failure happens
+    where a fold runs.
+
+    Mutation-verified: see the commit message for the restored wide catch, the failure this
+    test then produced, and the revert.
+    """
+    runner = CliRunner()
+    db = _turtle_db(tmp_path, name="wf-bug.db")
+
+    def _boom(*args, **kwargs):
+        raise ValueError("engine bug: malformed candle at bar 7")
+
+    monkeypatch.setattr(wf_mod.backtest_mod, "backtest", _boom)
+
+    result = _invoke(
+        runner, db, tmp_path,
+        "research", "walk-forward",
+        "--rule", "1", "--train-bars", "40", "--test-bars", "20",
+        "--ledger", str(tmp_path / "wf-bug-trials.jsonl"),
+    )
+
+    assert result.exit_code != 0, (
+        "a ValueError from the backtest engine exited 0 -- an engine bug is being reported "
+        f"as success: {result.output!r}"
+    )
+    assert "refused:" not in result.output, (
+        "a ValueError from the backtest engine was printed as an evidence refusal; only "
+        f"`folds` window failures may take that path: {result.output!r}"
+    )
+    assert isinstance(result.exception, ValueError), result.exception
+    assert "engine bug" in str(result.exception)

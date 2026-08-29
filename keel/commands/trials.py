@@ -573,19 +573,35 @@ def trials_walk_forward(
             test_bars=test_bars,
             step_bars=step_bars,
         )
-        report = wf_mod.walk_forward(
-            resolved.rule,
-            resolved.candles,
-            folds_bounds=folds_bounds,
-            fee_pct=resolved.fee_pct,
-        )
     except ValueError as exc:
-        # Evidence-shaped (#601): every ValueError this pair raises names a train/test
-        # window that does not fit the given candle series -- a well-formed request the
-        # cached history cannot answer, not an operator mistake. Print it and stop; no
-        # ledger rows, exit 0.
+        # Evidence-shaped (#601), and the catch is deliberately around `folds` ALONE.
+        # Every one of the seven ValueErrors `wf_mod.folds` raises names a train/test
+        # window against the available bars -- a well-formed request the cached history
+        # cannot answer, not an operator mistake. Print it and stop; no ledger rows,
+        # exit 0.
+        #
+        # ⚠️ Do NOT widen this to cover the `walk_forward` call below. That call runs the
+        # backtest engine twice per fold and reaches `deflate`; a ValueError from in
+        # there is a BUG (a Decimal conversion, a malformed candle, `_closed_pnl`'s
+        # poisoned-row guard), and swallowing it as `refused:` would exit 0 on a failure
+        # -- making a genuine defect quieter than it was before #601 touched this
+        # command, and indistinguishable from "the history cannot answer this". The one
+        # ValueError `walk_forward` raises for itself (an empty `folds_bounds`) is
+        # unreachable from here: `folds` refuses `train_bars + test_bars > n_bars` before
+        # its loop, so it never returns an empty list. If some walk_forward failure is
+        # ever genuinely evidence-shaped, give it a named exception in walkforward.py and
+        # catch THAT -- a type is a claim the callee makes about itself; a bare
+        # ValueError catch is the caller guessing on the callee's behalf, and the guess
+        # is what goes stale.
         click.echo(f"refused: {exc}")
         return
+
+    report = wf_mod.walk_forward(
+        resolved.rule,
+        resolved.candles,
+        folds_bounds=folds_bounds,
+        fee_pct=resolved.fee_pct,
+    )
 
     for line in wf_mod.render_lines(report):
         click.echo(line)
