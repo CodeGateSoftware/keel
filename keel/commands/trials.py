@@ -166,7 +166,16 @@ def trials_deflate(
     trials = trials_ledger.read_trials(_ledger_path(ledger))
     m_total, n_decisions = trials_ledger.trial_counts(trials)
     if n_decisions < 2:
-        raise click.ClickException(f"only {n_decisions} decision trials -- need >= 2")
+        # Evidence-shaped, not an operator error (#601): the ledger is readable and the
+        # question is well-formed, there is simply not yet enough recorded evidence to
+        # form a trial count for E[max SR_n]/MinBTL. A refusal is this command working,
+        # not this command failing -- print it on stdout and exit 0.
+        click.echo(
+            f"refused: only {n_decisions} decision trial(s) recorded -- need >= 2 to form "
+            "a trial count for E[max SR_n]/MinBTL; record more trials with `trials record` "
+            "and retry"
+        )
+        return
 
     click.echo("inputs")
     click.echo(f"  M (all ledger rows)      : {m_total}")
@@ -221,7 +230,13 @@ def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
     trials = trials_ledger.read_trials(_ledger_path(ledger))
     build = matrix_mod.build_matrix(trials, session=session)
     if not build.columns:
-        raise click.ClickException("no usable columns (all trials are series_missing?)")
+        # Evidence-shaped (#601): a readable, well-formed ledger with nothing to build a
+        # CSCV matrix from is a refusal, not an operator mistake -- print it and exit 0.
+        click.echo(
+            "refused: no usable columns -- every recorded trial is series_missing, so "
+            "there is no per-bar P&L to assemble a CSCV matrix from"
+        )
+        return
     for warning in build.warnings:
         click.echo(f"warning: {warning}", err=True)
     if build.refused:
@@ -369,9 +384,11 @@ def trials_monte_carlo(
 
     if mode == "trades":
         if not pnls:
-            raise click.ClickException(
-                "no closed trades in the observed backtest -- nothing to reshuffle"
-            )
+            # Evidence-shaped (#601): the rule resolved and the observed backtest ran; it
+            # simply closed nothing to resample. Print the refusal and stop -- exit 0, no
+            # ledger row, because there is nothing to diagnostic_only-record either.
+            click.echo("refused: no closed trades in the observed backtest -- nothing to reshuffle")
+            return
         resampled = mc_mod.reshuffle(pnls, paths, seed)
     else:
         if not resolved.candles:
@@ -563,7 +580,12 @@ def trials_walk_forward(
             fee_pct=resolved.fee_pct,
         )
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        # Evidence-shaped (#601): every ValueError this pair raises names a train/test
+        # window that does not fit the given candle series -- a well-formed request the
+        # cached history cannot answer, not an operator mistake. Print it and stop; no
+        # ledger rows, exit 0.
+        click.echo(f"refused: {exc}")
+        return
 
     for line in wf_mod.render_lines(report):
         click.echo(line)
