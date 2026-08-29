@@ -32,7 +32,7 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
-from keel.data.db import connect, migrate
+from keel.data.db import SCHEMA_VERSION, connect, migrate
 from keel.data.repository import Repository
 from keel.research import ledger as trials_ledger
 from keel.research import tuning as tuning_mod
@@ -365,6 +365,124 @@ def test_pooled_review_never_writes_to_the_profile_dbs(tmp_path):
 
     after = (_file_hash(db1), _file_hash(db2))
     assert before == after, "keel research pooled-review wrote to a profile db it must only read"
+
+
+# == #610: significance/factors/independence must be as read-only as pooled-review =============
+
+
+def _stamp_schema_version(db: Path, version: int) -> None:
+    """Rewrite the stored schema_version directly, bypassing `migrate()` -- the one way to
+    build a database that CLAIMS an older version than its tables actually match, without
+    hand-maintaining a second, older copy of the schema. The tables are today's; only the
+    claimed version is stale, which is exactly the field the new read-only seam reads."""
+    conn = connect(str(db))
+    conn.execute("UPDATE schema_version SET version = ?", (version,))
+    conn.commit()
+    conn.close()
+
+
+def test_significance_factors_independence_never_write_to_the_database(tmp_path):
+    """#610: these are read-only questions about a deployment, the same way `pooled-review`
+    is -- none may open it read-write or migrate it as a side effect of being asked. Same
+    mechanical pin as `test_pooled_review_never_writes_to_the_profile_dbs`: hash the file
+    before and after a real CLI invocation and require it byte-identical."""
+    sig_db = tmp_path / "sig-ro.db"
+    conn = connect(str(sig_db))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_trade_outcome(
+        dict(
+            product_id="BTC-USD", rule_name="turtle_breakout", is_dca=False,
+            opened_at=1000, closed_at=2000, qty=Decimal("1"),
+            entry_fill=Decimal("100"), exit_fill=Decimal("110"),
+            fees=Decimal("1"), pnl_net=Decimal("8"),
+        )
+    )
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    before_sig = _file_hash(sig_db)
+    result = _invoke(
+        CliRunner(), sig_db, tmp_path, "research", "significance", "--from", "deployment"
+    )
+    assert result.exit_code == 0, result.output
+    assert _file_hash(sig_db) == before_sig, "significance --from deployment wrote to the db"
+
+    fac_db = tmp_path / "factors-ro.db"
+    conn = connect(str(fac_db))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _factor_candles(400, seed=7))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    before_fac = _file_hash(fac_db)
+    result = _invoke(
+        CliRunner(), fac_db, tmp_path,
+        "research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY",
+    )
+    assert result.exit_code == 0, result.output
+    assert _file_hash(fac_db) == before_fac, "factors wrote to the db"
+
+    indep_db = tmp_path / "independence-ro.db"
+    conn = connect(str(indep_db))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule("turtle_breakout", _TURTLE_A_PARAMS, status="candidate", now_ts=1_800_000_000)
+    repo.insert_rule("turtle_breakout", _TURTLE_B_PARAMS, status="candidate", now_ts=1_800_000_000)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _sawtooth_candles(96))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    before_indep = _file_hash(indep_db)
+    result = _invoke(
+        CliRunner(), indep_db, tmp_path,
+        "research", "independence", "--rule-a", "1", "--rule-b", "2",
+    )
+    assert result.exit_code == 0, result.output
+    assert _file_hash(indep_db) == before_indep, "independence wrote to the db"
+
+
+def test_research_readonly_commands_refuse_a_database_older_than_this_binary(tmp_path):
+    """#610, decision 1: a database whose stored schema predates what this binary expects is
+    an OPERATOR error (run a command that writes, or upgrade), not a question a read-only
+    command can answer honestly by silently reading a schema it was never tested against.
+    Built by migrating to the current version and then rewriting the stamp down by one --
+    the tables match today's shape; only the claimed version is stale, which is exactly the
+    field under test."""
+    db = tmp_path / "stale.db"
+    conn = connect(str(db))
+    migrate(conn)
+    conn.close()
+    _stamp_schema_version(db, SCHEMA_VERSION - 1)
+
+    for args in (
+        ["research", "significance", "--from", "deployment"],
+        ["research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY"],
+        ["research", "independence", "--rule-a", "1", "--rule-b", "2"],
+    ):
+        result = _invoke(CliRunner(), db, tmp_path, *args)
+        assert result.exit_code != 0, f"{args} should refuse a stale-schema database"
+        assert "schema" in result.output.lower(), result.output
+        assert str(SCHEMA_VERSION) in result.output, result.output
+
+
+def test_research_readonly_commands_refuse_a_missing_database(tmp_path):
+    """Mirrors the MCP read-only surface's own rule (`keel/mcp/tools.py::_open_readonly_repo`):
+    a read-only view must never let `sqlite3.connect` CREATE the file it cannot find, which
+    would make a typo in `--db` the first write this surface has ever made.
+
+    The message is pinned, not just the exit code and the absent file: `mode=ro` against a
+    missing path already refuses on its own (sqlite3 raises `OperationalError: unable to
+    open database file` even with no explicit check), so a test that stopped at "non-zero
+    exit, file absent" would pass unchanged if the seam's own existence check -- which turns
+    that into a command a caller can actually act on -- were deleted.
+    """
+    missing = tmp_path / "does-not-exist.db"
+    result = _invoke(
+        CliRunner(), missing, tmp_path, "research", "significance", "--from", "deployment"
+    )
+    assert result.exit_code != 0
+    assert not missing.exists(), "a read-only command must never create the database file"
+    assert "no database at" in result.output, result.output
+    assert "read-only" in result.output, result.output
 
 
 # == throughput ==================================================================================

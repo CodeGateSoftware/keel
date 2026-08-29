@@ -24,8 +24,10 @@ do, runs against a real `--db` temp path instead of patching at all.
 from __future__ import annotations
 
 import functools
+import sqlite3
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import click
@@ -33,7 +35,7 @@ from keel_core import paths as _paths
 from keel_core.telemetry import bind_venue, current_venue
 
 from keel.config import Config, load_config
-from keel.data.db import connect, migrate
+from keel.data.db import SCHEMA_VERSION, connect, migrate
 from keel.data.repository import Repository
 from keel.execution.guards import DEFAULT_VENUE
 from keel.logging_setup import configure_logging
@@ -129,6 +131,63 @@ def _require_interactive_confirmation(action: str, detail: str) -> None:
 def _open_repo(ctx: click.Context) -> Repository:
     conn = connect(ctx.obj["db_path"])
     migrate(conn)
+    return Repository(conn)
+
+
+def _stored_schema_version(conn: sqlite3.Connection) -> int:
+    """The stamped `schema_version`, or 0 when the table is absent -- read WITHOUT assuming
+    the table exists, because a read-only connection cannot create it the way `migrate()`
+    would. `conn.row_factory` need not be `sqlite3.Row` for this one query."""
+    present = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    if present is None:
+        return 0
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _open_repo_ro(ctx: click.Context) -> Repository:
+    """A read-only repository seam (#610): for a command that only ANSWERS a question about a
+    deployment's state, `_open_repo`'s read-write `migrate(conn)` is the wrong default twice
+    over -- it takes a write lock against a database the agent may be mid-cycle on, and it can
+    silently migrate the file's schema as a side effect of being asked, rather than of an
+    operator choosing to. `keel research pooled-review` already does this correctly
+    (`_connect_ro` in `keel/commands/research.py`); this is that same `mode=ro` URI shape,
+    promoted to a shared seam so `significance --from deployment`, `factors` and
+    `independence` -- the file's three OTHER readers of `orders`/`trade_outcomes` -- stop
+    being the odd ones out.
+
+    Two refusals, both BEFORE any data is read, because an operator error caught up front
+    is cheaper than a command that partially answers a question it cannot answer honestly:
+
+    * **Missing file.** `sqlite3.connect` happily CREATES a file it cannot find; under a
+      plain read-write connection that would make a typo in `--db` this surface's first
+      write. Checked explicitly, the same way `keel/mcp/tools.py::_open_readonly_repo` does.
+    * **Stale schema.** A database stamped below this binary's `SCHEMA_VERSION` predates
+      what the running code knows how to read correctly -- not a column `Repository` guards
+      against, but a shape of database this binary has never been tested against. That gap
+      is an OPERATOR's to close (run a command that writes, such as `keel migrate`, or run
+      an older binary) rather than a question this command can answer quietly by reading a
+      schema it does not actually understand; #601's distinction -- an operator mistake is
+      not a result the evidence produced -- settles which of those two this is.
+    """
+    db_path = ctx.obj["db_path"]
+    if not Path(db_path).exists():
+        raise click.ClickException(
+            f"no database at {db_path} -- this is a read-only command and will not create one"
+        )
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    current = _stored_schema_version(conn)
+    if current < SCHEMA_VERSION:
+        conn.close()
+        raise click.ClickException(
+            f"{db_path} is at schema version {current}, older than this binary's "
+            f"{SCHEMA_VERSION} -- this database predates the running binary. Run a command "
+            "that writes (e.g. `keel migrate`) against it first, or run a binary that "
+            "matches its version, before asking a read-only question of it."
+        )
     return Repository(conn)
 
 

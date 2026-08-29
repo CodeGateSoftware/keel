@@ -193,27 +193,29 @@ edge of 57.6 points or larger at 80% power in the first place. `render_family` p
 rather than the bare verdict, so the reader sees exactly why the answer is no, and the command
 still exits 0 — the question was well-formed and the evidence answered it honestly.
 
-## ⚠️ Which of these open your database read-write
+## Which of these open your database read-only
 
-Worth knowing before you point one of these at a live deployment, because the toolkit is not
-consistent about it and the inconsistency is not obvious from the command names.
+`keel research pooled-review`, `significance --from deployment`, `factors` and
+`independence` — the four commands on this page that read `orders`/`trade_outcomes` off a
+live deployment — all connect `mode=ro` (`sqlite3.connect(f"file:{db}?mode=ro", uri=True)`)
+and never call `migrate()`. `pooled-review` did this first, with its own `_connect_ro`;
+the other three go through the shared seam, `_open_repo_ro` in
+`keel/commands/_common.py` (#610). None of the four can take a write lock against a
+database the agent may be mid-cycle on, and none will migrate its schema as a side effect
+of being asked a question about it — unlike `_open_repo` (the read-write seam every
+*writing* command uses), which calls `migrate(conn)` and commits unconditionally.
 
-`keel research pooled-review` opens every profile database **read-only**
-(`sqlite3.connect(f"file:{db}?mode=ro", uri=True)`) and goes out of its way to do so, because
-it is designed to be pointed at live and paper ledgers on the review date.
+A database whose stored schema predates this binary's is refused outright, before any data
+is read: `this database is at schema version N, older than this binary's SCHEMA_VERSION —
+run a command that writes (e.g. keel migrate) against it first, or run a binary that
+matches its version`. That gap is an operator's to close, not a question these commands can
+answer quietly by reading a shape they were never tested against (#601's distinction: an
+operator mistake is not a result the evidence produced).
 
-`keel research significance --from deployment`, `factors` and `independence` do **not**. They
-reach their data through `_open_repo` (`keel/commands/_common.py:128-131`), which calls
-`migrate(conn)`, and `migrate` commits unconditionally (`keel/data/db.py:595`). So a
-nominally read-only research command opens the database read-write, and — if the binary you
-are running is newer than the file — will migrate its schema as a side effect of answering a
-question about it.
-
-This is pre-existing behaviour that every other read-only `keel` command shares, and WAL mode
-makes it survivable alongside a running agent. It is called out here rather than left implicit
-because this page is what invites you to run these against a deployment. **If that matters for
-your case, copy the database first and point the command at the copy.** The read-only seam is
-filed as its own issue; `pooled-review` shows what the fix looks like.
+Every OTHER read-only `keel` command (`insights`, `status`, `pnl`, `activity`, …) still opens
+through the read-write seam, same as before — #610 narrowed the fix to the `research/` module,
+where the inconsistency was sharpest (`pooled-review` beside three siblings doing the opposite
+on the same tables), and left the rest for a follow-up once this seam has a shape to extend.
 
 ## What is NOT here
 
