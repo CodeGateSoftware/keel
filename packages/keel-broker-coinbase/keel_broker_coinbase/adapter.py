@@ -104,6 +104,15 @@ def _trade_scope_refusal(exc: BaseException) -> str | None:
     ENTRY through rail 20, and require an operator at a terminal to clear it -- an outage
     manufactured out of a fact about an asset class keel does not trade.
 
+    ⚠️ **A residual this cannot see, recorded deliberately.** It only ever inspects an EXCEPTION.
+    Advanced Trade also answers HTTP 200 with `success: false` and an `error_response` for a
+    class of order errors, and `place_order` maps those to `PlaceResult(success=False)` without
+    consulting this function -- so a scope refusal that ever arrived that way would be reported
+    as an ordinary rejected order and would never refute the record. That is the design's stated
+    trade: `error_response.error` is an open enum whose values are not documented as stable, and
+    pre-classifying an unobserved body from documentation is exactly what #233 forbids. The cost
+    of missing such a refusal is one more refused order; the cost of inventing one is an outage.
+
     Shape-typed, not `isinstance`-typed: the exception is a `requests.HTTPError` raised by
     `coinbase-advanced-py`, and `requests` is a TRANSITIVE dependency this package has never
     declared. Reaching past the SDK to import it would couple the adapter to a library it does
