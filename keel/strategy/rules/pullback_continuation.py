@@ -397,6 +397,16 @@ class PullbackContinuation(Rule):
     # whole periods for the fan and one tick for the buffer -- the grid the space is
     # COUNTED at, never a record of the sampler: the #476 TPE study drew step-1 ints (on
     # the fan's grid) and continuous floats (off the buffer's).
+    #: The JSON-plain -> constructor coercions this rule needs (`Rule.decimal_params` /
+    #: `granularity_param` / `tuple_params`). This is the only rule with `tuple_params`, and
+    #: until #447 that fact was a hardcoded `if kind == "pullback_continuation"` branch inside
+    #: `agent.build_rule_from_params`: `ema_periods` and `signal_patterns` are declared as
+    #: tuples, JSON stores them as lists, and a list reaching the constructor makes the rule's
+    #: params unhashable and its `describe()` output differ from the row it was built from.
+    decimal_params = ("buffer_ticks", "trail_atr_mult", "be_roll_rr")
+    granularity_param = "granularity"
+    tuple_params = ("ema_periods", "signal_patterns")
+
     _PARAM_SPACE: tuple[ParamSpec, ...] = (
         ParamSpec("ema_fast", "int", 5, 12, Decimal(1), param="ema_periods"),
         ParamSpec("ema_mid", "int", 15, 30, Decimal(1), param="ema_periods"),

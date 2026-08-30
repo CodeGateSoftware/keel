@@ -1243,18 +1243,27 @@ def test_coerced_param_keys_names_every_param_that_arrives_as_a_string():
 
 
 def test_coerced_param_keys_covers_exactly_what_build_rule_from_params_converts():
-    """Derived from the same two tables the coercion itself reads, so a rule that gains a
+    """Derived from the same declarations the coercion itself reads, so a rule that gains a
     `Decimal` or `Granularity` field cannot be converted on the way in without also being
     published here. A kind with no coerced params at all answers with an empty set, not a
     `KeyError`.
+
+    Reads `Rule.decimal_params`/`granularity_param` off the registered CLASS since #447, where
+    the two module-level dicts this used to read moved onto the rules themselves. The property
+    is unchanged; the source of truth moved.
     """
-    for kind in agent.RULE_REGISTRY:
-        expected = set(agent._DECIMAL_PARAMS.get(kind, ()))
-        gran = agent._GRANULARITY_PARAMS.get(kind)
-        if gran is not None:
-            expected.add(gran)
+    for kind, rule_cls in agent.RULE_REGISTRY.items():
+        expected = set(rule_cls.decimal_params)
+        if rule_cls.granularity_param is not None:
+            expected.add(rule_cls.granularity_param)
         assert agent.coerced_param_keys(kind) == expected, kind
     assert agent.coerced_param_keys("not_a_real_kind") == frozenset()
+
+    # `tuple_params` is deliberately absent from this answer: a tuple param arrives as a JSON
+    # LIST, never a quoted string, and `coerced_param_keys` exists to tell `rules add` which
+    # values an operator may legitimately quote. Folding tuples in would make `rules add`
+    # accept `--params '{"ema_periods": "8"}'` as a well-typed tuple declaration.
+    assert "ema_periods" not in agent.coerced_param_keys("pullback_continuation")
 
 
 # -- loop() wrapper -----------------------------------------------------------------------------
@@ -1489,7 +1498,13 @@ def test_a_dca_owned_exit_is_recorded_as_dca_and_never_moves_the_streak(
         def describe(self):
             return {"name": self.name, "params": self.params}
 
-    agent.RULE_REGISTRY["dca"] = lambda **kw: _ExitingDca()
+    # The CLASS, not a `lambda **kw: _ExitingDca()` factory. `RULE_REGISTRY` is declared
+    # `dict[str, type[Rule]]`, and since #447 `build_rule_from_params` reads the coercion
+    # declarations (`Rule.decimal_params` and friends) off the registered class before it
+    # constructs anything -- a bare function has no such attributes, so the type annotation
+    # this test used to disregard is now load-bearing. `_ExitingDca` takes no constructor
+    # arguments and the seeded row carries empty params, so it is a drop-in.
+    agent.RULE_REGISTRY["dca"] = _ExitingDca
     try:
         repo.insert_rule("dca", {}, status="live")
         _seed_open_position(

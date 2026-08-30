@@ -1083,7 +1083,8 @@ def _json_plain(value: Any) -> Any:
     `Rule.describe()`'s `params` dict holds real `Decimal`s and tuples (constructor kwargs, not
     storage types) -- `insert_rule` round-trips `params` through plain `json.dumps`/`json.loads`
     (see `agent._build_rule`'s own docstring), so a `Decimal` here would raise `TypeError` at
-    insert time. This is the inverse of `agent._build_rule`'s `_DECIMAL_PARAMS`/tuple coercion:
+    insert time. This is the inverse of `agent._build_rule`'s coercion the other way
+    (`Rule.decimal_params`/`tuple_params`):
     `Decimal` -> `str`, tuple -> list, recursively through nested dicts/lists.
     """
     if isinstance(value, Decimal):
@@ -1460,7 +1461,7 @@ def _nonfinite_params(params: dict[str, Any]) -> list[str]:
     - a `float` param (`lookback_days`, `volume_mult`) is stored by `json.dumps` as a bare
       `Infinity` token, which is not valid JSON and which no strict reader (any consumer of
       this DB that is not Python) can parse back;
-    - a `_DECIMAL_PARAMS` param (`budget_usd`) is stored as the STRING `"Infinity"`, which is
+    - a `Rule.decimal_params` param (`budget_usd`) is stored as the STRING `"Infinity"`, which is
       perfectly valid JSON -- and that is worse, not better. It rebuilds silently into
       `Decimal('Infinity')`, which no `> 0` guard rejects and which then propagates: an
       infinite `budget_usd` yields `size_usd=Decimal('Infinity')` with nothing raising anywhere.
