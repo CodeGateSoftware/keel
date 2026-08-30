@@ -103,6 +103,27 @@ def evaluate(
             )
             continue
 
+        if not _long_shaped_ok(setup):
+            # Rail, not a quality gate, so it runs BEFORE the market-buy-class branch below --
+            # a DCA-shaped intent is exempt from the choppy/bias/kill-zone gates but not from
+            # this. Refused rather than raised, deliberately: `evaluate` runs every live rule in
+            # one loop, and a raise here would take the whole cycle down -- every well-behaved
+            # rule's entry along with it -- because one rule proposed nonsense. Skipping emits
+            # no `Signal`, so nothing reaches sizing or execution, which is the fail-closed
+            # outcome a rail owes.
+            log_event(
+                logger,
+                logging.WARNING,
+                "engine.setup_rejected",
+                rule=rule.name,
+                product=setup.product_id,
+                gate="not_long_shaped",
+                entry=setup.entry,
+                stop=setup.stop,
+                target=setup.target,
+            )
+            continue
+
         trading_gran = _trading_granularity(rule, candles_by_tf)
         trading_candles = candles_by_tf.get(trading_gran, [])
 
@@ -177,6 +198,41 @@ def evaluate(
 # ---------------------------------------------------------------------------
 # Gates
 # ---------------------------------------------------------------------------
+
+
+def _long_shaped_ok(setup: Setup) -> bool:
+    """Whether a rule's PROPOSAL has the price geometry `direction="long"` claims.
+
+    The runtime half of `Setup.direction`'s rail, and it lives here rather than on `Setup`
+    because this is the rule BOUNDARY -- the one place a `Setup` is known to be a fresh
+    proposal from `rule.detect()` rather than a reconstruction of something already held. See
+    `Setup.__post_init__` for why that distinction is load-bearing: a held long's stop ratchets
+    above its entry on the break-even roll (`exit_policy.next_stop`), so the inequality below is
+    false for exactly the positions that are winning.
+
+    The inequality is what the four shipped rules ACTUALLY guarantee, checked against them
+    rather than assumed:
+
+    - `stop < entry` STRICTLY. `PullbackContinuation`, `RsiMeanReversion` and `TurtleBreakout`
+      each gate on `stop >= entry` inside `detect()` and decline; `Dca` ships the sentinel
+      `stop=0` against a positive close. Strictness is also what makes `Setup.rr` total -- it is
+      `(target - entry) / (entry - stop)`, so `stop == entry` is a `ZeroDivisionError` waiting
+      for whichever gate reads `rr` first.
+    - `target >= entry`, NON-strictly, and the slack is `Dca`'s alone: it sets `target=entry`
+      because accumulation is not a risk-defined trade and it wants `rr` to degrade to 0 rather
+      than the field to become optional for every other rule. Tightening this to `>` would
+      refuse every DCA entry the deployment places, which is why it is stated as what the rules
+      guarantee and not as what a risk-defined trade ought to look like.
+
+    A short wearing `direction="long"` -- the case #447 asks about -- is refused on BOTH legs:
+    its stop sits above its entry and its target below.
+
+    `strategy.backtest` calls `rule.detect()` directly and does NOT route through here, so an
+    inverted proposal is still backtestable. That is deliberate and not a hole: the backtester
+    spends no money and exists precisely to characterise what a rule does, including when what
+    it does is wrong. This rail guards the path where a proposal becomes an order.
+    """
+    return setup.stop < setup.entry and setup.target >= setup.entry
 
 
 def _is_market_buy_class(setup: Setup) -> bool:

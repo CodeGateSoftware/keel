@@ -341,12 +341,17 @@ class TestMultipleRules:
             context={},
             ts=_uptrend_candles()[-1].ts,
         )
+        # Long-SHAPED but a hopeless reward:risk (rr = 1/10). It used to be `target=95`, i.e.
+        # a target BELOW the entry, which #447's `_long_shaped_ok` rail now refuses before the
+        # kill-zone gate ever runs -- so the test would still have passed while silently no
+        # longer exercising the gate it was written for. Kept above the entry so the rejection
+        # under test is still the R:R floor's.
         bad_setup = Setup(
             product_id="ETH-USD",
             direction="long",
             entry=Decimal("100"),
             stop=Decimal("90"),
-            target=Decimal("95"),
+            target=Decimal("101"),
             context={},
             ts=_uptrend_candles()[-1].ts,
         )
@@ -388,12 +393,14 @@ class TestSignalPersistence:
         conn = connect(":memory:")
         migrate(conn)
         repo = Repository(conn)
+        # `target=101`, not the old `95`: long-shaped, so the rejection this pins is still the
+        # choppy/kill-zone gate's and not #447's `_long_shaped_ok` rail arriving first.
         setup = Setup(
             product_id="BTC-USD",
             direction="long",
             entry=Decimal("100"),
             stop=Decimal("90"),
-            target=Decimal("95"),
+            target=Decimal("101"),
             context={},
             ts=_choppy_candles()[-1].ts,
         )
