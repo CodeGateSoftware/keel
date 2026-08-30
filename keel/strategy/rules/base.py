@@ -48,6 +48,43 @@ class Setup:
     context: dict[str, Any]
     ts: int
 
+    def __post_init__(self) -> None:
+        """Enforce at RUNTIME the one thing `direction: Literal["long"]` only asserts statically.
+
+        `Literal["long"]` is a promise to mypy and nothing else. A rule -- a first-party one
+        edited carelessly, or a foreign one, since `RULE_REGISTRY` is a plain dict any caller can
+        write to -- could construct `Setup(direction="short", ...)` and nothing raised (#447).
+
+        It has never mattered, and this does not exist because it started to. Four independent
+        layers already stand behind it: `strategy.engine.evaluate` builds every `Signal` with
+        `side=Side.BUY` unconditionally and never reads `direction` for anything but a diagnostic
+        context dict; `guards.check` rails 18 and 19 refuse anything that is not a spot product
+        settling in a configured currency, whatever produced the intent; and no sizing path has a
+        short branch to take. What was missing is that "a rule cannot go short" was an
+        ASSUMPTION about four layers rather than a checked fact about one, and #447 asked for it
+        by test rather than assumption. This is the cheapest place to make it a fact: the type
+        already says it, so nothing shipped can trip it, and a rule that tries fails inside its
+        own `detect()` rather than emitting an intent for four other layers to catch.
+
+        **The price ordering is deliberately NOT checked here, and that is a correction to
+        #447's analysis rather than an omission.** `stop < entry < target` is what a rule's
+        PROPOSAL guarantees, and `strategy.engine` enforces exactly that where a rule proposes
+        (`_long_shaped_ok`). `Setup` is a wider type than a proposal: `agent._handle_exits`
+        rebuilds one for a HELD position, whose stop is `open_stop` -- a stop that
+        `exit_policy.next_stop` ratchets strictly upward, `max(stop, entry)` on the break-even
+        roll and higher still on the trail. A winning trailed long therefore has `stop > entry`
+        as its normal, intended state, and its reconstruction sets `target=entry` besides.
+        Enforcing the proposal's inequality on the type would raise on the live exit path for
+        precisely the trades that are working, which is the worst possible place to be wrong.
+        `Dca` is a second, independent reason: it ships `stop=0`/`target=entry` sentinels because
+        accumulation is not a risk-defined trade.
+        """
+        if self.direction != "long":
+            raise ValueError(
+                f"Setup.direction must be 'long', got {self.direction!r}. keel is long-only "
+                f"spot (PRD section 2); there is no short path in sizing, execution or the rails."
+            )
+
     @property
     def rr(self) -> Decimal:
         """Reward:risk ratio, e.g. entry=100, stop=90, target=120 -> rr=2."""
