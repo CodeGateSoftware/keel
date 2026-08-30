@@ -18,6 +18,12 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-08
 
+- [`2026-08-30-slippage-cap-options.md`](2026-08-30-slippage-cap-options.md) — All three of
+  #523's options for the 50 bp slippage cap, measured on one cohort by one method: raising the
+  cap costs 0.3%–24.0% of net PF, participation scaling makes results 0.9%–38.6% BETTER at this
+  deployment's real $50 clip (a flattery, not a correction), and a $5M admission floor changes
+  no number it keeps while deleting 15 products and live PAXG. Decides nothing · driver
+  `2026-08-30-slippage-cap-options.py`
 - [`2026-08-27-external-strategy-evaluation-hazard.md`](2026-08-27-external-strategy-evaluation-hazard.md)
   — No new measurement: the fill-model hazard in externally-sourced strategies (#529) — the four
   questions to answer before porting one (fill model, cost regime, sample size, capability) and
