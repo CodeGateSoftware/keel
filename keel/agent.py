@@ -35,10 +35,14 @@ tuples (`PullbackContinuation.granularity`/`buffer_ticks`/`ema_periods`,
 `RsiMeanReversion.timeframe`/its several `Decimal` fields). `RULE_REGISTRY` +
 `build_rule_from_params` are **the** coercion boundary: a caller (this module, `rules backtest`,
 `rules add`) only ever deals in real `Rule` instances, never in raw JSON dicts. `_build_rule` is
-the thin DB-row adapter over it. There is deliberately only ONE such table
-(`_DECIMAL_PARAMS`): a second copy living next to whichever command needed it would drift from
-this one silently, and the symptom of the drift is a `Decimal`/`float` `TypeError` raised deep
-inside a rule's arithmetic, at backtest or cycle time, far from the code that caused it.
+the thin DB-row adapter over it. WHAT to coerce is declared by each rule class itself
+(`Rule.decimal_params`/`granularity_param`/`tuple_params`, #447); this module owns only the
+single place it is DONE. Both halves of that split exist to stop the same drift: one copy of the
+conversion, so a command that grew its own would not disagree with this one, and one home for
+the declaration, so a rule that gains a `Decimal` field cannot leave a table in another file
+behind. The symptom either drift produces is identical and is why it is worth two rules to
+prevent -- a `Decimal`/`float` `TypeError` raised deep inside a rule's own arithmetic, at
+backtest or cycle time, far from the code that caused it.
 
 **Confirm mode places via a caller-supplied `confirm_fn`.** `run_once`/`loop` take an optional
 `confirm_fn`, which `executor.execute` calls with the broker preview. With `confirm_fn=None` --
@@ -127,33 +131,15 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     "turtle_breakout": TurtleBreakout,
 }
 
-# Constructor kwargs that must be coerced back from JSON-plain (str) to `Decimal`, per kind.
-_DECIMAL_PARAMS: dict[str, tuple[str, ...]] = {
-    "pullback_continuation": ("buffer_ticks", "trail_atr_mult", "be_roll_rr"),
-    "rsi_meanrev": (
-        "atr_mult",
-        "fixed_stop_pct",
-        "fixed_rr",
-        "level_tolerance",
-        "support_proximity_pct",
-        "trail_atr_mult",
-        "be_roll_rr",
-    ),
-    "dca": ("budget_usd", "dip_bonus_pct"),
-    "turtle_breakout": ("atr_stop_mult", "target_rr"),
-}
-
-# The constructor kwarg holding a `Granularity`, stored as its `.value` string, per kind.
-# `turtle_breakout`'s entry is what lets the hourly evidence profile (#337) store hourly rows:
-# without it, a `granularity` in a turtle row's params would reach the constructor as the
-# STRING "ONE_HOUR" and `isinstance(value, Granularity)` lookups (`_entry_gate_granularity`,
-# `engine._trading_granularity`) would miss it, silently re-gating the rule on the coarsest
-# configured granularity while it kept deciding on daily candles.
-_GRANULARITY_PARAMS: dict[str, str] = {
-    "pullback_continuation": "granularity",
-    "rsi_meanrev": "timeframe",
-    "turtle_breakout": "granularity",
-}
+# The per-kind coercion tables that used to live here -- `_DECIMAL_PARAMS`, `_GRANULARITY_PARAMS`
+# and a hardcoded `if kind == "pullback_continuation"` tuple branch inside the function below --
+# are gone as of #447. They now live ON THE RULE CLASSES as `Rule.decimal_params`,
+# `Rule.granularity_param` and `Rule.tuple_params`, beside `param_space()` and `promotion_class`,
+# which are the other two facts about a rule that only the rule knows. See `Rule`'s own comments
+# for why: a table keyed by kind in this file meant that adding a `Decimal` parameter to a rule
+# required editing a different module that nothing forced you to find, and forgetting made no
+# noise until a `Decimal`/`float` `TypeError` surfaced mid-cycle inside the rule's arithmetic.
+# `build_rule_from_params` below is still THE single boundary; what changed is where it reads.
 
 
 def coerced_param_keys(kind: str) -> frozenset[str]:
@@ -164,10 +150,18 @@ def coerced_param_keys(kind: str) -> frozenset[str]:
     (a `Decimal`) and wrong for `oversold` (a `float`), and only these tables know which is
     which. Anything not listed here reaches its constructor exactly as JSON produced it.
     """
-    keys = set(_DECIMAL_PARAMS.get(kind, ()))
-    gran_key = _GRANULARITY_PARAMS.get(kind)
-    if gran_key is not None:
-        keys.add(gran_key)
+    rule_cls = RULE_REGISTRY.get(kind)
+    if rule_cls is None:
+        # An unknown kind has no declaration to read, so the honest answer is "nothing is
+        # quotable" rather than an exception. Preserved deliberately from the dict-lookup era
+        # (`_DECIMAL_PARAMS.get(kind, ())`): every caller already checks `RULE_REGISTRY` and
+        # reports the unknown kind itself, with a message naming the known kinds, and raising
+        # here would replace those messages with a worse one from further away.
+        return frozenset()
+
+    keys = set(rule_cls.decimal_params)
+    if rule_cls.granularity_param is not None:
+        keys.add(rule_cls.granularity_param)
     return frozenset(keys)
 
 
@@ -198,19 +192,17 @@ def build_rule_from_params(kind: str, params: dict[str, Any]) -> Rule:
 
     kwargs = dict(params)
 
-    for key in _DECIMAL_PARAMS.get(kind, ()):
+    for key in rule_cls.decimal_params:
         if key in kwargs and kwargs[key] is not None:
             kwargs[key] = Decimal(str(kwargs[key]))
 
-    gran_key = _GRANULARITY_PARAMS.get(kind)
+    gran_key = rule_cls.granularity_param
     if gran_key is not None and gran_key in kwargs:
         kwargs[gran_key] = Granularity(kwargs[gran_key])
 
-    if kind == "pullback_continuation":
-        if "ema_periods" in kwargs:
-            kwargs["ema_periods"] = tuple(kwargs["ema_periods"])
-        if "signal_patterns" in kwargs:
-            kwargs["signal_patterns"] = tuple(kwargs["signal_patterns"])
+    for key in rule_cls.tuple_params:
+        if key in kwargs and kwargs[key] is not None:
+            kwargs[key] = tuple(kwargs[key])
 
     return rule_cls(**kwargs)
 

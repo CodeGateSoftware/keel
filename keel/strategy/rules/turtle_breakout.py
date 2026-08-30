@@ -122,6 +122,12 @@ class TurtleBreakout(Rule):
 
     promotion_class = "trend_follow"
 
+    #: The JSON-plain -> constructor coercions this rule needs (`Rule.decimal_params` /
+    #: `Rule.granularity_param`). `granularity` is the persisted knob the hourly evidence
+    #: profile (#337) turns, so its declaration is load-bearing rather than decorative.
+    decimal_params = ("atr_stop_mult", "target_rr")
+    granularity_param = "granularity"
+
     # Per-parameter docstrings, AT THE CLASS (issue #390 C4 / PRD O8's parameter-level
     # requirement): the single source `keel.commands.rules.describe_params` renders by
     # introspection, so the add-form's per-field help and the ledger's detail view can never

@@ -100,6 +100,27 @@ class RsiMeanReversion(Rule):
     # step is the grid the space is COUNTED at, never a record of what that sampler drew.
     # `ClassVar` keeps the dataclass machinery from mistaking this for a field, exactly as
     # `PARAM_DOCS` above does.
+    #: The JSON-plain -> constructor coercions this rule needs (`Rule.decimal_params` /
+    #: `Rule.granularity_param`). Spelled `ClassVar` for the reason `_PARAM_SPACE` and
+    #: `PARAM_DOCS` are: this is the one rule that is a dataclass, and an unadorned annotation
+    #: here would become a constructor FIELD -- a `decimal_params=` kwarg on the rule, which
+    #: `describe()` would then persist into `rules.params`, and `build_rule_from_params` would
+    #: hand straight back to the constructor. The base class's declarations are plain
+    #: annotations on a non-dataclass ABC and so are never collected as fields.
+    decimal_params: ClassVar[tuple[str, ...]] = (
+        "atr_mult",
+        "fixed_stop_pct",
+        "fixed_rr",
+        "level_tolerance",
+        "support_proximity_pct",
+        "trail_atr_mult",
+        "be_roll_rr",
+    )
+    #: Named `timeframe` rather than `granularity`: this rule's timeframe kwarg has always been
+    #: spelled differently from the other two, which is exactly why the mapping has to be a
+    #: DECLARATION and cannot be a convention over a fixed name.
+    granularity_param: ClassVar[str | None] = "timeframe"
+
     _PARAM_SPACE: ClassVar[tuple[ParamSpec, ...]] = (
         ParamSpec("oversold", "float", 15.0, 30.0, Decimal(5)),
         ParamSpec("overbought", "float", 70.0, 85.0, Decimal(5)),

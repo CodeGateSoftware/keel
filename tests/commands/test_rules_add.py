@@ -135,7 +135,8 @@ def test_json_numbers_land_as_the_decimals_the_rule_expects(tmp_path, valid_conf
     JSON has no `Decimal`: `--params '{"atr_stop_mult": 2.5}'` arrives as a float, while
     `TurtleBreakout` computes stops with `Decimal` arithmetic (mixing the two raises
     `TypeError` mid-backtest). The stored row must stay JSON-plain, and the rebuilt rule must
-    hold `Decimal`s -- via the SAME `_DECIMAL_PARAMS` table `agent._build_rule` uses, so the
+    hold `Decimal`s -- via the SAME `Rule.decimal_params` declaration `agent._build_rule`
+    reads, so the
     two can never drift.
     """
     repo = _repo(tmp_path)
@@ -370,7 +371,7 @@ def test_the_non_finite_refusal_states_the_reason_that_is_true_for_that_param(
     own worked example teaches the operator something false.
 
     A FLOAT param stores as a bare `Infinity` token, which really is unparseable by a strict
-    JSON reader. A `_DECIMAL_PARAMS` param stores as the STRING `"Infinity"` -- perfectly valid
+    JSON reader. A `Rule.decimal_params` param stores as the STRING `"Infinity"` -- perfectly valid
     JSON, which is worse rather than better: it round-trips silently into an infinite `Decimal`
     that no `<= 0` guard rejects, so `budget_usd: Infinity` yields `size_usd=Decimal('Infinity')`
     without anything raising at all.

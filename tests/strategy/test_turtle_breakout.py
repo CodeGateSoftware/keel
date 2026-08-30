@@ -174,7 +174,7 @@ class TestDeclaredGranularity:
     _trading_granularity`, `agent._entry_gate_granularity`, `backtest._rule_trading_tf` -- so
     an hourly turtle requires the declaration itself to be a param, persisted the way
     `RsiMeanReversion.timeframe` is (its `.value` string inside `params`, coerced back by
-    `agent._GRANULARITY_PARAMS`). `PullbackContinuation` is the counter-example this must not
+    `TurtleBreakout.granularity_param`). `PullbackContinuation` is the counter-example this must not
     copy: it accepts `granularity` but does NOT persist it, so `rules add` refuses it outright
     rather than silently rebuild the rule at the default on a different candle series.
     """

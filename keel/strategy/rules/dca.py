@@ -49,6 +49,11 @@ class Dca(Rule):
         ),
     }
 
+    #: The JSON-plain -> constructor coercions this rule needs (`Rule.decimal_params`). No
+    #: `granularity_param`: DCA decides on daily candles unconditionally, so there is no
+    #: timeframe knob to persist and nothing to convert back.
+    decimal_params = ("budget_usd", "dip_bonus_pct")
+
     def __init__(
         self,
         product_id: str,

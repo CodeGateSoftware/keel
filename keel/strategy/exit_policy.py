@@ -104,7 +104,8 @@ def _as_decimal(value: object) -> Decimal | None:
     """Coerce a param value to `Decimal`, or `None` for `None`.
 
     Rules constructed in Python carry real `Decimal`s already; rows rebuilt through
-    `agent.build_rule_from_params` arrive coerced (the knobs are in `_DECIMAL_PARAMS`);
+    `agent.build_rule_from_params` arrive coerced (the knobs are in the rule's own
+    `Rule.decimal_params` declaration);
     this defense-in-depth keeps a hand-built rule from raising mid-backtest on a value
     that was always meant to be a number.
     """

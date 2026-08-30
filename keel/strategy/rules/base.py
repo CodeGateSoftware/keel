@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from keel.types import Candle, Granularity, Side
 
@@ -233,6 +233,43 @@ class Rule(ABC):
     product_id: str
     promotion_class: str = "default"
     rule_id: int | None = None
+    #: The constructor kwargs whose stored form is a JSON string and whose real type is
+    #: `Decimal` -- `agent.build_rule_from_params` reads this to convert them back on the way
+    #: in. Declared HERE, on the class, for the same reason `param_space()` and
+    #: `promotion_class` are: it is a fact about the rule, and a rule is the only thing that
+    #: knows it. It lived until #447 as `agent._DECIMAL_PARAMS`, a module-level dict keyed by
+    #: kind, which meant adding a `Decimal` parameter to a rule required editing a table in a
+    #: DIFFERENT FILE that nothing forced you to find. Forgetting made no noise: `params`
+    #: round-trips through `json.dumps`, so the value arrives at the constructor as the STRING
+    #: `"1.5"`, is stored unconverted, and the first symptom is a `Decimal`/`float` `TypeError`
+    #: raised deep inside the rule's own arithmetic -- mid-cycle on the live path, or
+    #: mid-backtest, far from the declaration that caused it. On the class the declaration sits
+    #: beside the field it describes, and `tests/strategy/test_rule_contract.py` checks it
+    #: against the constructor's own annotations, so the drift is a failing test rather than a
+    #: production incident.
+    #:
+    #: Read off the CLASS, never an instance: `build_rule_from_params` needs to know how to
+    #: coerce the kwargs BEFORE it has an instance to ask. That is why these are class
+    #: attributes and not the method `param_space()` is.
+    decimal_params: ClassVar[tuple[str, ...]] = ()
+    #: The single constructor kwarg holding a `Granularity`, stored as its `.value` string, or
+    #: `None` for a rule that has none (`Dca` decides on daily candles unconditionally).
+    #: `TurtleBreakout`'s is what lets the hourly evidence profile (#337) store hourly rows:
+    #: without the declaration a `granularity` in a stored turtle row would reach the
+    #: constructor as the STRING `"ONE_HOUR"`, and the `isinstance(value, Granularity)` lookups
+    #: (`_entry_gate_granularity`, `engine._trading_granularity`) would miss it -- silently
+    #: re-gating the rule on the coarsest configured granularity while it kept deciding on
+    #: daily candles. A rule with two granularity kwargs has no way to say so here; none has
+    #: ever wanted one, and inventing the plural now would be a shape with no user.
+    granularity_param: ClassVar[str | None] = None
+    #: The constructor kwargs whose stored form is a JSON list and whose real type is a tuple.
+    #: Until #447 this was not a table at all but a literal `if kind == "pullback_continuation"`
+    #: branch inside `build_rule_from_params` -- the same contract as the two above, expressed
+    #: as a hardcoded special case for one rule, which is the form drift takes when a table is
+    #: not written down. Deliberately NOT part of `agent.coerced_param_keys`: a tuple param
+    #: arrives as a LIST, not a quoted string, and that function answers a narrower question
+    #: (which values an operator may legitimately quote in `rules add --params`).
+    tuple_params: ClassVar[tuple[str, ...]] = ()
     #: Why the last `detect()` call declined, or `None` if it fired (or never recorded one).
     #: `strategy.engine.evaluate` merges it into the `engine.no_signal` event it already emits,
     #: so a cycle reporting `signals=0` can say whether price was 1% or 40% off the trigger.
