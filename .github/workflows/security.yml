@@ -17,11 +17,46 @@
 # pushes) without gating merges.
 name: security
 
+# ── WHY THIS SKIPS DOCUMENTATION, AND WHY `ci.yml` DELIBERATELY DOES NOT (#644) ──────────────
+# This workflow reads no documentation, so a docs-only change can produce no signal from it and
+# the run is pure cost. Seven docs-only pull requests merged on 2026-08-30/31 fired it for
+# nothing.
+#
+# ⚠️ DO NOT COPY THIS BLOCK INTO `ci.yml`. keel's documentation is UNDER TEST, on purpose, and
+# `ci.yml` is what runs those tests:
+#
+#   * `tests/test_python_floor.py` reads README.md, README.ar.md and docs/desktop-install.md and
+#     fails when they disagree with the RELEASE's `requires-python`. It exists because five
+#     places said 3.11 while the wheels required 3.14 (#595/#607).
+#   * `tests/test_doc_links.py` pins the documented `SHA256SUMS-*` filenames against what
+#     `release.yml` actually emits -- the docs promised one file, the workflow shipped three
+#     (#605/#618).
+#
+# A docs-only pull request is the ONLY kind those pins are for. Filtering docs out of `ci.yml`
+# would disable them on exactly the changes they were built to catch.
+#
+# SAFE HERE for two independent reasons: `main` carries no branch protection, so no check is
+# "required" and a skipped run cannot leave a pull request permanently unmergeable; and
+# `paths-ignore` applies only to `push`/`pull_request` -- `schedule` fires regardless, so the
+# weekly cron below re-scans everything within seven days even on a pathological miss.
+#
+# `docs/**` sweeps up the experiment drivers and ledgers under `docs/experiments/`. Correct
+# here, since this workflow reads none of it; NOT correct for `ci.yml`, where
+# `docs/experiments/trials-ledger.jsonl` is a hash-chained artifact the research tests reason
+# about.
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE"
   schedule:
     - cron: "23 4 * * 1"
 
