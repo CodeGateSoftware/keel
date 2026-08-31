@@ -87,7 +87,11 @@ table). Site: #117 (roadmap page), #120 (ADR docs sync).
 - **Mobile-first PWA pass** — responsive redesign (bottom nav, ≥44px targets), install
   prompt, offline shell. The phone's honest role is command surface — above all
   **approve/deny in confirm mode**: the ceremony's remote desk.
-- **Web Push from the engine** — VAPID, direct; the service-worker groundwork already ships.
+- **Web Push from the engine** — VAPID, direct. Greenfield, not groundwork (corrected
+  2026-08-31): the service worker ships for offline/manifest only — it has no push
+  handler, no subscription endpoint, no payload encryption (RFC 8291), and the engine has
+  no VAPID key management. All of that is new work. Prerequisite: the remote-exposure
+  security pass (#648) — nothing remote ships before it.
 - **The one-thumb ceremony card** — confirm-mode approval as a dedicated card, not a
   scaled-down table. v1 fields are only what exists today (fee basis at the order's clip
   size, purification liability, trigger rationale); a spread vital sign arrives only with
