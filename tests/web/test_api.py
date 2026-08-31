@@ -733,6 +733,7 @@ def test_a_credential_less_dev_venue_stays_not_tradeable_even_with_a_confirmed_r
             confirmed_ts=1_700_000_000,
             refuted_ts=None,
             refuted_reason=None,
+            credential_fingerprint=None,
         )
     )
     conn.commit()

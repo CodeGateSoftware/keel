@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 from typing import Any
+from unittest import mock
 
 import pytest
 from keel_core.products import parse_spot_product_id
@@ -1813,6 +1814,123 @@ def test_rail20_violation_names_the_attest_command() -> None:
     violation = next(v for v in result.violations if v.startswith("trade_scope"))
     assert "keel scope attest --trading" in violation
     assert "coinbase" in violation
+
+
+# -- rail 20's #633 fingerprint check ------------------------------------------------------------
+#
+# The record's `may_place_live_entry` already carries the fingerprint policy (fully exercised in
+# `tests/test_trade_scope_record.py`); these tests are about the RAIL -- that it resolves and
+# passes the CURRENT fingerprint through correctly, and that a mismatch gets its own distinct
+# message rather than collapsing into "never attested" (#624's exact failure).
+
+_FP_RECORDED = "a" * 32
+_FP_CURRENT = "b" * 32
+
+
+def test_rail20_vetoes_on_a_credential_mismatch_with_the_new_message() -> None:
+    """THE #633 PIN. A CONFIRMED record -- the strongest state-machine answer there is -- is
+    still vetoed once its recorded fingerprint disagrees with the current credential, and the
+    violation must be the NEW wording, not the pre-existing "never attested" one."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_CURRENT):
+        result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" in _keys(result)
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "different credential" in violation.lower()
+    assert "never attested" not in violation.lower(), (
+        "a credential-mismatch veto must not read as 'never attested' -- that is precisely the "
+        "#624 collapse this message exists to avoid"
+    )
+
+
+def test_rail20_mismatch_advises_reattesting() -> None:
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_CURRENT):
+        result = check(_intent(), repo, _config(), NOW_TS)
+
+    violation = next(v for v in result.violations if v.startswith("trade_scope"))
+    assert "keel scope attest --trading --venue coinbase" in violation
+
+
+def test_rail20_null_recorded_fingerprint_does_not_veto_even_with_a_resolved_current_one() -> None:
+    """The v14-backfill shape, driven through the rail: no fingerprint was ever recorded, so
+    there is nothing for the current one to disagree with -- must not veto no matter what the
+    current credential resolves to."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=None
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_CURRENT):
+        result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_unresolvable_current_fingerprint_does_not_veto_a_recorded_one() -> None:
+    """A recorded fingerprint plus an UNRESOLVABLE current one (locked keychain, unreadable
+    `.env`) is `CREDENTIAL_UNREADABLE`, not a mismatch -- a fact about the observer, not the
+    credential, and must not take a working deployment off the market."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=None):
+        result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_matching_fingerprint_does_not_veto() -> None:
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_RECORDED):
+        result = check(_intent(), repo, _config(), NOW_TS)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_mismatch_stays_inert_on_a_sell() -> None:
+    """Entries-only, unchanged by #633: a mismatch is a fact about the credential, not the
+    position, and must not strand an exit."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+    sell_intent = _intent(side=Side.SELL, stop=None, rule_kind="target_harvest")
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_CURRENT):
+        result = check(sell_intent, repo, _config(), NOW_TS)
+
+    assert "trade_scope" not in _keys(result)
+
+
+def test_rail20_mismatch_stays_inert_in_paper_mode() -> None:
+    """Paper has no live account and no live credential to mismatch against -- LIVE_STATE_RAILS
+    skips it exactly as it does the rest of rail 20."""
+    repo = _repo_no_trade_scope()
+    attest_trade_scope(
+        repo, now_ts=NOW_TS, state=TradeScopeState.CONFIRMED, credential_fingerprint=_FP_RECORDED
+    )
+
+    with mock.patch.object(guards, "current_credential_fingerprint", return_value=_FP_CURRENT):
+        result = check(_intent(), repo, _config(), NOW_TS, offline=True)
+
+    assert "trade_scope" not in _keys(result)
+    assert "trade_scope" in result.skipped_rails
 
 
 # -- `_asset` and the history walk are total ---------------------------------------------------

@@ -112,6 +112,17 @@ like rails 11/16/17 -- existing holdings are already ours, and vetoing an EXIT o
 the credential would strand a position that wanted out. Listed in `LIVE_STATE_RAILS`: paper has
 no live account to verify a credential's trade scope against, so it is skipped there, and the
 skip is recorded like rails 13/17's.
+
+**#633: the record can now outlive the credential it was collected under, and this rail is where
+that gets caught.** A `CONFIRMED` or `ATTESTED`-for-`TRADING` record proves nothing about a
+credential the operator has since rotated -- so this rail also resolves the CURRENT credential's
+fingerprint (`keel_core.credential_identity.current_credential_fingerprint`, the bound venue's
+declared identifier env name) and hands it to `may_place_live_entry`, which withdraws permission
+when the record's fingerprint is known and disagrees with it. A THIRD violation message, distinct
+from "never attested" and "REFUSED", names this case plainly: the evidence was collected under a
+DIFFERENT credential than the one in place now. Conflating it with "never attested" would repeat
+#624's exact failure -- every distinct cause collapsing into one sentence that asserts the wrong
+thing about what actually happened.
 """
 
 from __future__ import annotations
@@ -123,10 +134,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from keel_core.credential_identity import current_credential_fingerprint
 from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import current_venue, log_event
-from keel_core.trade_scope import TradeScopeState
+from keel_core.trade_scope import CredentialEvidence, TradeScopeState
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -893,9 +905,20 @@ def check(
     #     trade. A REFUTED record gets its own message naming the venue's own `refuted_reason`
     #     (when present) -- "the venue refused a placement" is a more useful operator fact than
     #     a bare "attested read-only", and rail 17 draws the same None-vs-False distinction.
+    #
+    #     #633: a FOURTH case, checked first among the veto branches. `current_credential_
+    #     fingerprint(venue)` resolves what credential is actually in place right now (`None`
+    #     when this process cannot tell -- a venue #633 does not know how to fingerprint, or an
+    #     unreadable secret store -- which never withdraws permission by itself, exactly as a
+    #     missing record's opposite number does NOT grant it). When the record's OWN fingerprint
+    #     is known and disagrees with the current one, `may_place_live_entry` returns False
+    #     regardless of `state`, and that gets its own message -- distinct from BOTH "never
+    #     attested" and "REFUSED", because asserting either of those about a credential that was
+    #     never actually re-attested repeats #624's exact failure.
     if is_buy and not offline:
         venue = current_venue() or DEFAULT_VENUE
         trade_scope = repo.get_venue_trade_scope(venue)
+        current_fingerprint = current_credential_fingerprint(venue)
         if trade_scope is None:
             violations.append(
                 f"trade_scope: {venue} has never attested or confirmed a live trade scope for "
@@ -903,7 +926,19 @@ def check(
                 "vetoed. Exits, stop rolls, cancels and DCA exits are unaffected. Run "
                 f"`keel scope attest --trading --venue {venue}` once the credential is verified."
             )
-        elif not trade_scope.may_place_live_entry():
+        elif (
+            trade_scope.credential_evidence(current_fingerprint)
+            is CredentialEvidence.DIFFERENT_CREDENTIAL
+        ):
+            violations.append(
+                f"trade_scope: {venue}'s trade-scope evidence was collected under a DIFFERENT "
+                "credential than the one in place now -- something WAS attested or confirmed "
+                "here, but not for this credential, so new ENTRIES are vetoed until it is "
+                "re-attested. Exits, stop rolls, cancels and DCA exits are unaffected. Run "
+                f"`keel scope attest --trading --venue {venue}` once the current credential is "
+                "verified."
+            )
+        elif not trade_scope.may_place_live_entry(current_fingerprint):
             if trade_scope.state is TradeScopeState.REFUTED:
                 reason = f" ({trade_scope.refuted_reason})" if trade_scope.refuted_reason else ""
                 violations.append(

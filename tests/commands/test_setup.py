@@ -305,6 +305,7 @@ def _upsert_scope(
                 confirmed_ts=None,
                 refuted_ts=refuted_ts,
                 refuted_reason=refuted_reason,
+                credential_fingerprint=None,
             )
         )
         conn.commit()

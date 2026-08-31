@@ -17,6 +17,7 @@ import logging
 import sqlite3
 from decimal import Decimal
 from typing import Any
+from unittest import mock
 
 import pytest
 from keel_broker_api.orders import BracketGTC, LimitGTC, OrderSpec
@@ -3576,6 +3577,102 @@ def test_confirming_keeps_the_operators_attestation_and_the_refusal_history(repo
     assert record.refuted_reason == "an older credential was refused here"
 
 
+# -- #633: confirm and refute both stamp the current credential fingerprint ---------------------
+
+
+def test_confirming_stamps_the_current_credential_fingerprint(repo):
+    """The venue's acceptance is evidence about WHICHEVER credential just placed it -- the write
+    must record that credential's fingerprint, not leave the column untouched."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+        credential_fingerprint=None,
+    )
+
+    with mock.patch.object(executor, "current_credential_fingerprint", return_value="c" * 32):
+        result = execute(
+            _enter_signal(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS
+        )
+
+    assert result.placed is True
+    record = _scope(repo)
+    assert record is not None
+    assert record.credential_fingerprint == "c" * 32
+
+
+def test_confirming_replaces_a_stale_fingerprint_rather_than_carrying_it_forward(repo):
+    """Unlike `attested_scope`/`refuted_ts`, the fingerprint is a NEW fact about which credential
+    produced THIS evidence -- a confirmation must overwrite whatever fingerprint an earlier write
+    left behind, not preserve it."""
+    attest_trade_scope(
+        repo,
+        now_ts=NOW_TS,
+        state=TradeScopeState.ATTESTED,
+        attested_scope=TRADING,
+        attested_ts=NOW_TS,
+        confirmed_ts=None,
+        credential_fingerprint="stale" + "0" * 27,
+    )
+
+    with mock.patch.object(
+        executor, "current_credential_fingerprint", return_value="fresh" + "0" * 27
+    ):
+        execute(_enter_signal(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.credential_fingerprint == "fresh" + "0" * 27
+
+
+def test_refuting_stamps_the_current_credential_fingerprint(repo):
+    """The venue's refusal is evidence about the credential it just refused -- same discipline as
+    the confirm side."""
+    with mock.patch.object(executor, "current_credential_fingerprint", return_value="d" * 32):
+        with pytest.raises(TradeScopeDenied):
+            execute(
+                _enter_signal(),
+                _RefusingBroker(TradeScopeDenied("nope")),
+                repo,
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.credential_fingerprint == "d" * 32
+
+
+def test_refuting_still_latches_when_fingerprinting_is_unavailable(repo):
+    """`current_credential_fingerprint` never raises -- an unresolvable credential (a locked
+    keychain, a momentarily unreadable `.env`) comes back as `None`, not an exception. This pins
+    that the refusal write still proceeds and still latches `REFUTED` in that case: losing the
+    venue's REFUSAL to a fingerprinting hiccup (`_try_record_trade_scope_refuted`'s own
+    reasoning) would be strictly worse than writing a `None` fingerprint alongside it."""
+    with mock.patch.object(executor, "current_credential_fingerprint", return_value=None):
+        with pytest.raises(TradeScopeDenied):
+            execute(
+                _enter_signal(),
+                _RefusingBroker(TradeScopeDenied("nope")),
+                repo,
+                _config(),
+                mode="autonomous",
+                now_ts=NOW_TS,
+            )
+
+    record = _scope(repo)
+    assert record is not None
+    assert record.state is TradeScopeState.REFUTED, (
+        "an unresolvable current fingerprint must not swallow the venue's own refusal -- the "
+        "REFUTED state is what stops the next cycle from repeating the same denied placement"
+    )
+    assert record.credential_fingerprint is None
+
+
 def test_a_venue_rejecting_the_ORDER_does_not_confirm_the_scope(repo):
     """`PlaceResult(success=False)` is the venue refusing THIS ORDER -- no funds, a bad size, a
     price out of band. It is not the venue accepting a placement, so it proves nothing about the
@@ -3619,7 +3716,7 @@ def test_a_permission_refusal_at_placement_writes_refuted_with_the_venues_own_wo
     assert record.state is TradeScopeState.REFUTED
     assert record.refuted_ts == NOW_TS + 77
     assert record.refuted_reason == denial
-    assert record.may_place_live_entry() is False
+    assert record.may_place_live_entry(None) is False
 
 
 def test_a_permission_refusal_at_PREVIEW_also_writes_refuted(repo):
@@ -3921,7 +4018,7 @@ def test_a_successful_EXIT_does_not_confirm_a_credential_attested_READ_ONLY(repo
     assert record.state is TradeScopeState.ATTESTED
     assert record.attested_scope == READ_ONLY
     assert record.confirmed_ts is None
-    assert record.may_place_live_entry() is False
+    assert record.may_place_live_entry(None) is False
 
 
 def test_a_successful_EXIT_does_not_clear_a_LATCHED_REFUSAL(repo):
@@ -3947,7 +4044,7 @@ def test_a_successful_EXIT_does_not_clear_a_LATCHED_REFUSAL(repo):
     assert record is not None
     assert record.state is TradeScopeState.REFUTED
     assert record.refuted_reason == "Missing required scopes"
-    assert record.may_place_live_entry() is False
+    assert record.may_place_live_entry(None) is False
 
 
 def test_the_bracket_placed_alongside_an_entry_is_not_a_second_confirmation(repo):
@@ -4014,7 +4111,7 @@ def test_a_stop_ROLL_on_a_refuted_venue_does_not_clear_the_refusal(repo):
     record = _scope(repo)
     assert record is not None
     assert record.state is TradeScopeState.REFUTED
-    assert record.may_place_live_entry() is False
+    assert record.may_place_live_entry(None) is False
 
 
 # -- #233: the scope record is metadata and must never outrank the money path ------------------

@@ -23,6 +23,7 @@ def _record(venue: str = "coinbase", **overrides: object) -> VenueTradeScope:
         "confirmed_ts": None,
         "refuted_ts": None,
         "refuted_reason": None,
+        "credential_fingerprint": None,
     }
     fields.update(overrides)
     return VenueTradeScope(**fields)  # type: ignore[arg-type]
@@ -53,7 +54,7 @@ def test_confirmed_record_with_no_attestation_round_trips() -> None:
     loaded = repo.get_venue_trade_scope("coinbase")
     assert loaded == record
     assert loaded is not None
-    assert loaded.may_place_live_entry() is True
+    assert loaded.may_place_live_entry(None) is True
 
 
 def test_refuted_ts_survives_a_reattestation_upsert() -> None:
@@ -77,7 +78,7 @@ def test_refuted_ts_survives_a_reattestation_upsert() -> None:
     assert loaded == reattested
     assert loaded is not None
     assert loaded.refuted_ts == 1_750_000_000
-    assert loaded.may_place_live_entry() is True
+    assert loaded.may_place_live_entry(None) is True
 
 
 def test_upsert_replaces_in_place_keyed_on_venue() -> None:
@@ -116,3 +117,24 @@ def test_state_round_trips_as_an_enum_not_a_string() -> None:
     loaded = repo.get_venue_trade_scope("coinbase")
     assert loaded is not None
     assert loaded.state is TradeScopeState.REFUTED
+
+
+def test_credential_fingerprint_round_trips() -> None:
+    repo = _repo()
+    fingerprint = "a" * 32
+    repo.upsert_venue_trade_scope(_record(credential_fingerprint=fingerprint))
+    loaded = repo.get_venue_trade_scope("coinbase")
+    assert loaded is not None
+    assert loaded.credential_fingerprint == fingerprint
+
+
+def test_credential_fingerprint_is_replaced_not_merged_on_reattestation() -> None:
+    """`upsert_venue_trade_scope` writes exactly what it is given, including `None` -- a caller
+    that re-attests with an unresolved current credential must be able to clear a stale
+    fingerprint, not have the old one silently survive underneath a fresh write."""
+    repo = _repo()
+    repo.upsert_venue_trade_scope(_record(credential_fingerprint="a" * 32))
+    repo.upsert_venue_trade_scope(_record(credential_fingerprint=None))
+    loaded = repo.get_venue_trade_scope("coinbase")
+    assert loaded is not None
+    assert loaded.credential_fingerprint is None

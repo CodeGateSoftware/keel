@@ -48,6 +48,7 @@ def _record(
     attested_scope: str | None = None,
     refuted_ts: int | None = None,
     refuted_reason: str | None = None,
+    credential_fingerprint: str | None = None,
 ) -> VenueTradeScope:
     return VenueTradeScope(
         venue="v",
@@ -57,6 +58,7 @@ def _record(
         confirmed_ts=None,
         refuted_ts=refuted_ts,
         refuted_reason=refuted_reason,
+        credential_fingerprint=credential_fingerprint,
     )
 
 
@@ -254,7 +256,7 @@ def test_calls_may_place_live_entry_rather_than_re_deriving_it() -> None:
     module reads the METHOD'S answer and does not re-inspect `.state`/`.attested_scope` itself."""
     registry = {"v": _NeedsCreds}
     record = _record(TradeScopeState.REFUTED, refuted_reason="whatever")
-    object.__setattr__(record, "may_place_live_entry", lambda: True)
+    object.__setattr__(record, "may_place_live_entry", lambda current: True)
     row = venue_readiness("v", registry, _OK_CREDS, record)
     assert row.state is VenueReadiness.READY
 
@@ -437,6 +439,7 @@ def test_gather_readiness_reads_a_real_record_when_the_db_is_usable(
             confirmed_ts=int(time.time()),
             refuted_ts=None,
             refuted_reason=None,
+            credential_fingerprint=None,
         )
     )
     conn.commit()

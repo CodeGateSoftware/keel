@@ -66,6 +66,7 @@ def attest_trade_scope(
     confirmed_ts: int | None = None,
     refuted_ts: int | None = None,
     refuted_reason: str | None = None,
+    credential_fingerprint: str | None = None,
 ) -> None:
     """Write a venue trade-scope record -- rail 20's baseline, the `attest_subscription`
     counterpart for #233.
@@ -74,6 +75,11 @@ def attest_trade_scope(
     produces for an already-live venue, and the state that lets rail 20 admit a live entry --
     the quiet default every test not ABOUT rail 20 needs so it is not incidentally vetoed, same
     reason `attest_subscription` defaults to a roomy allowance.
+
+    `credential_fingerprint` (#633) defaults to `None` for the same reason: the v14-backfill
+    shape this helper otherwise mimics never had one, and `None` is also the value rail 20's
+    fingerprint check treats as "no evidence to disagree with", so tests not specifically ABOUT
+    the fingerprint check are not incidentally vetoed by it either.
 
     `now_ts` is required rather than defaulted, like `attest_subscription`: each caller module
     defines its own clock, and a default here would silently bind the wrong one.
@@ -91,6 +97,7 @@ def attest_trade_scope(
             confirmed_ts=confirmed_ts,
             refuted_ts=refuted_ts,
             refuted_reason=refuted_reason,
+            credential_fingerprint=credential_fingerprint,
         )
     )
 

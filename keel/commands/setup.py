@@ -701,7 +701,11 @@ def _scope_observation(conn: sqlite3.Connection, config: Any) -> tuple[bool | No
     record = Repository(conn).get_venue_trade_scope(venue)
     if record is None:
         return (False, f"{venue}: no trade scope attested -- rail 20 vetoes live entries")
-    if record.may_place_live_entry():
+    # `current_fingerprint=None` (#633 PR1): this inspection does not yet resolve the real
+    # current credential fingerprint, so it cannot distinguish "different credential" from
+    # "never attested" -- deliberately unchanged in this PR, same reasoning as `venue_readiness`
+    # and `scope_show_lines`. `None` never withdraws permission.
+    if record.may_place_live_entry(None):
         return (True, f"{venue}: attested for TRADING (state={record.state.value})")
     if record.state is TradeScopeState.REFUTED:
         reason = f" ({record.refuted_reason})" if record.refuted_reason else ""

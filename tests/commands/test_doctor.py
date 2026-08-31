@@ -124,6 +124,7 @@ def _scope(
     refuted_ts: int | None = None,
     refuted_reason: str | None = None,
     venue: str = "coinbase",
+    credential_fingerprint: str | None = None,
 ) -> VenueTradeScope:
     return VenueTradeScope(
         venue=venue,
@@ -133,6 +134,7 @@ def _scope(
         confirmed_ts=confirmed_ts,
         refuted_ts=refuted_ts,
         refuted_reason=refuted_reason,
+        credential_fingerprint=credential_fingerprint,
     )
 
 

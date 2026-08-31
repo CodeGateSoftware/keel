@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 14
+    assert version == db.SCHEMA_VERSION == 15
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -470,9 +470,10 @@ def test_v14_backfill_keeps_a_live_coinbase_deployment_trading() -> None:
         "no venue_trade_scopes row after upgrading a database with a live accepted order -- "
         "rail 20 will fail closed on the next live ENTRY and veto a venue that already works"
     )
-    assert scope.may_place_live_entry() is True, (
+    assert scope.may_place_live_entry("a" * 32) is True, (
         "backfilled coinbase record must permit a live entry, or upgrading breaks a venue that "
-        "was already trading unattended"
+        "was already trading unattended -- passing a NON-MATCHING current fingerprint on "
+        "purpose (#633): a NULL recorded fingerprint must never withhold permission"
     )
 
 
@@ -482,7 +483,7 @@ def test_v14_creates_the_venue_trade_scopes_table() -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
     assert cols >= {
         "venue", "state", "attested_scope", "attested_ts", "confirmed_ts", "refuted_ts",
-        "refuted_reason",
+        "refuted_reason", "credential_fingerprint",
     }
 
 
@@ -611,7 +612,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 14
+    assert stamped == db.SCHEMA_VERSION == 15
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -654,4 +655,134 @@ def test_v14_backfill_runs_on_a_database_already_stamped_at_v13() -> None:
         "a database already stamped at v13 by #502 got no #233 backfill -- the renumber left "
         "the live deployment with no trade-scope record and rail 20 will veto its next entry"
     )
-    assert scope.may_place_live_entry() is True
+    assert scope.may_place_live_entry("a" * 32) is True
+
+
+# -- v15: venue_trade_scopes.credential_fingerprint, and the #633 production hazard --------------
+#
+# The live deployment's database was verified at schema version 12 before this PR: no
+# `venue_trade_scopes` table at all. That means the v14 backfill and this v15 column run in the
+# SAME `migrate()` pass on the next upgrade -- `_v12_database()` plus `db.migrate(conn)` is
+# therefore not a hypothetical, it is exactly the upgrade path the running deployment will take.
+
+
+def test_v15_a_backfilled_confirmed_row_with_no_fingerprint_still_permits_a_live_entry() -> None:
+    """THE test #633's issue demands. A v12 database with one live accepted order, migrated all
+    the way to the current schema in one `migrate()` call (the real 12 -> 15 chain, not a
+    v14-shaped fixture), must come out with a `confirmed` coinbase row, a NULL
+    `credential_fingerprint`, and a live entry still permitted -- even against a current
+    fingerprint that does NOT match (there is nothing recorded to match against, and that is the
+    point)."""
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_787_664_005)
+
+    db.migrate(conn)
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["venue"] == "coinbase"
+    assert row["state"] == "confirmed"
+    assert row["credential_fingerprint"] is None
+
+    scope = Repository(conn).get_venue_trade_scope("coinbase")
+    assert scope is not None
+    assert scope.may_place_live_entry("a" * 32) is True, (
+        "a NULL recorded fingerprint must never withhold permission -- passing a "
+        "NON-MATCHING current fingerprint on purpose, because that is the exact production "
+        "situation (no fingerprint was ever recorded for this backfilled row) and the exact "
+        "thing that must not veto"
+    )
+
+
+def test_v15_rail_20_does_not_veto_a_live_entry_on_the_migrated_database() -> None:
+    """Drives rail 20 itself, not just the record -- #633's issue asks for "rail 20 does not
+    veto", and a record-level assertion alone does not prove the rail passes the current
+    fingerprint through correctly. Same 12 -> 15 chain and the same real live-deployment shape
+    as the test above."""
+    from keel.execution.guards import check
+    from tests.execution.test_guards import _config, _intent
+
+    conn = _v12_database()
+    _insert_order(conn, mode="live", status="filled", created_at=1_787_664_005)
+    db.migrate(conn)
+
+    repo = Repository(conn)
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", 1_787_664_005)
+
+    result = check(_intent(), repo, _config(), 1_787_664_005)
+
+    assert "trade_scope" not in {v.split(":", 1)[0] for v in result.violations}, (
+        f"rail 20 vetoed a live entry on the v14-backfilled, unfingerprinted coinbase record: "
+        f"{result.violations}"
+    )
+
+
+def test_v15_adds_the_column_to_a_v14_database() -> None:
+    """The v14 SHAPE (no `credential_fingerprint` column at all) -- built with the existing v14
+    helper, which must NOT itself gain the column (it defines what v14 looked like)."""
+    conn = _v12_database()
+    _create_venue_trade_scopes_table(conn)
+    conn.execute("UPDATE schema_version SET version = 14")
+    conn.execute(
+        """
+        INSERT INTO venue_trade_scopes (
+            venue, state, attested_scope, attested_ts, confirmed_ts, refuted_ts, refuted_reason
+        ) VALUES ('coinbase', 'confirmed', NULL, NULL, ?, NULL, NULL)
+        """,
+        (1_700_000_000,),
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
+    assert "credential_fingerprint" in cols
+
+    row = _trade_scope_rows(conn)[0]
+    assert row["venue"] == "coinbase"
+    assert row["state"] == "confirmed"
+    assert row["credential_fingerprint"] is None
+
+    scope = Repository(conn).get_venue_trade_scope("coinbase")
+    assert scope is not None
+    assert scope.may_place_live_entry("a" * 32) is True
+
+
+def test_v15_is_idempotent() -> None:
+    conn = _v12_database()
+    _create_venue_trade_scopes_table(conn)
+    conn.commit()
+
+    db._migrate_v15_trade_scope_credential_fingerprint(conn)
+    conn.commit()
+    db._migrate_v15_trade_scope_credential_fingerprint(conn)
+    conn.commit()
+
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")]
+    assert cols.count("credential_fingerprint") == 1
+
+
+def test_v15_on_a_fresh_database_has_the_column() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
+    assert "credential_fingerprint" in cols
+
+
+def test_v15_migration_bumps_the_stored_version() -> None:
+    conn = _v12_database()
+    db.migrate(conn)
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 15
+
+
+def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
+    """The exact hazard the PRAGMA guard exists for (#633): on a fresh-from-v12 upgrade,
+    `_SCHEMA_STATEMENTS` creates `venue_trade_scopes` WITH `credential_fingerprint` before any
+    numbered migration step runs, so v15's own step must find the column already there and do
+    nothing -- a bare `ALTER TABLE ADD COLUMN` here would raise sqlite's own
+    "duplicate column name" and break every upgrade through this release."""
+    conn = _v12_database()
+    db.migrate(conn)  # must not raise
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")]
+    assert cols.count("credential_fingerprint") == 1

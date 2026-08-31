@@ -121,7 +121,7 @@ def test_read_only_does_not_permit_a_live_entry(
     _run(db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase")
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
     assert record is not None
-    assert record.may_place_live_entry() is False
+    assert record.may_place_live_entry(None) is False
 
 
 def test_trading_permits_a_live_entry(
@@ -134,7 +134,7 @@ def test_trading_permits_a_live_entry(
     )
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
     assert record is not None
-    assert record.may_place_live_entry() is True
+    assert record.may_place_live_entry(None) is True
 
 
 def test_exactly_one_of_trading_or_read_only_is_required(
@@ -162,6 +162,7 @@ def test_reattesting_trading_over_a_refuted_record_keeps_refuted_ts_and_reason(
             confirmed_ts=1_650_000_000,
             refuted_ts=1_750_000_000,
             refuted_reason="403 You do not have permission to perform this action",
+            credential_fingerprint=None,
         )
     )
 
@@ -181,7 +182,7 @@ def test_reattesting_trading_over_a_refuted_record_keeps_refuted_ts_and_reason(
     assert record.refuted_reason == "403 You do not have permission to perform this action"
     assert record.confirmed_ts == 1_650_000_000
     # but a live entry is permitted again -- the whole point of re-attesting
-    assert record.may_place_live_entry() is True
+    assert record.may_place_live_entry(None) is True
 
 
 def test_reattesting_read_only_over_a_refuted_record_also_keeps_the_history(
@@ -197,6 +198,7 @@ def test_reattesting_read_only_over_a_refuted_record_also_keeps_the_history(
             confirmed_ts=None,
             refuted_ts=1_750_000_000,
             refuted_reason="some refusal",
+            credential_fingerprint=None,
         )
     )
     _at_a_terminal(monkeypatch, yes=False)
@@ -208,6 +210,74 @@ def test_reattesting_read_only_over_a_refuted_record_also_keeps_the_history(
     assert record is not None
     assert record.refuted_ts == 1_750_000_000
     assert record.refuted_reason == "some refusal"
+
+
+# -- #633: attest stamps the CURRENT fingerprint, never carries the old one forward --------------
+
+
+def test_attest_writes_the_current_credential_fingerprint(
+    db_path: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at_a_terminal(monkeypatch, yes=True)
+    monkeypatch.setattr(
+        "keel.commands.scope.current_credential_fingerprint", lambda venue: "f" * 32
+    )
+    result = _run(
+        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        input="yes\n",
+    )
+    assert result.exit_code == 0, result.output
+    record = _repo_at(db_path).get_venue_trade_scope("coinbase")
+    assert record is not None
+    assert record.credential_fingerprint == "f" * 32
+
+
+def test_attest_does_not_carry_an_old_fingerprint_forward(
+    db_path: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator is attesting about the credential IN PLACE NOW -- a re-attestation must
+    overwrite a stale fingerprint from an earlier write, unlike `refuted_ts`/`confirmed_ts`,
+    which are carried forward as history."""
+    repo = _repo_at(db_path)
+    repo.upsert_venue_trade_scope(
+        VenueTradeScope(
+            venue="coinbase",
+            state=TradeScopeState.CONFIRMED,
+            attested_scope=None,
+            attested_ts=None,
+            confirmed_ts=1_700_000_000,
+            refuted_ts=None,
+            refuted_reason=None,
+            credential_fingerprint="stale" + "0" * 27,
+        )
+    )
+    _at_a_terminal(monkeypatch, yes=True)
+    monkeypatch.setattr(
+        "keel.commands.scope.current_credential_fingerprint", lambda venue: "fresh" + "0" * 27
+    )
+    result = _run(
+        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        input="yes\n",
+    )
+    assert result.exit_code == 0, result.output
+    record = _repo_at(db_path).get_venue_trade_scope("coinbase")
+    assert record is not None
+    assert record.credential_fingerprint == "fresh" + "0" * 27
+
+
+def test_attest_writes_none_when_no_current_credential_resolves(
+    db_path: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at_a_terminal(monkeypatch, yes=False)
+    result = _run(
+        db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase",
+    )
+    assert result.exit_code == 0, result.output
+    record = _repo_at(db_path).get_venue_trade_scope("coinbase")
+    assert record is not None
+    # No credentials are configured in this test's environment, so the real
+    # `current_credential_fingerprint` resolves to None -- written as-is, not defaulted away.
+    assert record.credential_fingerprint is None
 
 
 # -- the venue key ---------------------------------------------------------------------------
@@ -297,6 +367,7 @@ def test_show_surfaces_a_past_refusal_even_after_reattestation(
             confirmed_ts=None,
             refuted_ts=1_750_000_000,
             refuted_reason="403 denied",
+            credential_fingerprint=None,
         )
     )
     _at_a_terminal(monkeypatch, yes=True)

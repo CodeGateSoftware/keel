@@ -107,7 +107,9 @@ def _trade_scope_from_row(row: sqlite3.Row) -> VenueTradeScope:
 
     `attested_scope`, `attested_ts`, `confirmed_ts`, and `refuted_ts` are all nullable: the
     record may hold only a subset of them depending on `state` (e.g. a backfilled `CONFIRMED`
-    row has no attestation at all).
+    row has no attestation at all). `credential_fingerprint` (#633) is nullable too, and NULL
+    there means "recorded before fingerprinting existed" -- `VenueTradeScope.credential_evidence`
+    is what decodes that meaning, not this function.
     """
     return VenueTradeScope(
         venue=row["venue"],
@@ -117,6 +119,7 @@ def _trade_scope_from_row(row: sqlite3.Row) -> VenueTradeScope:
         confirmed_ts=None if row["confirmed_ts"] is None else int(row["confirmed_ts"]),
         refuted_ts=None if row["refuted_ts"] is None else int(row["refuted_ts"]),
         refuted_reason=row["refuted_reason"],
+        credential_fingerprint=row["credential_fingerprint"],
     )
 
 
@@ -492,20 +495,27 @@ class Repository:
         return None if row is None else _trade_scope_from_row(row)
 
     def upsert_venue_trade_scope(self, record: VenueTradeScope) -> None:
-        """Insert or replace `record`, keyed on venue. One trade-scope record per venue."""
+        """Insert or replace `record`, keyed on venue. One trade-scope record per venue.
+
+        Writes `credential_fingerprint` (#633) exactly as given -- including `None`, which is a
+        meaningful value here (see `VenueTradeScope`'s own docstring for why it has no default),
+        not "leave whatever was there". Every writer decides what to put in this column, on every
+        call.
+        """
         self._conn.execute(
             """
             INSERT INTO venue_trade_scopes (
                 venue, state, attested_scope, attested_ts, confirmed_ts, refuted_ts,
-                refuted_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                refuted_reason, credential_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(venue) DO UPDATE SET
                 state = excluded.state,
                 attested_scope = excluded.attested_scope,
                 attested_ts = excluded.attested_ts,
                 confirmed_ts = excluded.confirmed_ts,
                 refuted_ts = excluded.refuted_ts,
-                refuted_reason = excluded.refuted_reason
+                refuted_reason = excluded.refuted_reason,
+                credential_fingerprint = excluded.credential_fingerprint
             """,
             (
                 record.venue,
@@ -515,6 +525,7 @@ class Repository:
                 record.confirmed_ts,
                 record.refuted_ts,
                 record.refuted_reason,
+                record.credential_fingerprint,
             ),
         )
         self._conn.commit()
