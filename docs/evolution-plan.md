@@ -1,6 +1,9 @@
 # The evolution plan — Jesse's skeleton, keel's soul
 
 **Status:** plan of record. Owner-approved across the 2026-08-28→31 delivery sessions.
+Amended 2026-08-31 after external review: ceremony card & idempotency binding (§5 Phase B),
+screening data source (§5 Phase C), Fee Reality flagship (§5 Phase E), hosted-confirm
+signer spike hypothesis (§5 Phase F).
 **Companion decisions:** ADR 0004 (monetisation, pending #603), ADR 0005 (options, pending #637).
 **Rule of application:** every item in this plan passes the constitution (§4) or it does not ship. The plan is subordinate to the constitution, always.
 
@@ -85,6 +88,13 @@ table). Site: #117 (roadmap page), #120 (ADR docs sync).
   prompt, offline shell. The phone's honest role is command surface — above all
   **approve/deny in confirm mode**: the ceremony's remote desk.
 - **Web Push from the engine** — VAPID, direct; the service-worker groundwork already ships.
+- **The one-thumb ceremony card** — confirm-mode approval as a dedicated card, not a
+  scaled-down table. v1 fields are only what exists today (fee basis at the order's clip
+  size, purification liability, trigger rationale); a spread vital sign arrives only with
+  #626's data capture — a number invented for the UI would be a constitution violation.
+  Confirmations carry `idempotency_key` + `proposal_hash`, both; a mismatch is refused and
+  proposals expire — so a retried approval over a flapping tunnel deduplicates cleanly,
+  and a replayed key can never approve a regenerated proposal.
 
 Why this and not a hosted app: a hosted executor can never honestly say "we can't see your
 data" — the operator ships the code that runs beside the plaintext keys. The only
@@ -95,7 +105,10 @@ architectures that keep the promise are the ones where the keys never reach our 
 - **Equities via Alpaca** — finish #370/#371. The completion bar now explicitly includes
   equity screening + purification extension (debt ratios, impermissible-revenue shares,
   human-sourced attestations) and cost fidelity *before* the live paper flip (#571's
-  lesson applied to a new asset class). Being first with honestly-costed,
+  lesson applied to a new asset class). Screening measures from **SEC XBRL
+  `companyfacts`** — AAOIFI 33/33/5 thresholds, a pinned quarterly snapshot under the
+  #523 pin/re-pin discipline; the module measures, the human attests (recorded on #370).
+  No third-party SaaS screening black box. Being first with honestly-costed,
   compliance-gated stocks next to crypto is a differentiator Jesse structurally cannot copy.
 - **Phase 13 Binance** — #564–#568, after Alpaca proves the pattern.
 - **Options** — a constitution decision, not a feature. Three collisions: the shipped
@@ -139,7 +152,10 @@ IKA (Go, pgvector, four lenses)  ──SSE──▶  B1: bounded stdlib client (
 Licence choice (permissive + trademark posture + the reserve-hosted-rights decision),
 README written for the GitHub audience, awesome-lists (site #14) and handles (site #15).
 Jesse's eight-year GitHub presence is their entire funnel; keel's is unstarted. The
-cheapest growth lever on the board.
+cheapest growth lever on the board. Its flagship is the **Fee Reality benchmark** (#646 +
+site #136): the negative result, reproducible from recorded runs, as the README's opening
+hook — every number rendered from the ledger or it does not ship, and no competitor named
+in the asset.
 
 ### Phase F — monetisation (trigger-gated; recorded in ADR 0004)
 
@@ -156,8 +172,17 @@ cheapest growth lever on the board.
   already made: no interest-bearing rails, no processor that sees the payer, no chargeback
   asymmetry. US reality stated plainly: crypto-only removes the processor, not the tax —
   receipt is ordinary income at fair-market value.
-- **Hosted-confirm** needs one substantial new artifact: a small native signer app (Swift
-  Keychain / Android Keystore, biometric-gated) — a PWA cannot hold venue keys securely.
+- **Hosted-confirm's signer** — one substantial new artifact, in either shape: (a) a small
+  native signer app (Swift Keychain / Android Keystore, biometric-gated), or (b) the
+  2026-08-31 hypothesis — venue keys held in the PWA as **non-extractable WebCrypto keys**,
+  passkey-gated (the biometric unlocks the signing call; a passkey authenticates, it
+  cannot sign an order), with the hosted engine as a **dumb relay** for fully-signed
+  requests: browsers cannot call venue APIs directly (origin blocks), so the engine
+  forwards bytes it can withhold but never forge. Caveats named honestly — IndexedDB is
+  not a Keychain; venue signing algorithms must exist in WebCrypto; replay protection
+  needs timestamps/nonces; and a malicious engine can still *propose* differently:
+  socialize, not steal. Shape (b) is settled by a validation spike before any commitment,
+  not by decision.
 - **No classic SaaS tier.** If full-autonomy hosting is ever demanded, it ships labeled
   with Jesse's privacy tradeoff, not with a promise keel cannot make.
 - The reopen trigger is unchanged and recorded in ADR 0004: **users, not revenue**.
