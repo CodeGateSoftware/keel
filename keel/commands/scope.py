@@ -23,6 +23,7 @@ import time
 from datetime import UTC, datetime
 
 import click
+from keel_core.credential_identity import current_credential_fingerprint
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel.commands._common import (
@@ -85,6 +86,15 @@ def apply_scope_attest(
     carried forward the same way -- it too describes what has happened on this venue, not what
     this attestation newly claims. Only `state`, `attested_scope` and `attested_ts` are the fresh
     facts this command asserts.
+
+    `credential_fingerprint` (#633) is the one field that does NOT follow "only state/
+    attested_scope/attested_ts are fresh": it is stamped with the CURRENT credential's
+    fingerprint (`current_credential_fingerprint`), including `None` when nothing resolves,
+    rather than carried forward from `existing`. The operator is attesting about the credential
+    IN PLACE right now, not about whichever credential happened to be current the last time this
+    venue was written -- carrying the old fingerprint forward would bind this fresh attestation
+    to a possibly-already-rotated-away credential and defeat the whole point of #633's read-time
+    comparison.
     """
     resolved_venue = _bound_venue_or_default(venue)
     existing = repo.get_venue_trade_scope(resolved_venue)
@@ -99,6 +109,7 @@ def apply_scope_attest(
             confirmed_ts=existing.confirmed_ts if existing is not None else None,
             refuted_ts=existing.refuted_ts if existing is not None else None,
             refuted_reason=existing.refuted_reason if existing is not None else None,
+            credential_fingerprint=current_credential_fingerprint(resolved_venue),
         )
     )
     label = "TRADING" if trading else "READ_ONLY"
@@ -138,9 +149,14 @@ def scope_show_lines(repo: Repository) -> list[str]:
     lines: list[str] = []
     for record in records:
         scope = record.attested_scope if record.attested_scope is not None else "none"
+        # `current_fingerprint=None` here is deliberate for PR1 of #633, not an oversight: this
+        # display does not yet resolve the real current fingerprint, so it cannot distinguish
+        # "different credential" from "never attested" -- wiring that distinction in before the
+        # display can make it correctly would reproduce #624's collapse. PR2 wires the real value
+        # and the distinguishing text; `None` here never withdraws permission in the meantime.
         lines.append(
             f"{record.venue}: state={record.state.value} attested_scope={scope} "
-            f"live_entry_permitted={record.may_place_live_entry()}"
+            f"live_entry_permitted={record.may_place_live_entry(None)}"
         )
         if record.refuted_ts is not None:
             # Surfaced even when the record has since been re-attested (state is no longer

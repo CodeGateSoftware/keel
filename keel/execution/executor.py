@@ -121,6 +121,7 @@ from keel_broker_api.results import (
     Preview,
     coerce_cancel_outcome,
 )
+from keel_core.credential_identity import current_credential_fingerprint
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import current_venue, log_event, log_exception, log_venue_failure
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
@@ -627,6 +628,14 @@ def _record_trade_scope_confirmed(repo: Repository, now_ts: int) -> None:
     Confirmation is a new fact, not a reset: what a human claimed and what a previous credential
     on this venue once did are both still true, and `doctor` renders both. `apply_scope_attest`
     carries the same fields forward in the other direction for the same reason.
+
+    `credential_fingerprint` (#633) is the ONE exception to "carry forward": it is stamped with
+    the CURRENT credential's fingerprint, replacing whatever was there. Unlike `attested_scope`
+    or the refusal history, a fingerprint is not a fact about the past that should survive
+    untouched -- it is a NEW fact about which credential just produced THIS evidence, and this
+    placement is proof about the credential that placed it, not about whichever one an earlier
+    write happened to be stamped with. `current_credential_fingerprint` never raises, so this
+    call needs no guard the way the refute path's write does.
     """
     venue = _trade_scope_venue()
     existing = repo.get_venue_trade_scope(venue)
@@ -639,6 +648,7 @@ def _record_trade_scope_confirmed(repo: Repository, now_ts: int) -> None:
             confirmed_ts=now_ts,
             refuted_ts=existing.refuted_ts if existing is not None else None,
             refuted_reason=existing.refuted_reason if existing is not None else None,
+            credential_fingerprint=current_credential_fingerprint(venue),
         )
     )
 
@@ -667,6 +677,14 @@ def _record_trade_scope_refuted(repo: Repository, reason: str, now_ts: int) -> N
     `attested_scope`/`attested_ts` and any earlier `confirmed_ts` survive, so `doctor` can say
     the sentence that actually helps -- "you attested this for trading and the venue then refused
     it" -- rather than presenting a bare refusal with no history behind it.
+
+    `credential_fingerprint` (#633) is stamped with the CURRENT credential's fingerprint, same as
+    the confirm side and for the same reason: this refusal is evidence about whichever credential
+    the venue just refused, not about whatever fingerprint an earlier write happened to carry.
+    `current_credential_fingerprint` never raises -- `_try_record_trade_scope_refuted`'s own
+    reasoning applies here too: losing the venue's REFUSAL to a fingerprinting error would be
+    strictly worse than writing a `None` fingerprint alongside it, and this function never has to
+    choose between the two.
     """
     venue = _trade_scope_venue()
     existing = repo.get_venue_trade_scope(venue)
@@ -681,6 +699,7 @@ def _record_trade_scope_refuted(repo: Repository, reason: str, now_ts: int) -> N
             confirmed_ts=existing.confirmed_ts if existing is not None else None,
             refuted_ts=now_ts,
             refuted_reason=reason,
+            credential_fingerprint=current_credential_fingerprint(venue),
         )
     )
 

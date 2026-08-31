@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -209,13 +209,22 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS venue_trade_scopes (
-        venue           TEXT PRIMARY KEY,
-        state           TEXT NOT NULL,
-        attested_scope  TEXT,
-        attested_ts     INTEGER,
-        confirmed_ts    INTEGER,
-        refuted_ts      INTEGER,
-        refuted_reason  TEXT
+        venue                   TEXT PRIMARY KEY,
+        state                   TEXT NOT NULL,
+        attested_scope          TEXT,
+        attested_ts             INTEGER,
+        confirmed_ts            INTEGER,
+        refuted_ts              INTEGER,
+        refuted_reason          TEXT,
+        -- Non-reversible fingerprint of the credential IDENTIFIER this evidence was collected
+        -- under (#633), NULL for every row written before v15 -- including a v14-backfilled
+        -- `confirmed` coinbase row, which by construction has no fingerprint to give it, and
+        -- every row an operator attested before this column existed. NULL means "recorded
+        -- before fingerprinting existed" and the read path (`VenueTradeScope.
+        -- credential_evidence`/`may_place_live_entry`) treats it as MATCHING, never as a
+        -- mismatch -- see `_migrate_v15_trade_scope_credential_fingerprint`'s docstring for why
+        -- getting that backwards would make this migration itself the outage.
+        credential_fingerprint  TEXT
     )
     """,
     """
@@ -625,6 +634,54 @@ def _migrate_v14_venue_trade_scopes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v15_trade_scope_credential_fingerprint(conn: sqlite3.Connection) -> None:
+    """v15 adds `venue_trade_scopes.credential_fingerprint` (#633).
+
+    `venue_trade_scopes` (#233) recorded evidence about a CREDENTIAL but was keyed only by
+    VENUE, so nothing noticed when the credential underneath a venue changed -- `keel
+    credentials forget CDP_API_KEY` followed by `keel credentials set CDP_API_KEY` (a different
+    key) left the venue's `confirmed` record standing, and rail 20 would permit a live entry on
+    the new key on the strength of the old key's evidence. This column is a non-reversible
+    fingerprint of the credential IDENTIFIER (never the signing secret --
+    `keel_core.credential_identity` carries the full argument) the evidence was collected under,
+    so the read path can compare it against the CURRENT credential instead of trusting the venue
+    key alone.
+
+    **NULL is the correct value for every existing row, including the live deployment's
+    backfilled `confirmed` one, and the read path MUST treat NULL as matching.** This is not an
+    incidental migration detail -- get it backwards and this migration IS the outage it exists
+    to prevent. The live deployment's database was verified at schema version 12 before this PR
+    (`venue_trade_scopes` did not exist yet), which means the v14 backfill and this v15 column
+    both run in the SAME `migrate()` pass on the next upgrade: `_SCHEMA_STATEMENTS` creates
+    `venue_trade_scopes` WITH `credential_fingerprint` already present, v14's backfill inserts a
+    `confirmed` coinbase row with no fingerprint (nothing observed which credential placed a
+    2026-07 order, and none can be reconstructed retroactively), and this step then finds nothing
+    to do to that row -- it already has the column, NULL, exactly the value a pre-#633 row is
+    supposed to carry. `VenueTradeScope.credential_evidence` reads that NULL as
+    `UNFINGERPRINTED`, and `may_place_live_entry` treats `UNFINGERPRINTED` as matching. Getting
+    that read-side decision backwards (withholding permission on a NULL fingerprint) would veto
+    the very next live entry on a healthy Coinbase deployment that has been trading unattended
+    the whole time -- the identical shape of incident the v14 backfill itself exists to prevent,
+    just one migration later.
+
+    **Why the `PRAGMA table_info` guard, unlike a bare `ALTER TABLE`.** On a fresh install, or on
+    the 12 -> 15 chain described above, `_SCHEMA_STATEMENTS` runs BEFORE any numbered migration
+    step (`migrate()`'s own ordering) and creates `venue_trade_scopes` with this column already
+    present. A bare `ALTER TABLE venue_trade_scopes ADD COLUMN credential_fingerprint TEXT` on
+    that database raises sqlite's own `duplicate column name: credential_fingerprint` and the
+    whole migration chain fails -- which would mean EVERY upgrade landing on this release breaks,
+    not just the ones that happen to skip through v14 on the way. Idempotent by the same
+    `PRAGMA table_info` pattern `_migrate_v11_orders_filled_quantity`/
+    `_migrate_v12_positions_initial_stop`/`_migrate_v13_positions_realized_legs` already use: add
+    the column only when it is not already there, so this step is a genuine no-op on a database
+    that got it from `_SCHEMA_STATEMENTS` and a real `ALTER TABLE` on one that got the v14 shape
+    of the table from an earlier release.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
+    if "credential_fingerprint" not in columns:
+        conn.execute("ALTER TABLE venue_trade_scopes ADD COLUMN credential_fingerprint TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -639,6 +696,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     12: _migrate_v12_positions_initial_stop,
     13: _migrate_v13_positions_realized_legs,
     14: _migrate_v14_venue_trade_scopes,
+    15: _migrate_v15_trade_scope_credential_fingerprint,
 }
 
 

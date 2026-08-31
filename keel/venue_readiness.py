@@ -124,6 +124,7 @@ def venue_readiness(
     record: VenueTradeScope | None,
     *,
     record_unreadable: bool = False,
+    current_fingerprint: str | None = None,
 ) -> VenueReadinessRow:
     """The pure derivation. `registry` is `keel_broker_api.registry.discover_brokers()`'s own
     shape (venue name -> adapter class); `secrets` is every credential env name any adapter might
@@ -132,6 +133,14 @@ def venue_readiness(
     repo could be read. No network call, ever -- the heaviest thing this function does is decode
     base64 and derive an Ed25519 public key, both in-process, inside an adapter's own
     `credential_defect` hook.
+
+    `current_fingerprint` (#633) is threaded straight into `record.may_place_live_entry` and
+    defaults to `None` -- "current credential unknown", which never withdraws permission. PR1 of
+    #633 keeps this display's behaviour UNCHANGED: `gather_readiness` below does not yet resolve
+    a real fingerprint, and this function does not yet distinguish "different credential" from
+    "never attested" in its `NOT_PERMITTED` explanation. Wiring that distinction in before the
+    display can make it correctly would repeat #624's collapse (every failure asserting "never
+    attested"); PR2 is where a real fingerprint and the distinguishing text both arrive together.
 
     `record_unreadable` distinguishes "there is no record" from "there IS a database and this
     process could not read it", which `record=None` alone cannot. Collapsing the two let the
@@ -235,7 +244,7 @@ def venue_readiness(
             next_step="keel doctor  (check the database path and that it is readable)",
         )
 
-    if record is not None and record.may_place_live_entry():
+    if record is not None and record.may_place_live_entry(current_fingerprint):
         return VenueReadinessRow(
             venue=venue,
             state=VenueReadiness.READY,
