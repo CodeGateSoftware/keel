@@ -304,10 +304,14 @@ class ExecutionConfig:
     fills are synthetic and see no book -- which is why the paper-hourly profile accrues no
     evidence about it, and the gate ships before any live resumption rather than after).
 
-    The default 0.005 (50bp) is anchored to #334's `strategy/backtest.SLIPPAGE_CAP_PCT`: the
-    backtest never assumes more than 50bp of per-leg slippage on even the thinnest book, so a
-    spread AT the cap has already consumed the model's entire worst-case cost, leaving the
-    taker fee wholly outside it. Validated to (0, 0.10] at load: 0 would silently disarm the
+    The default 0.005 (50bp) was set by #334 to equal `strategy/backtest.SLIPPAGE_CAP_PCT`,
+    which then assumed no more than 50bp of per-leg slippage on even the thinnest book. #523
+    moved that cap to the corpus tail (183.8bp) and deliberately left this threshold alone, so
+    the two are now independent numbers: loosening a live entry rail is its own decision, and
+    the drift runs the safe way -- the gate refuses books the backtest would now be willing to
+    price, not the reverse. 50bp remains the per-leg cost the model assumes for a $5M/day book,
+    so a spread at the threshold still costs a whole leg on its own with the taker fee wholly
+    outside it. Validated to (0, 0.10] at load: 0 would silently disarm the
     gate, and anything past 10% is not a threshold a thin-book guardrail could meaningfully
     have crossed by accident.
     """

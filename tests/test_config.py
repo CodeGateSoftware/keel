@@ -573,9 +573,12 @@ def test_load_config_logging_empty_file_raises_configerror(write_config):
 
 
 def test_load_config_execution_defaults_to_a_50bp_entry_spread_cap(valid_config_path):
-    """Omitted -> the conservative default 0.005 (50bp), anchored to #334's
-    `strategy/backtest.SLIPPAGE_CAP_PCT`: if the spread ALONE exceeds the worst per-leg cost
-    the backtest ever assumes, the fill economics are materially worse than modeled."""
+    """Omitted -> the conservative default 0.005 (50bp), set by #334 to equal
+    `strategy/backtest.SLIPPAGE_CAP_PCT`. #523 moved that cap to 183.8bp and left this gate
+    alone, so they are now independent numbers and this one is the stricter: a spread that
+    costs a whole leg on its own means fill economics materially worse than modeled. Pinned as
+    a LITERAL, deliberately -- if this default is ever meant to follow the backtest cap again,
+    that has to be a decision someone writes down, not a coincidence that survives."""
     config = load_config(valid_config_path)
 
     assert config.execution.max_entry_spread_pct == Decimal("0.005")

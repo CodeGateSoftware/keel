@@ -29,7 +29,11 @@ from keel.cli import cli
 from keel.commands._common import DISCLAIMER
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT
+from keel.strategy.backtest import (
+    SLIPPAGE_CAP_PCT,
+    SLIPPAGE_FLOOR_PCT,
+    SLIPPAGE_REFERENCE_QUOTE_VOLUME,
+)
 from keel.types import Candle, Granularity
 from tests.conftest import VALID_CONFIG_YAML
 
@@ -1464,8 +1468,14 @@ def _seed_liquidity_stratified_candles(repo: Repository, now_ts: int) -> None:
     simulate path's per-product slippage has something to scale from.
 
     BTC's daily bars carry volume*close == 500,000,000 == the mapping's anchor (-> the 5bp
-    floor); PAXG's carry 100 (-> the 50bp cap); ETH has NO daily bars cached at all (-> the
-    flat fallback, flagged). Hourly bars exist for all three so the account pass runs.
+    floor); PAXG's carry 100, four orders of magnitude below the corpus tail (-> the cap, 183.8bp
+    since #523); ETH has NO daily bars cached at all (-> the flat fallback, flagged). Hourly bars
+    exist for all three so the account pass runs.
+
+    PAXG's $100/day here is a FIXTURE, not its real liquidity: live PAXG medians $1.25M/day and
+    since #523 that is inside the sqrt region, priced at ~100bp by its own volume rather than
+    clamped. The fixture wants a row that provably reaches the clamp, which now requires
+    something thinner than anything real.
     """
     hour = now_ts - (now_ts % 3600)
 
@@ -1526,7 +1536,11 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
     # The terminal states what was assumed per product, from the cached candles alone.
     assert "slippage" in result.output.lower()
     assert "BTC-USD" in result.output and "5.0bp" in result.output
-    assert "PAXG-USD" in result.output and "50.0bp" in result.output and "capped" in result.output
+    assert (
+        "PAXG-USD" in result.output
+        and f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" in result.output
+        and "capped" in result.output
+    )
     assert "ETH-USD" in result.output and "fallback" in result.output
     assert "no liquidity statistic" in result.output
 
@@ -1534,9 +1548,51 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
     report_text = out_path.read_text()
     assert "1.2000%" in report_text
     assert "BTC-USD" in report_text and "5.0bp" in report_text
-    assert "PAXG-USD" in report_text and "50.0bp" in report_text
+    assert "PAXG-USD" in report_text and f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" in report_text
     assert "ETH-USD" in report_text and "no liquidity statistic" in report_text
     assert "assumption, not a measurement" in report_text
+
+
+def test_simulate_prints_floor_cap_and_anchor_beside_every_result(tmp_path, monkeypatch):
+    """#523 acceptance criterion 2: whatever the cap's value, `keel simulate` keeps printing
+    floor/cap/anchor beside the per-product table -- in the terminal AND in the written report.
+
+    This is the criterion the whole issue is about. A rate is only evidence if a reader can
+    recompute it, and `floor x sqrt(anchor / volume)` clamped is not recomputable from a
+    printed basis-point number alone: all three parameters have to travel with it. The cap in
+    particular has now moved once (50bp -> 183.8bp), so a report that omitted it would leave
+    two runs a year apart looking comparable when they are not.
+
+    Every expectation is built FROM the constants, so this pins the presence of each parameter
+    rather than today's value of it -- retuning the model keeps this test green; dropping a
+    parameter from the block does not.
+    """
+    db_path = tmp_path / "sim.db"
+    out_path = tmp_path / "report.md"
+    repo = _repo_at(db_path)
+    _seed_liquidity_stratified_candles(repo, int(time.time()))
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "simulate", "--no-fetch", "--years", "1", "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected = [
+        f"floor {SLIPPAGE_FLOOR_PCT * 10000:.1f}bp",
+        f"cap {SLIPPAGE_CAP_PCT * 10000:.1f}bp",
+        f"anchor ${SLIPPAGE_REFERENCE_QUOTE_VOLUME:,.0f}/day",
+    ]
+    report_text = out_path.read_text()
+    for fragment in expected:
+        assert fragment in result.output, f"terminal lost {fragment!r}"
+        assert fragment in report_text, f"report lost {fragment!r}"
+
+    # And beside EVERY result, not merely somewhere in the file: the block sits in the same
+    # output as the per-product rows it explains.
+    for product in ("BTC-USD", "PAXG-USD", "ETH-USD"):
+        assert product in result.output and product in report_text
 
 
 def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monkeypatch):

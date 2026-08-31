@@ -7,14 +7,17 @@ hand-built candle series where the expected outcome is known exactly.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from keel_core.config import FeesConfig
 
+from keel.compliance.screen import ScreenPolicy
 from keel.strategy.backtest import (
     SLIPPAGE_CAP_PCT,
     SLIPPAGE_FLOOR_PCT,
     SLIPPAGE_REFERENCE_QUOTE_VOLUME,
+    SLIPPAGE_TAIL_PRODUCT,
+    SLIPPAGE_TAIL_QUOTE_VOLUME,
     TAKER_FEE_PCT,
     BacktestResult,
     backtest,
@@ -417,27 +420,33 @@ class TestLiquidityScaledSlippage:
     def test_a_product_100x_thinner_pays_10x_the_slippage(self) -> None:
         """sqrt scaling: 100x thinner -> sqrt(100) = 10x the rate, i.e. 50bp.
 
-        Pinned as a NUMBER, not an inequality: 50bp is also the cap, and that is by construction
-        (#259's cap was chosen so the clamp binds at exactly 100x below the anchor). If either
-        parameter moves, this test is the one that names the round-number relationship that broke.
+        Pinned as a NUMBER, not an inequality, so a change to the curve's shape is named here.
+        Until #523 this point was ALSO the cap -- #259 chose 50bp so the clamp bound at exactly
+        100x below the anchor -- and $5M/day is now an ordinary interior point of the sqrt
+        region, which is the correction: the band between the $1M admission floor and here is
+        the cohort that used to be flattened onto one rate.
         """
         hundred_x_thinner = SLIPPAGE_REFERENCE_QUOTE_VOLUME / Decimal(100)
 
         assert slippage_for_quote_volume(hundred_x_thinner) == Decimal("0.005")
         assert slippage_for_quote_volume(hundred_x_thinner) == SLIPPAGE_FLOOR_PCT * Decimal(10)
+        assert slippage_for_quote_volume(hundred_x_thinner) < SLIPPAGE_CAP_PCT
 
-    def test_the_cap_clamps_beyond_100x(self) -> None:
-        """TON's measured corpus median (~$370K, ~1544x below the anchor) clamps at the cap.
+    def test_the_cap_clamps_only_below_the_corpus_tail(self) -> None:
+        """Something an order of magnitude thinner than the corpus tail clamps; the tail does not.
 
-        The unclamped curve would demand ~184bp -- more than any plausible thin-book spread for
-        the 1-unit notional this engine fills. The clamp keeps the model conservative without
-        making thin products untreatable by construction.
+        Since #523 the cap is the curve read AT the tail, so the clamp is a bound for assets
+        nobody has measured -- not a rate the measured corpus is charged. A hypothetical
+        $37K/day book would demand ~581bp unclamped, far outside anything the sqrt prior was
+        fitted near; that is the extrapolation the bound exists to refuse.
         """
-        ton = Decimal("369944")
-        unclamped = SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / ton).sqrt()
+        far_below_the_tail = SLIPPAGE_TAIL_QUOTE_VOLUME / Decimal(10)
+        unclamped = SLIPPAGE_FLOOR_PCT * (
+            SLIPPAGE_REFERENCE_QUOTE_VOLUME / far_below_the_tail
+        ).sqrt()
 
         assert unclamped > SLIPPAGE_CAP_PCT  # the clamp is genuinely load-bearing here
-        assert slippage_for_quote_volume(ton) == SLIPPAGE_CAP_PCT
+        assert slippage_for_quote_volume(far_below_the_tail) == SLIPPAGE_CAP_PCT
 
     def test_more_liquid_than_the_anchor_never_pays_less_than_the_floor(self) -> None:
         """The floor is a bound, not just a starting point: BTC itself sits just above the anchor
@@ -483,14 +492,215 @@ class TestLiquidityScaledSlippage:
     def test_measured_corpus_medians_map_where_the_corpus_says_they_should(self) -> None:
         """BTC at the floor, ETH a hair above it (~6.1bp), TON at the cap -- the measured anchors
         that motivated #259, restated as the mapping's own outputs so the model can be audited
-        against the data that produced it."""
+        against the data that produced it.
+
+        TON is still the row that reaches the cap, but since #523 it does so by ARRIVING there
+        along the curve rather than by being clamped: its rounded 2026-08-16 median sits a
+        hair below the exact 2026-08-30 tail the cap is derived from, so the clamp shaves
+        0.0176bp off it. Either way it is 183.8bp -- the tail is charged what the model says
+        the tail costs.
+        """
         btc = slippage_for_quote_volume(Decimal("571268510"))
         eth = slippage_for_quote_volume(Decimal("337185168"))
         ton = slippage_for_quote_volume(Decimal("369944"))
 
         assert btc == Decimal("0.0005")
         assert Decimal("0.0005") < eth < Decimal("0.001")  # ~6.1bp
-        assert ton == Decimal("0.005")
+        assert ton == SLIPPAGE_CAP_PCT == Decimal("0.01838")
+
+
+#: The pre-#523 cap: 50bp, the round number chosen so the clamp bound at exactly 100x below the
+#: anchor. Kept here as a LITERAL on purpose. The two classes below measure the distance
+#: travelled from it, and a distance that silently follows the constant it is measured against
+#: measures nothing.
+OLD_SLIPPAGE_CAP_PCT = Decimal("0.005")
+
+
+class TestTheCapIsDerivedFromTheCorpusTail:
+    """#523: the cap is DERIVED from the thinnest measured product, and the derivation is
+    checkable here instead of being asserted in prose.
+
+    The corpus these numbers are measured over lives in a deployment database, not in this
+    repository, so no test can recompute the tail volume from live data -- re-deriving it is a
+    documented one-liner against a deployment root (see `SLIPPAGE_TAIL_QUOTE_VOLUME`'s own
+    comment in `strategy/backtest.py`). What a test CAN do, and what these do, is refuse to let
+    the four numbers drift apart: the cap must remain this module's own curve evaluated at the
+    tail volume, so editing any ONE of floor, anchor, tail volume or cap fails here.
+
+    `assert SLIPPAGE_CAP_PCT == Decimal("0.01838")` would pin nothing at all -- it restates a
+    literal already in the file, and it is exactly the shape of assertion that let a round
+    number sit unexamined for two issues.
+
+    What this deliberately does NOT catch: a change to `SLIPPAGE_TAIL_QUOTE_VOLUME` too small to
+    move the cap at reporting precision (dropping its trailing decimals, say). That is the
+    correct tolerance rather than a gap -- the cap is quantised to the tenth of a basis point,
+    so a tail volume that rounds to the same cap IS the same cap. A drift large enough to matter
+    fails: $369,944 -> $340,000 is caught at `0.01838 != 0.01917`.
+    """
+
+    def _tail_rate(self) -> Decimal:
+        """The unclamped curve at the corpus tail, computed from the constants -- the same
+        expression `slippage_for_quote_volume` evaluates, written out so the arithmetic is
+        visible rather than borrowed from the function under test."""
+        return SLIPPAGE_FLOOR_PCT * (
+            SLIPPAGE_REFERENCE_QUOTE_VOLUME / SLIPPAGE_TAIL_QUOTE_VOLUME
+        ).sqrt()
+
+    def test_the_cap_is_the_curve_read_at_the_tail(self) -> None:
+        """floor x sqrt(anchor / tail volume), quantised to the tenth of a basis point every
+        caller reports at. This is the whole claim the constant makes about itself."""
+        assert SLIPPAGE_CAP_PCT == self._tail_rate().quantize(
+            Decimal("0.00001"), rounding=ROUND_HALF_UP
+        )
+
+    def test_the_quantisation_is_invisible_to_every_consumer(self) -> None:
+        """Rounding 183.8175bp to 183.8bp discards 0.0176bp, which no caller can print: both
+        `commands/simulate.render_slippage_assumptions` and `sim/report._render_slippage_rows`
+        format at one decimal place. A derivation whose rounding CHANGED the reported number
+        would be a fifth number in disguise."""
+        discarded = self._tail_rate() - SLIPPAGE_CAP_PCT
+
+        assert abs(discarded) <= Decimal("0.000005")  # at most half a tenth of a bp
+        assert f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" == f"{self._tail_rate() * 10000:.1f}bp"
+        assert f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" == "183.8bp"
+
+    def test_the_tail_product_is_named_beside_its_volume(self) -> None:
+        """A volume without the product it was measured on is unrecoverable: nobody can re-run
+        the one-liner. The constant that says WHICH asset is part of the derivation."""
+        assert SLIPPAGE_TAIL_PRODUCT == "TON-USD"
+        assert slippage_for_quote_volume(SLIPPAGE_TAIL_QUOTE_VOLUME) == SLIPPAGE_CAP_PCT
+
+    def test_the_clamp_now_binds_beneath_the_admission_floor(self) -> None:
+        """The defect #523 names, pinned from the other side.
+
+        The clamp binds at `anchor x (floor / cap)^2`. Under the old 50bp cap that was
+        $5,000,000/day while `ScreenPolicy.min_median_daily_volume` admits from $1,000,000/day,
+        so the entire $1M-$5M band was simultaneously admissible and capped -- one identical
+        rate across a 4.3x spread in liquidity, the flat-fee model #259 shipped to remove. At
+        the tail-derived cap the binding point is ~$370K/day, BELOW the admission floor, so no
+        admissible product can be clamped: every one of them is priced by its own liquidity.
+        """
+        admission_floor = ScreenPolicy().min_median_daily_volume
+
+        def binds_below(cap: Decimal) -> Decimal:
+            return SLIPPAGE_REFERENCE_QUOTE_VOLUME * (SLIPPAGE_FLOOR_PCT / cap) ** 2
+
+        assert binds_below(OLD_SLIPPAGE_CAP_PCT) > admission_floor  # the defect
+        assert binds_below(SLIPPAGE_CAP_PCT) < admission_floor  # the correction
+        # and the thinnest ADMISSIBLE product is strictly inside the sqrt region
+        assert SLIPPAGE_FLOOR_PCT < slippage_for_quote_volume(admission_floor) < SLIPPAGE_CAP_PCT
+
+    def test_the_admission_floor_itself_did_not_move(self) -> None:
+        """#523 option 3 -- raising the admission floor to $5M/day -- was measured and rejected:
+        it changes no rate for any asset it keeps and disqualifies live PAXG at $1.25M median.
+        This change is option 1 only. If the floor ever moves, that is its own decision."""
+        assert ScreenPolicy().min_median_daily_volume == Decimal("1000000")
+
+
+class TestControlsAboveTheCapThresholdAreUnaffected:
+    """#523 acceptance criterion 3: an asset above the cap threshold (BTC/ETH) is unchanged by
+    the cap moving -- proved by running the engine at both caps, not by reading the clamp.
+
+    The controls are the load-bearing half of the file: without a cohort asset that DOES move,
+    every "identical" assertion here would be satisfied by a harness incapable of showing a
+    difference, so `test_the_capped_cohort_is_the_half_that_moves` runs the same comparison on
+    CRO and demands the opposite answer.
+
+    Medians are the ones measured on 2026-08-30 in
+    `docs/experiments/2026-08-30-slippage-cap-options.md` (a dated record, quoted, not edited).
+    """
+
+    _BTC = Decimal("568492017.0755083632")
+    _ETH = Decimal("330302563.9767160125")
+    _CRO = Decimal("1139342.39804")
+
+    @staticmethod
+    def _rate_under_cap(volume: Decimal, cap: Decimal) -> Decimal:
+        """`slippage_for_quote_volume` with the clamp's thin end supplied by the caller.
+
+        Restated rather than monkeypatched, so the module under test stays the module that
+        ships and "what the OLD cap would have charged" is a value this test computes rather
+        than a global it mutates. `test_the_harness_reproduces_the_shipped_mapping` keeps the
+        restatement honest.
+        """
+        if volume <= 0:
+            return cap
+        unclamped = SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / volume).sqrt()
+        return min(max(unclamped, SLIPPAGE_FLOOR_PCT), cap)
+
+    def _candles(self) -> list[Candle]:
+        # The TestPerProductSlippageInBacktest shape: trigger at ts=60, fill at ts=120's open,
+        # exit at the target. Liquidity plays no part in the candles, so any difference between
+        # two runs is the cost model's and nothing else.
+        return [
+            _candle(0, "100", "101", "99", "100"),
+            _candle(60, "104", "106", "103", "105"),
+            _candle(120, "105", "112", "104", "108"),
+            _candle(180, "111", "135", "109", "132"),
+        ]
+
+    def _run_at(self, product_id: str, volume: Decimal, cap: Decimal) -> BacktestResult:
+        rule = _ScriptedRule(
+            60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id
+        )
+        rate = self._rate_under_cap(volume, cap)
+        return backtest(rule, self._candles(), slippage_by_product=lambda pid: rate)
+
+    def test_the_harness_reproduces_the_shipped_mapping(self) -> None:
+        """The control on the control: at the SHIPPED cap this test's clamp must agree with the
+        shipped function everywhere, or every comparison below is measuring the harness."""
+        for volume in (self._BTC, self._ETH, self._CRO, SLIPPAGE_TAIL_QUOTE_VOLUME, Decimal(0)):
+            assert self._rate_under_cap(volume, SLIPPAGE_CAP_PCT) == slippage_for_quote_volume(
+                volume
+            )
+
+    def test_control_rates_are_identical_under_both_caps(self) -> None:
+        """BTC 5.0bp, ETH ~6.1bp: both sit in the sqrt region under either cap, so the clamp
+        never touched them and moving it cannot."""
+        for volume in (self._BTC, self._ETH):
+            old = self._rate_under_cap(volume, OLD_SLIPPAGE_CAP_PCT)
+            new = self._rate_under_cap(volume, SLIPPAGE_CAP_PCT)
+
+            assert old == new == slippage_for_quote_volume(volume)
+            assert new < OLD_SLIPPAGE_CAP_PCT
+
+        # Pinned ABSOLUTELY as well as relatively. "Identical under both caps" is satisfied by
+        # any change that moves both sides together -- re-anchoring the curve instead of
+        # re-capping it, say, which is a plausible way to implement #523 and would silently
+        # move ETH. These are the rates the 2026-08-30 run measured for the controls.
+        assert slippage_for_quote_volume(self._BTC) == SLIPPAGE_FLOOR_PCT  # 5.00bp
+        assert f"{slippage_for_quote_volume(self._ETH) * 10000:.2f}" == "6.15"
+
+    def test_control_backtests_are_bit_identical_under_both_caps(self) -> None:
+        """The regression the acceptance criterion asks for, run through the engine: same rule,
+        same candles, same liquidity -- only the cap differs -- and every stat, every fill price
+        and every P&L comes back equal."""
+        for product_id, volume in (("BTC-USD", self._BTC), ("ETH-USD", self._ETH)):
+            old = self._run_at(product_id, volume, OLD_SLIPPAGE_CAP_PCT)
+            new = self._run_at(product_id, volume, SLIPPAGE_CAP_PCT)
+
+            assert new == old
+            assert new.trades[0].entry == old.trades[0].entry
+            assert new.trades[0].exit == old.trades[0].exit
+            assert new.trades[0].pnl == old.trades[0].pnl
+            assert new.profit_factor == old.profit_factor
+
+    def test_the_capped_cohort_is_the_half_that_moves(self) -> None:
+        """CRO, $1.14M/day, the thinnest admissible product in the cohort: capped at 50.0bp and
+        priced at 104.7bp by the model's own curve, a 2.09x understatement. It must move, and
+        it must move in the CONSERVATIVE direction -- worse entry, worse exit, less P&L. If this
+        passed alongside the controls only because nothing here can differ, this is the test
+        that fails."""
+        old = self._run_at("CRO-USD", self._CRO, OLD_SLIPPAGE_CAP_PCT)
+        new = self._run_at("CRO-USD", self._CRO, SLIPPAGE_CAP_PCT)
+
+        assert self._rate_under_cap(self._CRO, OLD_SLIPPAGE_CAP_PCT) == OLD_SLIPPAGE_CAP_PCT
+        assert self._rate_under_cap(self._CRO, SLIPPAGE_CAP_PCT) > OLD_SLIPPAGE_CAP_PCT
+        assert new != old
+        assert new.trades[0].entry > old.trades[0].entry
+        assert new.trades[0].exit < old.trades[0].exit
+        assert new.trades[0].pnl is not None and old.trades[0].pnl is not None
+        assert new.trades[0].pnl < old.trades[0].pnl
 
 
 class TestPerProductSlippageInBacktest:

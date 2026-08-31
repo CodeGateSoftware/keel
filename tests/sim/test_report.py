@@ -29,7 +29,7 @@ from keel.sim.report import (
     render_markdown,
 )
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, compute_tier_fee_result
-from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT, SlippageAssumption
+from keel.strategy.backtest import SLIPPAGE_CAP_PCT, SLIPPAGE_FLOOR_PCT, SlippageAssumption
 from keel.strategy.promotion import TREND_FOLLOW, PromotionConfig, floor_for_class
 from keel.strategy.rules.base import Rule, Setup, Trade
 from keel.strategy.stats import BacktestResult
@@ -749,7 +749,7 @@ def test_edge_section_states_the_per_product_slippage_actually_applied():
     """
     rows = [
         SlippageAssumption("BTC-USD", Decimal("571268510"), Decimal("0.0005")),
-        SlippageAssumption("TON-USD", Decimal("369944"), Decimal("0.005")),
+        SlippageAssumption("TON-USD", Decimal("369944"), SLIPPAGE_CAP_PCT),
         SlippageAssumption("ETH-USD", None, Decimal("0.0005")),
     ]
 
@@ -759,28 +759,37 @@ def test_edge_section_states_the_per_product_slippage_actually_applied():
     assert "1.2000%" in md
     # ...and the slippage now does too: per-product rows with volume and bp.
     assert "BTC-USD" in md and "571,268,510" in md and "5.0bp" in md
-    assert "TON-USD" in md and "369,944" in md and "50.0bp" in md
+    assert "TON-USD" in md and "369,944" in md
+    assert f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" in md
     assert "capped" in md
     # Fallback products are flagged, not silently priced.
     assert "ETH-USD" in md and "fallback" in md and "no liquidity statistic" in md
     # The mapping is stated as an assumption with its parameters, per the rule that a number
     # whose assumptions cannot be recovered is not evidence.
     assert "assumption, not a measurement" in md
-    assert "5.0bp" in md and "50.0bp" in md  # floor and cap, stated in the note
+    # floor and cap, stated in the note -- from the constants, so the note keeps naming both
+    # parameters whatever they are retuned to (#523 moved the cap once already).
+    assert f"floor {SLIPPAGE_FLOOR_PCT * 10000:.1f}bp" in md
+    assert f"cap {SLIPPAGE_CAP_PCT * 10000:.1f}bp" in md
 
 
 def test_render_markdown_carries_the_slippage_rows_into_the_written_report():
     """The report FILE must carry the per-product slippage table, not just the terminal -- #259's
-    reporting requirement names the report alongside the results."""
+    reporting requirement names the report alongside the results.
+
+    The rows are constructed directly, not derived from volumes: this is a RENDERING test. (WLD's
+    real $1.25M/day median stopped reaching the cap when #523 moved it to 183.8bp; what the row
+    needs is a capped rate, and it is given one.)
+    """
     rows = [
         SlippageAssumption("BTC-USD", Decimal("571268510"), Decimal("0.0005")),
-        SlippageAssumption("WLD-USD", Decimal("1245626"), Decimal("0.005")),
+        SlippageAssumption("WLD-USD", Decimal("1245626"), SLIPPAGE_CAP_PCT),
     ]
 
     md = _minimal_render_markdown_args([], slippage_rows=rows)
 
     assert "BTC-USD" in md and "5.0bp" in md
-    assert "WLD-USD" in md and "50.0bp" in md and "capped" in md
+    assert "WLD-USD" in md and f"{SLIPPAGE_CAP_PCT * 10000:.1f}bp" in md and "capped" in md
 
 
 def test_render_markdown_out_of_sample_label():

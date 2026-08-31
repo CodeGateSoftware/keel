@@ -88,7 +88,8 @@ sits materially off the venue's own book, so the override is visible rather than
 **The routing-time max-spread entry gate (#350).** A live BUY whose previewed book is too
 wide to enter is REFUSED after the preview and before the confirm gate/placement:
 `(best_ask - best_bid) / mid` at or beyond `execution.max_entry_spread_pct` (default 0.005,
-50bp -- #334's slippage cap as the anchor) refuses the order, and a preview with no readable
+50bp -- until #523 numerically #334's slippage cap; now an independent threshold that #523
+deliberately left where it was) refuses the order, and a preview with no readable
 bid/ask fails closed with a distinct reason. It sits BESIDE the eighteen rails, not among
 them: `guards.check` is broker-less by design, and the book exists only in the preview this
 module just fetched -- the same preview #332's warning reads (`_preview_book`: one helper,
@@ -1147,9 +1148,10 @@ def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: 
 #: A VISIBILITY threshold, not a correctness one: crossing it changes no order, only whether
 #: the operator is told. Anchored in this repo's own cost model, where a fill is priced at a
 #: 1.2% taker fee per leg (`strategy/backtest.TAKER_FEE_PCT`) plus a slippage FLOOR of 5bp
-#: (`strategy/backtest.SLIPPAGE_FLOOR_PCT`; #259 scales it up to a 50bp cap on thin books --
-#: so "10x the slippage assumption" below holds at the liquid end and narrows toward the cap,
-#: where a firing is all the more truthful). Against that, a deviation of a few bp is
+#: (`strategy/backtest.SLIPPAGE_FLOOR_PCT`; #259 scales it up on thin books, to a cap #523 then
+#: moved from 50bp to the corpus tail at 183.8bp -- so "10x the slippage assumption" below holds
+#: at the liquid end and inverts on the thin end, where the model now assumes MORE per leg than
+#: this threshold and a firing says less than it used to). Against that, a deviation of a few bp is
 #: microstructure -- the
 #: drift any enter-at-close rule (`turtle_breakout`, `rsi_meanrev`) accumulates by routing one
 #: cycle after its signal bar -- while tens of bp means the rule's entry encodes a CONDITION:
@@ -1339,11 +1341,19 @@ def _entry_spread_gate(
 
     **What it decides.** For a BUY on the live path, `(best_ask - best_bid) / mid` at or
     beyond `execution.max_entry_spread_pct` (default 0.005 = 50bp) refuses the order BEFORE
-    the confirm gate and placement. The anchor is #334's backtest slippage cap
-    (`strategy.backtest.SLIPPAGE_CAP_PCT`): the backtest never assumes more than 50bp of
-    per-leg slippage even on the thinnest book, so a spread AT the cap has already consumed
-    the model's entire worst-case cost estimate and the taker fee rides outside the model --
-    the fill economics are materially worse than anything the rule was measured on. The
+    the confirm gate and placement. 50bp was chosen (#334) as the backtest's slippage cap:
+    the backtest then assumed no more than 50bp of per-leg slippage even on the thinnest book,
+    so a spread AT the threshold had already consumed the model's entire worst-case cost while
+    the taker fee rode outside it.
+
+    #523 moved that cap to the corpus tail (183.8bp) and deliberately did NOT move this gate,
+    which is why the two are now separate numbers rather than one. Loosening a live entry rail
+    is its own decision, not a side effect of correcting a research cost model, and the drift
+    runs in the safe direction: the gate is now STRICTER than the model's worst case rather
+    than equal to it, refusing books the model would be willing to price. 50bp remains the
+    per-leg cost the model assumes for a $5M/day book -- a spread that wide is already several
+    times what any liquid book charges, and the fill economics are materially worse than
+    anything the rule was measured on. The
     comparison is `>=`, the fail-closed side of the line, UNLIKE #332's visibility-only
     strictly-greater: at the threshold the spread alone equals the model's worst case, which
     is already too wide to enter on this reasoning.
@@ -1422,8 +1432,9 @@ def _entry_spread_gate(
         veto=SPREAD_GATE_VETO,
         detail=(
             "refused at routing: the live book's spread alone is at/beyond "
-            "execution.max_entry_spread_pct, so the fill would cost more than the worst "
-            "per-leg cost the backtest ever models (#334's slippage cap) -- entries into "
+            "execution.max_entry_spread_pct, so the spread by itself costs more per leg than "
+            "the model assumes for a $5M/day book (#334 set this at the backtest's slippage "
+            "cap; #523 moved that cap and left this threshold where it was) -- entries into "
             "this book wait for it to tighten (#350)"
         ),
     )
