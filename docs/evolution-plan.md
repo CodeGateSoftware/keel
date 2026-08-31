@@ -99,6 +99,14 @@ table). Site: #117 (roadmap page), #120 (ADR docs sync).
   Confirmations carry `idempotency_key` + `proposal_hash`, both; a mismatch is refused and
   proposals expire — so a retried approval over a flapping tunnel deduplicates cleanly,
   and a replayed key can never approve a regenerated proposal.
+- **The price-drift gate** — an async approval is not a fresh quote: the envelope also
+  carries `price_at_proposal` and a per-product drift tolerance. **Entries** exceeding it
+  are refused with a named code and re-proposed at the next cycle; **exits are never
+  walled off** — they degrade to the typed-phrase friction path, the same principle
+  `_ask_to_place` already documents (trapping a position behind a gate is a worse money
+  outcome than a warned order). The tolerance is derived — per-product, from measured
+  spread once #626's capture lands — never a flat constant: a chosen number is the #523
+  mistake in miniature.
 
 Why this and not a hosted app: a hosted executor can never honestly say "we can't see your
 data" — the operator ships the code that runs beside the plaintext keys. The only
