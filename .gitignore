@@ -71,3 +71,9 @@ htmlcov/
 # Raw venue responses recorded by scripts/robinhood_order_probe.py. Recorded from a REAL
 # account, so they are reviewed by hand before any of it becomes a committed fixture.
 .robinhood-probe/
+
+# Browser console logs written by the Playwright MCP server when an agent drives a
+# browser from the repo root. Scratch output of a research session, never an artifact:
+# 74 of these appeared during the 2026-08-30 venue research and would have travelled
+# into the next commit that ran `git add -A`.
+.playwright-mcp/
