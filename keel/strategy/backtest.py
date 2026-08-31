@@ -80,6 +80,8 @@ __all__ = [
     "SLIPPAGE_CAP_PCT",
     "SLIPPAGE_FLOOR_PCT",
     "SLIPPAGE_REFERENCE_QUOTE_VOLUME",
+    "SLIPPAGE_TAIL_PRODUCT",
+    "SLIPPAGE_TAIL_QUOTE_VOLUME",
     "TAKER_FEE_PCT",
     "BacktestResult",
     "SlippageAssumption",
@@ -149,13 +151,62 @@ TAKER_FEE_PCT = Decimal("0.012")
 #: was never the problem, so the correction leaves it exactly where it was.
 SLIPPAGE_FLOOR_PCT = Decimal("0.0005")
 
-#: The per-leg rate the thinnest products are charged (50bp). A round cap in the "tens of bp"
-#: the issue asked for, chosen so it binds at exactly 100x below the anchor (sqrt(100) = 10x the
-#: floor) -- a relationship a reader can recover without reading this file's source. The corpus
-#: tail (TON ~1544x below the anchor) would demand ~184bp unclamped, more than any plausible
-#: thin-book spread for the 1-unit notional this engine fills; the cap keeps the model
-#: conservative without declaring thin products untreatable by construction.
-SLIPPAGE_CAP_PCT = Decimal("0.005")
+#: The thinnest product in the measured corpus, and the median daily quote volume that makes it
+#: the tail (measured 2026-08-30 over full cached ONE_DAY history; 5,902 cached ONE_HOUR bars).
+#: Named constants rather than a number left in prose, because `SLIPPAGE_CAP_PCT` below is
+#: DERIVED from them and `tests/strategy/test_backtest.py::TestTheCapIsDerivedFromTheCorpusTail`
+#: re-does the arithmetic -- the three numbers cannot drift apart silently, which is the whole
+#: difference between a derived bound and a magic number.
+#:
+#: Re-derive from a deployment root, the same one-liner #259 documents for the anchor, pointed
+#: at the tail and repeated across cached products to confirm nothing is thinner:
+#: `python -c "from keel.data.repository import Repository;
+#: from keel.compliance.screen import median_daily_quote_volume; import sqlite3;
+#: print(median_daily_quote_volume(Repository(sqlite3.connect('keel.db')).get_candles(
+#: 'TON-USD', 'ONE_DAY')))"`, full cached history, upper median on even-length series.
+SLIPPAGE_TAIL_PRODUCT = "TON-USD"
+SLIPPAGE_TAIL_QUOTE_VOLUME = Decimal("369944.11414")
+
+#: The per-leg rate the thinnest products are charged: 183.8bp, and deliberately NOT a round
+#: number (#523). It is this module's own curve evaluated at the corpus tail --
+#: `SLIPPAGE_FLOOR_PCT * sqrt(SLIPPAGE_REFERENCE_QUOTE_VOLUME / SLIPPAGE_TAIL_QUOTE_VOLUME)`,
+#: 183.8175bp, quantised to the tenth of a basis point every caller reports at (the 0.0176bp
+#: discarded is 1e-4 of the value, an order of magnitude below what any consumer prints). So
+#: the cap is no longer a second cost estimate chosen independently of the model: it IS the
+#: model, read at the thinnest thing that has been measured, and it binds only for something
+#: THINNER than anything measured.
+#:
+#: What it replaced, and why that could not stand. Until #523 this was 0.005 -- 50bp, "a round
+#: cap in the tens of bp", chosen so it bound at exactly 100x below the anchor. That
+#: relationship was legible, and it was also the defect. The clamp bound at $5M/day while
+#: `compliance.screen.ScreenPolicy.min_median_daily_volume` admits from $1M/day, so every
+#: product in that band was simultaneously admissible and capped: 17 of 30 cached products
+#: capped, 16 of them admissible, all charged an identical 50.0bp across a 4.3x spread in
+#: liquidity. Inside that band the square-root model degenerated into the flat-fee model
+#: #259/#334 shipped to remove -- removed for the liquid half of the universe and silently
+#: retained for the thin half, on the half where the error runs in the FLATTERING direction.
+#: Measured cost of the correction (`docs/experiments/2026-08-30-slippage-cap-options.md`, 30
+#: products x 7 arms, `turtle_breakout`, read at n >= 100): 0.3%-24.0% of net profit factor
+#: across the cohort, every one of them in the conservative direction, and no verdict moved,
+#: because nothing was net-positive at either rate. The cap was masking severity, not viability.
+#:
+#: At 183.8bp the clamp binds only below ~$370,015/day -- beneath the admission floor -- so no
+#: ADMISSIBLE product is capped today and every admissible product is priced by its own
+#: liquidity. The bound survives anyway, for the two jobs removing it outright would not do:
+#: volume <= 0 (no evidence of liquidity) still needs a fail-closed answer, and a future asset
+#: thinner than the tail still deserves a bound rather than an unbounded extrapolation of a
+#: curve fitted nowhere near it. "Cap at the tail" and "no cap at all" are bit-identical on
+#: every product cached today, so keeping the bound costs nothing measurable.
+#:
+#: What this does NOT fix, recorded here because the old cap was hiding it. The curve itself
+#: still prices a clip this deployment does not trade: inverting the square-root impact law at
+#: these rates implies an order of $26k-$165k, while the live deployment fills $50. The 50bp cap
+#: was accidentally holding that overstatement down, so raising it removes one unjustified
+#: number and leaves the larger one exposed. That is #626 (keel stores no spread data to price
+#: the clip it actually trades) and this constant does not address it. An honest overstatement
+#: beats two errors cancelling to a number nobody can defend -- but it is still an
+#: overstatement, and this cap does not make the model right.
+SLIPPAGE_CAP_PCT = Decimal("0.01838")
 
 #: The median daily quote volume (USD) that maps to the floor: $500M/day. Measured corpus top
 #: (BTC) is $571M, just above it -- BTC itself clamps to the floor, and so does anything more
@@ -174,9 +225,11 @@ def slippage_for_quote_volume(median_daily_quote_volume: Decimal) -> Decimal:
     liquidity is proxied by the one statistic it does compute. Every parameter is stated above
     as a conservative choice, because a number whose assumptions cannot be recovered is not
     evidence. The mapping is monotone (more liquid -> never more slippage) and bounded at both
-    ends (the floor at/below the anchor, the cap at 100x below it). Volume 0 -- what
-    `median_daily_quote_volume` returns for empty input -- maps to the cap: no evidence of
-    liquidity is maximally thin, the fail-closed direction.
+    ends: the floor at/below the anchor, and the cap below the corpus tail (~$370,015/day since
+    #523, beneath the $1M admission floor -- so the clamp no longer flattens the whole
+    admissible-but-thin cohort onto one rate). Volume 0 -- what `median_daily_quote_volume`
+    returns for empty input -- maps to the cap: no evidence of liquidity is maximally thin, the
+    fail-closed direction.
     """
     if median_daily_quote_volume <= 0:
         return SLIPPAGE_CAP_PCT

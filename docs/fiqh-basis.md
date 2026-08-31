@@ -162,7 +162,7 @@ refuses a live BUY whose previewed book shows `(best_ask − best_bid) / mid` at
 rails are broker-less by design and the book exists only in the venue's preview response.
 BUY-only (exits must execute), live-only (paper fills are synthetic and see no book), and
 fails closed on an unreadable book — the same fail-closed family as rails 12/13/17, justified
-by trading evidence (the backtest's worst-case per-leg cost assumption), carrying no
+by trading evidence (the per-leg cost the backtest assumes for a liquid book), carrying no
 religious claim.
 
 Rail 7 carries a correction this repository records prominently: §65.6 holds that

@@ -450,10 +450,12 @@ half it can:
   only ever be a 2% position.
 - **Live path (#350):** a **routing-time maximum-spread gate** refuses a live BUY when the
   venue's own previewed book shows `(best_ask − best_bid) / mid` at or beyond
-  `execution.max_entry_spread_pct` — default **0.005 (50bp)**, anchored to the backtest's
-  worst-case per-leg slippage assumption (#334's `SLIPPAGE_CAP_PCT`): if the spread ALONE
-  consumes the model's entire cost estimate, the fill economics are materially worse than
-  anything the rule was measured on, and the entry waits for the book to tighten.
+  `execution.max_entry_spread_pct` — default **0.005 (50bp)**, set by #334 to equal the
+  backtest's slippage cap (`SLIPPAGE_CAP_PCT`). #523 moved that cap to the corpus tail
+  (183.8bp) and deliberately left this gate at 50bp, so the two are now independent and the
+  gate is the stricter of the pair: if the spread ALONE costs more per leg than the model
+  assumes for a $5M/day book, the fill economics are materially worse than anything the rule
+  was measured on, and the entry waits for the book to tighten.
 
 The gate is BUY-only (exits must execute — the same principle that makes rail 17 halt entries,
 not exits), **fails closed** (a live BUY whose preview carries no readable bid/ask is refused

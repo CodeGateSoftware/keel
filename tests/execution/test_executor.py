@@ -2873,9 +2873,10 @@ class TestMaxSpreadEntryGate:
     paper mode never runs it (paper fills are synthetic and see no book, which is exactly why
     the paper-hourly profile accrues NO evidence about this gate).
 
-    Default threshold under test: `execution.max_entry_spread_pct` = 0.005 (50bp), anchored to
-    #334's `SLIPPAGE_CAP_PCT` -- if the spread ALONE exceeds the worst per-leg cost the
-    backtest ever assumes, the fill economics are materially worse than modeled.
+    Default threshold under test: `execution.max_entry_spread_pct` = 0.005 (50bp), set by #334
+    to equal `SLIPPAGE_CAP_PCT` and left at 50bp when #523 moved that cap to 183.8bp -- so the
+    gate is now the stricter of the two, refusing books the backtest would price. If the spread
+    ALONE costs a whole leg, the fill economics are materially worse than modeled.
     """
 
     def test_a_wide_book_refuses_the_live_buy_before_any_placement(self, repo, caplog) -> None:
@@ -2944,9 +2945,9 @@ class TestMaxSpreadEntryGate:
         """The boundary is pinned: >= refuses, a hair under passes.
 
         49,000/51,000 is a 2,000-wide book on a 50,000 mid -- exactly 0.04. AT the line the
-        spread alone already consumes the model's entire worst-case per-leg cost, leaving the
-        taker fee wholly outside it, so "at" is already too wide -- the fail-closed side of
-        the line, unlike #332's visibility-only strictly-greater.
+        spread alone already costs more per leg than the model assumes for a liquid book,
+        leaving the taker fee wholly outside it, so "at" is already too wide -- the fail-closed
+        side of the line, unlike #332's visibility-only strictly-greater.
         """
         from keel.config import ExecutionConfig
 

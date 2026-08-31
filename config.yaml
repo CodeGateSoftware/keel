@@ -157,9 +157,11 @@ research:
 # beyond it is REFUSED before placement, so a thin book cannot be entered when its spread
 # alone makes the fill materially more expensive than the cost model assumes. BUY entries
 # only (SELLs/exits are never gated) and the live path only -- paper fills are synthetic and
-# see no book, so the paper profiles accrue no evidence about this gate. 0.005 = 50bp,
-# anchored to the backtest's worst-case per-leg slippage assumption (#334's slippage cap):
-# a spread AT that line has already consumed the model's entire cost estimate. Valid range
-# (0, 0.10] -- a fraction of price, not basis points.
+# see no book, so the paper profiles accrue no evidence about this gate. 0.005 = 50bp, set by
+# #334 to equal the backtest's slippage cap; #523 moved that cap to 183.8bp and left this
+# threshold alone, so the gate is now STRICTER than the model's worst case, not equal to it.
+# 50bp is still the per-leg cost the model assumes for a $5M/day book -- a spread that wide
+# consumes a whole leg on its own. Valid range (0, 0.10] -- a fraction of price, not basis
+# points.
 execution:
   max_entry_spread_pct: 0.005
