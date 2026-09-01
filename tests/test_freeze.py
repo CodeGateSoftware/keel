@@ -140,10 +140,24 @@ def test_the_spec_builds_onedir_and_does_not_compress() -> None:
 
 def test_the_spec_entry_point_exists_and_calls_the_repositorys_cli() -> None:
     """Pointing PyInstaller at the INSTALLED console script would freeze whatever that script
-    happened to be in the build environment rather than this repository's CLI."""
+    happened to be in the build environment rather than this repository's CLI.
+
+    It must import from `keel.cli` -- and specifically `main`, not `cli`, since #663: `main` is
+    where the closed-stdout handler lives, and a frozen bundle that called `cli` directly would
+    be the ONE build without it. That is the build the Windows release leg runs, and the one
+    that died on `brokers list | head -1`.
+    """
     entry = _ROOT / "packaging" / "entry.py"
     assert entry.exists()
-    assert "from keel.cli import cli" in entry.read_text(encoding="utf-8")
+    source = entry.read_text(encoding="utf-8")
+    assert "from keel.cli import main" in source, (
+        "the frozen entry point must import this repository's CLI entry, not the installed script"
+    )
+    assert "    main()" in source, "the frozen entry point must CALL main, not merely import it"
+    assert "from keel.cli import cli" not in source, (
+        "calling `cli` directly skips main()'s closed-stdout handler -- the frozen Windows "
+        "bundle is exactly where that failure surfaced (#663)"
+    )
 
 
 def test_the_packaging_directory_ships_no_python_package_marker() -> None:

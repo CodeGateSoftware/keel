@@ -35,7 +35,7 @@ dependencies = [
 ]
 
 [project.scripts]
-keel = "keel.cli:cli"
+keel = "keel.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.10.4,<0.13.0"]
