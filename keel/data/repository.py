@@ -51,6 +51,12 @@ _ORDER_COLUMNS = (
     # executed. NULL on rows written before the column existed -- "not observed", so readers
     # fall back to `qty`, the behaviour those rows always had.
     "filled_quantity",
+    # The venue's own book at SUBMIT (#626), stored as the raw pair the venue gave rather than
+    # a derived spread -- `expected_fill`/`actual_fill` are the precedent. NULL is "not
+    # observed": a preview with no readable book, and every paper row (paper has no venue
+    # preview at all).
+    "submit_best_bid",
+    "submit_best_ask",
     "raw_response",
     "confirmation",
     "rule_id",
@@ -64,6 +70,10 @@ _ORDER_MONEY_FIELDS = (
     "expected_fill",
     "actual_fill",
     "filled_quantity",
+    # Prices, so they round-trip through `str(Decimal(...))` like every other price here (#626).
+    # A book read back as `float` would defeat the point of recording it exactly.
+    "submit_best_bid",
+    "submit_best_ask",
 )
 
 _SIGNAL_COLUMNS = ("rule_id", "product_id", "ts", "indicators", "cts_score", "fired")

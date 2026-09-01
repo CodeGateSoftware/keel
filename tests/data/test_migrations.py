@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 15
+    assert version == db.SCHEMA_VERSION == 16
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -612,7 +612,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 15
+    assert stamped == db.SCHEMA_VERSION == 16
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -773,7 +773,7 @@ def test_v15_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 15
+    assert stamped == db.SCHEMA_VERSION == 16
 
 
 def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
@@ -786,3 +786,132 @@ def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_presen
     db.migrate(conn)  # must not raise
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")]
     assert cols.count("credential_fingerprint") == 1
+
+
+# -- v16: the venue's book at submit, on the orders row (#626) ----------------
+
+
+def _v15_orders_table(conn: sqlite3.Connection) -> None:
+    """The `orders` table exactly as v15 shipped it -- no `submit_best_*`.
+
+    Written out longhand rather than derived from `_SCHEMA_STATEMENTS`, for the reason the v10
+    fixture above is: a fixture that reads today's DDL would gain the new columns the moment the
+    schema does, and then prove nothing about upgrading a database that predates them.
+    """
+    conn.execute(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_type TEXT,
+            qty TEXT NOT NULL,
+            limit_price TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            fee TEXT,
+            expected_fill TEXT,
+            actual_fill TEXT,
+            filled_quantity TEXT,
+            raw_response TEXT,
+            confirmation TEXT,
+            rule_id INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+
+
+def _v15_database() -> sqlite3.Connection:
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (15)")
+    _v15_orders_table(conn)
+    conn.commit()
+    return conn
+
+
+def test_migration_to_v16_adds_the_submit_book_columns() -> None:
+    """#626: the venue's own best bid/ask at the moment the order was submitted. keel already
+    fetched this (the preview #350's spread gate reads) and threw it away -- at this
+    deployment's $50 clips the modelled cost is essentially all spread, and nothing stored it."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert {"submit_best_bid", "submit_best_ask"} <= cols
+
+
+def test_an_existing_orders_table_gains_the_submit_book_by_ALTER() -> None:
+    """A v15 database got its `orders` from an older `CREATE TABLE IF NOT EXISTS`, which never
+    adds a column (the v8 lesson). The step must ALTER, and the four rows in the live
+    deployment's database must read back NULL.
+
+    NO BACKFILL is the load-bearing half, which is why the fixture row below carries an
+    `expected_fill` and an `actual_fill`: those are the two numbers a well-meaning backfill
+    would reach for, and either would put a FABRICATED book -- a fill price is not a quote, and
+    a quote is not two copies of one number -- into the exact table #523 will read to decide a
+    cost model. No book can be reconstructed for a 2026-07/08 order after the fact. NULL is
+    "not observed", and it is the only honest value.
+    """
+    conn = _v15_database()
+    conn.execute(
+        """
+        INSERT INTO orders (
+            mode, product_id, side, qty, status, expected_fill, actual_fill, fee,
+            created_at, updated_at
+        )
+        VALUES ('live', 'BTC-USD', 'BUY', '0.01', 'filled', '50000', '50012.5', '0.3', 1, 1)
+        """
+    )
+    conn.execute("CREATE TABLE agent_state (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+
+    db.migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert {"submit_best_bid", "submit_best_ask"} <= cols
+    row = conn.execute("SELECT submit_best_bid, submit_best_ask FROM orders").fetchone()
+    assert row["submit_best_bid"] is None
+    assert row["submit_best_ask"] is None
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 16
+
+
+def test_v16_is_idempotent_per_column() -> None:
+    """Both guards are independent: re-running adds nothing, and a database hand-patched with
+    only ONE of the two columns must still be able to gain the other rather than sticking."""
+    conn = _v15_database()
+    db._migrate_v16_orders_submit_book(conn)
+    conn.commit()
+    db._migrate_v16_orders_submit_book(conn)
+    conn.commit()
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)")]
+    assert cols.count("submit_best_bid") == 1
+    assert cols.count("submit_best_ask") == 1
+
+    half = _v15_database()
+    half.execute("ALTER TABLE orders ADD COLUMN submit_best_bid TEXT")
+    half.commit()
+    db._migrate_v16_orders_submit_book(half)
+    half.commit()
+    cols = [r["name"] for r in half.execute("PRAGMA table_info(orders)")]
+    assert cols.count("submit_best_bid") == 1
+    assert cols.count("submit_best_ask") == 1
+
+
+def test_v16_on_a_pre_v15_chain_does_not_duplicate_the_column() -> None:
+    """The hazard the PRAGMA guard exists for, the same one #633's v15 step documents: a
+    database arriving from v12 gets `orders` fresh from `_SCHEMA_STATEMENTS` -- which runs
+    BEFORE any numbered step and already carries both columns -- so a bare `ALTER TABLE` here
+    would raise sqlite's own "duplicate column name" and break every upgrade on this release."""
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (12)")
+    conn.commit()
+
+    db.migrate(conn)  # must not raise
+
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)")]
+    assert cols.count("submit_best_bid") == 1
+    assert cols.count("submit_best_ask") == 1
