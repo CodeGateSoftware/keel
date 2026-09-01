@@ -182,3 +182,86 @@ def test_the_cookie_outlives_the_browser_and_dies_with_the_run() -> None:
         "two serve runs handed out the same cookie -- the session token is being reused across "
         "processes, which is the persisted-secret design #634 declined"
     )
+
+
+# -- external hosts: a tunnel's own name, and nothing wider (#648) --------------------------------
+
+
+def test_an_allowlisted_external_host_is_admitted() -> None:
+    """A Cloudflare Tunnel forwards to loopback and presents the app's PUBLIC domain.
+
+    From inside the process that is indistinguishable from a rebinding attempt -- both are names
+    that resolve to a machine this server did not bind. Only the operator can tell them apart,
+    which is why the name has to be configured rather than inferred.
+    """
+    policy = HostPolicy(
+        bound_host="127.0.0.1", port=8765, external_hosts=frozenset({"keel.example.com"})
+    )
+    assert policy.permits("keel.example.com:8765")
+    assert policy.permits("keel.example.com")
+
+
+def test_allowlisting_one_name_admits_no_other() -> None:
+    """**The pin that matters.** The defence is not weakened, it is extended by exactly one name."""
+    policy = HostPolicy(
+        bound_host="127.0.0.1", port=8765, external_hosts=frozenset({"keel.example.com"})
+    )
+    assert not policy.permits("evil.example:8765")
+    assert not policy.permits("keel.example.com.evil.example:8765")
+    assert not policy.permits("sub.keel.example.com:8765")
+
+
+def test_the_loopback_rules_are_unchanged_by_an_allowlist() -> None:
+    """Adding an external name must not disturb what the bind already permitted, in either
+    direction: every loopback spelling still answers, and a rebinding attempt still does not."""
+    policy = HostPolicy(
+        bound_host="127.0.0.1", port=8765, external_hosts=frozenset({"keel.example.com"})
+    )
+    for host in ("127.0.0.1:8765", "localhost:8765", "[::1]:8765"):
+        assert policy.permits(host), host
+    assert not policy.permits("evil.example:8765")
+    assert not policy.permits(None)
+
+
+def test_the_port_check_still_applies_to_a_proxied_request() -> None:
+    """A proxied request is not exempt from being addressed to THIS server."""
+    policy = HostPolicy(
+        bound_host="127.0.0.1", port=8765, external_hosts=frozenset({"keel.example.com"})
+    )
+    assert not policy.permits("keel.example.com:9000")
+
+
+def test_an_external_host_is_matched_case_insensitively() -> None:
+    """DNS is case-insensitive and a proxy may present any casing. Refusing on case would be a
+    defence that fails open in the operator's head -- they configured the name, it looks right,
+    and requests are refused for a reason nothing reports."""
+    policy = HostPolicy(
+        bound_host="127.0.0.1", port=8765, external_hosts=frozenset({"keel.example.com"})
+    )
+    assert policy.permits("KEEL.Example.COM:8765")
+
+
+@pytest.mark.parametrize(
+    "wildcard", ["*", "*.example.com", ".example.com", "0.0.0.0", "::", "any", "all", ""]
+)
+def test_a_wildcard_external_host_is_refused_at_construction(wildcard: str) -> None:
+    """A wildcard is not a wider expectation -- it is the ABSENCE of one.
+
+    The rebinding defence works by naming what is expected, so `*` would answer `evil.example`
+    exactly as readily as the operator's own domain, which is the attack itself. A leading-dot
+    suffix is refused for the same reason: it admits every subdomain an attacker can provision,
+    and a tunnel presents one name.
+
+    Refused at CONSTRUCTION, not per request, so a configuration that would disable the defence
+    fails when the server starts -- visibly, once -- instead of quietly answering everything for
+    as long as it runs.
+    """
+    with pytest.raises(ValueError, match="wildcard"):
+        HostPolicy(bound_host="127.0.0.1", port=8765, external_hosts=frozenset({wildcard}))
+
+
+def test_no_external_hosts_is_the_default() -> None:
+    """Loopback-only is the posture, and remaining the posture unless someone types a name is
+    the point. A default that admitted anything would make every other test here decoration."""
+    assert HostPolicy(bound_host="127.0.0.1", port=8765).external_hosts == frozenset()
+    assert not HostPolicy(bound_host="127.0.0.1", port=8765).permits("keel.example.com:8765")

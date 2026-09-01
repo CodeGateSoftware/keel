@@ -102,10 +102,15 @@ class ServeConfig:
     #: `Any` rather than the real type for the same reason `api.load_config` returns `Any` -- this
     #: module names service objects loosely so that importing `keel/web/` stays cheap.
     build_info: Any = None
+    #: Hostnames a reverse proxy may present that this server never bound (#648). Empty by
+    #: default -- loopback-only is the posture, and remaining the posture is the point.
+    external_hosts: frozenset[str] = frozenset()
 
     @property
     def host_policy(self) -> HostPolicy:
-        return HostPolicy(bound_host=self.host, port=self.port)
+        return HostPolicy(
+            bound_host=self.host, port=self.port, external_hosts=self.external_hosts
+        )
 
     def url(self) -> str:
         host = f"[{self.host}]" if ":" in self.host else self.host

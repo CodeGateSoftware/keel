@@ -108,6 +108,29 @@ CSRF_HEADER = "X-Keel-CSRF"
 #: 127.0.0.1 -- is rejected, which is the entire point of checking the header at all.
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
+#: Spellings that mean "stop checking". Refused at construction rather than at request time so a
+#: configuration that would disable the defence fails when the server STARTS -- visibly, once --
+#: instead of quietly answering everything for as long as it runs.
+_WILDCARD_NAMES = frozenset({"*", "", "any", "all", "0.0.0.0", "::", "[::]"})
+
+
+def _reject_wildcard(name: str) -> None:
+    """Refuse an external host that is not one specific name.
+
+    The DNS-rebinding defence works by naming what is expected. A wildcard is not a wider
+    expectation, it is the absence of one, and a `*` here would answer `evil.example` exactly as
+    readily as the operator's own domain -- which is the whole attack. A leading-dot suffix
+    (`.example.com`) is refused for the same reason: it admits every subdomain an attacker can
+    provision, and a tunnel presents ONE name.
+    """
+    cleaned = name.strip().lower()
+    if cleaned in _WILDCARD_NAMES or "*" in cleaned or cleaned.startswith("."):
+        raise ValueError(
+            f"external host {name!r} is a wildcard, not a name. The DNS-rebinding defence works "
+            "by naming exactly what is expected; a wildcard removes the check rather than "
+            "widening it. List the tunnel's own hostname."
+        )
+
 
 def new_session_token() -> str:
     """A fresh token for one `keel serve` run. Never written to disk: a token that outlives the
@@ -192,6 +215,23 @@ class HostPolicy:
 
     bound_host: str
     port: int
+    #: Names a REVERSE PROXY may legitimately present that this server never bound (#648).
+    #:
+    #: A Cloudflare Tunnel forwards to loopback and passes the app's PUBLIC domain in `Host:`, so
+    #: the rebinding check refuses it -- correctly, and for exactly the same reason it refuses
+    #: `evil.example`. From inside the process the two are indistinguishable: both are names that
+    #: resolve to a machine this server did not bind. Only the OPERATOR can tell them apart, so
+    #: only the operator can name one, one at a time, in configuration.
+    #:
+    #: ⚠️ This EXTENDS the defence and never replaces it. Empty by default; a name is admitted
+    #: only by being listed; there is no wildcard and no "any" -- `_reject_wildcard` refuses the
+    #: spellings someone reaches for when a specific name is inconvenient. The port check still
+    #: applies to a proxied request the same as to a direct one.
+    external_hosts: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        for name in self.external_hosts:
+            _reject_wildcard(name)
 
     @property
     def is_loopback(self) -> bool:
@@ -207,6 +247,11 @@ class HostPolicy:
         name, port = split_host_header(host_header)
         if port is not None and port != str(self.port):
             return False
+        # Checked BEFORE the bind-derived rules, and it changes neither: an allowlisted name is
+        # an addition to what the bind permits, so the loopback and explicit-address branches
+        # below answer exactly what they answered before this field existed.
+        if name.lower() in self.external_hosts:
+            return True
         if self.is_loopback:
             return name in _LOOPBACK_NAMES
         return name == self.bound_host
