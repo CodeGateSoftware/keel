@@ -417,13 +417,22 @@ jobs:
 
           # Without the adapters as hidden imports this answers `0 adapter(s)`, and a packaged
           # keel with no venues is not a trading tool at all.
-          ADAPTERS="$("$BIN" brokers list | head -1)"
+          # CAPTURE, then filter -- never pipe the binary into something that exits early.
+          # `| head -1` closes the pipe after one line, and on Windows the next write raises
+          # `OSError: [Errno 22] Invalid argument` (EINVAL, not EPIPE), which killed the 0.13.0
+          # release leg mid-render. It only became reachable when #624 grew this command's
+          # output from 4 lines to 35; with four it finished before `head` exited. Every other
+          # check in this file already captures first -- these two were the exceptions (#663).
+          BROKERS_OUT="$("$BIN" brokers list)"
+          ADAPTERS="${BROKERS_OUT%%$'\n'*}"
           echo "$ADAPTERS"
           printf '%s' "$ADAPTERS" | grep -qE '^[1-9][0-9]* adapter' || {
             echo "::error::the bundle discovered no broker adapters"; exit 1; }
           # And the dev-only fake venue must never reach a shipped artifact: it would put a FAKE
           # VENUE in the venue list of a signed install a real person downloaded.
-          "$BIN" brokers list | grep -qi 'fake' && {
+          # Same trap as above: `grep -q` exits on first MATCH, so this would have failed
+          # exactly when it found the thing it is looking for. Reuse the captured output.
+          printf '%s' "$BROKERS_OUT" | grep -qi 'fake' && {
             echo "::error::the dev-only fake venue is in the bundle"; exit 1; } || true
 
           # Without collected package data `init-config` cannot write a config, so a first run

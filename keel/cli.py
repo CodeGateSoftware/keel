@@ -86,7 +86,11 @@ copies: `tests/commands/test_service_parity.py` pins the identity, and
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
+import os
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1557,3 +1561,47 @@ def reset_hwm(ctx: click.Context) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     cli()
+
+
+#: Errnos a write to a closed stdout raises. `EPIPE` is POSIX; **`EINVAL` is the Windows
+#: spelling**, and it is the whole reason #663 escaped -- a frozen bundle piped into `head -1`
+#: died with `OSError: [Errno 22] Invalid argument`, which no `except BrokenPipeError` catches.
+_CLOSED_STDOUT_ERRNOS = frozenset({errno.EPIPE, errno.EINVAL})
+
+
+def _is_closed_stdout(exc: BaseException) -> bool:
+    """Is `exc` a write to a reader that hung up, rather than a real I/O failure?
+
+    Deliberately NOT a blanket `except OSError`. A disk filling up mid-write raises `ENOSPC` and
+    an operator needs to hear about it; swallowing that to fix a pipe would trade a loud failure
+    for a silent one, which is the wrong direction for a tool that moves money.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _CLOSED_STDOUT_ERRNOS
+
+
+def main() -> None:
+    """The entry point for both the installed script and the frozen bundle.
+
+    `keel brokers list | head -1` is an ordinary thing to type, and so is piping into `less` and
+    quitting. Both close stdout while keel is still writing, and until #663 that produced a
+    traceback and a non-zero exit -- on Windows, where the errno is `EINVAL` rather than `EPIPE`,
+    it also took down the release workflow's own smoke test.
+
+    The devnull redirect is not decoration. Without it the interpreter tries to flush the dead
+    stream during shutdown and raises a SECOND time, after this handler has already run -- the
+    `Exception ignored while flushing sys.stdout` line in #663's traceback is exactly that.
+
+    Exit 128 + SIGPIPE(13) is the conventional status for a process whose reader hung up, which
+    is what a shell would report had Python not disabled SIGPIPE on our behalf.
+    """
+    try:
+        cli()
+    except BaseException as exc:  # noqa: BLE001 - re-raised below unless it is a closed pipe
+        if not _is_closed_stdout(exc):
+            raise
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(141)
