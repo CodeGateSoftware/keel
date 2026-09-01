@@ -4550,3 +4550,42 @@ def test_a_fully_filled_exit_still_closes_everything_and_clears_the_state(
     assert len(repo.get_trade_outcomes()) == 1
     assert repo.get_state(f"position_rule:{PRODUCT}") is None
     assert repo.get_state(f"open_stop:{PRODUCT}") is None
+
+
+# -- the orphan-bracket sweep runs, and runs LAST (#668) ----------------------------------------
+
+
+def test_run_once_sweeps_orphan_brackets_after_the_rebracket_pass(repo, monkeypatch):
+    """The sweep is wired into the cycle, and its POSITION in the cycle is the point.
+
+    A function nothing calls reports nothing, and no test above this one would notice: every
+    sweep test drives `sweep_orphan_brackets` directly. This asserts the wiring.
+
+    The order matters as much as the presence. `reconcile_unbracketed_positions` heals a tranche
+    that has no bracket, and for a tranche whose position left the account out of band it will
+    PLACE one -- against nothing. Sweeping afterwards makes the cancel the cycle's final word,
+    so nothing re-creates within the same cycle what the sweep just removed. Running it first
+    would leave a fresh orphan resting for a full day, and this deployment cycles once per UTC
+    day.
+    """
+    from keel.execution import reconcile
+
+    calls: list[str] = []
+
+    def record(name):
+        def _fn(*args, **kwargs):
+            calls.append(name)
+            return []
+
+        return _fn
+
+    monkeypatch.setattr(reconcile, "reconcile_open_orders", record("open_orders"))
+    monkeypatch.setattr(reconcile, "reconcile_unbracketed_positions", record("unbracketed"))
+    monkeypatch.setattr(reconcile, "sweep_orphan_brackets", record("orphan_sweep"))
+    repo.set_state("kill_switch", False)
+
+    run_once(FakeBroker(), repo, _config(), now_ts=90_000)
+
+    assert calls == ["open_orders", "unbracketed", "orphan_sweep"], (
+        f"expected the three reconciliation passes in order, got {calls}"
+    )

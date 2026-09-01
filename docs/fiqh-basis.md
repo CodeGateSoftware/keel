@@ -182,6 +182,14 @@ refused BUY costs nothing; a refused SELL strands a position that wanted out. An
 balance is not evidence the position is gone, and this is the one place in the engine where
 "unknown is a rejection" would do more harm than the hole it closes.
 
+Beside the rail, one sweep with the same warrant and no number: `sweep_orphan_brackets`
+(#668) cancels a resting SELL whose position has left the account. It is not a rail because it
+runs on the reconciliation pass rather than before an order, and it is order-driven where every
+other sweep is position-driven -- a protective order whose position is gone has no tranche to be
+found from. The trigger is the venue's own statement, never keel's ledger: cancelling a stop
+over a position that really exists strips a live holding of its only protection, and the ledger
+can be stale in exactly that direction.
+
 What remains open at the venue boundary is #666: on a cash account every case above is a
 rejected order rather than a short, and keel has no cash-account posture check on Coinbase —
 `verify_cash_account` exists only on the Alpaca adapter.
