@@ -94,6 +94,7 @@ from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+from keel.strategy.rules.triple_barrier import TripleBarrier
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Granularity, Side
 
@@ -136,6 +137,12 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     # does here. Registered with the honest prior on the record: at 0 of 90 measured, it is
     # expected to join the null, and it ships to BE measured rather than to be believed.
     "cusum_event": CusumEvent,
+    # #342. The other half of the same source: `cusum_event`'s entry with triple-barrier exits
+    # and a VERTICAL time stop no other kind has. Registered with a prior that #341's own
+    # measurement tightened rather than inherited -- the entry half loses at a median before
+    # any fee is charged, so a better exit has no gross edge to harvest. It ships to measure
+    # how much a better exit moves that, not to rescue it.
+    "triple_barrier": TripleBarrier,
 }
 
 # The per-kind coercion tables that used to live here -- `_DECIMAL_PARAMS`, `_GRANULARITY_PARAMS`
