@@ -1,4 +1,12 @@
 name: CI
+# The Actions list titles every run with the COMMIT MESSAGE, so four different workflows
+# triggered by one push read as four identical entries -- which is how a merge came to look
+# like a job running four times. `run-name` replaces that title with what the run IS.
+#
+# Deliberately NOT `github.event.head_commit.message`: this repository writes long,
+# multi-paragraph commit messages, the title would swallow the list, and GitHub already
+# shows the commit beside every run. The workflow's identity is the part that was missing.
+run-name: "CI · ${{ github.event_name }} · ${{ github.head_ref || github.ref_name }}"
 
 # ON EVERY MERGE, and on demand. A push to `main` is what a merge looks like from Actions' side,
 # so every merged PR now re-runs lint, the suite, and the build-identity check against the tree

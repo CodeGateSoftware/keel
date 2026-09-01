@@ -3,7 +3,7 @@
 # Why this workflow exists: the pre-launch gate names a gap that has been true since the
 # repo opened -- `SONAR_TOKEN` and `SNYK_TOKEN` were names for secrets nobody created, so
 # keel had no static analysis or dependency scanning that actually runs. This workflow is
-# the tokenless BASELINE: it runs on GITHUB_TOKEN alone, always, on every push and weekly.
+# the tokenless BASELINE: it runs on GITHUB_TOKEN alone, on every pull request and weekly.
 # `code-quality.yml` remains the optional enhanced tier (SonarQube + Snyk) for IF those
 # tokens are ever created -- its preflight skips cleanly while they are not, so the two
 # workflows disagree about nothing: baseline here, optional depth there.
@@ -12,10 +12,11 @@
 # context `test`, which ci.yml produces. A vulnerable dependency or a CodeQL finding is
 # information about the state of the world, not a verdict on a proposed change -- a new
 # CVE published against an already-pinned version must surface without waiting for a
-# merge to blame. So these jobs run alongside (on push, on PRs, and weekly on the
-# calendar, because CVEs are published against pinned versions whether or not anyone
-# pushes) without gating merges.
+# merge to blame. So these jobs run alongside (on PRs, and weekly on the calendar, because
+# CVEs are published against pinned versions whether or not anyone pushes) without gating
+# merges.
 name: security
+run-name: "Security audit · ${{ github.event_name }} · ${{ github.head_ref || github.ref_name }}"
 
 # ── WHY THIS SKIPS DOCUMENTATION, AND WHY `ci.yml` DELIBERATELY DOES NOT (#644) ──────────────
 # This workflow reads no documentation, so a docs-only change can produce no signal from it and
@@ -37,21 +38,29 @@ name: security
 #
 # SAFE HERE for two independent reasons: `main` carries no branch protection, so no check is
 # "required" and a skipped run cannot leave a pull request permanently unmergeable; and
-# `paths-ignore` applies only to `push`/`pull_request` -- `schedule` fires regardless, so the
+# `paths-ignore` applies only to `pull_request` here -- `schedule` fires regardless, so the
 # weekly cron below re-scans everything within seven days even on a pathological miss.
 #
 # `docs/**` sweeps up the experiment drivers and ledgers under `docs/experiments/`. Correct
 # here, since this workflow reads none of it; NOT correct for `ci.yml`, where
 # `docs/experiments/trials-ledger.jsonl` is a hash-chained artifact the research tests reason
 # about.
+# ── WHY THERE IS NO `push` TRIGGER ───────────────────────────────────────────────────────────
+# Both jobs ran a second time on the merge commit, and the second run cost ~2.5 minutes to
+# re-answer a question the pull-request run had answered four minutes earlier: `dependencies`
+# audits `uv.lock`, which the merge does not change, and neither job reads anything a merge
+# could combine differently. Five merges on 2026-09-01 spent ~12 minutes that way.
+#
+# ⚠️ THE COST, STATED RATHER THAN DISCOVERED. Code scanning reports alerts against the DEFAULT
+# BRANCH, and that baseline is refreshed by analyses OF the default branch -- which now means the
+# weekly cron alone. A finding introduced by a merge, or an alert a merge fixes, can therefore
+# take up to seven days to appear or clear in the Security tab. Pull-request analysis is
+# unaffected and still runs on every change, so nothing reaches `main` unscanned; what is slower
+# is the SUMMARY of what is on `main`, not the scanning itself. If that lag ever matters, put
+# `push` back rather than shortening the cron -- a daily scan pays most of the cost for a
+# fraction of the freshness.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - "LICENSE"
   pull_request:
     paths-ignore:
       - "docs/**"

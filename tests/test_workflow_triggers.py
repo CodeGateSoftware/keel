@@ -1,4 +1,4 @@
-"""Which workflows may skip a documentation-only change, and which may never (#644).
+"""Workflow-YAML invariants: which runs may skip documentation, and what a run is called.
 
 Three workflows read no documentation, so a docs-only change produces no signal from them
 and the run is pure cost. `ci.yml` is the opposite: keel's documentation is UNDER TEST, and
@@ -27,6 +27,11 @@ FILTERED = ("code-quality.yml", "security.yml", "migrate.yml")
 UNFILTERED = "ci.yml"
 
 _EXPECTED = {"docs/**", "**/*.md", "LICENSE"}
+
+#: Every workflow, because the clutter this guards against is caused by the ones nobody thinks
+#: about. Discovered from disk rather than listed, so a new workflow is covered on the day it
+#: lands instead of the day someone remembers to add it here.
+_ALL = sorted(p.name for p in _WORKFLOWS.glob("*.yml"))
 
 
 def _triggers(name: str) -> dict:
@@ -72,4 +77,35 @@ def test_ci_never_skips_a_documentation_change() -> None:
         assert not block.get("paths"), (
             f"ci.yml's `{event}` trigger has grown a paths allowlist, which skips everything "
             "NOT listed -- the same defect as paths-ignore, inverted (#644)."
+        )
+
+
+# -- what a run is CALLED ----------------------------------------------------------------------
+
+
+def test_every_workflow_names_its_own_runs() -> None:
+    """Without `run-name`, the Actions list titles every run with the COMMIT MESSAGE.
+
+    One push to `main` starts four workflows, and all four then appear under the same
+    `Merge pull request #NNN from ...` heading -- which reads as one job running four times
+    rather than four different checks running once. That is not a hypothetical: it is how this
+    pin came to exist.
+
+    The workflow's own identity is the part the default title drops, so that is what
+    `run-name` has to carry. Asserted for EVERY workflow, including the ones that only run on
+    dispatch: a release run sitting in the same list under a commit message is the same
+    confusion, just rarer.
+    """
+    assert _ALL, "no workflows found -- has .github/workflows moved?"
+    for name in _ALL:
+        doc = strict_load((_WORKFLOWS / name).read_text(encoding="utf-8"), source=name)
+        run_name = doc.get("run-name")
+        assert run_name, (
+            f"{name} has no `run-name`, so its runs are titled with the commit message and are "
+            "indistinguishable from every other workflow the same push started"
+        )
+        assert "github.event.head_commit.message" not in run_name, (
+            f"{name}'s `run-name` interpolates the commit message. This repository writes long, "
+            "multi-paragraph commit messages and GitHub already shows the commit beside every "
+            "run -- putting it in the title restores exactly the clutter run-name removes"
         )
