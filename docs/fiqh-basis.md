@@ -306,18 +306,23 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
   Whether "no underlying purpose" is disqualifying "is exactly the kind of judgement the
   screen defers to a human" (`docs/experiments/2026-07-20-candidate-universe.md`) — deferred,
   not decided.
-- **Long-only is enforced where keel DECIDES, not where it SETTLES.** Everything under
-  "Long-only" above governs what keel chooses. It does not govern the quantity that reaches
-  the venue. A SELL is never clamped to the account's available base (#667): the exit sells
-  what the ledger believes is held, and the ledger drifts from the account through fees taken
-  in the base asset, partial fills (`filled_quantity` is recorded nowhere on this
-  deployment), and out-of-band operator transfers. A resting stop leg can outlive the
-  position that justified it, because no sweep cancels a SELL whose position is gone (#668).
-  On a cash account each of these is a rejected order — bad, but not a fiqh failure. On a
-  margin-enabled account the venue fills the difference as a short, and keel has no
-  cash-account posture check on Coinbase (#666; the check exists only on the Alpaca adapter).
-  So the long-only ruling above is sound at the decision layer and **not yet closed at the
-  venue boundary**. Named here rather than left to be discovered.
+- **The venue boundary is closed by machinery that can decline to answer (#666).** This entry
+  was written when the boundary was open, and #667/#668 have since closed the three paths that
+  were named here — the SELL is clamped to the venue's holding, rail 21 refuses an order
+  against an empty one, and `sweep_orphan_brackets` cancels a protective order whose position
+  has left. What is *not* closed is the assumption every one of them rests on. All three fail
+  OPEN on an unreadable balance, deliberately and correctly: refusing a SELL over a balance
+  endpoint that went quiet would strand positions that wanted out. So a venue that stops
+  answering does not produce a refusal, it produces the old behaviour — an exit sized from
+  keel's own ledger.
+
+  That is survivable **only while the account cannot go short**, and keel does not check that
+  it cannot. `verify_cash_account` exists on the Alpaca adapter alone; Coinbase has no
+  equivalent read, and #666 must first establish whether Advanced Trade exposes an account
+  posture at all — an operator attestation, on rail 17's pattern, is a legitimate answer if it
+  does not. Until then the layered defence is sound whenever the venue answers, and rests on an
+  unverified premise whenever it does not. Named here rather than left to be inferred from
+  three closed issues.
 - **ZEC and the rest of the deferrals.** The candidate-universe record lists the open
   questions the attestation step has to answer and "which this agent must not answer".
 
