@@ -76,6 +76,8 @@ def _order(**overrides: Any) -> dict[str, Any]:
         "actual_fill": Decimal("100050"),
         "filled_quantity": Decimal("0.01"),
         "raw_response": json.dumps({"order_id": "cb-order-1"}),
+        "submit_best_bid": None,
+        "submit_best_ask": None,
         "confirmation": "autonomous",
         "rule_id": None,
         "created_at": NOW_TS - 3600,
@@ -243,6 +245,51 @@ def test_a_report_with_rows_carries_no_empty_note(tmp_path: Path) -> None:
     document = web_payload.orders_payload(_report(tmp_path, _order()))
     assert document["empty_reason"] == ""
     assert document["empty_note"] == ""
+
+
+def test_the_book_at_submit_crosses_as_the_pair_and_no_spread_is_derived(tmp_path: Path) -> None:
+    """#626's two columns, on the wire. A spread computed here would be arithmetic Rule 3
+    forbids in this layer AND would answer one of three different spread questions on the
+    reader's behalf -- the same mistake as a fee rate, which this payload also refuses."""
+    document = web_payload.orders_payload(
+        _report(
+            tmp_path,
+            _order(submit_best_bid=Decimal("99999.5"), submit_best_ask=Decimal("100000.5")),
+        )
+    )
+    row = document["rows"][0]
+    assert row["submit_best_bid"]["value"] == "99999.5"
+    assert row["submit_best_ask"]["value"] == "100000.5"
+    assert row["submit_book_observed"]["display"] == "recorded"
+    assert "spread" not in json.dumps(document).lower()
+    assert not any("spread" in key for key in row), sorted(row)
+
+
+def test_an_unobserved_book_says_which_kind_of_absence_it_is(tmp_path: Path) -> None:
+    """NULL is NOT OBSERVED, never zero, and a paper row's absence is by design while a live
+    row's is a gap in the record. The two sentences differ, and neither is a blank."""
+    document = web_payload.orders_payload(
+        _report(tmp_path, _order(mode="live"), _order(mode="paper", confirmation="paper"))
+    )
+    paper, live = document["rows"]  # newest first: the paper row was inserted second
+    assert live["submit_book_observed"]["display"] == "not observed"
+    assert live["submit_book_observed"]["state"] == "warn"
+    assert live["submit_best_bid"]["display"] == "\u2014"
+    assert "no readable book" in live["submit_book_note"]
+    assert "against no venue" in paper["submit_book_note"]
+    assert paper["submit_book_note"] != live["submit_book_note"]
+
+
+def test_the_renderer_shows_the_book_pair_without_computing_one() -> None:
+    """The client half. Already covered by the arithmetic ban over `ordersView`'s code, but
+    stated by name so the reason survives with it."""
+    source = _code("render.js")
+    start = source.index("export function ordersView(")
+    end = source.index("export function activityView(", start)
+    body = source[start:end]
+    assert "submit_best_bid" in body
+    assert "submit_best_ask" in body
+    assert "spread" not in body.lower()
 
 
 # -- the two front-ends agree ---------------------------------------------------------------------

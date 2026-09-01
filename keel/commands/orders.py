@@ -139,6 +139,17 @@ LIVE_NO_VENUE_DETAIL = "no venue order id recorded"
 MODELLED_FEE_DETAIL = "modelled from the configured rate, not charged by a venue"
 CHARGED_FEE_DETAIL = "as charged by the venue"
 
+#: Why a row carries no `submit_best_bid`/`submit_best_ask` pair (#626 added the columns while
+#: this view was being built, and they are exactly the audit columns it exists to surface).
+#:
+#: NULL there means NOT OBSERVED, never zero, and the two causes are different facts. A paper row
+#: has no book BY DESIGN -- `PaperTrader` fills synthetically against no venue at all, and #626's
+#: schema note says a fabricated book sharing a column name with a real one would poison the very
+#: measurement the columns exist for. A live row with no book is a preview that carried nothing
+#: readable, which is a gap in the record rather than a property of the mode.
+PAPER_NO_BOOK_DETAIL = "no venue book -- the paper trader fills synthetically, against no venue"
+LIVE_NO_BOOK_DETAIL = "no readable book was recorded at submit"
+
 
 def normalise_scope(scope: str) -> str:
     """Any unrecognised scope collapses to the default rather than raising.
@@ -258,6 +269,24 @@ class OrderRow:
 
     #: One sentence saying which of those two this fee is.
     fee_detail: str
+
+    #: The venue's own best bid at the moment this order was submitted (#626), or `None` for
+    #: NOT OBSERVED. Carried as the PAIR, and no spread is derived from it anywhere in this
+    #: module or in either renderer -- #626 stored two columns rather than one delta for the
+    #: same reason `expected_fill` and `actual_fill` are two: half-spread-from-mid,
+    #: half-spread-from-the-side-crossed and relative spread are three different questions off
+    #: one pair, and a view that silently answered one of them would be choosing on the
+    #: reader's behalf. Same rule as `fee`: the figure as recorded, never a rate.
+    submit_best_bid: Decimal | None
+
+    #: The venue's own best ask at submit, on the same terms.
+    submit_best_ask: Decimal | None
+
+    #: True when BOTH sides of that pair were recorded. A half-observed book is not a book.
+    submit_book_observed: bool
+
+    #: Why the pair is absent, when it is: `""` when both sides are present.
+    submit_book_detail: str
 
     #: The venue's own id for this order, or `""`. The ONLY thing read out of `raw_response`.
     venue_order_id: str
@@ -404,6 +433,9 @@ def _row_from_dict(row: dict[str, Any]) -> OrderRow:
     difference, _ = _divergence(expected, actual)
     venue_id = _venue_order_id(row.get("raw_response"))
     modelled_fee = mode == "paper"
+    best_bid = row.get("submit_best_bid")
+    best_ask = row.get("submit_best_ask")
+    book_observed = best_bid is not None and best_ask is not None
 
     if venue_id:
         venue_detail = ""
@@ -411,6 +443,13 @@ def _row_from_dict(row: dict[str, Any]) -> OrderRow:
         venue_detail = PAPER_NO_VENUE_DETAIL
     else:
         venue_detail = LIVE_NO_VENUE_DETAIL
+
+    if book_observed:
+        book_detail = ""
+    elif modelled_fee:
+        book_detail = PAPER_NO_BOOK_DETAIL
+    else:
+        book_detail = LIVE_NO_BOOK_DETAIL
 
     return OrderRow(
         id=int(row["id"]),
@@ -432,6 +471,10 @@ def _row_from_dict(row: dict[str, Any]) -> OrderRow:
         fee=row.get("fee"),
         fee_is_modelled=modelled_fee,
         fee_detail=MODELLED_FEE_DETAIL if modelled_fee else CHARGED_FEE_DETAIL,
+        submit_best_bid=best_bid,
+        submit_best_ask=best_ask,
+        submit_book_observed=book_observed,
+        submit_book_detail=book_detail,
         venue_order_id=venue_id,
         venue_order_id_detail=venue_detail,
         rule_id=None if row.get("rule_id") is None else int(row["rule_id"]),
@@ -598,6 +641,15 @@ def render_orders(report: OrdersReport) -> list[str]:
             f"{divergence}"
         )
         lines.append(f"      fee={_figure(row.fee)} -- {row.fee_detail}")
+        if row.submit_book_observed:
+            # The PAIR as the venue gave it. No spread is computed from it here or anywhere
+            # else in this view -- see `OrderRow.submit_best_bid`.
+            lines.append(
+                f"      book at submit: bid={_figure(row.submit_best_bid)} "
+                f"ask={_figure(row.submit_best_ask)}"
+            )
+        else:
+            lines.append(f"      {row.submit_book_detail}")
         if row.venue_order_id:
             lines.append(f"      venue order id: {row.venue_order_id}")
         else:

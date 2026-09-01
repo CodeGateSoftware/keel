@@ -70,6 +70,8 @@ def _order(**overrides: Any) -> dict[str, Any]:
         "actual_fill": Decimal("100050"),
         "filled_quantity": Decimal("0.01"),
         "raw_response": json.dumps({"order_id": "cb-order-1"}),
+        "submit_best_bid": None,
+        "submit_best_ask": None,
         "confirmation": "autonomous",
         "rule_id": None,
         "created_at": NOW_TS - 3600,
@@ -428,6 +430,65 @@ def test_no_figure_is_ever_rendered_in_exponent_form(tmp_path: Path) -> None:
     assert "qty=0.001" in text
     assert "E+" not in text
     assert "E-" not in text
+
+
+# -- the venue's book at submit (#626) ------------------------------------------------------------
+
+
+def test_the_book_at_submit_is_shown_as_the_pair_and_never_as_a_spread(tmp_path: Path) -> None:
+    """#626 stored `submit_best_bid` and `submit_best_ask` as TWO columns rather than one delta,
+    and said why: half-spread-from-mid, half-spread-from-the-side-crossed and relative spread are
+    three different questions off one pair, and a derivation cannot be re-derived differently
+    later. A view that computed one of them would answer one of those questions on the reader's
+    behalf -- the same mistake as showing a fee as a rate."""
+    repo = _repo(tmp_path)
+    repo.insert_order(
+        _order(submit_best_bid=Decimal("99999.5"), submit_best_ask=Decimal("100000.5"))
+    )
+    row = gather_orders(repo, now_ts=NOW_TS).rows[0]
+    assert row.submit_best_bid == Decimal("99999.5")
+    assert row.submit_best_ask == Decimal("100000.5")
+    assert row.submit_book_observed is True
+    assert row.submit_book_detail == ""
+
+    text = "\n".join(render_orders(gather_orders(repo, now_ts=NOW_TS)))
+    assert "bid=99999.5" in text
+    assert "ask=100000.5" in text
+    # The delta is 1.0 and the relative spread is 0.001%. Neither appears, and no field of
+    # `OrderRow` holds one.
+    assert "spread" not in text.lower()
+    assert not any("spread" in f.name for f in dataclass_fields(orders_service.OrderRow)), sorted(
+        f.name for f in dataclass_fields(orders_service.OrderRow)
+    )
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask"),
+    [(None, None), (Decimal("1"), None), (None, Decimal("2"))],
+)
+def test_a_half_observed_book_is_not_a_book(
+    tmp_path: Path, bid: Decimal | None, ask: Decimal | None
+) -> None:
+    """NULL means NOT OBSERVED, never zero (#626's schema note). One side alone cannot evidence
+    anything about spread, so it is reported as absent rather than as a book with a hole in it."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(submit_best_bid=bid, submit_best_ask=ask))
+    row = gather_orders(repo, now_ts=NOW_TS).rows[0]
+    assert row.submit_book_observed is False
+    assert row.submit_book_detail == orders_service.LIVE_NO_BOOK_DETAIL
+
+
+def test_a_paper_row_says_its_missing_book_is_by_design(tmp_path: Path) -> None:
+    """A paper row has no book because `PaperTrader` fills against no venue, and #626 says a
+    fabricated book sharing a column name with a real one would poison the measurement the
+    columns exist for. That is a different fact from a live preview that carried nothing
+    readable, and the two must not render as the same blank."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(mode="paper", confirmation="paper"))
+    row = gather_orders(repo, now_ts=NOW_TS).rows[0]
+    assert row.submit_book_detail == orders_service.PAPER_NO_BOOK_DETAIL
+    assert row.submit_book_detail != orders_service.LIVE_NO_BOOK_DETAIL
+    assert "against no venue" in "\n".join(render_orders(gather_orders(repo, now_ts=NOW_TS)))
 
 
 # -- scope, and the two empties -------------------------------------------------------------------

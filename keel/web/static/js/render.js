@@ -1288,6 +1288,12 @@ function orderDetail(row) {
       kv("fee", row.fee),
       kv("fee basis", field(row.fee_modelled)),
       kv("about this fee", plain(row.fee_note)),
+      // The venue's book at submit (#626), as the PAIR. No spread is derived here: the two
+      // columns exist precisely so that the three different spread questions stay askable, and
+      // a view that answered one of them silently would be choosing for the reader.
+      kv("best bid at submit", row.submit_best_bid),
+      kv("best ask at submit", row.submit_best_ask),
+      kv("book at submit", plain(row.submit_book_note) || field(row.submit_book_observed)),
       // The ONLY thing read out of `raw_response`, upstream, already bounded. When it is empty
       // the note says why -- a blank cell reads as missing data, and "the paper trader placed
       // this" reads as the answer it is.

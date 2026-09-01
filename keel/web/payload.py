@@ -1323,6 +1323,24 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
             off_state=NEUTRAL,
         ),
         "fee_note": row.fee_detail,
+        # THE VENUE'S OWN BOOK AT SUBMIT (#626), as the PAIR and never as a spread. #626 stored
+        # two columns rather than one delta deliberately -- half-spread-from-mid,
+        # half-spread-from-the-side-crossed and relative spread are three different questions off
+        # one pair -- so deriving one here would answer one of them on the reader's behalf, and
+        # would also be arithmetic Rule 3 forbids in this layer. Same rule as `fee`.
+        "submit_best_bid": money(row.submit_best_bid),
+        "submit_best_ask": money(row.submit_best_ask),
+        "submit_book_observed": flag(
+            row.submit_book_observed,
+            on="recorded",
+            off="not observed",
+            # Absent is not a defect -- every paper row is absent by design, and rows written
+            # before #626 have nothing to show -- but it IS the difference between a row that
+            # can evidence spread cost and one that cannot.
+            on_state=NEUTRAL,
+            off_state=WARN,
+        ),
+        "submit_book_note": row.submit_book_detail,
         # The ONLY thing anything reads out of `raw_response`, already bounded and validated by
         # `orders._venue_order_id`. `venue_order_id_detail` says why it is absent when it is, so
         # a paper row shows a sentence rather than a blank that reads as missing data.
