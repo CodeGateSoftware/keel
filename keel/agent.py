@@ -586,8 +586,12 @@ def _paper_resolve_bars(
     product_id: str,
     candles_by_tf: dict,
     granularities: list,
+    repo: Repository,
+    config: Config,
+    now_ts: int,
 ) -> None:
-    """Advance the paper position on the newest bar so stops and targets can fire.
+    """Advance the paper position on the newest bar so stops and targets can fire, and BOOK any
+    exit that fires against the `positions` ledger.
 
     Live trading resolves stops at the broker; paper has to be walked forward explicitly, or
     positions would only ever close on an explicit rule exit and the track record would be all
@@ -599,8 +603,75 @@ def _paper_resolve_bars(
     for granularity in granularities:
         candles = candles_by_tf.get(granularity) or []
         if candles:
-            trader.on_candle(product_id, candles[-1])
+            exit_order_id = trader.on_candle(product_id, candles[-1])
+            if exit_order_id is not None:
+                _book_paper_exit(repo, config, product_id, exit_order_id, now_ts)
             return
+
+
+def _book_paper_exit(
+    repo: Repository,
+    config: Config,
+    product_id: str,
+    exit_order_id: int,
+    now_ts: int,
+) -> None:
+    """Record the outcome of a paper exit and close the tranche it consumed (#639).
+
+    THE EDGE THAT WAS NEVER THERE. The agent OPENS a paper tranche -- `_open_tranche` runs in
+    the shared entry loop, paper and live alike -- and until now nothing ever closed one. Six
+    paper round trips completed in the live deployment between 2026-08-21 and 08-28, every exit
+    `status='filled'` with an `actual_fill`, and `trade_outcomes` held ZERO rows while all eight
+    `positions` sat `status='open'`. `promotion.py`'s pooled sample-size axis (#338) counts that
+    table, so pooled n was permanently 0 and no rule could ever be promoted -- silently, which is
+    the shape this repo dislikes most.
+
+    `_handle_exits` cannot cover for this, and it is worth being explicit about why rather than
+    leaving the next reader to conclude the paper path merely "also" needs booking:
+    `_held_position` reads `mode="live"` orders ONLY, so in a paper cycle it returns qty 0 and
+    `_handle_exits` returns `[]` before it ever looks at a rule. The live exit path is
+    unreachable from paper BY CONSTRUCTION, not by accident of ordering, and that is deliberate
+    -- routing paper exits through `executor.execute` would put a real broker behind them.
+
+    `now_ts` is the CYCLE's clock, not the bar's, matching the `opened_at` `_open_tranche`
+    recorded from the same source. A `closed_at` taken from the candle would make a paper
+    trade's recorded holding period the difference between two different clocks -- and
+    `record_closed_trade` computes rail 16's `streak_halt_until` from this same value, so a bar
+    timestamp would set a cool-off that expired before it began.
+
+    `is_dca` is DERIVED from the tranche's owning rule, exactly as `_handle_exits` derives it
+    from the owning rule on the live path (§12.6 exempts DCA from the STREAK, never from the
+    RECORD). Reading it off the ledger rather than off `position_rule:<product>` keeps the
+    answer sourced from the very rows `book_exit` is about to consume.
+    """
+    exit_order = repo.get_order(exit_order_id)
+    if exit_order is None or exit_order["actual_fill"] is None:
+        # Unreachable today -- `PaperTrader._close` always writes a filled row with a price --
+        # but the producer refuses to guess an exit price for the same reason it refuses to
+        # guess an entry one: a fabricated P&L can trip a breaker on a number nobody observed.
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.paper_exit_not_booked",
+            product=product_id,
+            order_id=exit_order_id,
+        )
+        return
+
+    positions = repo.get_open_positions(product_id)
+    is_dca = bool(positions) and positions[0]["rule_name"] == "dca"
+    _close_tranches(
+        repo,
+        config,
+        product_id=product_id,
+        exit_order=exit_order,
+        is_dca=is_dca,
+        now_ts=now_ts,
+    )
+    # The exit-ownership marker retires with the position it names, mirroring `_handle_exits`.
+    # Left behind it would outlive its position and hand the next tranche in this product a
+    # rule name chosen by a trade that is already booked.
+    repo.set_state(f"position_rule:{product_id}", None)
 
 
 def _paper_enter(
@@ -1785,7 +1856,9 @@ def run_once(
             product_rules = [r for r in rules if getattr(r, "product_id", None) == product_id]
 
             if paper_trader is not None:
-                _paper_resolve_bars(paper_trader, product_id, candles_by_tf, granularities)
+                _paper_resolve_bars(
+                    paper_trader, product_id, candles_by_tf, granularities, repo, config, now_ts
+                )
 
             # EXITS are exempt from `entries_allowed` and always run, for every non-stale
             # product, regardless of which (if any) product is withholding this cycle's
