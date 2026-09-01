@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
+from keel.web import security
 from keel.web import server as web_server
 from keel.web.security import new_session_token
 
@@ -239,3 +240,108 @@ def test_an_empty_flag_value_is_dropped_rather_than_refused(
     assert result.exit_code == 0, result.output
     assert cfg is not None
     assert cfg.external_hosts == frozenset()
+
+
+# -- a wildcard bind must name what it expects (#648) ---------------------------------------------
+
+
+@pytest.mark.parametrize("wildcard", ["0.0.0.0", "::", "[::]"])
+def test_a_wildcard_bind_without_a_named_host_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wildcard: str
+) -> None:
+    """The confusing failure, turned into an explanation.
+
+    Binding a wildcard used to produce a server that refused EVERY request: `HostPolicy` then
+    expects `Host: 0.0.0.0`, which no browser sends, so the bind succeeded, the URL printed, and
+    nothing worked behind a 403 that blamed the address. It failed closed -- right direction,
+    wrong explanation. The operator concludes "keel is broken", not "keel does not know which
+    name to expect".
+    """
+    result, _cfg = _policy_from_cli(monkeypatch, tmp_path, "--host", wildcard)
+
+    assert result.exit_code != 0, result.output
+    assert "every interface" in result.output
+
+
+def test_a_wildcard_bind_is_permitted_once_a_host_is_named(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Not a blocklist. A wildcard bind is exactly the case where the name cannot be derived --
+    every interface has a different one -- so it is the one bind that requires stating it."""
+    result, cfg = _policy_from_cli(
+        monkeypatch, tmp_path, "--host", "0.0.0.0", "--external-host", "keel.example.com"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.host_policy.permits("keel.example.com:8765")
+
+
+def test_a_specific_non_loopback_bind_is_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--host 10.0.0.5` derives its own name and always worked. This must not become collateral
+    damage of the wildcard refusal."""
+    result, cfg = _policy_from_cli(monkeypatch, tmp_path, "--host", "10.0.0.5")
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.host_policy.permits("10.0.0.5:8765")
+
+
+# -- the remote session lifetime (#648) -----------------------------------------------------------
+
+
+def test_a_loopback_server_has_no_session_expiry(tmp_path: Path) -> None:
+    """A decision, not an omission. On loopback the population who could use a leaked token is
+    software already running as this operator, and no session lifetime helps against that."""
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=8765,
+        token=new_session_token(),
+        db_path=str(tmp_path / "keel.db"),
+        config_path=str(tmp_path / "config.yaml"),
+    )
+
+    assert cfg.session_expired_at is None
+
+
+def test_configuring_a_remote_host_bounds_the_session(tmp_path: Path) -> None:
+    """A remote origin changes the population to anyone who can reach the tunnel, and the
+    30-day cookie is a BROWSER hint an attacker holding the token ignores entirely -- so the
+    bound has to be enforced on this side of the wire or it is not a bound."""
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=8765,
+        token=new_session_token(),
+        db_path=str(tmp_path / "keel.db"),
+        config_path=str(tmp_path / "config.yaml"),
+        external_hosts=frozenset({"keel.example.com"}),
+        started_at=1_000_000.0,
+    )
+
+    assert cfg.session_expired_at == 1_000_000.0 + security.REMOTE_SESSION_MAX_AGE_SECONDS
+
+
+def test_the_remote_lifetime_is_bounded_at_both_ends() -> None:
+    """A lifetime is only useful between two limits, and both are claims the docstring makes.
+
+    **Shorter than the cookie** the browser keeps, or the enforced bound never bites before the
+    browser stops sending the cookie anyway and the mechanism is decorative.
+
+    **Long enough for a working day**, or it is not a session lifetime but an outage: a value
+    small enough to expire mid-use would be indistinguishable, to the operator, from the
+    "refuses every request" failure the wildcard-bind refusal exists to prevent. A mutation run
+    set this to one second and every test still passed -- which is why the floor is here.
+    """
+    assert security.REMOTE_SESSION_MAX_AGE_SECONDS < security.SESSION_COOKIE_MAX_AGE_SECONDS
+    assert security.REMOTE_SESSION_MAX_AGE_SECONDS >= 8 * 60 * 60
+
+
+def test_the_entropy_arithmetic_is_recorded_beside_the_token() -> None:
+    """#648 asked for a brute-force posture and the honest answer is that there is no brute-force
+    threat: 256 bits is ~1.2e77 values. A rate limiter added to stop guessing would be theatre,
+    and this constant exists so the number travels with that claim instead of being re-derived
+    by whoever proposes one."""
+    assert security.TOKEN_ENTROPY_BITS == security._TOKEN_BYTES * 8
+    assert security.TOKEN_ENTROPY_BITS >= 128

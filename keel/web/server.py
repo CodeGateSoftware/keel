@@ -43,8 +43,9 @@ from __future__ import annotations
 import json
 import socket
 import sys
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 from keel.web import api, events, staticfiles
 from keel.web.security import (
     CSRF_HEADER,
+    REMOTE_SESSION_MAX_AGE_SECONDS,
     SESSION_COOKIE,
     HostPolicy,
     csrf_token,
@@ -105,6 +107,23 @@ class ServeConfig:
     #: Hostnames a reverse proxy may present that this server never bound (#648). Empty by
     #: default -- loopback-only is the posture, and remaining the posture is the point.
     external_hosts: frozenset[str] = frozenset()
+    #: When this run began, for the remote session lifetime (#648). Defaults to the moment the
+    #: config is built, which is the moment `keel serve` mints the token it bounds.
+    started_at: float = field(default_factory=time.time)
+
+    @property
+    def session_expired_at(self) -> float | None:
+        """When this session stops authenticating, or `None` if it does not expire.
+
+        `None` on a loopback-only server, and that is a decision rather than an omission --
+        `REMOTE_SESSION_MAX_AGE_SECONDS` carries the argument. The population who could use a
+        leaked token on loopback is software already running as this operator, and no session
+        lifetime helps against that; a remote origin changes the population to anyone who can
+        reach the tunnel, and the 30-day cookie is a browser hint such an attacker ignores.
+        """
+        if not self.external_hosts:
+            return None
+        return self.started_at + REMOTE_SESSION_MAX_AGE_SECONDS
 
     @property
     def host_policy(self) -> HostPolicy:
@@ -483,6 +502,20 @@ class KeelHandler(BaseHTTPRequestHandler):
                 403,
                 "Refused",
                 "This request did not come from the address keel is serving on.",
+            )
+            return False
+        # #648: an ENFORCED lifetime, checked before the token so an expired session cannot be
+        # distinguished from a wrong one by which refusal comes back. Only a remote-configured
+        # server has one -- see `ServeConfig.session_expired_at`.
+        expires = self.cfg.session_expired_at
+        if expires is not None and time.time() >= expires:
+            self._refuse(
+                403,
+                "Session expired",
+                "This session has reached its lifetime. keel enforces one when it is configured "
+                "to answer a remote hostname, because a token that leaked into a URL, a "
+                "screenshot or terminal scrollback should not still work tomorrow. Restart "
+                "`keel serve` and open the address it prints.",
             )
             return False
         cookies = parse_cookie_header(self.headers.get("Cookie"))

@@ -29,6 +29,11 @@ DEFAULT_PORT = 8765
 
 DEFAULT_HOST = "127.0.0.1"
 
+#: Binds that answer on EVERY interface, where no single hostname can be derived from the
+#: address (#648). Not a blocklist -- each is permitted the moment `--external-host` says what
+#: to expect.
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
 
 @click.command("serve")
 @click.option("--host", default=DEFAULT_HOST, show_default=True, help="Address to bind.")
@@ -92,6 +97,27 @@ def serve_cmd(
         HostPolicy(bound_host=host, port=port, external_hosts=cleaned)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--external-host") from exc
+
+    # #648, and this is a DECISION about a confusing failure rather than a new restriction.
+    # Binding a wildcard produced a server that refused every request: `HostPolicy` then expects
+    # `Host: 0.0.0.0`, which no browser ever sends, so the bind succeeded, the URL printed, and
+    # nothing worked with a 403 that blamed the address. It failed CLOSED, which is the right
+    # direction and the wrong explanation -- the operator's conclusion is "keel is broken", not
+    # "keel does not know what name to expect".
+    #
+    # A wildcard bind is exactly the case where the name cannot be derived, because the server
+    # is answering on every interface and each has a different one. So it is the one bind that
+    # REQUIRES the name to be stated. Refusing here says that, once, at the moment it can be
+    # acted on.
+    if host in _WILDCARD_BINDS and not cleaned:
+        raise click.BadParameter(
+            f"binding {host} answers on every interface, so keel cannot derive which hostname "
+            "to expect in Host: -- and a server that expects the wrong one refuses every "
+            "request with a 403 that looks like a fault. Name the hostname browsers will use, "
+            "e.g. `--external-host keel.example.com`, or bind that address directly. See "
+            "docs/remote-access.md before exposing this server at all.",
+            param_hint="--host",
+        )
     cfg = ServeConfig(
         host=host,
         port=port,

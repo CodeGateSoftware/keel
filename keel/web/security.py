@@ -91,6 +91,36 @@ SESSION_COOKIE = "keel_session"
 #: does not accumulate an entry with no end at all.
 SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
+#: How long a session may authenticate once a REMOTE origin is configured (#648). Twelve hours:
+#: long enough that a working day does not end in a re-authorisation, short enough that a token
+#: which leaked this morning does not still work tomorrow.
+#:
+#: ⚠️ This does NOT apply to a loopback-only server, and the asymmetry is the argument rather
+#: than an exemption. `SESSION_COOKIE_MAX_AGE_SECONDS`'s reasoning above is sound and unchanged:
+#: the token's power is bounded by a process the browser does not control, and on loopback the
+#: population who could USE a leaked copy is "software already running as this operator" --
+#: against which a shorter session buys nothing at all.
+#:
+#: A remote origin changes that population to "anyone who can reach the tunnel", and the token
+#: has been in a URL, in terminal scrollback, and in whatever the operator pasted while asking
+#: for help. The 30-day cookie is a BROWSER hint an attacker with the token ignores entirely, so
+#: the bound has to be enforced on this side of the wire or it is not a bound.
+REMOTE_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
+
+#: ⛔ THE BRUTE-FORCE ARITHMETIC, WRITTEN DOWN SO NOBODY ADDS A RATE LIMITER FOR THE WRONG
+#: REASON (#648). `_TOKEN_BYTES = 32` is 256 bits, so `secrets.token_urlsafe` draws from a space
+#: of 2**256 ~ 1.2e77. An attacker managing a billion guesses per second -- which no HTTP server
+#: on a laptop will serve -- needs on the order of 1e60 years to cover a meaningful fraction.
+#:
+#: Guessing is therefore NOT a threat this server has, and a rate limiter installed to stop it
+#: would be theatre: it would add state, a failure mode, and a false sense that something was
+#: closed. What bounds risk here is entropy, which is already past any margin that matters.
+#:
+#: What a limiter WOULD buy is unrelated to guessing -- bounding log volume from a scanner, and
+#: making probing visible. Those are real, and if one is ever added it must be justified by
+#: those and not by brute force. Recorded as a constant so the number travels with the claim.
+TOKEN_ENTROPY_BITS = 256
+
 #: The request header carrying the CSRF token on a write (#540).
 #:
 #: A HEADER rather than a body field, and the difference is the whole reason this layer still

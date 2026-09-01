@@ -16,14 +16,18 @@ pytest looks.
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import threading
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+from keel.web import security
 from keel.web import server as web_server
 from keel.web.security import SESSION_COOKIE, new_session_token, session_cookie
 
@@ -1357,3 +1361,71 @@ def test_starting_market_data_returns_immediately(
         gate.set()
         jobs.wait(5)
         jobs.reset()
+
+
+# -- an expired remote session is refused by the handler (#648) ---------------------------------
+
+
+@contextmanager
+def _serving(deployment: tuple[str, str], **changes: object):
+    """A live server with a config of this test's choosing.
+
+    The `running` fixture builds one loopback-only server per test and does not expose its
+    handler class, and these tests need a DIFFERENT posture -- a configured remote host and a
+    start time in the past. Building one here is shorter than widening the fixture for two
+    callers, and it binds port 0 and tears down the same way.
+    """
+    db_path, config_path = deployment
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+        **changes,  # type: ignore[arg-type]
+    )
+    server = web_server.build_server(cfg)
+    bound = dataclasses.replace(cfg, port=int(server.server_address[1]))
+    server.RequestHandlerClass.cfg = bound  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield bound
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_an_expired_remote_session_is_refused_even_with_a_valid_token(deployment) -> None:
+    """The lifetime is ENFORCED, not requested.
+
+    `Max-Age` is a browser hint: an attacker holding the token sends the cookie whenever they
+    like, for as long as they like. So the bound has to be applied on this side of the wire --
+    and it has to bite while the token itself is still perfectly valid, which is what makes
+    this a lifetime rather than a second way of spelling "wrong token".
+    """
+    remote = frozenset({"keel.example.com"})
+    stale = time.time() - security.REMOTE_SESSION_MAX_AGE_SECONDS - 1
+
+    with _serving(deployment, external_hosts=remote, started_at=time.time()) as fresh:
+        status, _headers, _body = _request(fresh, "/", cookie=f"{SESSION_COOKIE}={fresh.token}")
+        assert status == 200, "a fresh remote session must answer"
+
+    with _serving(deployment, external_hosts=remote, started_at=stale) as old:
+        status, _headers, body = _request(old, "/", cookie=f"{SESSION_COOKIE}={old.token}")
+        assert status == 403
+        assert "lifetime" in body
+
+
+def test_a_loopback_session_of_the_same_age_still_answers(deployment) -> None:
+    """The asymmetry is the argument, not an exemption -- see `REMOTE_SESSION_MAX_AGE_SECONDS`.
+
+    On loopback the population who could use a leaked token is software already running as this
+    operator, against which no session lifetime helps. Expiring there would cost the operator a
+    re-authorisation and buy nothing at all.
+    """
+    with _serving(deployment, started_at=time.time() - 365 * 24 * 3600) as aged:
+        status, _headers, _body = _request(aged, "/", cookie=f"{SESSION_COOKIE}={aged.token}")
+
+    assert status == 200

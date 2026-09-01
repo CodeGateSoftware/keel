@@ -3,9 +3,9 @@
 `keel serve` binds loopback. That is the posture, and this document exists so that widening it
 is a decision someone made on purpose rather than a flag someone found.
 
-**Status: incomplete. Nothing remote should be exposed yet.** Two of #648's five requirements
-are met — the bind is configurable and a reverse proxy's hostname can be expected explicitly —
-and three are not. They are named at the bottom, and they are not paperwork.
+**Status: incomplete. Nothing remote should be exposed yet.** Four of #648's five requirements
+are met. The last one — re-verifying the PWA's secure-context behaviour over a real HTTPS
+origin — cannot be done from a checkout, and it is named at the bottom rather than waved past.
 
 ## What the defence actually defends
 
@@ -62,21 +62,47 @@ discover it later would have failed.
 A mesh has no such property: WireGuard is end-to-end between devices the operator enrolled, and
 the coordination server distributes keys without being able to read what they protect.
 
+## The session, once a remote host is configured
+
+**There is no brute-force threat, and saying so is the point.** The token carries 256 bits of
+entropy (`secrets.token_urlsafe(32)`), a space of about 1.2 × 10⁷⁷. An attacker managing a
+billion guesses a second — which no `http.server` on a laptop will serve — needs on the order of
+10⁶⁰ years to cover a meaningful fraction. A rate limiter installed to stop guessing would be
+theatre: state, a failure mode, and a false sense that something was closed. The arithmetic is
+recorded beside the constant (`TOKEN_ENTROPY_BITS`) so it travels with the claim. If a limiter is
+ever added it must be justified by bounding log volume or making probing visible — never by
+brute force.
+
+**What a remote origin does change is who can use a token that leaked.** On loopback that
+population is software already running as the operator, and no session lifetime helps against
+it. Through a tunnel it becomes anyone who can reach the origin — and the token has been in a
+URL, in terminal scrollback, and in whatever got pasted while asking for help. The 30-day cookie
+`Max-Age` is a *browser* hint that such an attacker ignores entirely.
+
+So a server configured with `--external-host` enforces a **12-hour session lifetime on its own
+side of the wire**, checked before the token so an expired session cannot be told apart from a
+wrong one by which refusal comes back. A loopback-only server has none, and that asymmetry is
+the argument rather than an exemption. Restarting `keel serve` remains the instant revocation
+gesture in both postures.
+
+## Binding every interface
+
+`--host 0.0.0.0` (or `::`) used to produce a server that refused **every** request: `HostPolicy`
+would then expect `Host: 0.0.0.0`, which no browser sends. It failed closed — the right
+direction, the wrong explanation, and the operator's conclusion was "keel is broken" rather than
+"keel does not know which name to expect".
+
+A wildcard bind is precisely the case where the name cannot be derived, because every interface
+has a different one. So it is the one bind that requires stating it, and `keel serve` now refuses
+to start on a wildcard with no `--external-host` — once, at the moment it can be acted on.
+
 ## ⛔ Not done — do not expose the console yet
 
-Three of #648's requirements remain, and each is a real gap rather than a formality:
+One requirement remains, and it is not a formality:
 
-- **Session tokens over a remote origin.** The token is generated per `keel serve` run and never
-  written to disk, which is right for loopback. Nothing yet states its entropy against an
-  attacker who can reach the origin from the open internet, and there is no issuance
-  rate-limiting or brute-force posture — on loopback there was no attacker to rate-limit.
 - **Secure-context re-verification.** The service worker and manifest work today because
   `http://127.0.0.1` is a secure context *by specification*. Over an external origin that
   property comes from HTTPS instead, and the PWA behaviours have to be re-verified there rather
-  than assumed from the loopback behaviour.
-- **Bind opt-in beyond a mesh address.** `--host` accepts any address, and binding `0.0.0.0`
-  currently produces a server that refuses every request — `HostPolicy` then expects
-  `Host: 0.0.0.0`, which no browser sends. It fails closed, which is the safe direction, but it
-  fails confusingly and needs its own decision rather than this footnote.
-
-Until those land, `--external-host` is the mechanism waiting for the pass, not the pass.
+  than assumed from the loopback behaviour. That needs a real deployed origin, so it cannot be
+  closed from a checkout — and until it is, an installed console reached through a tunnel is
+  untested, not merely unsupported.
