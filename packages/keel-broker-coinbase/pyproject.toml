@@ -1,12 +1,12 @@
 [project]
 name = "keel-broker-coinbase"
-version = "0.12.2"
+version = "0.13.0"
 description = "Coinbase Advanced Trade adapter for keel"
 license = "Apache-2.0"
 requires-python = ">=3.14"
 # Siblings pinned `==` (see the root `pyproject.toml`); the third-party SDK is not, because it
 # has its own release cycle and is not cut from this repo.
-dependencies = ["keel-core==0.12.2", "keel-broker-api==0.12.2", "coinbase-advanced-py>=1.8.4"]
+dependencies = ["keel-core==0.13.0", "keel-broker-api==0.13.0", "coinbase-advanced-py>=1.8.4"]
 
 [project.entry-points."keel.brokers"]
 coinbase = "keel_broker_coinbase:CoinbaseAdapter"
