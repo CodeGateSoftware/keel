@@ -116,3 +116,126 @@ def test_a_port_already_in_use_is_a_message_not_a_traceback(
     )
     assert web_server.serve(cfg, echo=lines.append) == 1
     assert "could not bind 127.0.0.1:8765" in "\n".join(lines)
+
+
+# -- --external-host reaches the policy (#648) ----------------------------------------------------
+
+
+def _policy_from_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str):
+    """Invoke `keel serve` for real and hand back the `HostPolicy` it built.
+
+    Captured from the `ServeConfig` the command actually constructs, because the option being
+    parsed proves nothing about it reaching the check -- a flag wired to a field nothing reads
+    is a security control that exists only in `--help`.
+    """
+    captured: dict[str, object] = {}
+
+    class _Stub(_StubServer):
+        pass
+
+    def build(cfg):  # type: ignore[no-untyped-def]
+        captured["cfg"] = cfg
+        return _Stub((cfg.host, cfg.port))
+
+    monkeypatch.setattr(web_server, "ensure_schema", lambda _path: None)
+    monkeypatch.setattr(web_server, "build_server", build)
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(tmp_path / "keel.db"), "serve", "--no-open", *args],
+    )
+    return result, captured.get("cfg")
+
+
+def test_external_host_from_the_cli_reaches_the_host_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    result, cfg = _policy_from_cli(
+        monkeypatch, tmp_path, "--external-host", "keel.example.com"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    policy = cfg.host_policy
+    assert policy.permits("keel.example.com:8765"), (
+        "--external-host was accepted by Click and never reached the Host check"
+    )
+    assert not policy.permits("evil.example:8765")
+    assert policy.permits("127.0.0.1:8765"), "the loopback rules must be untouched"
+
+
+def test_no_external_host_flag_leaves_the_server_loopback_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The default is the posture. If this ever passes an external name, the flag has grown a
+    default and every other test in this section is decoration."""
+    result, cfg = _policy_from_cli(monkeypatch, tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.external_hosts == frozenset()
+    assert not cfg.host_policy.permits("keel.example.com:8765")
+
+
+def test_a_wildcard_external_host_stops_the_server_starting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Refused at startup, visibly, once -- not per request. A server that answered everything
+    for an hour before anyone noticed is the failure the defence exists to prevent."""
+    result, _cfg = _policy_from_cli(monkeypatch, tmp_path, "--external-host", "*.example.com")
+
+    assert result.exit_code != 0, result.output
+
+
+def test_repeating_the_flag_admits_each_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    result, cfg = _policy_from_cli(
+        monkeypatch,
+        tmp_path,
+        "--external-host",
+        "a.example.com",
+        "--external-host",
+        "b.example.com",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.host_policy.permits("a.example.com:8765")
+    assert cfg.host_policy.permits("b.example.com:8765")
+    assert not cfg.host_policy.permits("c.example.com:8765")
+
+
+def test_the_flag_normalises_case_and_whitespace_before_the_policy_sees_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name typed with the casing DNS allows, or pasted with a stray space, must still work.
+
+    `HostPolicy.permits` lowercases the incoming `Host:` and then compares by set membership, so
+    an un-normalised entry silently never matches: the operator configured the name, it looks
+    right in `--help`, and every request is refused for a reason nothing reports. Normalising at
+    the boundary is what keeps the comparison a plain membership test rather than a loop.
+    """
+    result, cfg = _policy_from_cli(
+        monkeypatch, tmp_path, "--external-host", "  KEEL.Example.COM  "
+    )
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.external_hosts == frozenset({"keel.example.com"})
+    assert cfg.host_policy.permits("keel.example.com:8765")
+
+
+def test_an_empty_flag_value_is_dropped_rather_than_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--external-host ''` is an unset variable expanding, not a request to serve everything.
+
+    It must not reach `HostPolicy`, where the empty string is a wildcard spelling and would stop
+    the server -- and it must not become an allowlist entry either. Dropping it leaves the
+    default posture, which is what an empty value meant.
+    """
+    result, cfg = _policy_from_cli(monkeypatch, tmp_path, "--external-host", "")
+
+    assert result.exit_code == 0, result.output
+    assert cfg is not None
+    assert cfg.external_hosts == frozenset()

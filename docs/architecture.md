@@ -73,9 +73,13 @@ is a load-bearing property across the codebase.
 
 ## 4. Security architecture
 
-- **Loopback bind by design** with Host/bind checks against DNS rebinding; remote
-  exposure is deliberately absent until #648 lands the opt-in bind, tunnel Host
-  allowlist, and off-loopback token posture.
+- **Loopback bind by design** with Host/bind checks against DNS rebinding. The tunnel
+  Host allowlist is in (`keel serve --external-host`, one specific name each, wildcards
+  refused at startup) and the threat model for each transport is written down in
+  [`docs/remote-access.md`](remote-access.md) — including that a Cloudflare Tunnel
+  terminates TLS at its edge. **Remote exposure is still deliberately absent**: #648's
+  off-loopback token posture and secure-context re-verification are not done, and that
+  document says so at the top rather than leaving it to be discovered.
 - **One-time session token** URLs; CSP `default-src 'self'` with no `unsafe-inline`
   (pinned by test); the key-parity scanner ensures the payload emits every key the
   client reads.

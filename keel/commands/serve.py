@@ -20,7 +20,7 @@ from typing import Any
 import click
 
 from keel.commands._common import default_config_path, default_db_path
-from keel.web.security import new_session_token
+from keel.web.security import HostPolicy, new_session_token
 from keel.web.server import ServeConfig, serve
 
 #: Not 8080. Freqtrade's FreqUI and Jesse's dashboard both sit there, and an operator running one
@@ -40,8 +40,25 @@ DEFAULT_HOST = "127.0.0.1"
     show_default=True,
     help="Open the URL in your default browser.",
 )
+@click.option(
+    "--external-host",
+    "external_hosts",
+    multiple=True,
+    metavar="HOSTNAME",
+    help=(
+        "A hostname a reverse proxy (e.g. a Cloudflare Tunnel) may present in Host:. "
+        "Repeatable. One specific name each -- wildcards are refused. Default: none, and "
+        "leaving it that way keeps this server loopback-only."
+    ),
+)
 @click.pass_context
-def serve_cmd(ctx: click.Context, host: str, port: int, open_browser: bool) -> None:
+def serve_cmd(
+    ctx: click.Context,
+    host: str,
+    port: int,
+    open_browser: bool,
+    external_hosts: tuple[str, ...],
+) -> None:
     """Serve keel's read-only view on localhost and open it in your browser.
 
     Read-only, by construction: the server implements GET and HEAD and nothing else, so there is
@@ -63,9 +80,22 @@ def serve_cmd(ctx: click.Context, host: str, port: int, open_browser: bool) -> N
     # forks a subprocess to answer "which build is this" would make the cheapest question on the
     # server the most expensive one.
     build = _build_info()
+    # #648. Normalised HERE rather than in `HostPolicy`, so the policy compares two values that
+    # are already in the same case and the comparison stays a plain set membership.
+    cleaned = frozenset(name.strip().lower() for name in external_hosts if name.strip())
+    # BUILT EAGERLY, and the reason is a bug this caught in its own first draft: `host_policy` is
+    # a lazy property, so `HostPolicy.__post_init__`'s wildcard guard fired on the first REQUEST
+    # rather than at startup -- a `--external-host '*.example.com'` server started cleanly, said
+    # nothing, and would have raised somewhere inside a handler. Constructing one here turns that
+    # into the command refusing to start, which is what the guard was written to mean.
+    try:
+        HostPolicy(bound_host=host, port=port, external_hosts=cleaned)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--external-host") from exc
     cfg = ServeConfig(
         host=host,
         port=port,
+        external_hosts=cleaned,
         token=new_session_token(),
         db_path=obj.get("db_path") or default_db_path(),
         config_path=obj.get("config_path") or default_config_path(),
