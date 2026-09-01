@@ -90,6 +90,7 @@ from keel.strategy import engine
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
+from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
@@ -129,6 +130,12 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     "rsi_meanrev": RsiMeanReversion,
     "dca": Dca,
     "turtle_breakout": TurtleBreakout,
+    # #341. Entry GATING rather than a signal: it asks whether price has moved enough since
+    # the last event to be worth evaluating, and its threshold is stated as a multiple of round
+    # -trip friction so the knob cannot quietly mean "break-even" the way the source's 2.5%
+    # does here. Registered with the honest prior on the record: at 0 of 90 measured, it is
+    # expected to join the null, and it ships to BE measured rather than to be believed.
+    "cusum_event": CusumEvent,
 }
 
 # The per-kind coercion tables that used to live here -- `_DECIMAL_PARAMS`, `_GRANULARITY_PARAMS`

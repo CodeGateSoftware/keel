@@ -315,7 +315,7 @@ def test_a_stored_rule_row_rebuilds_with_real_decimals_on_its_attributes(kind: s
     principle be satisfied by a rule that stored strings and stringified them back on the way
     out. This reads the ATTRIBUTES the rule's arithmetic actually uses.
 
-    `params` is checked alongside because three of the four rules build that dict in their
+    `params` is checked alongside because most rules build that dict in their
     constructor from the coerced kwargs, and it is what `exit_policy` reads for `trail_atr_mult`
     (`keel/strategy/exit_policy.py`'s own docstring relies on those arriving coerced).
     """
