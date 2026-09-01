@@ -21,7 +21,11 @@ Four independent layers, none of which is sufficient alone:
    user is already viewing. `keel serve` mints it per run, prints it in the URL, and the browser
    exchanges it for a `SameSite=Strict` cookie on first load. `Strict` (not `Lax`) is deliberate:
    `Lax` attaches the cookie to top-level navigations, so a link on a hostile page would arrive
-   authenticated. Nothing is persisted -- close the server and the token is gone.
+   authenticated. Nothing is persisted **on this side of the wire** -- the token is minted per
+   process and never written to disk, so closing the server destroys it and every outstanding
+   cookie becomes a string that authenticates nothing. Since #634 the cookie carries a `Max-Age`
+   so the BROWSER stops throwing away a token that is still valid; `SESSION_COOKIE_MAX_AGE_SECONDS`
+   carries the whole argument for why that extends convenience and not authority.
 
 4. **A closed set of setup actions** is the whole write surface. `POST` exists now (#437 -- a
    first-run user on a machine with no terminal has to be able to create a deployment somehow),
@@ -57,6 +61,35 @@ _TOKEN_BYTES = 32
 #: prefix REQUIRES `Secure`, and `Secure` cookies over plain http are dropped by every browser --
 #: a name that silently disables the cookie is worse than a plain name that works.
 SESSION_COOKIE = "keel_session"
+
+#: How long the browser keeps its copy of the session cookie (#634).
+#:
+#: It used to have no `Max-Age` at all, which made it a SESSION cookie -- and that was never a
+#: decision, it was the default. What it cost: closing the browser, or a phone evicting the
+#: installed console from memory, threw away a token that was still perfectly valid, and the
+#: operator was told to go and read a terminal for a value the browser had just discarded. An
+#: installed icon that has to be re-authorised from a terminal is worse than a bookmark.
+#:
+#: **This does not extend the token's life by one second, and that is the whole argument.** The
+#: cookie is checked against `ServeConfig.token`, which `new_session_token` mints per process and
+#: which is never written to disk. When `keel serve` exits, every copy of that token -- in a
+#: cookie jar, in terminal scrollback, in a link someone pasted -- stops authenticating anything.
+#: So a persistent cookie is a browser holding a value whose power is already bounded by a process
+#: it does not control, and `new_session_token`'s "a token that outlives the process it authorised
+#: is a credential" stays literally true: the token does not outlive the process. Only the
+#: browser's copy does, and by then it is inert.
+#:
+#: **What DOES change, said out loud rather than discovered later.** Closing the browser used to
+#: revoke access -- by accident, as a side effect of a default nobody chose. It no longer does.
+#: The revocation gesture is restarting `keel serve`, which mints a new token and invalidates
+#: every outstanding cookie at once; it is instant, it needs no new command, and it is available
+#: at the terminal the operator is already at on the one occasion they care.
+#:
+#: Thirty days is measured against the useful life of a `keel serve` process, NOT against the
+#: value's sensitivity -- the sensitivity ends at process exit whatever this number says. Long
+#: enough that the installed icon still works next month; short enough that a browser profile
+#: does not accumulate an entry with no end at all.
+SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 #: The request header carrying the CSRF token on a write (#540).
 #:
@@ -102,6 +135,28 @@ def tokens_match(presented: str | None, expected: str) -> bool:
     if not presented:
         return False
     return secrets.compare_digest(presented, expected)
+
+
+def session_cookie(token: str) -> str:
+    """The `Set-Cookie` value for a session hand-off, built in one place.
+
+    One place because every attribute here is load-bearing and none is a default, so a second
+    spelling at a call site is a second chance to drop one silently:
+
+      * `HttpOnly` keeps the token out of `document.cookie`, and therefore out of everything the
+        derived CSRF value is deliberately written into.
+      * `SameSite=Strict`, never `Lax` -- see layer 3 of the module docstring; `Lax` would attach
+        this to a top-level navigation from a hostile page.
+      * `Path=/` matches the scope the shell has been served under since #540.
+      * `Max-Age` is #634, and `SESSION_COOKIE_MAX_AGE_SECONDS` carries its argument.
+      * **No `Secure`**, for the reason `SESSION_COOKIE` gives about the `__Host-` prefix: a
+        `Secure` cookie over plain http is dropped by every browser, so adding it here would
+        disable the session silently rather than harden it.
+    """
+    return (
+        f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; "
+        f"Max-Age={SESSION_COOKIE_MAX_AGE_SECONDS}"
+    )
 
 
 def split_host_header(value: str) -> tuple[str, str | None]:

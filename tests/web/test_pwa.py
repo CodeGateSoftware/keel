@@ -24,6 +24,7 @@ below as a property of the two path constants rather than as a property of a run
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import subprocess
@@ -658,3 +659,167 @@ def test_the_worker_is_served_with_no_store(running) -> None:  # type: ignore[no
     worker that keeps serving the previous build's shell after an upgrade."""
     _status, headers, _body = _request(running, _P("sw.js"), cookie=_session(running))
     assert headers["Cache-Control"] == "no-store, max-age=0"
+
+
+# -- the cold start, after the run that authorised it ended (#634) --------------------------
+
+
+_MAIN = _STATIC / "js" / "main.js"
+_RENDER = _STATIC / "js" / "render.js"
+
+
+def _strip_js_comments(source: str) -> str:
+    """`source` with `//` and `/* */` comments removed.
+
+    Needed because every assertion below is about CODE, and this repository writes more prose in
+    its comments than code around them -- a substring search over the raw file would match the
+    paragraph explaining a rule as readily as the line enforcing it. Neither `main.js` nor
+    `render.js` contains a regex literal on the lines this touches, so a four-state scanner is
+    enough; `test_client_assets._code_only` makes the same argument at greater length.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        pair = source[index : index + 2]
+        if pair == "//":
+            end = source.find("\n", index)
+            index = length if end == -1 else end
+        elif pair == "/*":
+            end = source.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+        else:
+            out.append(source[index])
+            index += 1
+    return "".join(out)
+
+
+def test_the_install_identity_and_the_start_url_are_unchanged() -> None:
+    """#634 changed neither, and both were candidates.
+
+    `id` is install identity: a browser that sees a different `id` treats the manifest as a
+    different app, so an operator who already installed keel would end up with two icons and the
+    old one pointing at nothing. It is `"/"` and it stays `"/"`.
+
+    `start_url` was the more tempting edit -- the issue is literally titled around it -- and it is
+    unchanged on purpose. The tokenless cold start is not fixed by pointing it somewhere else,
+    because there is no path on this server that carries a token: the token is minted per run and
+    lives in the terminal. Moving `start_url` would have relocated the failure, not removed it."""
+    manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+    assert manifest["id"] == "/"
+    assert manifest["start_url"] == "/status"
+
+
+def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> None:
+    """**A 403 said "keel isn't running", and keel was running.**
+
+    A refusal arrives at the client in the same shape a stopped engine does -- `data: null` with
+    an `error` -- so it fell into `stoppedView`, whose heading is "keel isn't running". That sends
+    an operator to restart the one thing that is working, which mints a new token and makes the
+    situation strictly worse. The branch must split before that view.
+
+    **The status is bound to the wire, not to a constant this test invented.** The refusal is
+    fetched from a real server over a real socket and its `error.status` is read out of the JSON
+    the client will actually parse; `main.js`'s constant must equal that. A hard-coded `"403"` in
+    both places would pass while the server answered `403` as an integer, or as `"Forbidden"`, or
+    stopped putting a status in the envelope at all -- and the client would silently fall back to
+    the outage view again.
+    """
+    connection = http.client.HTTPConnection(running.host, running.port, timeout=10)
+    try:
+        connection.request(
+            "GET", "/api/status", headers={"Host": f"{running.host}:{running.port}"}
+        )
+        response = connection.getresponse()
+        refusal = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+
+    assert response.status == 403
+    on_the_wire = refusal["error"]["status"]
+
+    main = _strip_js_comments(_MAIN.read_text(encoding="utf-8"))
+    render = _strip_js_comments(_RENDER.read_text(encoding="utf-8"))
+
+    assert "export function refusedView(" in render, (
+        "render.js no longer offers a view for a refusal, so a 403 falls back to the outage view"
+    )
+    assert re.search(r"^\s*refusedView,\s*$", main, re.MULTILINE), (
+        "main.js does not import refusedView"
+    )
+
+    constant = re.search(r'const REFUSED_STATUS = "([^"]*)";', main)
+    assert constant is not None, "main.js no longer names the status it treats as a refusal"
+    assert constant.group(1) == on_the_wire, (
+        f"main.js branches on {constant.group(1)!r} and the server answers "
+        f"{on_the_wire!r} -- one side was changed and the other was not"
+    )
+
+    # The WHOLE guard line, and its position relative to the outage view. A substring search for
+    # `refusedView` anywhere in the file passes against a guard that is inverted, one that is
+    # dead (`false &&`), one that reads `primary.data` instead of `primary.error`, and one that
+    # sits AFTER the `stoppedView` call and can therefore never run -- four edits that each
+    # restore the "keel isn't running" lie.
+    guard = re.search(
+        r"^\s*if \(primary\.error && primary\.error\.status === REFUSED_STATUS\) \{\s*$",
+        main,
+        re.MULTILINE,
+    )
+    assert guard is not None, (
+        "the refusal branch is not `if (primary.error && primary.error.status === "
+        "REFUSED_STATUS) {` -- an inverted, dead or differently-keyed guard reads like a check "
+        "and paints a running server as a stopped one"
+    )
+    refused_call = main.find("refusedView(primary")
+    stopped_call = main.find("stoppedView(primary")
+    assert refused_call != -1 and stopped_call != -1
+    assert guard.start() < refused_call < stopped_call, (
+        "the refusal view must be reached from the guard and before the outage view"
+    )
+
+
+def test_the_reconnect_field_never_navigates_to_a_pasted_origin() -> None:
+    """**The pasted text supplies a token and nothing else.**
+
+    The obvious implementation of "paste the address keel printed" navigates to the pasted
+    address, which is an open redirect the operator types into themselves -- and it is also wrong
+    over a private network, because what `keel serve` prints on the machine is a loopback URL and
+    a phone reaching the same process over Tailscale is on another origin entirely.
+
+    So `reconnect` mines the paste for its `token` and builds its destination from
+    `window.location`. Asserted as the shape rather than as behaviour: the only thing handed to
+    `location.assign` is a URL constructed from `window.location`, and the parsed paste is only
+    ever read for its token.
+
+    Chosen against the mutations someone who preferred the obvious version would write:
+    `assign(text)`, `assign(parsed.href)`, `new URL(text, ...)` as the target, and dropping the
+    empty-token guard so a blank field navigates to a tokenless URL and lands back here."""
+    main = _strip_js_comments(_MAIN.read_text(encoding="utf-8"))
+    body = re.search(r"function reconnect\(pasted\) \{(.*?)\n\}", main, re.DOTALL)
+    assert body is not None, "reconnect is not in the shape this test understands"
+    code = body.group(1)
+
+    assigns = re.findall(r"window\.location\.assign\(([^)]*)\)", code)
+    assert assigns == ["target.href"], (
+        f"reconnect navigates to {assigns!r}; the only value it may navigate to is a URL it "
+        "built itself from window.location -- anything derived from the paste is an open "
+        "redirect and breaks the loopback-URL-pasted-into-a-Tailscale-origin case"
+    )
+
+    assert re.search(
+        r"^\s*const target = new URL\(window\.location\.pathname, window\.location\.origin\);\s*$",
+        code,
+        re.MULTILINE,
+    ), "the destination is no longer built from window.location"
+
+    uses = re.findall(r"parsed\.[A-Za-z.]*", code)
+    assert set(uses) == {"parsed.searchParams.get"}, (
+        f"the parsed paste is read for {sorted(set(uses))!r}; it may only be read for its token"
+    )
+
+    guard = code.find("if (!token) {")
+    assert guard != -1, "an empty token is no longer refused before navigating"
+    assert guard < code.find("window.location.assign("), (
+        "the empty-token guard must come before the navigation, or a blank field reloads to a "
+        "tokenless URL and lands straight back on the refusal"
+    )

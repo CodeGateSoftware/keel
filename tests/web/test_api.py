@@ -909,12 +909,24 @@ def test_a_navigation_still_refuses_in_something_a_person_can_read(
     `render.page`. There is no renderer now -- the server generates no markup at all -- so the
     refusal is plain text. The property is unchanged and is the one that matters: someone who
     opens `http://127.0.0.1:8765/` in a browser without the token gets the sentence telling them
-    to use the URL keel printed, not a JSON envelope around it and not an empty page."""
+    to use the URL keel printed, not a JSON envelope around it and not an empty page.
+
+    #634 rewrote the sentence and this test with it. The old assertion was the literal opening
+    words, which pinned the prose rather than the property; what is asserted now is that the text
+    still does the two jobs the property is about. It must name the TOKEN, because "keel refused
+    you" without saying what would not is a dead end -- and it must name an action that can be
+    taken from where it is being read, because the old text's only instruction was to open the
+    address keel printed, which is an instruction a window with no address bar cannot follow.
+    That was the whole of #634's complaint about this page."""
     status, headers, body = _get(running, "/insights")
 
     assert status == 403
     assert headers["Content-Type"].startswith("text/plain")
-    assert "Open the address keel printed" in body
+    assert not body.lstrip().startswith("{"), "a navigation must not be refused in JSON"
+    assert "token" in body
+    assert "Paste" in body, (
+        "the refusal names no action the reader can take from where they are -- see #634"
+    )
     assert "<" not in body, "the refusal is markup again"
 
 
