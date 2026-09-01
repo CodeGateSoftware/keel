@@ -110,8 +110,31 @@ PRODUCTION_WHEEL_PREFIXES: tuple[str, ...] = (
     "keel_trader",
 )
 
-_HTTP_TIMEOUT_SEC = 15
+#: Per-socket-operation timeout, NOT a deadline for the whole transfer -- `urlopen` applies it
+#: to each read. Raised from 15 with #675's retries: a shared CDN that goes quiet briefly is the
+#: common case, and 30-with-retries recovers from more of it than 60-without while giving up on
+#: a genuinely dead host sooner.
+_HTTP_TIMEOUT_SEC = 30
 _SUBPROCESS_TIMEOUT_SEC = 600
+
+#: How many times a TRANSPORT failure is retried before the update is abandoned (#675). Three
+#: attempts, because the failure this exists for is a momentary stall: one retry is often the
+#: same second, and a fourth is waiting on something that is not coming back.
+_DOWNLOAD_ATTEMPTS = 3
+
+#: Seconds to wait before each retry. A tuple rather than a formula so the total added latency
+#: of a doomed update is legible at a glance: 4 seconds, once, not an unbounded backoff.
+_RETRY_BACKOFF_SEC = (1.0, 3.0)
+
+#: HTTP statuses worth retrying: the server said "not now", not "no". Everything else is an
+#: ANSWER -- a 404 is the wrong URL and a 403 is the rate limit `_http_get` names with its own
+#: workaround, and retrying either burns time or budget to be told the same thing again.
+#:
+#: 429 is deliberately ABSENT even though it is transient. On the unauthenticated releases
+#: endpoint it means the 60-requests/hour budget is spent, and spending it faster is the one
+#: response that cannot help; `_http_get` already turns it into an operator-readable message
+#: pointing at the manual procedure, which needs no API call at all.
+_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 
 
 class UpdateError(Exception):
@@ -176,6 +199,46 @@ def parse_release(payload: bytes | str) -> ReleaseInfo:
     return ReleaseInfo(tag=doc["tag_name"], assets=tuple(assets))
 
 
+def _is_retryable(exc: Exception) -> bool:
+    """Whether `exc` is a stall worth asking again about, or an answer that will not change.
+
+    **`urllib.error.HTTPError` is a subclass of `OSError`**, so the obvious `except OSError:
+    retry` retries a 404 and a 403 as eagerly as a dropped connection. It is the trap this
+    function exists to avoid: a 404 means the URL is wrong and three attempts make it wrong
+    three times, and a 403 on the unauthenticated releases endpoint is the rate limit, where
+    retrying spends the very budget that ran out.
+
+    So an HTTPError is judged by its STATUS and everything else -- a timeout, a reset, a DNS
+    failure, anything `urlopen` raises without a response behind it -- is transport, and
+    transport is retried.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRYABLE_STATUS
+    return isinstance(exc, OSError)
+
+
+def _with_retries[T](attempt: Callable[[], T], *, sleep: Callable[[float], None] = time.sleep) -> T:
+    """Run `attempt`, retrying a transport failure up to `_DOWNLOAD_ATTEMPTS` times (#675).
+
+    Re-raises the LAST exception rather than a wrapper, so every caller's own error message --
+    `_http_get`'s rate-limit text, `_download_file`'s URL -- survives unchanged. This function
+    decides only WHETHER to ask again, never what to say when the answer is final.
+
+    `sleep` is a parameter because the alternative is a test suite that really waits four
+    seconds per retry pin.
+    """
+    last: Exception | None = None
+    for index in range(_DOWNLOAD_ATTEMPTS):
+        try:
+            return attempt()
+        except Exception as exc:  # noqa: BLE001 -- re-raised below; the filter is `_is_retryable`
+            if not _is_retryable(exc) or index == _DOWNLOAD_ATTEMPTS - 1:
+                raise
+            last = exc
+            sleep(_RETRY_BACKOFF_SEC[min(index, len(_RETRY_BACKOFF_SEC) - 1)])
+    raise last if last is not None else AssertionError("unreachable")
+
+
 def _http_get(url: str) -> bytes:
     """GET `url` with keel's own user agent, honestly. A rate-limit (HTTP 403/429 on
     this unauthenticated endpoint) is named as what it is, with the workaround."""
@@ -183,9 +246,12 @@ def _http_get(url: str) -> bytes:
         url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "keel-self-update"},
     )
-    try:
+    def attempt() -> bytes:
         with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SEC) as response:
-            return response.read()
+            return bytes(response.read())
+
+    try:
+        return _with_retries(attempt)
     except urllib.error.HTTPError as exc:
         if exc.code in (403, 429):
             raise UpdateError(
@@ -566,9 +632,12 @@ _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 def _download_file(url: str, dest: Path) -> None:
     """Download a public asset URL to `dest`, with the read BOUNDED at
     `_MAX_DOWNLOAD_BYTES`. The production seam; tests inject."""
-    try:
+    def attempt() -> bytes:
         with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT_SEC) as response:
-            payload = response.read(_MAX_DOWNLOAD_BYTES + 1)
+            return bytes(response.read(_MAX_DOWNLOAD_BYTES + 1))
+
+    try:
+        payload = _with_retries(attempt)
     except OSError as exc:
         raise UpdateError(f"could not download {url}: {exc}") from exc
     if len(payload) > _MAX_DOWNLOAD_BYTES:
@@ -789,20 +858,22 @@ def run_update(
             + ", ".join(path.name for path in superseded)
         )
 
-    # BACKUPS FIRST -- before any download, before any install: if anything after
-    # this point half-happens, the databases' pre-update state exists on disk. Each
-    # is a consistent SQLite snapshot, and a same-second name never overwrites one.
-    occupied = {p.name for p in plan.launch_dir.glob("*.bak-before-*")}
-    backups: list[Path] = []
-    for db_path in plan.db_paths:
-        dest = backup_path(db_path, plan.target_version, ts, occupied=occupied)
-        backup_file(db_path, dest)
-        occupied.add(dest.name)
-        backups.append(dest)
-        say(f"backed up {db_path.name} -> {dest.name}")
-    if not plan.db_paths:
-        say("no keel*.db databases in the launch folder -- nothing to back up")
-
+    # DOWNLOAD FIRST, THEN BACK UP -- and this inverts what this function used to do, so the
+    # argument belongs here rather than in the issue that moved it (#676).
+    #
+    # The old order backed up every database before fetching anything, on the reasoning that
+    # "if anything after this point half-happens, the databases' pre-update state exists on
+    # disk". That guarantee is real and it is UNCHANGED by this order, because a download
+    # cannot make anything half-happen TO A DATABASE: `_download_file` writes only into
+    # `Release/`. The only steps that touch a database are the install (which replaces the
+    # running binary) and the migrate, and both still run after every backup exists.
+    #
+    # What the old order did do is spend the expensive, irreversible work before the cheap,
+    # failure-prone one. On 2026-09-01 a transient stall on the FIRST of five wheels threw away
+    # ~466 MB of `sqlite3.backup()` across three databases -- and because backups are
+    # timestamped and deliberately never deleted, the retry left a second full set behind
+    # rather than reusing the first. A failed download now costs nothing but the partial wheel
+    # the handler below already removes.
     plan.release_dir.mkdir(parents=True, exist_ok=True)
     wheel_paths: list[Path] = []
     try:
@@ -826,13 +897,29 @@ def run_update(
             "removed the partial wheel file(s) from Release/ -- a torn download must "
             "not poison a later rollback"
         )
+        # EMPTY, and that is the change: no database was touched, so there is nothing to
+        # report and nothing on disk to clean up.
         return UpdateResult(
             ok=False,
             steps=tuple(steps),
             error=str(exc),
             rolled_back=False,
-            backups=tuple(backups),
+            backups=(),
         )
+
+    # Every wheel is on disk. NOW back up -- before the install, which is the first step that
+    # can change a database. Each is a consistent SQLite snapshot, and a same-second name never
+    # overwrites one.
+    occupied = {p.name for p in plan.launch_dir.glob("*.bak-before-*")}
+    backups: list[Path] = []
+    for db_path in plan.db_paths:
+        dest = backup_path(db_path, plan.target_version, ts, occupied=occupied)
+        backup_file(db_path, dest)
+        occupied.add(dest.name)
+        backups.append(dest)
+        say(f"backed up {db_path.name} -> {dest.name}")
+    if not plan.db_paths:
+        say("no keel*.db databases in the launch folder -- nothing to back up")
 
     new_keel = console_entry(plan.venv_python)
     installed = False  # whether the wheels FINISHED installing (uv returned success)
@@ -964,7 +1051,7 @@ def gate_detail(plan: UpdatePlan) -> str:
     PURE."""
     return (
         f"launch folder {plan.launch_dir}: download the production wheels to "
-        f"{plan.release_dir}, back up every keel database first "
+        f"{plan.release_dir}, back up every keel database once they are all on disk "
         f"(.bak-before-{plan.latest_version}-<ts>, never deleted by the updater), "
         f"install them into the RUNNING venv ({plan.venv_python}) -- the binary this "
         "process is running RIGHT NOW is replaced -- then migrate and verify. This "
@@ -1040,10 +1127,10 @@ def render_plan_lines(plan: UpdatePlan) -> list[str]:
     lines.append(f"  download to: {plan.release_dir}")
     if plan.db_paths:
         names = ", ".join(path.name for path in plan.db_paths)
-        lines.append(f"  back up first (never deleted): {names}")
+        lines.append(f"  then back up (never deleted): {names}")
         lines.append(f"  backups named: <db>.bak-before-{plan.latest_version}-<timestamp>")
     else:
-        lines.append("  back up first: no keel*.db databases in the launch folder")
+        lines.append("  then back up: no keel*.db databases in the launch folder")
     lines.append(f"  install into the RUNNING venv: {plan.venv_python}")
     lines.append("  then: migrate every database with the new build, verify with")
     lines.append(f"  `keel versions` (every distribution at {plan.latest_version}),")
