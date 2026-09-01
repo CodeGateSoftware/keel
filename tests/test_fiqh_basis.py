@@ -388,7 +388,9 @@ _LONG_ONLY_SIDE = "side=Side.BUY"
 
 _HADITH_NOT_IN_KB = "That reference is not extracted in this repository's knowledge base"
 
-_SELL_SIZE_CONTRACT = "it can only ever make an exit MORE likely to be accepted"
+_CASH_POSTURE_CHECK = "verify_cash_account"
+
+_VENUE_BOUNDARY_PREMISE = "rests on an unverified premise whenever it does not"
 
 
 def test_the_long_only_ruling_is_pinned_two_sided_to_the_code_that_enforces_it():
@@ -461,24 +463,36 @@ def test_the_hadith_reference_is_marked_as_outside_the_knowledge_base():
     )
 
 
-def test_the_venue_boundary_gap_is_stated_not_hidden():
-    """Long-only holds where keel decides; the doc must admit it is open where keel settles.
+def test_the_venue_boundary_premise_is_stated_not_hidden():
+    """The boundary is closed by machinery that fails OPEN, over an account nobody checked.
 
-    A SELL is never clamped to the account's available base, so fee dust, an unrecorded
-    partial fill, or an out-of-band transfer can send an order for more than is held (#667).
-    That is `bay' ma la yamlik` reached by arithmetic. Pinned to `_sell_base_size`'s own
-    contract: while that function's only job is to make an exit more likely to be accepted, it
-    reads no balance, and the open question must stay in the doc. When #667 lands this test
-    fails -- which is the point: the doc gets updated with the code, not after it.
+    This test's first form pinned `_sell_base_size`'s docstring as a proxy for "the SELL is not
+    clamped", on the theory that #667 landing would break it and force the doc to be updated
+    with the code. It did not: #667 clamped at intent construction and left that docstring
+    intact, so the pin held while the paragraph it guarded became false. **A proxy is only a pin
+    while the thing it stands for and the thing it matches move together**, and this one stopped.
+
+    Re-anchored to the fact that actually remains open. `_clamp_to_held`, rail 21 and
+    `sweep_orphan_brackets` all fail open on an unreadable balance -- correctly, since refusing
+    a SELL over a quiet endpoint strands positions that wanted out -- so the defence rests on
+    the account being unable to go short, and nothing verifies that on the venue that trades
+    live. When #666 gives the coinbase adapter a posture read, this test fails, and it fails
+    because the premise changed rather than because a sentence was reworded.
     """
     doc = _unwrapped(_doc())
-    assert "not yet closed at the venue boundary" in doc, (
-        f"{_DOC} must state that long-only is unclosed at the venue boundary -- the ruling is "
-        "sound at the decision layer and the operational gap is not the reader's to discover"
+    assert _VENUE_BOUNDARY_PREMISE in doc, (
+        f"{_DOC} must state that the long-only defence rests on an unverified premise when the "
+        "venue does not answer -- a layered defence described without its assumption reads as "
+        "settled, and the assumption is the part still open"
     )
-    for issue in ("#666", "#667", "#668"):
-        assert issue in doc, f"{_DOC} must name {issue} as the open venue-boundary work"
-    assert _SELL_SIZE_CONTRACT in _rel("keel/execution/executor.py"), (
-        "keel/execution/executor.py's `_sell_base_size` must still carry its stated contract; "
-        f"if the exit now clamps to a real balance, {_DOC}'s open question is stale"
+    assert "#666" in doc, f"{_DOC} must name #666 as the open venue-boundary work"
+    coinbase = "packages/keel-broker-coinbase/keel_broker_coinbase/adapter.py"
+    assert _CASH_POSTURE_CHECK not in _rel(coinbase), (
+        f"{coinbase} now has a {_CASH_POSTURE_CHECK!r} read -- #666 has landed and the open "
+        f"question in {_DOC} is stale. Update the doc, then re-point this test."
+    )
+    alpaca = "packages/keel-broker-alpaca/keel_broker_alpaca/adapter.py"
+    assert _CASH_POSTURE_CHECK in _rel(alpaca), (
+        f"{_DOC} says the posture check exists on the Alpaca adapter alone; {alpaca} must still "
+        "carry it, or the doc is describing a check no adapter has"
     )
