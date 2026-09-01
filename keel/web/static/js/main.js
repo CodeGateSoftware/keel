@@ -44,6 +44,7 @@ import {
   gatesView,
   insightsView,
   modeBadge,
+  ordersView,
   refusedView,
   rulesView,
   setupView,
@@ -95,6 +96,7 @@ const ROUTES = [
   { name: "status", label: "Status", endpoints: ["status"] },
   { name: "setup", label: "Setup", endpoints: ["setup"] },
   { name: "activity", label: "Activity", endpoints: ["activity"] },
+  { name: "orders", label: "Orders", endpoints: ["orders"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
@@ -382,6 +384,15 @@ function mount(route, readings) {
   }
   if (route.name === "activity") {
     return activityView(data, primary.sort, onSort, (scope) => {
+      paramsFor(route.endpoints[0]).scope = scope;
+      void paint(route, true, true);
+    });
+  }
+  if (route.name === "orders") {
+    // The same server-side scope switch Activity uses, and deliberately the same control: two
+    // views over one deployment whose "how far back" behaved differently would be a thing an
+    // operator has to learn twice.
+    return ordersView(data, primary.sort, onSort, (scope) => {
       paramsFor(route.endpoints[0]).scope = scope;
       void paint(route, true, true);
     });

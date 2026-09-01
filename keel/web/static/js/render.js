@@ -1138,6 +1138,176 @@ function jobPanel(job) {
  * @param {(scope: string) => void} onScope
  * @returns {DocumentFragment}
  */
+/**
+ * The orders view (#659): what keel actually bought and sold, and whether anybody agreed to it.
+ *
+ * **`placement` is the first column, and that is the argument this view exists to make.** On a
+ * deployment running `autonomy: ON`, "did I approve this, or did keel place it alone" is the
+ * first question about an order, not the last -- so it leads the row, ahead of the product and
+ * ahead of the price. The word and its tone both arrive already decided
+ * (`payload._order_row_payload`), because `bypass` meaning the same thing as `autonomous` is a
+ * judgement, and judgements are made in Python.
+ *
+ * **`expected` and `actual` are adjacent, with the divergence between them.** That difference is
+ * realised slippage. Its tone is side-aware and comes from the server for the reason
+ * `_order_row_payload` states: paying more than expected is bad on a buy and good on a sell, so
+ * a client colouring the minus sign would be wrong on half the rows.
+ *
+ * **`fee` is the figure as recorded and never a rate.** No percentage is computed here, and none
+ * crosses the wire. A paper row's fee carries a `modelled` badge instead, because
+ * `PaperTrader` derives it from the configured rate and reading it back as a measurement of that
+ * rate is circular.
+ *
+ * **`raw_response` is not in the payload at all**, so this function could not render it if it
+ * tried. The venue's order id is, when there is one, and a sentence saying why there is not,
+ * when there is not.
+ *
+ * @param {any} data
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @param {(scope: string) => void} onScope
+ * @returns {DocumentFragment}
+ */
+export function ordersView(data, sort, onSort, onScope) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Orders"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.generated_at));
+  fragment.append(sub);
+
+  fragment.append(scopeSwitch(plain(data.scope), onScope, "Orders scope"));
+
+  fragment.append(
+    gridCard([
+      kv("shown", data.shown_count),
+      kv("in scope", data.scoped_count),
+      kv("in this book", data.total_count),
+      // Which modes this book actually holds. A deployment book holds one, and saying which
+      // means a reader never concludes it from an empty section -- the same reason `mode` is
+      // on every row below.
+      kv("modes", (data.modes || []).join(", ") || "none"),
+    ]),
+  );
+
+  const rows = data.rows || [];
+  fragment.append(heading("h-orders", "Placed orders"));
+  fragment.append(
+    table(
+      "h-orders",
+      [
+        { label: "placement", numeric: false, key: "placement" },
+        { label: "id", numeric: true, key: "id" },
+        { label: "mode", numeric: false, key: "mode" },
+        { label: "side", numeric: false, key: "side" },
+        { label: "product", numeric: false, key: "product_id" },
+        { label: "status", numeric: false, key: "status" },
+        { label: "qty", numeric: true, key: "qty" },
+        { label: "filled", numeric: true, key: "filled_quantity" },
+        { label: "expected", numeric: true, key: "expected_fill" },
+        { label: "actual", numeric: true, key: "actual_fill" },
+        { label: "divergence", numeric: true, key: "fill_divergence" },
+        { label: "fee", numeric: true, key: "fee" },
+        { label: "placed (UTC)", numeric: false, key: "created_at" },
+      ],
+      rows.map(
+        /** @param {any} row */ (row) => [
+          row.placement,
+          row.id,
+          row.mode,
+          row.side,
+          plain(row.product_id) || "—",
+          row.status,
+          row.qty,
+          row.filled_quantity,
+          row.expected_fill,
+          row.actual_fill,
+          row.fill_divergence,
+          row.fee,
+          row.created_at,
+        ],
+      ),
+      // Never reached when `rows` is empty, because `emptyOrders` below answers first with the
+      // specific fact; kept as the table's own fallback rather than a lie about which empty it
+      // is.
+      "No orders to show.",
+      { sort: sort, onSort: onSort },
+    ),
+  );
+
+  if (rows.length === 0) fragment.append(emptyOrders(data));
+  else for (const row of rows) fragment.append(orderDetail(row));
+
+  return fragment;
+}
+
+/**
+ * What to say when there are no rows, which is NEVER a bare empty table.
+ *
+ * "This book has never held an order" and "the window you chose excluded them" are different
+ * facts, and an empty table that could mean either is a surface asserting something it has not
+ * established. The sentence arrives already chosen (`payload._EMPTY_NOTES`) because selecting
+ * prose from an enum word is a branch on a value, which this file does not do.
+ *
+ * @param {any} data
+ * @returns {HTMLElement}
+ */
+function emptyOrders(data) {
+  const card = el("div", "card");
+  card.append(el("strong", undefined, plain(data.empty_note) || "No orders to show."));
+  return card;
+}
+
+/**
+ * One order's full record, as a disclosure under the table.
+ *
+ * The table is the scan; this is the audit. It carries the three things a row cannot fit and an
+ * operator needs anyway: what the placement WORD means in a sentence, whether the fee was
+ * charged or modelled, and the venue's own order id (or why there is none).
+ *
+ * @param {any} row
+ * @returns {HTMLElement}
+ */
+function orderDetail(row) {
+  const node = el("details", "cycle");
+  const summary = el("summary");
+  summary.append(field(row.placement), " · ", field(row.mode), " ", field(row.side), " ");
+  summary.append(plain(row.product_id) || "—", " · ");
+  summary.append(field(row.created_at));
+  node.append(summary);
+  node.append(
+    gridCard([
+      kv("placement", field(row.placement)),
+      kv("what that means", plain(row.placement_note)),
+      kv("order type", row.order_type),
+      kv("status", row.status),
+      kv("expected fill", row.expected_fill),
+      kv("actual fill", row.actual_fill),
+      kv("divergence", row.fill_divergence),
+      kv("divergence direction", row.fill_divergence_adverse),
+      kv("fee", row.fee),
+      kv("fee basis", field(row.fee_modelled)),
+      kv("about this fee", plain(row.fee_note)),
+      // The venue's book at submit (#626), as the PAIR. No spread is derived here: the two
+      // columns exist precisely so that the three different spread questions stay askable, and
+      // a view that answered one of them silently would be choosing for the reader.
+      kv("best bid at submit", row.submit_best_bid),
+      kv("best ask at submit", row.submit_best_ask),
+      kv("book at submit", plain(row.submit_book_note) || field(row.submit_book_observed)),
+      // The ONLY thing read out of `raw_response`, upstream, already bounded. When it is empty
+      // the note says why -- a blank cell reads as missing data, and "the paper trader placed
+      // this" reads as the answer it is.
+      kv(
+        "venue order id",
+        plain(row.venue_order_id) || plain(row.venue_order_id_note) || "—",
+      ),
+      kv("rule", row.rule_id),
+      kv("last updated", row.updated_at),
+    ]),
+  );
+  return node;
+}
+
 export function activityView(data, sort, onSort, onScope) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Activity"));
@@ -1227,13 +1397,19 @@ export function activityView(data, sort, onSort, onScope) {
  * when the view is rebuilt underneath a keyboard user who just pressed it. `aria-current` and the
  * underline carry which one is on, from one attribute, so nothing is lost by keeping it pressable.
  *
+ * The `label` argument arrived with #659's second caller. Two scope switches on one site
+ * announcing themselves identically would leave a screen-reader user unable to tell which view's
+ * window they had just landed in, and hard-coding "Activity scope" onto the Orders view would be
+ * worse than no name at all.
+ *
  * @param {string} current
  * @param {(scope: string) => void} onScope
+ * @param {string} [label]  how the control announces itself. Defaults to Activity's wording.
  * @returns {HTMLElement}
  */
-function scopeSwitch(current, onScope) {
+function scopeSwitch(current, onScope, label) {
   const wrap = el("nav", "scopes");
-  wrap.setAttribute("aria-label", "Activity scope");
+  wrap.setAttribute("aria-label", label || "Activity scope");
   wrap.append(el("span", "k", "scope"));
   for (const name of SCOPES) {
     const button = el("button", "scopekey", name);

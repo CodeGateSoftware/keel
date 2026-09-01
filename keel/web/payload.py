@@ -130,6 +130,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         JournalReport,
         RuleTrackRecord,
     )
+    from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.status import (
         AutonomyStatus,
         MarketSessionStatus,
@@ -216,7 +217,7 @@ def _decimalise(value: Decimal | float | None) -> Decimal | None:
         return value if value.is_finite() else None
     try:
         candidate = Decimal(repr(value))
-    except (InvalidOperation, ValueError, TypeError):
+    except InvalidOperation, ValueError, TypeError:
         return None
     return candidate if candidate.is_finite() else None
 
@@ -369,7 +370,7 @@ def _gmt(ts: float | int | None, fmt: str) -> str:
         return ""
     try:
         return time.strftime(fmt, time.gmtime(float(ts)))
-    except (OverflowError, OSError, ValueError):
+    except OverflowError, OSError, ValueError:
         return ""
 
 
@@ -677,9 +678,7 @@ def _attestation_payload(attestation: WithdrawalAttestationStatus) -> dict[str, 
 
 def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     return {
-        "state": label(
-            session.state, state=_SESSION_STATES.get(session.state or "", UNKNOWN)
-        ),
+        "state": label(session.state, state=_SESSION_STATES.get(session.state or "", UNKNOWN)),
         "recorded_at": moment(session.recorded_ts),
         # `defused` is whether a recorded CLOSED still vouches for the quiet -- the reason a
         # weekend's stale data must not alert. It is a fact the report already carries, and the
@@ -716,9 +715,7 @@ def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
     if position.initial_stop is not None:
         stop = money(position.initial_stop)
         return label(stop["value"], display=f"paper stop {stop['display']}", state=NEUTRAL)
-    return label(
-        "n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL
-    )
+    return label("n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL)
 
 
 def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]:
@@ -1215,6 +1212,177 @@ def activity_payload(feed: ActivityFeed) -> dict[str, Any]:
     }
 
 
+# -- orders (#659) ---------------------------------------------------------------------------------
+
+
+#: How an `empty_reason` word is stated to a reader, and how it is styled.
+#:
+#: Chosen HERE rather than in the client for `activity_payload::status_note`'s reason:
+#: `tests/web/test_client_assets.py::test_render_never_judges_a_value_itself` forbids
+#: `render.js` from reading `Field.value` at all, so prose selected by an enum word is a branch
+#: that must cross the wire already made. `""` is not in the table -- a report with rows needs
+#: no paragraph.
+_EMPTY_NOTES: dict[str, str] = {
+    "book": "no orders in this book at all -- keel has placed none here.",
+    "scope": (
+        "no orders in this window. The book holds orders, all of them outside this scope -- "
+        "widen it to see them."
+    ),
+}
+
+#: The two `mode` words, styled. `live` is `warn` not because live trading is wrong but because
+#: it is the row where real money moved, and a reader scanning a mixed list must be able to find
+#: those rows without reading them.
+_ORDER_MODE_STATES: dict[str, str] = {"live": WARN, "paper": NEUTRAL}
+
+#: `orders.status`, judged. `filled` is the outcome the row exists to record; `rejected` and
+#: `canceled` are the ones an operator went looking for; `pending` is neither yet.
+_ORDER_STATUS_STATES: dict[str, str] = {
+    "filled": GOOD,
+    "pending": NEUTRAL,
+    "open": NEUTRAL,
+    "canceled": WARN,
+    "cancelled": WARN,
+    "rejected": BAD,
+}
+
+
+def _order_row_payload(row: OrderRow) -> dict[str, Any]:
+    """One `OrderRow`, placed. Nothing is decided here.
+
+    Every judgement on this row was made by `keel/commands/orders.py`: whether the placement was
+    autonomous, whether the fill divergence went against the order, whether the fee was modelled
+    or charged. This function chooses a `state` word for each and a symbol for each figure, and
+    that is all -- which is what makes the browser and `keel orders` incapable of disagreeing.
+
+    **There is no `raw_response` key, and there is nothing to leave one out of.**
+    `OrdersReport` does not carry the column; `venue_order_id` is the short scalar the service
+    read out of it. A reader wanting the blob opens SQLite, which is the right amount of
+    friction for unbounded venue JSON.
+
+    **`fee` is a figure, never a rate.** No percentage appears in this payload. Deriving one
+    would be arithmetic Rule 3 forbids here, and would put a number on the page that the report
+    does not hold.
+    """
+    return {
+        # FIRST, and that is the layout argument rather than a JSON convention: on a deployment
+        # running `autonomy: ON`, "did I approve this, or did keel place it alone" is the most
+        # important thing about an order. The client renders keys in this order.
+        "placement": flag(
+            row.confirmation_is_autonomous,
+            on="AUTONOMOUS",
+            off=row.confirmation or "unrecorded",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "placement_note": row.confirmation_detail,
+        "confirmation": label(row.confirmation or "unrecorded", state=NEUTRAL),
+        "id": count(row.id),
+        # Per ROW, never inferred from the book: each deployment book holds one mode, so a
+        # reader comparing two consoles needs the distinction on the row itself.
+        "mode": label(row.mode, state=_ORDER_MODE_STATES.get(row.mode, UNKNOWN)),
+        "product_id": row.product_id,
+        "side": label(row.side, state=NEUTRAL),
+        "order_type": label(row.order_type or "unknown", state=NEUTRAL),
+        "status": label(row.status, state=_ORDER_STATUS_STATES.get(row.status, UNKNOWN)),
+        "qty": quantity(row.qty),
+        "filled_quantity": quantity(row.filled_quantity),
+        "limit_price": money(row.limit_price),
+        # Side by side, with the difference between them, because that difference is realised
+        # slippage and a reader should not have to do the subtraction -- nor could this layer do
+        # it for them (Rule 3).
+        "expected_fill": money(row.expected_fill),
+        "actual_fill": money(row.actual_fill),
+        "fill_divergence": money(
+            row.fill_divergence,
+            signed=True,
+            # The service decided this. A negative divergence is GOOD on a sell and BAD on a
+            # buy, so `money`'s own sign-derived state would be wrong on half the rows -- which
+            # is why the state is passed rather than inferred.
+            state=(
+                NEUTRAL
+                if row.fill_divergence_adverse is None
+                else (BAD if row.fill_divergence_adverse else GOOD)
+            ),
+        ),
+        "fill_divergence_adverse": flag(
+            row.fill_divergence_adverse,
+            on="against keel",
+            off="in keel's favour",
+            on_state=BAD,
+            off_state=GOOD,
+        ),
+        "fee": money(row.fee),
+        "fee_modelled": flag(
+            row.fee_is_modelled,
+            on="modelled",
+            off="charged",
+            # A modelled fee is not a defect, it is a fact about which book this is -- but it is
+            # a fact a reader must not mistake for evidence about what trading costs.
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "fee_note": row.fee_detail,
+        # THE VENUE'S OWN BOOK AT SUBMIT (#626), as the PAIR and never as a spread. #626 stored
+        # two columns rather than one delta deliberately -- half-spread-from-mid,
+        # half-spread-from-the-side-crossed and relative spread are three different questions off
+        # one pair -- so deriving one here would answer one of them on the reader's behalf, and
+        # would also be arithmetic Rule 3 forbids in this layer. Same rule as `fee`.
+        "submit_best_bid": money(row.submit_best_bid),
+        "submit_best_ask": money(row.submit_best_ask),
+        "submit_book_observed": flag(
+            row.submit_book_observed,
+            on="recorded",
+            off="not observed",
+            # Absent is not a defect -- every paper row is absent by design, and rows written
+            # before #626 have nothing to show -- but it IS the difference between a row that
+            # can evidence spread cost and one that cannot.
+            on_state=NEUTRAL,
+            off_state=WARN,
+        ),
+        "submit_book_note": row.submit_book_detail,
+        # The ONLY thing anything reads out of `raw_response`, already bounded and validated by
+        # `orders._venue_order_id`. `venue_order_id_detail` says why it is absent when it is, so
+        # a paper row shows a sentence rather than a blank that reads as missing data.
+        "venue_order_id": row.venue_order_id,
+        "venue_order_id_note": row.venue_order_id_detail,
+        "rule_id": count(row.rule_id),
+        "created_at": moment(row.created_at),
+        "updated_at": moment(row.updated_at),
+    }
+
+
+def orders_payload(report: OrdersReport) -> dict[str, Any]:
+    """`gather_orders`'s `OrdersReport`, as JSON.
+
+    The three counts all cross, and all three are READ from the report rather than measured
+    here -- Rule 6e of `test_console_thinness.py` bans `len()` in this module for exactly this
+    reason, and `OrdersReport.shown_count` exists so the ban costs nothing.
+
+    `empty_reason` crosses as a raw word AND as `empty_note`, already written out. "This book
+    has never held an order" and "your window excluded them" are different facts, and a client
+    that had to tell them apart by comparing `total_count` to `scoped_count` would be
+    re-deriving a judgement the report already made.
+
+    `modes` is every mode present in the whole book. A deployment book holds one in practice, so
+    stating which means a reader never concludes it from an empty section.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "scope": report.scope,
+        "scope_start_at": moment(report.scope_start_ts),
+        "limit": count(report.limit),
+        "total_count": count(report.total_count),
+        "scoped_count": count(report.scoped_count),
+        "shown_count": count(report.shown_count),
+        "modes": [str(mode) for mode in report.modes],
+        "empty_reason": report.empty_reason,
+        "empty_note": _EMPTY_NOTES.get(report.empty_reason, ""),
+        "rows": [_order_row_payload(row) for row in report.rows],
+    }
+
+
 # -- the envelope (#534) -------------------------------------------------------------------------
 #
 # Every `GET /api/*` success is wrapped in the same four keys, so #536's single `fetch` wrapper
@@ -1355,7 +1523,7 @@ def _finite_decimal(text: str) -> Decimal | None:
         return None
     try:
         candidate = Decimal(text)
-    except (InvalidOperation, ValueError, TypeError):
+    except InvalidOperation, ValueError, TypeError:
         return None
     return candidate if candidate.is_finite() else None
 

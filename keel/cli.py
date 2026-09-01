@@ -154,6 +154,7 @@ from keel.commands.fetch import run_fetch
 from keel.commands.insights import insights_group
 from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
+from keel.commands.orders import orders_cmd
 from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.purification import render_purification_report
 from keel.commands.research import research_group
@@ -1340,6 +1341,14 @@ cli.add_command(scope_group)
 # defined in `keel.commands.status` and registered here.
 cli.add_command(status_cmd)
 cli.add_command(doctor_cmd)
+
+# -- orders (the audit trail: what keel actually bought and sold) -------------------------------
+
+# `orders` is the one table that records money moving, and until #659 no front-end read it:
+# `status` shows what is HELD right now and `activity` parses the LOG, so "did keel place this,
+# or did I approve it" was answerable only in SQLite. Read-only, both modes, newest first --
+# defined in `keel.commands.orders`, which `keel/web/payload.py` projects onto the same report.
+cli.add_command(orders_cmd)
 
 
 # -- serve (the interactive surface -- there is one, and it is a browser) ------------------------

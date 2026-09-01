@@ -245,6 +245,39 @@ def read_activity(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> 
     return payload.activity_payload(apply_scope(feed, scope, now_ts=time.time()))
 
 
+def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
+    """The audit trail: what keel actually bought and sold, and at what price (#659).
+
+    **No `mode` reaches the service, and none may.** `gather_orders` calls `get_orders()`
+    unfiltered because each deployment book holds exactly one mode; a `?mode=` here would put
+    that failure back through the query string, so this endpoint has no such parameter. The mode
+    is on every row.
+
+    `?scope=` is NORMALISED rather than refused, `activity`'s reasoning exactly: it is the
+    SERVICE's own function with the CLI's own default behind it, and refusing here would have
+    the browser and the terminal disagreeing about the same input. The resolved value is echoed
+    back in `data.scope`. `?limit=` IS refused when it is not a whole number or is out of range,
+    because a caller who asked for two thousand rows and silently got fifty has been told
+    nothing -- unlike a scope, whose echo makes the substitution visible.
+    """
+    from keel.commands.orders import (
+        DEFAULT_ORDERS_LIMIT,
+        MAX_ORDERS_LIMIT,
+        gather_orders,
+        normalise_scope,
+    )
+
+    scope = normalise_scope(_first(query, "scope"))
+    raw_limit = _first(query, "limit")
+    limit = DEFAULT_ORDERS_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_ORDERS_LIMIT)
+    repo = open_repo(cfg.db_path)
+    try:
+        report = gather_orders(repo, now_ts=int(time.time()), scope=scope, limit=limit)
+    finally:
+        close_repo(repo)
+    return payload.orders_payload(report)
+
+
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The per-rule track records and the promotion-gate distances.
 
@@ -280,9 +313,7 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
     limit = _journal_limit(query)
     repo = open_repo(cfg.db_path)
     try:
-        report = build_journal_report(
-            repo, _status_report(cfg, now_ts), now_ts, limit=limit
-        )
+        report = build_journal_report(repo, _status_report(cfg, now_ts), now_ts, limit=limit)
     finally:
         close_repo(repo)
     return payload.journal_payload(report, curve=build_equity_curve(report.entries))
@@ -370,9 +401,7 @@ class ApiRoute:
 #: would be a surface built in order to be removed -- and any client written against it would break
 #: on the release that removes it.
 API_ROUTES: dict[str, ApiRoute] = {
-    "/api/config": ApiRoute(
-        html_route="", read=read_config, needs_database=False
-    ),
+    "/api/config": ApiRoute(html_route="", read=read_config, needs_database=False),
     "/api/status": ApiRoute(
         html_route="/",
         read=read_status,
@@ -452,6 +481,29 @@ API_ROUTES: dict[str, ApiRoute] = {
             "outcome",
         ),
     ),
+    "/api/orders": ApiRoute(
+        html_route="/orders",
+        read=read_orders,
+        collection="rows",
+        # The money columns and the audit ones. `placement` sorts the rows an operator most
+        # needs to find -- the autonomous ones -- to one end of the list, which is the reason
+        # this endpoint exists at all.
+        sortable=(
+            "id",
+            "placement",
+            "mode",
+            "product_id",
+            "side",
+            "status",
+            "qty",
+            "filled_quantity",
+            "expected_fill",
+            "actual_fill",
+            "fill_divergence",
+            "fee",
+            "created_at",
+        ),
+    ),
     "/api/rules": ApiRoute(
         html_route="/rules",
         read=read_rules,
@@ -491,6 +543,21 @@ def _first(query: Query, name: str) -> str:
     return values[0]
 
 
+def _whole_number(raw: str, ceiling: int) -> int:
+    """A `?limit=` that is a whole number inside `1..ceiling`, or an `ApiRefusal`.
+
+    `_journal_limit`'s body, generalised over the ceiling when `/api/orders` arrived (#659)
+    rather than copied: two functions refusing the same input with two texts is how the API's
+    error vocabulary starts to drift one endpoint at a time."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ApiRefusal(400, "Bad limit", f"limit={raw!r} is not a whole number.") from exc
+    if value < 1 or value > ceiling:
+        raise ApiRefusal(400, "Bad limit", f"limit={raw!r} is outside 1..{ceiling}.")
+    return value
+
+
 def _journal_limit(query: Query) -> int:
     """How many journal rows to build, from `?limit=`.
 
@@ -500,19 +567,7 @@ def _journal_limit(query: Query) -> int:
     raw = _first(query, "limit")
     if not raw:
         return DEFAULT_JOURNAL_LIMIT
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ApiRefusal(
-            400, "Bad limit", f"limit={raw!r} is not a whole number."
-        ) from exc
-    if value < 1 or value > MAX_JOURNAL_LIMIT:
-        raise ApiRefusal(
-            400,
-            "Bad limit",
-            f"limit={raw!r} is outside 1..{MAX_JOURNAL_LIMIT}.",
-        )
-    return value
+    return _whole_number(raw, MAX_JOURNAL_LIMIT)
 
 
 def _sort_request(path: str, route: ApiRoute, query: Query) -> tuple[str, bool]:
