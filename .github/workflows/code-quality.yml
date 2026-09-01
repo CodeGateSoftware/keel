@@ -1,4 +1,5 @@
 name: Code Quality
+run-name: "Sonar/Snyk · ${{ github.event_name }} · ${{ github.head_ref || github.ref_name }}"
 
 # SonarQube (static analysis + coverage) and Snyk (dependency vulnerabilities).
 #
