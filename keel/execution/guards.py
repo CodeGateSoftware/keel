@@ -4,7 +4,7 @@
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
 16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, 18, the
 settlement-currency rail, 19, the spot-instrument rail, and 20, the trade-scope rail (#233) —
-nineteen in all, since there is no rail 15. They run before any order is placed, in every
+twenty in all, since there is no rail 15. They run before any order is placed, in every
 `auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA order classes. It
 never short-circuits: every violated rail is collected and reported so an operator (or the
 executor, Task 4) sees the full picture, not just the first trip-wire.
@@ -231,18 +231,40 @@ class OrderIntent:
     # exit, which is worse than the imprecision being fixed.
     base_increment: Decimal | None = None
 
+    # #667: what the venue says the account actually HOLDS of this product's base currency.
+    # Fetched by the executor, like `available_quote` and `base_increment`, because guards has
+    # no broker of its own. Rail 21 reads it, and `executor._clamp_to_held` clamps the SELL
+    # quantity to it.
+    #
+    # ⚠️ This is `Balance.total`, NEVER `Balance.available`, and the distinction is the whole
+    # reason this field is safe to have. `available` EXCLUDES base committed to resting orders,
+    # and keel's own protective bracket commits the entire position -- so `available` reads
+    # ~0 for exactly the products keel is protecting, and clamping to it would veto every stop
+    # roll and every exit keel has ever placed. `total` (available + hold) is the ownership
+    # number, and ownership is the question *bay' ma la yamlik* asks.
+    #
+    # `None` means UNKNOWN and does NOT veto -- the deliberate opposite of rail 13's fail-closed
+    # posture, for the reason `_sell_base_size` gives: refusing a SELL strands a position that
+    # wanted out, and an unreadable balance is not evidence the position is gone.
+    available_base: Decimal | None = None
+
 
 #: Rails whose inputs describe the LIVE ACCOUNT and therefore cannot be evaluated offline:
 #: rail 13 needs a broker-fetched quote balance, rail 17 needs the account's real withdrawal
 #: state, rail 20 needs the venue's own attested/confirmed trade-scope record. Paper trading has
 #: no live account, so these are SKIPPED there -- and RECORDED as skipped, never silently
 #: omitted, so a paper track record is honest about its own gaps.
-LIVE_STATE_RAILS = ("usdc_funding", "withdrawal_capability", "trade_scope")
+LIVE_STATE_RAILS = (
+    "usdc_funding",
+    "withdrawal_capability",
+    "trade_scope",
+    "base_balance",
+)
 
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all nineteen rails: `ok` iff `violations` is empty."""
+    """The outcome of running all twenty rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -446,13 +468,13 @@ def check(
     now_ts: int,
     offline: bool = False,
 ) -> GuardResult:
-    """Run all nineteen §14 (+ Issue #59, Task 4, #233) hard rails against `intent`. Never
+    """Run all twenty §14 (+ Issue #59, Task 4, #233, #667) hard rails against `intent`. Never
     short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
     un-overridable.
 
-    `offline=True` (paper trading only) skips `LIVE_STATE_RAILS` — the two rails whose inputs
+    `offline=True` (paper trading only) skips `LIVE_STATE_RAILS` — the rails whose inputs
     describe the real account, which a paper rehearsal has no access to. **Every other rail still
     runs**, because the promotion gate is scored on the paper track record: a rehearsal that
     skipped the rails would promote a strategy on evidence of trades live trading would have
@@ -955,6 +977,42 @@ def check(
                     "rolls, cancels and DCA exits are unaffected. Run `keel scope attest "
                     f"--trading --venue {venue}` once the credential can place live orders."
                 )
+
+    # 21. Base-balance (#667) — a SELL may not be sent for a base the account does not hold.
+    #     The mirror of rail 13, and deliberately NOT its mirror image.
+    #
+    #     Rail 13 fails CLOSED: an unknown quote balance vetoes the BUY, because a refused BUY
+    #     costs nothing. This one fails OPEN on unknown, because a refused SELL strands a
+    #     position that wanted out -- `_sell_base_size`'s asymmetry table, applied to a balance
+    #     instead of an increment. Do not "fix" this into consistency either.
+    #
+    #     It therefore vetoes ONE case: the venue affirmatively reports a zero-or-negative
+    #     holding while keel's ledger believes it holds something. That is not an exit to
+    #     protect, it is a divergence between the books and the account -- and `_build_intent`
+    #     already returns `None` when the LEDGER says zero, so reaching here at all means the
+    #     two disagree. Sending it would be *bay' ma la yamlik* reached by arithmetic: on a cash
+    #     account the venue rejects it, and on a margin-enabled one (#666) it fills as a short.
+    #     Refusing sells nothing and traps nothing, because there is nothing there to trap.
+    #
+    #     A holding that is merely SMALLER than the order is NOT vetoed here -- that is the
+    #     clamp's job (`executor._clamp_to_held`), and vetoing it would refuse an exit that can
+    #     still be made, for a position that really exists.
+    #
+    #     ⚠️ `available_base` is `Balance.total`, not `Balance.available`. See `OrderIntent`:
+    #     `available` excludes base committed to resting orders, and keel's own bracket commits
+    #     the whole position, so this rail read on `available` would veto every exit keel places.
+    if not offline and not is_buy:
+        held = intent.available_base
+        # The loose parse, purely for the MESSAGE. The executor matched the venue balance on
+        # the strict one; naming a leg here costs nothing and never raises.
+        base = _asset(intent.product_id)
+        if held is not None and held <= 0:
+            violations.append(
+                f"base_balance: the venue reports a {base} holding of {held} for "
+                f"{intent.product_id} while keel's ledger expects {intent.qty} -- refusing to "
+                "sell what the account does not hold. Reconcile the position (an out-of-band "
+                "transfer, or an exit that already executed) before trading this product."
+            )
 
     for violation in violations:
         log_event(

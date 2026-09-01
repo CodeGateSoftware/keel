@@ -768,6 +768,51 @@ def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
 
 
 
+def balance_drift_findings(records: dict[str, Any]) -> list[Finding]:
+    """Products where the venue held less base than keel's ledger expected (#667).
+
+    Written by `executor._clamp_to_held` whenever a SELL had to be reduced. The clamp already
+    kept the order honest -- keel asked for what was there, not what it remembered -- so this is
+    not a report of an order that went wrong. It is a report that the BOOKS and the ACCOUNT
+    disagree, which the clamp handles per-order and nobody reconciles.
+
+    WARN, not FAIL, and for a specific reason: every cause is legitimate. A venue took its fee
+    out of the base leg, a fill came in short, or the operator moved coins. None of those is a
+    fault in the deployment; all of them make the ledger's idea of the position wrong until a
+    human decides which it was. A FAIL would demand action on a state that may be entirely
+    intended.
+
+    Surfaced HERE rather than left to the log line the clamp also writes, because the drift
+    outlives the order that discovered it: the next exit will be clamped by the same amount, and
+    an operator who never greps for `executor.sell_clamped_to_held` would never learn why.
+    """
+    drifts = sorted((p, r) for p, r in records.items() if isinstance(r, dict))
+    if not drifts:
+        return [
+            Finding(
+                "balance.drift",
+                OK,
+                "no ledger/venue divergence recorded",
+                "every SELL went out at the quantity the ledger expected",
+                "-",
+            )
+        ]
+    described = ", ".join(
+        f"{product}: ledger {record.get('ordered')} vs venue {record.get('held')} "
+        f"(short {record.get('drift')})"
+        for product, record in drifts
+    )
+    return [
+        Finding(
+            "balance.drift",
+            WARN,
+            f"{len(drifts)} product(s) held less than the ledger expected",
+            f"{described} -- the SELL was clamped to the held quantity, so nothing oversold",
+            "reconcile the position: a base-leg fee, a short fill, or an out-of-band transfer",
+        )
+    ]
+
+
 def unbooked_exit_findings(
     open_positions: list[dict[str, Any]], orders: list[dict[str, Any]]
 ) -> list[Finding]:
@@ -938,6 +983,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     from keel import agent
     from keel.commands import fetch
     from keel.commands._products import _default_sim_products
+    from keel.execution import executor as executor_mod
     from keel.execution import guards
 
     findings: list[Finding] = []
@@ -983,6 +1029,14 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     findings += veto_findings(log_lines, since_ts=now_ts - 7 * 86_400)
     # A repo read, like every other check -- pinned read-only by the same change-counter test.
     findings += partial_fill_findings(repo.get_orders(mode="live"))
+    # Read here rather than inside the finding, so the finding stays a pure function of data
+    # like every other one in this module and the read stays where the repo already is.
+    findings += balance_drift_findings(
+        {
+            key[len(executor_mod.BALANCE_DRIFT_PREFIX) :]: repo.get_state(key)
+            for key in repo.get_state_keys(executor_mod.BALANCE_DRIFT_PREFIX)
+        }
+    )
     # #639: modes are POOLED here, unlike the partial-fill sweep above -- the ledger
     # invariant belongs to `agent._open_tranche`, which writes it for paper and live alike.
     findings += unbooked_exit_findings(repo.get_open_positions(), repo.get_orders())

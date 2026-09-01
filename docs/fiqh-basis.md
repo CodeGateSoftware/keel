@@ -181,10 +181,10 @@ account level is the operator's obligation, listed first in
 
 ### The remaining rails — prudential, not fiqh
 
-Nineteen rails exist (1–14, 16, 17, 18, 19, 20 — there is no rail 15). Of these, only rail 17
-encodes a fiqh ruling, and rails 1/18/19 enforce what the screen and the charter admit. The
-rest are PRUDENTIAL — risk and discipline, justified by trading evidence, carrying no
-religious claim:
+Twenty rails exist (1–14, 16–21 — there is no rail 15). Of these, rails 17 and 21 encode a
+fiqh ruling, and rails 1/18/19 enforce what the screen and the charter admit. The rest are
+PRUDENTIAL — risk and discipline, justified by trading evidence, carrying no religious
+claim:
 
 | rail | what it does | basis |
 | --- | --- | --- |
@@ -197,6 +197,37 @@ religious claim:
 | 12 | stale-feed + kill-switch, fails closed | operational safety |
 | 13, 14 | spend only the settled quote currency; monthly allowance cap | operational safety |
 | 20 | trade-scope veto on live entries for a venue credential nobody has attested for trading | operational safety |
+
+**Rail 21 is the second fiqh rail, and it was added because the ruling had a hole under it
+(#667).** keel's refusal to go short is structural — no rule can express a short and the engine
+builds every entry as a BUY — but structure governs what keel DECIDES, not the quantity that
+reaches the venue. A SELL was sized from keel's own ledger, and the ledger runs high: a venue
+that takes its taker fee out of the received base leaves less than the order said, a partial
+fill leaves less still, and an operator who moves coins out of the account tells keel nothing.
+Ask a venue for base that is not there and a cash account rejects it — but a margin-enabled one
+fills the difference by opening a short.
+
+That is *bay' ma la yamlik* (بيع ما لا يملك), "do not sell what you do not possess" — Ayub
+Ch 6.5.1 (§65.4), with Ch 5.4.2 (§65.11) recording that "short-selling has been prohibited by
+almost all scholars" because the subject matter must be "capable of ownership/title, capable of
+delivery/possession". It is a more direct anchor than riba for this particular failure, and the
+difference is load-bearing: the oversell is impermissible before any interest is charged, so a
+riba-framed defence does not reach it at all.
+
+Two mechanisms, deliberately split. `executor._clamp_to_held` reduces an order that is too big
+for a position that really exists — down only, never up. Rail 21 refuses the one case the clamp
+will not touch: a venue that affirmatively reports holding nothing while the ledger expects
+something. Neither cancels a protective order, which is why
+`_record_observed_fill_quantity`'s refusal to auto-resize still stands beside them unchanged.
+
+⚠️ The rail fails **OPEN** on an unknown holding, the deliberate inverse of rails 12/13/17. A
+refused BUY costs nothing; a refused SELL strands a position that wanted out. An unreadable
+balance is not evidence the position is gone, and this is the one place in the engine where
+"unknown is a rejection" would do more harm than the hole it closes.
+
+What remains open at the venue boundary is #666: on a cash account every case above is a
+rejected order rather than a short, and keel has no cash-account posture check on Coinbase —
+`verify_cash_account` exists only on the Alpaca adapter.
 
 Beside the rails — not among them, and not numbered — sits one routing-time check with the
 same prudential character: the **max-spread entry gate** (#350, `keel/execution/executor.py`)
