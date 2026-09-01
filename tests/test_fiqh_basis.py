@@ -376,3 +376,109 @@ def test_the_readme_links_the_document():
     assert _DOC in (_ROOT / "README.md").read_text(), (
         f"README.md must link {_DOC} from its documentation map"
     )
+
+
+_LONG_ONLY_PROHIBITION = "short-selling has been prohibited by"
+
+_LONG_ONLY_SUBJECT_MATTER = "capable of ownership/title, capable of delivery/possession"
+
+_LONG_ONLY_TYPE = 'direction: Literal["long"]'
+
+_LONG_ONLY_SIDE = "side=Side.BUY"
+
+_HADITH_NOT_IN_KB = "That reference is not extracted in this repository's knowledge base"
+
+_SELL_SIZE_CONTRACT = "it can only ever make an exit MORE likely to be accepted"
+
+
+def test_the_long_only_ruling_is_pinned_two_sided_to_the_code_that_enforces_it():
+    """The doc names two enforcement points by their exact source text; both must still exist.
+
+    Long-only is the one ruling in this document that is neither an attestation nor a rail:
+    it is structural, and it holds only because the rule contract cannot express a short and
+    the engine cannot construct one. Either half silently changing would leave the doc making
+    a fiqh claim about behaviour the code no longer has.
+    """
+    doc = _unwrapped(_doc())
+    assert _LONG_ONLY_TYPE in doc and _LONG_ONLY_SIDE in doc, (
+        f"{_DOC} must name both long-only enforcement points exactly "
+        f"({_LONG_ONLY_TYPE!r} and {_LONG_ONLY_SIDE!r}) -- a claim that cannot be checked "
+        "against a line of code is the kind this document exists to refuse"
+    )
+    base = (_ROOT / "keel/strategy/rules/base.py").read_text()
+    assert re.search(r'(?m)^\s+direction: Literal\["long"\]\s*$', base), (
+        "keel/strategy/rules/base.py must still DECLARE the field as `Literal[\"long\"]`. "
+        "Matched on the field line, not anywhere in the file: the `__post_init__` docstring "
+        f"quotes the annotation too, and a prose mention is not a contract {_DOC} can cite"
+    )
+    assert 'if self.direction != "long":' in _rel("keel/strategy/rules/base.py"), (
+        "keel/strategy/rules/base.py must still enforce the direction at RUNTIME -- the "
+        "annotation is a promise to mypy, and a foreign rule never runs mypy (#447)"
+    )
+    assert _LONG_ONLY_SIDE in _rel("keel/strategy/engine.py"), (
+        "keel/strategy/engine.py must still build every entry Signal as a BUY; if an entry "
+        f"can be a SELL, {_DOC}'s long-only section is false"
+    )
+
+
+def test_the_long_only_doctrine_is_quoted_from_the_knowledge_base():
+    """`bay' ma la yamlik` is cited, not asserted -- and the source must still say it.
+
+    The document's whole method is that a ruling is checkable against an in-repo extract.
+    Long-only rests on §65.11's short-selling passage, so the doc's quotation and source-65's
+    text are pinned to each other in both directions.
+    """
+    doc = _unwrapped(_doc())
+    source = "docs/superpowers/references/trading-knowledge-base/sources/source-65.md"
+    text = _rel(source)
+    for quoted in (_LONG_ONLY_PROHIBITION, _LONG_ONLY_SUBJECT_MATTER):
+        assert quoted in doc, (
+            f"{_DOC} must quote §65.11 verbatim ({quoted!r}) -- long-only is a fiqh "
+            "derivation here, not a charter, so it must carry its citation"
+        )
+        assert quoted in text, (
+            f"{source} must still carry the passage the doc quotes ({quoted!r})"
+        )
+
+
+def test_the_hadith_reference_is_marked_as_outside_the_knowledge_base():
+    """A primary-text citation with no `§N.x` row must SAY it has none.
+
+    Every other citation in this document resolves to an in-repo extract; the hadith of Hakim
+    ibn Hizam does not. Recording it without the disclaimer would let a reader assume the same
+    provenance the `§N.x` rows carry -- exactly the papering-over the KB's honesty rules
+    forbid. Two-sided: the disclaimer must be there, and it must still be TRUE.
+    """
+    assert _HADITH_NOT_IN_KB in _unwrapped(_doc()), (
+        f"{_DOC} must mark the hadith reference as outside the knowledge base "
+        f"({_HADITH_NOT_IN_KB!r}) -- an uncited primary text may be recorded, never disguised"
+    )
+    sources = _ROOT / "docs/superpowers/references/trading-knowledge-base/sources"
+    carrying = [p.name for p in sorted(sources.glob("*.md")) if "an-Nasa'i" in p.read_text()]
+    assert not carrying, (
+        f"{carrying} now extracts the hadith the doc says is absent -- the disclaimer has "
+        "become false; give the citation its §N.x row and drop the caveat"
+    )
+
+
+def test_the_venue_boundary_gap_is_stated_not_hidden():
+    """Long-only holds where keel decides; the doc must admit it is open where keel settles.
+
+    A SELL is never clamped to the account's available base, so fee dust, an unrecorded
+    partial fill, or an out-of-band transfer can send an order for more than is held (#667).
+    That is `bay' ma la yamlik` reached by arithmetic. Pinned to `_sell_base_size`'s own
+    contract: while that function's only job is to make an exit more likely to be accepted, it
+    reads no balance, and the open question must stay in the doc. When #667 lands this test
+    fails -- which is the point: the doc gets updated with the code, not after it.
+    """
+    doc = _unwrapped(_doc())
+    assert "not yet closed at the venue boundary" in doc, (
+        f"{_DOC} must state that long-only is unclosed at the venue boundary -- the ruling is "
+        "sound at the decision layer and the operational gap is not the reader's to discover"
+    )
+    for issue in ("#666", "#667", "#668"):
+        assert issue in doc, f"{_DOC} must name {issue} as the open venue-boundary work"
+    assert _SELL_SIZE_CONTRACT in _rel("keel/execution/executor.py"), (
+        "keel/execution/executor.py's `_sell_base_size` must still carry its stated contract; "
+        f"if the exit now clamps to a real balance, {_DOC}'s open question is stale"
+    )

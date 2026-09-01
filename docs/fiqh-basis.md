@@ -123,6 +123,49 @@ The fiqh content — that derivatives and difference-settlement are impermissibl
 (§65.6: what makes speculation *maisir* is non-ownership, non-delivery, difference-settlement)
 but the RAILS are the charter enforcing it.
 
+### Long-only — *bay' ma la yamlik*, §65.4/§65.6/§65.11
+
+keel never sells what it does not hold, and four independent places enforce it:
+
+- **The rule contract.** `Setup` declares `direction: Literal["long"]`, and `__post_init__`
+  enforces at runtime the one thing that annotation only asserts statically — so a foreign
+  rule cannot propose a short, and cannot propose one wearing a long's label (#447).
+- **The engine.** `keel/strategy/engine.py` builds every entry `Signal` with `side=Side.BUY`,
+  unconditionally. No branch produces a `Side.SELL` entry.
+- **Rail 10.** Every SELL must cite a defined rule — no arbitrary liquidation.
+- **Rails 18/19.** The spot-only charter: nothing that settles by price difference.
+
+The doctrine, from the same source the rest of this document rests on. §65.11 (Ayub Ch 5.4.2):
+*"short-selling has been prohibited by almost all scholars"* — because the subject matter
+*"must be existing/existable… capable of ownership/title, capable of delivery/possession… and
+the seller must have its title and risk."* §65.6 draws the same boundary from the other side:
+what converts speculation into *maisir* is **(a) not owning it, (b) not possessing it, (c) not
+taking or making delivery, or (d) settling by price difference** — never frequency, never
+volatility.
+
+**Unlike rails 18/19, this one is a fiqh-derivation and not a charter.** It descends from the
+prohibition Ayub states at Ch 6.5.1 (§65.4) as *"do not sell what you do not possess"* —
+*bay' ma la yamlik*. That anchor is more direct than riba for this class of failure, and the
+difference matters: a sale of what the seller does not hold is impermissible with no interest
+anywhere in the transaction, so a riba-framed defence does not reach it.
+
+⚠️ One qualification, because §65.4 is invoked here for nearly the opposite of what it was read
+for. §65.4's own point is that the prohibition is **not** a physical-custody rule — *"what is
+meant by possession here is the inability to deliver the goods"* — which is exactly how
+exchange-held balances qualify as valid `qabd`. That lenient reading does not weaken the
+long-only claim; it sharpens it. On the constructive-possession test the question is whether
+anything prevents delivery, and in the failure modes recorded under "Known open questions" the
+asset is not there at all. Selling it fails the prohibition on the lenient reading, not merely
+the strict one.
+
+**On the primary text.** The doctrine is conventionally anchored to the hadith of Hakim ibn
+Hizam — *"Do not sell what is not with you"* (لا تبع ما ليس عندك), Sunan an-Nasa'i 4613 /
+Sunan Abu Dawud 3503. **That reference is not extracted in this repository's knowledge base**,
+and is recorded here as the operator's citation: checkable against the collections, but
+carrying no `§N.x` row and not treated as one. The in-repo authority for everything above is
+§65.4/§65.6/§65.11, corroborated by §28.2's ownership principle and §33's gharar reading of
+*"the sale of items not owned"*.
+
 ### Purification (§65.9) and idle-balance rewards (§56.3)
 
 `keel/compliance/purification.py` implements Ayub §65.9: interest/reward credits are
@@ -224,6 +267,18 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
   Whether "no underlying purpose" is disqualifying "is exactly the kind of judgement the
   screen defers to a human" (`docs/experiments/2026-07-20-candidate-universe.md`) — deferred,
   not decided.
+- **Long-only is enforced where keel DECIDES, not where it SETTLES.** Everything under
+  "Long-only" above governs what keel chooses. It does not govern the quantity that reaches
+  the venue. A SELL is never clamped to the account's available base (#667): the exit sells
+  what the ledger believes is held, and the ledger drifts from the account through fees taken
+  in the base asset, partial fills (`filled_quantity` is recorded nowhere on this
+  deployment), and out-of-band operator transfers. A resting stop leg can outlive the
+  position that justified it, because no sweep cancels a SELL whose position is gone (#668).
+  On a cash account each of these is a rejected order — bad, but not a fiqh failure. On a
+  margin-enabled account the venue fills the difference as a short, and keel has no
+  cash-account posture check on Coinbase (#666; the check exists only on the Alpaca adapter).
+  So the long-only ruling above is sound at the decision layer and **not yet closed at the
+  venue boundary**. Named here rather than left to be discovered.
 - **ZEC and the rest of the deferrals.** The candidate-universe record lists the open
   questions the attestation step has to answer and "which this agent must not answer".
 
