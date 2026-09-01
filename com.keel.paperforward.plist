@@ -14,7 +14,7 @@
          So this fires often and the runner decides: 09:00 through 20:00 hourly, plus on load
          (= login/boot). The first trigger at or after 09:00 that finds no stamp for today runs
          the cycle; every later one is a no-op. A cycle that FAILS leaves no stamp, so the next
-         hour retries it -- which also covers waking with no network. -->
+         hour retries it, which also covers waking with no network. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>

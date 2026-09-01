@@ -14,8 +14,11 @@ ship).
 
 The runner tests execute the REAL script verbatim through a harness that shims `date` (so
 they do not depend on, or wait on, the wall clock) and stubs the deployment's
-`.venv/bin/keel`. No sandboxing is needed here, unlike `test_schedule.py`: this script places
-nothing real, notifies nobody, and is repointed away from `~/keel` before it runs.
+`.venv/bin/keel`. No `sandbox-exec` is needed here, unlike `test_schedule.py`: this script
+places nothing real, and is repointed away from `~/keel` before it runs. It DOES notify now
+(#642 gave it a `notify()` seam identical in shape to `keel-live-run.sh`'s), so the harness
+still redirects the literal `/usr/bin/osascript` the same way, purely so a test run can never
+pop a real notification.
 """
 
 from __future__ import annotations
@@ -185,19 +188,42 @@ def _install_date_shim(bin_dir: Path) -> None:
     shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
 
 
-def _sandbox(tmp_path: Path, keel_exit_code: int) -> tuple[Path, Path, Path, dict[str, str]]:
+def _sandbox(
+    tmp_path: Path,
+    keel_exit_code: int,
+    *,
+    fetch_exit_code: int = 0,
+    doctor_exit_code: int = 0,
+    doctor_stdout: str = "",
+) -> tuple[Path, Path, Path, dict[str, str], Path]:
     """Copy the REAL runner into `tmp_path`, repointed at the sandbox, with a stubbed `keel`.
 
-    Only ONE rewrite, load-bearing for safety: `DIR="..."` -> `tmp_path`, so the gate, the
-    stamp and the invocation all run VERBATIM. No notification redirection is needed (this
-    script never notifies); no sandbox-exec either (it places nothing real -- but the DIR
-    rewrite is still asserted so a test can never run the deployment's own copy).
+    Two rewrites, both load-bearing: `DIR="..."` -> `tmp_path`, so the gate, the stamp and the
+    invocations all run VERBATIM; and the literal `/usr/bin/osascript` -> a recorder (#642 gave
+    this script a `notify()` seam it did not have before, shaped identically to
+    `keel-live-run.sh`'s so this same rewrite works unmodified). No `sandbox-exec` is needed
+    (this script places nothing real).
+
+    The `$KEEL` stub dispatches on subcommand (`fetch`/`doctor`/`agent`), mirroring
+    `tests/test_schedule.py`'s `_sandbox`: `keel_exit_code` keeps its original meaning -- the
+    AGENT invocation's exit code -- so every pre-existing call site keeps working unmodified;
+    `fetch_exit_code`/`doctor_exit_code`/`doctor_stdout` default to a clean, silent fetch and
+    doctor, exactly as if this script still only ever ran `agent`.
     """
     source = RUN_SCRIPT.read_text()
     patched, count = re.subn(
         r'^DIR="[^"]*"$', f'DIR="{tmp_path}"', source, count=1, flags=re.MULTILINE
     )
     assert count == 1, "could not repoint DIR -- refusing to run a script aimed at the deployment"
+
+    calls_log = tmp_path / "osascript-calls.log"
+    recorder = tmp_path / "osascript-recorder.sh"
+    recorder.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{calls_log}"\nexit 0\n')
+    recorder.chmod(recorder.stat().st_mode | stat.S_IEXEC)
+    osascript_count = patched.count("/usr/bin/osascript")
+    assert osascript_count == 1, "expected exactly one literal reference to /usr/bin/osascript"
+    patched = patched.replace("/usr/bin/osascript", str(recorder))
+
     assert "/Users/elmehdiaitbrahim/keel" not in patched
 
     script = tmp_path / "paper-hourly-run.sh"
@@ -207,11 +233,17 @@ def _sandbox(tmp_path: Path, keel_exit_code: int) -> tuple[Path, Path, Path, dic
     stub_dir = tmp_path / ".venv" / "bin"
     stub_dir.mkdir(parents=True, exist_ok=True)
     invocations = stub_dir / "keel.invocations"
+    doctor_stdout_file = stub_dir / "doctor.stdout"
+    doctor_stdout_file.write_text(doctor_stdout)
     stub = stub_dir / "keel"
     stub.write_text(
         "#!/bin/bash\n"
         f'printf "%s\\n" "$*" >> "{invocations}"\n'
-        f"exit {keel_exit_code}\n"
+        'case " $* " in\n'
+        f'  *" fetch "*) exit {fetch_exit_code} ;;\n'
+        f'  *" doctor "*) cat "{doctor_stdout_file}"; exit {doctor_exit_code} ;;\n'
+        f"  *) exit {keel_exit_code} ;;\n"
+        "esac\n"
     )
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
@@ -220,7 +252,7 @@ def _sandbox(tmp_path: Path, keel_exit_code: int) -> tuple[Path, Path, Path, dic
 
     env = dict(os.environ)
     env["PATH"] = f"{date_bin}:{env.get('PATH', '')}"
-    return script, invocations, tmp_path / "logs" / ".paper-hourly-last-run", env
+    return script, invocations, tmp_path / "logs" / ".paper-hourly-last-run", env, calls_log
 
 
 def _run(script: Path, env: dict[str, str], now_utc: datetime) -> subprocess.CompletedProcess[str]:
@@ -241,74 +273,83 @@ def test_a_clean_cycle_stamps_the_utc_hour_and_the_same_hour_is_a_no_op(tmp_path
     """The dedupe, end to end, in the real shell: a successful cycle stamps THIS_HOUR
     (`YYYY-MM-DDThh`, UTC); any later trigger in the same UTC hour (a repeated load,
     fall-back's repeated local hour) does nothing."""
-    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=0)
+    script, invocations, stamp, env, _calls = _sandbox(tmp_path, keel_exit_code=0)
     at_1420 = datetime(2026, 6, 15, 14, 20, tzinfo=UTC)
 
     first = _run(script, env, at_1420)
     assert first.returncode == 0
-    assert _count_lines(invocations) == 1
+    # fetch, pre-cycle doctor, agent, post-cycle doctor (#640/#642's cycle shape).
+    assert _count_lines(invocations) == 4
     assert stamp.read_text().strip() == "2026-06-15T14"
 
     second = _run(script, env, at_1420)
     assert second.returncode == 0
     assert "already ran" in second.stdout
-    assert _count_lines(invocations) == 1
+    assert _count_lines(invocations) == 4, "an already-ran hour must not invoke keel at all"
 
 
 def test_the_next_utc_hour_runs_its_own_cycle(tmp_path):
     """The regression a copy of paperforward-run.sh would ship: that script stamps the DATE,
     so 23 of this job's 24 daily triggers would be no-ops and the profile would silently
     collect daily evidence. The stamp must be hour-grained."""
-    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=0)
+    script, invocations, stamp, env, _calls = _sandbox(tmp_path, keel_exit_code=0)
 
     assert _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC)).returncode == 0
     assert _run(script, env, datetime(2026, 6, 15, 15, 20, tzinfo=UTC)).returncode == 0
     assert _run(script, env, datetime(2026, 6, 15, 16, 50, tzinfo=UTC)).returncode == 0
 
-    assert _count_lines(invocations) == 3
+    assert _count_lines(invocations) == 12, "3 cycles x (fetch, doctor, agent, doctor)"
     assert stamp.read_text().strip() == "2026-06-15T16"
 
 
-def test_the_cycle_runs_the_hourly_config_against_its_own_database(tmp_path):
+def test_the_cycle_invokes_fetch_then_doctor_then_agent_then_doctor_against_its_own_database(
+    tmp_path,
+):
     """Config and database must travel as a pair: `--db` defaults to keel.db (the DAILY paper
     account), so a runner that dropped the flag would drive hourly rows against the wrong
-    ledger -- the exact footgun the `keel-live`/`keel-paperhourly` wrappers exist to remove."""
-    script, invocations, _, env = _sandbox(tmp_path, keel_exit_code=0)
+    ledger -- the exact footgun the `keel-live`/`keel-paperhourly` wrappers exist to remove.
+    Also pins the #640/#642 cycle SHAPE and its ORDER: fetch, doctor, agent, doctor."""
+    script, invocations, _, env, _calls = _sandbox(tmp_path, keel_exit_code=0)
 
     _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC))
 
-    assert invocations.read_text().strip() == (
-        "--config config.paper-hourly.yaml --db keel-paperhourly.db agent"
-    )
+    lines = invocations.read_text().splitlines()
+    assert [line.split()[-1] for line in lines] == ["fetch", "doctor", "agent", "doctor"]
+    for line in lines:
+        assert line.startswith("--config config.paper-hourly.yaml --db keel-paperhourly.db ")
 
 
 def test_a_failed_cycle_writes_no_stamp_so_the_same_hour_retries(tmp_path):
     """Same failure direction as paperforward/live: a cycle that died (no network on wake,
     venue late publishing the bar) must not be recorded as done. A later trigger in the SAME
     hour retries; the stamp only appears once a cycle succeeds."""
-    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=4)
+    script, invocations, stamp, env, _calls = _sandbox(tmp_path, keel_exit_code=4)
 
     failed = _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC))
     assert failed.returncode == 4, "the script must surface the cycle's exit code, not mask it"
     assert not stamp.exists(), "a failed cycle must leave the hour unstamped so it is retried"
+    # the post-cycle doctor still ran even though the cycle itself failed.
+    assert _count_lines(invocations) == 4
 
     retried = _run(script, env, datetime(2026, 6, 15, 14, 40, tzinfo=UTC))
     assert retried.returncode == 4
     assert "already ran" not in retried.stdout
-    assert _count_lines(invocations) == 2
+    assert _count_lines(invocations) == 8
 
 
 def test_a_failed_cycle_is_retried_and_then_stamped_by_a_later_trigger(tmp_path):
     """The two-step of the failure path, in one sandbox: fail at 14:20 (no stamp), succeed at
     14:40 (stamps the same UTC hour), no-op at 14:59."""
-    script, invocations, stamp, env = _sandbox(tmp_path, keel_exit_code=4)
+    script, invocations, stamp, env, _calls = _sandbox(tmp_path, keel_exit_code=4)
     at_1420 = datetime(2026, 6, 15, 14, 20, tzinfo=UTC)
     at_1440 = datetime(2026, 6, 15, 14, 40, tzinfo=UTC)
 
     assert _run(script, env, at_1420).returncode == 4
     assert not stamp.exists()
 
-    # Flip the stub to success in place, then re-fire inside the same hour.
+    # Flip the stub to success in place, then re-fire inside the same hour. This simple
+    # replacement stub does not dispatch by subcommand -- it does not need to, since every one
+    # of the cycle's four invocations (fetch, doctor, agent, doctor) only needs to succeed here.
     stub = tmp_path / ".venv" / "bin" / "keel"
     stub.write_text(f'#!/bin/bash\nprintf "cycle\\n" >> "{invocations}"\nexit 0\n')
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
@@ -316,12 +357,64 @@ def test_a_failed_cycle_is_retried_and_then_stamped_by_a_later_trigger(tmp_path)
     ok = _run(script, env, at_1440)
     assert ok.returncode == 0
     assert stamp.read_text().strip() == "2026-06-15T14"
-    assert _count_lines(invocations) == 2
+    assert _count_lines(invocations) == 8
 
     later = _run(script, env, datetime(2026, 6, 15, 14, 59, tzinfo=UTC))
     assert later.returncode == 0
     assert "already ran" in later.stdout
-    assert _count_lines(invocations) == 2
+    assert _count_lines(invocations) == 8
+
+
+# -- #640/#642: fetch/doctor never gate, and this script now has a notify() seam ----------------
+
+
+def test_runner_script_has_a_notify_seam_shaped_like_keel_live_runs(tmp_path):
+    """#642: every paper wrapper gets the SAME single-seam `notify()` (identical shape, same
+    `2>/dev/null || true` guard) as `keel-live-run.sh`'s, precisely so the same test-harness
+    rewrite (`_sandbox`'s `/usr/bin/osascript` -> recorder swap) works on it unmodified."""
+    text = RUN_SCRIPT.read_text()
+    assert 'OSASCRIPT="/usr/bin/osascript"' in text
+    assert "notify() {" in text
+    assert '2>/dev/null || true' in text
+
+
+def test_a_failing_fetch_notifies_and_the_cycle_still_runs(tmp_path):
+    """#642: a fetch failure is reported, not swallowed, and never gates -- the cycle still
+    runs on whatever cache it already has."""
+    script, invocations, stamp, env, calls = _sandbox(tmp_path, keel_exit_code=0, fetch_exit_code=5)
+    result = _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC))
+
+    assert result.returncode == 0, "a fetch failure must never abort the script"
+    assert stamp.read_text().strip() == "2026-06-15T14", "the cycle must still run and stamp"
+    assert _count_lines(invocations) == 4
+    assert "fetch failed" in calls.read_text()
+
+
+def test_a_doctor_fail_notifies_and_the_cycle_still_runs_with_no_gate(tmp_path):
+    """#642's per-product-gating instruction is refused here too, for the identical reason it
+    is refused in `keel-live-run.sh` (see that script's block comment, and
+    `tests/test_schedule.py::test_a_doctor_fail_notifies_and_the_cycle_still_runs_with_no_gate_of_its_own`):
+    `keel/agent.py`'s whole-cycle admission bit already withholds every entry, on every
+    product, book-wide, the instant any rule is blocked. A doctor FAIL ahead of this cycle is
+    a REPORT, and must not stop the cycle from running or stamping."""
+    script, invocations, stamp, env, calls = _sandbox(
+        tmp_path,
+        keel_exit_code=0,
+        doctor_exit_code=1,
+        doctor_stdout=(
+            "[FAIL] data.stale: 3 of 19 series are stale\n"
+            "       BTC-USD ONE_HOUR 5 bars behind\n"
+        ),
+    )
+    result = _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC))
+
+    assert result.returncode == 0, "a doctor FAIL must never abort the script"
+    assert stamp.read_text().strip() == "2026-06-15T14", "the cycle must still run and stamp"
+    assert _count_lines(invocations) == 4
+    calls_text = calls.read_text()
+    assert "doctor reported FAIL" in calls_text
+    assert "data.stale" in calls_text
+    assert "report only" in calls_text
 
 
 # -- the wrapper and the runbook ----------------------------------------------------------------
@@ -346,3 +439,32 @@ def test_runbook_documents_the_profile_its_database_and_the_caveat():
     assert "NET-NEGATIVE" in text
     assert "keel migrate --db keel-paperhourly.db" in text
     assert '"granularity": "ONE_HOUR"' in text
+
+
+def test_runbook_documents_launchctl_install_and_verification():
+    """#640 exists because the install step was never written down: `com.keel.paper-hourly.plist`
+    was tracked in-repo and sat in `~/keel` for weeks, unloaded, and nothing noticed for ten
+    days. This pin is worth having on its own -- it is the one paragraph that would have
+    prevented the incident."""
+    text = RUNBOOK.read_text()
+    assert "launchctl bootstrap gui/$(id -u)" in text
+    assert "launchctl list | grep com.keel" in text
+    assert "launchctl bootout gui/$(id -u)" in text
+    assert "schedules nothing" in text
+
+
+def test_runbook_documents_profile_scheduled_and_profile_cycled_findings():
+    """The new `keel doctor` findings that make a stalled or unscheduled profile visible are
+    the structural fix for #640; the runbook must name them, not just the incident."""
+    text = RUNBOOK.read_text()
+    assert "profile.scheduled" in text
+    assert "profile.cycled" in text
+
+
+def test_runbook_documents_the_cycle_shape_and_why_doctor_does_not_gate():
+    """#642's refused per-product-gating instruction, in the operator-facing doc: per product
+    in the report, book-wide in the gate."""
+    text = RUNBOOK.read_text()
+    assert "fetch" in text
+    normalized = " ".join(text.split())
+    assert "per product in the report, book-wide in the gate" in normalized

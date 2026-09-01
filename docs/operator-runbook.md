@@ -311,6 +311,79 @@ and has already produced one. Establish which account a number came from before 
 | cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) | daily, in the US session (UTC day-stamp) |
 | rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
 
+### Installing and verifying a profile's launchd job
+
+**Being tracked in this repo, or even sitting in `~/keel`, schedules nothing.** A plist has to
+be COPIED to `~/Library/LaunchAgents/` and then `bootstrap`ped into launchd before it will ever
+fire — those are two separate facts, and #640 is what it costs to conflate them.
+`com.keel.paper-hourly.plist` has been tracked in this repo since 2026-08-03 and sat correctly
+written in `~/keel`, but was never installed. Verified state on 2026-08-31: the hourly book's
+last cycle was **2026-08-21 00:20:05Z** — ten days, and roughly 240 missed hourly cycles,
+earlier — with **4 orders total (2 BUY / 2 SELL, all 2026-08-20), 19 rules in `paper`, and 0
+rows in `trade_outcomes`**, while `~/Library/LaunchAgents/` held only `com.keel.live.plist` and
+`com.keel.paperforward.plist`. No keel surface reported it: `keel status` and the pre-#640
+`keel doctor` only ever look at the one database a given invocation is pointed at, never at a
+sibling profile that has gone dark. `keel doctor`'s `profile.scheduled`/`profile.cycled`
+findings close that hole -- see below.
+
+Per profile, after copying `com.keel.<name>.plist` from the deployment directory to
+`~/Library/LaunchAgents/`:
+
+```bash
+# install (or re-install after editing the plist)
+cp com.keel.paper-hourly.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.keel.paper-hourly.plist
+
+# verify it is actually loaded
+launchctl list | grep com.keel
+
+# uninstall (before deleting the plist, or before a `bootstrap` re-install)
+launchctl bootout gui/$(id -u)/com.keel.paper-hourly
+```
+
+`launchctl list | grep com.keel` is the ground truth for "is launchd actually going to run
+this" -- a job absent from that list runs on no schedule at all, regardless of what the plist
+file says or where it sits on disk. Do this for all four: `com.keel.live`,
+`com.keel.paperforward`, `com.keel.paper-hourly`, `com.keel.paper-equities`.
+
+**`keel doctor` is the standing check that this never silently regresses again.** Since #640 it
+gathers every profile a deployment declares (plist + runner script + config + sibling
+database) and asks two questions no single `--config`/`--db` invocation could ever answer on
+its own, because each only ever looks at the ONE database it was pointed at:
+
+- `profile.scheduled` -- does launchd actually have a job for this profile right now (parses
+  `launchctl list` itself)? FAILs when a profile is confirmed not loaded -- exactly the
+  paper-hourly incident, reproduced as a finding instead of ten days of silence.
+- `profile.cycled` -- is each profile's last cycle recent relative to ITS OWN cadence (a
+  multiple of `interval_sec`, so an hourly profile and a daily profile are held to their own
+  clocks, not one flat threshold)? FAILs on a profile that is loaded but has stalled.
+
+Run `keel doctor` (or `keel doctor --json` for the machine-readable form, `products` array
+included) after installing a new profile, and periodically thereafter -- it is what would have
+caught the ten-day gap on day one instead of day ten.
+
+**The new cycle shape, and why `doctor` does not gate.** As of #640/#642 all four wrappers run
+`fetch`, then `doctor`, then the cycle (`agent`), then `doctor` again. `doctor`'s verdict is
+surfaced by a macOS notification when it FAILs, but it is a REPORT, never a second gate: the
+engine (`keel/agent.py`'s whole-cycle admission bit) already withholds every entry, on every
+product, the instant any rule anywhere is blocked -- deliberately, to close a real-money
+duplicate-order hazard (a blocked rule on one product must not leave a DIFFERENT product's
+order placed while the day goes unstamped, which would re-enter the placed product on the next
+trigger). A wrapper-level gate keyed to one product would be *finer-grained* than the engine
+already is, would change nothing about what actually trades, and pushing the engine itself to
+decide per-product would reopen the exact hazard that admission bit exists to close. So: **per
+product in the report, book-wide in the gate** -- `doctor` names what is wrong; the engine
+alone decides what does not trade.
+
+This is also why fetching before every cycle matters more than it looks: on 2026-08-31 the
+live book's BTC, ETH, PAXG, XLM and ADA feeds were each 18 hourly bars behind -- all five carry
+live rules -- so the whole-cycle admission bit withheld EVERY entry, book-wide, every cycle,
+and a single `keel fetch` cleared it. A product with NOTHING cached is skipped entirely and
+withholds nothing (harmless, if unwatched); a product merely a few bars BEHIND is what
+withholds the whole cycle. The wrappers now fetch before evaluating for exactly this reason,
+and the live wrapper additionally gives exit 4 (`agent.DATA_NOT_READY_EXIT`, entries withheld
+on data readiness) its own notification, distinct from an ordinary failure or a quiet market.
+
 **Why there are three files per database.** Since keel serves a web UI, one process reads the
 database while another writes it — a page refreshing while a fetch or an agent cycle runs. SQLite's
 default journal cannot do that (a writer takes an exclusive lock), and it did not: a first fetch

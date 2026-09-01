@@ -264,6 +264,42 @@ you have and how long is left.
 
 Turn it on only once you have watched several supervised cycles behave correctly.
 
+## 8. Schedule it
+
+Everything above ran `keel agent` by hand. Unattended running means `keel-live-run.sh`
+scheduled by `com.keel.live.plist` — and **being tracked in this repo, or even copied into
+`~/keel`, schedules nothing**: launchd only ever runs a plist that has been copied to
+`~/Library/LaunchAgents/` and explicitly `bootstrap`ped. #640 is what it costs to skip this
+step: `com.keel.paper-hourly.plist` sat correctly written in `~/keel` for weeks, unloaded, and
+nothing noticed for ten days.
+
+```bash
+cp com.keel.live.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.keel.live.plist
+
+# verify it is actually loaded -- the ONLY ground truth for "will this run unattended"
+launchctl list | grep com.keel
+
+# to stop scheduling it (before editing/removing the plist, or before re-bootstrapping)
+launchctl bootout gui/$(id -u)/com.keel.live
+```
+
+Then verify the deployment itself, not just the launchd registration:
+
+```bash
+keel doctor
+```
+
+Since #640/#642, `doctor` gathers every profile a deployment declares (plist + runner + config
++ database) and reports two things no single `--config`/`--db` invocation can see on its own:
+`profile.scheduled` (is launchd's job actually loaded — the exact fact `launchctl list` above
+just checked, cross-checked from the deployment's own side) and `profile.cycled` (has it
+actually cycled recently, relative to its own cadence). Run it right after bootstrapping, and
+again after the first scheduled trigger has had a chance to fire, to confirm the job is not
+just loaded but actually running. `doctor`'s verdict here is diagnostic, not a gate: it never
+stops a cycle from running (see `docs/operator-runbook.md`'s "Installing and verifying a
+profile's launchd job" for the full argument on why doctor reports and the engine alone gates).
+
 ---
 
 ## What can still go wrong
