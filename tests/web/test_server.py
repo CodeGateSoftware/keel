@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from keel.web import server as web_server
-from keel.web.security import SESSION_COOKIE, new_session_token
+from keel.web.security import SESSION_COOKIE, new_session_token, session_cookie
 
 #: Every endpoint that can carry deployment data, for the tests that sweep all of them.
 #:
@@ -814,6 +814,110 @@ def test_the_token_is_exchanged_for_a_strict_cookie_and_leaves_the_url(
     assert cookie.startswith(f"{SESSION_COOKIE}={running.token}")
     assert "SameSite=Strict" in cookie
     assert "HttpOnly" in cookie
+
+
+def test_the_cookie_on_the_wire_is_the_one_security_py_builds(
+    running: web_server.ServeConfig,
+) -> None:
+    """The header the browser actually receives, compared against the builder BYTE FOR BYTE.
+
+    Equality, not `in`. The attribute set is the whole session model in five words, and a
+    substring assertion is satisfied by a header that carries the right attributes plus a wrong
+    one -- or by a call site that formats its own string and happens to agree today. Binding the
+    two sides here means `test_the_session_cookie_carries_every_attribute_the_model_depends_on`
+    reasons about the builder and this reasons about the wire, and neither can drift alone.
+
+    The `Max-Age` half is #634: without it this is a session cookie, and closing the browser
+    threw away a token `keel serve` was still honouring."""
+    _status, headers, _body = _request(running, f"/?token={running.token}")
+
+    assert headers["Set-Cookie"] == session_cookie(running.token)
+    assert "Max-Age=" in headers["Set-Cookie"], (
+        "the session cookie has no lifetime again -- closing the browser will discard a token "
+        "that is still valid, which is the whole of #634"
+    )
+
+
+def test_a_cookie_from_another_serve_run_is_refused(
+    running: web_server.ServeConfig,
+) -> None:
+    """**The property #634 declined to sell, asserted against a running server.**
+
+    A persistent cookie is only safe because the value inside it is bounded by the process that
+    minted it. `keel serve` mints a token per run and never writes it to disk, so a cookie that
+    survives a restart is a cookie carrying a string the next run has never heard of -- and that
+    is what makes a thirty-day `Max-Age` an extension of convenience rather than of authority.
+
+    Presented here as the cookie a DIFFERENT run would have set, built through the same builder
+    the server uses, so the shape is right and only the secret is wrong. The refusal must be the
+    session refusal (403, "Not authorised"), not a parse error or a 500.
+
+    An implementation that persisted the session secret across runs -- option 2 of #634 -- would
+    make this cookie admit, which is precisely why the test is written as another RUN's cookie
+    rather than as a random string."""
+    other_run = new_session_token()
+    assert other_run != running.token
+
+    status, _headers, body = _request(
+        running, "/api/status", cookie=session_cookie(other_run).partition(";")[0]
+    )
+
+    assert status == 403
+    assert "Not authorised" in body
+
+
+def test_the_module_that_mints_the_session_token_cannot_write_it_anywhere() -> None:
+    """`keel/web/security.py` has no way to reach the filesystem, and that is load-bearing.
+
+    `new_session_token`'s docstring makes a promise -- "never written to disk: a token that
+    outlives the process it authorised is a credential" -- and #634 is the issue that was
+    tempted to break it, because persisting the secret is the cheapest way to make an installed
+    app survive a restart. A promise in a docstring is not enforcement; this is.
+
+    Asserted structurally: the module imports nothing that can open a file and calls nothing that
+    can write one. Anyone persisting the token would have to do it somewhere else and would have
+    to notice they were leaving the module that argues it is never persisted.
+
+    **What this does NOT cover, stated plainly:** it constrains ONE module. Nothing here stops a
+    future `keel/commands/serve.py` from reading a token out of a file and handing it to
+    `ServeConfig`, and no source-level test in a Python-only suite can prove a secret never
+    reaches a disk at run time. This raises the cost of the quiet version of that change and
+    makes the deliberate version visible in review; it does not make it impossible."""
+    import ast
+
+    from keel.web import security
+
+    source = Path(security.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    filesystem_modules = {"pathlib", "os", "os.path", "io", "shutil", "tempfile", "json", "pickle"}
+    writers = {"open", "write_text", "write_bytes", "write", "writelines", "dump", "mkdir"}
+
+    offences: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in filesystem_modules:
+                    offences.append(f"imports {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in filesystem_modules:
+                offences.append(f"imports from {node.module}")
+        elif isinstance(node, ast.Call):
+            callee = node.func
+            name = (
+                callee.id
+                if isinstance(callee, ast.Name)
+                else callee.attr
+                if isinstance(callee, ast.Attribute)
+                else None
+            )
+            if name in writers:
+                offences.append(f"calls {name}")
+
+    assert not offences, (
+        "keel/web/security.py can now reach the filesystem, and it is the module that promises "
+        "the session token never does: " + "; ".join(sorted(set(offences)))
+    )
 
 
 def test_a_wrong_token_is_refused(running: web_server.ServeConfig) -> None:

@@ -9,12 +9,33 @@ from __future__ import annotations
 import pytest
 
 from keel.web.security import (
+    SESSION_COOKIE,
+    SESSION_COOKIE_MAX_AGE_SECONDS,
     HostPolicy,
     new_session_token,
     parse_cookie_header,
+    session_cookie,
     split_host_header,
     tokens_match,
 )
+
+
+def _cookie_parts(header: str) -> tuple[str, str, dict[str, str]]:
+    """`Set-Cookie` split into name, value and a lowercased attribute map.
+
+    Parsed rather than substring-searched, because a substring assertion passes against a header
+    that carries the attribute inside the VALUE, against one that spells it twice, and against
+    one whose attributes are separated by something a browser will not split on.
+    """
+    first, _, rest = header.partition(";")
+    name, _, value = first.partition("=")
+    attributes: dict[str, str] = {}
+    for chunk in rest.split(";"):
+        if not chunk.strip():
+            continue
+        key, _, raw = chunk.partition("=")
+        attributes[key.strip().lower()] = raw.strip()
+    return name.strip(), value.strip(), attributes
 
 
 def test_a_hostname_that_resolves_to_loopback_is_still_refused() -> None:
@@ -101,3 +122,63 @@ def test_cookie_parsing_drops_malformed_pairs_rather_than_raising() -> None:
         "other": "1",
     }
     assert parse_cookie_header("HttpOnly; keel_session=abc") == {"keel_session": "abc"}
+
+
+def test_the_session_cookie_carries_every_attribute_the_model_depends_on() -> None:
+    """Four attributes, each refusing a different thing, asserted as a parsed SET.
+
+    `HttpOnly` keeps the token out of `document.cookie` and so out of anything the derived CSRF
+    value is written into. `SameSite=Strict` -- and the assertion is that it is `Strict`, not
+    merely that the attribute is present, because `Lax` is the plausible edit and `Lax` attaches
+    this cookie to a top-level navigation from a hostile page. `Path=/` matches the scope the
+    shell has been served under since #540; anything narrower silently un-authorises a deep link.
+
+    And **`Secure` must be ABSENT**, which is the one that looks like a regression and is not:
+    `keel serve` speaks plain http, and every browser drops a `Secure` cookie over plain http.
+    Adding it would disable the session rather than harden it -- the same trap `SESSION_COOKIE`
+    records about the `__Host-` prefix.
+    """
+    token = new_session_token()
+    name, value, attributes = _cookie_parts(session_cookie(token))
+
+    assert name == SESSION_COOKIE
+    assert value == token
+    assert attributes["path"] == "/"
+    assert "httponly" in attributes
+    assert attributes["samesite"] == "Strict"
+    assert "secure" not in attributes, (
+        "a Secure cookie over plain http is dropped by the browser -- this would turn the "
+        "session off, not lock it down"
+    )
+    assert set(attributes) == {"path", "httponly", "samesite", "max-age"}, (
+        "an attribute appeared or vanished without this test being asked about it"
+    )
+
+
+def test_the_cookie_outlives_the_browser_and_dies_with_the_run() -> None:
+    """#634's whole trade, in one test.
+
+    **The browser half.** Without `Max-Age` this is a session cookie, and closing the browser --
+    or a phone evicting the installed console from memory -- throws away a token that is still
+    perfectly valid. So `Max-Age` must be present and must be a real, positive number of seconds:
+    `Max-Age=0` and a non-numeric value both parse as "delete this cookie now", which is the
+    original bug wearing the fix's clothes.
+
+    **The keel half, which is the property #634 refused to sell.** The cookie is only ever a
+    carrier for `ServeConfig.token`, and that token is minted fresh per process. So a cookie that
+    outlives the run that minted it authenticates nothing: `test_tokens_are_unique_per_call`
+    already pins that two runs never share a token, and this asserts the consequence -- two runs
+    never hand out the same cookie either. A persisted server-side secret (the option this issue
+    considered and declined) is exactly what would make these two cookies equal.
+    """
+    max_age = _cookie_parts(session_cookie(new_session_token()))[2]["max-age"]
+    assert max_age.isdigit(), f"Max-Age must be a whole number of seconds, got {max_age!r}"
+    assert int(max_age) > 0, "a Max-Age of zero tells the browser to delete the cookie at once"
+    assert int(max_age) == SESSION_COOKIE_MAX_AGE_SECONDS
+
+    first = session_cookie(new_session_token())
+    second = session_cookie(new_session_token())
+    assert first != second, (
+        "two serve runs handed out the same cookie -- the session token is being reused across "
+        "processes, which is the persisted-secret design #634 declined"
+    )

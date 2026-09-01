@@ -510,6 +510,73 @@ export function stoppedView(reading, setupHref) {
 }
 
 /**
+ * The "keel refused this browser" view (#634).
+ *
+ * ── WHY THIS IS NOT `stoppedView` ───────────────────────────────────────────────────────────
+ * A 403 arrives here as `data: null` with an `error`, which is the same shape a stopped engine
+ * arrives in, so it used to render `stoppedView` -- headed **"keel isn't running"**. That is
+ * false in the one case it is shown: keel is running, answering on this port, and has declined
+ * this browser. Telling an operator the server is down when it is up sends them to restart the
+ * thing that is working, which mints a new token and makes the situation worse.
+ *
+ * ── WHY IT OFFERS A FIELD RATHER THAN A SENTENCE ────────────────────────────────────────────
+ * `keel serve` mints a token per run and never writes it to disk, so after a restart there is
+ * nothing on this device that can authorise it -- and the installed console is a window with no
+ * address bar, so "open the address keel printed" is an instruction it cannot follow. The one
+ * action available from inside the app is to accept the new run's token by hand. That is what
+ * this field is: not a login, and not a credential store -- a way to hand over a value the
+ * operator can already see, from a surface that has nowhere else to put it.
+ *
+ * `onReconnect` rather than a navigation here: this module places nodes and never decides where
+ * the browser goes, the same division `sortableHeader` and the scope switch already keep. It is
+ * also the division that keeps the origin check in ONE place -- `main.js`'s `reconnect`, which
+ * builds its target from `window.location` and never from the pasted text.
+ *
+ * `FormData` rather than reading the input's `.value`: `test_render_never_judges_a_value_itself`
+ * bans the `.value` attribute from this file outright, and the ban is worth more than the two
+ * characters it costs here.
+ *
+ * @param {Reading} reading
+ * @param {(address: any) => string} onReconnect  handed the pasted text; returns what to show.
+ * @returns {DocumentFragment}
+ */
+export function refusedView(reading, onReconnect) {
+  const fragment = document.createDocumentFragment();
+  const card = el("div", "card stopped reconnect");
+  card.append(el("h1", undefined, "keel is running, and did not admit this browser"));
+  if (reading.error) {
+    card.append(el("p", "detail", reading.error.detail || reading.error.title));
+  }
+
+  const form = el("form");
+  const label = el("label", undefined, "Paste the address keel printed, or just its token");
+  label.setAttribute("for", "reconnect-address");
+  const input = el("input");
+  input.setAttribute("id", "reconnect-address");
+  input.setAttribute("name", "address");
+  input.setAttribute("type", "text");
+  input.setAttribute("autocomplete", "off");
+  input.setAttribute("spellcheck", "false");
+  const submit = el("button", undefined, "Reconnect");
+  submit.setAttribute("type", "submit");
+
+  // `role="status"`, so a refusal typed into this field is announced rather than only drawn --
+  // the operator who most needs this view is the one who cannot see a terminal.
+  const note = el("p", "detail");
+  note.setAttribute("role", "status");
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    note.textContent = onReconnect(new FormData(form).get("address"));
+  });
+
+  form.append(label, input, submit);
+  card.append(form, note);
+  fragment.append(card);
+  return fragment;
+}
+
+/**
  * The status view: `/api/status`'s payload, in the order `/` renders it today.
  *
  * ── PARITY, AND THE FIVE PLACES IT IS DELIBERATELY NOT BYTE-FOR-BYTE ─────────────────────────

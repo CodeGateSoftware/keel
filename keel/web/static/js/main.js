@@ -44,6 +44,7 @@ import {
   gatesView,
   insightsView,
   modeBadge,
+  refusedView,
   rulesView,
   setupView,
   statusView,
@@ -435,13 +436,86 @@ async function paint(route, rebuild, force) {
   if (!rebuild) return;
 
   if (primary.data === null) {
-    // `data: null` is the ONLY route into this view, and `payload.envelope` guarantees the key
-    // is `null` rather than `{}` for exactly this reason -- see `render.stoppedView`.
-    rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
+    // `data: null` is the ONLY route into these two views, and `payload.envelope` guarantees the
+    // key is `null` rather than `{}` for exactly this reason -- see `render.stoppedView`.
+    //
+    // #634 split the branch. A 403 also arrives as `data: null` with an `error`, and it used to
+    // land in `stoppedView` -- headed "keel isn't running", which is false: keel is running and
+    // refused this browser. The two 403s (`_admitted`'s host check and its session check) share
+    // this branch on purpose. They have the same remedy from the operator's side: the address
+    // keel printed is what admits this browser, and pasting it is the action either one needs.
+    if (primary.error && primary.error.status === REFUSED_STATUS) {
+      rebuildInto(refusedView(primary, reconnect), Boolean(force));
+    } else {
+      rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
+    }
   } else {
     rebuildInto(mount(route, readings), Boolean(force));
   }
   contentNode.setAttribute("aria-busy", "false");
+}
+
+/**
+ * The status an `ApiError` carries when keel declined the request rather than failed it.
+ *
+ * A STRING, because `api.readingFrom` writes `String(response.status)` -- see its note on why the
+ * client mirrors the server's own field types rather than renaming or re-typing them.
+ * @type {string}
+ */
+const REFUSED_STATUS = "403";
+
+/**
+ * Take a token the operator pasted and reload this page carrying it (#634).
+ *
+ * ── THE PASTED TEXT SUPPLIES A TOKEN AND NOTHING ELSE ───────────────────────────────────────
+ * The obvious implementation navigates to the pasted URL. That is an open redirect the operator
+ * types into themselves, and it is also WRONG over a private network: what `keel serve` prints
+ * on the machine is `http://127.0.0.1:8765/?token=...`, and a phone reaching the same process
+ * over Tailscale is on a different origin entirely -- so a paste of the printed line would be
+ * refused for mismatching an origin the operator had no way to know about.
+ *
+ * So the pasted text is mined for ONE value, its `token`, and the destination is built from
+ * `window.location` -- this origin, this path. The pasted origin is never navigated to and never
+ * even consulted. That makes the open-redirect question structural rather than careful, and it
+ * makes the printed loopback URL work verbatim from a phone.
+ *
+ * A bare token pastes just as well as a whole address: an operator reading a line off a terminal
+ * on another machine will sometimes copy the URL and sometimes copy the tail of it, and refusing
+ * one of the two would be a rule with no purpose.
+ *
+ * The token is not stored, not logged and not echoed back -- the same discipline
+ * `keel_core.secrets.ResolvedSecret` keeps for a credential. It goes into a navigation, and the
+ * server's 303 strips it back out of the address bar on arrival (`server.do_GET`).
+ *
+ * @param {any} pasted  whatever was in the field.
+ * @returns {string}    what to show the operator; empty when the page is already navigating.
+ */
+function reconnect(pasted) {
+  const text = String(pasted === null || pasted === undefined ? "" : pasted).trim();
+  if (!text) {
+    return "Paste the address keel printed when it started, or just the token from it.";
+  }
+
+  let token = text;
+  if (text.includes("?")) {
+    try {
+      // `window.location.origin` as the base only so a relative paste parses at all. Nothing
+      // from `parsed` other than the token is used, so the base cannot leak into the target.
+      const parsed = new URL(text, window.location.origin);
+      token = parsed.searchParams.get("token") || "";
+    } catch (cause) {
+      void cause; // an unparseable paste is the same outcome as one with no token
+      token = "";
+    }
+  }
+  if (!token) {
+    return "That address carries no token. keel prints one on the line it shows when it starts.";
+  }
+
+  const target = new URL(window.location.pathname, window.location.origin);
+  target.searchParams.set("token", token);
+  window.location.assign(target.href);
+  return "";
 }
 
 /** Where "set keel up on this machine" points. @type {Route} */
