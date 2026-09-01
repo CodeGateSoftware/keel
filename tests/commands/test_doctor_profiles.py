@@ -304,6 +304,144 @@ def test_collect_profiles_empty_directory_returns_empty_list(tmp_path: Path) -> 
     assert collect_profiles(tmp_path, frozenset(), NOW) == []
 
 
+# -- collect_profiles: the runner's real invocation, not whatever text matches first ---------
+#
+# The real wrappers never pass `--config`/`--db` as literals -- they invoke
+# `"$KEEL" --config "$CONFIG" --db "$DB" ...` with CONFIG/DB assigned earlier in the script.
+# A naive `re.search` over the whole file also risks matching a comment before it ever reaches
+# that invocation. These pin that collect_profiles resolves the shell variables from their own
+# assignments and ignores comment text entirely, no matter what it says or where it sits.
+
+
+def _write_variable_runner(
+    directory: Path,
+    name: str,
+    *,
+    config_file: str,
+    db_file: str,
+    config_var: str = "$CONFIG",
+    db_var: str = "$DB",
+    decoy_comment: str | None = None,
+) -> Path:
+    """A runner shaped like the real wrappers: `CONFIG=`/`DB=` assignments feeding a
+    `"$KEEL" --config "$CONFIG" --db "$DB"` invocation, with an optional decoy comment line
+    (naming DIFFERENT files) placed above the real assignments -- exactly where
+    `keel-live-run.sh`'s own "check which one is live" note sits relative to its cycle."""
+    path = directory / name
+    lines = ["#!/bin/bash"]
+    if decoy_comment is not None:
+        lines.append(f"# {decoy_comment}")
+    lines.append(f'CONFIG="{config_file}"')
+    lines.append(f'DB="{db_file}"')
+    lines.append(f'./.venv/bin/keel --config "{config_var}" --db "{db_var}" agent')
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_collect_profiles_resolves_shell_variables_to_their_assigned_files(
+    deployment_dir: Path,
+) -> None:
+    """The wrappers' actual shape: `--config "$CONFIG" --db "$DB"` with CONFIG/DB assigned
+    above. Without variable resolution, `load_config` is handed the literal string
+    `"$CONFIG"`, raises, and the broad `except Exception: continue` silently drops the
+    profile."""
+    runner = deployment_dir / "paper-hourly-run.sh"
+    runner.unlink()
+    _write_variable_runner(
+        deployment_dir,
+        "paper-hourly-run.sh",
+        config_file="config.paper-hourly.yaml",
+        db_file="keel-paperhourly.db",
+    )
+
+    (profile,) = collect_profiles(deployment_dir, frozenset(), NOW)
+
+    assert profile.db_file == "keel-paperhourly.db"
+
+
+def test_a_decoy_comment_naming_different_files_never_wins_over_the_real_invocation(
+    deployment_dir: Path,
+) -> None:
+    """The actual defect this pins: `re.search` returns the FIRST match anywhere in the file,
+    including inside a comment. `keel-live-run.sh` shipped a "check which one is live" comment
+    that happened to name the right files in the right order, so the old regex "worked" by
+    coincidence of comment wording -- reword it, reorder its flags, or delete it, and the
+    profile would have silently vanished. Here the comment deliberately names the WRONG files
+    (`config.WRONG.yaml` / `wrong.db`), which do not exist and are not written by this test;
+    if the resolved profile ever reads them instead of the real `$CONFIG`/`$DB` assignments,
+    `load_config` raises on a file that was never created, the broad `except` swallows it, and
+    `collect_profiles` returns an EMPTY list rather than the one real profile -- a comment
+    must never be a source of truth for what a script actually runs."""
+    runner = deployment_dir / "paper-hourly-run.sh"
+    runner.unlink()
+    _write_variable_runner(
+        deployment_dir,
+        "paper-hourly-run.sh",
+        config_file="config.paper-hourly.yaml",
+        db_file="keel-paperhourly.db",
+        decoy_comment="example: keel --config config.WRONG.yaml --db wrong.db",
+    )
+
+    (profile,) = collect_profiles(deployment_dir, frozenset(), NOW)
+
+    assert profile.db_file == "keel-paperhourly.db"
+
+
+def test_brace_form_variable_reference_also_resolves(deployment_dir: Path) -> None:
+    """`${CONFIG}` is the same reference as `$CONFIG`, just braced -- shells accept both, so
+    collect_profiles must too."""
+    runner = deployment_dir / "paper-hourly-run.sh"
+    runner.unlink()
+    _write_variable_runner(
+        deployment_dir,
+        "paper-hourly-run.sh",
+        config_file="config.paper-hourly.yaml",
+        db_file="keel-paperhourly.db",
+        config_var="${CONFIG}",
+        db_var="${DB}",
+    )
+
+    (profile,) = collect_profiles(deployment_dir, frozenset(), NOW)
+
+    assert profile.db_file == "keel-paperhourly.db"
+
+
+def test_variable_with_no_matching_assignment_skips_the_profile_rather_than_raising(
+    deployment_dir: Path,
+) -> None:
+    """A runner referencing `$CONFIG` with no `CONFIG=` assignment anywhere in the script
+    cannot be resolved to a real file. That must skip the profile exactly like today's
+    "no --config in the file at all" case -- not raise, and not hand `load_config` the raw
+    literal string `$CONFIG`."""
+    runner = deployment_dir / "paper-hourly-run.sh"
+    runner.write_text('#!/bin/bash\n./.venv/bin/keel --config "$CONFIG" --db "$DB" agent\n')
+
+    assert collect_profiles(deployment_dir, frozenset(), NOW) == []
+
+
+def test_the_real_shipped_live_wrapper_resolves_without_its_comment_as_the_crutch(
+    tmp_path: Path,
+) -> None:
+    """The regression pin that would have caught the actual incident: read the repository's
+    OWN `keel-live-run.sh` verbatim (not a synthetic stand-in), and confirm collect_profiles
+    resolves its config/db from the real `CONFIG=`/`DB=` assignments and cycle invocation --
+    not from line 15's "check which one is live" comment. Comment-stripping inside
+    collect_profiles means this passes regardless of whether that comment exists, is reworded,
+    or has its flags reordered -- which is exactly the property the old first-match regex
+    lacked."""
+    repo_root = Path(__file__).resolve().parents[2]
+    live_runner_src = repo_root / "keel-live-run.sh"
+    assert live_runner_src.exists(), "this pin only means something against the real script"
+
+    (tmp_path / "config.live-sandbox.yaml").write_text(VALID_CONFIG_YAML)
+    _write_plist(tmp_path, "com.keel.live", "keel-live-run.sh")
+    (tmp_path / "keel-live-run.sh").write_text(live_runner_src.read_text())
+
+    (profile,) = collect_profiles(tmp_path, frozenset(), NOW)
+
+    assert profile.db_file == "keel-live.db"
+
+
 # -- #642: structured product identity on Finding ---------------------------------------------
 
 

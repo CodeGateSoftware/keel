@@ -1186,11 +1186,67 @@ def collect_profiles(
     schema writes on construction, and `PRAGMA query_only = ON` makes SQLite itself refuse any
     write on the connection, so reading one profile's `last_feed_ts` can never take the schema
     write lock `keel/web/server.py`'s read surfaces are forbidden from taking on a live db.
+
+    THE RUNNER'S REAL INVOCATION -- not any text that happens to appear in the script -- is the
+    only source of truth for a profile's config/db. Two things make a naive
+    `re.search(r"--config (\\S+)", runner_text)` wrong: the wrappers invoke `keel` as
+    `"$KEEL" --config "$CONFIG" --db "$DB" ...` (a shell-variable reference, never a literal
+    filename), and a comment earlier in the script -- a worked example, a "check which one is
+    live" note -- can carry its own unrelated `--config`/`--db` text that `re.search` would
+    match FIRST, before ever reaching the real invocation. `keel-live-run.sh` hit both: its
+    line 15 comment happened to name the right files in the right order, so the old regex
+    "worked" by coincidence, and would have silently broken had that comment been reworded,
+    reordered, or deleted. Because a config that fails to load is swallowed by the broad
+    `except Exception: continue` below, that break would not raise -- it would just make the
+    live, real-money profile vanish from `profile.scheduled`/`profile.cycled` with no error
+    at all, which is worse than a loud failure and is exactly the silent-blind-spot failure
+    mode this whole check exists to catch. So the match here runs only over comment-stripped
+    text (any line whose first non-whitespace character is `#` is dropped first), and a
+    captured token that is a shell-variable reference (`$NAME`, `${NAME}`, or either quoted)
+    is traced back to that variable's own assignment elsewhere in the comment-stripped script;
+    a variable with no matching assignment resolves to `None` and the whole profile is skipped,
+    the same as today's "no `--config` at all" case, rather than being fed a raw shell
+    expression `load_config` cannot open.
     """
     import plistlib
     import re
 
     from keel.config import load_config
+
+    def _strip_comments(text: str) -> str:
+        """Drop every line whose first non-whitespace character is `#`. A comment must never
+        compete with the script's real invocation for a regex match -- see the docstring
+        above for the incident this prevents."""
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def _resolve_token(token: str, code_text: str) -> str | None:
+        """Resolve one captured `--config`/`--db` argument to a plain filename.
+
+        A literal token (no wrapper actually ships this way, but nothing forbids it) passes
+        through unchanged. A shell-variable reference -- `$NAME`, `${NAME}`, or either form
+        quoted, which is what every tracked wrapper actually uses (`"$CONFIG"`, `"$DB"`) -- is
+        traced back to that variable's own assignment (`NAME="value"` / `NAME=value`, on its
+        own line) in `code_text`. No matching assignment means the invocation cannot be
+        resolved, so this returns `None` and the caller skips the profile rather than handing
+        `load_config` a shell expression it will raise on.
+        """
+        value = token.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        var_match = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", value)
+        if var_match is None:
+            return value
+        name = var_match.group(1)
+        assign_match = re.search(
+            rf'^\s*{re.escape(name)}=(?:"([^"]*)"|\'([^\']*)\'|(\S+))\s*$',
+            code_text,
+            re.MULTILINE,
+        )
+        if assign_match is None:
+            return None
+        return next(g for g in assign_match.groups() if g is not None)
 
     profiles: list[ProfileHealth] = []
     for plist_path in sorted(deployment_dir.glob("com.keel.*.plist")):
@@ -1201,12 +1257,21 @@ def collect_profiles(
             runner_arg = next(a for a in reversed(args) if a.endswith(".sh"))
             runner = Path(runner_arg).name
             runner_text = (deployment_dir / runner).read_text()
-            config_match = re.search(r"--config (\S+)", runner_text)
+            code_text = _strip_comments(runner_text)
+            config_match = re.search(r"--config (\S+)", code_text)
             if config_match is None:
                 continue
-            config_file = config_match.group(1)
-            db_match = re.search(r"--db (\S+)", runner_text)
-            db_file = db_match.group(1) if db_match else "keel.db"
+            config_file = _resolve_token(config_match.group(1), code_text)
+            if config_file is None:
+                continue
+            db_match = re.search(r"--db (\S+)", code_text)
+            if db_match is None:
+                db_file = "keel.db"
+            else:
+                resolved_db = _resolve_token(db_match.group(1), code_text)
+                if resolved_db is None:
+                    continue
+                db_file = resolved_db
             config = load_config(deployment_dir / config_file)
             interval_sec = int(config.auto_trade.interval_sec)
         except Exception:  # one unreadable profile must not hide the rest
