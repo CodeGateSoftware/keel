@@ -122,7 +122,7 @@ from keel_broker_api.results import (
     coerce_cancel_outcome,
 )
 from keel_core.credential_identity import current_credential_fingerprint
-from keel_core.products import quote_currency_of
+from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.telemetry import current_venue, log_event, log_exception, log_venue_failure
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
@@ -478,6 +478,127 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     return None
 
 
+#: `agent_state` key prefix for a recorded divergence between keel's ledger and the venue's own
+#: holding (#667). Written whenever a SELL is clamped, read by `keel doctor` -- the drift is a
+#: fact about the ACCOUNT, so it outlives the order that discovered it and must not live only in
+#: a log line an operator has to know to grep for.
+BALANCE_DRIFT_PREFIX = "balance_drift:"
+
+
+def _held_base(broker: Any, product_id: str) -> Decimal | None:
+    """What the venue says the account HOLDS of `product_id`'s base leg, or `None` if unknown.
+
+    ⚠️ **`Balance.total`, never `Balance.available`, and this is the load-bearing line of #667.**
+    `available` excludes base committed to resting orders, and keel's own protective bracket
+    commits the ENTIRE position -- so for exactly the products keel is protecting, `available`
+    reads ~0. Clamping or vetoing on that number would refuse every stop roll and every exit
+    keel has ever placed, which is the one outcome worse than the oversell being fixed here.
+    `total` is `available + hold` on the venue that trades live (see the coinbase adapter), and
+    ownership -- not encumbrance -- is what *bay' ma la yamlik* asks about.
+
+    The STRICT parse, unlike `guards._asset`: this string is matched against the venue's own
+    currency code, and a loose reduction of a futures id (`ADA-28AUG26-CDE` -> `ADA`) would match
+    a real balance for an instrument rail 19 refuses. A product id that is not a spot pair has no
+    base balance to read, and says so by returning `None`.
+
+    Never raises -- every failure is the same answer, UNKNOWN, which does not veto and does not
+    clamp (rail 21, `_clamp_to_held`). An exit must not become less likely to go out because a
+    balance endpoint was slow.
+    """
+    parsed = parse_spot_product_id(product_id)
+    if parsed is None:
+        return None
+    base = parsed[0]
+    if broker is None:
+        # Paper mode passes no broker; expected, not an error -- the same reasoning
+        # `_fetch_available_quote` and `_base_increment_for` both record.
+        return None
+    try:
+        balances = broker.get_balances()
+    except Exception:
+        log_venue_failure(logger, "executor.held_base_fetch_failed", product=product_id)
+        return None
+    for balance in balances or []:
+        if balance.currency.upper() == base.upper():
+            return balance.total
+    # No account row for this currency at all. Deliberately UNKNOWN rather than zero: a venue
+    # that omits empty accounts and a venue that reports `0` are saying different things, and
+    # only the second is an affirmative statement about the holding. Rail 21 vetoes on the
+    # second; guessing it from the first would refuse exits on a venue whose only fault is a
+    # sparse response.
+    return None
+
+
+def _clamp_to_held(
+    qty: Decimal, held: Decimal | None, repo: Repository, product_id: str, now_ts: int
+) -> Decimal:
+    """`qty`, reduced to what the account actually holds. Never raises, never RAISES the quantity.
+
+    Three inputs, three answers, and the asymmetry is the point:
+
+    | venue says | answer |
+    |---|---|
+    | unknown (`None`) | `qty` unchanged -- an unreadable balance must not strand an exit |
+    | at least `qty` | `qty` unchanged -- never rounds UP to the balance |
+    | less than `qty` | the holding -- sell what is there, not what the ledger remembers |
+
+    A zero-or-less holding is deliberately NOT clamped to zero and NOT refused here: rail 21
+    owns that refusal, so it arrives as a `GuardResult` violation with an audit trail like every
+    other veto, instead of as a malformed zero-size order or a second refusal path in the sizing
+    code. This function's job is to shrink a real order, not to decide there is no order.
+
+    **Why the ledger drifts, which is the whole of #667.** A venue that takes its taker fee out
+    of the received base leaves 0.9985 where the order said 1.0000; a partial fill leaves less
+    still, and `orders.filled_quantity` is only written when the venue's post-fill status was
+    observable; an operator who moves coins out of the account tells keel nothing at all. Each
+    one makes the ledger say more than the account holds, and a SELL sized from the ledger then
+    asks the venue for base that is not there. On a cash account that is a rejected exit; on a
+    margin-enabled account (#666) the venue fills the difference by opening a short -- *bay' ma
+    la yamlik* arrived at by arithmetic rather than by anyone's intent.
+
+    Clamping is NOT the auto-resize `_record_observed_fill_quantity` declines to do, and the
+    distinction matters because that refusal is well argued and still stands. What it refuses is
+    CANCELLING A PROTECTIVE ORDER on the strength of a settling snapshot. This cancels nothing.
+    It only declines to ask for more than is there, which is the one thing no snapshot ambiguity
+    can make wrong: whatever the true holding turns out to be, it is not larger than the
+    venue's own report of it plus keel's own hold.
+    """
+    if held is None or held <= 0 or qty <= held:
+        return qty
+    log_event(
+        logger,
+        logging.WARNING,
+        "executor.sell_clamped_to_held",
+        product=product_id,
+        ordered=str(qty),
+        held=str(held),
+        drift=str(qty - held),
+        detail=(
+            "keel's ledger expected more base than the venue reports holding -- the SELL is "
+            "reduced to the held quantity. Fee taken in the base asset, a partial fill the "
+            "venue never reported, or an out-of-band transfer; reconcile the position"
+        ),
+    )
+    repo.set_state(
+        f"{BALANCE_DRIFT_PREFIX}{product_id}",
+        {"ordered": str(qty), "held": str(held), "drift": str(qty - held), "observed_at": now_ts},
+    )
+    return held
+
+
+def _clamped_sell_qty(
+    broker: Any, repo: Repository, product_id: str, qty: Decimal, now_ts: int
+) -> tuple[Decimal, Decimal | None]:
+    """`(quantity to sell, what the venue says is held)` -- the one entry point every SELL uses.
+
+    Returned as a pair because both halves travel onward and they answer different questions:
+    the clamped quantity sizes the order, and the raw holding rides on the intent for rail 21,
+    which refuses the case the clamp deliberately will not (see `_clamp_to_held`).
+    """
+    held = _held_base(broker, product_id)
+    return _clamp_to_held(qty, held, repo, product_id, now_ts), held
+
+
 def _build_intent(
     signal: Signal,
     broker: Any,
@@ -543,6 +664,10 @@ def _build_intent(
         return None
 
     entry = signal.setup.entry if signal.setup is not None else avg_cost
+    # #667. `qty` above is what the ORDERS AUDIT LOG says is held; this is what the VENUE says.
+    # They diverge through fees taken in the base asset, partial fills the venue never reported,
+    # and out-of-band transfers -- and the ledger is the one that runs high.
+    qty, held = _clamped_sell_qty(broker, repo, signal.product_id, qty, now_ts)
     return OrderIntent(
         product_id=signal.product_id,
         side=Side.SELL,
@@ -556,6 +681,7 @@ def _build_intent(
         # #516. Fetched here, like `available_quote` above, so `_order_spec` stays a
         # pure function of the intent. `None` is fine and means "send unquantized".
         base_increment=_base_increment_for(broker, repo, signal.product_id, now_ts),
+        available_base=held,
     )
 
 
@@ -1046,12 +1172,19 @@ def _upgrade_to_observed_economics(
         log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
         return
 
+    # #667: the QUANTITY observation goes first, and no longer sits behind the price guard.
+    # `filled_quantity` and `average_filled_price` are two independent facts the venue may
+    # report independently, and the `fill <= 0` test belongs to the second one -- it is there
+    # because overwriting a good estimate with a zero price makes the row worse. Behind it, a
+    # venue that answered with a filled size and no average price lost the size too, and the
+    # size is the one that tells `_clamp_to_held` how far the ledger has drifted. Recording it
+    # first costs nothing when both are present and keeps the more useful half when they are not.
+    _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
     fill = observed.average_filled_price
     fees = observed.total_fees
     if not fill or fill <= 0:
         return
     repo.update_order(order_id, actual_fill=fill, fee=fees, updated_at=now_ts)
-    _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
     _log_intent_divergence(order_id, intent, fill)
 
 
@@ -1604,6 +1737,14 @@ def _order_spec(intent: OrderIntent) -> OrderSpec:
 
     Down, not nearest, on both sides: selling slightly less than held leaves dust, while selling
     more is rejected for insufficient funds anyway.
+
+    **The quantity arriving here is already clamped to the venue's holding (#667).** That is a
+    change of INPUT, not of contract: this function still only quantizes, still never refuses,
+    and the sentence above still describes it exactly. What changed is upstream -- "rejected for
+    insufficient funds anyway" was the whole answer to overselling only for as long as every
+    account was a cash account, and on a margin-enabled one the venue fills the difference by
+    opening a short instead of rejecting it. `_clamp_to_held` closes that at intent-construction
+    time, where a repo and a broker are in hand; refusing an empty holding outright is rail 21's.
     """
     if intent.side == Side.BUY:
         increment = sizing.quote_increment_for(intent.product_id)
@@ -1870,6 +2011,13 @@ def place_bracket(
     now carries both prices -- rolling the stop means re-placing the bracket, and the target is
     no longer recoverable from a separate leg.
     """
+    # #667, and this is the site the fee-dust case actually bites: `qty` here is the size the
+    # ENTRY was placed for, and a venue that takes its taker fee out of the received base leaves
+    # less than that in the account. A bracket for the ordered size is then a protective order
+    # able to sell more than is held -- the "oversized-bracket condition"
+    # `_record_observed_fill_quantity` names and declines to fix by cancelling. Sizing it down
+    # before it is ever placed cancels nothing.
+    qty, held = _clamped_sell_qty(broker, repo, product_id, qty, now_ts)
     intent = OrderIntent(
         product_id=product_id,
         side=Side.SELL,
@@ -1882,6 +2030,7 @@ def place_bracket(
         notional=sizing.spend(qty, stop),
         is_dca=False,
         rule_kind=rule_name,
+        available_base=held,
     )
     result = _run_order(
         intent,
@@ -2011,6 +2160,12 @@ def scale_out(
                 "position's rule ownership and levels"
             ),
         )
+    # #667. `held` above is the LEDGER's holding; clamp the partial to the VENUE's before the
+    # remainder is derived from it, so the crash-ledger record and the log both describe the
+    # sequence that is actually about to run. Under no drift this changes nothing at all -- a
+    # scale-out is a fraction of the position by construction, so the clamp binds only when the
+    # books and the account genuinely disagree.
+    qty, venue_held = _clamped_sell_qty(broker, repo, product_id, qty, now_ts)
     remainder = held - qty
 
     stop = repo.get_state(f"open_stop:{product_id}")
@@ -2082,6 +2237,7 @@ def scale_out(
         notional=sizing.spend(qty, exit_price),
         is_dca=False,
         rule_kind=rule_name,
+        available_base=venue_held,
     )
     result = _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
 
@@ -2335,6 +2491,11 @@ def _roll_stop(
         _cancel_at_exchange(broker, repo, old_order)
         repo.update_order(old_stop_order_id, status="canceled", updated_at=now_ts)
 
+    # #667, read AFTER the cancel above -- which is free, and worth saying why it is free. The
+    # holding is `Balance.total`, so it does not move when a resting bracket is cancelled; had
+    # this used `Balance.available` the number would jump from ~0 to the full position across
+    # that line, and every roll would depend on which side of the cancel it was read.
+    qty, held = _clamped_sell_qty(broker, repo, product_id, qty, now_ts)
     intent = OrderIntent(
         product_id=product_id,
         side=Side.SELL,
@@ -2347,6 +2508,7 @@ def _roll_stop(
         notional=sizing.spend(qty, new_stop),
         is_dca=False,
         rule_kind=rule_name,
+        available_base=held,
     )
     result = _run_order(
         intent,

@@ -138,7 +138,7 @@ exists to accumulate the live evidence the promotion gate demands and cannot its
 Demoting these rules would end that experiment without putting anything in its place.
 
 **What bounds the risk instead.** Not the promotion gate, which never ran. The caps
-(`max_exposure_usd` 200 total at once, `max_per_order_usd` 100), the nineteen un-overridable
+(`max_exposure_usd` 200 total at once, `max_per_order_usd` 100), the twenty un-overridable
 `guards.py` rails, rail 1's allowlist, and rail 14's monthly allowance. **The bypass is of the
 evidence gate, not the safety rails** — separate mechanisms, and only the first was skipped.
 

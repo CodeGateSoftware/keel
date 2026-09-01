@@ -527,7 +527,11 @@ def test_execute_fetches_the_available_quote_balance_for_a_buy_and_places(repo):
     result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
-    assert broker.get_balances_calls == 1
+    # TWO reads, and they are different questions about different currencies (#667). The first
+    # is rail 13's: how much QUOTE can this BUY spend. The second belongs to the exit bracket
+    # `execute` places once the entry has filled -- how much BASE does the account actually hold
+    # to protect. A bracket sized from the ordered quantity is the oversized-bracket condition.
+    assert broker.get_balances_calls == 2
 
 
 def test_broker_balance_fetch_error_vetoes_the_buy_before_preview_or_place(repo):
@@ -555,9 +559,15 @@ def test_insufficient_usdc_balance_vetoes_the_buy_before_preview_or_place(repo):
     assert repo.get_orders() == []
 
 
-def test_exit_signal_never_fetches_a_balance(repo):
-    """SELL is exempt from rail 13 -- the executor shouldn't even bother fetching a balance for
-    an EXIT, since it wouldn't be used."""
+def test_exit_signal_fetches_the_held_base_not_the_quote_balance(repo):
+    """A SELL is still exempt from rail 13, and since #667 it reads a balance anyway.
+
+    This test asserted `get_balances_calls == 0` for six months, and the reasoning was sound
+    while the only balance question was rail 13's: an EXIT spends no quote, so fetching one
+    bought nothing. #667 asks a DIFFERENT question of the same endpoint -- not "can this order
+    be funded" but "does the account still hold what the ledger says it holds" -- and that one
+    an exit must ask, because the exit is the order that oversells when the answer is no.
+    """
     _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
     broker = FakeBroker()
     signal = Signal(
@@ -574,7 +584,12 @@ def test_exit_signal_never_fetches_a_balance(repo):
     result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
 
     assert result.placed is True
-    assert broker.get_balances_calls == 0
+    assert broker.get_balances_calls == 1
+    # And it is the BASE leg that was asked about: the default fake funds USD/USDC and carries
+    # no BTC row, so the holding reads UNKNOWN and the exit goes out at the ledger quantity --
+    # unchanged, un-vetoed. An unreadable balance never strands a position that wanted out.
+    spec = broker.place_calls[-1]["spec"]
+    assert spec.base_size == Decimal("0.1")
 
 
 # -- autonomous mode: compliant -> placed without a prompt

@@ -24,6 +24,7 @@ from keel.commands.doctor import (
     admissibility_findings,
     allowance_findings,
     attestation_findings,
+    balance_drift_findings,
     data_health_findings,
     doctor_exit_code,
     doctor_lines,
@@ -580,6 +581,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "allowance.headroom",
         "veto.recent",
         "fill.partial",
+        "balance.drift",
         "ledger.unbooked_exit",
         "data.missing",
         "data.stale",
@@ -762,3 +764,73 @@ def test_an_unbooked_LIVE_exit_warns_too() -> None:
     alike, and an unbooked LIVE exit is strictly worse than the paper one that found this."""
     (finding,) = unbooked_exit_findings([_tranche()], [_sell(mode="live")])
     assert finding.status == "warn"
+
+
+# -- ledger/venue balance drift (#667) -----------------------------------------------------------
+
+
+def test_balance_drift_findings_is_ok_when_nothing_drifted() -> None:
+    """The clean state is REPORTED, not omitted. An absent row reads as a check that never ran."""
+    (finding,) = balance_drift_findings({})
+
+    assert finding.name == "balance.drift"
+    assert finding.status == "ok"
+
+
+def test_balance_drift_findings_warns_and_names_both_numbers() -> None:
+    """An operator cannot reconcile a divergence they are only told the size of.
+
+    WARN rather than FAIL because every cause is legitimate -- a fee taken in the base leg, a
+    short fill, an operator's own transfer. None is a fault in the deployment; all of them leave
+    the ledger's idea of the position wrong until a human decides which it was.
+    """
+    (finding,) = balance_drift_findings(
+        {
+            "BTC-USD": {
+                "ordered": "1.0",
+                "held": "0.9985",
+                "drift": "0.0015",
+                "observed_at": NOW,
+            }
+        }
+    )
+
+    assert finding.status == "warn"
+    assert "1.0" in finding.detail and "0.9985" in finding.detail
+    assert "clamped" in finding.detail, (
+        "the detail must say the SELL was already reduced -- otherwise this reads as an order "
+        "that oversold, which is the outcome the clamp exists to prevent"
+    )
+
+
+def test_balance_drift_findings_ignores_a_malformed_record() -> None:
+    """State is written by code that can change; a bad row must not crash `doctor`.
+
+    `doctor` is what an operator runs when something is already wrong. It is the one command
+    that must not fail on the state it exists to describe.
+    """
+    (finding,) = balance_drift_findings({"BTC-USD": "not a record"})
+
+    assert finding.status == "ok"
+
+
+def test_gather_findings_surfaces_a_recorded_drift(tmp_path, valid_config_path) -> None:
+    """The wiring, not just the function. A finding nothing calls reports nothing.
+
+    Written the way the executor writes it -- `balance_drift:<product_id>` -- so a rename on
+    either side fails here rather than silently retiring the check.
+    """
+    from keel.execution.executor import BALANCE_DRIFT_PREFIX
+
+    repo = _seeded_repo(tmp_path / "keel.db")
+    repo.set_state(
+        f"{BALANCE_DRIFT_PREFIX}BTC-USD",
+        {"ordered": "1.0", "held": "0.9985", "drift": "0.0015", "observed_at": NOW},
+    )
+    config = load_config(valid_config_path)
+
+    findings = gather_findings(repo, config, [], NOW)
+
+    (drift,) = [f for f in findings if f.name == "balance.drift"]
+    assert drift.status == "warn"
+    assert "BTC-USD" in drift.detail

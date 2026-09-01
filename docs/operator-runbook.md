@@ -532,7 +532,7 @@ half it can:
 
 The gate is BUY-only (exits must execute — the same principle that makes rail 17 halt entries,
 not exits), **fails closed** (a live BUY whose preview carries no readable bid/ask is refused
-with a distinct `book_unreadable` reason, never guessed past), and lives beside the nineteen
+with a distinct `book_unreadable` reason, never guessed past), and lives beside the twenty
 rails rather than among them: `guards.check` is broker-less by design, and the book exists only
 in the preview the executor just fetched.
 
