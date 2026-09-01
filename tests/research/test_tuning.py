@@ -140,12 +140,21 @@ def _consistent_columns(values: list[float], t: int = 32) -> list[list[Decimal]]
 # -- 1-3. SEARCH_SPACES integrity --------------------------------------------------------------
 
 
-def test_search_spaces_pin_exactly_the_three_families() -> None:
-    """The three tradable families with a stop (dca is out of scope -- it has none)."""
+def test_search_spaces_pin_exactly_the_families_with_a_stop() -> None:
+    """Every tradable family with a stop. `dca` is out of scope because it has none.
+
+    `cusum_event` joined at #341 and did so WITHOUT anyone editing this module: since #528
+    `SEARCH_SPACES` reads the rules' own `param_space()` declarations, so declaring a space is
+    what enrols a rule here. That is the one-source-of-truth design working -- and it is also
+    why this pin is worth keeping: enrolment is now a side effect of a declaration made in
+    another file, and a rule that gained a space by accident would otherwise appear in a sweep
+    budget silently.
+    """
     assert set(tuning.SEARCH_SPACES) == {
         "turtle_breakout",
         "rsi_meanrev",
         "pullback_continuation",
+        "cusum_event",
     }
     for family, space in tuning.SEARCH_SPACES.items():
         assert 4 <= len(space) <= 7, family

@@ -14,7 +14,7 @@ Subclass `RuleConformanceTests` in a test module and implement `rule()` and
 `packages/keel-broker-api/keel_broker_api/conformance/suite.py` ships the broker contract
 from an installable package because third-party broker adapters exist and need something to
 prove themselves against. Issue #447 decided the rule registry stays CURATED: `keel.agent.
-RULE_REGISTRY` is a closed, hand-maintained dict of exactly the four rules this repository
+RULE_REGISTRY` is a closed, hand-maintained dict of exactly the rules this repository
 ships, there is no `keel.rules` entry point, and there will not be one -- a rule is not a
 pluggable adapter, it is an investment decision this team made and is accountable for. A
 suite that shipped from `keel/` would imply the opposite: that some future third party is
