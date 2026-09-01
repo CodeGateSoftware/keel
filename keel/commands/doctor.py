@@ -32,6 +32,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import Any
 
 import click
@@ -59,13 +60,22 @@ HALTED = "halted"
 @dataclass(frozen=True)
 class Finding:
     """One doctor verdict. `fix` names the command that resolves it ('-' when none
-    is needed); `detail` carries the numbers (days remaining, dollars, counts)."""
+    is needed); `detail` carries the numbers (days remaining, dollars, counts).
+
+    `products` is the machine-readable per-product identity a WRAPPER reads from
+    `--json` (#642): the point is that a cold SOL series must be nameable without the
+    caller re-parsing `detail` prose. Defaulted to `()` and trailing, so every existing
+    positional `Finding(...)` construction in this module is untouched. Left empty on
+    every OK finding -- there is nothing to gate a caller's per-product decision on when
+    the check passed.
+    """
 
     name: str
     status: str
     headline: str
     detail: str
     fix: str
+    products: tuple[str, ...] = ()
 
 
 def _days(seconds: float) -> int:
@@ -599,6 +609,13 @@ class SeriesHealth:
     unexplained_gaps: int
 
 
+def _product_ids(rows: list[SeriesHealth]) -> tuple[str, ...]:
+    """Sorted, de-duplicated product ids involved in one finding -- one product can carry
+    several flagged granularities, and a wrapper naming what is gated wants the product
+    named once, not once per granularity."""
+    return tuple(sorted({row.product for row in rows}))
+
+
 def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
     """Staleness, cold caches and gaps per allowlisted series, at doctor's 7-day window.
 
@@ -619,6 +636,7 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
                 f"{len(missing_rows)} series have nothing cached",
                 f"cold cache: {pairs}",
                 "keel fetch",
+                products=_product_ids(missing_rows),
             )
         )
     else:
@@ -645,6 +663,7 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
                 "the feed looks dead: every series is stale",
                 f"all {len(judged)} judged series are behind beyond the fetch tolerance",
                 "keel fetch",
+                products=_product_ids(stale_open),
             )
         )
     elif stale_open:
@@ -658,6 +677,7 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
                 f"{len(stale_open)} of {len(judged)} series are stale",
                 behind,
                 "keel fetch",
+                products=_product_ids(stale_open),
             )
         )
     else:
@@ -680,6 +700,7 @@ def data_health_findings(series: list[SeriesHealth]) -> list[Finding]:
                 f"{len(gappy)} series have unexplained gaps",
                 counts,
                 "keel fetch --repair-gaps",
+                products=_product_ids(gappy),
             )
         )
     else:
@@ -778,6 +799,7 @@ def render_json(findings: list[Finding]) -> str:
                 "headline": f.headline,
                 "detail": f.detail,
                 "fix": f.fix,
+                "products": list(f.products),
             }
             for f in findings
         ],
@@ -921,6 +943,306 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     return findings
 
 
+# -- profile health: is every configured profile actually running? (#640, #642) -----------------
+#
+# Deliberately kept OUT of `gather_findings` above, appended here as a self-contained block
+# `doctor_cmd` alone calls. `gather_findings` is the seam `keel mcp`'s doctor tool shares with
+# this command (#477), pinned READ-ONLY by a change-counter test on the ONE repo it is handed --
+# opening sibling deployment databases and shelling `launchctl` would change what a read-only
+# MCP view of THIS repo does, and that is exactly the kind of scope creep that seam's test exists
+# to catch. This is CLI-side, deployment-wide reporting; `gather_findings` stays single-repo.
+
+#: A stalled profile is judged against a MULTIPLE of its own cadence, not a flat number of
+#: seconds -- see `profile_findings`' docstring for why a flat threshold cannot work for both
+#: an hourly and a daily profile at once.
+STALL_WARN_INTERVALS = 2
+STALL_FAIL_INTERVALS = 3
+
+_STATUS_RANK = {OK: 0, WARN: 1, FAIL: 2}
+
+
+@dataclass(frozen=True)
+class ProfileHealth:
+    """One launchd-scheduled profile's observed state, as `collect_profiles` assembles it from
+    the plist + runner script + config + sibling database it wires together -- everything
+    `profile_findings` needs to judge whether the profile is actually running."""
+
+    label: str  #: launchd Label, e.g. "com.keel.paper-hourly"
+    runner: str  #: basename of the runner script the plist executes
+    db_file: str  #: the db that runner drives
+    scheduled: bool | None  #: True loaded, False not loaded, None launchd unreadable
+    last_cycle_ts: int | None  #: state['last_feed_ts'], None if never cycled / db unreadable
+    interval_sec: int  #: the profile's own cadence (config.auto_trade.interval_sec)
+
+
+def _human_duration(seconds: float) -> str:
+    """`10d 4h`, `1h`, `45m` -- coarse enough to read at a glance. Used for both an AGE
+    ("last cycle 10d 4h ago") and a CADENCE ("cadence 1h"), so a reader can compare the two at
+    the same granularity without doing the arithmetic themselves."""
+    total = max(int(seconds), 0)
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{total}s"
+
+
+def profile_findings(profiles: list[ProfileHealth], now_ts: int) -> list[Finding]:
+    """Is every deployment profile launchd knows about actually cycling?
+
+    This is #640 made structural. `com.keel.paper-hourly.plist` sat correctly written in the
+    repo and in `~/keel` and was simply never `launchctl bootstrap`ped into
+    `~/Library/LaunchAgents`; the real deployment's hourly profile last cycled 2026-08-21
+    00:20:05Z against an `interval_sec` of 3600 -- ten days of silence is roughly 240 missed
+    hourly cycles -- and nothing in `keel status` or the old `doctor` said so, because both only
+    ever looked at the ONE db this process happened to be pointed at, never at the sibling
+    profiles a deployment is supposed to be running. `profile_findings` is the check that closes
+    that hole: given every plist -> runner -> config -> db a deployment declares
+    (`collect_profiles` assembles the list), it asks two independent questions.
+
+    `profile.scheduled` -- does launchd actually have a job for this profile? FAIL when any
+    profile is confirmed NOT loaded (`scheduled is False`); WARN when launchd itself could not be
+    asked (`scheduled is None`) and nothing is confirmed missing -- "cannot tell" must never
+    read as "fine", which is exactly the gap a silently-broken `launchctl` call would otherwise
+    hide behind. OK only when every profile is confirmed loaded.
+
+    `profile.cycled` -- is each profile's `last_feed_ts` recent relative to ITS OWN cadence? The
+    threshold is a MULTIPLE of `interval_sec`, not a flat number of seconds, because "how stale
+    is too stale" only means something relative to how often a profile is supposed to cycle. A
+    daily profile (interval_sec=86400) that is 10 days stale and an hourly profile
+    (interval_sec=3600) that is 10 days stale are both clearly broken -- but a flat threshold
+    tight enough to catch the daily one at, say, 2 hours would false-positive on every ordinary
+    hourly cycle, and a flat threshold loose enough to tolerate the hourly profile's normal
+    jitter would let the daily profile go silent for weeks unnoticed. Scaling by the profile's
+    own `interval_sec` is the only way one pair of constants (`STALL_WARN_INTERVALS`,
+    `STALL_FAIL_INTERVALS`) works for every cadence at once: 90 minutes stale is a FAIL on an
+    hourly profile (it has missed its window more than twice over) and unremarkable on a daily
+    one (it has not even missed its first cycle yet) -- that contrast is the whole point.
+    """
+    if not profiles:
+        return [
+            Finding("profile.scheduled", OK, "no profiles configured", "-", "-"),
+            Finding("profile.cycled", OK, "no profiles configured", "-", "-"),
+        ]
+
+    findings: list[Finding] = []
+
+    unscheduled = [p for p in profiles if p.scheduled is False]
+    unknown = [p for p in profiles if p.scheduled is None]
+    if unscheduled:
+        commands = [
+            f"launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{p.label}.plist"
+            for p in unscheduled
+        ]
+        findings.append(
+            Finding(
+                "profile.scheduled",
+                FAIL,
+                f"{len(unscheduled)} of {len(profiles)} profile(s) not loaded into launchd",
+                "launchd has no job for: " + ", ".join(p.label for p in unscheduled),
+                "; ".join(commands),
+                products=(),
+            )
+        )
+    elif unknown:
+        findings.append(
+            Finding(
+                "profile.scheduled",
+                WARN,
+                f"cannot tell whether {len(unknown)} of {len(profiles)} profile(s) are scheduled",
+                "launchctl is unreadable for: " + ", ".join(p.label for p in unknown),
+                "check `launchctl list` by hand",
+                products=(),
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "profile.scheduled",
+                OK,
+                f"all {len(profiles)} profile(s) loaded into launchd",
+                ", ".join(p.label for p in profiles),
+                "-",
+                products=(),
+            )
+        )
+
+    worst = OK
+    bad_lines: list[str] = []
+    bad_labels: list[str] = []
+    for p in profiles:
+        if p.last_cycle_ts is None:
+            status = FAIL
+            bad_lines.append(f"{p.label}: has never cycled")
+        else:
+            age = now_ts - p.last_cycle_ts
+            if age > STALL_FAIL_INTERVALS * p.interval_sec:
+                status = FAIL
+            elif age > STALL_WARN_INTERVALS * p.interval_sec:
+                status = WARN
+            else:
+                status = OK
+            if status != OK:
+                bad_lines.append(
+                    f"{p.label}: last cycle {_human_duration(age)} ago, "
+                    f"cadence {_human_duration(p.interval_sec)}"
+                )
+        if status != OK:
+            bad_labels.append(p.label)
+        if _STATUS_RANK[status] > _STATUS_RANK[worst]:
+            worst = status
+
+    if worst == OK:
+        findings.append(
+            Finding(
+                "profile.cycled",
+                OK,
+                f"all {len(profiles)} profile(s) cycling within their own cadence",
+                ", ".join(p.label for p in profiles),
+                "-",
+                products=(),
+            )
+        )
+    else:
+        fix = "; ".join(
+            f"check the {p.runner} runner and `launchctl list {p.label}`"
+            for p in profiles
+            if p.label in bad_labels
+        )
+        findings.append(
+            Finding(
+                "profile.cycled",
+                worst,
+                f"{len(bad_lines)} of {len(profiles)} profile(s) stalled or never cycled",
+                "; ".join(bad_lines),
+                fix,
+                products=(),
+            )
+        )
+
+    return findings
+
+
+def _loaded_launchd_labels() -> frozenset[str] | None:
+    """The set of Labels `launchctl list` currently reports, or `None` when the question could
+    not be asked at all (non-macOS, no `launchctl` binary, a timeout, a nonzero exit, unparseable
+    output). `None` and an empty set mean different things -- `profile_findings` reads `None` as
+    "cannot tell" (WARN) and a label's ABSENCE from a non-None set as "confirmed not loaded"
+    (FAIL) -- so a failure to ask must never be reported as if the answer were "nothing is
+    loaded"; that would be a false positive doctor cannot afford.
+
+    `launchctl list`'s output is three whitespace-separated columns, `PID  Status  Label`, with a
+    header row of the same shape -- parsed positionally (column index 2) rather than by name
+    matching, since the header text itself is not a stable contract to depend on.
+    """
+    import platform
+    import subprocess
+
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    labels: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if parts[0] == "PID" and parts[1] == "Status":
+            continue
+        labels.add(parts[2])
+    return frozenset(labels)
+
+
+def collect_profiles(
+    deployment_dir: Path, loaded_labels: frozenset[str] | None, now_ts: int
+) -> list[ProfileHealth]:
+    """Every `com.keel.*.plist` in `deployment_dir`, turned into the `ProfileHealth` rows
+    `profile_findings` judges.
+
+    Follows `_profiles()`'s precedent in `keel/mcp/tools.py` (enumerate the profiles of a
+    deployment by globbing its directory): one bad profile must never hide the rest, so any
+    error resolving ONE plist's identity -- unparseable plist, missing `Label`/
+    `ProgramArguments`, no `.sh` argument, unreadable runner script, no `--config` in it, or a
+    config that fails to load -- skips that profile silently rather than raising. A missing or
+    unreadable DATABASE is different: it is exactly the "never cycled" state doctor exists to
+    report, so it becomes `last_cycle_ts=None` on an otherwise-valid profile rather than a skip.
+
+    The plist's `ProgramArguments` carries the OPERATOR's absolute path to the runner script
+    (whatever machine it was authored on); only the basename is trusted, re-resolved inside
+    `deployment_dir`, which is this call's own source of truth for where the deployment lives.
+
+    The sibling database is opened read-only and NEVER migrated -- `Repository` performs no
+    schema writes on construction, and `PRAGMA query_only = ON` makes SQLite itself refuse any
+    write on the connection, so reading one profile's `last_feed_ts` can never take the schema
+    write lock `keel/web/server.py`'s read surfaces are forbidden from taking on a live db.
+    """
+    import plistlib
+    import re
+
+    from keel.config import load_config
+
+    profiles: list[ProfileHealth] = []
+    for plist_path in sorted(deployment_dir.glob("com.keel.*.plist")):
+        try:
+            plist = plistlib.loads(plist_path.read_bytes())
+            label = str(plist["Label"])
+            args = [str(a) for a in plist["ProgramArguments"]]
+            runner_arg = next(a for a in reversed(args) if a.endswith(".sh"))
+            runner = Path(runner_arg).name
+            runner_text = (deployment_dir / runner).read_text()
+            config_match = re.search(r"--config (\S+)", runner_text)
+            if config_match is None:
+                continue
+            config_file = config_match.group(1)
+            db_match = re.search(r"--db (\S+)", runner_text)
+            db_file = db_match.group(1) if db_match else "keel.db"
+            config = load_config(deployment_dir / config_file)
+            interval_sec = int(config.auto_trade.interval_sec)
+        except Exception:  # one unreadable profile must not hide the rest
+            continue
+
+        last_cycle_ts: int | None = None
+        db_path = deployment_dir / db_file
+        if db_path.exists():
+            try:
+                from keel.data.db import connect
+                from keel.data.repository import Repository
+
+                conn = connect(str(db_path))
+                try:
+                    conn.execute("PRAGMA query_only = ON")
+                    raw = Repository(conn).get_state("last_feed_ts", default=None)
+                    last_cycle_ts = int(raw) if raw is not None else None
+                finally:
+                    conn.close()
+            except Exception:
+                last_cycle_ts = None
+
+        scheduled = None if loaded_labels is None else (label in loaded_labels)
+        profiles.append(
+            ProfileHealth(
+                label=label,
+                runner=runner,
+                db_file=db_file,
+                scheduled=scheduled,
+                last_cycle_ts=last_cycle_ts,
+                interval_sec=interval_sec,
+            )
+        )
+    return profiles
+
+
 @click.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="emit findings as JSON")
 @click.option("--log", "log_path", default="logs/keel.log", show_default=True)
@@ -947,6 +1269,14 @@ def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
 
     now_ts = int(__import__("time").time())
     findings = gather_findings(repo, config, _read_log_lines(log_path), now_ts)
+    # Deliberately NOT folded into `gather_findings`: that seam is shared with `keel mcp` and
+    # pinned read-only by a change-counter test on ONE repo (see the comment above
+    # `profile_findings`). Opening sibling databases and shelling `launchctl` belongs only here,
+    # on the CLI side.
+    findings += profile_findings(
+        collect_profiles(Path(ctx.obj["config_path"]).parent, _loaded_launchd_labels(), now_ts),
+        now_ts,
+    )
 
     _emit(findings, as_json)
     raise SystemExit(doctor_exit_code(findings))
