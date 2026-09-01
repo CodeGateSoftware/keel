@@ -28,6 +28,7 @@ Slice 2 adds the two checks the issue names as remaining:
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -972,7 +973,8 @@ class ProfileHealth:
     db_file: str  #: the db that runner drives
     scheduled: bool | None  #: True loaded, False not loaded, None launchd unreadable
     last_cycle_ts: int | None  #: state['last_feed_ts'], None if never cycled / db unreadable
-    interval_sec: int  #: the profile's own cadence (config.auto_trade.interval_sec)
+    cadence_sec: int  #: how often the runner ACTUALLY cycles -- see `_runner_cadence_sec`'s
+    #: docstring for why this is emphatically NOT `config.auto_trade.interval_sec`
 
 
 def _human_duration(seconds: float) -> str:
@@ -1012,17 +1014,23 @@ def profile_findings(profiles: list[ProfileHealth], now_ts: int) -> list[Finding
     hide behind. OK only when every profile is confirmed loaded.
 
     `profile.cycled` -- is each profile's `last_feed_ts` recent relative to ITS OWN cadence? The
-    threshold is a MULTIPLE of `interval_sec`, not a flat number of seconds, because "how stale
+    threshold is a MULTIPLE of `cadence_sec`, not a flat number of seconds, because "how stale
     is too stale" only means something relative to how often a profile is supposed to cycle. A
-    daily profile (interval_sec=86400) that is 10 days stale and an hourly profile
-    (interval_sec=3600) that is 10 days stale are both clearly broken -- but a flat threshold
+    daily profile (cadence_sec=86400) that is 10 days stale and an hourly profile
+    (cadence_sec=3600) that is 10 days stale are both clearly broken -- but a flat threshold
     tight enough to catch the daily one at, say, 2 hours would false-positive on every ordinary
     hourly cycle, and a flat threshold loose enough to tolerate the hourly profile's normal
     jitter would let the daily profile go silent for weeks unnoticed. Scaling by the profile's
-    own `interval_sec` is the only way one pair of constants (`STALL_WARN_INTERVALS`,
+    own `cadence_sec` is the only way one pair of constants (`STALL_WARN_INTERVALS`,
     `STALL_FAIL_INTERVALS`) works for every cadence at once: 90 minutes stale is a FAIL on an
     hourly profile (it has missed its window more than twice over) and unremarkable on a daily
     one (it has not even missed its first cycle yet) -- that contrast is the whole point.
+
+    `cadence_sec` is deliberately NOT `config.auto_trade.interval_sec` -- see
+    `_runner_cadence_sec`'s docstring for the incident that field name change is pinning against:
+    `interval_sec` is the auto-trade LOOP's sleep interval, not launchd's cadence, and trusting
+    it made this exact FAIL threshold a permanent false alarm on the live and paperforward
+    profiles, both of which cycle once a day against an `interval_sec` of 900 seconds.
     """
     if not profiles:
         return [
@@ -1081,16 +1089,16 @@ def profile_findings(profiles: list[ProfileHealth], now_ts: int) -> list[Finding
             bad_lines.append(f"{p.label}: has never cycled")
         else:
             age = now_ts - p.last_cycle_ts
-            if age > STALL_FAIL_INTERVALS * p.interval_sec:
+            if age > STALL_FAIL_INTERVALS * p.cadence_sec:
                 status = FAIL
-            elif age > STALL_WARN_INTERVALS * p.interval_sec:
+            elif age > STALL_WARN_INTERVALS * p.cadence_sec:
                 status = WARN
             else:
                 status = OK
             if status != OK:
                 bad_lines.append(
                     f"{p.label}: last cycle {_human_duration(age)} ago, "
-                    f"cadence {_human_duration(p.interval_sec)}"
+                    f"cadence {_human_duration(p.cadence_sec)}"
                 )
         if status != OK:
             bad_labels.append(p.label)
@@ -1164,19 +1172,132 @@ def _loaded_launchd_labels() -> frozenset[str] | None:
     return frozenset(labels)
 
 
+#: A runner that stamps the UTC HOUR (`date -u '+%Y-%m-%dT%H'`, as `paper-hourly-run.sh:48`
+#: does) cycles once an hour. The closing quote must sit IMMEDIATELY after `%H` -- that anchor is
+#: the whole trick (see `_runner_cadence_sec`'s docstring): `keel-live-run.sh` also logs with
+#: `'+%Y-%m-%dT%H:%M:%SZ'`, whose `%H` is followed by `:M:SZ`, not a closing quote, so it must
+#: NOT match this pattern.
+_HOURLY_STAMP_RE = re.compile(r"'\+%Y-%m-%dT%H'")
+
+#: A runner that stamps the UTC (or, for `paperforward-run.sh`, local) DATE
+#: (`date -u '+%Y-%m-%d'`, as `keel-live-run.sh:202` and `paper-equities-run.sh:70` do; plain
+#: `date '+%Y-%m-%d'` as `paperforward-run.sh:34` does) cycles once a day. Checked only AFTER
+#: the hourly pattern above, and with the same closing-quote anchor immediately after `%d` -- a
+#: format that goes on to log more of the timestamp (`'+%Y-%m-%d %H:%M'`, which every one of the
+#: four runners also uses for plain log lines) does not match, because what follows `%d` there
+#: is a space, not the closing quote.
+_DAILY_STAMP_RE = re.compile(r"'\+%Y-%m-%d'")
+
+
+def _runner_cadence_sec(code_text: str, fallback_sec: int) -> int:
+    """How often the runner ACTUALLY cycles, read off the granularity of its own day/hour
+    stamp -- deliberately NOT `config.auto_trade.interval_sec`, which is a different number
+    describing a different thing.
+
+    `auto_trade.interval_sec` is the sleep interval `keel agent --loop` uses, and the input to
+    Rail 12's staleness threshold; it says how often the auto-trade LOOP would poll if a
+    profile ran that way. None of the four tracked wrappers do -- every one invokes plain
+    `keel agent` once per launchd trigger and leaves the "once per real cycle" enforcement to
+    its own stamp file. Verified against the real deployment before writing this function:
+    `auto_trade.interval_sec` is 900 (15 minutes) on BOTH `com.keel.live` and
+    `com.keel.paperforward`, whose runners in fact cycle once a day; only
+    `com.keel.paper-hourly`'s 3600 happens to equal its true once-an-hour cadence, and that is a
+    coincidence of one profile's config, not a property of the field. Trusting it as the cadence
+    made `profile.cycled`'s FAIL threshold (`STALL_FAIL_INTERVALS * cadence`, 3 intervals) 45
+    minutes on books that in fact cycle once a day -- a permanent false alarm on 3 of the 4
+    tracked profiles, including the live, real-money one. A check that cries wolf on 3 of 4
+    profiles every single day is worse than no check at all: it trains the operator to ignore
+    doctor, which is precisely the failure mode this whole arc exists to close.
+
+    So the cadence is read off what actually governs how often a cycle can run: the format of
+    the day/hour stamp each runner checks before deciding whether today's (or this hour's)
+    cycle has already happened. The hourly pattern is checked before the daily one, and both
+    require the format string's CLOSING QUOTE to sit immediately after the last format code --
+    without that anchor, `keel-live-run.sh`'s `'+%Y-%m-%dT%H:%M:%SZ'` log-line timestamp would
+    misread as its hourly STAMP and wrongly give the once-a-day live profile a 3600-second
+    cadence, right back to the false-alarm bug this function exists to fix. An unrecognised
+    stamp format falls back to `fallback_sec` (the caller passes `auto_trade.interval_sec`) so
+    every profile still resolves to a number rather than being skipped outright.
+    """
+    if _HOURLY_STAMP_RE.search(code_text):
+        return 3600
+    if _DAILY_STAMP_RE.search(code_text):
+        return 86_400
+    return fallback_sec
+
+
+def unreadable_profile_findings(failed: list[dict[str, str]]) -> list[Finding]:
+    """Is every `com.keel.*.plist` `collect_profiles` found even readable?
+
+    This is Defect 3 of #640/#642's own aftermath, closed: `collect_profiles`'s broad
+    `except Exception: continue` is right to keep one bad profile from hiding the rest of the
+    fleet's report -- one profile FAILing must never suppress every OTHER profile's findings --
+    but as originally written it also made the bad profile itself INVISIBLE, which is this arc's
+    exact failure mode reproduced inside the fix for it: keel knew something was wrong (the
+    exception fired) and said nothing. `com.keel.paperforward.plist`'s `--`-in-a-comment defect
+    (Defect 1) was invisible for precisely this reason -- there was no `profile.unreadable`
+    finding, and no "com.keel.paperforward" anywhere in doctor's output at all, to say the file
+    even existed.
+
+    Follows `keel/mcp/tools.py::_profiles()`'s existing precedent of reporting a `failed` list
+    of `{"file", "error"}` alongside the profiles that DID resolve, rather than dropping them --
+    the same shape, so a caller (or a human) already used to reading that field reads this one
+    the same way.
+
+    WARN, not FAIL: an unparseable plist or an unresolvable runner invocation is a real defect
+    an operator should fix, but it is not itself evidence that the profile it names is
+    UNSCHEDULED or STALLED -- `profile.scheduled` and `profile.cycled` already FAIL on those
+    confirmed-bad states from the profiles that DID resolve. This finding says only "doctor
+    could not judge this one at all," which is a WARN-shaped fact (investigate), not a
+    FAIL-shaped one (a confirmed fault) -- conflating "unknown" with "broken" would be exactly
+    the false-confidence failure this whole check exists to avoid in the opposite direction.
+    """
+    if not failed:
+        return [
+            Finding(
+                "profile.unreadable",
+                OK,
+                "every profile file resolves",
+                "-",
+                "-",
+            )
+        ]
+    named = "; ".join(f"{f['file']}: {f['error']}" for f in failed)
+    return [
+        Finding(
+            "profile.unreadable",
+            WARN,
+            f"{len(failed)} profile file(s) could not be read",
+            named,
+            "fix the file(s) named above, then re-run doctor -- a profile doctor cannot parse "
+            "is a profile doctor cannot watch",
+        )
+    ]
+
+
 def collect_profiles(
     deployment_dir: Path, loaded_labels: frozenset[str] | None, now_ts: int
-) -> list[ProfileHealth]:
+) -> tuple[list[ProfileHealth], list[dict[str, str]]]:
     """Every `com.keel.*.plist` in `deployment_dir`, turned into the `ProfileHealth` rows
-    `profile_findings` judges.
+    `profile_findings` judges, plus (a second return value) every plist that could NOT be
+    turned into one.
 
     Follows `_profiles()`'s precedent in `keel/mcp/tools.py` (enumerate the profiles of a
-    deployment by globbing its directory): one bad profile must never hide the rest, so any
+    deployment by globbing its directory, and report `{"file", "error"}` for the ones that
+    don't resolve rather than dropping them): one bad profile must never hide the rest, so any
     error resolving ONE plist's identity -- unparseable plist, missing `Label`/
     `ProgramArguments`, no `.sh` argument, unreadable runner script, no `--config` in it, or a
-    config that fails to load -- skips that profile silently rather than raising. A missing or
-    unreadable DATABASE is different: it is exactly the "never cycled" state doctor exists to
-    report, so it becomes `last_cycle_ts=None` on an otherwise-valid profile rather than a skip.
+    config that fails to load -- skips that profile rather than raising, but it is recorded in
+    the second return value, not silently dropped. #640's own incident was invisible for
+    exactly this reason before this change: `com.keel.paperforward.plist` carried a `--` inside
+    an XML comment (XML forbids it; Apple's lenient plist parser tolerated it, `plistlib`
+    didn't), so it silently vanished from every doctor run with nothing to say it had ever
+    existed. `profile_findings` stays a pure function over the FIRST return value only -- the
+    second is surfaced as its own `profile.unreadable` finding (see that function) so a broken
+    plist is reportable without being confused with a confirmed-unscheduled or confirmed-stalled
+    one. A missing or unreadable DATABASE is different again: it is exactly the "never cycled"
+    state doctor exists to report, so it becomes `last_cycle_ts=None` on an otherwise-valid
+    profile rather than a skip.
 
     The plist's `ProgramArguments` carries the OPERATOR's absolute path to the runner script
     (whatever machine it was authored on); only the basename is trusted, re-resolved inside
@@ -1207,9 +1328,13 @@ def collect_profiles(
     a variable with no matching assignment resolves to `None` and the whole profile is skipped,
     the same as today's "no `--config` at all" case, rather than being fed a raw shell
     expression `load_config` cannot open.
+
+    A profile's `cadence_sec` comes from `_runner_cadence_sec` over this same comment-stripped
+    runner text, NOT from `config.auto_trade.interval_sec` -- see that function's docstring for
+    the incident (a permanent `profile.cycled` false alarm on the live and paperforward
+    profiles) trusting the config field caused.
     """
     import plistlib
-    import re
 
     from keel.config import load_config
 
@@ -1249,6 +1374,7 @@ def collect_profiles(
         return next(g for g in assign_match.groups() if g is not None)
 
     profiles: list[ProfileHealth] = []
+    failed: list[dict[str, str]] = []
     for plist_path in sorted(deployment_dir.glob("com.keel.*.plist")):
         try:
             plist = plistlib.loads(plist_path.read_bytes())
@@ -1260,21 +1386,31 @@ def collect_profiles(
             code_text = _strip_comments(runner_text)
             config_match = re.search(r"--config (\S+)", code_text)
             if config_match is None:
-                continue
+                raise ValueError(f"{runner}'s real invocation has no --config argument")
             config_file = _resolve_token(config_match.group(1), code_text)
             if config_file is None:
-                continue
+                raise ValueError(
+                    f"{runner}'s --config argument ({config_match.group(1)!r}) does not "
+                    "resolve to an assigned filename"
+                )
             db_match = re.search(r"--db (\S+)", code_text)
             if db_match is None:
                 db_file = "keel.db"
             else:
                 resolved_db = _resolve_token(db_match.group(1), code_text)
                 if resolved_db is None:
-                    continue
+                    raise ValueError(
+                        f"{runner}'s --db argument ({db_match.group(1)!r}) does not resolve "
+                        "to an assigned filename"
+                    )
                 db_file = resolved_db
             config = load_config(deployment_dir / config_file)
-            interval_sec = int(config.auto_trade.interval_sec)
-        except Exception:  # one unreadable profile must not hide the rest
+            cadence_sec = _runner_cadence_sec(
+                code_text, fallback_sec=int(config.auto_trade.interval_sec)
+            )
+        except Exception as exc:  # one unreadable profile must not hide the rest -- but it must
+            # not vanish either; see `profile.unreadable` (#640's own incident, reproduced).
+            failed.append({"file": plist_path.name, "error": str(exc)})
             continue
 
         last_cycle_ts: int | None = None
@@ -1302,10 +1438,10 @@ def collect_profiles(
                 db_file=db_file,
                 scheduled=scheduled,
                 last_cycle_ts=last_cycle_ts,
-                interval_sec=interval_sec,
+                cadence_sec=cadence_sec,
             )
         )
-    return profiles
+    return profiles, failed
 
 
 @click.command("doctor")
@@ -1338,10 +1474,11 @@ def doctor_cmd(ctx: click.Context, as_json: bool, log_path: str) -> None:
     # pinned read-only by a change-counter test on ONE repo (see the comment above
     # `profile_findings`). Opening sibling databases and shelling `launchctl` belongs only here,
     # on the CLI side.
-    findings += profile_findings(
-        collect_profiles(Path(ctx.obj["config_path"]).parent, _loaded_launchd_labels(), now_ts),
-        now_ts,
+    resolved_profiles, unreadable_profiles = collect_profiles(
+        Path(ctx.obj["config_path"]).parent, _loaded_launchd_labels(), now_ts
     )
+    findings += profile_findings(resolved_profiles, now_ts)
+    findings += unreadable_profile_findings(unreadable_profiles)
 
     _emit(findings, as_json)
     raise SystemExit(doctor_exit_code(findings))

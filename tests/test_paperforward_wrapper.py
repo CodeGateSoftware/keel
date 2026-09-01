@@ -18,6 +18,7 @@ like `tests/test_schedule.py`'s and the sibling profile tests' harnesses do.
 from __future__ import annotations
 
 import os
+import plistlib
 import re
 import stat
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_SCRIPT = REPO_ROOT / "paperforward-run.sh"
+PLIST = REPO_ROOT / "com.keel.paperforward.plist"
 
 
 def _install_date_shim(bin_dir: Path) -> None:
@@ -117,6 +119,29 @@ def _count_lines(path: Path) -> int:
     if not path.exists():
         return 0
     return len(path.read_text().splitlines())
+
+
+# -- the plist: the pin the other three profiles had and this one did not -------------------
+
+
+def test_plist_is_well_formed_xml() -> None:
+    """Same requirement as every sibling plist (`tests/test_schedule.py`,
+    `tests/test_paper_hourly_profile.py`, `tests/test_paper_equities_profile.py`): parse with a
+    STRICT XML parser, not merely with Apple's lenient one.
+
+    `com.keel.paperforward.plist` was the only one of the four tracked plists WITHOUT this pin,
+    and it was the only one that was actually broken: its "hour retries it" comment carried a
+    literal `--` inside an XML comment, which XML forbids. `plutil -lint` reports OK (Apple's
+    CFPropertyList parser tolerates it), which is how it shipped and ran under launchd for as
+    long as it did, but Python's `plistlib` (expat) rejects it outright:
+    `xml.parsers.expat.ExpatError: not well-formed (invalid token): line 17, column 27`. Because
+    `collect_profiles` parses every plist with `plistlib`, the malformed file made the daily
+    paper profile silently unparseable -- it never even reached the broad
+    `except Exception: continue`'s "one bad profile" accounting, because there was no test
+    watching this file at all. Three plists tested, one untested, and the untested one was the
+    one that was wrong.
+    """
+    plistlib.loads(PLIST.read_bytes())
 
 
 def test_runner_script_has_a_notify_seam_shaped_like_keel_live_runs() -> None:
