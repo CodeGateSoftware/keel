@@ -328,6 +328,28 @@ class TestNoLiveOrders:
         assert repo.get_order(entry_id)["mode"] == "paper"
         assert repo.get_order(exit_id)["mode"] == "paper"
 
+    def test_paper_orders_carry_no_book_at_submit(self, repo: Repository) -> None:
+        """#626: `submit_best_bid`/`submit_best_ask` are NULL on every paper row, and that is
+        the decision, not an omission.
+
+        Paper has no venue preview at all -- it fills synthetically off a candle, which is
+        exactly why #350's spread gate never runs here either. The columns exist to measure
+        what the REAL book charged this deployment; a mid derived from a candle close, or a
+        spread invented from a volume model, would sit in the same two columns under the same
+        two names as a genuine venue quote. #523 is going to read this table to decide a cost
+        model, and a table that mixes measured and fabricated spread under one name is worse
+        than one with a gap in it -- the gap is legible, the mixture is not. `mode` already
+        separates the two populations; NULL says it a second time, per row.
+        """
+        trader = PaperTrader(repo)
+        entry_id = trader.on_signal(_enter_signal(ts=1_000))
+        exit_id = trader.on_candle("BTC-USD", _candle(1_060, "115", "121", "114", "120"))
+
+        for order_id in (entry_id, exit_id):
+            order = repo.get_order(order_id)
+            assert order["submit_best_bid"] is None
+            assert order["submit_best_ask"] is None
+
 
 class TestTrackRecord:
     def _win(self, repo: Repository, rule_name: str, ts: int) -> None:

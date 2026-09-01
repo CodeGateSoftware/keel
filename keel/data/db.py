@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -59,6 +59,33 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- size; this is the observed fill, so a partial is two numbers, not one rewritten.
         -- NULL on every row written before v11: "not observed", not zero.
         filled_quantity TEXT,
+        -- THE VENUE'S OWN BOOK AT THE MOMENT THIS ORDER WAS SUBMITTED (#626), as the venue
+        -- gave it: the raw pair, never a derived spread. At this deployment's clip sizes
+        -- (`max_per_order_usd: 100`; the three real live fills were $50.00, $50.00, $61.71)
+        -- square-root-law impact is under 5bp for every product in the corpus while the
+        -- backtest charges 50bp, so essentially the whole modelled cost is SPREAD -- and
+        -- before these two columns keel stored nothing that measured it. #523's merged
+        -- measurement reports every participation arm as a LOWER BOUND on cost for exactly
+        -- this reason.
+        --
+        -- The pair, not `(ask - bid) / mid`, for the same reason `expected_fill` and
+        -- `actual_fill` are two columns rather than one delta: a derivation cannot be
+        -- re-derived differently later, and half-spread-from-mid, half-spread-from-the-side
+        -- crossed, and relative spread are three different questions off one pair.
+        --
+        -- NULL means NOT OBSERVED, never zero: a preview that carried no readable book, and
+        -- every `mode='paper'` row (paper fills synthetically, with no venue preview at all --
+        -- a fabricated book sharing a column name with a real one would poison the very
+        -- measurement these columns exist for).
+        --
+        -- AT SUBMIT, and for a resting order that is NOT the book it eventually fills in. A
+        -- market IOC crosses this book; a `BracketGTC` records the book it was submitted into
+        -- and then waits, sometimes for days. `order_type` CANNOT separate the two -- the
+        -- executor writes `'market'` on every row -- so a reader measuring realised spread
+        -- cost excludes the bracket legs by their id in `positions.bracket_order_id`, the one
+        -- linkage direction that exists.
+        submit_best_bid TEXT,
+        submit_best_ask TEXT,
         raw_response TEXT,
         confirmation TEXT,
         rule_id INTEGER,
@@ -682,6 +709,50 @@ def _migrate_v15_trade_scope_credential_fingerprint(conn: sqlite3.Connection) ->
         conn.execute("ALTER TABLE venue_trade_scopes ADD COLUMN credential_fingerprint TEXT")
 
 
+def _migrate_v16_orders_submit_book(conn: sqlite3.Connection) -> None:
+    """v16 adds `orders.submit_best_bid` / `orders.submit_best_ask` -- the venue's own book at
+    the moment the order was submitted (#626, option 1).
+
+    keel already FETCHES this on every live order and has since #350: `_run_order` previews
+    before it places, and the routing-time max-entry-spread gate reads `best_bid`/`best_ask`
+    out of that preview to decide whether to enter at all. It then threw the numbers away.
+    These two columns are pure persistence of a value already in hand -- no new port method,
+    no extra venue call, no added latency on the order path.
+
+    Why it matters is `config.live-sandbox.yaml`'s `max_per_order_usd: 100`. At the $50-ish
+    clips this deployment actually fills, square-root-law market impact is under 5bp for every
+    product in the corpus while `slippage_for_quote_volume` charges 50bp, so the modelled cost
+    is essentially ALL spread -- and nothing recorded the spread. #523 cannot resolve its
+    participation-rate option without these rows, which is why its measurement
+    (`docs/experiments/2026-08-30-slippage-cap-options.md`) reports every arm it has as a
+    lower bound on cost.
+
+    Idempotent by the `PRAGMA table_info` pattern of `_migrate_v11_orders_filled_quantity` /
+    `_migrate_v15_trade_scope_credential_fingerprint`, and for the same two reasons. A database
+    already stamped at v15 got its `orders` table from an older `CREATE TABLE IF NOT EXISTS`,
+    which never adds a column, so it needs a real `ALTER TABLE` -- the v8 lesson, where
+    `profile.autonomous_until` silently never appeared. A database arriving from below v15 gets
+    `orders` fresh from `_SCHEMA_STATEMENTS`, which runs BEFORE any numbered step and already
+    carries both columns, so a bare `ALTER TABLE` there would raise sqlite's own "duplicate
+    column name" and break every upgrade landing on this release.
+
+    Each column is guarded INDEPENDENTLY rather than the pair being guarded on one of them: a
+    database interrupted between the two ALTERs (or hand-patched with one of them) must be able
+    to complete, and a guard that inferred the second from the first would leave it stuck.
+
+    NO BACKFILL, deliberately. The honest value for every row written before this column is
+    NULL -- "not observed". The four `orders` rows in the live deployment's database were placed
+    against books nobody wrote down, and no book can be reconstructed for a 2026-07/08 order
+    after the fact. Inventing one -- from a daily candle, from a current quote -- would put
+    fabricated spread observations into the exact table #523 will read to decide a cost model.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "submit_best_bid" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN submit_best_bid TEXT")
+    if "submit_best_ask" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN submit_best_ask TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -697,6 +768,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     13: _migrate_v13_positions_realized_legs,
     14: _migrate_v14_venue_trade_scopes,
     15: _migrate_v15_trade_scope_credential_fingerprint,
+    16: _migrate_v16_orders_submit_book,
 }
 
 

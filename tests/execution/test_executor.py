@@ -4236,3 +4236,191 @@ def test_it_is_the_ENTRY_placement_that_confirms_not_the_bracket_that_follows_it
         "exactly one scope write, taken after the ENTRY and before the bracket -- "
         f"got writes after placement counts {writes_at}"
     )
+
+
+# -- #626: the venue's book at submit, recorded on the order row --------------------------------
+
+
+class TestBookAtSubmit:
+    """#626 option 1: every live order row carries the venue's own `best_bid`/`best_ask` from
+    the preview that immediately precedes its placement.
+
+    Why it exists. `config.live-sandbox.yaml` sets `max_per_order_usd: 100` and the three real
+    live fills were $50.00, $50.00 and $61.71. At $50 the square-root law puts market impact
+    under 5bp for every product in the corpus while `slippage_for_quote_volume` charges 50bp --
+    so essentially the whole modelled cost is SPREAD, and keel stored nothing that measured it.
+    #523's merged measurement reports every participation arm as a LOWER BOUND on cost for
+    exactly that reason.
+
+    Why it is cheap. keel has ALWAYS fetched this: `_run_order` previews before it places, and
+    #350's max-entry-spread gate reads these two fields out of that preview to decide whether to
+    enter at all. Option 1 is pure persistence of a value already in hand -- no port method, no
+    extra venue call, and the write rides the `insert_order` that already precedes placement.
+    """
+
+    def test_a_live_buy_records_the_book_the_preview_carried(self, repo) -> None:
+        """The headline row: one live entry, one spread observation, and NO second venue call
+        to get it -- the same single preview #350's gate consumed."""
+        broker = FakeBroker(preview=_book_preview(Decimal("49990"), Decimal("50000")))
+
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["submit_best_bid"] == Decimal("49990")
+        assert order["submit_best_ask"] == Decimal("50000")
+        # The ENTRY's preview only. A bracket follows on this path and previews too, so this
+        # counts the entry's own call rather than asserting a global total of one.
+        assert broker.preview_calls[0]["spec"].side == Side.BUY
+
+    def test_the_raw_pair_is_stored_not_a_derived_spread(self, repo) -> None:
+        """The pair, digit for digit, the way `expected_fill`/`actual_fill` keep two numbers
+        rather than one delta.
+
+        A stored `(ask - bid) / mid` cannot be re-derived differently later, and half-spread
+        off the mid, the half actually crossed, and relative spread are three different
+        questions off one pair. The awkward precision here is the point: the venue's own string
+        survives the round trip, so a reader can compute any of them.
+        """
+        broker = FakeBroker(preview=_book_preview(Decimal("0.000012340"), Decimal("0.000012341")))
+        signal = _enter_signal(
+            _setup(
+                product_id="ETH-USD",
+                entry=Decimal("0.000012341"),
+                stop=Decimal("0.000012000"),
+                target=Decimal("0.000014000"),
+            )
+        )
+
+        result = execute(signal, broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        order = repo.get_order(result.order_id)
+        bid, ask = order["submit_best_bid"], order["submit_best_ask"]
+        assert str(bid) == "0.000012340"
+        assert str(ask) == "0.000012341"
+        # Re-derivable, which is the whole reason the pair is what is stored. The trailing zero
+        # on the bid survives too: a venue string, not a normalised number.
+        assert (ask - bid) / ((ask + bid) / 2) == Decimal("0.00008103399376038248045054900531")
+
+    def test_a_sell_records_its_book_even_though_the_gate_never_runs_on_one(
+        self, repo, caplog
+    ) -> None:
+        """Deliberately WIDER scope than #350's gate, which is BUY-and-live only.
+
+        A gate that refused an exit would strand a position in exactly the book the rule said
+        to leave, so #350 stops at BUYs. Measurement has the opposite requirement: a round trip
+        costs the entry half-spread AND the exit half-spread, so recording only entries would
+        hand #523 half a number and call it whole. This 400bp book is not refused -- it is
+        written down.
+        """
+        _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+        broker = FakeBroker(preview=_book_preview(Decimal("48000"), Decimal("50000")))
+
+        with caplog.at_level(logging.WARNING):
+            result = execute(_exit_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        assert result.vetoed_by == []
+        order = repo.get_order(result.order_id)
+        assert order["side"] == "SELL"
+        assert order["submit_best_bid"] == Decimal("48000")
+        assert order["submit_best_ask"] == Decimal("50000")
+
+    def test_a_bracket_leg_records_the_book_it_was_submitted_into(self, repo) -> None:
+        """`place_bracket` comes through the same `_run_order`, so its row carries a book too.
+
+        The columns are named `submit_` because for a RESTING order this is not the book it
+        eventually fills in -- a `BracketGTC` waits at the exchange for hours or days. Note what
+        the assertions below do NOT rely on: `order_type` is `'market'` on every row
+        `_order_row` writes, so a reader separating the resting legs from the market IOCs that
+        actually crossed a book does it by `positions.bracket_order_id`. The observation is
+        still real data about the venue at submit and is kept.
+        """
+        broker = FakeBroker(preview=_book_preview(Decimal("50000"), Decimal("50010")))
+        _seed_open_position(repo, "BTC-USD", Decimal("0.002"), Decimal("50000"))
+
+        bracket_id = place_bracket(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            qty=Decimal("0.002"),
+            stop=Decimal("49000"),
+            target=Decimal("53000"),
+            rule_name="position_rule",
+            now_ts=NOW_TS,
+        )
+
+        assert bracket_id is not None
+        bracket = repo.get_order(bracket_id)
+        assert bracket["status"] == "pending", "a RESTING order -- it has not crossed this book"
+        assert bracket["submit_best_bid"] == Decimal("50000")
+        assert bracket["submit_best_ask"] == Decimal("50010")
+
+    def test_a_preview_with_no_book_records_nothing_and_still_places(self, repo) -> None:
+        """The venue that supplies no book is a DEGRADED response, not a refusal: `_preview_book`
+        already answers `(None, None)` for it, and NULL here means "not observed" -- the same
+        meaning `filled_quantity` NULL carries. A SELL is the reachable case: a BUY with no
+        readable book is already refused upstream by #350's fail-closed gate.
+        """
+        _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+        bookless = FakeBroker(
+            preview={"order_total": Decimal("50.00"), "commission_total": Decimal("0.30")}
+        )
+
+        result = execute(_exit_signal(), bookless, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True, "a missing book must never refuse an exit"
+        assert bookless.place_calls, "the order really went to the venue"
+        order = repo.get_order(result.order_id)
+        assert order["submit_best_bid"] is None
+        assert order["submit_best_ask"] is None
+
+    def test_recording_the_book_can_never_raise_into_placement(self, repo, caplog) -> None:
+        """THE safety property. A diagnostic column must not be able to decide whether an order
+        is placed -- the `_record_trade_scope_confirmed` precedent, wrapped so a failing metadata
+        write could not cost a live position its protective bracket.
+
+        `_preview_book` is safe against the FIELDS it reads but not against a `detail` that is
+        not a mapping at all (`.get` on a list raises `AttributeError`), and until #626 nothing
+        called it on the SELL path -- so this change is what newly exposes exits to that shape.
+        The order places, the row carries NULLs, and the failure is LOGGED rather than swallowed
+        silently, because a preview shape that stopped being readable is a venue change an
+        operator needs to see.
+        """
+        _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+        broker = FakeBroker()
+        hostile = Preview(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            est_base_size=Decimal("0.1"),
+            est_quote_size=Decimal("5000"),
+            est_fee=Decimal("0.30"),
+            synthetic=False,
+            detail=["best_bid", "50000"],  # type: ignore[arg-type]
+        )
+        broker.preview_order = lambda *a, **k: hostile  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.ERROR):
+            result = execute(_exit_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True, "an unreadable preview shape must not refuse an exit"
+        order = repo.get_order(result.order_id)
+        assert order["submit_best_bid"] is None
+        assert order["submit_best_ask"] is None
+        assert [r for r in caplog.records if r.getMessage() == "executor.submit_book_unreadable"]
+
+    def test_a_rejected_placement_still_carries_the_book(self, repo) -> None:
+        """The row is written BEFORE `place_order`, so a venue refusal leaves the observation
+        intact. A book that was too wide to fill in is exactly the book worth having recorded."""
+        broker = FakeBroker(
+            preview=_book_preview(Decimal("49990"), Decimal("50000")), place_success=False
+        )
+
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is False
+        order = repo.get_order(result.order_id)
+        assert order["status"] == "rejected"
+        assert order["submit_best_bid"] == Decimal("49990")
+        assert order["submit_best_ask"] == Decimal("50000")

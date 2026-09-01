@@ -877,7 +877,7 @@ def _run_order(
     elif mode != "autonomous":
         raise ValueError(f"execute: unknown mode {mode!r} -- must be 'confirm' or 'autonomous'")
 
-    order_id = repo.insert_order(_order_row(intent, mode, now_ts))
+    order_id = repo.insert_order(_order_row(intent, mode, now_ts, preview))
 
     try:
         place_result = broker.place_order(spec)
@@ -1240,6 +1240,48 @@ def _preview_best_ask(preview: Preview) -> Decimal | None:
     return _preview_book(preview)[1]
 
 
+def _submit_book(preview: Preview | None) -> tuple[Decimal | None, Decimal | None]:
+    """The book to RECORD on the order row (#626) -- `(best_bid, best_ask)`, and NEVER raising.
+
+    #626 option 1: at this deployment's clip sizes spread IS the cost, and nothing stored it.
+    keel already has the number -- `_run_order` previews before every live placement and #350's
+    max-entry-spread gate reads exactly these two fields out of that preview -- so this is
+    persistence of a value already in hand, not a new venue call.
+
+    **Recorded on EVERY live row, deliberately wider than the gate that fetches it.** #350
+    gates BUYs only, because trapping an exit in a wide book strands a position the rule said
+    to leave. Measurement has the opposite requirement: a round trip costs the entry
+    half-spread AND the exit half-spread, so recording only the entry would hand #523 half a
+    number and call it whole. A SELL is never refused on its book here -- it is written down.
+
+    **A resting order records the book it was SUBMITTED into, which is not the book it fills
+    in.** `place_bracket` comes through `_run_order` too, and its `BracketGTC` waits at the
+    exchange for hours or days. That is why the columns are named `submit_`. `order_type`
+    cannot be the discriminator -- `_order_row` writes `'market'` on every row it produces --
+    so a reader measuring realised spread cost excludes the bracket legs by their id in
+    `positions.bracket_order_id`. Recorded rather than suppressed because one uniform rule
+    ("whatever the preview carried, on every live row") is easier to reason about than a
+    per-side allowlist, and because a bracket's submit-time book is real data about the venue.
+
+    **The wrapper, not the `try` inside `_preview_book`.** `_preview_book` is safe against the
+    fields it reads but not against a `detail` that is not a mapping at all (a list would raise
+    `AttributeError` on `.get`) -- and until now nothing called it on the SELL path, so this
+    change would newly expose exits to that. The precedent is `_record_trade_scope_confirmed`,
+    wrapped so a failing metadata write could not cost a live position its protective bracket:
+    a DIAGNOSTIC column must never be able to decide whether an order is placed. `(None, None)`
+    is the same "not observed" this column already means, and the failure is logged rather than
+    swallowed silently, because a preview shape that stopped being readable is a venue change
+    an operator needs to see.
+    """
+    if preview is None:
+        return None, None
+    try:
+        return _preview_book(preview)
+    except Exception:
+        log_exception(logger, "executor.submit_book_unreadable")
+        return None, None
+
+
 def _warn_if_market_routing_overrides_entry(
     intent: OrderIntent,
     preview: Preview | None,
@@ -1489,11 +1531,14 @@ def _book_unreadable_refusal(intent: OrderIntent, why: str) -> _SpreadGateRefusa
     )
 
 
-def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
+def _order_row(
+    intent: OrderIntent, mode: str, now_ts: int, preview: Preview | None = None
+) -> dict[str, Any]:
     # Routed MARKET unconditionally (#258's faithful-engine decision): `expected_fill` below
     # records the rule's intended entry even though execution ignores it -- the override
     # #260's routing-time warning (`_warn_if_market_routing_overrides_entry` in `_run_order`)
     # exists to make visible rather than silent.
+    submit_best_bid, submit_best_ask = _submit_book(preview)
     return dict(
         mode="live",
         product_id=intent.product_id,
@@ -1505,6 +1550,14 @@ def _order_row(intent: OrderIntent, mode: str, now_ts: int) -> dict[str, Any]:
         fee=None,
         expected_fill=intent.entry,
         actual_fill=None,
+        # #626: the venue's own book at submit, from the preview `_run_order` JUST fetched --
+        # the same one #350's spread gate read. Written on the INSERT that already precedes
+        # placement, so this adds no statement, no round trip and no failure mode to the order
+        # path: the row either goes in with two more columns or the order was never placed,
+        # exactly as today. `_submit_book` cannot raise. The RAW PAIR, never a spread: see the
+        # column comment in `data/db.py` for why a derivation would be the lossy choice.
+        submit_best_bid=submit_best_bid,
+        submit_best_ask=submit_best_ask,
         raw_response=None,
         # NOTE: rows written before 2026-07-21 carry `confirmation='bypass'` for what is now
         # called `'autonomous'`. Nothing reads this column back -- it is an audit trail only --
