@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -170,13 +171,19 @@ class _FakeOps:
         self.events: list[tuple[str, Any]] = []
         self.fail_verify = False
         self.fail_verify_with = "verify exploded"
+        self.fail_download_with: str | None = None
         self.fail_install_with: str | None = None
         self.fail_migrate_with: str | None = None
         self.installs = 0
 
     def download(self, url: str, dest: Path) -> None:
+        # The backups present AT DOWNLOAD TIME. Since #676 this is empty on every wheel --
+        # downloads run first now -- and it is recorded rather than dropped because the tuple
+        # is what makes a future re-reordering visible in `events` instead of silent.
         baks = sorted(p.name for p in self.launch_dir.glob("*.bak-before-0.7.0-*"))
         self.events.append(("download", dest.name, tuple(baks)))
+        if self.fail_download_with is not None:
+            raise up.UpdateError(self.fail_download_with)
         dest.write_bytes(b"new-wheel-bytes")
 
     def install(self, venv_python: Path, wheels: Any) -> None:
@@ -1308,3 +1315,219 @@ def test_cli_packaged_network_failure_is_calm_and_not_an_error(
     assert "could not check" in result.output.lower()
     assert "0.6.0" in result.output
     assert up.RELEASES_URL in result.output
+
+
+# -- transport retries (#675) --------------------------------------------------------------------
+#
+# One transient stall used to abandon the whole update. On 2026-09-01 the live deployment failed
+# on the FIRST of five wheels with "The read operation timed out"; the asset was healthy the
+# whole time -- HTTP 200, 51,701 bytes, 0.82s a minute later, download counter still 0.
+
+
+def _slept() -> tuple[list[float], Any]:
+    """A `sleep` double that records instead of waiting. A suite that really backs off spends
+    four seconds per retry pin."""
+    waits: list[float] = []
+    return waits, waits.append
+
+
+def test_a_transport_stall_is_retried_and_the_second_attempt_wins() -> None:
+    calls: list[int] = []
+
+    def attempt() -> str:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise TimeoutError("The read operation timed out")
+        return "payload"
+
+    waits, sleep = _slept()
+    assert up._with_retries(attempt, sleep=sleep) == "payload"
+    assert len(calls) == 2
+    assert waits == [1.0], "the first retry must back off before asking again"
+
+
+def test_retries_are_bounded_and_the_last_failure_is_what_the_operator_sees() -> None:
+    """Re-raises the LAST exception, not a wrapper: every caller's own message --
+    `_http_get`'s rate-limit text, `_download_file`'s URL -- has to survive."""
+    calls: list[int] = []
+
+    def attempt() -> str:
+        calls.append(len(calls))
+        raise ConnectionResetError("connection reset by peer")
+
+    waits, sleep = _slept()
+    with pytest.raises(ConnectionResetError, match="connection reset by peer"):
+        up._with_retries(attempt, sleep=sleep)
+    assert len(calls) == up._DOWNLOAD_ATTEMPTS
+    assert waits == [1.0, 3.0], "a doomed update waits 4 seconds total, once, and gives up"
+
+
+@pytest.mark.parametrize("status", [404, 403, 401])
+def test_an_http_answer_that_will_not_change_is_not_retried(status: int) -> None:
+    """**The trap this guards.** `urllib.error.HTTPError` is a subclass of `OSError`, so the
+    obvious `except OSError: retry` retries a 404 as eagerly as a dropped connection -- three
+    times wrong instead of once. A 403 is worse than pointless: on the unauthenticated releases
+    endpoint it IS the rate limit, so retrying spends the budget that just ran out.
+    """
+    calls: list[int] = []
+
+    def attempt() -> str:
+        calls.append(len(calls))
+        raise urllib.error.HTTPError("http://x", status, "nope", {}, None)  # type: ignore[arg-type]
+
+    waits, sleep = _slept()
+    with pytest.raises(urllib.error.HTTPError):
+        up._with_retries(attempt, sleep=sleep)
+    assert len(calls) == 1, f"HTTP {status} is an answer, not a stall -- it must not be retried"
+    assert waits == []
+
+
+@pytest.mark.parametrize("status", sorted(up._RETRYABLE_STATUS))
+def test_a_server_side_status_is_retried(status: int) -> None:
+    """502/503 from a CDN is the same transient event as a timeout, wearing a status code."""
+    calls: list[int] = []
+
+    def attempt() -> str:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError("http://x", status, "later", {}, None)  # type: ignore[arg-type]
+        return "payload"
+
+    waits, sleep = _slept()
+    assert up._with_retries(attempt, sleep=sleep) == "payload"
+    assert len(calls) == 2
+
+
+def test_429_is_deliberately_not_retried() -> None:
+    """Transient, and still the one response retrying cannot help: it means the 60-per-hour
+    budget is spent. `_http_get` turns it into a message naming the manual procedure, which
+    needs no API call at all -- that message is the useful answer, not a fourth request."""
+    assert 429 not in up._RETRYABLE_STATUS
+
+
+def test_the_rate_limit_message_survives_the_retry_wrapper(monkeypatch) -> None:
+    """Two-sided with the branch `_http_get` has always had: the wrapper decides only WHETHER
+    to ask again, never what to say when the answer is final."""
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise urllib.error.HTTPError("http://x", 403, "rate limited", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(up.urllib.request, "urlopen", boom)
+    with pytest.raises(up.UpdateError, match="rate-limited by the GitHub API"):
+        up._http_get("http://x")
+
+
+# -- a failed download costs no backup (#676) ----------------------------------------------------
+
+
+def test_a_failed_download_leaves_no_database_backup_on_disk(tmp_path: Path) -> None:
+    """The reordering, pinned by its consequence rather than by call order.
+
+    Backups used to run first, so a stall on the first of five wheels threw away ~466 MB of
+    `sqlite3.backup()` across three databases -- and because backups are timestamped and never
+    deleted, the retry left a second full set behind rather than reusing the first.
+    """
+    launch = _deployment(tmp_path)
+    plan = _plan(launch)
+    ops = _FakeOps(launch)
+    ops.fail_download_with = "The read operation timed out"
+
+    result, _steps = _run(plan, ops)
+
+    assert result.ok is False
+    assert result.backups == (), (
+        f"a failed download reported backups {[b.name for b in result.backups]} -- the "
+        "expensive work ran before the step most likely to fail"
+    )
+    assert list(launch.glob("*.bak-before-*")) == [], (
+        "a failed download left database backups on disk; each retry adds another full set "
+        "and the updater never deletes them"
+    )
+
+
+def test_download_file_itself_retries_a_stall(monkeypatch, tmp_path: Path) -> None:
+    """`_with_retries` being correct proves nothing about `_download_file` USING it.
+
+    Every retry test above calls the helper directly, so removing the call from the production
+    downloader leaves all of them green -- which is exactly what a mutation run showed. This
+    exercises the real function.
+    """
+    attempts: list[int] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"wheel-bytes"
+
+    def urlopen(url: str, timeout: int | None = None) -> _Response:
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise TimeoutError("The read operation timed out")
+        return _Response()
+
+    monkeypatch.setattr(up.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(up.time, "sleep", lambda _s: None)
+    dest = tmp_path / "keel_core-0.13.2-py3-none-any.whl"
+
+    up._download_file("http://x/wheel.whl", dest)
+
+    assert len(attempts) == 2, "the production downloader does not retry"
+    assert dest.read_bytes() == b"wheel-bytes"
+
+
+def test_http_get_itself_retries_a_stall(monkeypatch) -> None:
+    """And the releases-API read, which fails the update before it has even started."""
+    attempts: list[int] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request: object, timeout: int | None = None) -> _Response:
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return _Response()
+
+    monkeypatch.setattr(up.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(up.time, "sleep", lambda _s: None)
+
+    assert up._http_get("http://x") == b"{}"
+    assert len(attempts) == 2, "the releases-API read does not retry"
+
+
+def test_a_failed_download_does_not_claim_backups_left_by_an_EARLIER_run(tmp_path: Path) -> None:
+    """`backups=()` has to mean "this run took none", not "the glob found none".
+
+    The sibling test proves nothing on its own: with no prior backups on disk, an
+    implementation that globbed `*.bak-before-*` would also return empty. A real launch folder
+    is the opposite case -- `~/keel` holds 7 GB of them going back to 0.9.1 -- so the
+    distinction is the normal state, not an edge case, and reporting someone else's backup as
+    this run's would send an operator to restore from the wrong file.
+    """
+    launch = _deployment(tmp_path)
+    stale = launch / "keel.db.bak-before-0.6.9-20260101-000000"
+    stale.write_bytes(b"an older run's backup")
+    plan = _plan(launch)
+    ops = _FakeOps(launch)
+    ops.fail_download_with = "The read operation timed out"
+
+    result, _steps = _run(plan, ops)
+
+    assert result.ok is False
+    assert result.backups == (), (
+        f"reported {[b.name for b in result.backups]} as this run's backups -- they belong to "
+        "an earlier update and this run took none"
+    )
+    assert stale.is_file(), "an earlier run's backup must never be touched"
