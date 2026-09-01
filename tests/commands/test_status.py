@@ -227,6 +227,128 @@ def test_open_position_without_bracket_reports_false(repo: Repository) -> None:
     assert report.open_positions[0].has_bracket is False
 
 
+def test_open_position_carries_initial_stop_when_recorded(repo: Repository) -> None:
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        initial_stop=Decimal("64000"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.open_positions[0].initial_stop == Decimal("64000")
+
+
+def test_open_position_without_initial_stop_reports_none(repo: Repository) -> None:
+    """A DCA leg, or any tranche opened before v12, never got one -- `None` means "not on this
+    row", not "no stop"."""
+    repo.open_position(
+        product_id="ETH-USD",
+        rule_name="dca",
+        opened_at=NOW_TS,
+        qty=Decimal("1"),
+        entry_fill=Decimal("3000"),
+        entry_fee=Decimal("2"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+
+    assert report.open_positions[0].initial_stop is None
+
+
+# -- bracket rendering / #641: paper's "NO bracket" is the mode, not a hazard ----------------
+
+
+def test_live_position_with_no_bracket_still_renders_no_bracket(repo: Repository) -> None:
+    """The acceptance criterion this fix must not touch: a LIVE position (`auto_trade.mode ==
+    "confirm"`, this codebase's only non-paper mode -- see `_VALID_AUTO_TRADE_MODES`) with a
+    NULL `bracket_order_id` is a real venue-order gap -- the exact state `reconcile_unbracketed_
+    positions` and the `unbracketed:` crash ledger (#519, #502) exist to heal. This line must
+    render byte-identically to before #641."""
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(
+        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
+    )
+    lines = render_human(report)
+
+    assert any(line.endswith("(NO bracket)") for line in lines)
+
+
+def test_paper_position_with_no_bracket_does_not_render_no_bracket(repo: Repository) -> None:
+    """The bug: paper never places a venue order, so `has_bracket` is False on every paper
+    position by construction, and the old rendering said `NO bracket` on all of them --
+    unactionable, nine of nine on the reported book."""
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)  # default mode="paper"
+    lines = render_human(report)
+
+    assert not any(line.endswith("(NO bracket)") for line in lines)
+
+
+def test_paper_position_with_a_recorded_stop_shows_it(repo: Repository) -> None:
+    """Option 1 (the issue's preference order): report the protection that exists. Paper's stop
+    is known once `initial_stop` is on the row, and `PaperTrader.on_candle` is what actually
+    enforces it, so the line names that stop instead of a NULL venue order paper never places."""
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="pullback_continuation",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("65000"),
+        entry_fee=Decimal("1.5"),
+        initial_stop=Decimal("64000"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    lines = render_human(report)
+
+    assert any("paper stop 64000" in line for line in lines)
+
+
+def test_paper_position_without_a_recorded_stop_names_the_mechanism(repo: Repository) -> None:
+    """A DCA leg, or a tranche opened before the v12 migration, has no `initial_stop` to show --
+    it names the mechanism (candle-touch resolution) instead of inventing a number."""
+    repo.open_position(
+        product_id="ETH-USD",
+        rule_name="dca",
+        opened_at=NOW_TS,
+        qty=Decimal("1"),
+        entry_fill=Decimal("3000"),
+        entry_fee=Decimal("2"),
+        bracket_order_id=None,
+    )
+
+    report = gather_status(repo, _config(), now_ts=NOW_TS)
+    lines = render_human(report)
+
+    assert any("candle touch" in line for line in lines)
+
+
 # -- rules ---------------------------------------------------------------------------------
 
 

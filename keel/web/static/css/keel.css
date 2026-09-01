@@ -493,6 +493,25 @@ code,
 .stopped p { margin: 0 0 0.7rem; }
 .stopped .detail { color: var(--muted); font-size: 0.88rem; }
 
+/* The reconnect field (#634): the one control on a refused page, so it is laid out as a row that
+ * wraps rather than a form, and its border is `--control-line` -- the variable that exists
+ * because WCAG 1.4.11 wants 3:1 on a control boundary and `--line` is decorative only. */
+.reconnect form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.reconnect label { flex-basis: 100%; color: var(--muted); font-size: 0.88rem; }
+.reconnect input {
+  font: inherit;
+  flex: 1 1 18rem;
+  min-width: 0;
+  padding: 0.35rem 0.6rem;
+  border-radius: 7px;
+  border: 1px solid var(--control-line);
+  background: var(--bg);
+  color: var(--fg);
+  /* WCAG 2.5.8: the same 24px floor the buttons keep. */
+  min-height: 24px;
+}
+.reconnect input:focus-visible { border-color: var(--accent); }
+
 button {
   font: inherit;
   font-weight: 550;

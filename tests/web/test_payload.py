@@ -692,6 +692,78 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
             assert figure in available, f"{name} {path}: {leaf!r} is on no report field"
 
 
+def _position(**overrides: Any) -> OpenPositionStatus:
+    base: dict[str, Any] = dict(
+        id=7,
+        product_id="BTC-USD",
+        rule_name="turtle_breakout",
+        qty=Decimal("0.01000000"),
+        entry_price=Decimal("50000.00"),
+        opened_at=NOW_TS - 7200,
+        has_bracket=False,
+        initial_stop=None,
+    )
+    base.update(overrides)
+    return OpenPositionStatus(**base)
+
+
+# -- bracket / #641: paper's "NO bracket" is the mode, not a hazard ------------------------------
+
+
+def test_live_position_with_no_bracket_still_warns() -> None:
+    """The acceptance criterion this fix must not touch: a LIVE position (`auto_trade.mode ==
+    "confirm"`, this codebase's only non-paper mode -- see `_VALID_AUTO_TRADE_MODES`) with a
+    NULL `bracket_order_id` is a real venue-order gap -- the exact state `reconcile_unbracketed_
+    positions` and the `unbracketed:` crash ledger (#519, #502) exist to heal. Whatever paper's
+    rendering becomes, this one must render byte-identically to before #641."""
+    report = _status_report(mode="confirm", open_positions=[_position(has_bracket=False)])
+    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    assert bracket["display"] == "NO bracket"
+    assert bracket["state"] == "warn"
+
+
+def test_live_position_with_a_bracket_still_reads_good() -> None:
+    """The other half of the live case, unchanged: a real bracket still reads GOOD."""
+    report = _status_report(mode="confirm", open_positions=[_position(has_bracket=True)])
+    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    assert bracket["display"] == "bracketed"
+    assert bracket["state"] == "good"
+
+
+def test_paper_position_with_no_bracket_does_not_warn() -> None:
+    """The bug: paper never places a venue order, so `has_bracket` is False on every paper
+    position by construction, and the old rendering WARNed on all of them -- unactionable, nine
+    of nine. A paper row without a bracket must not read `warn`."""
+    report = _status_report(mode="paper", open_positions=[_position(has_bracket=False)])
+    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    assert bracket["state"] != "warn"
+
+
+def test_paper_position_with_a_recorded_stop_shows_it_instead_of_the_absent_bracket() -> None:
+    """Option 1 (the issue's preference order): report the protection that exists. Paper's stop
+    is known once `initial_stop` (#520, since 0.12.2) is on the row -- `PaperTrader.on_candle`
+    is what actually enforces it -- so the column names that stop rather than a NULL venue order
+    paper can never place."""
+    report = _status_report(
+        mode="paper", open_positions=[_position(has_bracket=False, initial_stop=Decimal("64000"))]
+    )
+    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    assert bracket["state"] == "neutral"
+    assert "64,000" in bracket["display"]
+
+
+def test_paper_position_without_a_recorded_stop_falls_back_to_mode_aware_text() -> None:
+    """A tranche that predates the v12 migration, or a DCA leg that never recorded one
+    (`repository._position_row_to_dict`'s own note), has no stop to show -- it names the
+    mechanism instead of inventing a number (option 2 of the issue's preference order)."""
+    report = _status_report(
+        mode="paper", open_positions=[_position(has_bracket=False, initial_stop=None)]
+    )
+    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    assert bracket["state"] == "neutral"
+    assert "candle touch" in bracket["display"]
+
+
 def test_an_open_position_carries_no_notional_because_the_report_holds_none() -> None:
     """The single most tempting place to break Rule 2, pinned so the temptation fails loudly.
 

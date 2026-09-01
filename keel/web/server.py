@@ -57,6 +57,7 @@ from keel.web.security import (
     HostPolicy,
     csrf_token,
     parse_cookie_header,
+    session_cookie,
     tokens_match,
 )
 
@@ -484,8 +485,17 @@ class KeelHandler(BaseHTTPRequestHandler):
             self._refuse(
                 403,
                 "Not authorised",
-                "Open the address keel printed when it started -- it carries a one-time token "
-                "for this session. The token is new every run and is never written to disk. "
+                # #634: the old text's only instruction was "open the address keel printed",
+                # which is an instruction an installed app -- a window with no address bar --
+                # cannot follow, and which does not say WHY a link that worked yesterday stopped.
+                # Both halves are fixed here: the cause is named, and the action named is one
+                # that can be taken from wherever this is being read.
+                "keel is running and refused this browser. The address keel prints when it "
+                "starts carries the token for that run, and the token is new every run and is "
+                "never written to disk -- so if keel has been restarted since this browser last "
+                "worked, the address printed THIS time is the one that admits it. Paste that "
+                "address into the address bar here, or paste just its token into the field the "
+                "console offers when it is refused. "
                 "If you opened that address and still see this, an installed service worker "
                 "from a build before this one is answering the page from its cache, so the "
                 "token never reached the server: unregister it once (browser devtools, "
@@ -766,10 +776,7 @@ class KeelHandler(BaseHTTPRequestHandler):
                 "",
                 extra=(
                     ("Location", parsed.path or "/"),
-                    (
-                        "Set-Cookie",
-                        f"{SESSION_COOKIE}={self.cfg.token}; Path=/; HttpOnly; SameSite=Strict",
-                    ),
+                    ("Set-Cookie", session_cookie(self.cfg.token)),
                 ),
             )
             return
@@ -879,6 +886,12 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         echo("")
     echo(f"keel is serving a read-only view at:\n\n    {running.url()}\n")
     echo("This link contains a one-time token for this session. Press Ctrl-C to stop.")
+    # #634: the browser keeps this session across a restart of its own, which is what makes the
+    # installed console usable at all -- and which means closing the browser has stopped being a
+    # way to sign out. Said here rather than only in a docstring, because the operator who needs
+    # to revoke is the operator reading this terminal, and the gesture is the one they already
+    # have: stopping keel invalidates the token, so every browser holding it is out.
+    echo("Stopping keel revokes it: the token is new every run and is never written to disk.")
 
     try:
         server.serve_forever()

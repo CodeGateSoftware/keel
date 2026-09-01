@@ -2532,6 +2532,156 @@ def test_paper_mode_loads_PAPER_status_rules_not_live_ones(repo, monkeypatch):
     assert repo.get_orders(mode="paper") == [], "a LIVE rule must not trade in paper mode"
 
 
+# -- #639: a filled paper exit must book its outcome -----------------------------------------
+#
+# The pin the deployment needed two weeks ago. Six paper round trips completed in `~/keel/keel.db`
+# between 08-21 and 08-28, every exit `status='filled'` with an `actual_fill`, and
+# `trade_outcomes` held ZERO rows while all eight `positions` stayed `status='open'`. The
+# promotion gate's pooled sample-size axis (#338) counts `trade_outcomes`, so pooled n was
+# permanently 0 and no rule could ever be promoted -- silently.
+#
+# The cause is a whole missing edge, not a regression: `_paper_resolve_bars` -> `on_candle` ->
+# `PaperTrader._close` writes the exit ORDER and forgets the position it belongs to, and
+# `_handle_exits` (which is what calls `_close_tranches`) cannot cover for it because
+# `_held_position` reads `mode="live"` orders ONLY -- so in a paper cycle it returns qty 0 and
+# returns `[]` before ever looking at a rule. The agent OPENS the paper tranche
+# (`_open_tranche`, in the shared entry loop) and, until now, nothing ever closed it.
+
+
+class _EnterOnceRule(_AlwaysEnterRule):
+    """Enters on the FIRST bar only, so the round-trip tests can assert `exactly one` outcome
+    row without `_AlwaysEnterRule` re-entering on the very cycle the exit books."""
+
+    def __init__(self, product_id: str, name: str = "fake_enter", stop_mult: str = "0.95",
+                 target_mult: str = "1.15") -> None:
+        super().__init__(product_id, name=name, stop_mult=stop_mult)
+        self.target_mult = Decimal(target_mult)
+
+    def detect(self, candles_by_tf):
+        candles = next((c for c in candles_by_tf.values() if c), [])
+        if len(candles) != 1:
+            return None
+        last = candles[-1]
+        return Setup(
+            product_id=self.product_id,
+            direction="long",
+            entry=last.close,
+            stop=last.close * self.stop_mult,
+            target=last.close * self.target_mult,
+            context={},
+            ts=last.ts,
+        )
+
+
+def _bar(ts: int, o: str, h: str, low: str, c: str) -> Candle:
+    return Candle(
+        ts=ts, open=Decimal(o), high=Decimal(h), low=Decimal(low), close=Decimal(c),
+        volume=Decimal("1"),
+    )
+
+
+_DAY = 86_400
+
+
+def _paper_round_trip(repo, monkeypatch, rule, second_bar: Candle, *, now_ts: int = 90_000):
+    """Two paper cycles: bar 1 enters, `second_bar` resolves the stop/target. Returns the
+    cycle timestamp the exit booked at."""
+    _seed_rule(repo, monkeypatch, rule)
+    first = _bar(0, "100", "100", "100", "100")
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): [first]})
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+
+    run_once(broker, repo, cfg, now_ts=now_ts)
+    assert len(repo.get_open_positions(PRODUCT)) == 1, "the entry cycle must open a tranche"
+
+    broker._series = {(PRODUCT, Granularity.ONE_DAY): [first, second_bar]}
+    exit_ts = now_ts + _DAY
+    run_once(broker, repo, cfg, now_ts=exit_ts)
+    return exit_ts
+
+
+def test_a_filled_paper_exit_books_exactly_one_outcome_and_closes_its_tranche(repo, monkeypatch):
+    """#639's invariant, end to end: a filled exit carrying an `actual_fill` produces EXACTLY
+    ONE `trade_outcomes` row and closes the position it belongs to.
+
+    This is the check that would have caught the six unbooked round trips. It asserts the whole
+    row, not just its existence: the pooled promotion axis counts rows, but rail 16 and the
+    track record read the numbers on them, and a row written against the wrong price is a worse
+    failure than no row at all.
+    """
+    exit_ts = _paper_round_trip(
+        repo, monkeypatch, _EnterOnceRule(PRODUCT), _bar(_DAY, "101", "130", "101", "130")
+    )
+
+    orders = repo.get_orders(mode="paper")
+    sells = [o for o in orders if o["side"] == Side.SELL.value]
+    assert len(sells) == 1 and sells[0]["status"] == "filled"
+    assert sells[0]["actual_fill"] is not None, "the premise: the exit reported a fill price"
+    entry = next(o for o in orders if o["side"] == Side.BUY.value)
+
+    outcomes = repo.get_trade_outcomes()
+    assert len(outcomes) == 1, (
+        "a filled paper exit booked no outcome row -- the promotion gate's pooled sample size "
+        "(#338) counts these, so it stays at zero forever and no rule can ever be promoted"
+    )
+    (outcome,) = outcomes
+    assert outcome["product_id"] == PRODUCT
+    assert outcome["rule_name"] == "fake_enter"
+    assert outcome["is_dca"] is False
+    assert outcome["qty"] == entry["qty"]
+    assert outcome["entry_fill"] == entry["actual_fill"]
+    assert outcome["exit_fill"] == sells[0]["actual_fill"]
+    assert outcome["fees"] == sells[0]["fee"]
+    # NET of BOTH legs' fees, like the sim -- the entry fee is carried on the tranche.
+    assert outcome["pnl_net"] == (
+        sells[0]["actual_fill"] * entry["qty"]
+        - entry["actual_fill"] * entry["qty"]
+        - sells[0]["fee"]
+        - entry["fee"]
+    )
+    # The CYCLE's clock, not the bar's: `opened_at` is the cycle timestamp `_open_tranche`
+    # recorded, and a `closed_at` taken from the candle would make a paper trade's recorded
+    # holding period the difference between two different clocks.
+    assert outcome["closed_at"] == exit_ts
+
+    assert repo.get_open_positions(PRODUCT) == [], (
+        "the tranche is still open after its exit filled -- exactly the state #639 found in the "
+        "live paper book, where all eight positions sat open against six completed round trips"
+    )
+    assert repo.get_state(f"position_rule:{PRODUCT}") is None, (
+        "the exit-ownership marker outlived the position it names"
+    )
+
+
+def test_a_losing_paper_exit_advances_the_consecutive_loss_streak(repo, monkeypatch):
+    """Rail 16 is fed by the SAME producer. Booking the outcome row without wiring the streak
+    would leave the breaker blind to every paper loss, which is the half of `record_closed_trade`
+    a caller can most easily forget."""
+    _paper_round_trip(
+        repo, monkeypatch, _EnterOnceRule(PRODUCT), _bar(_DAY, "99", "99", "80", "80")
+    )
+
+    (outcome,) = repo.get_trade_outcomes()
+    assert outcome["pnl_net"] < 0
+    assert repo.get_state("consecutive_losses") == 1
+
+
+def test_a_losing_paper_dca_exit_is_recorded_but_exempt_from_the_streak(repo, monkeypatch):
+    """§12.6: DCA is exempt from the STREAK, not from the RECORD. DCA buys through drawdowns on
+    a fixed budget by design, so its losses must not trip rail 16 -- but its P&L is real and the
+    pooled promotion axis still counts it. `is_dca` is DERIVED from the tranche's owning rule,
+    exactly as `_handle_exits` derives it from the owning rule on the live path; hardcoding
+    either value breaks one of these two tests."""
+    _paper_round_trip(
+        repo, monkeypatch, _EnterOnceRule(PRODUCT, name="dca"), _bar(_DAY, "99", "99", "80", "80")
+    )
+
+    (outcome,) = repo.get_trade_outcomes()
+    assert outcome["is_dca"] is True
+    assert outcome["pnl_net"] < 0, "the premise: this round trip lost money"
+    assert repo.get_state("consecutive_losses", default=0) == 0
+
+
 # -- paper equity: seed, mode-flip clear, per-cycle drawdown (P4 Task 5) --------------------
 
 

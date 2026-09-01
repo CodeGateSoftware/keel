@@ -767,6 +767,82 @@ def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
     ]
 
 
+
+def unbooked_exit_findings(
+    open_positions: list[dict[str, Any]], orders: list[dict[str, Any]]
+) -> list[Finding]:
+    """Tranches still OPEN behind an exit that already filled (#639) -- the state that made the
+    promotion ladder unreachable and said nothing.
+
+    Six paper round trips completed in the live deployment between 2026-08-21 and 08-28, every
+    exit `status='filled'` with an `actual_fill`, and `trade_outcomes` held ZERO rows while all
+    eight `positions` sat `status='open'`. `promotion.py`'s pooled sample-size axis (#338)
+    counts that table, so pooled n was pinned at 0 and no rule could ever be promoted. Nothing
+    surfaced it: it was found by asking how long promotion would take, which is not a diagnostic
+    channel. This is the channel.
+
+    The condition is stated over the two tables that must agree, not over the bug that broke
+    them, so it still holds if a future path forgets the same edge: an OPEN tranche whose
+    product has a FILLED SELL dated at or after the tranche opened has been sold and is not
+    booked. Every clause earns its place --
+
+    * `realized_qty > 0` is EXCLUDED. A deliberate scale-out (`executor.scale_out`) and a short
+      market exit (#446) both leave a tranche legitimately open behind a filled SELL, and both
+      record the leg on the tranche. A finding that flagged them would fire on correct behaviour
+      every time a position was de-risked, which is how a check gets ignored.
+    * The SELL must be at or after `opened_at`. A sale that closed an EARLIER tranche says
+      nothing about one opened after it, and the ledger is FIFO so the ordering is meaningful.
+
+    Modes are pooled on purpose: paper is where this was found, but the invariant is not
+    paper's -- `agent._open_tranche` writes the ledger for both, and an unbooked LIVE exit is
+    strictly worse.
+
+    WARN, not FAIL: the deployment is trading correctly and the money is real either way; what
+    is lost is the EVIDENCE, and that is a state a human resolves by deciding whether to
+    backfill, not a fault that should stop a cycle.
+    """
+    sold_at_by_product: dict[str, list[int]] = {}
+    for order in orders:
+        if order.get("side") != "SELL" or order.get("status") != "filled":
+            continue
+        ts = order.get("created_at")
+        if ts is None:
+            continue
+        sold_at_by_product.setdefault(str(order.get("product_id")), []).append(int(ts))
+
+    stranded = [
+        p
+        for p in open_positions
+        if Decimal(str(p.get("realized_qty") or 0)) == 0
+        and any(
+            ts >= int(p["opened_at"]) for ts in sold_at_by_product.get(str(p["product_id"]), [])
+        )
+    ]
+    if not stranded:
+        return [
+            Finding(
+                "ledger.unbooked_exit",
+                OK,
+                "no unbooked exits",
+                "every filled exit closed the tranche it sold",
+                "-",
+            )
+        ]
+    described = ", ".join(
+        f"{p['product_id']} tranche {p['id']} ({p.get('rule_name')})" for p in stranded
+    )
+    return [
+        Finding(
+            "ledger.unbooked_exit",
+            WARN,
+            f"{len(stranded)} tranche(s) open behind a filled exit",
+            f"{described} -- the sale filled but no `trade_outcomes` row was written, so the "
+            "promotion gate's pooled sample size (#338) does not count these trades",
+            "inspect the orders behind each tranche and decide whether to backfill (#639)",
+        )
+    ]
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -907,6 +983,9 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     findings += veto_findings(log_lines, since_ts=now_ts - 7 * 86_400)
     # A repo read, like every other check -- pinned read-only by the same change-counter test.
     findings += partial_fill_findings(repo.get_orders(mode="live"))
+    # #639: modes are POOLED here, unlike the partial-fill sweep above -- the ledger
+    # invariant belongs to `agent._open_tranche`, which writes it for paper and live alike.
+    findings += unbooked_exit_findings(repo.get_open_positions(), repo.get_orders())
 
     from keel.data import freshness as freshness_mod
 

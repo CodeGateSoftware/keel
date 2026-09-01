@@ -688,7 +688,40 @@ def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     }
 
 
-def _position_payload(position: OpenPositionStatus) -> dict[str, Any]:
+def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
+    """The `bracket` column for one open position (#641).
+
+    Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
+    gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
+    ledger (#519, #502) exist to heal, so it stays WARN, unchanged, for every non-paper mode
+    regardless of `has_bracket`.
+
+    Paper never places a venue order, so `has_bracket` is False on every paper position by
+    construction; WARNing on that reports the MODE, not a hazard, and desensitises the reader to
+    the live case that matters. Paper is not unprotected, though -- `PaperTrader.on_candle`
+    resolves the setup's stop/target against each candle's range -- so a paper row without a
+    bracket names the protection that mechanism actually enforces: the stop the tranche was sized
+    against, when the row recorded one (`initial_stop`, since 0.12.2 / #520). A tranche that
+    predates that migration, or a DCA leg that never got one, has no number to show and says so
+    (NEUTRAL, not WARN) rather than asserting one it does not have.
+    """
+    if position.has_bracket or mode != "paper":
+        return flag(
+            position.has_bracket,
+            on="bracketed",
+            off="NO bracket",
+            on_state=GOOD,
+            off_state=WARN,
+        )
+    if position.initial_stop is not None:
+        stop = money(position.initial_stop)
+        return label(stop["value"], display=f"paper stop {stop['display']}", state=NEUTRAL)
+    return label(
+        "n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL
+    )
+
+
+def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]:
     """One open position.
 
     NO `notional` and NO `pnl`. `OpenPositionStatus` carries neither, so emitting one would mean
@@ -702,6 +735,10 @@ def _position_payload(position: OpenPositionStatus) -> dict[str, Any]:
     so that a malformed id is decoded in ONE place with one set of consequences. `quantity` takes
     a `unit` for the day `OpenPositionStatus` carries a `base_asset`; until then the exact
     quantity sits beside the `product_id` and nothing is guessed.
+
+    `mode` is `report.mode` (`status_payload`'s own `StatusReport.mode`), passed down purely so
+    `_bracket_field` can tell paper from live -- it is never stored on the position itself and
+    never used for anything but that one judgement (#641).
     """
     return {
         "id": str(position.id),
@@ -710,13 +747,7 @@ def _position_payload(position: OpenPositionStatus) -> dict[str, Any]:
         "qty": quantity(position.qty),
         "entry_price": money(position.entry_price),
         "opened_at": moment(position.opened_at),
-        "bracket": flag(
-            position.has_bracket,
-            on="bracketed",
-            off="NO bracket",
-            on_state=GOOD,
-            off_state=WARN,
-        ),
+        "bracket": _bracket_field(position, mode),
     }
 
 
@@ -799,7 +830,7 @@ def status_payload(report: StatusReport) -> dict[str, Any]:
             "rail11": label(report.rail11_status, state=_rail_state(report.rail11_status)),
         },
         "withdrawal_attestation": _attestation_payload(report.withdrawal_attestation),
-        "open_positions": [_position_payload(p) for p in report.open_positions],
+        "open_positions": [_position_payload(p, report.mode) for p in report.open_positions],
         # A LIST of pairs rather than an object, because the order is a presentation decision and
         # Rule 2 says presentation decisions are made here. `sorted` matches `render_human`'s own
         # ordering, so the two front-ends list the statuses the same way.
