@@ -813,6 +813,45 @@ def balance_drift_findings(records: dict[str, Any]) -> list[Finding]:
     ]
 
 
+def orphan_bracket_findings(records: dict[str, Any]) -> list[Finding]:
+    """Resting SELLs the orphan sweep cancelled because the account no longer held them (#668).
+
+    The cancel already resolved the ORDER -- there is nothing left at the venue to trigger
+    against nothing. What it did not resolve is why keel was protecting a position the account
+    says is gone, and that question outlives the order: the tranche is still open in the ledger,
+    deliberately, because closing it would book a realized outcome at a price nobody observed.
+
+    WARN. The sweep did the safe thing and did it automatically; this is the record that it had
+    to, which is a state a human should look at once rather than an ongoing fault.
+    """
+    orphans = sorted((p, r) for p, r in records.items() if isinstance(r, dict))
+    if not orphans:
+        return [
+            Finding(
+                "bracket.orphan",
+                OK,
+                "no orphaned protective orders",
+                "every resting SELL stands against a position the venue confirms",
+                "-",
+            )
+        ]
+    described = ", ".join(
+        f"{product}: order {record.get('order_id')} cancelled, venue held {record.get('held')}"
+        for product, record in orphans
+    )
+    return [
+        Finding(
+            "bracket.orphan",
+            WARN,
+            f"{len(orphans)} product(s) had a protective order with nothing behind it",
+            f"{described} -- cancelled before the market could trigger it; the tranche is "
+            "still open in the ledger",
+            "reconcile the position: an out-of-band sale or transfer, or an exit that "
+            "already executed at the venue",
+        )
+    ]
+
+
 def unbooked_exit_findings(
     open_positions: list[dict[str, Any]], orders: list[dict[str, Any]]
 ) -> list[Finding]:
@@ -985,6 +1024,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     from keel.commands._products import _default_sim_products
     from keel.execution import executor as executor_mod
     from keel.execution import guards
+    from keel.execution import reconcile as reconcile_mod
 
     findings: list[Finding] = []
 
@@ -1035,6 +1075,12 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         {
             key[len(executor_mod.BALANCE_DRIFT_PREFIX) :]: repo.get_state(key)
             for key in repo.get_state_keys(executor_mod.BALANCE_DRIFT_PREFIX)
+        }
+    )
+    findings += orphan_bracket_findings(
+        {
+            key[len(reconcile_mod.ORPHAN_BRACKET_PREFIX) :]: repo.get_state(key)
+            for key in repo.get_state_keys(reconcile_mod.ORPHAN_BRACKET_PREFIX)
         }
     )
     # #639: modes are POOLED here, unlike the partial-fill sweep above -- the ledger

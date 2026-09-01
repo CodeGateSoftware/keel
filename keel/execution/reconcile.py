@@ -29,6 +29,14 @@ case, not the norm. No production frequency data exists to cite -- the state sim
 recorded before this change, which is the gap itself. That rarity changes the priority of
 auto-remediation, not the validity of recognizing the state.
 
+ORPHANED PROTECTIVE ORDERS (#668) are swept here too, and by a different kind of pass. Every
+other reconciliation in this module and in `executor` is POSITION-DRIVEN: it starts from a
+tranche and asks what protects it. `sweep_orphan_brackets` runs the other way -- it starts from
+keel's own resting SELLs and asks whether the account still holds what each one stands over --
+because a protective order whose position has left the account has no tranche to be walked from,
+and nothing else in the engine can reach it. Left alone, the market reverses through the stop and
+the venue is asked to sell an asset that is not there.
+
 What is deliberately NOT done here: resizing or amending the bracket when a partially-filled
 entry leaves it oversized for what is held. The port migration is done and the
 cancel-and-replace is expressible (`BracketGTC` since #569; `executor._roll_stop` performs
@@ -314,6 +322,149 @@ def reconcile_unbracketed_positions(
         )
 
     return healed
+
+
+#: `agent_state` key prefix for a resting SELL this sweep cancelled because the account no
+#: longer held the product (#668). Read by `keel doctor`: the cancel resolves the ORDER, but the
+#: divergence that produced it -- keel holding a protective order for something the venue says is
+#: gone -- is a fact about the deployment that outlives the order and nobody else reports.
+ORPHAN_BRACKET_PREFIX = "orphan_bracket:"
+
+
+def sweep_orphan_brackets(broker: Any, repo: Repository, now_ts: int) -> list[int]:
+    """Cancel every resting SELL for a product the venue says the account no longer holds (#668).
+
+    **The gap this closes is structural, not incidental.** `_clear_resting_bracket` fails closed
+    before an exit, and `reconcile_unbracketed_positions` heals a position with no bracket. Both
+    are POSITION-DRIVEN -- they start from a tranche and ask what protects it. A resting SELL
+    whose position is gone has no tranche to be walked from, so neither can reach it, and nothing
+    else looks.
+
+    How one appears, since the shape is not obvious on a venue with native brackets:
+
+    * the operator sells or transfers the asset at the venue themselves -- keel's bracket keeps
+      resting against inventory that left without telling it;
+    * `scale_out` and `_roll_stop` both cancel before they place, and a process that dies inside
+      that window can leave a replacement resting with the position already resolved;
+    * a venue without a native trigger-bracket needs two legs, and a filled target then leaves a
+      live stop behind (the classic spot-OCO collision -- not reachable on the venue that trades
+      live today, where `BracketGTC` is one order, and reachable the moment one is not).
+
+    The market then reverses through the stop and the venue sells an asset that is not held. On a
+    cash account that is a rejection; on a margin-enabled one (#666) it is a short, produced
+    entirely by a missing cancel -- *bay' ma la yamlik* with nobody in the loop.
+
+    **The VENUE decides, never the ledger, and that asymmetry is a safety property.** Cancelling
+    a protective order on a position that really exists strips a live holding of its stop, so the
+    trigger must be the account's own statement about itself. keel's ledger can be stale in the
+    dangerous direction -- it says zero while the venue holds the position -- and a sweep driven
+    from it would cancel exactly the brackets that were doing their job. An unreadable balance
+    therefore cancels NOTHING; the sweep simply did not run for that product this cycle.
+
+    `Balance.total`, not `Balance.available`, for the same reason as #667's clamp: a resting SELL
+    holds the base it commits, so `available` reads ~0 for precisely the products this sweep is
+    looking at, and cancelling on it would cancel every bracket keel has ever placed.
+
+    Dust below the venue's own `base_increment` counts as nothing held -- a residue the venue
+    cannot even express as a size is not a position, and a bracket protecting it is an orphan
+    with a rounding error attached.
+
+    Returns the local ids it cancelled. **Never raises into the cycle**: an unreachable venue
+    means the sweep did not run, which is the honest state, and the next cycle retries. The
+    tranche is deliberately LEFT ALONE -- closing it would book a realized outcome at a price
+    nobody observed, and this function's warrant covers the order, not the ledger.
+    """
+    cancelled: list[int] = []
+    rows = [r for r in _polled_rows(repo) if str(r["side"]).upper() == Side.SELL.value.upper()]
+    if not rows:
+        return cancelled
+
+    # One balance read per PRODUCT, not per row: a product with two resting legs asks the same
+    # question twice otherwise, and this runs on every cycle.
+    held_by_product: dict[str, Decimal | None] = {}
+    for row in rows:
+        product_id = row["product_id"]
+        if product_id not in held_by_product:
+            held_by_product[product_id] = _orphan_threshold_held(broker, repo, product_id, now_ts)
+        held = held_by_product[product_id]
+        if held is None:
+            continue
+
+        try:
+            executor._cancel_at_exchange(broker, repo, row)
+        except executor.CancelPending:
+            # The venue took it and settles asynchronously. Not a failure and not a retry:
+            # `reconcile_open_orders` reads the terminal state next cycle, and this sweep will
+            # see the row gone from `_polled_rows` when it does.
+            log_event(
+                logger,
+                logging.INFO,
+                "reconcile.orphan_cancel_pending",
+                product=product_id,
+                order_id=row["id"],
+            )
+            continue
+        except Exception:
+            # Includes `CancelUnavailable` -- an order the venue refuses to cancel may be one it
+            # already filled, which is a fact the next status poll will settle. Per-row
+            # isolation, like every other venue call in this module: one refusal must not
+            # abandon the remaining orphans.
+            log_exception(
+                logger,
+                "reconcile.orphan_cancel_failed",
+                product=product_id,
+                order_id=row["id"],
+            )
+            continue
+
+        repo.update_order(row["id"], status="canceled", updated_at=now_ts)
+        repo.set_state(
+            f"{ORPHAN_BRACKET_PREFIX}{product_id}",
+            {"order_id": row["id"], "held": str(held), "cancelled_at": now_ts},
+        )
+        cancelled.append(row["id"])
+        log_event(
+            logger,
+            logging.WARNING,
+            "reconcile.orphan_bracket_cancelled",
+            product=product_id,
+            order_id=row["id"],
+            held=str(held),
+            detail=(
+                "a resting SELL was protecting a position the venue reports the account no "
+                "longer holds -- cancelled before the market could trigger it against nothing. "
+                "The tranche is left open deliberately: closing it would book an outcome at a "
+                "price nobody observed"
+            ),
+        )
+
+    return cancelled
+
+
+def _orphan_threshold_held(
+    broker: Any, repo: Repository, product_id: str, now_ts: int
+) -> Decimal | None:
+    """The venue's holding when it is small enough to orphan a bracket, else `None`.
+
+    `None` is the DO-NOTHING answer and covers two different situations on purpose: the balance
+    could not be read (so nothing may be cancelled), and the account holds a real position (so
+    nothing should be). Collapsing them is safe precisely because the action is the same and the
+    dangerous mistake -- cancelling a live position's only stop -- is impossible from either.
+    """
+    held = executor._held_base(broker, product_id)
+    if held is None:
+        return None
+    increment = executor._base_increment_for(broker, repo, product_id, now_ts)
+    if increment is not None and increment > 0:
+        # Dust the venue cannot express as a size is not a position. Strictly BELOW the
+        # increment: a holding of exactly one increment is the smallest real position there is,
+        # and a bracket over it is doing its job.
+        return held if held < increment else None
+    # No increment known, so there is no dust threshold to apply and none may be invented --
+    # only an affirmative nothing counts. `_base_increment_for` returns None for a venue error
+    # as well as for a genuinely unknown product, and guessing a floor from either would cancel
+    # protective orders over a number nobody supplied.
+    return held if held <= 0 else None
 
 
 def _has_resting_bracket(repo: Repository, position: dict[str, Any]) -> bool:

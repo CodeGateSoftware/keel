@@ -29,6 +29,7 @@ from keel.commands.doctor import (
     doctor_exit_code,
     doctor_lines,
     gather_findings,
+    orphan_bracket_findings,
     partial_fill_findings,
     rail_state_findings,
     render_json,
@@ -582,6 +583,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "veto.recent",
         "fill.partial",
         "balance.drift",
+        "bracket.orphan",
         "ledger.unbooked_exit",
         "data.missing",
         "data.stale",
@@ -834,3 +836,50 @@ def test_gather_findings_surfaces_a_recorded_drift(tmp_path, valid_config_path) 
     (drift,) = [f for f in findings if f.name == "balance.drift"]
     assert drift.status == "warn"
     assert "BTC-USD" in drift.detail
+
+
+# -- orphaned protective orders (#668) -----------------------------------------------------------
+
+
+def test_orphan_bracket_findings_is_ok_when_none_were_swept() -> None:
+    (finding,) = orphan_bracket_findings({})
+
+    assert finding.name == "bracket.orphan"
+    assert finding.status == "ok"
+
+
+def test_orphan_bracket_findings_warns_and_says_the_tranche_is_still_open() -> None:
+    """The cancel resolved the order. The ledger row it stood over is deliberately untouched.
+
+    An operator reading only "cancelled" would assume the position was closed out; it was not,
+    and the detail has to say so or the finding is misleading in the direction that matters.
+    """
+    (finding,) = orphan_bracket_findings(
+        {"BTC-USD": {"order_id": 7, "held": "0", "cancelled_at": NOW}}
+    )
+
+    assert finding.status == "warn"
+    assert "still open in the ledger" in finding.detail
+
+
+def test_orphan_bracket_findings_ignores_a_malformed_record() -> None:
+    (finding,) = orphan_bracket_findings({"BTC-USD": "not a record"})
+
+    assert finding.status == "ok"
+
+
+def test_gather_findings_surfaces_a_swept_orphan(tmp_path, valid_config_path) -> None:
+    """The wiring, keyed on the prefix the sweep actually writes."""
+    from keel.execution.reconcile import ORPHAN_BRACKET_PREFIX
+
+    repo = _seeded_repo(tmp_path / "keel.db")
+    repo.set_state(
+        f"{ORPHAN_BRACKET_PREFIX}BTC-USD", {"order_id": 7, "held": "0", "cancelled_at": NOW}
+    )
+    config = load_config(valid_config_path)
+
+    findings = gather_findings(repo, config, [], NOW)
+
+    (orphan,) = [f for f in findings if f.name == "bracket.orphan"]
+    assert orphan.status == "warn"
+    assert "BTC-USD" in orphan.detail

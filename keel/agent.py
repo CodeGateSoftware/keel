@@ -1648,6 +1648,16 @@ def run_once(
         # row, so the pass above cannot see it (issue #195).
         reconcile.reconcile_unbracketed_positions(broker, repo, config, now_ts)
 
+        # Then cancel any resting SELL the account can no longer honour (#668). LAST of the
+        # three, and the order is load-bearing: the pass above heals a tranche that has no
+        # bracket, and for a tranche whose position left the account out of band it will place
+        # one -- against nothing. Sweeping afterwards makes this the cycle's final word, so
+        # nothing re-creates within the same cycle what it just cancelled. (#667's rail 21 stops
+        # that re-place at source, which makes the churn rare rather than making the order
+        # optional: the rail refuses to PLACE into an empty holding, and this cancels what is
+        # already resting. Neither subsumes the other.)
+        reconcile.sweep_orphan_brackets(broker, repo, now_ts)
+
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to
         # be done now, not after the loop: `guards.check` reads these scalars from inside
