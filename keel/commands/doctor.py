@@ -852,6 +852,122 @@ def orphan_bracket_findings(records: dict[str, Any]) -> list[Finding]:
     ]
 
 
+@dataclass(frozen=True)
+class BackupFootprint:
+    """What `keel update` has left behind in one launch folder (#681)."""
+
+    #: `<db>.bak-before-...` files, grouped by the database they were taken from.
+    per_database: dict[str, int]
+    total_files: int
+    total_bytes: int
+    #: The version stamp of the oldest backup, for the operator's sense of how far back this
+    #: goes -- "0.4.0" says more about whether to act than a byte count does.
+    oldest_version: str | None
+
+
+def backup_footprint_findings(footprint: BackupFootprint, *, keep: int = 3) -> list[Finding]:
+    """Superseded update backups, counted rather than deleted (#681).
+
+    `keel update` copies every database before it installs and NEVER removes one. That is
+    correct -- `update.py` names them as the data-recovery path, and an updater that pruned its
+    own rollback would be an updater you cannot roll back from. So this reports and does not
+    act, and `test_nothing_in_keel_deletes_an_update_backup` is the pin that keeps it that way.
+
+    **The COUNT is the operator-actionable number, not the bytes.** "23 superseded copies of
+    keel.db, oldest from 0.4.0" tells someone what to do; "7 GB" tells them only that something
+    is large. The size rides along because a disk filling during an update is the failure mode,
+    and it is the one moment a rollback path matters most.
+
+    WARN, not FAIL, and never below `keep`: a handful of recent backups is the design working.
+    What is worth a human's attention is a launch folder still holding the rollback for a
+    version nobody could install any more.
+    """
+    superseded = {db: n for db, n in footprint.per_database.items() if n > keep}
+    if not superseded:
+        return [
+            Finding(
+                "backups.footprint",
+                OK,
+                f"{footprint.total_files} update backup(s) retained",
+                f"{_human_bytes(footprint.total_bytes)}; nothing beyond the {keep} most recent "
+                "per database",
+                "-",
+            )
+        ]
+    described = ", ".join(
+        f"{db}: {count}" for db, count in sorted(superseded.items(), key=lambda kv: -kv[1])
+    )
+    since = f" going back to {footprint.oldest_version}" if footprint.oldest_version else ""
+    return [
+        Finding(
+            "backups.footprint",
+            WARN,
+            f"{footprint.total_files} update backups, {_human_bytes(footprint.total_bytes)}",
+            f"{described}{since} -- `keel update` never deletes one, by design, so they "
+            "accumulate one set per release",
+            "review and prune BY HAND: `ls -lhS <launch>/*.bak-before-*`. keel will not delete "
+            "a backup for you -- the release you need is the one before the release that broke",
+        )
+    ]
+
+
+def _human_bytes(count: int) -> str:
+    """A size an operator reads at a glance. Binary units, one decimal, never scientific."""
+    size = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GiB"  # pragma: no cover - the loop always returns
+
+
+def read_backup_footprint(launch_dir: Path) -> BackupFootprint:
+    """Measure `launch_dir`'s `.bak-before-*` files. Never raises.
+
+    `doctor` is what an operator runs when something is already wrong, so a launch folder it
+    cannot read must produce an empty measurement rather than an exception -- a diagnostic that
+    dies on the state it exists to describe is worse than no diagnostic.
+
+    **No `try` around the glob, and that is a correction rather than an omission.** The first
+    version wrapped it, on the assumption that a missing or unreadable directory raises. It does
+    not: `Path.glob` returns an empty iterator for a path that does not exist AND for one with
+    mode 000, so the handler was unreachable and a mutation deleting it changed nothing --
+    which is how it was found. What genuinely races is `stat` on a file that vanished between
+    the glob and the read, and that one is guarded below where it can actually happen.
+    """
+    per_database: dict[str, int] = {}
+    total_bytes = 0
+    total_files = 0
+    versions: list[str] = []
+    for path in sorted(launch_dir.glob("*.bak-before-*")):
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            continue
+        total_files += 1
+        database, _, stamp = path.name.partition(".bak-before-")
+        per_database[database] = per_database.get(database, 0) + 1
+        version = stamp.rsplit("-", 2)[0] if "-" in stamp else stamp
+        if version:
+            versions.append(version)
+    return BackupFootprint(
+        per_database=per_database,
+        total_files=total_files,
+        total_bytes=total_bytes,
+        oldest_version=min(versions, key=_version_key) if versions else None,
+    )
+
+
+def _version_key(stamp: str) -> tuple[int, ...]:
+    """Sort `0.4.0` before `0.13.2`, and anything unparseable last -- a hand-named backup
+    (`keel.db.bak-before-recordflow-...`) is not a release and must not claim to be the oldest
+    one."""
+    parts = stamp.split(".")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        return (0, *(int(p) for p in parts))
+    return (1,)
+
+
 def unbooked_exit_findings(
     open_positions: list[dict[str, Any]], orders: list[dict[str, Any]]
 ) -> list[Finding]:
@@ -1021,6 +1137,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     """
     from keel import agent
     from keel.commands import fetch
+    from keel.commands import update as update_mod
     from keel.commands._products import _default_sim_products
     from keel.execution import executor as executor_mod
     from keel.execution import guards
@@ -1083,6 +1200,10 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
             for key in repo.get_state_keys(reconcile_mod.ORPHAN_BRACKET_PREFIX)
         }
     )
+    # #681. The LAUNCH FOLDER, resolved the way `keel update` resolves it -- the same directory
+    # the runbook's four commands run from -- because that is where the updater writes and
+    # therefore the only place the count means anything.
+    findings += backup_footprint_findings(read_backup_footprint(update_mod._launch_dir()))
     # #639: modes are POOLED here, unlike the partial-fill sweep above -- the ledger
     # invariant belongs to `agent._open_tranche`, which writes it for paper and live alike.
     findings += unbooked_exit_findings(repo.get_open_positions(), repo.get_orders())

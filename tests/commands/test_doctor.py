@@ -24,6 +24,7 @@ from keel.commands.doctor import (
     admissibility_findings,
     allowance_findings,
     attestation_findings,
+    backup_footprint_findings,
     balance_drift_findings,
     data_health_findings,
     doctor_exit_code,
@@ -32,6 +33,7 @@ from keel.commands.doctor import (
     orphan_bracket_findings,
     partial_fill_findings,
     rail_state_findings,
+    read_backup_footprint,
     render_json,
     trade_scope_findings,
     unbooked_exit_findings,
@@ -584,6 +586,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "fill.partial",
         "balance.drift",
         "bracket.orphan",
+        "backups.footprint",
         "ledger.unbooked_exit",
         "data.missing",
         "data.stale",
@@ -883,3 +886,159 @@ def test_gather_findings_surfaces_a_swept_orphan(tmp_path, valid_config_path) ->
     (orphan,) = [f for f in findings if f.name == "bracket.orphan"]
     assert orphan.status == "warn"
     assert "BTC-USD" in orphan.detail
+
+
+# -- update backups: counted, never deleted (#681) ------------------------------------------------
+
+
+def _bak(launch: Path, name: str, size: int = 1024) -> None:
+    (launch / name).write_bytes(b"x" * size)
+
+
+def test_a_launch_folder_with_no_backups_says_so_calmly(tmp_path) -> None:
+    """A fresh deployment must not be told it has a problem it does not have."""
+    (finding,) = backup_footprint_findings(read_backup_footprint(tmp_path))
+
+    assert finding.name == "backups.footprint"
+    assert finding.status == "ok"
+
+
+def test_a_handful_of_recent_backups_is_the_design_working(tmp_path) -> None:
+    """`keel update` is SUPPOSED to leave these. Warning about three would train the finding
+    to be ignored by the time it matters."""
+    for version in ("0.13.0", "0.13.1", "0.13.2"):
+        _bak(tmp_path, f"keel.db.bak-before-{version}-20260901-120000")
+
+    (finding,) = backup_footprint_findings(read_backup_footprint(tmp_path))
+
+    assert finding.status == "ok"
+
+
+def test_backups_beyond_the_keep_count_are_surfaced_per_database(tmp_path) -> None:
+    """The COUNT is the operator-actionable number. "23 copies of keel.db, oldest 0.4.0" says
+    what to do; a byte total says only that something is large."""
+    for version in ("0.4.0", "0.9.1", "0.12.2", "0.13.1", "0.13.2"):
+        _bak(tmp_path, f"keel.db.bak-before-{version}-20260901-120000")
+    _bak(tmp_path, "keel-live.db.bak-before-0.13.2-20260901-120000")
+
+    (finding,) = backup_footprint_findings(read_backup_footprint(tmp_path))
+
+    assert finding.status == "warn"
+    assert "keel.db: 5" in finding.detail
+    assert "0.4.0" in finding.detail, "the oldest version is what says how far back this goes"
+    assert "keel-live.db" not in finding.detail, "one backup is not an accumulation"
+
+
+def test_the_fix_never_tells_keel_to_delete_anything(tmp_path) -> None:
+    """**The load-bearing test of this finding.** These files are the data-recovery path, and
+    the release you need is the one before the release that broke. A fix line that offered to
+    prune them would be the updater deleting its own rollback with extra steps."""
+    for version in ("0.4.0", "0.9.1", "0.12.2", "0.13.2"):
+        _bak(tmp_path, f"keel.db.bak-before-{version}-20260901-120000")
+
+    (finding,) = backup_footprint_findings(read_backup_footprint(tmp_path))
+
+    assert "BY HAND" in finding.fix
+    assert "keel will not delete" in finding.fix
+    for forbidden in ("keel backups prune", "--prune", "rm -rf"):
+        assert forbidden not in finding.fix
+
+
+def test_nothing_in_keel_deletes_an_update_backup() -> None:
+    """The pin that outlives this finding.
+
+    `update.py` states that the `.bak-before-*` files are never removed, and every recovery
+    procedure in the runbook rests on it. A future change that added a prune would be a change
+    to the rollback guarantee, and it should have to delete this test to make it.
+    """
+    import keel
+
+    root = Path(keel.__file__).resolve().parent
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "bak-before" not in source:
+            continue
+        for line in source.splitlines():
+            if "bak-before" not in line:
+                continue
+            if any(verb in line for verb in ("unlink", "rmtree", "os.remove", "shutil.move")):
+                offenders.append(f"{path.name}: {line.strip()}")
+    assert not offenders, (
+        f"something now deletes an update backup: {offenders}. These are the data-recovery "
+        "path; the release you need is the one before the release that broke."
+    )
+
+
+def test_an_unreadable_launch_folder_does_not_break_doctor(tmp_path) -> None:
+    """`doctor` is what an operator runs when something is already wrong. A diagnostic that
+    dies on the state it exists to describe is worse than no diagnostic."""
+    missing = tmp_path / "not-a-directory"
+
+    footprint = read_backup_footprint(missing)
+
+    assert footprint.total_files == 0
+    assert backup_footprint_findings(footprint)[0].status == "ok"
+
+
+def test_a_hand_named_backup_never_claims_to_be_the_oldest_release(tmp_path) -> None:
+    """`keel.db.bak-before-recordflow-...` exists in the live deployment and is not a version.
+
+    Sorting it as one would report the oldest release as "recordflow", which is both wrong and
+    unactionable -- the operator cannot decide whether to keep a release they cannot name.
+    """
+    _bak(tmp_path, "keel.db.bak-before-recordflow-20260820T075747")
+    for version in ("0.9.1", "0.12.2", "0.13.1", "0.13.2"):
+        _bak(tmp_path, f"keel.db.bak-before-{version}-20260901-120000")
+
+    footprint = read_backup_footprint(tmp_path)
+
+    assert footprint.oldest_version == "0.9.1"
+
+
+def test_gather_findings_reads_the_real_launch_folder(tmp_path, valid_config_path, monkeypatch):
+    """The wiring, not just the finding.
+
+    A mutation replacing the launch-folder read with an empty footprint passed every test above,
+    because the seeded deployment has no backups and both paths then report `ok`. The finding
+    has to be shown reading somewhere real.
+
+    Resolved through `update._launch_dir`, the same seam `keel update` uses, so doctor counts
+    the folder the updater actually writes to rather than the process's cwd.
+    """
+    from keel.commands import update as update_mod
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    for version in ("0.4.0", "0.9.1", "0.12.2", "0.13.2"):
+        (launch / f"keel.db.bak-before-{version}-20260901-120000").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(update_mod, "_launch_dir", lambda: launch)
+
+    repo = _seeded_repo(tmp_path / "keel.db")
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+
+    (footprint,) = [f for f in findings if f.name == "backups.footprint"]
+    assert footprint.status == "warn", (
+        "doctor reported no backups for a folder holding four -- it is not reading the launch "
+        "folder the updater writes to"
+    )
+    assert "keel.db: 4" in footprint.detail
+
+
+def test_a_folder_keel_cannot_read_measures_as_empty(tmp_path) -> None:
+    """`Path.glob` returns nothing for a missing directory and for one with mode 000 alike, so
+    this is a statement about behaviour rather than about a handler -- see the note in
+    `read_backup_footprint` about the guard that was removed for being unreachable."""
+    import os
+
+    unreadable = tmp_path / "sealed"
+    unreadable.mkdir()
+    (unreadable / "keel.db.bak-before-0.1.0-1").write_bytes(b"x")
+    os.chmod(unreadable, 0o000)
+    try:
+        footprint = read_backup_footprint(unreadable)
+    finally:
+        os.chmod(unreadable, 0o755)
+
+    assert footprint.total_files == 0
+    assert read_backup_footprint(tmp_path / "missing").total_files == 0

@@ -1531,3 +1531,31 @@ def test_a_failed_download_does_not_claim_backups_left_by_an_EARLIER_run(tmp_pat
         "an earlier update and this run took none"
     )
     assert stale.is_file(), "an earlier run's backup must never be touched"
+
+
+def test_the_plan_names_the_backups_already_kept(tmp_path: Path) -> None:
+    """#681: surfaced at the one moment the operator is already thinking about backups —
+    immediately before another set is written.
+
+    Reported, never acted on. `keel update` does not delete a backup, and this line is not the
+    beginning of one that does; `tests/commands/test_doctor.py` carries the pin that nothing in
+    keel ever removes one.
+    """
+    launch = _deployment(tmp_path)
+    for version in ("0.12.2", "0.13.1"):
+        (launch / f"keel.db.bak-before-{version}-20260901-120000").write_bytes(b"x" * 2048)
+    plan = _plan(launch)
+
+    lines = up.render_plan_lines(plan)
+
+    kept = [line for line in lines if "already kept" in line]
+    assert kept, f"the plan did not name the existing backups: {lines}"
+    assert "2 file(s)" in kept[0]
+    assert "never deleted by keel" in kept[0]
+
+
+def test_a_launch_folder_with_no_backups_adds_no_line(tmp_path: Path) -> None:
+    """A first update must not be told about a footprint it does not have."""
+    plan = _plan(_deployment(tmp_path))
+
+    assert not [line for line in up.render_plan_lines(plan) if "already kept" in line]

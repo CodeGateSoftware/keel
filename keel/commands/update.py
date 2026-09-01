@@ -1125,6 +1125,20 @@ def render_plan_lines(plan: UpdatePlan) -> list[str]:
     for name in plan.wheel_names:
         lines.append(f"  wheel: {name}")
     lines.append(f"  download to: {plan.release_dir}")
+    # #681: what is ALREADY there, named at the one moment the operator is thinking about
+    # backups anyway -- immediately before another set is written. Reported, never acted on:
+    # `keel update` does not delete a backup, and this line is not the beginning of one that
+    # does. A launch folder it cannot read simply contributes nothing.
+    existing = sorted(plan.launch_dir.glob("*.bak-before-*"))
+    if existing:
+        try:
+            total = sum(path.stat().st_size for path in existing)
+        except OSError:  # pragma: no cover - a file that vanished between glob and stat
+            total = 0
+        lines.append(
+            f"  already kept from earlier updates: {len(existing)} file(s), "
+            f"{total / (1024 * 1024):.0f} MiB (never deleted by keel -- prune by hand)"
+        )
     if plan.db_paths:
         names = ", ".join(path.name for path in plan.db_paths)
         lines.append(f"  then back up (never deleted): {names}")
