@@ -32,6 +32,7 @@ from keel.commands.doctor import (
     rail_state_findings,
     render_json,
     trade_scope_findings,
+    unbooked_exit_findings,
     veto_findings,
 )
 from keel.config import load_config
@@ -579,6 +580,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "allowance.headroom",
         "veto.recent",
         "fill.partial",
+        "ledger.unbooked_exit",
         "data.missing",
         "data.stale",
         "data.gaps",
@@ -676,3 +678,87 @@ def test_paper_mode_rows_do_not_warn() -> None:
     row["mode"] = "paper"
     (finding,) = partial_fill_findings([row])
     assert finding.status == "ok"
+
+
+# -- unbooked exits (#639): the ledger invariant doctor was silent about ------------------------
+
+
+def _tranche(**over):
+    row = {
+        "id": 7,
+        "product_id": "BTC-USD",
+        "rule_name": "turtle_breakout",
+        "opened_at": NOW - 2 * DAY,
+        "qty": Decimal("0.01"),
+        "realized_qty": Decimal("0"),
+    }
+    row.update(over)
+    return row
+
+
+def _sell(**over):
+    row = {
+        "id": 11,
+        "mode": "paper",
+        "product_id": "BTC-USD",
+        "side": "SELL",
+        "status": "filled",
+        "created_at": NOW - DAY,
+    }
+    row.update(over)
+    return row
+
+
+def test_a_filled_exit_behind_an_open_tranche_warns() -> None:
+    """#639 exactly as the deployment held it: the exit filled, the tranche never closed, and
+    `trade_outcomes` stayed empty -- found by asking about promotion timing, because no
+    diagnostic said a word."""
+    (finding,) = unbooked_exit_findings([_tranche()], [_sell()])
+    assert finding.name == "ledger.unbooked_exit"
+    assert finding.status == "warn"
+    assert "BTC-USD" in finding.detail and "7" in finding.detail
+    assert "#338" in finding.detail, "the finding must name what the missing rows starve"
+    assert finding.fix.strip() and finding.fix != "-"
+
+
+def test_a_tranche_with_no_exit_behind_it_is_ok() -> None:
+    """A position that is simply still held is the normal case and must stay silent."""
+    (finding,) = unbooked_exit_findings([_tranche()], [_sell(side="BUY")])
+    assert finding.status == "ok"
+
+
+def test_a_partially_exited_tranche_does_not_warn() -> None:
+    """A deliberate scale-out (`executor.scale_out`) and #446's short market exit BOTH leave a
+    tranche legitimately open behind a filled SELL, and both record the leg on the tranche.
+    Flagging them would fire on correct behaviour every time a position was de-risked."""
+    (finding,) = unbooked_exit_findings(
+        [_tranche(realized_qty=Decimal("0.004"))], [_sell()]
+    )
+    assert finding.status == "ok"
+
+
+def test_a_sale_that_predates_the_tranche_does_not_warn() -> None:
+    """The ledger is FIFO: a sale that closed an EARLIER tranche says nothing about one opened
+    after it, so a long-running product would otherwise warn forever on its own history."""
+    (finding,) = unbooked_exit_findings(
+        [_tranche(opened_at=NOW)], [_sell(created_at=NOW - DAY)]
+    )
+    assert finding.status == "ok"
+
+
+def test_an_unfilled_exit_does_not_warn() -> None:
+    """A resting or cancelled SELL has sold nothing -- the tranche is correctly still open."""
+    (finding,) = unbooked_exit_findings([_tranche()], [_sell(status="pending")])
+    assert finding.status == "ok"
+
+
+def test_a_sale_in_another_product_does_not_warn() -> None:
+    (finding,) = unbooked_exit_findings([_tranche()], [_sell(product_id="ETH-USD")])
+    assert finding.status == "ok"
+
+
+def test_an_unbooked_LIVE_exit_warns_too() -> None:
+    """Modes are pooled deliberately: `agent._open_tranche` writes the ledger for paper and live
+    alike, and an unbooked LIVE exit is strictly worse than the paper one that found this."""
+    (finding,) = unbooked_exit_findings([_tranche()], [_sell(mode="live")])
+    assert finding.status == "warn"
