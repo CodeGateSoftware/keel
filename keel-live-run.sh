@@ -383,6 +383,52 @@ else
   exit 66
 fi
 
+# B (#640/#642). FETCH, then DOCTOR, then the cycle, then DOCTOR again. Neither fetch nor
+# doctor may abort this script or change what the cycle below does -- see the block comments
+# on each for why, and see the whole-cycle admission bit in keel/agent.py
+# (`entries_allowed = not blocked_entries`, and the pre-pass comment above it) for the reason
+# doctor is a REPORT here and not a second gate: that bit already withholds EVERY entry, on
+# EVERY product, the instant ANY rule anywhere is blocked, on purpose, to close a real-money
+# duplicate-order hazard -- see tests/test_agent.py::
+# test_a_ready_products_order_placed_before_a_blocked_products_own_check_is_the_regression. A
+# per-product gate in THIS script would be strictly finer-grained than the engine already is,
+# would change nothing about what actually trades (the engine still withholds book-wide
+# regardless), and pushing the engine itself to decide per-product would reopen the exact
+# duplicate-order hazard that comment closes. So: per product in the REPORT below, book-wide in
+# the GATE the engine already owns.
+
+# FETCH. `keel fetch`'s own docstring: it "places no orders, touches no rails and reads no
+# credentials beyond the venue's public market-data endpoints -- which is why it is safe to
+# schedule". A fetch failure still leaves a usable (if stale) cache behind for the cycle below,
+# so it is REPORTED (#642: "reported rather than swallowed"), never swallowed, and never
+# treated as a cycle failure -- $STATUS below is the agent's own, not fetch's.
+FETCH_OUT="$("$KEEL" --config "$CONFIG" --db "$DB" fetch 2>&1)"
+FETCH_STATUS=$?
+printf '%s\n' "$FETCH_OUT" >>"$OUTLOG"
+if [ "$FETCH_STATUS" -ne 0 ]; then
+  notify "keel-live: fetch failed ahead of this cycle (exit ${FETCH_STATUS}) -- the cycle will still run against whatever cache it already has. See ${OUTLOG}."
+  printf '%s [keel-live] pre-cycle fetch exited %d -- continuing with the existing cache\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$FETCH_STATUS" >>"$OUTLOG"
+fi
+
+# DOCTOR, before the cycle -- a REPORT, not a gate (see the block comment above). Plain human
+# output, not `--json`: macOS ships no jq, and shelling a second interpreter into a
+# notification path to parse JSON adds a dependency for a one-off parse. `doctor`'s `[FAIL]`
+# and detail lines already carry per-product identity for the findings that matter here
+# operationally (data.missing's detail lists the cold products by name; data.stale's WARN
+# branch names each stale product and its lag; profile.scheduled/profile.cycled name the
+# stalled profile labels) -- `--json`'s machine-readable `products` array exists for a caller
+# like the web UI, not for a shell notification that already has the same names in prose.
+DOCTOR_OUT="$("$KEEL" --config "$CONFIG" --db "$DB" doctor 2>&1)"
+DOCTOR_STATUS=$?
+printf '%s\n' "$DOCTOR_OUT" >>"$OUTLOG"
+if [ "$DOCTOR_STATUS" -ne 0 ]; then
+  DOCTOR_FAILS="$(printf '%s\n' "$DOCTOR_OUT" | grep -A2 '^\[FAIL\]' || true)"
+  notify "keel-live: doctor reported FAIL ahead of this cycle -- ${DOCTOR_FAILS//$'\n'/ | } -- report only, the engine still gates entries book-wide on its own."
+  printf '%s [keel-live] pre-cycle doctor FAIL(s):\n%s\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$DOCTOR_FAILS" >>"$OUTLOG"
+fi
+
 # One headless cycle on the live money path. With autonomy ON this PLACES orders unattended; with
 # it OFF the confirm gate declines for want of a TTY and nothing is placed. Captures the
 # LoopResult line, which reads e.g.:  [ts] mode=confirm polled=.. products=[..] signals=N entered=0 ..
@@ -452,6 +498,21 @@ if [ "$STATUS" -eq 0 ]; then
     exit 66
   fi
 else
+  # #642. Exit 4 (`agent.DATA_NOT_READY_EXIT`) is not an ordinary failure and must not read as
+  # one, and it is emphatically not a quiet market either: it means the whole-cycle admission
+  # bit above withheld EVERY entry, on EVERY product, because at least one rule's feed was not
+  # ready (stale or the fresh bar had not arrived). On 2026-08-31 that was BTC/ETH/PAXG/XLM/ADA
+  # -- 18 bars behind hourly, all five carrying live rules -- and it withheld the entire live
+  # book, every cycle, until a `keel fetch` cleared it; nothing distinguished that from an
+  # ordinary quiet day until now. This branch is deliberately UNCONDITIONAL (not folded into
+  # the $ESCALATE_EVERY counter below): a single exit-4 trigger is already the book-wide
+  # condition described above, not a one-off worth waiting out.
+  if [ "$STATUS" -eq 4 ]; then
+    notify "keel-live: this cycle withheld ALL entries on data readiness (exit 4, DATA_NOT_READY_EXIT) -- NOT a quiet market, NOT an ordinary failure. A rule's feed was stale or its fresh bar had not arrived, and keel/agent.py's whole-cycle admission bit withholds every entry, on every product, until it clears. Run \`keel doctor\` to see which product; \`keel fetch\` usually clears it."
+    printf '%s [keel-live] cycle exited 4 -- entries withheld on data readiness (DATA_NOT_READY_EXIT), not a quiet market\n' \
+      "$(date -u '+%Y-%m-%d %H:%M UTC')" >>"$OUTLOG"
+  fi
+
   # Only a clean cycle counts as "this UTC day is done"; anything else leaves the day open for
   # one of the remaining hourly triggers to retry. Deliberately NOT a notification by itself -- see
   # NOTIFICATION POLICY at the top: a single nonzero keel exit is an expected, self-healing
@@ -495,4 +556,20 @@ else
       "$(date -u '+%Y-%m-%d %H:%M UTC')" "$FAILS" >>"$OUTLOG"
   fi
 fi
+
+# POST-CYCLE DOCTOR -- runs REGARDLESS of $STATUS, and never touches it. This is the check that
+# catches the 2026-08-31 incident shape: a cycle can return 0 having quietly withheld every
+# entry on stale data, which reads identically to a quiet day with no signals unless something
+# looks at the data itself afterward. A REPORT for the same reason the pre-cycle doctor above
+# is one (see the block comment there) -- it adds no gate.
+POST_DOCTOR_OUT="$("$KEEL" --config "$CONFIG" --db "$DB" doctor 2>&1)"
+POST_DOCTOR_STATUS=$?
+printf '%s\n' "$POST_DOCTOR_OUT" >>"$OUTLOG"
+if [ "$POST_DOCTOR_STATUS" -ne 0 ]; then
+  POST_DOCTOR_FAILS="$(printf '%s\n' "$POST_DOCTOR_OUT" | grep -A2 '^\[FAIL\]' || true)"
+  notify "keel-live: doctor reported FAIL after this cycle -- ${POST_DOCTOR_FAILS//$'\n'/ | } -- report only."
+  printf '%s [keel-live] post-cycle doctor FAIL(s):\n%s\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$POST_DOCTOR_FAILS" >>"$OUTLOG"
+fi
+
 exit "$STATUS"

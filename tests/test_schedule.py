@@ -749,6 +749,10 @@ def _sandbox(
     *,
     signals: int = 0,
     keel_stub_extra: str = "",
+    fetch_exit_code: int = 0,
+    fetch_stdout: str = "",
+    doctor_exit_code: int = 0,
+    doctor_stdout: str = "",
 ) -> Sandbox:
     """Copy `keel-live-run.sh` into `tmp_path`, repointed at the sandbox and wired for testing.
 
@@ -760,11 +764,22 @@ def _sandbox(
         tests can assert BOTH that a machine-is-broken condition alerts and that an ordinary
         self-healing one does not, without ever risking a real notification.
 
-    `signals`/`keel_stub_extra` customise the `$KEEL` stub: `signals` controls the `signals=N` the
-    stub's fake LoopResult line reports, and `keel_stub_extra` is shell text spliced in right
-    before the stub exits, so a test can make "a cycle ran" also DO something observable -- the
-    atomic-stamp tests use it to `chflags uchg` the stamp mid-cycle, simulating a write that fails
-    only after the pre-flight probe (a differently-named file) already passed.
+    The `$KEEL` stub DISPATCHES ON SUBCOMMAND (#642): the script now calls `fetch`, `doctor`
+    (twice) and `agent` in one cycle, and each needs an independently settable exit code and
+    stdout so a test can, e.g., fail `fetch` while `agent` still runs cleanly. `keel_exit_code`
+    keeps its original meaning -- the AGENT invocation's exit code, and by extension the
+    script's own `$STATUS` -- so every pre-existing call site in this file, none of which knew
+    fetch or doctor existed, keeps working unmodified: `fetch_exit_code`/`doctor_exit_code`
+    default to 0 (clean, silent, exactly as if they were not there).
+
+    `signals`/`keel_stub_extra` customise the AGENT branch specifically: `signals` controls the
+    `signals=N` the stub's fake LoopResult line reports, and `keel_stub_extra` is shell text
+    spliced in right before the stub exits, so a test can make "the cycle ran" also DO something
+    observable -- the atomic-stamp tests use it to `chflags uchg` the stamp mid-cycle, simulating
+    a write that fails only after the pre-flight probe (a differently-named file) already passed.
+    Restricted to the agent branch (not fetch/doctor too) because that is the invocation these
+    tests mean by "the cycle" -- applying it to all three would fire it up to 3x per trigger for
+    no test here that needs that.
     """
     source = RUN_SCRIPT.read_text()
     patched, count = re.subn(
@@ -787,12 +802,33 @@ def _sandbox(
     stub_dir.mkdir(parents=True, exist_ok=True)
     stub = stub_dir / "keel"
     invocations_log = stub_dir / "keel.invocations"
+
+    # stdout is written to a file and `cat` rather than embedded via an f-string/printf, so a
+    # doctor/fetch stdout fixture can carry newlines, quotes or `[FAIL]` lines without any shell
+    # quoting hazard.
+    fetch_stdout_file = stub_dir / "fetch.stdout"
+    fetch_stdout_file.write_text(fetch_stdout)
+    doctor_stdout_file = stub_dir / "doctor.stdout"
+    doctor_stdout_file.write_text(doctor_stdout)
+
     stub.write_text(
         "#!/bin/bash\n"
         f'printf "%s\\n" "$*" >> "{invocations_log}"\n'
-        f"printf 'mode=confirm signals={signals}\\n'\n"
-        f"{keel_stub_extra}\n"
-        f"exit {keel_exit_code}\n"
+        'case " $* " in\n'
+        f'  *" fetch "*)\n'
+        f'    cat "{fetch_stdout_file}"\n'
+        f"    exit {fetch_exit_code}\n"
+        "    ;;\n"
+        f'  *" doctor "*)\n'
+        f'    cat "{doctor_stdout_file}"\n'
+        f"    exit {doctor_exit_code}\n"
+        "    ;;\n"
+        "  *)\n"
+        f"    printf 'mode=confirm signals={signals}\\n'\n"
+        f"    {keel_stub_extra}\n"
+        f"    exit {keel_exit_code}\n"
+        "    ;;\n"
+        "esac\n"
     )
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
@@ -1060,7 +1096,9 @@ def test_stamp_with_mode_000_is_still_replaceable_via_rename(tmp_path: Path) -> 
         sb = _sandbox(tmp_path, keel_exit_code=0)
         result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
         assert result.returncode == 0, "a mode-000 stamp must not block the pre-flight or the cycle"
-        assert _count_lines(sb.invocations_log) == 1, "the cycle must have actually run"
+        assert _count_lines(sb.invocations_log) == 4, (
+            "the cycle must have actually run: fetch, pre-cycle doctor, agent, post-cycle doctor"
+        )
         assert sb.stamp.read_text().strip() == "2026-06-15", (
             "the real post-cycle write must succeed too, via the same rename mechanism"
         )
@@ -1205,8 +1243,10 @@ def test_stamp_write_failure_halts_every_subsequent_trigger_until_cleared(tmp_pa
         assert first.returncode == 66, "the post-cycle write failure itself still exits 66"
         assert halt_path.exists(), "a post-cycle stamp-write failure must drop the halt sentinel"
         ran_after_failure = _count_lines(sb.invocations_log)
-        assert ran_after_failure == 1, (
-            "exactly the one cycle that already ran is the damage this is meant to bound"
+        assert ran_after_failure == 3, (
+            "exactly the one cycle that already ran is the damage this is meant to bound: fetch, "
+            "pre-cycle doctor, agent -- the post-cycle doctor never runs because the stamp-write "
+            "failure `exit`s the script directly, before reaching it"
         )
 
         calls_before = _count_lines(sb.calls_log)
@@ -1386,7 +1426,10 @@ def test_clock_rollback_does_not_rerun_or_move_the_stamp_backwards(tmp_path: Pat
     )
 
     _run(sb, x_plus_1)
-    assert _count_lines(sb.invocations_log) == ran_once + 1, "the day after must run exactly once"
+    assert _count_lines(sb.invocations_log) == ran_once + 4, (
+        "the day after must run exactly one cycle -- fetch, pre-cycle doctor, agent, post-cycle "
+        "doctor, four invocations"
+    )
     assert sb.stamp.read_text().strip() == "2026-06-16"
 
 
@@ -1430,7 +1473,9 @@ def test_forward_clock_excursion_escalates_instead_of_silently_skipping(tmp_path
         "it runs normally, which is exactly how the bogus stamp gets written in the first place"
     )
     assert sb.stamp.read_text().strip() == "2035-01-01"
-    assert _count_lines(sb.invocations_log) == ran_once + 1
+    assert _count_lines(sb.invocations_log) == ran_once + 4, (
+        "one cycle: fetch, pre-cycle doctor, agent, post-cycle doctor"
+    )
 
     calls_before_return = _count_lines(sb.calls_log)
     for day in (7, 8, 9, 10, 11):
@@ -1441,7 +1486,7 @@ def test_forward_clock_excursion_escalates_instead_of_silently_skipping(tmp_path
             "have exited 0 and RUN a (duplicate) cycle here instead; the regression this PR "
             "introduced exited 0 and skipped SILENTLY instead of either"
         )
-        assert _count_lines(sb.invocations_log) == ran_once + 1, (
+        assert _count_lines(sb.invocations_log) == ran_once + 4, (
             "a stamp ahead of today must never run a cycle, on any of these days"
         )
         assert sb.stamp.read_text().strip() == "2035-01-01", (
@@ -1652,3 +1697,164 @@ def test_no_pending_notification_on_a_failed_cycle(tmp_path: Path) -> None:
     assert result.returncode == 3
     calls = sb.calls_log.read_text() if sb.calls_log.exists() else ""
     assert "run the agent interactively" not in calls
+
+
+# -- C (#640/#642): fetch -> doctor -> cycle -> doctor, and doctor never gates -------------------
+
+
+def test_a_clean_cycle_invokes_fetch_then_doctor_then_agent_then_doctor_in_order(
+    tmp_path: Path,
+) -> None:
+    """The cycle shape #642 asks for: `fetch -> doctor -> cycle -> post-cycle doctor`, pinned on
+    the ORDER the real script actually invokes `$KEEL` in, not merely that all four subcommands
+    appear somewhere in the log."""
+    sb = _sandbox(tmp_path, keel_exit_code=0)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+    assert result.returncode == 0
+
+    lines = sb.invocations_log.read_text().splitlines()
+    subcommands = [line.split()[-1] for line in lines]
+    assert subcommands == ["fetch", "doctor", "agent", "doctor"], (
+        f"expected fetch, doctor, agent, doctor in that order; got {subcommands}"
+    )
+
+
+def test_a_failing_fetch_notifies_and_the_cycle_still_runs(tmp_path: Path) -> None:
+    """#642: a fetch failure is REPORTED, not swallowed -- and the cycle still runs on whatever
+    cache it has, because `keel fetch`'s own docstring says a failure still leaves a usable
+    cache behind. Neither the notification nor the failure may abort the script or change
+    whether the cycle -- and therefore the stamp -- happens."""
+    sb = _sandbox(tmp_path, keel_exit_code=0, fetch_exit_code=7)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 0, "a fetch failure must never abort the script"
+    assert sb.stamp.read_text().strip() == "2026-06-15", (
+        "the cycle must still run, and still stamp, on a fetch failure -- the engine decides "
+        "what to do with whatever cache it has, not this script"
+    )
+    subcommands = [line.split()[-1] for line in sb.invocations_log.read_text().splitlines()]
+    assert subcommands == ["fetch", "doctor", "agent", "doctor"], (
+        "a failed fetch must not skip the rest of the cycle"
+    )
+    calls = sb.calls_log.read_text()
+    assert "fetch failed" in calls
+    assert "7" in calls, "the notification must name fetch's own exit code"
+
+
+def test_a_doctor_fail_notifies_and_the_cycle_still_runs_with_no_gate_of_its_own(
+    tmp_path: Path,
+) -> None:
+    """#642's per-product-gating instruction is REFUSED here, on purpose. `keel/agent.py`'s
+    whole-cycle admission bit (`entries_allowed = not blocked_entries`, and the pre-pass comment
+    above it) already withholds EVERY entry, on EVERY product, the instant ANY rule anywhere is
+    blocked -- deliberately, to close a real-money duplicate-order hazard; see
+    `tests/test_agent.py::test_a_ready_products_order_placed_before_a_blocked_products_own_check_is_the_regression`.
+    A doctor FAIL ahead of the cycle must therefore be a REPORT -- surfaced by name, exactly like
+    a fetch failure -- and never a second gate: a per-product gate here would be strictly finer
+    than the engine already is, and would change nothing about what actually trades. If a future
+    change makes this test fail by having doctor block the cycle, that change is the regression,
+    not this test.
+    """
+    sb = _sandbox(
+        tmp_path,
+        keel_exit_code=0,
+        doctor_exit_code=1,
+        doctor_stdout=(
+            "keel doctor -- is this deployment actually working?\n\n"
+            "[FAIL] data.missing: 2 series have nothing cached\n"
+            "       cold cache: BTC-USD ONE_DAY, ETH-USD ONE_DAY\n"
+            "       fix: keel fetch\n"
+        ),
+    )
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 0, "a doctor FAIL must never abort the script"
+    assert sb.stamp.read_text().strip() == "2026-06-15", (
+        "the cycle must still run, and still stamp, on a doctor FAIL -- doctor is a report, the "
+        "engine is the only gate"
+    )
+    subcommands = [line.split()[-1] for line in sb.invocations_log.read_text().splitlines()]
+    assert subcommands == ["fetch", "doctor", "agent", "doctor"], (
+        "a FAILing doctor must not skip or reorder the rest of the cycle"
+    )
+    calls = sb.calls_log.read_text()
+    assert "doctor reported FAIL" in calls
+    assert "data.missing" in calls, (
+        "the notification must name the failing finding, not just say 'doctor failed'"
+    )
+    assert "report only" in calls
+
+
+def test_exit_4_produces_a_distinct_log_line_and_notification_and_leaves_the_day_unstamped(
+    tmp_path: Path,
+) -> None:
+    """#642's central acceptance criterion, part one: `DATA_NOT_READY_EXIT` (4) must be visibly
+    distinct from an ordinary failure -- a distinct OUTLOG line and a distinct notification
+    naming DATA READINESS, not a generic "cycle exited N" -- while the load-bearing exit-4
+    contract (leaves the day unstamped so the next trigger retries) is UNCHANGED."""
+    from keel.agent import DATA_NOT_READY_EXIT
+
+    assert DATA_NOT_READY_EXIT == 4
+
+    sb = _sandbox(tmp_path, keel_exit_code=DATA_NOT_READY_EXIT)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 4, "the script must surface the cycle's own exit code"
+    assert not sb.stamp.exists(), (
+        "exit 4 must still leave the day unstamped -- this is the load-bearing contract "
+        "agent.py's own comment names by name; it must not change"
+    )
+    outlog = sb.outlog.read_text()
+    assert "data readiness" in outlog
+    assert "DATA_NOT_READY_EXIT" in outlog
+    calls = sb.calls_log.read_text()
+    assert "data readiness" in calls
+    assert "NOT a quiet market" in calls
+    # post-cycle doctor still ran, per the cycle shape.
+    subcommands = [line.split()[-1] for line in sb.invocations_log.read_text().splitlines()]
+    assert subcommands == ["fetch", "doctor", "agent", "doctor"]
+
+
+def test_exit_4_is_distinguishable_from_a_clean_cycle_with_no_signals(tmp_path: Path) -> None:
+    """#642's central acceptance criterion, part two: exit 4 (every entry withheld on data
+    readiness) must produce OBSERVABLY DIFFERENT output from an ordinary clean, quiet cycle
+    (`signals=0`) -- before this fix the two were indistinguishable from the outside, which is
+    the whole incident."""
+    from keel.agent import DATA_NOT_READY_EXIT
+
+    # Two SEPARATE sandboxes (distinct tmp dirs): each `_sandbox` call's stamp file is scoped to
+    # the directory it is given, and re-using one `tmp_path` for both would let the first run's
+    # stamp silently turn the second into an unrelated "already ran today" no-op.
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    clean = _sandbox(clean_dir, keel_exit_code=0, signals=0)
+    clean_result = _run(clean, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+    assert clean_result.returncode == 0
+    assert not clean.calls_log.exists() or not clean.calls_log.read_text().strip(), (
+        "a clean, quiet cycle must stay silent, exactly as before this fix"
+    )
+
+    withheld_dir = tmp_path / "withheld"
+    withheld_dir.mkdir()
+    withheld = _sandbox(withheld_dir, keel_exit_code=DATA_NOT_READY_EXIT)
+    withheld_result = _run(withheld, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+    assert withheld_result.returncode == 4
+    assert withheld.calls_log.exists() and withheld.calls_log.read_text().strip(), (
+        "entries withheld book-wide on data readiness must alert -- a quiet market never does, "
+        "and the two must not read the same way"
+    )
+    assert clean_result.returncode != withheld_result.returncode
+
+
+def test_post_cycle_doctor_runs_even_when_the_cycle_failed(tmp_path: Path) -> None:
+    """The post-cycle doctor is the check that actually catches a cycle which blocked every
+    entry while still exiting nonzero for an unrelated reason -- it must run REGARDLESS of
+    $STATUS, not only after a clean cycle."""
+    sb = _sandbox(tmp_path, keel_exit_code=9)
+    result = _run(sb, datetime(2026, 6, 15, 1, 20, tzinfo=UTC))
+
+    assert result.returncode == 9
+    subcommands = [line.split()[-1] for line in sb.invocations_log.read_text().splitlines()]
+    assert subcommands == ["fetch", "doctor", "agent", "doctor"], (
+        "the post-cycle doctor must run even though the cycle itself failed"
+    )
