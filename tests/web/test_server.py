@@ -37,6 +37,7 @@ ROUTES = (
     "/api/status",
     "/api/setup",
     "/api/activity",
+    "/api/orders",
     "/api/insights",
     "/api/journal",
     "/api/rules",
