@@ -60,6 +60,14 @@ class OpenPositionStatus:
     entry_price: Decimal
     opened_at: int
     has_bracket: bool
+    #: The stop this tranche was SIZED against (`positions.initial_stop`, #520), when the row
+    #: recorded one. `None` for a tranche that predates the v12 migration or a DCA leg that never
+    #: got one (`repository._position_row_to_dict`'s own note) -- NOT "no stop", just "not on this
+    #: row". Carried here so a paper position's bracket column (#641) can name the protection
+    #: `PaperTrader.on_candle` actually enforces instead of a venue order paper never places.
+    #: Defaulted so every existing `OpenPositionStatus(...)` construction stays valid -- the same
+    #: pattern `StatusReport.market_session` uses for its own later-added field.
+    initial_stop: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +221,7 @@ def _open_position_status(row: dict[str, Any]) -> OpenPositionStatus:
         entry_price=row["entry_fill"],
         opened_at=row["opened_at"],
         has_bracket=row["bracket_order_id"] is not None,
+        initial_stop=row["initial_stop"],
     )
 
 
@@ -462,6 +471,28 @@ def _session_line(s: MarketSessionStatus) -> str | None:
     return None
 
 
+def _bracket_display(pos: OpenPositionStatus, mode: str) -> str:
+    """The bracket column's text for one open position (#641).
+
+    Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
+    gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
+    ledger (#519, #502) exist to heal. Paper never places a venue order, so `has_bracket` is
+    False on every paper position by construction; rendering that as the SAME WARN reports the
+    mode, not a hazard, and trains the reader to ignore the live case that matters.
+
+    Paper is not unprotected, though: `PaperTrader.on_candle` resolves the setup's stop/target
+    against each candle's range, so a paper row without a bracket names the protection that
+    mechanism actually enforces -- the stop the tranche was sized against, when the row recorded
+    one (`initial_stop`, since 0.12.2 / #520). A tranche that predates that migration, or a DCA
+    leg that never got one, has no number to show and says so instead of inventing one.
+    """
+    if pos.has_bracket or mode != "paper":
+        return "bracketed" if pos.has_bracket else "NO bracket"
+    if pos.initial_stop is not None:
+        return f"paper stop {pos.initial_stop}"
+    return "n/a -- paper resolves stop/target on candle touch"
+
+
 def render_human(report: StatusReport) -> list[str]:
     """The `keel status` (default, non-`--json`) rendering, as a list of lines -- kept as a pure
     function of the report so it is testable without a CliRunner."""
@@ -506,7 +537,7 @@ def render_human(report: StatusReport) -> list[str]:
     else:
         lines.append(f"open positions ({len(report.open_positions)}):")
         for pos in report.open_positions:
-            bracket = "bracketed" if pos.has_bracket else "NO bracket"
+            bracket = _bracket_display(pos, report.mode)
             lines.append(
                 f"  [{pos.id}] {pos.product_id} qty={pos.qty} entry={pos.entry_price} "
                 f"opened_at={pos.opened_at} rule={pos.rule_name} ({bracket})"
