@@ -42,6 +42,7 @@ from keel import agent
 from keel.analysis import indicators
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
 from keel.commands._products import parse_products_option
+from keel.compliance import screen as screen_mod
 from keel.data.history import GRANULARITY_SECONDS
 from keel.data.repository import Repository
 
@@ -228,6 +229,38 @@ def _resolve_backtest_inputs(
     return granularity, repo.get_candles(product_id, granularity)
 
 
+def backtest_slippage(repo: Repository, product_id: str) -> tuple[Decimal, bool]:
+    """`(rate, measured)` -- this product's liquidity-scaled per-leg slippage for the gate (#335).
+
+    **The gate priced every fill at the 5bp FLOOR until now, and the floor is not a typical
+    rate -- it is the best case the model can produce.** `slippage_for_quote_volume` reaches it
+    only at its $500M/day anchor, and measured over the 24-asset universe's own cached candles
+    NOT ONE ASSET GETS THERE: the range is 1.1x the floor (BTC) to 36.8x (TON, the cap), median
+    near 10x. #259 deferred this on the reasoning that the correction is conservative-only --
+    real cost is higher, so a corrected profit factor can only fall -- and that reasoning is
+    sound. What it does not survive is the magnitude:
+    `docs/experiments/2026-09-01-per-product-slippage-restatement.md` measures a median profit
+    factor of 0.309 falling to 0.219 across 120 cells, and the single cell above 1.0 under flat
+    pricing dying at 0.626.
+
+    Computed over the product's cached **ONE_DAY** bars, matching `simulate.slippage_assumptions`
+    exactly -- the ONE definition of the statistic (`screen.median_daily_quote_volume`) over the
+    granularity it is named for. Deliberately NOT over the rule's own trading granularity: that
+    median is a PER-BAR figure, and handing an hourly one to a model anchored on a daily volume
+    reports every asset as maximally thin. `triple_barrier.per_product_round_trip` has to scale
+    for exactly that reason -- it is a pure rule and cannot fetch daily bars -- and says so.
+
+    `measured=False` means no daily bars, so the flat floor stands as a FALLBACK rather than as
+    a verdict, and `run_rule_backtest` prints which of the two happened. An absent statistic
+    must never be presented as a measured one.
+    """
+    daily = repo.get_candles(product_id, Granularity.ONE_DAY)
+    if not daily:
+        return backtest_mod.SLIPPAGE_FLOOR_PCT, False
+    median = screen_mod.median_daily_quote_volume(daily)
+    return backtest_mod.slippage_for_quote_volume(median), True
+
+
 def _backtest_rule(
     repo: Repository,
     rule: Any,
@@ -239,7 +272,8 @@ def _backtest_rule(
     `rules backtest`/`rules promote` (and the strategy console's ledger/retry) all share.
     A rule with no product or no resolvable granularity is a refusal, not a crash."""
     _granularity, candles = _resolve_backtest_inputs(repo, rule, granularity_opt, echo_err)
-    return backtest_mod.backtest(rule, candles, fee_pct=fee_pct)
+    slippage_pct, _measured = backtest_slippage(repo, rule.product_id)
+    return backtest_mod.backtest(rule, candles, fee_pct=fee_pct, slippage_pct=slippage_pct)
 
 
 def _load_pbo_for(
@@ -333,6 +367,13 @@ class ResolvedBacktest:
     fee_source: str
     granularity: Granularity
     candles: list[Candle]
+    #: The per-leg slippage its fills are priced at, and whether it was MEASURED from the
+    #: product's own liquidity or is the flat floor standing in as a fallback (#335). Carried
+    #: here for the same reason `fee_source` is: an assumption a run does not report is one the
+    #: reader supplies for themselves, and #259's whole discipline is that the per-product rate
+    #: is printed beside the numbers it produced.
+    slippage_pct: Decimal = backtest_mod.SLIPPAGE_FLOOR_PCT
+    slippage_measured: bool = False
 
 
 def resolve_rule_backtest(
@@ -357,6 +398,7 @@ def resolve_rule_backtest(
     rule = agent._build_rule(row)
     fee_pct, fee_source = _backtest_fee(config)
     granularity, candles = _resolve_backtest_inputs(repo, rule, granularity_opt, echo_err)
+    slippage_pct, slippage_measured = backtest_slippage(repo, rule.product_id)
     return ResolvedBacktest(
         row=row,
         rule=rule,
@@ -364,6 +406,8 @@ def resolve_rule_backtest(
         fee_source=fee_source,
         granularity=granularity,
         candles=candles,
+        slippage_pct=slippage_pct,
+        slippage_measured=slippage_measured,
     )
 
 
@@ -373,7 +417,12 @@ def backtest_resolved(resolved: ResolvedBacktest) -> backtest_mod.BacktestResult
     resolution derived, so no front-end ever assembles the engine call itself. Whatever
     the backtest raises on a poisoned row propagates untouched: the caller renders the
     failure (the CLI as a crash, the console as its honest per-row error line)."""
-    return backtest_mod.backtest(resolved.rule, resolved.candles, fee_pct=resolved.fee_pct)
+    return backtest_mod.backtest(
+        resolved.rule,
+        resolved.candles,
+        fee_pct=resolved.fee_pct,
+        slippage_pct=resolved.slippage_pct,
+    )
 
 
 def run_rule_backtest(
