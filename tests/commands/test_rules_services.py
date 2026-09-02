@@ -48,6 +48,7 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.strategy import backtest as backtest_mod
 from keel.types import Candle, Granularity
 
 NOW_TS = 1_800_000_000
@@ -427,3 +428,148 @@ def test_apply_rule_disable_and_demote_write_through_the_service(repo: Repositor
     assert outcome.new_status == "disabled"
     assert repo.get_rules()[0]["status"] == "disabled"
     assert "status -> disabled" in "\n".join(out)
+
+
+# -- the promotion gate prices fills per product (#335) -------------------------------------------
+
+
+def _daily(repo, product_id: str, *, quote_volume: float, bars: int = 60) -> None:
+    """`bars` ONE_DAY candles whose `volume * close` is `quote_volume` — the one statistic
+    `screen.median_daily_quote_volume` reads, at the granularity it is named for."""
+    price = Decimal("100")
+    repo.upsert_candles(
+        product_id,
+        Granularity.ONE_DAY,
+        [
+            Candle(
+                ts=1_700_000_000 + index * 86_400,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=Decimal(str(quote_volume)) / price,
+            )
+            for index in range(bars)
+        ],
+    )
+
+
+def test_the_gate_prices_a_liquid_product_near_the_floor(repo) -> None:
+    """The model's floor is reached at its $500M/day anchor, so 600M/day lands on it."""
+    _daily(repo, "BTC-USD", quote_volume=600_000_000.0)
+
+    rate, measured = rules_mod.backtest_slippage(repo, "BTC-USD")
+
+    assert measured is True
+    assert rate == backtest_mod.SLIPPAGE_FLOOR_PCT
+
+
+def test_the_gate_prices_a_thin_product_far_above_the_floor(repo) -> None:
+    """**The whole point of #335.** The gate used to price every fill at the floor, and the
+    floor is not a typical rate — it is the best case the model can produce. Measured over the
+    real universe not one asset reaches it; TON-USD sits at 36.8x.
+    """
+    _daily(repo, "TON-USD", quote_volume=280_000.0)
+
+    rate, measured = rules_mod.backtest_slippage(repo, "TON-USD")
+
+    assert measured is True
+    assert rate == backtest_mod.SLIPPAGE_CAP_PCT
+    assert rate > backtest_mod.SLIPPAGE_FLOOR_PCT * 20
+
+
+def test_no_daily_bars_falls_back_and_says_so(repo) -> None:
+    """`measured=False` is the load-bearing half. An absent statistic must never be presented
+    as a measured verdict — that is the distinction `simulate`'s report already draws, and the
+    gate has to draw it too or the flat 5bp reads as a finding."""
+    rate, measured = rules_mod.backtest_slippage(repo, "NOTHING-USD")
+
+    assert measured is False
+    assert rate == backtest_mod.SLIPPAGE_FLOOR_PCT
+
+
+def test_the_statistic_comes_from_daily_bars_not_the_rules_own_granularity(repo) -> None:
+    """The trap this sidesteps, which produces no error.
+
+    `median_daily_quote_volume` returns a PER-BAR median despite its name. Reading it off an
+    HOURLY series and handing it to a model anchored on a DAILY volume reports every asset as
+    maximally thin — so a rule that trades hourly would price at the cap regardless of how
+    liquid its product actually is. Reading ONE_DAY bars, as `simulate.slippage_assumptions`
+    already does, means no scaling is needed and none can be forgotten.
+    """
+    _daily(repo, "BTC-USD", quote_volume=600_000_000.0)
+    # An hourly series at 1/24th the daily figure. If the helper read THIS, the rate would be
+    # far above the floor rather than on it.
+    price = Decimal("100")
+    repo.upsert_candles(
+        "BTC-USD",
+        Granularity.ONE_HOUR,
+        [
+            Candle(
+                ts=1_700_000_000 + i * 3600,
+                open=price, high=price, low=price, close=price,
+                volume=Decimal("25000000") / price,
+            )
+            for i in range(200)
+        ],
+    )
+
+    rate, _measured = rules_mod.backtest_slippage(repo, "BTC-USD")
+
+    assert rate == backtest_mod.SLIPPAGE_FLOOR_PCT, (
+        "the gate is reading a per-bar statistic off the wrong granularity"
+    )
+
+
+def _spy_slippage(monkeypatch) -> list[Decimal]:
+    """Capture the `slippage_pct` every gate backtest actually passes to the engine.
+
+    The helper being right proves nothing about the CALL SITES using it — a mutation removing
+    `slippage_pct=` from either one left every test above green, which is why this exists.
+    """
+    seen: list[Decimal] = []
+    real = backtest_mod.backtest
+
+    def spy(rule, candles, **kwargs):
+        seen.append(kwargs.get("slippage_pct"))
+        return real(rule, candles, **kwargs)
+
+    monkeypatch.setattr(rules_mod.backtest_mod, "backtest", spy)
+    return seen
+
+
+def test_the_gate_backtest_path_passes_the_per_product_rate(repo, monkeypatch) -> None:
+    _daily(repo, "TON-USD", quote_volume=280_000.0)
+    rule = agent.build_rule_from_params("turtle_breakout", {"product_id": "TON-USD"})
+    seen = _spy_slippage(monkeypatch)
+
+    rules_mod._backtest_rule(repo, rule, "ONE_DAY", Decimal("0.012"), lambda _m: None)
+
+    assert seen == [backtest_mod.SLIPPAGE_CAP_PCT], (
+        f"_backtest_rule priced fills at {seen} — it is not passing the per-product rate"
+    )
+
+
+def test_the_resolved_backtest_path_passes_the_per_product_rate(repo, monkeypatch) -> None:
+    """`backtest_resolved` is the seam the strategy console runs, so it must price the same
+    way the CLI does — two front-ends disagreeing about cost is exactly what #259's
+    one-definition discipline exists to prevent."""
+    _daily(repo, "TON-USD", quote_volume=280_000.0)
+    # Params in their STORED (JSON-plain) form -- `build_rule_from_params` is the boundary that
+    # turns these back into `Decimal`s, and writing a row with real Decimals in it would test a
+    # shape the DB never holds.
+    rule_id = repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": "TON-USD", "granularity": "ONE_DAY"},
+        status="candidate",
+    )
+    resolved = rules_mod.resolve_rule_backtest(repo, None, rule_id)
+    seen = _spy_slippage(monkeypatch)
+
+    rules_mod.backtest_resolved(resolved)
+
+    assert resolved.slippage_pct == backtest_mod.SLIPPAGE_CAP_PCT
+    assert resolved.slippage_measured is True
+    assert seen == [backtest_mod.SLIPPAGE_CAP_PCT], (
+        f"backtest_resolved priced fills at {seen} — the resolved rate is not reaching the engine"
+    )
