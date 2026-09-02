@@ -155,6 +155,7 @@ def test_search_spaces_pin_exactly_the_families_with_a_stop() -> None:
         "rsi_meanrev",
         "pullback_continuation",
         "cusum_event",
+        "triple_barrier",
     }
     for family, space in tuning.SEARCH_SPACES.items():
         assert 4 <= len(space) <= 7, family
