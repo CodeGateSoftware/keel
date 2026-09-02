@@ -1,5 +1,12 @@
 # Experiment records — index
 
+> **Cost note (added 2026-09-02).** Every record here dated before 2026-09-01 prices fills
+> at the flat 5bp slippage floor. [the per-product restatement](2026-09-01-per-product-slippage-restatement.md)
+> measured that **no asset in keel's universe reaches that floor** — 1.1× to 36.8× — so
+> those profit factors are optimistic by roughly 0.09 at the median. **No verdict in this
+> directory changes:** the correction only ever moves a number *down*, and they were
+> already null. Records are appended to, never revised.
+
 This directory is keel's experiment log: **pre-registered, reproducible records** of
 measurements, feasibility studies, and engine-defect findings. Every document states its own
 scope and status up front (in-sample vs out-of-sample, "not a promotion decision", "amends
