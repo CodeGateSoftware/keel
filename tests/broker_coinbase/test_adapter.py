@@ -8,6 +8,7 @@ No live network calls are made, and no live order is ever placed.
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from keel_broker_api.results import (
     SessionState,
 )
 from keel_broker_coinbase import CoinbaseAdapter
+from keel_broker_coinbase.adapter import CashAccountRequired
 from keel_core.types import Candle, Granularity, Side
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -688,3 +690,116 @@ def test_declares_no_credential_defect_hook() -> None:
     opaque pair with no locally-provable shape to check, so the `getattr(..., None)` default is
     what the readiness derivation actually reads here, not a stub that always says "fine"."""
     assert getattr(CoinbaseAdapter, "credential_defect", None) is None
+
+
+# -- cash-account posture, refute-only (#666) -----------------------------------------------------
+#
+# Coinbase exposes NO cash-vs-margin field for spot. A probe against the live account on
+# 2026-09-02 established what it does expose: `margin_rate` is present-and-NULL (it is in the
+# response schema for every account, so its presence signals nothing), and portfolio `type` is
+# `DEFAULT`/`CONSUMER` for spot with `INTX` the international/perpetuals one.
+#
+# So this check can only ever REFUTE. It never grants a cash posture, and the residual unknown
+# stays with an operator attestation on rail 17's pattern.
+
+
+class _PortfolioTransport(FakeTransport):
+    """A transport whose portfolio list the test chooses."""
+
+    def __init__(self, types: list[str], *, raises: Exception | None = None) -> None:
+        super().__init__()
+        self._types = types
+        self._raises = raises
+
+    def get_portfolios(self, **kwargs: Any) -> Any:
+        if self._raises is not None:
+            raise self._raises
+        return {
+            "portfolios": [
+                {"name": f"p{i}", "uuid": f"u{i}", "type": t}
+                for i, t in enumerate(self._types)
+            ]
+        }
+
+
+def test_a_spot_only_account_passes() -> None:
+    """DEFAULT and CONSUMER are the spot portfolios — exactly what the live account returned."""
+    CoinbaseAdapter(_PortfolioTransport(["DEFAULT", "CONSUMER"])).verify_cash_account()
+
+
+def test_an_intx_portfolio_refuses_the_broker() -> None:
+    """**The one unambiguous signal.** INTX is Coinbase's international/perpetuals portfolio;
+    its presence is derivative capability on the account, and a spot-only engine must not build
+    a broker against it."""
+    adapter = CoinbaseAdapter(_PortfolioTransport(["DEFAULT", "INTX"]))
+
+    with pytest.raises(CashAccountRequired, match="INTX"):
+        adapter.verify_cash_account()
+
+
+def test_the_refusal_is_case_insensitive() -> None:
+    """The venue's casing is not a contract keel should depend on for a compliance refusal."""
+    with pytest.raises(CashAccountRequired):
+        CoinbaseAdapter(_PortfolioTransport(["intx"])).verify_cash_account()
+
+
+def test_an_unreadable_portfolio_list_PASSES_and_that_is_deliberate() -> None:
+    """⚠️ The opposite of `keel-broker-alpaca`, and the asymmetry is the whole design.
+
+    Alpaca fails CLOSED on an unreadable classification because `multiplier` IS the answer — a
+    readable response is definitive, so silence is a distinct third state worth refusing on.
+
+    Coinbase has no such field. This check can only refute, so an unreadable response proves
+    nothing that a readable one would not also have failed to prove: "no contradiction found"
+    is the same answer either way. Failing closed here would refuse a compliant deployment on a
+    network blip while establishing nothing — and a gate that fires on the compliant case is
+    the gate that gets disabled in anger.
+    """
+    adapter = CoinbaseAdapter(_PortfolioTransport([], raises=RuntimeError("venue unreachable")))
+
+    adapter.verify_cash_account()  # must not raise
+
+
+def test_a_malformed_portfolio_response_passes() -> None:
+    """Same reasoning: a shape keel does not recognise is not evidence of derivatives."""
+    class _Malformed(FakeTransport):
+        def get_portfolios(self, **kwargs: Any) -> Any:
+            return {"unexpected": "shape"}
+
+    CoinbaseAdapter(_Malformed()).verify_cash_account()
+
+
+def test_passing_is_recorded_as_no_contradiction_never_as_proof() -> None:
+    """The docstring is load-bearing: a future reader must not take a pass here as evidence the
+    account is cash-only. Coinbase exposes no affirmative flag, so nothing here can grant one —
+    that stays with the operator attestation."""
+    doc = CoinbaseAdapter.verify_cash_account.__doc__ or ""
+    assert "no contradiction" in doc.lower()
+    assert "never" in doc.lower() and "prov" in doc.lower()
+
+
+def test_a_non_null_margin_rate_warns_without_refusing(caplog) -> None:
+    """`margin_rate` is present-and-NULL on a spot-only account, so PRESENCE is not a signal.
+
+    A non-null value plausibly is one — but there is no margin-enabled account to verify that
+    against, so the refusal branch would ship untested. It is surfaced as a warning instead,
+    on the fee read that ALREADY fetches this response, so it costs no extra request.
+    """
+    class _MarginRate(FakeTransport):
+        def get_transaction_summary(self, **kwargs: Any) -> Any:
+            base = super().get_transaction_summary(**kwargs) or {}
+            return {**dict(base), "margin_rate": {"value": "0.05"}}
+
+    with caplog.at_level(logging.WARNING):
+        CoinbaseAdapter(_MarginRate()).get_fee_summary()
+
+    assert any("margin_rate" in r.getMessage() for r in caplog.records)
+
+
+def test_a_null_margin_rate_is_silent(caplog) -> None:
+    """The live account carries `margin_rate: null`. Warning on that would fire on every
+    compliant deployment, which is the failure mode this whole design avoids."""
+    with caplog.at_level(logging.WARNING):
+        CoinbaseAdapter(FakeTransport()).get_fee_summary()
+
+    assert not [r for r in caplog.records if "margin_rate" in r.getMessage()]

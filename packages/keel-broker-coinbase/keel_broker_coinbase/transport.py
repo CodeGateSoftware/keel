@@ -27,6 +27,12 @@ class Transport(Protocol):
 
     def get_accounts(self, **kwargs: Any) -> Any: ...
 
+    #: The portfolio list, for the cash-account posture check (#666). Declared here rather than
+    #: called off an untyped client, because this Protocol IS the adapter's statement of what it
+    #: needs from a transport -- a method reached without declaring it is a dependency the test
+    #: fakes are not obliged to satisfy and mypy cannot see.
+    def get_portfolios(self, **kwargs: Any) -> Any: ...
+
     def preview_order(
         self, product_id: str, side: str, order_configuration: dict[str, Any], **kwargs: Any
     ) -> Any: ...

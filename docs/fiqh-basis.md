@@ -306,23 +306,26 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
   Whether "no underlying purpose" is disqualifying "is exactly the kind of judgement the
   screen defers to a human" (`docs/experiments/2026-07-20-candidate-universe.md`) — deferred,
   not decided.
-- **The venue boundary is closed by machinery that can decline to answer (#666).** This entry
-  was written when the boundary was open, and #667/#668 have since closed the three paths that
-  were named here — the SELL is clamped to the venue's holding, rail 21 refuses an order
-  against an empty one, and `sweep_orphan_brackets` cancels a protective order whose position
-  has left. What is *not* closed is the assumption every one of them rests on. All three fail
-  OPEN on an unreadable balance, deliberately and correctly: refusing a SELL over a balance
-  endpoint that went quiet would strand positions that wanted out. So a venue that stops
-  answering does not produce a refusal, it produces the old behaviour — an exit sized from
-  keel's own ledger.
+- **Nothing can affirm that the account cannot go short (#666).** The three paths that could
+  oversell are closed — the SELL is clamped to the venue's holding, rail 21 refuses an order
+  against an empty one, `sweep_orphan_brackets` cancels a protective order whose position has
+  left — and since 2026-09-02 the coinbase adapter refuses to build a broker on an account
+  holding an INTX (perpetuals) portfolio, alongside the Alpaca adapter's own posture check.
 
-  That is survivable **only while the account cannot go short**, and keel does not check that
-  it cannot. `verify_cash_account` exists on the Alpaca adapter alone; Coinbase has no
-  equivalent read, and #666 must first establish whether Advanced Trade exposes an account
-  posture at all — an operator attestation, on rail 17's pattern, is a legitimate answer if it
-  does not. Until then the layered defence is sound whenever the venue answers, and rests on an
-  unverified premise whenever it does not. Named here rather than left to be inferred from
-  three closed issues.
+  What none of that establishes is the affirmative. A probe of the live account settled why:
+  Coinbase exposes **no cash-versus-margin field for spot**. Every margin, borrow, leverage and
+  liquidation field in its SDK lives in the futures, perpetuals or derivative-order types, and
+  `margin_rate` on the transaction summary is present-and-NULL — it is in the response schema
+  for every account, so its presence signals nothing. The check can therefore **refute a cash
+  posture and never issue one**, which is the same shape as rail 17: silence is not evidence of
+  possession, and here silence is not evidence of a cash account either.
+
+  So the layered defence is sound whenever the venue contradicts itself, and rests on the
+  operator's own knowledge whenever it does not. That residual is a human attestation this
+  repository has not yet built — the second half of the #233 pattern, where venue evidence can
+  refute an attestation but cannot manufacture one. Until it exists, "this account cannot go
+  short" is something the operator knows and keel does not.
+
 - **ZEC and the rest of the deferrals.** The candidate-universe record lists the open
   questions the attestation step has to answer and "which this agent must not answer".
 

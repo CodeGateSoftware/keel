@@ -390,7 +390,9 @@ _HADITH_NOT_IN_KB = "That reference is not extracted in this repository's knowle
 
 _CASH_POSTURE_CHECK = "verify_cash_account"
 
-_VENUE_BOUNDARY_PREMISE = "rests on an unverified premise whenever it does not"
+#: The affirmative Coinbase does not expose. A probe of the live account on 2026-09-02 found
+#: `margin_rate` present-and-NULL and no cash-versus-margin field anywhere in the spot surface.
+_NO_AFFIRMATIVE = "refute a cash posture and never issue one"
 
 
 def test_the_long_only_ruling_is_pinned_two_sided_to_the_code_that_enforces_it():
@@ -463,36 +465,42 @@ def test_the_hadith_reference_is_marked_as_outside_the_knowledge_base():
     )
 
 
-def test_the_venue_boundary_premise_is_stated_not_hidden():
-    """The boundary is closed by machinery that fails OPEN, over an account nobody checked.
+def test_the_unprovable_half_of_the_cash_posture_is_stated_not_hidden():
+    """The venue can contradict a cash posture. It cannot confirm one, and the doc must say so.
 
-    This test's first form pinned `_sell_base_size`'s docstring as a proxy for "the SELL is not
-    clamped", on the theory that #667 landing would break it and force the doc to be updated
-    with the code. It did not: #667 clamped at intent construction and left that docstring
-    intact, so the pin held while the paragraph it guarded became false. **A proxy is only a pin
-    while the thing it stands for and the thing it matches move together**, and this one stopped.
+    This test has been re-pointed twice, and both moves are the record of a premise changing
+    rather than a sentence being reworded.
 
-    Re-anchored to the fact that actually remains open. `_clamp_to_held`, rail 21 and
-    `sweep_orphan_brackets` all fail open on an unreadable balance -- correctly, since refusing
-    a SELL over a quiet endpoint strands positions that wanted out -- so the defence rests on
-    the account being unable to go short, and nothing verifies that on the venue that trades
-    live. When #666 gives the coinbase adapter a posture read, this test fails, and it fails
-    because the premise changed rather than because a sentence was reworded.
+    Its first form pinned `_sell_base_size`'s docstring as a proxy for "the SELL is not clamped",
+    expecting #667 to break it. #667 clamped at intent construction and left that docstring
+    standing, so the pin held while the paragraph it guarded went false.
+
+    Its second form pinned the coinbase adapter having NO posture read, expecting #666 to break
+    it. #666 did — and the test failing is what forced this rewrite, which is exactly what it
+    was for.
+
+    What is pinned now is the thing that cannot be engineered away: Coinbase exposes no
+    cash-versus-margin field for spot, so the check REFUTES and never issues. Closing that needs
+    a human attestation, not another adapter read — and if one is ever built, this fails again.
     """
     doc = _unwrapped(_doc())
-    assert _VENUE_BOUNDARY_PREMISE in doc, (
-        f"{_DOC} must state that the long-only defence rests on an unverified premise when the "
-        "venue does not answer -- a layered defence described without its assumption reads as "
-        "settled, and the assumption is the part still open"
+    assert _NO_AFFIRMATIVE in doc, (
+        f"{_DOC} must state that the venue check can only REFUTE a cash posture. A reader who "
+        "takes a passing check as proof has the guarantee backwards, and that is the one "
+        "misreading this section exists to prevent"
     )
-    assert "#666" in doc, f"{_DOC} must name #666 as the open venue-boundary work"
+    assert "#666" in doc, f"{_DOC} must name the issue the residual belongs to"
+
     coinbase = "packages/keel-broker-coinbase/keel_broker_coinbase/adapter.py"
-    assert _CASH_POSTURE_CHECK not in _rel(coinbase), (
-        f"{coinbase} now has a {_CASH_POSTURE_CHECK!r} read -- #666 has landed and the open "
-        f"question in {_DOC} is stale. Update the doc, then re-point this test."
+    source = _rel(coinbase)
+    assert _CASH_POSTURE_CHECK in source, (
+        f"{coinbase} no longer has a posture check; the doc says it refuses an INTX portfolio"
+    )
+    assert "no contradiction" in source.lower(), (
+        f"{coinbase}'s check must record a pass as NO CONTRADICTION FOUND rather than as proof "
+        "-- the distinction is the whole of what the probe established"
     )
     alpaca = "packages/keel-broker-alpaca/keel_broker_alpaca/adapter.py"
     assert _CASH_POSTURE_CHECK in _rel(alpaca), (
-        f"{_DOC} says the posture check exists on the Alpaca adapter alone; {alpaca} must still "
-        "carry it, or the doc is describing a check no adapter has"
+        f"{alpaca} must still carry its own posture check -- the doc says both venues have one"
     )

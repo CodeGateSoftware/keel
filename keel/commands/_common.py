@@ -258,6 +258,13 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     the real (network-free at construction) Alpaca and Coinbase classes by
     `tests/test_paper_equities_profile.py`.
 
+    **BOTH branches verify the account posture before returning, on different evidence and
+    with different confidence.** Alpaca reads `multiplier`, which IS the venue's own
+    classification, so it fails CLOSED on an unreadable one. Coinbase has no such field (#666):
+    it refuses an INTX perpetuals portfolio and otherwise passes, recording "no contradiction
+    found" rather than proof -- and passing on an unreadable response, because a check that can
+    only refute learns nothing from silence. The asymmetry is a property of the venues.
+
     **The alpaca branch verifies the account posture before returning** (#372): one
     `verify_cash_account()` read of the venue's own account classification, refusing a
     margin-postured account (and failing closed on an unreadable one) so no engine path
@@ -290,7 +297,16 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
         )
         # The registry-resolved adapter, not a hand-imported client -- the same
         # conformance-tested class every other venue resolves through.
-        return adapter_cls(transport)
+        broker = adapter_cls(transport)
+        # Cash-account posture (#666), the coinbase half of what the alpaca branch does below
+        # -- and REFUTE-ONLY, which the alpaca one is not. Coinbase exposes no cash-vs-margin
+        # field for spot, so this refuses an account holding an INTX (perpetuals) portfolio and
+        # otherwise records "no contradiction found", never proof of a cash posture. It passes
+        # on an unreadable response for that reason: failing closed would refuse a compliant
+        # deployment on a network blip while establishing nothing. One `get_portfolios` read
+        # per build. See `CoinbaseAdapter.verify_cash_account` for the probe that settled it.
+        broker.verify_cash_account()
+        return broker
 
     if module_root != "keel_broker_alpaca":
         raise RuntimeError(

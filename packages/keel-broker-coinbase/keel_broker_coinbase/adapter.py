@@ -12,6 +12,7 @@ actually needs the network raises a clear error rather than a confusing `Attribu
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
 from typing import Any
@@ -35,6 +36,7 @@ from keel_broker_api.results import (
     Preview,
     SessionState,
 )
+from keel_core.telemetry import log_event, log_venue_failure
 from keel_core.types import Candle, Granularity
 
 from keel_broker_coinbase.translate import to_order_configuration
@@ -130,6 +132,24 @@ def _trade_scope_refusal(exc: BaseException) -> str | None:
     # what `doctor` and `keel scope show` read back to the operator. The body is preferred over
     # `str(exc)` because the body is what Coinbase said; the message is what the SDK made of it.
     return body
+
+
+#: Coinbase's international/perpetuals portfolio type. `DEFAULT` and `CONSUMER` are the spot
+#: portfolios a probe of a live spot-only account returned on 2026-09-02; `INTX` is the one that
+#: means derivatives are available on this account.
+logger = logging.getLogger(__name__)
+
+_DERIVATIVE_PORTFOLIO_TYPES = frozenset({"INTX"})
+
+
+class CashAccountRequired(RuntimeError):
+    """This account has derivative capability keel is not scoped to (#666).
+
+    Named to match `keel_broker_alpaca.CashAccountRequired` because `_build_broker` treats both
+    the same way and an operator meeting one should recognise the other. The two are raised on
+    DIFFERENT evidence and with different confidence -- see `verify_cash_account` -- and the
+    difference is a property of the venues, not of the engine.
+    """
 
 
 class CoinbaseAdapter:
@@ -347,6 +367,60 @@ class CoinbaseAdapter:
         reason = _field(error_response, "message") or _field(error_response, "error")
         return PlaceResult(success=False, broker_order_id=None, reason=reason)
 
+    def verify_cash_account(self) -> None:
+        """Refuse an account with derivative capability. **Refutes only; never proves (#666).**
+
+        Coinbase exposes NO cash-vs-margin field for spot. A probe of the live account on
+        2026-09-02 established what it does expose: every margin/borrow/leverage/liquidation
+        field in the SDK lives in `futures_types`, `perpetuals_types` or the derivative order
+        fields, and `margin_rate` on the transaction summary is present-and-NULL -- it is in the
+        response schema for every account, so its presence signals nothing at all.
+
+        What IS unambiguous is the portfolio list. `DEFAULT` and `CONSUMER` are the spot
+        portfolios; `INTX` is the international/perpetuals one, and its presence is derivative
+        capability on this account. That is the one signal strong enough to refuse on.
+
+        **A pass means NO CONTRADICTION WAS FOUND -- it is never proof of a cash posture, and a
+        future reader must not take it as one.** There is no affirmative flag to read, so the
+        residual unknown stays with the operator's attestation on rail 17's pattern: venue
+        evidence can refute an attestation, it cannot issue one.
+
+        ⚠️ **Passes on an unreadable response, which is the OPPOSITE of
+        `keel_broker_alpaca.verify_cash_account` and is deliberate.** Alpaca fails closed
+        because `multiplier` IS the classification, so a readable answer is definitive and
+        silence is a distinct third state worth refusing on. Here the check can only refute, so
+        an unreadable response proves nothing a readable one would not also have failed to
+        prove -- and failing closed would refuse a compliant deployment on a network blip while
+        establishing nothing. A gate that fires on the compliant case is the gate that gets
+        disabled in anger.
+
+        One `get_portfolios` request per broker construction, alongside Alpaca's one
+        `/v2/account` read, well inside the venue's rate budget at this cadence.
+        """
+        try:
+            response = self._require_transport().get_portfolios()
+            portfolios = _field(response, "portfolios", []) or []
+            found = sorted(
+                {
+                    str(_field(p, "type", "") or "").upper()
+                    for p in portfolios
+                    if str(_field(p, "type", "") or "").upper() in _DERIVATIVE_PORTFOLIO_TYPES
+                }
+            )
+        except Exception:
+            # Every failure is the same answer: no contradiction found. See the docstring --
+            # this must not become a refusal, and it must not raise into broker construction.
+            log_venue_failure(logger, "coinbase.portfolio_posture_unreadable")
+            return
+        if found:
+            raise CashAccountRequired(
+                f"this Coinbase account holds a {', '.join(found)} portfolio -- derivatives are "
+                "available on it, and keel is spot-only by charter (rails 18/19). Trade from an "
+                "account without one, or remove the portfolio. keel cannot verify the reverse: "
+                "Coinbase exposes no cash-account flag for spot, so the absence of this "
+                "portfolio is not proof of a cash posture and never will be."
+            )
+
     def get_fee_summary(self) -> FeeSummary:
         """Map Coinbase's `transaction_summary` to a `FeeSummary`.
 
@@ -356,6 +430,24 @@ class CoinbaseAdapter:
         The subscription spec's §10 tracks confirming this against a live account.
         """
         response = self._require_transport().get_transaction_summary()
+        # #666: surfaced HERE rather than in `verify_cash_account`, because this call already
+        # fetches the response -- so the warning costs no extra request. A WARNING and not a
+        # refusal: `margin_rate` is present-and-null on a spot-only account, so presence is not
+        # a signal, and a NON-null value is plausibly one but could not be verified against a
+        # margin-enabled account. Shipping an untested refusal branch on a compliance gate is
+        # how a gate ends up firing on the compliant case.
+        if _field(response, "margin_rate") is not None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "coinbase.margin_rate_present",
+                detail=(
+                    "this account's transaction summary carries a non-null `margin_rate`, "
+                    "which may mean margin is available on it. keel does not refuse on this "
+                    "because the signal is unverified -- confirm the account's posture and "
+                    "your rail 17 attestation"
+                ),
+            )
         fee_tier = _field(response, "fee_tier") or {}
         return FeeSummary(
             venue="coinbase",
