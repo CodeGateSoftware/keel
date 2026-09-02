@@ -1,5 +1,13 @@
 # The 50 bp slippage cap: all three of #523's options, measured on one cohort by one method
 
+> **Cost note (added 2026-09-02).** The figures below are priced at the flat 5bp
+> slippage floor. [the per-product restatement](2026-09-01-per-product-slippage-restatement.md) later measured that **no
+> asset in keel's universe reaches that floor** — the range is 1.1× to 36.8× — so every
+> profit factor here is optimistic by roughly 0.09 at the median. **The verdict is
+> unaffected:** the correction only ever moves a number *down*, and every result here was
+> already negative. Nothing on this page has been rewritten; records are appended to, not
+> revised.
+
 **Issue #523.** Driver: [`2026-08-30-slippage-cap-options.py`](2026-08-30-slippage-cap-options.py)
 (pre-registered in its docstring before the run). Artifact: every number below is a row of
 [`2026-08-30-slippage-cap-options.jsonl`](2026-08-30-slippage-cap-options.jsonl) — 210 cells

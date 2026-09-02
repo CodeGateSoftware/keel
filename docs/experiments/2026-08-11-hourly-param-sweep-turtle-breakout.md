@@ -1,5 +1,13 @@
 # Re-tuning `turtle_breakout` to the hourly clock buys 51% and still loses on everything — 0 of 144 parameter sets
 
+> **Cost note (added 2026-09-02).** The figures below are priced at the flat 5bp
+> slippage floor. [the per-product restatement](2026-09-01-per-product-slippage-restatement.md) later measured that **no
+> asset in keel's universe reaches that floor** — the range is 1.1× to 36.8× — so every
+> profit factor here is optimistic by roughly 0.09 at the median. **The verdict is
+> unaffected:** the correction only ever moves a number *down*, and every result here was
+> already negative. Nothing on this page has been rewritten; records are appended to, not
+> revised.
+
 **Date:** 2026-08-11
 **Issue:** none. This is the experiment `docs/experiments/2026-08-11-hourly-backtest-turtle-breakout.md`
 §9.4 recommended someone file, run on the same day instead of filed. That document identified its

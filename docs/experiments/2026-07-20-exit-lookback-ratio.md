@@ -1,5 +1,13 @@
 # `exit_lookback` ratio test — §79.6's monotone prediction does NOT replicate
 
+> **Cost note (added 2026-09-02).** The figures below are priced at the flat 5bp
+> slippage floor. [the per-product restatement](2026-09-01-per-product-slippage-restatement.md) later measured that **no
+> asset in keel's universe reaches that floor** — the range is 1.1× to 36.8× — so every
+> profit factor here is optimistic by roughly 0.09 at the median. **The verdict is
+> unaffected:** the correction only ever moves a number *down*, and every result here was
+> already negative. Nothing on this page has been rewritten; records are appended to, not
+> revised.
+
 **Date:** 2026-07-20
 **Status:** in-sample sensitivity characterisation on cached daily history. **Not a promotion decision.**
 **Ledger session:** `exit-lookback-2026-07-20` (5 diagnostic columns + 1 decision row)
