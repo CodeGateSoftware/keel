@@ -505,6 +505,19 @@ keel --config config.paper-hourly.yaml --db keel-paperhourly.db rules promote --
 keel --config config.paper-hourly.yaml --db keel-paperhourly.db fetch
 ```
 
+**Arm it.** `keel migrate` creates schema and never seeds, so a fresh database has no
+`kill_switch` row and `get_state("kill_switch", default=True)` fails closed — the profile logs
+`skipped: kill_switch` on every cycle until this is run:
+
+> ⚠️ **At a terminal, by a human, deliberately.** Same gate as `keel autonomy on` and the rail-17
+> release: a scheduled job must never start a halted agent. Do not fold it into the block above,
+> do not script it, do not pipe a `yes` into it. `keel resume` (with this profile's
+> `--config`/`--db`) disengages the kill switch; `keel autonomy on` is a SEPARATE control,
+> deciding who gets asked rather than whether the agent runs. Neither substitutes for the other —
+> running only `autonomy on` leaves a halted agent authorised to trade unattended, which is worse
+> than either state alone (#693).
+
+
 **The 2026-08-17 expansion (#351): 8 → 19 assets.** The 11 additions above — ZEC, NEAR, AVAX,
 UNI, FET, ICP, DOT, CRV, ALGO, BCH, DOGE — each passed a 15-minute data-health screen over 90
 days (coverage ≥ 95.98%, zero zero-volume bars; results recorded in the issue), and each sits at
@@ -621,6 +634,19 @@ Alpaca paper credentials); the steps, once you have them:
    keel --config config.paper-equities.yaml --db keel-equities.db rules promote --force <id>
    keel --config config.paper-equities.yaml --db keel-equities.db fetch
    ```
+
+**Arm it.** `keel migrate` creates schema and never seeds, so a fresh database has no
+`kill_switch` row and `get_state("kill_switch", default=True)` fails closed — the profile logs
+`skipped: kill_switch` on every cycle until this is run:
+
+> ⚠️ **At a terminal, by a human, deliberately.** Same gate as `keel autonomy on` and the rail-17
+> release: a scheduled job must never start a halted agent. Do not fold it into the block above,
+> do not script it, do not pipe a `yes` into it. `keel resume` (with this profile's
+> `--config`/`--db`) disengages the kill switch; `keel autonomy on` is a SEPARATE control,
+> deciding who gets asked rather than whether the agent runs. Neither substitutes for the other —
+> running only `autonomy on` leaves a halted agent authorised to trade unattended, which is worse
+> than either state alone (#693).
+
 
    The `rules add` form (explicit per-symbol rows, granularity stated even though ONE_DAY is
    the constructor default) mirrors the hourly bootstrap so the clock each row trades is
