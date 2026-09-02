@@ -306,7 +306,13 @@ def rail_state_findings(
                 HALTED,
                 "kill switch engaged",
                 "every entry is vetoed; this is a correct state, not a fault",
-                "keel autonomy on",
+                # `keel resume`, NOT `keel autonomy on` (#693). They are separate gates on
+                # purpose -- autonomy is who gets ASKED, the kill switch is whether the agent
+                # runs at all -- and `autonomy_on` says in its own docstring that it cannot
+                # release a safety halt. The old line sent an operator to type a confirmation
+                # for unattended order placement and leave the halt in force, which is strictly
+                # worse than either state alone.
+                "keel resume",
             )
         )
     else:

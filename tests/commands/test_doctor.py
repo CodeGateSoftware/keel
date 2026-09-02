@@ -232,7 +232,10 @@ def test_kill_switch_is_halted_not_broken() -> None:
     )
     (kill,) = [f for f in findings if f.name == "rail.kill_switch"]
     assert kill.status == "halted"
-    assert "keel autonomy on" in kill.fix
+    # `keel resume`, not `keel autonomy on` -- this assertion pinned the wrong command until
+    # #693, and an operator who followed it got a still-halted agent authorised to trade
+    # unattended. See tests/commands/test_doctor_fix_lines.py for the standing pin.
+    assert "keel resume" in kill.fix
 
 
 def test_streak_halts_expire_on_their_own() -> None:
@@ -301,7 +304,7 @@ def test_quiet_veto_log_is_ok() -> None:
 
 
 def test_exit_code_fails_only_on_real_faults() -> None:
-    halted = Finding("rail.kill_switch", "halted", "engaged", "deliberate", "keel autonomy on")
+    halted = Finding("rail.kill_switch", "halted", "engaged", "deliberate", "keel resume")
     ok = Finding("install.versions", "ok", "aligned", "six of six", "-")
     assert doctor_exit_code([halted, ok]) == 0
     broken = Finding("attest.withdrawals", "fail", "expired", "9 days over", "attest")
