@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -134,3 +135,78 @@ def test_the_renderer_refuses_a_readme_without_sentinels() -> None:
     """It will not guess where the benchmark belongs."""
     with pytest.raises(SystemExit, match="sentinels"):
         rfr.replace_block("# keel\n\nnothing here\n", "block")
+
+
+# -- the cost-distortion block (#646) ------------------------------------------------------------
+
+
+def test_the_cost_distortion_block_matches_what_the_ledger_renders() -> None:
+    """Same drift pin as the benchmark above, on the section that makes the claim.
+
+    This block asserts that our own cost-model error exceeded our best strategy gain. That is a
+    statement about two measured numbers, and it is only worth making while both come out of the
+    record rather than out of someone's memory of them.
+    """
+    assert rfr.render_cost_distortion(_LEDGER_TEXT) in _README, (
+        "README.md's cost-distortion block is not what the renderer produces from the ledger. "
+        "Regenerate it rather than editing the numbers."
+    )
+
+
+def test_the_ratio_is_computed_not_typed() -> None:
+    """`2.7x` is a DERIVED figure — the correction divided by the improvement — and both sides
+    come from separate hash-chained ledger rows. A literal would survive either number changing
+    underneath it, which is exactly the failure a headline ratio invites."""
+    restated = rfr._summary(_LEDGER_TEXT, rfr._RESTATEMENT)
+    exit_ab = rfr._summary(_LEDGER_TEXT, rfr._EXIT_AB)
+    correction = abs(Decimal(restated["pf_median_delta"]))
+    improvement = Decimal(exit_ab["delta_vs_control_median_zero_fee"])
+    expected = (correction / improvement).quantize(Decimal("0.1"))
+
+    assert f"**{expected}× larger**" in rfr.render_cost_distortion(_LEDGER_TEXT)
+    assert expected > 1, "the claim only holds while the correction exceeds the improvement"
+
+
+def test_the_block_names_no_other_framework() -> None:
+    """#646 in terms: 'No competitor naming in the asset. Generic fee-drag math — never what
+    another product costs you.'
+
+    And beyond the trademark posture: we have not measured anyone else's assumptions. An
+    unsourced claim about a named third party is the exact failure this section exists to avoid
+    making about ourselves, and it would cost more credibility than it could ever buy.
+    """
+    block = rfr.render_cost_distortion(_LEDGER_TEXT).lower()
+    for name in ("jesse", "freqtrade", "hummingbot", "backtrader", "quantconnect", "zipline"):
+        assert name not in block, f"the block names {name!r}"
+    assert "not a claim about any other framework" in block
+
+
+def test_the_block_scopes_its_own_claim() -> None:
+    """One venue, one universe, our own numbers. A finding stated wider than it was measured is
+    the thing this repository refuses to publish, and a headline ratio is exactly where that
+    temptation lands."""
+    block = rfr.render_cost_distortion(_LEDGER_TEXT)
+    assert "keel mis-pricing keel" in block
+    assert "one venue" in block
+
+
+def test_the_source_link_is_not_broken_by_wrapping() -> None:
+    """`textwrap` will happily break inside a URL, and a broken markdown link renders as literal
+    text — which the first render did. Every link in the block must survive on one line."""
+    for line in rfr.render_cost_distortion(_LEDGER_TEXT).splitlines():
+        if "](" in line:
+            assert line.count("](") == line.count(")"), f"link broken across lines: {line!r}"
+            assert ".md)" in line, f"link truncated: {line!r}"
+
+
+def test_the_table_is_one_table() -> None:
+    """A blank line between rows ENDS a markdown table. The first render put one after every
+    paragraph uniformly and produced four one-row tables."""
+    rows = [
+        line
+        for line in rfr.render_cost_distortion(_LEDGER_TEXT).splitlines()
+        if line.startswith("|")
+    ]
+    assert len(rows) == 4
+    block = rfr.render_cost_distortion(_LEDGER_TEXT)
+    assert "\n\n|" not in block.split("| :--", 1)[1], "a blank line splits the table"
