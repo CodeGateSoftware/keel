@@ -1,7 +1,7 @@
 """The order executor (P3 Task 4) -- turns a `Signal` into a guarded live order.
 
 `execute()` is the only path from a strategy `Signal` to a real order: it sizes the candidate
-(`execution.sizing`), runs the eighteen un-overridable §14 hard rails (`execution.guards.check`)
+(`execution.sizing`), runs the twenty un-overridable §14 hard rails (`execution.guards.check`)
 **before** anything reaches the broker, previews the order, honors the confirm/autonomous mode gate,
 places it, and writes a full audit trail to the `orders` table both before and after the broker
 call (so a crash mid-placement, or a broker-side rejection, still leaves a record). No path in
@@ -90,7 +90,7 @@ wide to enter is REFUSED after the preview and before the confirm gate/placement
 `(best_ask - best_bid) / mid` at or beyond `execution.max_entry_spread_pct` (default 0.005,
 50bp -- until #523 numerically #334's slippage cap; now an independent threshold that #523
 deliberately left where it was) refuses the order, and a preview with no readable
-bid/ask fails closed with a distinct reason. It sits BESIDE the eighteen rails, not among
+bid/ask fails closed with a distinct reason. It sits BESIDE the twenty rails, not among
 them: `guards.check` is broker-less by design, and the book exists only in the preview this
 module just fetched -- the same preview #332's warning reads (`_preview_book`: one helper,
 two consumers). BUY-only (exits must execute, like rail 17 halting entries not exits) and
@@ -1555,7 +1555,7 @@ def _entry_spread_gate(
     **Where it sits, and why.** AFTER `guards.check` and AFTER the preview: guards are
     broker-less by design (this module's docstring), so the book -- which only
     `broker.preview_order` returns -- cannot reach a `guards.check` rail. The gate is a
-    routing-time check BESIDE the eighteen rails, not a numbered rail, and it consumes the
+    routing-time check BESIDE the twenty rails, not a numbered rail, and it consumes the
     SAME preview #332's `_warn_if_market_routing_overrides_entry` reads (one helper,
     `_preview_book`, two consumers). It runs after that warning so the warning's position --
     pinned by #332's tests -- is unchanged; on a wide book both facts are true at routing

@@ -187,7 +187,7 @@ the stop holds, not what you spend.
 ```
 keel/                          the agent and CLI
 ├── agent.py                   the loop and RULE_REGISTRY (where rules live)
-├── execution/guards.py        the 18 rails (where enforcement lives)
+├── execution/guards.py        the 20 rails (where enforcement lives)
 ├── execution/sizing.py        position sizing
 ├── compliance/screen.py       attested allowlist admission (fails closed)
 └── commands/                  CLI command implementations
