@@ -298,6 +298,21 @@ RESEARCH_INDEX: tuple[ResearchModuleEntry, ...] = (
         ),
         runs_as="keel research tuning",
     ),
+    ResearchModuleEntry(
+        module="spread.py",
+        question=(
+            "What does a round trip cost on a venue whose commission is zero -- the "
+            "Corwin-Schultz (2012) proportional spread, recovered from daily highs and lows "
+            "alone, so ONE estimator prices both asset classes from candles already cached."
+        ),
+        cannot_answer=(
+            "Cannot report the spread anyone actually paid: it is an estimator with real "
+            "dispersion, not a quote feed, and it is noisy for any single series. It also "
+            "cannot tell a zero spread from an unmeasurable one on its own -- that is what "
+            "the unfloored `raw_spread_pct` and the negative-pair share are for."
+        ),
+        runs_as="docs/experiments/2026-09-02-equities-cost-fidelity.py",
+    ),
 )
 
 #: Names accepted by `--module`, in the same declared order as `RESEARCH_INDEX` -- derived
