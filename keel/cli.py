@@ -1025,7 +1025,10 @@ def monitor(
     """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    broker = _build_broker(config)
+    # `repo=` so a venue posture check that REFUSES also refutes the standing attestation
+    # (#691). Passed on the paths that go on to trade; the read-only inspection commands do
+    # not have a repo and do not need one -- see `record_cash_posture_refutation`.
+    broker = _build_broker(config, repo=repo)
     products = _default_sim_products(config)
     granularities = list(config.market_data.granularities)
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
@@ -1084,7 +1087,8 @@ def agent_cmd(
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    broker = _build_broker(config)
+    # See the `run` command: refutation is recorded on the trading paths (#691).
+    broker = _build_broker(config, repo=repo)
 
     if not loop:
         confirm_fn = _interactive_confirm

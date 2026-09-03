@@ -59,7 +59,13 @@ ALLOWANCE_NEARING_USED_PCT = Decimal("80")
 #: absent: a lapsed (or never-attested) subscription surfaces through the ALLOWANCE event
 #: instead -- the unsubscribed allowance (0 by default) with month-to-date spend IS that
 #: event's zero-runway case, so a rail-14 finding here would double-notify the same fact.
-_ATTESTATION_FINDINGS = frozenset({"attest.withdrawals"})
+#: `attest.cash_posture` (#691) joins rail 17 here because it has the same failure shape and
+#: a longer fuse: nothing re-confirms it, so it lapses on a clock, and the live profile runs
+#: unattended. A doctor finding nobody is told about is only marginally better than the veto.
+_ATTESTATION_FINDINGS = frozenset({"attest.withdrawals", "attest.cash_posture"})
+
+#: Which rail each attestation finding belongs to, for the event message.
+_RAIL_LABEL = {"attest.withdrawals": "rail 17", "attest.cash_posture": "rail 22"}
 
 #: The doctor findings the rail-armed event reads. `rail.kill_switch` is deliberately absent:
 #: the kill switch is engaged by an operator at a TTY (doctor renders it "a correct state,
@@ -107,7 +113,7 @@ def events_from_state(
             events.append(
                 notification_event(
                     "attestation.expiring",
-                    f"rail 17: {finding.headline} -- {finding.detail}",
+                    f"{_RAIL_LABEL[finding.name]}: {finding.headline} -- {finding.detail}",
                     finding=finding.name,
                     status=finding.status,
                     detail=finding.detail,

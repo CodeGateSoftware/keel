@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import sqlite3
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -240,7 +241,56 @@ def _bound_venue_or_default(venue: str | None) -> str:
     return current_venue() or DEFAULT_VENUE
 
 
-def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
+def record_cash_posture_refutation(
+    broker: Any, *, repo: Any | None, venue: str, now_ts: int
+) -> None:
+    """Run the broker's cash-posture check and, if it REFUSES, mark the standing attestation
+    refuted before letting the refusal propagate (#691).
+
+    **Recording is in addition to failing closed, never instead.** The exception is re-raised
+    unchanged: swallowing it would turn a hard stop into a database row, leaving the account just
+    as wrong and the build proceeding anyway.
+
+    **REFUTE-ONLY.** A check that finds no contradiction touches nothing. Coinbase exposes no
+    cash-vs-margin field for spot, so "no INTX portfolio" is the absence of contradicting evidence
+    and not proof of a cash posture -- promoting a record on the strength of it would manufacture
+    exactly the affirmation #666 established cannot be had.
+
+    `repo=None` is the read-only call sites (`keel balances`, `keel brokers list`), which have no
+    repository in hand and will not go on to trade. The CHECK still runs and still refuses for
+    them; only the recording is skipped, so threading a repo through every inspection command to
+    record a fact none of them acts on is churn nobody needs.
+    """
+    try:
+        broker.verify_cash_account()
+    except Exception:
+        if repo is not None:
+            # Imported here rather than at module scope: `keel.commands.posture` imports
+            # `_common` for the venue resolver, and a top-level import would close the cycle.
+            from keel.commands.posture import refute_posture
+
+            refute_posture(
+                repo,
+                venue=venue,
+                reason=_refutation_reason(),
+                now_ts=now_ts,
+            )
+        raise
+
+
+def _refutation_reason() -> str:
+    """The refusal's own message, for the operator surface. Read from the live exception rather
+    than composed here, so `doctor` and `posture show` quote what the venue check actually said
+    instead of a paraphrase that could drift from it."""
+    import sys
+
+    exc = sys.exc_info()[1]
+    return str(exc) if exc is not None else "venue posture check refused"
+
+
+def _build_broker(
+    config: Config, *, timeout: int | None = None, repo: Any | None = None
+) -> Any:
     """Construct the real, network-talking broker for the venue `config.broker` selects.
 
     **Every name resolves through the registry (issue #524).** The `broker:` config section
@@ -305,7 +355,9 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
         # on an unreadable response for that reason: failing closed would refuse a compliant
         # deployment on a network blip while establishing nothing. One `get_portfolios` read
         # per build. See `CoinbaseAdapter.verify_cash_account` for the probe that settled it.
-        broker.verify_cash_account()
+        record_cash_posture_refutation(
+            broker, repo=repo, venue=venue, now_ts=int(time.time())
+        )
         return broker
 
     if module_root != "keel_broker_alpaca":
@@ -353,5 +405,5 @@ def _build_broker(config: Config, *, timeout: int | None = None) -> Any:
     # position. Every command that builds a broker (agent cycle, fetch, monitor, the order
     # paths) inherits it; one extra `/v2/account` read per build sits far inside FR-11's
     # rate budget at the daily equities cadence.
-    broker.verify_cash_account()
+    record_cash_posture_refutation(broker, repo=repo, venue=venue, now_ts=int(time.time()))
     return broker

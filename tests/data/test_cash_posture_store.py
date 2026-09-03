@@ -14,9 +14,14 @@ last time.
 from __future__ import annotations
 
 import pytest
-from keel_core.cash_posture import SPOT_CASH, CashPostureState, VenueCashPosture
+from keel_core.cash_posture import (
+    MARGIN_ENABLED,
+    SPOT_CASH,
+    CashPostureState,
+    VenueCashPosture,
+)
 
-from keel.data.db import SCHEMA_VERSION, connect, migrate
+from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 
 NOW = 1_800_000_000
@@ -58,7 +63,10 @@ def test_the_schema_carries_the_table() -> None:
 def test_an_existing_database_gains_the_table_on_migration() -> None:
     conn = connect(":memory:")
     migrate(conn)
-    conn.execute(f"UPDATE schema_version SET version = {SCHEMA_VERSION - 1}")
+    # Literal 17, not `SCHEMA_VERSION - 1`: every version pin in tests/data/ is a literal
+    # precisely so a bump is acknowledged rather than silently absorbed. Deriving it would
+    # opt this one test out of that discipline.
+    conn.execute("UPDATE schema_version SET version = 17")
     conn.execute("DROP TABLE venue_cash_postures")
     conn.commit()
     migrate(conn)
@@ -80,10 +88,9 @@ def test_a_record_round_trips(repo: Repository) -> None:
 
 def test_the_record_is_keyed_on_venue_alone(repo: Repository) -> None:
     repo.upsert_venue_cash_posture(_record(venue="coinbase"))
-    repo.upsert_venue_cash_posture(_record(venue="alpaca", posture=None,
-                                           state=CashPostureState.UNVERIFIED))
+    repo.upsert_venue_cash_posture(_record(venue="alpaca", posture=MARGIN_ENABLED))
     assert repo.get_venue_cash_posture("coinbase").attested_posture == SPOT_CASH
-    assert repo.get_venue_cash_posture("alpaca").attested_posture is None
+    assert repo.get_venue_cash_posture("alpaca").attested_posture == MARGIN_ENABLED
 
 
 def test_re_attesting_replaces_in_place(repo: Repository) -> None:

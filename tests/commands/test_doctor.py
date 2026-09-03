@@ -597,6 +597,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "attest.subscription",
         "attest.withdrawals",
         "scope.trade",
+        "attest.cash_posture",
         "rail.kill_switch",
         "rail.streak_halt",
         "rail.drawdown",

@@ -63,12 +63,22 @@ def _posture(
 # --- the state machine's shape ----------------------------------------------------------------
 
 
-def test_there_is_no_confirmed_state() -> None:
-    """THE load-bearing pin. No venue read can affirm a spot cash posture, so a `CONFIRMED`
-    value would be one nothing is entitled to write -- and an unreachable state is one a later
-    reader eventually reaches for. The absence is the design."""
-    assert {s.value for s in CashPostureState} == {"unverified", "attested", "refuted"}
+def test_only_the_two_states_something_can_actually_write_exist() -> None:
+    """THE load-bearing pin, and it cuts BOTH ways.
+
+    `CONFIRMED` is absent because no venue read can ever affirm a spot cash posture, so it would
+    be a state nothing is entitled to write -- and an unreachable state is one a later reader
+    eventually reaches for.
+
+    `UNVERIFIED` is absent for the SAME reason, which the first version of this module missed:
+    `attest` writes `ATTESTED`, `refute_posture` writes `REFUTED`, and "nobody has attested" is
+    represented by NO ROW -- `get_venue_cash_posture` returns `None`. An `UNVERIFIED` member was
+    therefore just as unreachable as `CONFIRMED`, sitting one line below the docstring arguing
+    against exactly that. Absence-as-`None` and absence-as-a-row are the same fact, and having
+    two spellings for it invites a caller to check one and miss the other."""
+    assert {s.value for s in CashPostureState} == {"attested", "refuted"}
     assert not hasattr(CashPostureState, "CONFIRMED")
+    assert not hasattr(CashPostureState, "UNVERIFIED")
 
 
 def test_the_ttl_is_longer_than_rail_17s_window_and_shorter_than_forever() -> None:
@@ -82,11 +92,9 @@ def test_the_ttl_is_longer_than_rail_17s_window_and_shorter_than_forever() -> No
 # --- may_place_live_entry --------------------------------------------------------------------
 
 
-def test_an_unverified_record_refuses() -> None:
-    """Fails closed on absent, like rails 12/13/17/20."""
-    assert not _posture(state=CashPostureState.UNVERIFIED, posture=None).may_place_live_entry(
-        NOW, FP
-    )
+# "Nobody has attested" is the ABSENCE of a record, not a state within one, so it is tested
+# where absence is representable: `tests/execution/test_cash_posture_rail.py::
+# test_a_missing_posture_vetoes_a_live_entry`.
 
 
 def test_an_in_force_spot_cash_attestation_permits() -> None:

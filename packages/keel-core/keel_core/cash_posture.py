@@ -66,11 +66,19 @@ ATTESTATION_TTL_SEC = 90 * 86400
 class CashPostureState(str, Enum):
     """What is known about a venue account's cash-versus-margin posture.
 
-    THREE states, and the missing fourth is the point -- see the module docstring. There is no
-    `CONFIRMED`, because no venue read can affirm this and a state nothing may write is a trap.
+    TWO states, and both absences are the point.
+
+    There is no `CONFIRMED`: no venue read can affirm this, so it would be a state nothing is
+    entitled to write, and an unreachable state is one a later reader eventually reaches for.
+
+    There is no `UNVERIFIED` either, and the first version of this enum HAD one -- sitting a line
+    below a docstring arguing against exactly that. Nothing writes it: `posture attest` writes
+    `ATTESTED`, `refute_posture` writes `REFUTED`, and "nobody has attested" is represented by NO
+    ROW, which `Repository.get_venue_cash_posture` returns as `None`. Absence-as-`None` and
+    absence-as-a-row are the same fact, and two spellings for one fact invite a caller to check
+    one and miss the other.
     """
 
-    UNVERIFIED = "unverified"
     ATTESTED = "attested"
     REFUTED = "refuted"
 
@@ -149,9 +157,10 @@ class VenueCashPosture:
           no claim.
         - `ATTESTED` with any other posture (`MARGIN_ENABLED` included): False.
         - `REFUTED`: False. Venue evidence outranks the claim.
-        - `UNVERIFIED`: False.
 
-        Fails closed on anything not listed.
+        "Nobody has attested" never reaches here -- it is the absence of a record, and the caller
+        (rail 22) handles `None` before constructing anything. Fails closed on anything not
+        listed.
         """
         if self.credential_evidence(current_fingerprint) is CredentialEvidence.DIFFERENT_CREDENTIAL:
             return False

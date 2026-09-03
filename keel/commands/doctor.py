@@ -37,6 +37,12 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.cash_posture import (
+    ATTESTATION_TTL_SEC,
+    MARGIN_ENABLED,
+    CashPostureState,
+    VenueCashPosture,
+)
 from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
@@ -188,6 +194,108 @@ def _utc_date(ts: int) -> str:
     epoch like `1750000000`; `keel scope attest`'s own doctor-facing rendering uses this same
     shape, so a refusal date reads identically everywhere an operator sees one."""
     return datetime.fromtimestamp(ts, tz=UTC).date().isoformat()
+
+
+def cash_posture_findings(
+    record: VenueCashPosture | None, *, venue: str, now_ts: int
+) -> list[Finding]:
+    """Rail 22's standing report: has a human stated this posture, and is it still current?
+
+    **The warning window is the reason this exists rather than leaving the rail to speak.** Rail 22
+    vetoes an expired attestation, correctly and silently -- the live profile runs unattended
+    daily, so on the day it lapses entries stop and nothing has said why. Rail 17 already treats
+    an expiring attestation as WARN-worthy BEFORE it bites, and this TTL is thirteen times longer,
+    which makes the cliff more surprising rather than less: nobody remembers what they attested a
+    quarter ago.
+
+    The window is PROPORTIONAL to the TTL (a sixth of it, 15 days on 90), not rail 17's flat two
+    days. Two days is ~29% of a 7-day window and 2% of a 90-day one, and a daily profile that
+    misses two cycles for any reason would get no notice at all.
+
+    A MARGIN attestation is a FAIL whose fix is a change to the ACCOUNT, not a re-attestation --
+    telling an operator to re-attest would send them to type the same true answer again.
+    """
+    attest = f"keel posture attest --spot-cash --venue {venue}"
+    if record is None:
+        return [
+            Finding(
+                "attest.cash_posture",
+                FAIL,
+                "cash posture never attested",
+                f"no venue exposes a cash-versus-margin field for spot, so nothing but you can "
+                f"supply this for {venue} -- rail 22 vetoes every live ENTRY until it is attested",
+                attest,
+            )
+        ]
+    if record.state is CashPostureState.REFUTED:
+        reason = f": {record.refuted_reason}" if record.refuted_reason else ""
+        return [
+            Finding(
+                "attest.cash_posture",
+                FAIL,
+                "venue evidence contradicts the attested posture",
+                f"{venue}{reason} -- evidence outranks the claim, and rail 22 vetoes live "
+                "ENTRIES until the account is changed and re-attested",
+                attest,
+            )
+        ]
+    if record.attested_posture == MARGIN_ENABLED:
+        return [
+            Finding(
+                "attest.cash_posture",
+                FAIL,
+                "account attested as MARGIN-ENABLED",
+                f"{venue} is attested MARGIN-ENABLED, so a sell can fill as a short -- rail "
+                "22 vetoes live ENTRIES. This needs a change to the ACCOUNT, not a "
+                "re-attestation",
+                "disable margin at the venue, then re-attest",
+            )
+        ]
+    due = record.attest_due_ts
+    if due is None:
+        return [
+            Finding(
+                "attest.cash_posture",
+                FAIL,
+                "cash posture attested without a due date",
+                f"{venue}'s record carries no expiry, which rail 22 refuses rather than treating "
+                "as never expiring",
+                attest,
+            )
+        ]
+    remaining = _days(due - now_ts)
+    if due <= now_ts:
+        return [
+            Finding(
+                "attest.cash_posture",
+                FAIL,
+                "cash posture attestation expired",
+                f"{venue} expired {_days(now_ts - due)} day(s) ago; rail 22 vetoes "
+                "live ENTRIES",
+                attest,
+            )
+        ]
+    if due - now_ts <= ATTESTATION_TTL_SEC // 6:
+        return [
+            Finding(
+                "attest.cash_posture",
+                WARN,
+                "cash posture attestation due soon",
+                f"{remaining} day(s) remain on {venue}'s "
+                f"{ATTESTATION_TTL_SEC // 86_400}-day TTL -- rail 22 vetoes live ENTRIES the "
+                "moment it lapses",
+                attest,
+            )
+        ]
+    return [
+        Finding(
+            "attest.cash_posture",
+            OK,
+            "cash posture attested and current",
+            f"{venue}: {record.attested_posture}, {remaining} day(s) remain",
+            "-",
+        )
+    ]
 
 
 def trade_scope_findings(record: VenueTradeScope | None, venue: str) -> list[Finding]:
@@ -1261,6 +1369,11 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         now_ts=now_ts,
     )
     findings += trade_scope_findings(repo.get_venue_trade_scope(venue), venue)
+    # #691. Venue-keyed the same way, and reported BEFORE it bites: rail 22 vetoes silently on
+    # a lapse, and the live profile runs unattended.
+    findings += cash_posture_findings(
+        repo.get_venue_cash_posture(venue), venue=venue, now_ts=now_ts
+    )
     findings += rail_state_findings(
         kill_switch=bool(repo.get_state("kill_switch", default=False)),
         streak_halt_until=int(repo.get_state("streak_halt_until", default=0) or 0),

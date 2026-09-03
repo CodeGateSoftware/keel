@@ -121,7 +121,7 @@ def test_disclaimer_shown_even_when_refused(tmp_path):
 
 
 def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -138,7 +138,7 @@ def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, mon
 
 
 def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -160,7 +160,7 @@ def test_agent_prints_paper_equity_and_drawdown_line(tmp_path, write_config, mon
     scalars -- the observability for a paper-forward, not just a side effect buried in state."""
     from tests.conftest import VALID_CONFIG_YAML
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     config_path = write_config(VALID_CONFIG_YAML + "\npaper:\n  starting_equity_usd: 10000\n")
     db_path = tmp_path / "test.db"
     _repo_at(db_path).set_state("kill_switch", False)
@@ -213,7 +213,7 @@ def test_agent_exits_data_not_ready_when_an_entry_is_blocked(tmp_path, write_con
     """
     from tests.conftest import VALID_CONFIG_YAML
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     # Drop FIFTEEN_MINUTE -- the live config's finest granularity -- so the market-data-wide
     # STALE-FEED skip (`market_feed.is_fresh`, checked against the finest configured
     # granularity) doesn't need its own fixture and can't mask the entry gate this test is about.
@@ -239,7 +239,7 @@ def test_agent_exits_zero_and_reports_blocked_zero_when_nothing_is_blocked(
     emitting the `signals=[0-9]+` token the live runner greps out of its output (see the runner's
     own `keel-live-run.sh`), and `blocked=0` proves the new token is additive, not a replacement.
     """
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
     _repo_at(db_path).set_state("kill_switch", False)
     runner = CliRunner()
@@ -265,7 +265,7 @@ def test_agent_loop_does_not_exit_the_process_when_a_cycle_is_blocked(
     """
     from tests.conftest import VALID_CONFIG_YAML
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     config_path = write_config(VALID_CONFIG_YAML.replace("    - FIFTEEN_MINUTE\n", ""))
     db_path = tmp_path / "test.db"
     now_ts = 5 * 86_400 + 2 * 3_600
@@ -316,7 +316,7 @@ def test_agent_exits_clock_unavailable_when_the_session_clock_cannot_be_read(
     silently loses the trading day to a skip that carried no information. Mirrors
     `DATA_NOT_READY_EXIT`'s contract; see `agent.MARKET_CLOCK_UNAVAILABLE_EXIT`."""
     monkeypatch.setattr(
-        cli_module, "_build_broker", lambda config: _SessionClockCLIBroker(
+        cli_module, "_build_broker", lambda config, **_kw: _SessionClockCLIBroker(
             SessionState.CLOCK_UNAVAILABLE
         )
     )
@@ -340,7 +340,7 @@ def test_agent_still_exits_zero_on_a_market_closed_skip(
     -- nothing more can happen that day -- and stamping it is right. Only the degraded
     clock read must decline to stamp."""
     monkeypatch.setattr(
-        cli_module, "_build_broker", lambda config: _SessionClockCLIBroker(
+        cli_module, "_build_broker", lambda config, **_kw: _SessionClockCLIBroker(
             SessionState.CLOSED
         )
     )
@@ -443,7 +443,7 @@ def test_fetch_and_monitor_help_state_distinct_jobs():
 
 
 def test_monitor_single_poll_needs_no_passphrase(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -461,7 +461,7 @@ def test_monitor_single_poll_needs_no_passphrase(tmp_path, valid_config_path, mo
 
 
 def test_monitor_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: FakeBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -510,7 +510,7 @@ def test_monitor_skips_polling_while_the_venue_reports_closed(
     tmp_path, valid_config_path, monkeypatch
 ):
     broker = _SessionClockFakeBroker([SessionState.CLOSED])
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: broker)
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -538,7 +538,7 @@ def test_monitor_resumes_polling_when_the_venue_reopens(tmp_path, valid_config_p
     broker = _SessionClockFakeBroker(
         [SessionState.CLOSED, SessionState.CLOSED, SessionState.OPEN]
     )
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: broker)
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -561,7 +561,7 @@ def test_monitor_resumes_polling_when_the_venue_reopens(tmp_path, valid_config_p
 
 def test_monitor_polls_as_today_when_the_venue_is_open(tmp_path, valid_config_path, monkeypatch):
     broker = _SessionClockFakeBroker([SessionState.OPEN])
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: broker)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: broker)
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -1441,7 +1441,7 @@ def test_simulate_still_fetches_exactly_the_engine_timeframes(
         grans.append(tuple(granularities))
         return {}
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: object())
     monkeypatch.setattr(cli_module.history_mod, "ensure_history", _record_ensure)
 
     result = CliRunner().invoke(
@@ -1515,7 +1515,7 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
     out_path = tmp_path / "report.md"
     repo = _repo_at(db_path)
     _seed_liquidity_stratified_candles(repo, int(time.time()))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: None)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1571,7 +1571,7 @@ def test_simulate_prints_floor_cap_and_anchor_beside_every_result(tmp_path, monk
     out_path = tmp_path / "report.md"
     repo = _repo_at(db_path)
     _seed_liquidity_stratified_candles(repo, int(time.time()))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: None)
 
     result = CliRunner().invoke(
         cli,
@@ -1605,7 +1605,7 @@ def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monke
     monkeypatch.setattr(
         cli_module,
         "_build_broker",
-        lambda config: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
+        lambda config, **_kw: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
     )
 
     runner = CliRunner()
@@ -1631,7 +1631,7 @@ def test_simulate_artifact_flag_writes_html_next_to_markdown(tmp_path, monkeypat
     out_path = tmp_path / "report.md"
     repo = _repo_at(db_path)
     _seed_candles_for_allowlist(repo, int(time.time()))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: None)
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: None)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1710,7 +1710,7 @@ def test_simulate_no_fetch_default_runs_full_tier_matrix(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_module,
         "_build_broker",
-        lambda config: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
+        lambda config, **_kw: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
     )
 
     runner = CliRunner()

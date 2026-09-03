@@ -3375,7 +3375,7 @@ def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypa
             ts=now_ts, skipped=False, skip_reason=None, mode=config.auto_trade.mode, polled=0
         )
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: object())
     monkeypatch.setattr(cli_module, "_open_repo", lambda ctx: repo)
     monkeypatch.setattr(cli_module, "_load_cfg", lambda ctx: _live_config())
     monkeypatch.setattr(cli_module.agent, "run_once", _fake_run_once)

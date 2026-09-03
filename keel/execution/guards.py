@@ -1085,18 +1085,16 @@ def check(
                     f"are vetoed. {unaffected} This needs a change to the ACCOUNT, not a "
                     "re-attestation: disable margin at the venue, then re-attest."
                 )
-            elif not posture.is_current(now_ts):
+            else:
+                # EXPIRED is the only remaining case, and that is a property of the state
+                # machine rather than luck: `REFUTED` and `MARGIN_ENABLED` are handled above,
+                # "no record" never reaches here, and there is no `UNVERIFIED` state to fall
+                # through to -- see `CashPostureState` for why both absences were removed.
                 violations.append(
                     f"cash_posture: {venue}'s cash-posture attestation has EXPIRED "
                     f"(due {posture.attest_due_ts}) -- a claim nobody has re-confirmed is the "
                     "same class of unknown as no claim, so new ENTRIES are vetoed. "
                     f"{unaffected} Re-attest with {attest} after re-checking the account."
-                )
-            else:
-                violations.append(
-                    f"cash_posture: {venue}'s cash-posture record does not permit a live entry "
-                    f"(state {posture.state.value}, posture {posture.attested_posture!r}) -- new "
-                    f"ENTRIES are vetoed. {unaffected} Run {attest} once the account is checked."
                 )
 
     for violation in violations:
