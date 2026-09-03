@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -1085,6 +1086,12 @@ def test_the_derived_failure_tags_actually_match_screen_asset_output():
         venue="coinbase",
     )
     tags = {f.split(":")[0] for f in screen_mod.screen_asset(facts, None).failures}
+    # `liquidity` and `liquidity_unmeasured` are mutually exclusive by construction (#696): which
+    # one a below-floor series produces depends on whether its feed sees the whole market, so no
+    # single set of facts can emit both. The partial-feed arm is screened here too, or the tag
+    # would look unreachable and the suppression would be dropped as dead.
+    partial = replace(facts, volume_feed="alpaca:iex", volume_feed_is_consolidated=False)
+    tags |= {f.split(":")[0] for f in screen_mod.screen_asset(partial, None).failures}
 
     missing = screen_mod.DATA_DERIVED_FAILURES - tags
     assert not missing, (

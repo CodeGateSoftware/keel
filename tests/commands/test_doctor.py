@@ -594,6 +594,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "data.missing",
         "data.stale",
         "data.gaps",
+        "data.feed_scope",
         "sizing.admissible",
     }
     # an unattested, empty deployment fails the run, exactly as the command does
