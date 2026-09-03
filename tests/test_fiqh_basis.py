@@ -394,6 +394,12 @@ _CASH_POSTURE_CHECK = "verify_cash_account"
 #: `margin_rate` present-and-NULL and no cash-versus-margin field anywhere in the spot surface.
 _NO_AFFIRMATIVE = "refute a cash posture and never issue one"
 
+#: The sentence the doc carried while the attestation was unbuilt. It is now FALSE, and its
+#: continued presence is the specific regression the pin below watches for -- a section saying
+#: keel relies on nothing, where it now relies on an EXPIRING human claim, understates what an
+#: operator owes.
+_STALE_UNBUILT_CLAIM = "a human attestation this repository has not yet built"
+
 
 def test_the_long_only_ruling_is_pinned_two_sided_to_the_code_that_enforces_it():
     """The doc names two enforcement points by their exact source text; both must still exist.
@@ -468,20 +474,35 @@ def test_the_hadith_reference_is_marked_as_outside_the_knowledge_base():
 def test_the_unprovable_half_of_the_cash_posture_is_stated_not_hidden():
     """The venue can contradict a cash posture. It cannot confirm one, and the doc must say so.
 
-    This test has been re-pointed twice, and both moves are the record of a premise changing
-    rather than a sentence being reworded.
+    THIS PIN HAS BEEN RE-POINTED THREE TIMES, and the third move is the most instructive, because
+    the pin did not fail when it should have.
 
     Its first form pinned `_sell_base_size`'s docstring as a proxy for "the SELL is not clamped",
     expecting #667 to break it. #667 clamped at intent construction and left that docstring
     standing, so the pin held while the paragraph it guarded went false.
 
     Its second form pinned the coinbase adapter having NO posture read, expecting #666 to break
-    it. #666 did — and the test failing is what forced this rewrite, which is exactly what it
-    was for.
+    it. #666 did, and the failure forced a rewrite -- the pin working as intended.
 
-    What is pinned now is the thing that cannot be engineered away: Coinbase exposes no
-    cash-versus-margin field for spot, so the check REFUTES and never issues. Closing that needs
-    a human attestation, not another adapter read — and if one is ever built, this fails again.
+    Its third form promised, in its own docstring, that "closing that needs a human attestation,
+    not another adapter read -- and if one is ever built, this fails again". #691 built one.
+    **The pin passed.** Nothing in it observed the attestation, so it repeated its FIRST failure
+    mode exactly: a promise in a docstring is not a pin, and prose that matches is not prose that
+    is true. Hence the assertions below reach for the MECHANISM, not for sentences.
+
+    What is pinned now, and why each half cannot be quietly engineered away:
+
+    * The venue check still only refutes. No adapter read can affirm a spot cash posture; if one
+      is ever added, the first assertion's premise is false and this section must be rewritten.
+    * The residual is now carried by an expiring human claim, so the doc must say that rather
+      than that keel relies on nothing. `_STALE_UNBUILT_CLAIM` catches the old sentence.
+    * `CashPostureState` must carry no affirmative state. The moment someone adds `CONFIRMED`,
+      this section's central claim is false in code whatever the prose says.
+    * The claim must EXPIRE. An attestation with no TTL turns "the operator states it and keel
+      records it" into "keel remembers something a person said once" -- a weaker guarantee than
+      the doc describes.
+    * A rail must READ the record. Without one, "an unattested posture vetoes live entries" is
+      a sentence about nothing.
     """
     doc = _unwrapped(_doc())
     assert _NO_AFFIRMATIVE in doc, (
@@ -490,6 +511,15 @@ def test_the_unprovable_half_of_the_cash_posture_is_stated_not_hidden():
         "misreading this section exists to prevent"
     )
     assert "#666" in doc, f"{_DOC} must name the issue the residual belongs to"
+    assert "#691" in doc, (
+        f"{_DOC} must name the issue that CLOSED the residual with an attestation -- a reader "
+        "left at #666 concludes keel relies on nothing here"
+    )
+    assert _STALE_UNBUILT_CLAIM not in doc, (
+        f"{_DOC} still says the attestation is unbuilt; #691 built it (rail 22). This is the "
+        "exact failure this pin repeated once already: prose left standing after its premise "
+        "changed"
+    )
 
     coinbase = "packages/keel-broker-coinbase/keel_broker_coinbase/adapter.py"
     source = _rel(coinbase)
@@ -503,4 +533,22 @@ def test_the_unprovable_half_of_the_cash_posture_is_stated_not_hidden():
     alpaca = "packages/keel-broker-alpaca/keel_broker_alpaca/adapter.py"
     assert _CASH_POSTURE_CHECK in _rel(alpaca), (
         f"{alpaca} must still carry its own posture check -- the doc says both venues have one"
+    )
+
+    # THE MECHANISM, not the prose. Removing any of these makes a sentence in the doc false.
+    from keel_core.cash_posture import ATTESTATION_TTL_SEC, CashPostureState
+
+    assert not hasattr(CashPostureState, "CONFIRMED"), (
+        "a `CONFIRMED` cash-posture state would mean keel believes something can AFFIRM a spot "
+        f"cash account. Nothing can, which is what {_DOC} says -- the state machine and the doc "
+        "have to agree"
+    )
+    assert ATTESTATION_TTL_SEC > 0, (
+        "the attestation must EXPIRE. Without a TTL the doc's 'the operator states it and keel "
+        "records it' degrades to 'keel remembers what someone said once', a weaker guarantee "
+        "than this section describes"
+    )
+    assert "cash_posture" in _rel("keel/execution/guards.py"), (
+        f"rail 22 is gone; {_DOC} says an unattested posture vetoes live ENTRIES, and with no "
+        "rail reading the record that sentence is about nothing"
     )

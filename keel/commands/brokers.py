@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+import time
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as dist_version
@@ -36,6 +37,11 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.cash_posture import (
+    MARGIN_ENABLED,
+    CashPostureState,
+    VenueCashPosture,
+)
 
 from keel.commands._common import DISCLAIMER
 from keel.venue_readiness import VenueReadinessRow, gather_readiness
@@ -325,6 +331,85 @@ def render_readiness_lines(rows: list[VenueReadinessRow]) -> list[str]:
     return lines
 
 
+#: The line the posture block ends on, and it is not decoration. Every other readiness-adjacent
+#: surface in keel reports something it CHECKED; this one reports something no venue will confirm.
+#: A reader who takes these rows for verification has the guarantee backwards -- which is the one
+#: misreading `docs/fiqh-basis.md`'s cash-posture section exists to prevent.
+CASH_POSTURE_HONESTY_LINE = (
+    "  No venue exposes a cash-versus-margin field for spot, so these are the OPERATOR's "
+    "statements, expiring on a clock. Venue evidence can refute one; nothing can confirm one."
+)
+
+
+def render_cash_posture_lines(
+    records: list[VenueCashPosture], *, now_ts: int
+) -> list[str]:
+    """The cash-posture block (#691): what a human has stated about each venue account.
+
+    A THIRD block, after declarations and readiness, and that follows this codebase's own
+    argument rather than a preference. `keel/venue_readiness.py` renders readiness separately
+    because merging two different questions "would re-blur exactly the distinction #233 exists to
+    draw". Posture is a third question -- readiness asks whether this CREDENTIAL may trade,
+    posture asks whether this ACCOUNT can borrow -- and folding it into either would repeat the
+    mistake both were shaped to avoid.
+
+    PURE over the records it is handed. Sorted by venue so the same database renders the same
+    text twice.
+    """
+    lines = ["", "cash posture (rail 22) -- attested by you, refutable by the venue:"]
+    if not records:
+        lines.append("  no venue has an attested cash posture -- rail 22 vetoes live ENTRIES")
+        lines.append("  next: keel posture attest --spot-cash")
+        lines.append(CASH_POSTURE_HONESTY_LINE)
+        return lines
+    for record in sorted(records, key=lambda r: r.venue):
+        state = record.state.value.upper()
+        if record.state is CashPostureState.ATTESTED and not record.is_current(now_ts):
+            state = "EXPIRED"
+        expires = (
+            _utc_day(record.attest_due_ts) if record.attest_due_ts is not None else "never set"
+        )
+        lines.append(
+            f"  {record.venue}: {state} attested={record.attested_posture} expires={expires}"
+        )
+        if record.attested_posture == MARGIN_ENABLED:
+            lines.append("    margin-enabled: rail 22 vetoes live ENTRIES on this venue")
+        if record.refuted_ts is not None:
+            reason = f": {record.refuted_reason}" if record.refuted_reason else ""
+            lines.append(
+                f"    venue evidence contradicted a claim here on "
+                f"{_utc_day(record.refuted_ts)}{reason}"
+            )
+    lines.append(CASH_POSTURE_HONESTY_LINE)
+    return lines
+
+
+def _utc_day(ts: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d")
+
+
+def _cash_posture_records(ctx: click.Context) -> list[VenueCashPosture]:
+    """Read-only, best-effort, never creates or migrates a database -- `_readiness_rows`'
+    discipline, for the same reason: `keel brokers list` must keep working on a fresh checkout
+    with no deployment at all, and a display command that created a database as a side effect
+    would be a surprising one."""
+    obj = ctx.obj or {}
+    db_path = obj.get("db_path")
+    if db_path is None or not Path(db_path).exists():
+        return []
+    try:
+        from keel.data.db import connect
+        from keel.data.repository import Repository
+
+        return Repository(connect(str(db_path))).list_venue_cash_postures()
+    except Exception:
+        # A missing table (a database older than v18), a locked file, anything: an empty block
+        # is the honest display, and never a reason to fail a read-only command.
+        return []
+
+
 def _readiness_rows(ctx: click.Context) -> list[VenueReadinessRow]:
     """Gathers this deployment's readiness rows for `keel brokers list` -- `gather_readiness`'s
     CLI wiring, the same service `/api/venues` wires to a repo it knows is migrated.
@@ -393,6 +478,8 @@ def brokers_list(ctx: click.Context, as_json: bool) -> None:
     for line in render_brokers_lines(infos):
         click.echo(line)
     for line in render_readiness_lines(_readiness_rows(ctx)):
+        click.echo(line)
+    for line in render_cash_posture_lines(_cash_posture_records(ctx), now_ts=int(time.time())):
         click.echo(line)
     click.echo("")
     click.echo(DISCLAIMER)
