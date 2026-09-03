@@ -232,6 +232,18 @@ class AlpacaAdapter:
         return self._endpoint
 
     @property
+    def volume_feed_id(self) -> str:
+        """Which feed this adapter's candles came from, for `candle_series_feed` (#696).
+
+        Qualified by venue (`alpaca:iex`, never bare `iex`) because the id is a market-structure
+        claim and "iex" alone would collide the day another venue routes there. The distinction
+        is load-bearing: IEX reports one exchange's own executions, so `median(volume * close)`
+        over its bars is a LOWER BOUND on consolidated volume; SIP is the consolidated tape and
+        the same statistic is a measurement of it.
+        """
+        return f"alpaca:{self.data_feed}"
+
+    @property
     def data_feed(self) -> str:
         """The declared market-data tier ("iex" | "sip"), sent on every data request."""
         return self._data_feed

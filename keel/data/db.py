@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -168,6 +168,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         c TEXT NOT NULL,
         v TEXT NOT NULL,
         PRIMARY KEY (product_id, granularity, ts)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS candle_series_feed (
+        product_id TEXT NOT NULL,
+        granularity TEXT NOT NULL,
+        feed TEXT NOT NULL,
+        first_seen_ts INTEGER NOT NULL,
+        last_seen_ts INTEGER NOT NULL,
+        PRIMARY KEY (product_id, granularity, feed)
     )
     """,
     """
@@ -753,6 +763,22 @@ def _migrate_v16_orders_submit_book(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE orders ADD COLUMN submit_best_ask TEXT")
 
 
+def _migrate_v17_candle_series_feed(conn: sqlite3.Connection) -> None:
+    """v17 adds `candle_series_feed`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill, and the reason is the whole point of the table (#696).
+
+    A row here asserts "these bars were written while THIS feed was in use". For every candle
+    already cached, nobody wrote that down -- the feed was inferred at read time from whatever
+    config happened to be loaded, which is precisely the bug. Seeding rows from the CURRENT
+    `broker.data_feed` would manufacture exactly the claim this table exists to make checkable,
+    and would do it for years of bars that may well have come from somewhere else.
+
+    An empty table means "provenance unrecorded", which is true of every pre-existing series and
+    is a different statement from "consolidated". Callers must keep those apart: the first is
+    the absence of evidence, the second is evidence.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -769,6 +795,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _migrate_v14_venue_trade_scopes,
     15: _migrate_v15_trade_scope_credential_fingerprint,
     16: _migrate_v16_orders_submit_book,
+    17: _migrate_v17_candle_series_feed,
 }
 
 

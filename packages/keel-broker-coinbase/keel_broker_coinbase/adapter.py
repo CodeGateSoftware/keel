@@ -161,6 +161,17 @@ class CoinbaseAdapter:
     #: second list keyed by venue name would be the thing #233's display exists to avoid.
     DECLARED_CREDENTIAL_ENV: tuple[str, str] = ("CDP_API_KEY", "CDP_API_SECRET")
 
+    @property
+    def volume_feed_id(self) -> str:
+        """Which feed this adapter's candles come from, for `candle_series_feed` (#696).
+
+        Coinbase serves one feed: its own book. That is DECLARED here rather than assumed,
+        because keel's liquidity floor was calibrated against exactly this number -- a crypto
+        exchange's own reported volume -- and the claim "venue volume is market volume for this
+        purpose" should be written down somewhere a reader can find it, not left as the silent
+        default it used to be.
+        """
+        return "coinbase"
     def __init__(self, transport: Transport | None = None) -> None:
         self._transport = transport
 

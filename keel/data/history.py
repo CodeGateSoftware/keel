@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from keel.data.feed_scope import volume_feed_of
 from keel.types import Candle, Granularity
 
 GRANULARITY_SECONDS: dict[Granularity, int] = {
@@ -61,7 +62,12 @@ class _Repo(Protocol):
     ) -> list[Candle]: ...
 
     def upsert_candles(
-        self, product_id: str, granularity: Granularity, candles: list[Candle]
+        self,
+        product_id: str,
+        granularity: Granularity,
+        candles: list[Candle],
+        *,
+        feed: str | None = None,
     ) -> int: ...
 
 
@@ -107,6 +113,7 @@ def _fill_forward(
     now_ts: int,
     sleep_fn,
     sleep_sec: float,
+    feed: str | None = None,
 ) -> None:
     """Fetch any bars strictly newer than `latest_cached`, up to `now_ts` (recent-bar gaps)."""
     window_start = latest_cached + step
@@ -116,7 +123,7 @@ def _fill_forward(
         window_end = min(now_ts, window_start + (MAX_CANDLES_PER_REQUEST - 1) * step)
         batch = client.get_candles(product, granularity, window_start, window_end)
         if batch:
-            repo.upsert_candles(product, granularity, batch)
+            repo.upsert_candles(product, granularity, batch, feed=feed)
         sleep_fn(sleep_sec)
         window_start = window_end + step
 
@@ -131,6 +138,7 @@ def _fill_backward(
     start_floor: int,
     sleep_fn,
     sleep_sec: float,
+    feed: str | None = None,
 ) -> None:
     """Page backward from `window_end` down to `start_floor`, stopping at the first empty
     window -- that window is either the asset's inception or already-covered territory."""
@@ -140,7 +148,7 @@ def _fill_backward(
         batch = client.get_candles(product, granularity, window_start, window_end)
         if not batch:
             break  # inception (or a confirmed-empty probe) -- nothing older to fetch
-        repo.upsert_candles(product, granularity, batch)
+        repo.upsert_candles(product, granularity, batch, feed=feed)
         sleep_fn(sleep_sec)
         window_end = window_start - step
 
@@ -164,6 +172,9 @@ def ensure_history(
     Otherwise (no cache, or `refresh=True`) page backward from `now_ts` down to the `years`
     floor, stopping the instant a window comes back empty.
     """
+    # Asked once, at the top: the client cannot change feed mid-run, and asking per call would
+    # invite a caller to pass a different one for the forward and backward halves of one series.
+    feed = volume_feed_of(client)
     result: dict[tuple[str, Granularity], CoverageInfo] = {}
     for product in products:
         for granularity in granularities:
@@ -177,16 +188,19 @@ def ensure_history(
                 _fill_forward(
                     client, repo, product, granularity, step, latest_cached, now_ts,
                     sleep_fn, sleep_sec,
-                )
+                    feed=feed,
+)
                 _fill_backward(
                     client, repo, product, granularity, step,
                     earliest_cached - step, start_floor, sleep_fn, sleep_sec,
-                )
+                    feed=feed,
+)
             else:
                 _fill_backward(
                     client, repo, product, granularity, step,
                     now_ts, start_floor, sleep_fn, sleep_sec,
-                )
+                    feed=feed,
+)
 
             result[(product, granularity)] = coverage(repo, product, granularity, start_floor)
     return result

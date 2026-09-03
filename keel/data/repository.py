@@ -195,9 +195,28 @@ class Repository:
     # -- candles ----------------------------------------------------------
 
     def upsert_candles(
-        self, product_id: str, granularity: Granularity, candles: list[Candle]
+        self,
+        product_id: str,
+        granularity: Granularity,
+        candles: list[Candle],
+        *,
+        feed: str | None = None,
+        now_ts: int | None = None,
     ) -> int:
-        """Upsert `candles` keyed on `(product_id, granularity, ts)`. Returns rows written."""
+        """Upsert `candles` keyed on `(product_id, granularity, ts)`. Returns rows written.
+
+        `feed`, when given, records WHICH DATA FEED served these bars (#696) -- the liquidity
+        statistic is `median(volume * close)` over this table, and on a single-exchange feed
+        that number is a lower bound on the market rather than a measurement of it. Recording it
+        at write time is the point: inferring it later from whatever `broker.data_feed` happens
+        to be loaded lets a database filled under IEX be judged under a SIP setting, silently.
+
+        `feed=None` records NOTHING rather than a default. Every bar cached before this existed
+        has genuinely unknown provenance, and "unrecorded" must stay distinguishable from
+        "consolidated" -- the absence of evidence is not evidence.
+        """
+        if feed is not None and not feed.strip():
+            raise ValueError("feed must be a non-empty identifier or None, not an empty string")
         gran_value = Granularity(granularity).value
         rows = [
             (
@@ -221,8 +240,60 @@ class Repository:
             """,
             rows,
         )
+        # Only a fetch that actually returned bars is evidence that this feed served this
+        # series. An empty batch records nothing.
+        if feed is not None and rows:
+            stamp = int(time.time()) if now_ts is None else now_ts
+            self._conn.execute(
+                """
+                INSERT INTO candle_series_feed
+                    (product_id, granularity, feed, first_seen_ts, last_seen_ts)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(product_id, granularity, feed) DO UPDATE SET
+                    last_seen_ts = excluded.last_seen_ts
+                """,
+                (product_id, gran_value, feed, stamp, stamp),
+            )
         self._conn.commit()
         return len(rows)
+
+    def get_series_feeds(self, product_id: str, granularity: Granularity) -> tuple[str, ...]:
+        """Every feed recorded against this series, sorted. `()` means UNRECORDED, which is not
+        the same as consolidated -- see `upsert_candles`.
+
+        More than one entry means the series is MIXED, which is the case a caller most needs to
+        know about and the one a single overwritable column would have hidden.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT feed FROM candle_series_feed WHERE product_id = ? AND granularity = ?"
+                " ORDER BY feed",
+                (product_id, Granularity(granularity).value),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A hand-patched or partially-migrated file must not turn a liquidity read into a
+            # crash. No table is no provenance, which is true.
+            return ()
+        return tuple(row["feed"] for row in rows)
+
+    def get_series_feed_window(
+        self, product_id: str, granularity: Granularity, feed: str
+    ) -> tuple[int, int] | None:
+        """`(first_seen_ts, last_seen_ts)` for one feed on one series, or `None` if unrecorded.
+
+        Lets a report say "the IEX rows stopped in March" rather than only "this series is
+        mixed" -- the difference between a series that switched feeds cleanly and one still
+        being written by both.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT first_seen_ts, last_seen_ts FROM candle_series_feed"
+                " WHERE product_id = ? AND granularity = ? AND feed = ?",
+                (product_id, Granularity(granularity).value, feed),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return None if row is None else (int(row["first_seen_ts"]), int(row["last_seen_ts"]))
 
     def get_candles(
         self,
