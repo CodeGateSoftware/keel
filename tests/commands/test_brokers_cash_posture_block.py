@@ -112,3 +112,90 @@ def test_venues_are_listed_in_a_stable_order() -> None:
         [_record(venue="alpaca"), _record(venue="robinhood"), _record(venue="coinbase")]
     )
     assert text.index("alpaca") < text.index("coinbase") < text.index("robinhood")
+
+
+# --- the read path: unreadable is not the same as nothing, and reading must not WRITE ----------
+#
+# Both pins come from `venue_readiness._read_only_trade_scope`'s own docstring, which sits one
+# function away from the code they guard. The first version of `_cash_posture_records` violated
+# both: it used `keel.data.db.connect` (the read-WRITE opener that sets `journal_mode = WAL`) and
+# returned `[]` for "no record" and "could not read" alike.
+
+
+def test_reading_the_records_never_writes_to_the_database(tmp_path) -> None:
+    """A read-only display command must not modify the deployment database.
+
+    `keel.data.db.connect` runs `PRAGMA journal_mode = WAL`, which is a WRITE -- it changes the
+    file and can leave `-wal`/`-shm` sidecars behind. `_read_only_trade_scope`'s docstring says
+    "**Not `keel.data.db.connect`, and that is the whole point of this function**". The journal
+    mode is the observable: open the database in DELETE mode, read, and it must still be DELETE.
+    """
+    import sqlite3
+
+    from keel.commands.brokers import _cash_posture_records
+    from keel.data.db import migrate
+
+    db = tmp_path / "keel.db"
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.commit()
+    conn.close()
+
+    records, unreadable = _cash_posture_records(_ctx(db))
+    assert records == [] and not unreadable
+
+    probe = sqlite3.connect(str(db))
+    mode = probe.execute("PRAGMA journal_mode").fetchone()[0]
+    probe.close()
+    assert mode.lower() == "delete", f"the read switched the journal mode to {mode!r}"
+    assert not (tmp_path / "keel.db-wal").exists(), "the read left a -wal sidecar behind"
+
+
+def test_an_unreadable_database_is_reported_as_unknown_not_as_nothing_attested(tmp_path) -> None:
+    """`_read_only_trade_scope`'s docstring names the harm exactly: conflating these two "let the
+    display assert the former about the latter, and then advise `keel scope attest`". It is worse
+    here -- re-attesting resets `attested_ts` and `attest_due_ts`, and the TTY gate would ask the
+    operator to affirm a cash account they may not have re-checked. A display bug would become a
+    prompt to make an unverified claim.
+    """
+    from keel.commands.brokers import _cash_posture_records
+
+    db = tmp_path / "keel.db"
+    db.write_bytes(b"this is not a sqlite database")
+    records, unreadable = _cash_posture_records(_ctx(db))
+    assert records == []
+    assert unreadable is True
+
+
+def test_no_database_at_all_is_not_unreadable(tmp_path) -> None:
+    """"There is no deployment" is a true statement about this machine, not an admission of
+    ignorance -- the same distinction `_read_only_trade_scope` draws in its first branch."""
+    from keel.commands.brokers import _cash_posture_records
+
+    records, unreadable = _cash_posture_records(_ctx(tmp_path / "absent.db"))
+    assert records == []
+    assert unreadable is False
+
+
+def test_the_block_says_it_could_not_read_rather_than_advising_an_attestation() -> None:
+    """And critically, it must NOT print the attest command: that is the prompt this whole
+    distinction exists to withhold."""
+    text = "\n".join(render_cash_posture_lines([], now_ts=NOW, unreadable=True))
+    assert "could not" in text.lower() or "unreadable" in text.lower()
+    assert "keel posture attest" not in text
+
+
+def test_the_block_still_advises_attesting_when_there_genuinely_is_no_record() -> None:
+    text = "\n".join(render_cash_posture_lines([], now_ts=NOW, unreadable=False))
+    assert "keel posture attest" in text
+
+
+def _ctx(db_path):
+    """A minimal stand-in for the click context `_cash_posture_records` reads `db_path` from."""
+
+    class _Ctx:
+        obj = {"db_path": str(db_path)}
+
+    return _Ctx()
