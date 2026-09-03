@@ -50,7 +50,7 @@ from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Candle, Granularity, Side
-from tests.conftest import attest_subscription, attest_trade_scope
+from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
 
 PRODUCT = "BTC-USD"
 
@@ -195,6 +195,8 @@ def repo() -> Repository:
     # Rail 20 (#233) fails closed without a trade-scope record; confirm coinbase here for the
     # same reason -- these tests are not ABOUT rail 20.
     attest_trade_scope(r, now_ts=0)
+    # Rail 22 (#691) fails closed without a cash-posture record, same as rail 20.
+    attest_cash_posture(r, now_ts=0)
     return r
 
 
@@ -3373,7 +3375,7 @@ def test_agent_command_passes_interactive_confirm_in_CONFIRM_mode(repo, monkeypa
             ts=now_ts, skipped=False, skip_reason=None, mode=config.auto_trade.mode, polled=0
         )
 
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: object())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: object())
     monkeypatch.setattr(cli_module, "_open_repo", lambda ctx: repo)
     monkeypatch.setattr(cli_module, "_load_cfg", lambda ctx: _live_config())
     monkeypatch.setattr(cli_module.agent, "run_once", _fake_run_once)
@@ -4394,6 +4396,9 @@ def test_a_cycle_with_notifications_disabled_makes_zero_transport_calls(repo, mo
     # rail 17 at 5 of its 7 days (2 remain): the WARN state an opted-in deployment would be
     # told about -- doctor's `attest.withdrawals` WARN, not the never-attested FAIL.
     repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
+    # The module fixture attests the cash posture at ts 0, which is already expired by
+    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(
@@ -4417,6 +4422,9 @@ def test_a_warn_state_cycle_emits_exactly_the_opted_in_events(repo, monkeypatch)
     # attested 5 days before NOW: 2 of the 7 TTL days remain -> doctor WARNs (not the
     # never-attested FAIL a negative epoch would take).
     repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
+    # The module fixture attests the cash posture at ts 0, which is already expired by
+    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(

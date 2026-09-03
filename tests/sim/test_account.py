@@ -29,7 +29,7 @@ from keel.execution import guards
 from keel.execution.guards import OrderIntent
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.types import Side
-from tests.conftest import attest_subscription, attest_trade_scope
+from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
 
 
 def _ts(year: int, month: int, day: int, hour: int = 12) -> int:
@@ -362,6 +362,7 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
     # Rail 20 (#233) fails closed without a trade-scope record; this comparison is about the
     # monthly allowance divergence, not rail 20, so confirm coinbase here.
     attest_trade_scope(repo, now_ts=now_ts)
+    attest_cash_posture(repo, now_ts=now_ts)
     # Subscription is attested below, once `config` (and its assumed_free_volume_usd) exists --
     # guards.check derives its cap from the attested record, so it must match what `config`
     # gives the sim side for this to be a genuine guards-vs-sim comparison.
@@ -849,6 +850,7 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     # Rail 20 (#233) fails closed without a trade-scope record; these parity tests are about
     # the spend-cap rails, not rail 20, so confirm coinbase here.
     attest_trade_scope(repo, now_ts=now_ts)
+    attest_cash_posture(repo, now_ts=now_ts)
     # No subscription attestation here -- each caller attests a record matching its own
     # `config.subscription` (see `_attest`), since guards.check now derives its cap from the
     # attested record while SimAccount reads `config.subscription` directly; parity requires
@@ -1019,6 +1021,7 @@ def test_parity_with_guards_check_streak_halt_active():
     # Rail 20 (#233) fails closed without a trade-scope record; this comparison is about rail
     # 16, not rail 20, so confirm coinbase here.
     attest_trade_scope(repo, now_ts=now_ts)
+    attest_cash_posture(repo, now_ts=now_ts)
 
     config = _config()  # roomy on every spend cap ($500 monthly allowance is the only real cap)
     _attest(

@@ -961,7 +961,7 @@ function stepCard(step, actions, notAutomated) {
  *
  * **The gate did not move with the button, and that is the property to keep in view.** What may be
  * performed here is `keel.commands.setup.ACTIONS` and nothing else: idempotent, non-destructive,
- * `MECHANICAL` steps, asserted disjoint from the eight capability-increasing actions. A client
+ * `MECHANICAL` steps, asserted disjoint from the nine capability-increasing actions. A client
  * that hides a button is not a gate, so nothing is hidden -- and nothing needed to be, because the
  * server refuses what is not in that set regardless of what this file draws.
  *

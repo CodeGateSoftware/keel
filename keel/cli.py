@@ -160,6 +160,7 @@ from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
 from keel.commands.orders import orders_cmd
 from keel.commands.pnl import build_pnl_report, render_pnl_report
+from keel.commands.posture import posture_group
 from keel.commands.purification import render_purification_report
 from keel.commands.research import research_group
 from keel.commands.rules import rules_group, rules_seed
@@ -1024,7 +1025,10 @@ def monitor(
     """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)
-    broker = _build_broker(config)
+    # `repo=` so a venue posture check that REFUSES also refutes the standing attestation
+    # (#691). Passed on the paths that go on to trade; the read-only inspection commands do
+    # not have a repo and do not need one -- see `record_cash_posture_refutation`.
+    broker = _build_broker(config, repo=repo)
     products = _default_sim_products(config)
     granularities = list(config.market_data.granularities)
     interval = interval_sec if interval_sec is not None else config.auto_trade.interval_sec
@@ -1083,7 +1087,8 @@ def agent_cmd(
     """
     config = _load_cfg(ctx)
     repo = _open_repo(ctx)
-    broker = _build_broker(config)
+    # See the `run` command: refutation is recorded on the trading paths (#691).
+    broker = _build_broker(config, repo=repo)
 
     if not loop:
         confirm_fn = _interactive_confirm
@@ -1336,6 +1341,7 @@ cli.add_command(subscription_group)
 # -- scope (rail 20, per-venue trade-scope attestation, #233) -------------------------------------
 
 # The `scope` group is defined in `keel.commands.scope`; register it here.
+cli.add_command(posture_group)
 cli.add_command(scope_group)
 
 

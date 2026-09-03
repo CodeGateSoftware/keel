@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 from keel_core import telemetry
+from keel_core.cash_posture import (
+    ATTESTATION_TTL_SEC,
+    SPOT_CASH,
+    CashPostureState,
+    VenueCashPosture,
+)
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
@@ -51,6 +57,49 @@ def attest_subscription(
             attest_due_ts=(
                 attest_due_ts if attest_due_ts is not None else now_ts + ATTESTATION_PERIOD_SEC
             ),
+        )
+    )
+
+
+def attest_cash_posture(
+    repo: Repository,
+    *,
+    now_ts: int,
+    state: CashPostureState = CashPostureState.ATTESTED,
+    attested_posture: str | None = SPOT_CASH,
+    venue: str = "coinbase",
+    attested_ts: int | None = None,
+    attest_due_ts: int | None = None,
+    refuted_ts: int | None = None,
+    refuted_reason: str | None = None,
+    credential_fingerprint: str | None = None,
+) -> None:
+    """Write a venue cash-posture record -- rail 22's baseline (#691), the `attest_trade_scope`
+    counterpart.
+
+    Defaults to an in-force `ATTESTED` / `spot_cash` record: the shape that lets rail 22 admit a
+    live entry, so a test not ABOUT rail 22 is not incidentally vetoed. Same reason this file
+    already defaults `attest_trade_scope` to `CONFIRMED` and `attest_subscription` to a roomy
+    allowance.
+
+    `attest_due_ts` defaults to `now_ts + ATTESTATION_TTL_SEC`, i.e. freshly attested. A test
+    about EXPIRY passes its own, in the past.
+
+    `credential_fingerprint` defaults to `None` -- the "recorded without fingerprinting" value,
+    which reads as MATCHING, so a test that does not care about #633 is not vetoed by it.
+    """
+    repo.upsert_venue_cash_posture(
+        VenueCashPosture(
+            venue=venue,
+            state=state,
+            attested_posture=attested_posture,
+            attested_ts=now_ts if attested_ts is None else attested_ts,
+            attest_due_ts=(
+                now_ts + ATTESTATION_TTL_SEC if attest_due_ts is None else attest_due_ts
+            ),
+            refuted_ts=refuted_ts,
+            refuted_reason=refuted_reason,
+            credential_fingerprint=credential_fingerprint,
         )
     )
 

@@ -941,7 +941,7 @@ def _state_as_json(state: DeploymentState) -> dict[str, Any]:
 #    outcome that changed nothing -- never an overwrite, and there is deliberately no `force`
 #    parameter for any web caller to pass.
 #
-# 4. Nothing here increases what keel can DO. Not one of the eight capability-increasing actions
+# 4. Nothing here increases what keel can DO. Not one of the nine capability-increasing actions
 #    in `keel/capabilities.py` is reachable from this module, and a test asserts the two sets are
 #    disjoint. Creating a config, a schema and a library of CANDIDATE rules leaves an engine that
 #    still places nothing: candidates trade nothing until a human promotes them, and promotion is

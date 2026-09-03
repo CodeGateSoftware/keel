@@ -34,7 +34,7 @@ from keel.data.repository import Repository
 from keel.execution import guards
 from keel.execution.guards import LIVE_STATE_RAILS, GuardResult, OrderIntent, check
 from keel.types import Side
-from tests.conftest import attest_subscription, attest_trade_scope
+from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
 
 NOW_TS = 1_700_000_000  # 2023-11-14T22:13:20Z -- well inside its UTC day for boundary tests
 
@@ -60,6 +60,8 @@ def repo() -> Repository:
     # rail 20 gets the CONFIRMED shape the v14 backfill produces for an already-live venue --
     # same reason this fixture seeds the kill-switch, feed timestamp and subscription.
     attest_trade_scope(r, now_ts=NOW_TS)
+    # Rail 22 (#691) likewise fails closed without a cash-posture record.
+    attest_cash_posture(r, now_ts=NOW_TS)
     return r
 
 
@@ -763,6 +765,7 @@ def test_rail12_missing_feed_timestamp_treated_as_stale(repo):
     _attest(fresh_repo, free_volume_usd=_LARGE_ALLOWANCE)
     # confirmed so only rail 12 (not rail 20's missing-record fallback) trips
     attest_trade_scope(fresh_repo, now_ts=NOW_TS)
+    attest_cash_posture(fresh_repo, now_ts=NOW_TS)
 
     result = check(_intent(), fresh_repo, _config(), NOW_TS)
 
@@ -1001,6 +1004,8 @@ def _unattested_repo() -> Repository:
     # This helper is about rail 14 (no subscription), not rail 20 -- seed a CONFIRMED trade
     # scope so these tests aren't incidentally vetoed by the rail this module isn't testing.
     attest_trade_scope(r, now_ts=NOW_TS)
+    # Rail 22 (#691) is not what any caller of this helper is testing.
+    attest_cash_posture(r, now_ts=NOW_TS)
     return r
 
 
@@ -1169,6 +1174,7 @@ def test_rail14_reads_the_bound_venues_record_not_the_default_constants() -> Non
     # `_unattested_repo()` only seeds coinbase's trade scope (rail 20 is not what this test is
     # about) -- attest alpaca's too, or rail 20 vetoes the bound venue for an unrelated reason.
     attest_trade_scope(repo, now_ts=NOW_TS, venue="alpaca")
+    attest_cash_posture(repo, now_ts=NOW_TS, venue="alpaca")
     token = bind_venue("alpaca")
     try:
         result = guards.check(_intent(notional=Decimal("50")), repo, _roomy_config(), NOW_TS)
@@ -1626,6 +1632,8 @@ def _repo_no_trade_scope() -> Repository:
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
     attest_subscription(r, now_ts=NOW_TS, free_volume_usd=_LARGE_ALLOWANCE)
+    # Rail 22 (#691) is not what any caller of this helper is testing.
+    attest_cash_posture(r, now_ts=NOW_TS)
     return r
 
 
@@ -1646,6 +1654,8 @@ def test_rail20_does_NOT_veto_the_v13_backfilled_CONFIRMED_coinbase_record() -> 
     live the whole time."""
     repo = _repo_no_trade_scope()
     attest_trade_scope(repo, now_ts=NOW_TS)  # CONFIRMED, attested_scope=None -- the backfill shape
+    # Rail 22 (#691) is a separate precondition; this test is about rail 20 alone.
+    attest_cash_posture(repo, now_ts=NOW_TS)
 
     result = check(_intent(), repo, _config(), NOW_TS)
 

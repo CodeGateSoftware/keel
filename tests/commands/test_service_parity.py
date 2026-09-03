@@ -175,7 +175,7 @@ def test_fetch_check_failing_parity(tmp_path, valid_config_path, monkeypatch, ch
     _repo_at(db_svc)
 
     monkeypatch.setattr(cli_module, "time", _FrozenClock(NOW_TS))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: _ExplodingBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: _ExplodingBroker())
 
     result = CliRunner().invoke(
         cli,
@@ -215,7 +215,7 @@ def test_fetch_check_current_parity(tmp_path, valid_config_path, monkeypatch):
     _seed_current_series(_repo_at(db_svc), ("BTC-USD", "ETH-USD", "PAXG-USD"))
 
     monkeypatch.setattr(cli_module, "time", _FrozenClock(NOW_TS))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: _ExplodingBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: _ExplodingBroker())
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_cli), "--config", str(valid_config_path), "fetch", "--check"]
@@ -261,7 +261,7 @@ def test_monitor_single_poll_parity(tmp_path, valid_config_path, monkeypatch):
     _repo_at(db_cli)
     _repo_at(db_svc)
     monkeypatch.setattr(cli_module, "time", _FrozenClock(NOW_TS))
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: _FakePollBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: _FakePollBroker())
 
     result = CliRunner().invoke(
         cli, ["--db", str(db_cli), "--config", str(valid_config_path), "monitor"]
@@ -334,7 +334,7 @@ def test_simulate_report_parity(tmp_path, valid_config_path, monkeypatch):
     monkeypatch.setattr(
         cli_module,
         "_build_broker",
-        lambda config: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
+        lambda config, **_kw: (_ for _ in ()).throw(AssertionError("no network under --no-fetch")),
     )
 
     result = CliRunner().invoke(
@@ -482,7 +482,7 @@ def test_assets_holdings_render_parity(tmp_path, valid_config_path, monkeypatch)
     repo_svc = _repo_at(db_svc)
     _attest_btc(repo_cli)
     _attest_btc(repo_svc)
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: _AccountsBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: _AccountsBroker())
 
     result = CliRunner().invoke(
         cli,
@@ -521,7 +521,7 @@ class _DiscoverBroker(_FakePollBroker):
 
 
 def test_assets_discover_render_parity(tmp_path, valid_config_path, monkeypatch):
-    monkeypatch.setattr(cli_module, "_build_broker", lambda config: _DiscoverBroker())
+    monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: _DiscoverBroker())
 
     result = CliRunner().invoke(
         cli,

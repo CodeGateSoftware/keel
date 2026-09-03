@@ -30,7 +30,7 @@ Four independent layers, none of which is sufficient alone:
 4. **A closed set of setup actions** is the whole write surface. `POST` exists now (#437 -- a
    first-run user on a machine with no terminal has to be able to create a deployment somehow),
    but it routes ONLY through `keel.commands.setup.ACTIONS`, every member of which is a step
-   declared `MECHANICAL`, is idempotent and is never destructive. Not one of the eight
+   declared `MECHANICAL`, is idempotent and is never destructive. Not one of the nine
    capability-increasing actions in `keel/capabilities.py` is reachable, and a test asserts the
    two sets are disjoint. That is a narrower guarantee than "no POST at all" was, and a more
    useful one: "no POST" would have been satisfied by a server that could not set anything up,

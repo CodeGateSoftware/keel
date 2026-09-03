@@ -103,8 +103,15 @@ def test_every_rail_count_claim_in_the_repository_is_current() -> None:
             lowered = line.lower()
             for number, word in wrong.items():
                 # `<word> rails` and `the <n> rails` -- the two shapes this repository writes.
-                if re.search(rf"\b{word}\b[^.]{{0,40}}\brails?\b", lowered) or re.search(
-                    rf"\bthe {number}\b[^.]{{0,20}}\brails?\b", lowered
+                # `(?!\s*%)` keeps a THRESHOLD from reading as a count: "total drawdown at or
+                # past the 20% rail" is rail 11's percentage, not a claim that there are twenty
+                # rails, and it matched until #691 added the twenty-SECOND rail and surfaced it.
+                # `(?!-)` stops a SHORTER word matching inside a longer one: a hyphen is a word
+                # boundary, so `\btwenty\b` matches inside "twenty-one" and the whole sweep
+                # reported every freshly-corrected line as still stale. #691 surfaced this the
+                # first time the count crossed twenty.
+                if re.search(rf"\b{word}\b(?!-)[^.]{{0,40}}\brails?\b", lowered) or re.search(
+                    rf"\bthe {number}\b(?!\s*%)[^.]{{0,20}}\brails?\b", lowered
                 ):
                     rel = path.relative_to(_ROOT).as_posix()
                     stale.append(f"{rel}:{line_no}: {line.strip()[:88]}")
