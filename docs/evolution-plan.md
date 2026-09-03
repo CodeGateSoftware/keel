@@ -216,3 +216,71 @@ no, compliance gates that stay in human hands, access from any device without cu
 intelligence from IKA that informs without instructing — and monetizes trust itself:
 signing, updates, access, support. Jesse's product asks to be trusted with your money;
 keel's is designed so it never has to be.
+
+## 8. Appendix — the honest cockpit: the Alpaca audit (2026-09)
+
+A page-by-page audit of Alpaca's dashboard (overview, plans, connect, and the account
+section: configure, balances, activities, orders, positions) was run against keel's
+verified web surface. Alpaca's information architecture is worth copying in three places;
+almost everything inside the skeleton is a growth funnel. The result is milestone
+**28 — The honest cockpit (dashboard)**, and one addition to the thesis: the dashboard
+itself is a moat, because every competitor's UI depends on hiding what keel shows.
+
+### What the audit took
+
+- **The account switcher as session identity** — paper/live visible on every page, not
+  buried in settings (#704). Keel's chip displays and navigates; it never mutates. The
+  paper banner carries **no CTA, ever** — Alpaca's carries "Open Live Account".
+- **The account section's four-table split** — Balances / Activities / Orders / Positions
+  (#700, #701, #702, #703). The engine already records everything these views need
+  (per-order fees and expected-vs-actual fills, per-tranche brackets and stops, settled
+  cash, the purification ledger); none of it was surfaced.
+- **Status tabs, type chips, CSV export** — adopted (#703), with the export upgraded from
+  spreadsheet to audit record: trials-ledger row hashes and attestation sources ride along.
+
+### What the audit refused
+
+- Any live-mode CTA, any one-click order entry, any one-click position close. Exits
+  degrade to typed friction; a panic tap is never the last line of defense.
+- Market movers and watchlist feeds inside the trading loop — engagement bait, not
+  judgment support. Screening stays a separate honest tool (#370) that gates, never ranks.
+- The Connect marketplace's credential handoff to third-party code. Keel's Connect page
+  (growing the existing Venues view) shows adapters, declared capability gaps, and
+  credential fingerprints — including what each key cannot do.
+- Feature-gating inside the engine. The Plans page ships **inverted** (#706): a
+  transparency artifact stating what is free forever and why — not a paywall matrix.
+
+### What keel does beyond parity
+
+- **The cancel asymmetry** (#707): cancelling an entry is refusing risk — frictionless,
+  one-click even from the web. Cancelling an exit or protective bracket is removing
+  protection — walled off with a typed `EXIT_PROTECTION_LOCKED` refusal naming the
+  terminal command. No broker on earth makes this distinction; keel's constitution hands
+  us the design.
+- **Per-order honesty receipts** (#700): expected vs actual fill, fee as actually charged,
+  quote provenance — execution drag in plain sight on every order row.
+- **A mark-to-market equity series** (#698): the audit's one genuine engine addition —
+  a mode-partitioned `equity_points` table replacing the 7-day rolling window, making the
+  chart time-axised with the rail-11 and drawdown ceilings as overlays.
+- **The Research Hub** (#708): trials ledger, evidence matrix, promotion gauntlet, and
+  slippage universe in the navigation — all read-only surfaces over machinery that
+  already exists and is already public. No broker, SaaS platform, or open-source
+  competitor shows their trials and negative results; their business models depend on
+  trading looking easy. PR #686's null — 0 of 120 cells clear PF 1.0 at per-product
+  cost; the corpus null stands at 0 of 138 — is the headline exhibit, not a footnote.
+  The Strathern rail holds in the UI: nothing in `/research` sorts or ranks by profit
+  factor; views group by rule family and report pass/fail gates.
+
+### Sequencing and guardrails
+
+Sprint 1 — the cockpit backbone (#698 → #700 → #701 → #702); Sprint 2 — context and
+history (#703 → #704 → #705, wiring the dead `journal` table as a human-sourced
+attestation); Sprint 3 — action and transparency (#707 → #706, the cancel action last
+because it opens the first non-setup write surface and carries its own security pass);
+#708 runs in parallel after Sprint 1 — it is read-only and shares no code with #707.
+
+Everything here is loopback-safe and waits on nothing: no view depends on #648, and the
+async ceremony card remains Phase B exactly as planned. Money crosses the wire as
+presentation-ready `Field`s, never JSON numbers; there is zero client-side math; and
+every claim on every new page traces to recorded data — the dashboard holds itself to
+the same standard as the engine.
