@@ -4,7 +4,7 @@
 un-overridable safety-critical rails: 13/14 added by Issue #59 (USDC-funding + monthly-allowance),
 16, the consecutive-loss circuit breaker (Task 4), 17, the withdrawal/`qabd` rail, 18, the
 settlement-currency rail, 19, the spot-instrument rail, and 20, the trade-scope rail (#233) —
-twenty in all, since there is no rail 15. They run before any order is placed, in every
+twenty-one in all, since there is no rail 15. They run before any order is placed, in every
 `auto_trade` mode (confirm *and* autonomous) and for both rule-trading and DCA order classes. It
 never short-circuits: every violated rail is collected and reported so an operator (or the
 executor, Task 4) sees the full picture, not just the first trip-wire.
@@ -134,6 +134,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from keel_core.cash_posture import MARGIN_ENABLED, CashPostureState
 from keel_core.credential_identity import current_credential_fingerprint
 from keel_core.products import parse_spot_product_id, quote_currency_of
 from keel_core.subscription import SubscriptionStatus
@@ -259,12 +260,13 @@ LIVE_STATE_RAILS = (
     "withdrawal_capability",
     "trade_scope",
     "base_balance",
+    "cash_posture",
 )
 
 
 @dataclass(frozen=True)
 class GuardResult:
-    """The outcome of running all twenty rails: `ok` iff `violations` is empty."""
+    """The outcome of running all twenty-one rails: `ok` iff `violations` is empty."""
 
     ok: bool
     violations: list[str]
@@ -468,7 +470,7 @@ def check(
     now_ts: int,
     offline: bool = False,
 ) -> GuardResult:
-    """Run all twenty §14 (+ Issue #59, Task 4, #233, #667) hard rails against `intent`. Never
+    """Run all twenty-one §14 (+ Issue #59, Task 4, #233, #667) hard rails against `intent`. Never
     short-circuits.
 
     Called before every order in every `auto_trade` mode (confirm *and* autonomous) --
@@ -1013,6 +1015,89 @@ def check(
                 "sell what the account does not hold. Reconcile the position (an out-of-band "
                 "transfer, or an exit that already executed) before trading this product."
             )
+
+    # 22. Cash posture (#691, Stage 2 of #666) — a live BUY may not be placed against an account
+    #     nobody has stated is cash-only.
+    #
+    #     STAGE 1 ESTABLISHED WHY THIS CANNOT BE A VENUE READ. Coinbase exposes no
+    #     cash-versus-margin field for spot: `margin_rate` is in every account's response schema
+    #     and carries `null`, so a check keyed on its presence would refuse every deployment, and
+    #     every margin/borrow/leverage/liquidation field in the SDK lives in the futures or
+    #     perpetuals types. The adapter's `verify_cash_account` therefore REFUTES and never
+    #     issues -- an INTX portfolio proves derivatives are available, its absence proves
+    #     nothing.
+    #
+    #     That residual is the same shape as rail 17's `qabd`: silence is not evidence of
+    #     possession, and silence is not evidence of a cash account. So the fact comes from a
+    #     human who knows their own account, on the record, with the venue able to contradict
+    #     them -- and this rail asks that record.
+    #
+    #     The policy lives on the record (`VenueCashPosture.may_place_live_entry`,
+    #     `keel_core/cash_posture.py`), not here. This rail does not re-derive the state machine;
+    #     it calls the one method that owns it and then explains the answer, so there is exactly
+    #     one place to get the decision wrong and one place to get the wording wrong.
+    #
+    #     Venue-keyed like rails 14 and 20, ENTRIES ONLY like rails 11/16/17/20, and fails CLOSED
+    #     on a missing record like rails 12/13/17/20. The entries-only part is load-bearing: a
+    #     rail that blocked an exit over a fact about the ACCOUNT would strand a position that
+    #     wanted out.
+    #
+    #     FOUR distinct veto messages, because there is no venue read for an operator to fall
+    #     back on -- the message IS the interface. "Never attested" and "expired" call for the
+    #     same command but say different things about the operator's own diligence; "attested
+    #     margin" calls for a change to the ACCOUNT, not a re-run of the command; and a DIFFERENT
+    #     credential must never be described as "never attested", which is #624's exact mistake.
+    if is_buy and not offline:
+        venue = current_venue() or DEFAULT_VENUE
+        posture = repo.get_venue_cash_posture(venue)
+        current_fingerprint = current_credential_fingerprint(venue)
+        attest = f"`keel posture attest --spot-cash --venue {venue}`"
+        unaffected = "Exits, stop rolls, cancels and DCA exits are unaffected."
+        if posture is None:
+            violations.append(
+                f"cash_posture: nobody has attested {venue}'s cash-versus-margin posture, and "
+                "the venue exposes no field that could -- unknown is not evidence of a cash "
+                f"account, so new ENTRIES are vetoed. {unaffected} Run {attest} once you have "
+                "checked the account yourself."
+            )
+        elif (
+            posture.credential_evidence(current_fingerprint)
+            is CredentialEvidence.DIFFERENT_CREDENTIAL
+        ):
+            violations.append(
+                f"cash_posture: {venue}'s posture was attested under a DIFFERENT credential than "
+                "the one in place now -- a claim about one account is not a claim about another, "
+                f"so new ENTRIES are vetoed until it is re-attested. {unaffected} Run {attest} "
+                "for the current credential."
+            )
+        elif not posture.may_place_live_entry(now_ts, current_fingerprint):
+            if posture.state is CashPostureState.REFUTED:
+                reason = f" ({posture.refuted_reason})" if posture.refuted_reason else ""
+                violations.append(
+                    f"cash_posture: venue evidence CONTRADICTS the attested cash posture for "
+                    f"{venue}{reason} -- evidence outranks the claim, so new ENTRIES are vetoed. "
+                    f"{unaffected} Close the derivative portfolio, then re-attest with {attest}."
+                )
+            elif posture.attested_posture == MARGIN_ENABLED:
+                violations.append(
+                    f"cash_posture: {venue} is attested as MARGIN-ENABLED -- on a margin account "
+                    "a sell can fill as a short, which is *bay' ma la yamlik*, so new ENTRIES "
+                    f"are vetoed. {unaffected} This needs a change to the ACCOUNT, not a "
+                    "re-attestation: disable margin at the venue, then re-attest."
+                )
+            elif not posture.is_current(now_ts):
+                violations.append(
+                    f"cash_posture: {venue}'s cash-posture attestation has EXPIRED "
+                    f"(due {posture.attest_due_ts}) -- a claim nobody has re-confirmed is the "
+                    "same class of unknown as no claim, so new ENTRIES are vetoed. "
+                    f"{unaffected} Re-attest with {attest} after re-checking the account."
+                )
+            else:
+                violations.append(
+                    f"cash_posture: {venue}'s cash-posture record does not permit a live entry "
+                    f"(state {posture.state.value}, posture {posture.attested_posture!r}) -- new "
+                    f"ENTRIES are vetoed. {unaffected} Run {attest} once the account is checked."
+                )
 
     for violation in violations:
         log_event(

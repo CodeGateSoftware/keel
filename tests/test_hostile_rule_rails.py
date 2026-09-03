@@ -40,7 +40,7 @@ from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity, Side
-from tests.conftest import attest_subscription, attest_trade_scope
+from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
 from tests.test_agent import (
     PRODUCT,
     FakeBroker,
@@ -67,6 +67,8 @@ def _fresh_repo() -> Repository:
     r.set_autonomous(True, now_ts=0)
     attest_subscription(r, now_ts=0, free_volume_usd=Decimal("10000000"))
     attest_trade_scope(r, now_ts=0)
+    # Rail 22 (#691) fails closed without a cash-posture record, same as rail 20.
+    attest_cash_posture(r, now_ts=0)
     return r
 
 

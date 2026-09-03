@@ -160,6 +160,7 @@ from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
 from keel.commands.orders import orders_cmd
 from keel.commands.pnl import build_pnl_report, render_pnl_report
+from keel.commands.posture import posture_group
 from keel.commands.purification import render_purification_report
 from keel.commands.research import research_group
 from keel.commands.rules import rules_group, rules_seed
@@ -1336,6 +1337,7 @@ cli.add_command(subscription_group)
 # -- scope (rail 20, per-venue trade-scope attestation, #233) -------------------------------------
 
 # The `scope` group is defined in `keel.commands.scope`; register it here.
+cli.add_command(posture_group)
 cli.add_command(scope_group)
 
 

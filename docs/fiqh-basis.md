@@ -181,7 +181,7 @@ account level is the operator's obligation, listed first in
 
 ### The remaining rails — prudential, not fiqh
 
-Twenty rails exist (1–14, 16–21 — there is no rail 15). Of these, rails 17 and 21 encode a
+Twenty-one rails exist (1–14, 16–22 — there is no rail 15). Of these, rails 17, 21 and 22 encode a
 fiqh ruling, and rails 1/18/19 enforce what the screen and the charter admit. The rest are
 PRUDENTIAL — risk and discipline, justified by trading evidence, carrying no religious
 claim:

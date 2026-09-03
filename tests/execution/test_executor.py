@@ -52,7 +52,7 @@ from keel.execution.executor import (
 from keel.execution.guards import OrderIntent
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Side
-from tests.conftest import attest_subscription, attest_trade_scope
+from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
 
 NOW_TS = 1_700_000_000
 
@@ -226,6 +226,8 @@ def repo() -> Repository:
     # rail 20 gets the CONFIRMED shape the v14 backfill produces for an already-live venue --
     # same reason this fixture seeds withdrawals and the subscription above.
     attest_trade_scope(r, now_ts=NOW_TS)
+    # Rail 22 (#691) fails closed without a cash-posture record, same as rail 20.
+    attest_cash_posture(r, now_ts=NOW_TS)
     return r
 
 
@@ -3866,6 +3868,9 @@ def test_the_record_is_written_against_the_BOUND_venue_not_a_frozen_default(repo
         attested_scope=TRADING,
         attested_ts=NOW_TS,
     )
+    # Rail 22 (#691) is venue-keyed for the same reason: an alpaca-bound cycle needs
+    # alpaca's posture row, or it is vetoed before it reaches the venue.
+    attest_cash_posture(repo, now_ts=NOW_TS, venue="alpaca")
     # Rail 14 is venue-keyed too, so an alpaca-bound cycle needs alpaca's subscription row or it
     # is vetoed before it ever reaches the venue -- which would pass this test for the wrong
     # reason (no placement, hence no refusal, hence no write).

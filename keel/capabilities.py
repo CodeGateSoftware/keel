@@ -176,6 +176,18 @@ CAPABILITIES: tuple[Capability, ...] = (
         ),
     ),
     Capability(
+        module="keel.commands.posture",
+        function="posture_attest",
+        surface="cli",
+        invocation="keel posture attest --spot-cash",
+        increases=(
+            "rail 22 may place a live ENTRY order against this venue's account -- it was refused "
+            "that until a human attested the account is cash-only spot. No venue exposes this "
+            "field for spot (#666), so this statement is the ONLY thing that can release the "
+            "rail, and nothing can check it"
+        ),
+    ),
+    Capability(
         module="keel.commands.update",
         function="typed_update_gate",
         surface="cli",

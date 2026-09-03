@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -261,6 +261,28 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- credential_evidence`/`may_place_live_entry`) treats it as MATCHING, never as a
         -- mismatch -- see `_migrate_v15_trade_scope_credential_fingerprint`'s docstring for why
         -- getting that backwards would make this migration itself the outage.
+        credential_fingerprint  TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS venue_cash_postures (
+        venue                   TEXT PRIMARY KEY,
+        state                   TEXT NOT NULL,
+        -- `spot_cash` | `margin_enabled` | NULL. NULL only alongside state `unverified`.
+        attested_posture        TEXT,
+        attested_ts             INTEGER,
+        -- When the attestation expires. Deliberately stored rather than derived, so changing
+        -- `ATTESTATION_TTL_SEC` cannot retroactively expire (or extend) a claim a human made
+        -- under the window that was in force when they made it.
+        attest_due_ts           INTEGER,
+        -- Set when venue evidence CONTRADICTS the claim -- an INTX portfolio is the only such
+        -- evidence Stage 1 can produce. The attestation columns are preserved alongside it: a
+        -- report has to be able to say what was claimed and when, not just that it was refuted.
+        refuted_ts              INTEGER,
+        refuted_reason          TEXT,
+        -- Non-reversible fingerprint of the credential IDENTIFIER the claim was made under
+        -- (#633). NULL means "recorded without fingerprinting" and reads as MATCHING, never as a
+        -- mismatch -- the same fail-safe direction as `venue_trade_scopes`.
         credential_fingerprint  TEXT
     )
     """,
@@ -779,6 +801,21 @@ def _migrate_v17_candle_series_feed(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v18_venue_cash_postures(conn: sqlite3.Connection) -> None:
+    """v18 adds `venue_cash_postures`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill, and here that is close to the entire point of the feature.
+
+    A row asserts that a HUMAN examined their own venue account and stated its cash-versus-margin
+    posture. Nothing else can produce that claim -- Coinbase exposes no such field for spot
+    (#666), which is why the attestation exists at all. Seeding a row for the live deployment
+    because its portfolios happen to look cash-only today would fabricate the one thing the record
+    is for, and would do it in the table a rail reads before placing a live entry.
+
+    An empty table means every venue is UNVERIFIED, which is true, and unverified vetoes new
+    entries and nothing else.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -796,6 +833,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     15: _migrate_v15_trade_scope_credential_fingerprint,
     16: _migrate_v16_orders_submit_book,
     17: _migrate_v17_candle_series_feed,
+    18: _migrate_v18_venue_cash_postures,
 }
 
 

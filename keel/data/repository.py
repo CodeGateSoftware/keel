@@ -14,6 +14,7 @@ import time
 from decimal import Decimal
 from typing import Any
 
+from keel_core.cash_posture import CashPostureState, VenueCashPosture
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
@@ -132,6 +133,24 @@ def _trade_scope_from_row(row: sqlite3.Row) -> VenueTradeScope:
         credential_fingerprint=row["credential_fingerprint"],
     )
 
+
+
+def _cash_posture_from_row(row: Any) -> VenueCashPosture:
+    """Map a `venue_cash_postures` row to the domain record.
+
+    `state` is rebuilt as the enum, not left a string, so a caller comparing with `is` cannot
+    silently always be false -- the mistake a `str`-valued Enum makes easy.
+    """
+    return VenueCashPosture(
+        venue=row["venue"],
+        state=CashPostureState(row["state"]),
+        attested_posture=row["attested_posture"],
+        attested_ts=row["attested_ts"],
+        attest_due_ts=row["attest_due_ts"],
+        refuted_ts=row["refuted_ts"],
+        refuted_reason=row["refuted_reason"],
+        credential_fingerprint=row["credential_fingerprint"],
+    )
 
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
@@ -622,6 +641,60 @@ class Repository:
         """Every recorded trade scope, ordered by venue."""
         rows = self._conn.execute("SELECT * FROM venue_trade_scopes ORDER BY venue").fetchall()
         return [_trade_scope_from_row(row) for row in rows]
+
+    # -- venue cash posture (#691) ------------------------------------------
+
+    def get_venue_cash_posture(self, venue: str) -> VenueCashPosture | None:
+        """Return `venue`'s cash-posture record, or `None` if it has never been recorded.
+
+        `None` is meaningful, not an error: no row means no human has stated this account's
+        posture, and since no venue read can supply one either, the caller must treat it as
+        unknown and therefore closed for new entries.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM venue_cash_postures WHERE venue = ?", (venue,)
+        ).fetchone()
+        return None if row is None else _cash_posture_from_row(row)
+
+    def upsert_venue_cash_posture(self, record: VenueCashPosture) -> None:
+        """Insert or replace `record`, keyed on venue. One posture record per venue.
+
+        Writes `credential_fingerprint` exactly as given, `None` included -- `None` is the value
+        meaning "recorded without fingerprinting", not "leave whatever was there". A writer that
+        could not clear it would let a stale fingerprint outlive the record it described.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO venue_cash_postures (
+                venue, state, attested_posture, attested_ts, attest_due_ts, refuted_ts,
+                refuted_reason, credential_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(venue) DO UPDATE SET
+                state = excluded.state,
+                attested_posture = excluded.attested_posture,
+                attested_ts = excluded.attested_ts,
+                attest_due_ts = excluded.attest_due_ts,
+                refuted_ts = excluded.refuted_ts,
+                refuted_reason = excluded.refuted_reason,
+                credential_fingerprint = excluded.credential_fingerprint
+            """,
+            (
+                record.venue,
+                record.state.value,
+                record.attested_posture,
+                record.attested_ts,
+                record.attest_due_ts,
+                record.refuted_ts,
+                record.refuted_reason,
+                record.credential_fingerprint,
+            ),
+        )
+        self._conn.commit()
+
+    def list_venue_cash_postures(self) -> list[VenueCashPosture]:
+        """Every recorded cash posture, ordered by venue."""
+        rows = self._conn.execute("SELECT * FROM venue_cash_postures ORDER BY venue").fetchall()
+        return [_cash_posture_from_row(row) for row in rows]
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 
