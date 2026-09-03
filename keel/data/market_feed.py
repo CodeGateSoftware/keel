@@ -22,13 +22,13 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from keel.data.feed_scope import volume_feed_of
 from keel.data.history import MAX_CANDLES_PER_REQUEST
+from keel.data.repository import Repository
 from keel.types import Candle, Granularity
 
 if TYPE_CHECKING:
     from keel_broker_api.port import Broker
-
-    from keel.data.repository import Repository
 
 _GRANULARITY_SECONDS: dict[Granularity, int] = {
     Granularity.ONE_MINUTE: 60,
@@ -107,6 +107,7 @@ def backfill(
     history_days: int,
     *,
     now_ts: int | None = None,
+    feed: str | None = None,
 ) -> int:
     """Backfill `history_days` of closed candles for every product x granularity.
 
@@ -116,6 +117,10 @@ def backfill(
 
     Returns the total number of candle rows written across all products/granularities.
     """
+    # `backfill` has no in-tree caller today, so it resolves its own rather than relying on
+    # one being threaded in -- a writer that silently records nothing is the failure mode
+    # this whole table exists to prevent (#696).
+    feed = volume_feed_of(client) if feed is None else feed
     now_ts = int(time.time()) if now_ts is None else now_ts
     total_written = 0
 
@@ -144,7 +149,9 @@ def backfill(
                         if window_start <= c.ts <= latest_closed and c.ts not in existing
                     ]
                     if gap_candles:
-                        total_written += repo.upsert_candles(product_id, granularity, gap_candles)
+                        total_written += repo.upsert_candles(
+                            product_id, granularity, gap_candles, feed=feed
+                        )
 
     return total_written
 
@@ -158,6 +165,7 @@ def _poll_catch_up(
     fetch_start: int,
     latest_closed: int,
     last_ts: int | None,
+    feed: str | None = None,
 ) -> int:
     """Fetch and upsert `[fetch_start, latest_closed]`, chunked under the venue's candle cap.
 
@@ -178,7 +186,7 @@ def _poll_catch_up(
         ]
         if new_candles:
             seen.update(c.ts for c in new_candles)
-            total_written += repo.upsert_candles(product_id, granularity, new_candles)
+            total_written += repo.upsert_candles(product_id, granularity, new_candles, feed=feed)
 
     return total_written
 
@@ -202,6 +210,11 @@ def poll_once(
 
     Returns the total number of new candle rows written.
     """
+    # Resolved ONCE here, then passed down: this is the path `agent.run_once` uses on EVERY
+    # cycle, so it decides whether `candle_series_feed` has anything in it at all (#696).
+    # A client that declares nothing records nothing.
+    feed = volume_feed_of(client)
+
     now_ts = int(time.time()) if now_ts is None else now_ts
     total_written = 0
 
@@ -217,7 +230,15 @@ def poll_once(
 
             fetch_start = last_ts + gran_sec if last_ts is not None else latest_closed
             total_written += _poll_catch_up(
-                client, repo, product_id, granularity, gran_sec, fetch_start, latest_closed, last_ts
+                client,
+                repo,
+                product_id,
+                granularity,
+                gran_sec,
+                fetch_start,
+                latest_closed,
+                last_ts,
+                feed=feed,
             )
 
     return total_written

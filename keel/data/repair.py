@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass, field
 
 from keel.data import gaps as gaps_mod
+from keel.data.feed_scope import volume_feed_of
 from keel.data.history import GRANULARITY_SECONDS, MAX_CANDLES_PER_REQUEST
 from keel.types import Granularity
 
@@ -79,6 +80,7 @@ def _fetch_window_chunked(
     Upserting per chunk, rather than batching the whole window, is what lets an interior chunk
     failure leave the earlier chunks persisted instead of losing the whole fetch.
     """
+    feed = volume_feed_of(client)
     fetch_start = window.start_ts - step
     fetch_end = window.end_ts + step
     chunk_start = fetch_start
@@ -86,7 +88,7 @@ def _fetch_window_chunked(
         chunk_end = min(fetch_end, chunk_start + (MAX_CANDLES_PER_REQUEST - 1) * step)
         fetched = client.get_candles(product, granularity, chunk_start, chunk_end)
         if fetched:
-            repo.upsert_candles(product, granularity, fetched)
+            repo.upsert_candles(product, granularity, fetched, feed=feed)
         sleep_fn(sleep_sec)
         chunk_start = chunk_end + step
 
