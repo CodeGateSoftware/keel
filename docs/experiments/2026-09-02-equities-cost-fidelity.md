@@ -132,6 +132,33 @@ the fee question it was filed beside. Two consequences worth separating:
    closed, so it is safe — but safe for the wrong reason, and it will misinform any equities
    universe decision. Filed as **#696**; nothing in this document changes it.
 
+> **Amendment (2026-09-03), per #696.** Records are appended to, never rewritten, so nothing
+> above has been altered — but the framing of this finding was sharper than the evidence, and
+> the resolution improved on it.
+>
+> Two claims here were asserted rather than measured: that the cached figure is "roughly 2% …
+> approximately IEX's share of US equity volume", and that the understatement is "~50×". IEX
+> publishes its own overall share as roughly 3.8% for Q2 2026, so the 2% was simply wrong, and
+> neither figure was derived from anything in the tables above. **No number in this document
+> depends on either**; the finding is that the statistic is structurally unable to answer the
+> question asked of it, which needs no percentage at all.
+>
+> What shipped is better than what this section proposed. The fix is not a fail-closed refusal
+> of every partial-feed series — that would have made a data-vendor pricing tier a prerequisite
+> for running the engine, and would have banned MSFT and AAPL for thinness they do not have.
+> It is an **asymmetric lower-bound gate**: venue volume is a lower bound on consolidated
+> volume, so at or above the admission floor a partial feed is CONCLUSIVE, while below it the
+> screen refuses as `liquidity_unmeasured` rather than asserting an asset is thin. The bound
+> holds for any venue share below 100%, so no percentage is encoded anywhere in the code —
+> `keel/data/feed_scope.py` carries the argument, and a test greps its body to keep a market
+> share from ever being multiplied into a volume statistic.
+>
+> Provenance is now recorded per series at fetch time (`candle_series_feed`, schema v17), so
+> the feed is no longer inferred from whatever config is loaded when someone reads the series,
+> and `doctor`'s `data.feed_scope` reports which cached series carry a bound rather than a
+> measurement. Series cached before v17 read as *unrecorded* — deliberately distinct from
+> *partial*, since one should be re-fetched and the other may already be consolidated.
+
 ## Finding 3 — the crypto model is validated, in passing
 
 332.27bp modelled against 306.31bp measured, conservative by 8%, using an estimator with no

@@ -78,7 +78,7 @@ WAIVABLE_CRITERIA = frozenset({"history"})
 #: callers import it (or, better, call `split_failures`/`missing_history_lines` below rather than
 #: reimplementing the split) so a tag rename here cannot silently disable the suppression
 #: elsewhere.
-DATA_DERIVED_FAILURES = frozenset({"history", "liquidity"})
+DATA_DERIVED_FAILURES = frozenset({"history", "liquidity", "liquidity_unmeasured"})
 
 
 @dataclass(frozen=True)
@@ -155,6 +155,17 @@ class MarketFacts:
     #: silently inherit "Coinbase, therefore spot" -- the fail-OPEN answer to the one question
     #: this field was added to ask. A construction site that forgets it must fail at the call.
     venue: str
+    #: Which data feed the cached candles came from (`candle_series_feed`, #696), or `None` when
+    #: unrecorded -- every series cached before that table existed.
+    volume_feed: str | None = None
+    #: Whether that feed reports CONSOLIDATED market volume. `True` = the statistic measures the
+    #: market; `False` = it is a LOWER BOUND on it; `None` = unrecorded, which is the absence of
+    #: evidence and NOT the same as either.
+    #:
+    #: Defaults are safe here, unlike `product_id`'s: a caller that forgets these gets `None`,
+    #: which preserves the pre-#696 verdict exactly rather than silently admitting or refusing
+    #: anything new.
+    volume_feed_is_consolidated: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -233,10 +244,34 @@ def screen_asset(
                 f"history: {facts.daily_bars} daily bars < {policy.min_daily_bars} required "
                 "(a rule cannot be validated on a series shorter than its evidence needs)"
             )
-    if facts.median_daily_volume < policy.min_median_daily_volume:
+    if facts.median_daily_volume >= policy.min_median_daily_volume:
+        # CONCLUSIVE, on any feed. Venue volume is a LOWER BOUND on consolidated volume, so a
+        # name that traded this much on one venue alone necessarily traded at least this much in
+        # total (#696). Refusing here would ban the most liquid securities in the world for
+        # thinness they do not have.
+        pass
+    elif facts.volume_feed_is_consolidated is False:
+        # NOT a verdict. Below the floor on a single-venue feed is equally consistent with a thin
+        # asset and with a liquid one that barely trades HERE, and the gate has measured neither.
+        # Saying "illiquid" would assert the half it cannot see.
+        # `:,` on a Decimal keeps whatever exponent the arithmetic produced -- `Decimal("5E+5")`
+        # formats as `5E+5`, not `500,000`, and `volume * close` can land in that form. An
+        # operator comparing `5E+5` against `1,000,000` is being asked to do the wrong work.
+        observed = _dollars(facts.median_daily_volume)
+        floor = _dollars(policy.min_median_daily_volume)
+        failures.append(
+            f"liquidity_unmeasured: {facts.volume_feed} reports one venue's own executions, and "
+            f"its median daily volume {observed} is below the {floor} floor -- so CONSOLIDATED "
+            "volume is UNMEASURED, not low. Re-fetch this series under a consolidated feed to "
+            "decide it"
+        )
+    else:
+        scope = (
+            "" if facts.volume_feed_is_consolidated else " (feed scope unrecorded for this series)"
+        )
         failures.append(
             f"liquidity: median daily volume {facts.median_daily_volume} < "
-            f"{policy.min_median_daily_volume} required"
+            f"{policy.min_median_daily_volume} required{scope}"
         )
     if policy.require_settlement_quote and not facts.quotable_in_settlement_currency:
         failures.append(
@@ -490,6 +525,17 @@ class DiscoveryPolicy:
     #: This bounds how many products get probed for history; it is not a liquidity verdict.
     #: `--probe-liquidity` computes the gate's own statistic and is the honest estimator of that.
     min_quote_24h_volume: Decimal = Decimal("100000")
+
+
+def _dollars(amount: Decimal) -> str:
+    """`$1,234,567` -- thousands-separated, exponent form normalised away.
+
+    `f"{Decimal('5E+5'):,}"` is `5E+5`: Decimal preserves the exponent its arithmetic produced,
+    and `format` does not normalise it. Every figure this renders comes from `volume * close`,
+    so the form is not hypothetical, and these strings are read by an operator deciding whether
+    a series is worth re-fetching.
+    """
+    return f"${amount.quantize(Decimal(1)):,}"
 
 
 def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:

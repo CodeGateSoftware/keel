@@ -40,6 +40,7 @@ import click
 from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
+from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
 from keel.execution import sizing
 from keel.types import Granularity
@@ -819,6 +820,90 @@ def balance_drift_findings(records: dict[str, Any]) -> list[Finding]:
     ]
 
 
+def feed_scope_findings(series_feeds: dict[tuple[str, str], tuple[str, ...]]) -> list[Finding]:
+    """Cached series whose volume statistic is a LOWER BOUND rather than a measurement (#696).
+
+    `median_daily_quote_volume` is read by the admission floor, by
+    `slippage_for_quote_volume`, and by the asset scout's discovery probe. On a feed that reports
+    one venue's own executions it is a bound on the market, not the market -- the cost-fidelity
+    run measured MSFT cached at $186M/day and priced it as thinner than the model's reference
+    liquidity.
+
+    `screen_asset` already refuses honestly at screen time. This exists because that only fires
+    for a candidate somebody is actively screening, while the slippage model prices off the same
+    number on EVERY cycle and says nothing. The bound is invisible unless something reports it.
+
+    WARN, never FAIL. A single-venue feed is a legitimate configuration -- it is the free tier,
+    and the asymmetric bound admits the liquid names from it honestly (volume at or above the
+    floor on one venue proves the floor is cleared). What is not legitimate is not knowing.
+
+    UNRECORDED series are reported SEPARATELY from partial ones, because they are different
+    facts: a partial series should be re-fetched under a consolidated feed, an unrecorded one may
+    already BE consolidated and simply predates the provenance table. Telling an operator to
+    re-fetch the second would be advice based on the absence of evidence.
+    """
+    partial: list[tuple[str, str, str]] = []
+    unrecorded: list[str] = []
+    for (product, granularity), feeds in sorted(series_feeds.items()):
+        if not feeds:
+            unrecorded.append(f"{product} {granularity}")
+        elif reports_consolidated_volume(feeds) is False:
+            partial.append((product, granularity, ", ".join(feeds)))
+
+    if not partial and not unrecorded:
+        total = len(series_feeds)
+        return [
+            Finding(
+                "data.feed_scope",
+                OK,
+                "every series' volume is consolidated" if total else "no cached series to judge",
+                f"{total} series carry a recorded, consolidated feed -- the liquidity statistic "
+                "measures the market rather than bounding it"
+                if total
+                else "nothing cached yet",
+                "-",
+            )
+        ]
+
+    # BOTH groups, in ONE finding. They coexist in the ordinary case -- equities on a
+    # single-venue feed alongside crypto series cached before provenance existed -- and an
+    # early return on `partial` dropped the unrecorded group silently in exactly that
+    # configuration. One finding rather than two keeps `data.feed_scope` a single name in the
+    # report, which the name-coverage pin depends on.
+    headline_parts: list[str] = []
+    detail_parts: list[str] = []
+    fix_parts: list[str] = []
+    if partial:
+        headline_parts.append(f"{len(partial)} series bounded")
+        detail_parts.append(
+            ", ".join(f"{p} {g} ({feeds})" for p, g, feeds in partial)
+            + " -- these feeds report one venue's own executions, so median daily volume is a "
+            "LOWER BOUND on consolidated volume. Above the admission floor that is conclusive; "
+            "below it, nothing is established"
+        )
+        fix_parts.append(
+            "re-fetch a below-floor bounded series under a CONSOLIDATED feed: "
+            "`keel fetch --refresh`"
+        )
+    if unrecorded:
+        headline_parts.append(f"{len(unrecorded)} series unrecorded")
+        detail_parts.append(
+            f"{', '.join(unrecorded)} -- feed provenance UNRECORDED, so whether this volume "
+            "measures the market or bounds it is unknown -- not the same as knowing it is partial"
+        )
+        fix_parts.append("re-fetch an unrecorded series to stamp provenance: `keel fetch`")
+
+    return [
+        Finding(
+            "data.feed_scope",
+            WARN,
+            ", ".join(headline_parts),
+            "; ".join(detail_parts),
+            " | ".join(fix_parts),
+        )
+    ]
+
+
 def orphan_bracket_findings(records: dict[str, Any]) -> list[Finding]:
     """Resting SELLs the orphan sweep cancelled because the account no longer held them (#668).
 
@@ -1221,6 +1306,32 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     market_closed = agent.recorded_market_closed(repo, config, now_ts)
     start_ts = now_ts - DOCTOR_WINDOW_SEC
 
+    # Computed ONCE and read twice: the health report needs every row, and the feed-scope
+    # report needs to know which series actually HAVE bars.
+    health = fetch.assess_products(
+        repo,
+        products,
+        granularities,
+        now_ts,
+        start_ts,
+        freshness_mod.DEFAULT_TOLERANCE_BARS,
+        market_closed,
+    )
+
+    # #696. Only series that carry candles. A never-fetched series has no provenance because it
+    # has no BARS, not because it predates the provenance table -- `data.missing` already reports
+    # an empty series, and on a fresh deployment this would otherwise say "predates feed
+    # provenance" about every one of them.
+    findings += feed_scope_findings(
+        {
+            (row.product, row.granularity.value): repo.get_series_feeds(
+                row.product, row.granularity
+            )
+            for row, _unexplained in health
+            if row.n_candles > 0
+        }
+    )
+
     findings += data_health_findings(
         [
             SeriesHealth(
@@ -1229,15 +1340,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
                 freshness=row,
                 unexplained_gaps=unexplained,
             )
-            for row, unexplained in fetch.assess_products(
-                repo,
-                products,
-                granularities,
-                now_ts,
-                start_ts,
-                freshness_mod.DEFAULT_TOLERANCE_BARS,
-                market_closed,
-            )
+            for row, unexplained in health
         ]
     )
     findings += admissibility_findings(

@@ -48,6 +48,7 @@ from keel.compliance.screen import (
     discover_candidates,
 )
 from keel.config import Config
+from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.repository import Repository
 from keel.types import Granularity
 
@@ -152,6 +153,7 @@ def market_facts(repo: Repository, product: str, quote: str) -> MarketFacts:
     """Everything the screen can compute for itself from data we already hold."""
     asset = product.split("-")[0]
     candles = repo.get_candles(product, Granularity.ONE_DAY)
+    feeds = repo.get_series_feeds(product, Granularity.ONE_DAY)
     return MarketFacts(
         asset=asset,
         daily_bars=len(candles),
@@ -169,6 +171,11 @@ def market_facts(repo: Repository, product: str, quote: str) -> MarketFacts:
         product_id=product,
         # The other half of the key the instrument statement is recorded under. See `VENUE`.
         venue=VENUE,
+        # WHICH FEED the median above was computed from (#696). Read for ONE_DAY specifically,
+        # because that is the granularity the statistic uses -- an hourly series fetched under a
+        # different feed says nothing about this number.
+        volume_feed=", ".join(feeds) or None,
+        volume_feed_is_consolidated=reports_consolidated_volume(feeds),
     )
 
 

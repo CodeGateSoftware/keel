@@ -18,6 +18,7 @@ from pathlib import Path
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel.commands.doctor import (
+    OK,
     AdmissibilityRow,
     Finding,
     SeriesHealth,
@@ -569,6 +570,21 @@ def _seeded_repo(db_path: Path):
     return Repository(conn)
 
 
+def test_feed_scope_ignores_series_with_no_bars(tmp_path, valid_config_path) -> None:
+    """A product that was never fetched has no provenance because it has no CANDLES, not because
+    it predates the provenance table (#696). `data.missing` already reports an empty series; the
+    feed-scope report saying "predates feed provenance" about it is advice from the absence of
+    bars, and on a fresh deployment it would say that about everything.
+    """
+    repo = _seeded_repo(tmp_path / "keel.db")
+    config = load_config(valid_config_path)
+    findings = gather_findings(repo, config, [], NOW)
+    (scope,) = [f for f in findings if f.name == "data.feed_scope"]
+    assert scope.status == OK, scope.detail
+    for product in config.allowlist:
+        assert product not in scope.detail
+
+
 def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_config_path) -> None:
     repo = _seeded_repo(tmp_path / "keel.db")
     config = load_config(valid_config_path)
@@ -594,6 +610,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "data.missing",
         "data.stale",
         "data.gaps",
+        "data.feed_scope",
         "sizing.admissible",
     }
     # an unattested, empty deployment fails the run, exactly as the command does
