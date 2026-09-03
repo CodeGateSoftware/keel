@@ -28,7 +28,9 @@ Alpaca, Coinbase, and Robinhood are trademarks of their respective owners.
 from __future__ import annotations
 
 import json
+import sqlite3
 import textwrap
+import time
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as dist_version
@@ -36,8 +38,14 @@ from pathlib import Path
 from typing import Any
 
 import click
+from keel_core.cash_posture import (
+    MARGIN_ENABLED,
+    CashPostureState,
+    VenueCashPosture,
+)
 
 from keel.commands._common import DISCLAIMER
+from keel.commands.posture import _utc_date
 from keel.venue_readiness import VenueReadinessRow, gather_readiness
 
 #: The venues a SHIPPED deployment selects -- the whole wired/optional classification, in
@@ -325,6 +333,113 @@ def render_readiness_lines(rows: list[VenueReadinessRow]) -> list[str]:
     return lines
 
 
+#: The line the posture block ends on, and it is not decoration. Every other readiness-adjacent
+#: surface in keel reports something it CHECKED; this one reports something no venue will confirm.
+#: A reader who takes these rows for verification has the guarantee backwards -- which is the one
+#: misreading `docs/fiqh-basis.md`'s cash-posture section exists to prevent.
+CASH_POSTURE_HONESTY_LINE = (
+    "  No venue exposes a cash-versus-margin field for spot, so these are the OPERATOR's "
+    "statements, expiring on a clock. Venue evidence can refute one; nothing can confirm one."
+)
+
+
+def render_cash_posture_lines(
+    records: list[VenueCashPosture], *, now_ts: int, unreadable: bool = False
+) -> list[str]:
+    """The cash-posture block (#691): what a human has stated about each venue account.
+
+    A THIRD block, after declarations and readiness, and that follows this codebase's own
+    argument rather than a preference. `keel/venue_readiness.py` renders readiness separately
+    because merging two different questions "would re-blur exactly the distinction #233 exists to
+    draw". Posture is a third question -- readiness asks whether this CREDENTIAL may trade,
+    posture asks whether this ACCOUNT can borrow -- and folding it into either would repeat the
+    mistake both were shaped to avoid.
+
+    PURE over the records it is handed. Sorted by venue so the same database renders the same
+    text twice.
+    """
+    lines = ["", "cash posture (rail 22) -- attested by you, refutable by the venue:"]
+    if unreadable:
+        # Deliberately does NOT print the attest command. That prompt is the thing this whole
+        # distinction exists to withhold: the record may be perfectly good and merely unread,
+        # and re-attesting over it would reset its clock on an unchecked account.
+        lines.append(
+            "  a database is present but could not be read -- whether a posture is attested is "
+            "UNKNOWN, which is not the same as nothing being attested"
+        )
+        lines.append(CASH_POSTURE_HONESTY_LINE)
+        return lines
+    if not records:
+        lines.append("  no venue has an attested cash posture -- rail 22 vetoes live ENTRIES")
+        lines.append("  next: keel posture attest --spot-cash")
+        lines.append(CASH_POSTURE_HONESTY_LINE)
+        return lines
+    for record in sorted(records, key=lambda r: r.venue):
+        state = record.state.value.upper()
+        if record.state is CashPostureState.ATTESTED and not record.is_current(now_ts):
+            state = "EXPIRED"
+        expires = (
+            _utc_date(record.attest_due_ts) if record.attest_due_ts is not None else "never set"
+        )
+        lines.append(
+            f"  {record.venue}: {state} attested={record.attested_posture} expires={expires}"
+        )
+        if record.attested_posture == MARGIN_ENABLED:
+            lines.append("    margin-enabled: rail 22 vetoes live ENTRIES on this venue")
+        if record.refuted_ts is not None:
+            reason = f": {record.refuted_reason}" if record.refuted_reason else ""
+            lines.append(
+                f"    venue evidence contradicted a claim here on "
+                f"{_utc_date(record.refuted_ts)}{reason}"
+            )
+    lines.append(CASH_POSTURE_HONESTY_LINE)
+    return lines
+
+
+def _cash_posture_records(
+    ctx: click.Context,
+) -> tuple[list[VenueCashPosture], bool]:
+    """`(records, unreadable)` -- never raises, never migrates, never writes, never creates a file.
+
+    THE TUPLE IS NOT DECORATION, and `venue_readiness._read_only_trade_scope` already paid for
+    this lesson one function away: returning a bare empty list for both "nothing is attested" and
+    "there is a database this process could not read" lets the display assert the former about
+    the latter, and then advise `keel posture attest --spot-cash`. That is worse here than it is
+    for trade scope -- re-attesting resets `attested_ts` and `attest_due_ts`, and the TTY gate
+    would ask the operator to affirm a cash account they may not have re-checked. A display bug
+    would become a prompt to make an unverified claim.
+
+    ⚠️ **Not `keel.data.db.connect`**, for the reason that function's own docstring gives: it is
+    the read-WRITE opener, it runs `PRAGMA journal_mode = WAL` on whatever it opens, and a
+    read-only informational command must not modify the deployment database or leave `-wal`/`-shm`
+    sidecars behind. The `mode=ro` URI shape (#610's seam) is what a display path uses, with an
+    existence check in front of it because `mode=ro`'s own refusal is an exception and this path
+    wants an ANSWER.
+    """
+    obj = ctx.obj or {}
+    db_path = obj.get("db_path")
+    if db_path is None or not Path(db_path).exists():
+        # NOT "unreadable": there is no deployment, so "nothing is attested" is a true statement
+        # about this machine rather than an admission of ignorance.
+        return [], False
+    conn = None
+    try:
+        from keel.data.repository import Repository
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return Repository(conn).list_venue_cash_postures(), False
+    except Exception:
+        # A file IS there and this process could not read it: a schema older than v18, a
+        # permissions problem, or a WAL database whose `-shm` sidecar is absent (every copied
+        # backup has that shape), which `mode=ro` cannot open because SQLite would have to CREATE
+        # it. Reported as unknown, never as "nothing is attested".
+        return [], True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _readiness_rows(ctx: click.Context) -> list[VenueReadinessRow]:
     """Gathers this deployment's readiness rows for `keel brokers list` -- `gather_readiness`'s
     CLI wiring, the same service `/api/venues` wires to a repo it knows is migrated.
@@ -393,6 +508,11 @@ def brokers_list(ctx: click.Context, as_json: bool) -> None:
     for line in render_brokers_lines(infos):
         click.echo(line)
     for line in render_readiness_lines(_readiness_rows(ctx)):
+        click.echo(line)
+    posture_records, posture_unreadable = _cash_posture_records(ctx)
+    for line in render_cash_posture_lines(
+        posture_records, now_ts=int(time.time()), unreadable=posture_unreadable
+    ):
         click.echo(line)
     click.echo("")
     click.echo(DISCLAIMER)

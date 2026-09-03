@@ -233,9 +233,12 @@ found from. The trigger is the venue's own statement, never keel's ledger: cance
 over a position that really exists strips a live holding of its only protection, and the ledger
 can be stale in exactly that direction.
 
-What remains open at the venue boundary is #666: on a cash account every case above is a
-rejected order rather than a short, and keel has no cash-account posture check on Coinbase —
-`verify_cash_account` exists only on the Alpaca adapter.
+At the venue boundary the distinction that matters is the account's posture: on a cash account
+every case above is a rejected order rather than a short. Both adapters now carry a
+`verify_cash_account` check (#666), and **rail 22** (#691) reads a per-venue operator attestation
+of that posture, vetoing new ENTRIES when none stands. Neither the check nor the rail can affirm
+a cash account — see "Nothing can affirm that the account cannot go short" below for what that
+means and what carries the residual.
 
 Beside the rails — not among them, and not numbered — sits one routing-time check with the
 same prudential character: the **max-spread entry gate** (#350, `keel/execution/executor.py`)
@@ -321,10 +324,33 @@ Stated, not hidden — each is a place where keel's encoded behaviour could be w
   possession, and here silence is not evidence of a cash account either.
 
   So the layered defence is sound whenever the venue contradicts itself, and rests on the
-  operator's own knowledge whenever it does not. That residual is a human attestation this
-  repository has not yet built — the second half of the #233 pattern, where venue evidence can
-  refute an attestation but cannot manufacture one. Until it exists, "this account cannot go
-  short" is something the operator knows and keel does not.
+  operator's own knowledge whenever it does not. **Since 2026-09-03 that residual is recorded
+  rather than merely acknowledged (#691).** `keel posture attest --spot-cash` writes a per-venue
+  claim; **rail 22** vetoes new ENTRIES — and only entries, never an exit — when none stands.
+  This is the second half of the #233 pattern: venue evidence can refute an attestation and
+  cannot manufacture one, so an INTX portfolio found at broker-build marks a standing claim
+  REFUTED, and nothing ever marks one confirmed.
+
+  Three properties of that record are load-bearing, and none is incidental:
+
+  - **There is no `CONFIRMED` state.** Trade scope has one because the venue re-proves it on
+    every accepted placement. Nothing can ever prove a spot account is cash-only, so a
+    `CONFIRMED` value would be a state nothing is entitled to write — and an unreachable state is
+    one a later reader eventually writes anyway. Its absence is the design.
+  - **The claim EXPIRES**, after 90 days. Nothing re-confirms it, ever, so a due date is the only
+    thing standing between a lapsed claim and a live entry — the same reasoning as the
+    subscription record, which is likewise user-asserted with no observation channel. `doctor`
+    warns 15 days out rather than at the cliff.
+  - **The claim is about a credential, not just a venue.** A posture attested under one
+    credential is not a claim about the account another credential reaches (#633), so a rotated
+    key withdraws permission until the operator re-attests.
+
+  What has NOT changed is the epistemics, and this is the sentence to keep if only one survives:
+  **keel still cannot verify this, and neither can the venue.** What the engine now does is
+  record a human's statement, expire it on a clock, let venue evidence contradict it, and refuse
+  to trade without it. "This account cannot go short" remains something the operator knows and
+  keel takes on trust — the difference is that the trust is now dated, revocable, and written
+  down, rather than assumed.
 
 - **ZEC and the rest of the deferrals.** The candidate-universe record lists the open
   questions the attestation step has to answer and "which this agent must not answer".
