@@ -856,9 +856,7 @@ def feed_scope_findings(series_feeds: dict[tuple[str, str], tuple[str, ...]]) ->
             Finding(
                 "data.feed_scope",
                 OK,
-                "every series' volume is consolidated"
-                if total
-                else "no cached series to judge",
+                "every series' volume is consolidated" if total else "no cached series to judge",
                 f"{total} series carry a recorded, consolidated feed -- the liquidity statistic "
                 "measures the market rather than bounding it"
                 if total
@@ -867,30 +865,41 @@ def feed_scope_findings(series_feeds: dict[tuple[str, str], tuple[str, ...]]) ->
             )
         ]
 
+    # BOTH groups, in ONE finding. They coexist in the ordinary case -- equities on a
+    # single-venue feed alongside crypto series cached before provenance existed -- and an
+    # early return on `partial` dropped the unrecorded group silently in exactly that
+    # configuration. One finding rather than two keeps `data.feed_scope` a single name in the
+    # report, which the name-coverage pin depends on.
+    headline_parts: list[str] = []
+    detail_parts: list[str] = []
+    fix_parts: list[str] = []
     if partial:
-        described = ", ".join(f"{p} {g} ({feeds})" for p, g, feeds in partial)
-        return [
-            Finding(
-                "data.feed_scope",
-                WARN,
-                f"{len(partial)} series' volume is a LOWER BOUND, not a measurement",
-                f"{described} -- these feeds report one venue's own executions, so "
-                "median daily volume is a lower bound on consolidated volume. Above the "
-                "admission floor that is conclusive; below it, nothing is established",
-                "re-fetch under a consolidated feed to decide a below-floor series: "
-                "`keel fetch --refresh`",
-            )
-        ]
+        headline_parts.append(f"{len(partial)} series bounded")
+        detail_parts.append(
+            ", ".join(f"{p} {g} ({feeds})" for p, g, feeds in partial)
+            + " -- these feeds report one venue's own executions, so median daily volume is a "
+            "LOWER BOUND on consolidated volume. Above the admission floor that is conclusive; "
+            "below it, nothing is established"
+        )
+        fix_parts.append(
+            "re-fetch a below-floor bounded series under a CONSOLIDATED feed: "
+            "`keel fetch --refresh`"
+        )
+    if unrecorded:
+        headline_parts.append(f"{len(unrecorded)} series unrecorded")
+        detail_parts.append(
+            f"{', '.join(unrecorded)} -- feed provenance UNRECORDED, so whether this volume "
+            "measures the market or bounds it is unknown -- not the same as knowing it is partial"
+        )
+        fix_parts.append("re-fetch an unrecorded series to stamp provenance: `keel fetch`")
 
     return [
         Finding(
             "data.feed_scope",
             WARN,
-            f"{len(unrecorded)} series predate feed provenance",
-            f"{', '.join(unrecorded)} -- feed provenance UNRECORDED, so whether this "
-            "volume measures the market or bounds it is unknown -- not the same as "
-            "knowing it is partial",
-            "re-fetch to stamp provenance: `keel fetch`",
+            ", ".join(headline_parts),
+            "; ".join(detail_parts),
+            " | ".join(fix_parts),
         )
     ]
 
@@ -1297,15 +1306,29 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     market_closed = agent.recorded_market_closed(repo, config, now_ts)
     start_ts = now_ts - DOCTOR_WINDOW_SEC
 
-    # #696. The same (product, granularity) set the health report covers -- the series whose
-    # volume the slippage model and the admission floor actually read.
+    # Computed ONCE and read twice: the health report needs every row, and the feed-scope
+    # report needs to know which series actually HAVE bars.
+    health = fetch.assess_products(
+        repo,
+        products,
+        granularities,
+        now_ts,
+        start_ts,
+        freshness_mod.DEFAULT_TOLERANCE_BARS,
+        market_closed,
+    )
+
+    # #696. Only series that carry candles. A never-fetched series has no provenance because it
+    # has no BARS, not because it predates the provenance table -- `data.missing` already reports
+    # an empty series, and on a fresh deployment this would otherwise say "predates feed
+    # provenance" about every one of them.
     findings += feed_scope_findings(
         {
-            (product, Granularity(granularity).value): repo.get_series_feeds(
-                product, granularity
+            (row.product, row.granularity.value): repo.get_series_feeds(
+                row.product, row.granularity
             )
-            for product in products
-            for granularity in granularities
+            for row, _unexplained in health
+            if row.n_candles > 0
         }
     )
 
@@ -1317,15 +1340,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
                 freshness=row,
                 unexplained_gaps=unexplained,
             )
-            for row, unexplained in fetch.assess_products(
-                repo,
-                products,
-                granularities,
-                now_ts,
-                start_ts,
-                freshness_mod.DEFAULT_TOLERANCE_BARS,
-                market_closed,
-            )
+            for row, unexplained in health
         ]
     )
     findings += admissibility_findings(

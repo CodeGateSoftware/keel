@@ -81,3 +81,47 @@ def test_the_fix_line_says_the_re_fetch_must_be_under_a_different_feed() -> None
     (finding,) = feed_scope_findings({("MSFT-USD", "ONE_DAY"): ("alpaca:iex",)})
     assert "keel fetch" in finding.fix
     assert "consolidated" in finding.fix.lower()
+
+
+# --- the two states coexist, because that IS this deployment --------------------------------
+
+
+def test_partial_and_unrecorded_are_both_reported_when_both_exist() -> None:
+    """The normal state of this deployment: equities on a single-venue feed, plus legacy crypto
+    series cached before provenance existed. An early return on the partial group dropped the
+    unrecorded one entirely -- and every test here exercised one category alone, which is
+    exactly how that survived.
+    """
+    (finding,) = feed_scope_findings(
+        {
+            ("MSFT-USD", "ONE_DAY"): ("alpaca:iex",),
+            ("ETH-USD", "ONE_DAY"): (),
+        }
+    )
+    assert finding.status == WARN
+    assert "MSFT-USD" in finding.detail
+    assert "ETH-USD" in finding.detail, "the unrecorded series was dropped"
+    assert "lower bound" in finding.detail.lower()
+    assert "unrecorded" in finding.detail.lower()
+
+
+def test_the_fix_covers_both_remedies_when_both_states_exist() -> None:
+    """They are different actions: re-fetch a partial series under a CONSOLIDATED feed; re-fetch
+    an unrecorded one under any feed just to stamp it."""
+    (finding,) = feed_scope_findings(
+        {("MSFT-USD", "ONE_DAY"): ("alpaca:iex",), ("ETH-USD", "ONE_DAY"): ()}
+    )
+    assert "consolidated" in finding.fix.lower()
+    assert "keel fetch" in finding.fix
+
+
+def test_the_headline_counts_both_groups() -> None:
+    findings = feed_scope_findings(
+        {
+            ("MSFT-USD", "ONE_DAY"): ("alpaca:iex",),
+            ("AAPL-USD", "ONE_DAY"): ("alpaca:iex",),
+            ("ETH-USD", "ONE_DAY"): (),
+        }
+    )
+    (finding,) = findings
+    assert "2" in finding.headline and "1" in finding.headline

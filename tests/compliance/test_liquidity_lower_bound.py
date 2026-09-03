@@ -181,3 +181,23 @@ def test_the_new_tag_is_not_waivable_yet() -> None:
     The module says expanding this set is a decision, not a default, and no attestation record
     exists for volume today -- a waiver with nothing to record would be a rubber stamp."""
     assert "liquidity_unmeasured" not in WAIVABLE_CRITERIA
+
+
+def test_an_exponent_form_decimal_is_still_printed_as_dollars() -> None:
+    """`f"{Decimal('5E+5'):,}"` is `5E+5`, not `500,000` -- Decimal keeps the exponent its
+    arithmetic produced. The median is `volume * close`, so exponent form is reachable, and this
+    string is what an operator reads to decide whether $500,000 against a $1,000,000 floor is
+    worth a re-fetch. `5E+5` against `1,000,000` is not a comparison anyone should have to make.
+    """
+    asset, instrument = _clean_attestations()
+    facts = _facts("5E+5", scope=False)
+    assert facts.median_daily_volume == Decimal("500000")  # same number, different form
+    result = screen_asset(
+        facts,
+        asset,
+        policy=ScreenPolicy(min_median_daily_volume=_FLOOR, min_daily_bars=1),
+        instrument=instrument,
+    )
+    line = next(f for f in result.failures if f.startswith("liquidity_unmeasured"))
+    assert "500,000" in line
+    assert "E+" not in line

@@ -254,11 +254,16 @@ def screen_asset(
         # NOT a verdict. Below the floor on a single-venue feed is equally consistent with a thin
         # asset and with a liquid one that barely trades HERE, and the gate has measured neither.
         # Saying "illiquid" would assert the half it cannot see.
+        # `:,` on a Decimal keeps whatever exponent the arithmetic produced -- `Decimal("5E+5")`
+        # formats as `5E+5`, not `500,000`, and `volume * close` can land in that form. An
+        # operator comparing `5E+5` against `1,000,000` is being asked to do the wrong work.
+        observed = _dollars(facts.median_daily_volume)
+        floor = _dollars(policy.min_median_daily_volume)
         failures.append(
             f"liquidity_unmeasured: {facts.volume_feed} reports one venue's own executions, and "
-            f"its median daily volume ${facts.median_daily_volume:,} is below the "
-            f"${policy.min_median_daily_volume:,} floor -- so CONSOLIDATED volume is UNMEASURED, "
-            "not low. Re-fetch this series under a consolidated feed to decide it"
+            f"its median daily volume {observed} is below the {floor} floor -- so CONSOLIDATED "
+            "volume is UNMEASURED, not low. Re-fetch this series under a consolidated feed to "
+            "decide it"
         )
     else:
         scope = (
@@ -520,6 +525,17 @@ class DiscoveryPolicy:
     #: This bounds how many products get probed for history; it is not a liquidity verdict.
     #: `--probe-liquidity` computes the gate's own statistic and is the honest estimator of that.
     min_quote_24h_volume: Decimal = Decimal("100000")
+
+
+def _dollars(amount: Decimal) -> str:
+    """`$1,234,567` -- thousands-separated, exponent form normalised away.
+
+    `f"{Decimal('5E+5'):,}"` is `5E+5`: Decimal preserves the exponent its arithmetic produced,
+    and `format` does not normalise it. Every figure this renders comes from `volume * close`,
+    so the form is not hypothetical, and these strings are read by an operator deciding whether
+    a series is worth re-fetching.
+    """
+    return f"${amount.quantize(Decimal(1)):,}"
 
 
 def median_daily_quote_volume(candles: Sequence[Any]) -> Decimal:
