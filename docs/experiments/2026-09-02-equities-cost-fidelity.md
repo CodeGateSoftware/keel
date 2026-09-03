@@ -4,8 +4,8 @@
 factor of 141.** keel's cost model is close to right on crypto (it charges 332bp against a
 measured 306bp, conservative by 8%) and wrong by 7.5× on equities, where it charges 16.4bp
 against a measured 2.2bp. Both errors are now explained, and the equities one has a specific
-cause: the IEX feed reports only IEX's own executions, so keel's liquidity statistic reads
-MSFT as a $186M/day product when it trades several billion.
+cause: the equities profile runs on a single-venue (IEX) feed, so keel's liquidity statistic
+reads MSFT as a $186M/day product and prices it as thinner than the model's reference liquidity.
 
 The PRD makes this a precondition — "no strategy claim is believed before it" (§6.3, O4) — and
 that ordering earned its keep. `config.paper-equities.yaml` ships `taker_pct: 0.0`, honestly
@@ -39,10 +39,10 @@ Round trip = commission (both legs) + spread (half per leg) + regulatory (sell o
 
 | ticker | bars | spread bp | naive bp | raw bp | reg bp | measured RT bp | keel charges bp |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| GOOGL | 1253 | 1.29 | 44.83 | -44.21 | 0.2339 | **1.51** | 18.46 |
+| GOOGL | 1253 | 1.29 | 44.83 | -44.21 | 0.2339 | **1.52** | 18.46 |
 | COST | 1253 | 1.36 | 34.81 | -27.66 | 0.2308 | **1.59** | 33.57 |
 | MSFT | 1253 | 1.94 | 41.82 | -32.21 | 0.2323 | **2.17** | 16.38 |
-| AAPL | 1253 | 2.83 | 43.55 | -32.96 | 0.2341 | **3.07** | 15.21 |
+| AAPL | 1253 | 2.83 | 43.55 | -32.96 | 0.2341 | **3.06** | 15.21 |
 | NVDA | 1253 | 4.50 | 77.48 | -63.29 | 0.2364 | **4.74** | 12.90 |
 
 | | median spread | median measured RT | median keel charges | model error |
@@ -86,7 +86,7 @@ asset class this measurement exists to price. `keel.research.spread` keeps both 
 reachable, because the comparison between them is itself the finding, and the biased one is
 what makes the bias demonstrable rather than folklore.
 
-## Finding 2 — keel reads MSFT as a thin asset, because IEX is 2% of the market
+## Finding 2 — keel reads MSFT as a thin asset, because a single-venue feed is not the market
 
 `slippage_for_quote_volume` keys off `median_daily_quote_volume` computed from cached candles,
 against a $500M/day anchor with a 5bp floor. What it sees:
@@ -100,14 +100,25 @@ against a $500M/day anchor with a 5bp floor. What it sees:
 | COST | $44,370,750 | 16.78bp |
 
 Every one sits below the anchor, so every one is priced as *thinner than the model's reference
-liquidity*. MSFT's real consolidated volume is several billion dollars a day. The cached figure
-is roughly 2% of it — which is approximately IEX's share of US equity volume, and the equities
-profile runs on the IEX feed by configuration.
+liquidity* — including MSFT, which is not a thin instrument by any reading.
 
-**The candles are not wrong; the statistic is being asked a question the feed cannot answer.**
-IEX reports its own executions faithfully. A model keyed on that volume will misread every US
-equity as ~50× thinner than it is, and will do so silently, because nothing in the pipeline
-knows the difference between "this product is thin" and "this feed sees 2% of the market".
+The mechanism does not need a market-share statistic to establish, and is stated structurally
+here for that reason. **The equities profile runs on Alpaca's IEX feed by configuration, and
+IEX is one exchange among the many US venues (plus off-exchange execution) that make up
+consolidated volume.** A single-venue feed therefore reports a fraction of consolidated volume
+BY CONSTRUCTION, however faithfully it reports its own executions. Any statistic that treats
+that fraction as though it were the whole market will understate liquidity by whatever that
+venue's share happens to be, on every symbol, silently — because nothing in the pipeline
+distinguishes "this product is thin" from "this feed sees part of the market".
+
+For scale, and flagged as an order-of-magnitude expectation rather than a measurement: IEX
+publishes its own overall share as roughly 3.8% for Q2 2026 ([iex.io](https://www.iex.io/news),
+the operator's own figure, not independently verified here), and the cached MSFT series is a
+low-single-digit percentage of the consolidated volume a mega-cap of that size is generally
+understood to trade. **This document does not measure either quantity**, and no number in the
+tables above depends on them — the finding is that the statistic is structurally unable to
+answer the question, not that it is off by a specific factor. Establishing the actual factor is
+part of #696, not of this document.
 
 This is the SIP-vs-IEX data-tier implication #371 asked about, and it is more consequential than
 the fee question it was filed beside. Two consequences worth separating:
@@ -116,7 +127,7 @@ the fee question it was filed beside. Two consequences worth separating:
    anyway, and even the floor is ~2.5× the measured 1.94bp spread. Both the floor and the
    volume statistic are crypto-shaped.
 2. **For anything else keyed on volume** — liquidity screens, admission floors, the asset
-   scout's `--probe-liquidity` — the same 50× understatement applies, and a genuinely liquid
+   scout's `--probe-liquidity` — the same understatement applies, and a genuinely liquid
    equity could be refused admission for thinness it does not have. That direction fails
    closed, so it is safe — but safe for the wrong reason, and it will misinform any equities
    universe decision. Filed as **#696**; nothing in this document changes it.

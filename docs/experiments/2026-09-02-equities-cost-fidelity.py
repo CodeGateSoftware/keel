@@ -129,7 +129,12 @@ def measure(db: str, product_id: str, asset_class: str) -> dict[str, object] | N
     # beside the estimated spread. Omitting them would compare an equities total that is
     # ~all spread against a crypto total that is ~all fee, and understate crypto 5-fold.
     commission_bp = (Decimal("0") if asset_class == "equities" else 2 * TAKER_FEE_PCT) * 10000
-    measured_rt_bp = commission_bp + 2 * est.half_spread_bp + reg_bp
+    # `est.spread_bp`, NOT `2 * est.half_spread_bp`: the half is quantised to 0.01bp before
+    # doubling, so the round trip disagreed with the spread column it is derived from by up to
+    # 0.01bp in either direction (GOOGL published 1.29 and used 1.28; AAPL 2.83 and used 2.84).
+    # Immaterial to the conclusion, and a table whose columns do not add up invites the reader
+    # to distrust the ones that matter.
+    measured_rt_bp = commission_bp + est.spread_bp + reg_bp
 
     return {
         "product_id": product_id,

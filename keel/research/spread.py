@@ -127,8 +127,14 @@ class SpreadEstimate:
 
     @property
     def negative_pair_share(self) -> Decimal:
-        """How much of the series floored to zero -- the noise diagnostic. Above roughly half
-        and the mean is being carried by a minority of pairs."""
+        """How much of the series estimated a negative spread -- the noise diagnostic.
+
+        NOT "how much floored to zero": under the default block aggregation a negative PAIR
+        does not floor, it averages against the positives inside its block, and only a
+        negative BLOCK mean floors. (Under `block_size=None` the two coincide, which is
+        exactly the conflation that makes that variant biased.) Read it as signal-to-noise:
+        approaching half means the estimator cannot resolve a spread in this series at this
+        frequency, whichever aggregation is then applied."""
         if self.pairs == 0:
             return Decimal("0")
         return (Decimal(self.negative_pairs) / Decimal(self.pairs)).quantize(Decimal("0.0001"))
@@ -192,7 +198,21 @@ def corwin_schultz_spread(
     or no usable pair. That is a different statement from an estimate of zero, and a caller
     must not read the two the same way: one says the venue is cheap, the other says the
     question was not answered.
+
+    **PRECONDITION, UNCHECKED: `candles` must be CONSECUTIVE bars of one series.** `ts` is
+    never read. Every adjacent pair is treated as a two-day pair, so a series with a hole in
+    it -- a fetch gap, two series concatenated, a filtered subset -- prices that hole as an
+    overnight move and returns a number with no warning attached. Blocks are likewise formed
+    over usable PAIRS, not over calendar time, so a gappy series' "month" can span far more
+    than a month. Checking adjacency here would need a granularity this function is not given;
+    the caller has it, and owns this.
     """
+    if block_size is not None and block_size < 1:
+        # Caught by name rather than left to the slice arithmetic: 0 reached `range(step=0)`
+        # and negatives produced an empty block list to divide by. `None` is the one
+        # non-positive-integer value with a meaning, and it keeps it.
+        raise ValueError(f"block_size must be a positive integer or None; got {block_size!r}")
+
     estimates: list[float] = []
     negative = 0
     gapped = 0

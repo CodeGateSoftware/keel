@@ -226,6 +226,18 @@ def test_a_floored_block_still_counts_toward_the_average() -> None:
     )
 
 
+def test_a_block_size_that_cannot_form_a_block_is_refused() -> None:
+    """Zero and negative block sizes are rejected by name rather than by whatever the slice
+    arithmetic happens to raise -- `block_size=0` reached `range(step=0)` and `-1` divided by
+    an empty block list. `None` is the one non-positive-integer value with a meaning, and it
+    keeps it."""
+    candles = [_c("101", "99", ts=i) for i in range(30)]
+    for bad in (0, -1, -21):
+        with pytest.raises(ValueError, match="block_size"):
+            corwin_schultz_spread(candles, block_size=bad)
+    assert corwin_schultz_spread(candles, block_size=None) is not None
+
+
 def test_the_block_size_defaults_to_a_trading_month() -> None:
     assert MONTHLY_BLOCK == 21
 
