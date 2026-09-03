@@ -59,6 +59,12 @@ class DeclaresVolumeFeed(Protocol):
     to implement it would mean editing five packages to add a value four of them would state
     identically -- and a required field invites a placeholder, which is the one value that must
     never enter this table.
+
+    `volume_feed_of` reads the attribute with `getattr` rather than through this Protocol,
+    because presence is not enough -- the value must also be a non-blank string. So the Protocol
+    would drift from the check that actually matters unless something asserted it:
+    `tests/data/test_feed_provenance_is_wired.py::test_both_adapters_satisfy_the_declared_protocol`
+    is what keeps it load-bearing rather than decorative.
     """
 
     @property

@@ -270,9 +270,14 @@ class Repository:
                 " ORDER BY feed",
                 (product_id, Granularity(granularity).value),
             ).fetchall()
-        except sqlite3.OperationalError:
-            # A hand-patched or partially-migrated file must not turn a liquidity read into a
-            # crash. No table is no provenance, which is true.
+        except sqlite3.OperationalError as exc:
+            # ONLY a missing table. A hand-patched or partially-migrated file must not turn a
+            # liquidity read into a crash -- no table is no provenance, which is true. But
+            # `OperationalError` is also what a lock timeout raises, and swallowing THAT would
+            # report "scope unrecorded" for a series whose scope is on disk, which is exactly
+            # the `None`-vs-`False` conflation `feed_scope` exists to prevent.
+            if "no such table" not in str(exc):
+                raise
             return ()
         return tuple(row["feed"] for row in rows)
 
@@ -291,7 +296,9 @@ class Repository:
                 " WHERE product_id = ? AND granularity = ? AND feed = ?",
                 (product_id, Granularity(granularity).value, feed),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):  # a lock is not an absence -- see above
+                raise
             return None
         return None if row is None else (int(row["first_seen_ts"]), int(row["last_seen_ts"]))
 

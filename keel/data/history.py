@@ -189,18 +189,18 @@ def ensure_history(
                     client, repo, product, granularity, step, latest_cached, now_ts,
                     sleep_fn, sleep_sec,
                     feed=feed,
-)
+                )
                 _fill_backward(
                     client, repo, product, granularity, step,
                     earliest_cached - step, start_floor, sleep_fn, sleep_sec,
                     feed=feed,
-)
+                )
             else:
                 _fill_backward(
                     client, repo, product, granularity, step,
                     now_ts, start_floor, sleep_fn, sleep_sec,
                     feed=feed,
-)
+                )
 
             result[(product, granularity)] = coverage(repo, product, granularity, start_floor)
     return result

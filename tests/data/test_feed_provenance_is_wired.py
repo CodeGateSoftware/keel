@@ -16,7 +16,7 @@ from decimal import Decimal
 
 from keel_core.types import Candle, Granularity
 
-from keel.data import history
+from keel.data import history, market_feed, repair
 from keel.data.db import connect, migrate
 from keel.data.feed_scope import volume_feed_of
 from keel.data.repository import Repository
@@ -100,3 +100,61 @@ def test_a_client_that_declares_nothing_records_nothing() -> None:
     )
     assert repo.get_candles("BTC-USD", Granularity.ONE_DAY)
     assert repo.get_series_feeds("BTC-USD", Granularity.ONE_DAY) == ()
+
+
+# --- EVERY writer, not just the one the mechanism was built against ---------------------------
+#
+# The three tests above prove `ensure_history` carries the declaration. They say nothing about
+# the other paths that write candles, and the first review of this branch found that they did
+# not: `market_feed.poll_once` -- the path `agent.run_once` uses on EVERY cycle in every
+# deployment -- and `repair.repair_series` both dropped it. The mechanism worked and was very
+# nearly inert, because `keel fetch` is not how bars normally arrive.
+
+
+class _PollClient(_FeedClient):
+    """Enough of `Broker` for `poll_once`: it only reads candles here."""
+
+    def get_candles(self, product_id, granularity, start, end):  # noqa: ANN001, ANN201
+        return self._batches.pop(0) if self._batches else []
+
+
+def test_the_live_poll_path_records_the_feed() -> None:
+    """`agent.run_once` polls through here every cycle, so this is the path that decides
+    whether provenance exists in a real database at all."""
+    repo = _repo()
+    client = _PollClient("alpaca:iex", [[_candle(0), _candle(86400)]])
+    market_feed.poll_once(
+        client, repo, ["MSFT-USD"], [Granularity.ONE_DAY], now_ts=86400 * 3
+    )
+    assert repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY) == ("alpaca:iex",)
+
+
+def test_the_gap_repair_path_records_the_feed() -> None:
+    """`fetch --repair-gaps` backfilled 29,676 bars into the hourly profile in one run. Bars
+    that arrive in bulk are exactly the ones whose provenance must not be missing."""
+    repo = _repo()
+    repo.upsert_candles("MSFT-USD", Granularity.ONE_DAY, [_candle(0), _candle(86400 * 5)])
+    client = _FeedClient("alpaca:iex", [[_candle(86400 * 2)], []])
+    repair.repair_series(
+        client,
+        repo,
+        "MSFT-USD",
+        Granularity.ONE_DAY,
+        now_ts=86400 * 6,
+        sleep_fn=lambda _: None,
+    )
+    assert "alpaca:iex" in repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY)
+
+
+def test_both_adapters_satisfy_the_declared_protocol() -> None:
+    """`DeclaresVolumeFeed` documents the contract `volume_feed_of` reads. Unless something
+    checks it, it drifts from the `getattr` that actually enforces it -- so this is what makes
+    the Protocol load-bearing rather than decorative."""
+    from keel_broker_alpaca.adapter import AlpacaAdapter
+    from keel_broker_coinbase.adapter import CoinbaseAdapter
+
+    from keel.data.feed_scope import DeclaresVolumeFeed
+
+    assert isinstance(AlpacaAdapter(transport=object(), data_feed="iex"), DeclaresVolumeFeed)
+    assert isinstance(CoinbaseAdapter(transport=object()), DeclaresVolumeFeed)
+    assert volume_feed_of(_SilentClient([])) is None

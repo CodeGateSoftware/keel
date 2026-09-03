@@ -20,6 +20,7 @@ somewhere else -- and a mixed series is exactly the case a reader most needs to 
 
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -174,3 +175,27 @@ def test_a_legacy_database_missing_the_table_does_not_break_reads() -> None:
     repo = Repository(conn)
     assert repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY) == ()
     assert repo.get_series_feed_window("MSFT-USD", Granularity.ONE_DAY, "alpaca:iex") is None
+
+
+def test_a_locked_database_is_raised_not_read_as_unrecorded(repo: Repository) -> None:
+    """The missing-table rescue must catch ONLY a missing table.
+
+    `sqlite3.OperationalError` is also what a lock timeout raises, and keel reads and writes this
+    file from more than one process (see `db.connect`'s WAL note). Swallowing a lock would report
+    "scope unrecorded" for a series whose scope is sitting on disk -- turning a retryable error
+    into the `None` verdict that `feed_scope` reserves for the absence of evidence, and doing it
+    silently. A caught mutant is what put this test here: the rescue started life as a bare
+    `except`, and nothing failed.
+    """
+
+    class _Locked:
+        row_factory = sqlite3.Row
+
+        def execute(self, *_args: object, **_kwargs: object) -> object:
+            raise sqlite3.OperationalError("database is locked")
+
+    repo._conn = _Locked()  # type: ignore[assignment]  # noqa: SLF001
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        repo.get_series_feed_window("MSFT-USD", Granularity.ONE_DAY, "alpaca:iex")
