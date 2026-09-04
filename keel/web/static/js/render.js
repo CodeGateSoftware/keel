@@ -1139,6 +1139,130 @@ function jobPanel(job) {
  * @returns {DocumentFragment}
  */
 /**
+ * The Positions view (#701): what is held, what it is worth, and how close it is to its stop.
+ *
+ * ── NO CLOSE ACTION, AND THAT IS THE DESIGN ──────────────────────────────────────────────────
+ *
+ * Alpaca's positions page has a per-row close. This one does not, ever. An exit goes through the
+ * typed-phrase friction of the terminal path, because a panic tap on a table row must not be the
+ * last line of defence between an operator and an unplanned market sell. The absence is pinned by
+ * `tests/web/test_positions_view.py::test_the_positions_view_has_no_close_action_anywhere`, so it
+ * survives the day it looks like an obvious convenience to add.
+ *
+ * ── GROUPED BY THE REPORT'S OWN PRODUCT LIST ─────────────────────────────────────────────────
+ *
+ * `data.products` rather than a set this file assembles from the rows: two answers to "which
+ * products does this book hold" is one too many, and the ordered one is already on the report.
+ * A product holds several TRANCHES -- that is what tranches are for -- so each section is a
+ * table of them rather than one row pretending to be the position.
+ *
+ * ── THE CHIP EXPLAINS THE IDLE DEPLOYMENT ────────────────────────────────────────────────────
+ *
+ * `freshness` is the ENTRY GATE's verdict, not a data age: `missing`/`behind`/`unconfirmed` are
+ * the agent's own reasons for refusing to open here. It is the most common answer to "why has
+ * nothing happened", which is why it sits beside the money rather than under a disclosure.
+ *
+ * It is a COLUMN and not a per-product chip, because the gate granularity is the one the RULE
+ * that opened the tranche declares. Two tranches of one product, opened by rules on different
+ * timeframes, have two verdicts -- and a chip above the table would have to pick one.
+ *
+ * @param {any} data  `/api/positions`'s `data`.
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @returns {DocumentFragment}
+ */
+export function positionsView(data, sort, onSort) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Positions"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.generated_at), " · ");
+  sub.append(field(data.open_count), " open tranche(s)");
+  fragment.append(sub);
+
+  const rows = data.rows || [];
+  if (rows.length === 0) {
+    // A real answer, not a blank panel: an account holding nothing is an ordinary state for a
+    // daily agent between entries, and it is not the same as a page that failed to load.
+    fragment.append(el("p", "empty", "No open positions. keel is holding nothing right now."));
+    return fragment;
+  }
+
+  for (const product of data.products || []) {
+    const held = rows.filter(/** @param {any} row */ (row) => row.product_id === product);
+    const id = ["h-pos", product].join("-");
+    fragment.append(heading(id, product));
+
+    // The chip belongs to the PRODUCT, not the tranche: the entry gate asks about a series, so
+    // every tranche of one product shares one verdict and repeating it per row would suggest
+    // they could differ.
+    if (held.length === 0) continue;
+
+    fragment.append(
+      table(
+        id,
+        [
+          { label: "opened (UTC)", numeric: false, key: "opened_at" },
+          { label: "rule", numeric: false, key: "rule_name" },
+          { label: "qty held", numeric: true, key: "qty" },
+          { label: "entry", numeric: true, key: "entry_fill" },
+          { label: "entry fee", numeric: true, key: "entry_fee" },
+          { label: "mark", numeric: true, key: "mark" },
+          { label: "value", numeric: true, key: "market_value" },
+          { label: "unrealized", numeric: true, key: "unrealized" },
+          { label: "stop", numeric: true, key: "initial_stop" },
+          { label: "to stop", numeric: true, key: "stop_distance" },
+          { label: "to stop %", numeric: true, key: "stop_distance_pct" },
+          // PER TRANCHE, not per product. The gate granularity comes from the RULE that opened
+          // this tranche (`_gate_granularity_for`), so one product holding tranches from rules
+          // on different timeframes has two verdicts -- a single chip above the table would
+          // state one of them over the other.
+          { label: "entry gate", numeric: false, key: "freshness" },
+        ],
+        held.map(/** @param {any} row */ (row) => [
+          row.opened_at,
+          plain(row.rule_name) || "—",
+          row.qty,
+          row.entry_fill,
+          row.entry_fee,
+          row.mark,
+          row.market_value,
+          row.unrealized,
+          row.initial_stop,
+          row.stop_distance,
+          row.stop_distance_pct,
+          row.freshness,
+        ]),
+        "No open tranches for this product.",
+        { sort: sort, onSort: onSort },
+      ),
+    );
+
+    for (const row of held) {
+      // The realized side, under a disclosure: a scaled-out tranche has legs already booked, and
+      // they belong beside the running position rather than in the journal's separate account of
+      // the same trade. Collapsed because most tranches have never been scaled out.
+      const node = el("details", "row");
+      const summary = el("summary");
+      summary.append("tranche ", plain(row.id), " · realized legs");
+      node.append(summary);
+      node.append(
+        gridCard([
+          kv("realized qty", row.realized_qty),
+          kv("realized proceeds", row.realized_proceeds),
+          kv("realized fees", row.realized_fees),
+          kv("marked at", row.mark_at),
+        ]),
+      );
+      fragment.append(node);
+    }
+  }
+
+  return fragment;
+}
+
+
+/**
  * The orders view (#659): what keel actually bought and sold, and whether anybody agreed to it.
  *
  * **`placement` is the first column, and that is the argument this view exists to make.** On a

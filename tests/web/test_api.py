@@ -58,12 +58,29 @@ API_ROUTES = (
     "/api/setup",
     "/api/activity",
     "/api/orders",
+    "/api/positions",
     "/api/insights",
     "/api/journal",
     "/api/rules",
     "/api/venues",
     "/api/gates",
 )
+
+
+def test_this_module_pins_every_route_the_server_serves() -> None:
+    """`API_ROUTES` above is hand-written, and everything in this file is parametrised over it --
+    the envelope, the no-JSON-number walk, the cache headers, the nosniff header and the
+    POST refusal. A route left out of it is served with none of those checked.
+
+    That happened: `/api/positions` (#701) shipped outside the tuple, so its reader was executed
+    by no test at all while its payload builder was well covered -- and this module's own header
+    says those are not the same statement. Cross-checked here so the next one cannot.
+    """
+    from keel.web import api as web_api
+
+    assert set(API_ROUTES) == set(web_api.API_ROUTES), (
+        "API_ROUTES here must name every route the server actually serves"
+    )
 
 
 # -- a real server ------------------------------------------------------------------------------

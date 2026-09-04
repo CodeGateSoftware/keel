@@ -304,6 +304,33 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> di
     return payload.orders_payload(report)
 
 
+def read_positions(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """What is held right now, marked at the price the rails used (#701).
+
+    **READ ONLY, and there is no write route on this path.** #701's own refusal: a position is
+    closed through the typed-phrase friction of the exit path, never a table-row tap. A panic tap
+    must not be the last line of defence, so the affordance does not exist here to be tapped.
+
+    No `?limit=` and no `?scope=`. Both exist on `/api/orders` because a book of orders grows
+    without bound; OPEN tranches do not -- the number is bounded by what the deployment holds
+    right now, and rail 4's concurrent-position cap bounds that. A cap here would hide a position
+    an operator is looking for, which is the one thing this page must never do.
+
+    `config` is loaded because the mark comes from the FINEST configured series -- the same read
+    `agent._mark_to_market_parts` makes. Reading a different series would put a different current
+    price on the page from the one that moved rail 11's drawdown scalars.
+    """
+    from keel.commands.positions import gather_positions
+
+    repo = open_repo(cfg.db_path)
+    try:
+        config = load_config(cfg.config_path)
+        report = gather_positions(repo, config, now_ts=now_ts)
+    finally:
+        close_repo(repo)
+    return payload.positions_payload(report)
+
+
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The per-rule track records, the promotion-gate distances, and the account-equity series.
 
@@ -551,6 +578,28 @@ API_ROUTES: dict[str, ApiRoute] = {
             "fill_divergence",
             "fee",
             "created_at",
+        ),
+    ),
+    "/api/positions": ApiRoute(
+        html_route="/positions",
+        read=read_positions,
+        collection="rows",
+        # The figures an operator scans by. `unrealized` and `stop_distance` first in intent:
+        # "what is losing" and "what is closest to its stop" are the two questions this page
+        # exists to answer, and both are sorted server-side because both are Decimals that a
+        # browser would compare as doubles.
+        sortable=(
+            "product_id",
+            "rule_name",
+            "opened_at",
+            "qty",
+            "entry_fill",
+            "mark",
+            "market_value",
+            "unrealized",
+            "initial_stop",
+            "stop_distance",
+            "stop_distance_pct",
         ),
     ),
     "/api/rules": ApiRoute(
