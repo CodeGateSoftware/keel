@@ -431,6 +431,45 @@ def test_the_scope_is_normalised_and_echoed_rather_than_refused(
     assert scoped["data"]["total_count"]["value"] == "2"
 
 
+def test_the_status_filter_reaches_the_service_from_the_query(
+    book: web_server.ServeConfig,
+) -> None:
+    """The tabs, end to end. Filtered by the SERVICE off the whole book -- not by the client
+    over the capped page it received, which would present "every canceled order" while meaning
+    "the canceled ones among the fifty rows I was sent"."""
+    _status, unfiltered = _json_get(book, "/api/orders")
+    assert len(unfiltered["data"]["rows"]) == 2, "the fixture must hold both rows"
+    assert unfiltered["data"]["statuses"] == ["filled"], "both fixture rows are filled"
+
+    status, document = _json_get(book, "/api/orders?status=filled")
+    assert status == 200
+    data = document["data"]
+    assert data["status"] == "filled"
+    assert [row["status"]["value"] for row in data["rows"]] == ["filled", "filled"]
+    assert data["filtered_count"]["value"] == "2"
+
+    # The narrowing itself, against a status this book does not hold. Asserted through the
+    # ENDPOINT rather than only on the service, because a filter applied in the client would
+    # answer this with both rows -- the two cases are indistinguishable on the matching status.
+    _status, none_match = _json_get(book, "/api/orders?status=pending")
+    assert none_match["data"]["rows"] == []
+    # The book is still described whole: the tab narrowed the rows, not the denominators.
+    assert none_match["data"]["total_count"]["value"] == "2"
+    assert none_match["data"]["filtered_count"]["value"] == "0"
+
+
+def test_an_unknown_status_returns_an_honest_empty_rather_than_a_400(
+    book: web_server.ServeConfig,
+) -> None:
+    """Unlike `?sort=`, whose columns are a closed set this code declares, a status is written
+    by whatever placed the order -- a venue word or an older spelling would be refused wrongly.
+    So it filters, matches nothing, and says which emptiness that is."""
+    status, document = _json_get(book, "/api/orders?status=rejected")
+    assert status == 200
+    assert document["data"]["rows"] == []
+    assert document["data"]["empty_reason"] == "status"
+
+
 @pytest.mark.parametrize("bad", ["0", "-1", "abc", "99999"])
 def test_a_bad_limit_is_refused_rather_than_silently_substituted(
     book: web_server.ServeConfig, bad: str
@@ -522,7 +561,11 @@ def test_the_orders_view_is_wired_into_the_client_router() -> None:
     source = _source("main.js")
     assert "ordersView," in source
     assert 'route.name === "orders"' in source
-    assert "ordersView(data, primary.sort, onSort," in source
+    # The ARGUMENTS, not one line's worth of whitespace: #700 added a fifth (the status tab
+    # callback), which reflowed the call across lines and broke the literal without changing
+    # anything this test is here to protect.
+    call = re.search(r"ordersView\(\s*data,\s*primary\.sort,\s*onSort,", source)
+    assert call is not None, "ordersView must still be called with (data, sort, onSort, ...)"
 
 
 def test_the_scope_switch_names_itself_per_view() -> None:
@@ -541,3 +584,121 @@ def test_the_client_added_no_new_asset_to_precache() -> None:
     precache = (_STATIC / "sw.js").read_text(encoding="utf-8")
     assert "orders.js" not in precache
     assert not (_STATIC / "js" / "orders.js").exists()
+
+
+# -- the status tabs, on the wire (#700) ------------------------------------------------------
+#
+# The service decides; this pins that the browser gets the decision unaltered. The tabs come
+# from what this book RECORDED (`statuses`), the active one from what the report APPLIED
+# (`status`), and the caption's denominator from the report's own `filtered_count` -- so no
+# client ever subtracts one count from another to caption a tab.
+
+
+def test_the_orders_payload_carries_the_tabs_and_the_active_one(tmp_path: Path) -> None:
+    report = _report(
+        tmp_path,
+        _order(status="filled"),
+        _order(status="canceled"),
+        status="canceled",
+    )
+    built = web_payload.orders_payload(report)
+
+    assert built["status"] == "canceled"
+    assert built["statuses"] == ["canceled", "filled"]
+
+
+def test_the_tabs_list_every_status_in_the_book_not_only_the_open_one(tmp_path: Path) -> None:
+    """A tab bar that lost its other tabs the moment one was chosen would be a control that
+    deletes its own alternatives."""
+    built = web_payload.orders_payload(
+        _report(tmp_path, _order(status="filled"), _order(status="pending"), status="filled")
+    )
+
+    assert built["statuses"] == ["filled", "pending"]
+
+
+def test_the_filtered_count_crosses_as_its_own_field(tmp_path: Path) -> None:
+    """`scoped_count` counts the window and `filtered_count` counts the open tab. A client that
+    had to compare them to caption "2 of 3 filled" would be deriving a figure in the browser."""
+    built = web_payload.orders_payload(
+        _report(
+            tmp_path,
+            _order(status="filled"),
+            _order(status="filled"),
+            _order(status="canceled"),
+            status="filled",
+        )
+    )
+
+    assert built["scoped_count"]["value"] == "3"
+    assert built["filtered_count"]["value"] == "2"
+    assert built["shown_count"]["value"] == "2"
+
+
+def test_an_empty_status_tab_reads_differently_from_an_empty_book(tmp_path: Path) -> None:
+    """Four ways to render zero rows, four sentences. Reusing the book's wording here would tell
+    a reader keel has never traded on a deployment whose book is full."""
+    filtered = web_payload.orders_payload(
+        _report(tmp_path, _order(status="filled"), status="rejected")
+    )
+    empty_book = web_payload.orders_payload(_report(tmp_path))
+
+    assert filtered["empty_reason"] == "status"
+    assert filtered["empty_note"]
+    assert filtered["empty_note"] != empty_book["empty_note"]
+
+
+def test_the_status_note_does_not_echo_the_requested_word_back(tmp_path: Path) -> None:
+    """`?status=` is caller-controlled text. It is applied as a filter and named on the wire in
+    `status`, which the client places as a value -- but the prose sentence is a fixed string, so
+    an unrecognised word cannot reach the page through the note."""
+    built = web_payload.orders_payload(
+        _report(tmp_path, _order(status="filled"), status="<script>x</script>")
+    )
+
+    assert "<script>" not in built["empty_note"]
+    assert built["status"] == "<script>x</script>".lower()
+
+
+# -- the tabs and the rule column, in the client (#700) ---------------------------------------
+#
+# Source-text assertions, per this module's own header: there is no JavaScript runtime here, so
+# what is pinned is that the declarations exist and read from the right keys -- not that the DOM
+# they describe behaves.
+
+
+def test_the_status_tabs_are_built_from_the_book_not_from_a_hardcoded_list() -> None:
+    """A tab bar listing statuses this deployment never recorded invites a reader to click into
+    four empty tabs and conclude something about the engine. `data.statuses` is what the book
+    actually holds, which is why the service carries it."""
+    code = _code("render.js")
+    assert "data.statuses" in code, "the tabs must come from the payload, not from a constant"
+    assert "statusSwitch" in code, "the tab bar needs a control of its own"
+
+
+def test_the_tab_bar_offers_a_way_back_to_every_status() -> None:
+    """A filter with no way to clear it is a trap: having clicked Canceled, a reader who wants
+    the whole book again has to know that the empty string means "all"."""
+    code = _code("render.js")
+    body = code.split("function statusSwitch")[1][:900]
+    assert '"all"' in body, "the tab bar needs an All tab"
+    assert 'onStatus("")' in body, "the All tab must clear the filter, not set a word"
+
+
+def test_the_active_tab_is_read_from_what_the_report_applied() -> None:
+    """`data.status`, never the value the client last sent. If the two ever disagree the report
+    is right, and a tab bar drawn from the request would show a filter that is not in force."""
+    assert "data.status" in _code("render.js")
+
+
+def test_the_orders_table_names_the_rule_that_placed_each_order() -> None:
+    """`rule_id` alone is a foreign key -- a number a reader cannot act on."""
+    code = _code("render.js")
+    assert '"rule_name"' in code, "the orders table must carry the rule NAME column"
+
+
+def test_the_status_tab_reaches_the_query_string_not_a_client_side_filter() -> None:
+    """The tabs must re-ask the SERVER. Filtering the received page in the browser would filter
+    the fifty rows that arrived and label the result "every canceled order"."""
+    code = _code("main.js")
+    assert ".status = status" in code, "the tab must set the endpoint's status param"

@@ -285,11 +285,20 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> di
     )
 
     scope = normalise_scope(_first(query, "scope"))
+    # `?status=` is applied, never refused (#700). `?sort=`'s columns are a closed set this
+    # module declares, so an unknown one is a client bug worth a 400; a status is written by
+    # whatever placed the order -- a venue's own word, or an older spelling like `cancelled`
+    # already in `_ORDER_STATUS_STATES` -- so a refusal here would reject a status some book
+    # genuinely holds. An unmatched filter comes back empty with `empty_reason: "status"`,
+    # which shows a typo as plainly as a 400 would and cannot be wrong about a real one.
+    status = _first(query, "status") or ""
     raw_limit = _first(query, "limit")
     limit = DEFAULT_ORDERS_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_ORDERS_LIMIT)
     repo = open_repo(cfg.db_path)
     try:
-        report = gather_orders(repo, now_ts=int(time.time()), scope=scope, limit=limit)
+        report = gather_orders(
+            repo, now_ts=int(time.time()), scope=scope, status=status, limit=limit
+        )
     finally:
         close_repo(repo)
     return payload.orders_payload(report)

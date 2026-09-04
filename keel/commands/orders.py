@@ -50,6 +50,7 @@ from __future__ import annotations
 import datetime
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -294,6 +295,18 @@ class OrderRow:
     #: Why it is absent, when it is: `""` when there is an id to show.
     venue_order_id_detail: str
 
+    #: The NAME of the rule that placed this order -- `rules.kind`, the same string
+    #: `build_rule_track_record` calls `rule_name`, so the Orders view and the track-record
+    #: table name one rule one way. `""` when there is no name to show, for either of the two
+    #: reasons `rule_name_detail` tells apart.
+    rule_name: str
+
+    #: Why the name is absent, when it is. Two states that both render as an empty cell and are
+    #: NOT the same fact: no rule was recorded against this order at all, or a rule WAS and that
+    #: rule is no longer in the book. The second is the one worth investigating, so it names the
+    #: id. `""` when there is a name.
+    rule_name_detail: str
+
     rule_id: int | None
     created_at: int | None
     updated_at: int | None
@@ -320,8 +333,16 @@ class OrdersReport:
     #: "nothing here" into a fact rather than a guess.
     total_count: int
 
-    #: Rows inside the scope, before `limit`.
+    #: Rows inside the scope, before `status` and before `limit`. Its meaning is unchanged by
+    #: the status filter on purpose: it is the denominator that says whether the SCOPE is what
+    #: emptied the table, and a count that moved with the open tab could not answer that.
     scoped_count: int
+
+    #: Rows inside the scope AND matching `status`, before `limit` -- what `rows` is a page of.
+    #: Equal to `scoped_count` when no status filter is applied. It exists because "1 of 3" on
+    #: a Canceled tab must count canceled orders; counting the scope there would be a true
+    #: number answering a question nobody asked.
+    filtered_count: int
 
     #: Rows in `rows`. Held on the report rather than measured by a front-end: Rule 6e of
     #: `test_console_thinness.py` bans `len()` in the serialiser precisely so a count on the
@@ -333,13 +354,43 @@ class OrdersReport:
     #: it from an empty live section.
     modes: tuple[str, ...]
 
+    #: The resolved status filter, lowercased, or `""` for "every status". Echoed back for the
+    #: reason `scope` is: a client rendering the active tab reads what was APPLIED rather than
+    #: trusting what it asked for.
+    status: str
+
+    #: Every distinct `status` present in the whole book, sorted -- what a tab bar is built
+    #: from. From the WHOLE book and not the scope, deliberately: scoped, the Canceled tab
+    #: would vanish on a quiet day and return tomorrow, and a control that comes and goes is
+    #: worse than one that is sometimes empty. Same reasoning as `modes`.
+    statuses: tuple[str, ...]
+
     #: `""` when there are rows; `"book"` when the book has never held an order; `"scope"`
-    #: when it holds orders and this window excluded all of them. Decided here, where the
-    #: counts are.
+    #: when it holds orders and this window excluded all of them; `"status"` when the window
+    #: holds orders and none of them wear the filtered status. Decided here, where the counts
+    #: are -- four different facts that all render as zero rows, and a reader who cannot tell
+    #: them apart learns the wrong one.
     empty_reason: str
 
     #: NEWEST FIRST. Reversed here, never in a renderer.
     rows: tuple[OrderRow, ...]
+
+
+#: What an order with no `rule_id` says. A real state, not a defect: a manual order, or one
+#: placed before the column was written.
+NO_RULE_DETAIL = "no rule recorded against this order"
+
+#: What an order whose rule has left the book says. Deliberately different wording AND the id,
+#: because "nothing placed this" and "rule 7 placed this and rule 7 is gone" are different facts
+#: and only the second is worth chasing.
+MISSING_RULE_DETAIL = "rule {rule_id} placed this order and is no longer in the book"
+
+#: What a row says when nobody LOOKED. A caller that passed no rule map has not searched the
+#: book, so reporting the rule as gone would state the result of a search that never ran -- and
+#: would send a reader hunting for a deleted rule that is sitting in the table. The same sentence
+#: covers a rule that WAS found and has no `kind` to show: it is present, so "no longer in the
+#: book" would be false, and the only honest report is that no name is available.
+UNRESOLVED_RULE_DETAIL = "rule {rule_id} placed this order; its name is unresolved here"
 
 
 def _venue_order_id(raw_response: Any) -> str:
@@ -422,12 +473,31 @@ def _adverse(side: str, difference: Decimal | None) -> bool | None:
     return None
 
 
-def _row_from_dict(row: dict[str, Any]) -> OrderRow:
+def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = None) -> OrderRow:
     """One repository dict, projected. Every judgement this report makes about a row is made
-    here, once, so neither renderer has to make it twice."""
+    here, once, so neither renderer has to make it twice.
+
+    `rule_names` is `{rules.id: rules.kind}`, read ONCE by `gather_orders` and passed down. A
+    lookup per row would be one query per order against a book capped at `MAX_ORDERS_LIMIT`, on
+    a route with no proxy in front of it -- and would be invisible on any fixture small enough
+    to read. Omitted (the default), every row reports its rule as unresolved rather than
+    claiming there is none: a caller that did not supply the map has not established that.
+    """
     mode = str(row.get("mode") or "")
     side = str(row.get("side") or "")
     confirmation = str(row.get("confirmation") or "")
+    rule_id = None if row.get("rule_id") is None else int(row["rule_id"])
+    rule_name = "" if rule_id is None or rule_names is None else rule_names.get(rule_id, "")
+    if rule_name:
+        rule_detail = ""
+    elif rule_id is None:
+        rule_detail = NO_RULE_DETAIL
+    elif rule_names is None or rule_id in rule_names:
+        # Either nobody looked, or the rule was found and carries no name. Both are "present, or
+        # at least not shown to be absent" -- and neither supports the claim below.
+        rule_detail = UNRESOLVED_RULE_DETAIL.format(rule_id=rule_id)
+    else:
+        rule_detail = MISSING_RULE_DETAIL.format(rule_id=rule_id)
     expected = row.get("expected_fill")
     actual = row.get("actual_fill")
     difference, _ = _divergence(expected, actual)
@@ -477,6 +547,8 @@ def _row_from_dict(row: dict[str, Any]) -> OrderRow:
         submit_book_detail=book_detail,
         venue_order_id=venue_id,
         venue_order_id_detail=venue_detail,
+        rule_name=rule_name,
+        rule_name_detail=rule_detail,
         rule_id=None if row.get("rule_id") is None else int(row["rule_id"]),
         created_at=None if row.get("created_at") is None else int(row["created_at"]),
         updated_at=None if row.get("updated_at") is None else int(row["updated_at"]),
@@ -488,15 +560,31 @@ def gather_orders(
     *,
     now_ts: int,
     scope: str = DEFAULT_ORDERS_SCOPE,
+    status: str = "",
     limit: int | None = DEFAULT_ORDERS_LIMIT,
 ) -> OrdersReport:
     """Every order in the book, newest first, scoped and capped.
 
-    `repo.get_orders()` is called with NO arguments: no `mode`, no `product_id`, no `status`.
-    That is the load-bearing choice in this function. Each deployment book holds exactly one
-    mode, so any mode filter renders empty on the books that hold the other one, and a report
-    that showed nothing while the book held fifteen rows would be a surface asserting a fact it
-    had not established. The mode is carried per ROW instead.
+    `repo.get_orders()` is still called with NO arguments: no `mode`, no `product_id`, no
+    `status`. That is the load-bearing choice in this function, and the reason is about MODE --
+    each deployment book holds exactly one, so any mode filter renders empty on the books that
+    hold the other one, and a report that showed nothing while the book held fifteen rows would
+    be a surface asserting a fact it had not established. The mode is carried per ROW instead.
+
+    `status` (#700) narrows the report WITHOUT touching that call: the filter runs in the same
+    pass as the scope, over rows the repository handed back whole, so `total_count` and
+    `statuses` still describe the entire book and the empty states below can still tell "keel
+    has never traded" from "nothing wears this status". Pushing it into the query would trade
+    those for nothing -- the cap is applied after both narrowings either way.
+
+    Filtering server-side rather than in the browser is the same argument `?sort=` makes: a
+    client filtering a CAPPED page would be filtering the fifty rows it happened to receive and
+    presenting the result as every rejected order.
+
+    An unrecognised status is not refused. It is applied, matches nothing, and comes back with
+    `empty_reason == "status"` naming what was asked for -- which shows a typo plainly, and
+    cannot wrongly refuse a status some venue or some older row spells differently. `statuses`
+    is the list a client should build tabs from.
 
     A row with no `created_at` cannot be placed in time, so it is never excluded by a scope:
     excluding it would hide a row on the strength of a timestamp that does not exist. It counts
@@ -504,29 +592,59 @@ def gather_orders(
     """
     resolved_scope = normalise_scope(scope)
     resolved_limit = normalise_limit(limit)
+    resolved_status = (status or "").strip().lower()
     start_ts = scope_start_ts(resolved_scope, now_ts)
 
     raw = repo.get_orders()
+    # ONE read of a small table, before the row loop -- see `_row_from_dict`'s note on why this
+    # is not a per-row lookup. `kind` IS the rule's name here (`build_rule_track_record` reads
+    # the same column under the same meaning); there is no separate name column to prefer.
+    rule_names: dict[int, str] = {
+        int(rule["id"]): str(rule.get("kind") or "")
+        for rule in repo.get_rules()
+        if rule.get("id") is not None
+    }
     total = 0
     modes: set[str] = set()
+    statuses: set[str] = set()
     scoped: list[dict[str, Any]] = []
+    filtered: list[dict[str, Any]] = []
     for row in raw:
         total += 1
         modes.add(str(row.get("mode") or ""))
+        # From every row in the BOOK, before either narrowing -- see `statuses`' own note.
+        # LOWERCASED, like `resolved_status` below and for the same reason: the client marks the
+        # active tab with `name === current`, so a raw `Filled` tab would send `?status=Filled`,
+        # get `filled` echoed back, and highlight neither itself nor "all" -- while a book
+        # holding both spellings would show two tabs returning identical rows. `api.py` declines
+        # to refuse unknown statuses precisely because such spellings exist in real books, so
+        # they have to be folded here rather than assumed away.
+        statuses.add(str(row.get("status") or "").strip().lower())
         created = row.get("created_at")
         if start_ts is not None and created is not None and int(created) < start_ts:
             continue
         scoped.append(row)
+        # Lowercased on BOTH sides. The stored word is lowercase today, but matching the
+        # caller's casing against a raw column would make a hand-typed `?status=FILLED` fail
+        # while the tab that sends `filled` works -- one control, two behaviours.
+        if resolved_status and str(row.get("status") or "").strip().lower() != resolved_status:
+            continue
+        filtered.append(row)
 
     # Newest first, HERE. `get_orders` orders by `id` ascending; reversing in each renderer
     # would be the same decision made twice and the second copy is the one that drifts.
-    scoped.reverse()
-    shown = tuple(_row_from_dict(row) for row in scoped[:resolved_limit])
+    filtered.reverse()
+    shown = tuple(_row_from_dict(row, rule_names) for row in filtered[:resolved_limit])
 
+    # Ordered widest cause first: a book with nothing in it is not a scope problem, and a scope
+    # that excluded everything is not the tab's doing. Reporting the narrowest true cause would
+    # send a reader to change the filter when the book is simply empty.
     if total == 0:
         empty_reason = "book"
     elif not scoped:
         empty_reason = "scope"
+    elif not filtered:
+        empty_reason = "status"
     else:
         empty_reason = ""
 
@@ -535,10 +653,13 @@ def gather_orders(
         scope=resolved_scope,
         scope_start_ts=start_ts,
         limit=resolved_limit,
+        status=resolved_status,
         total_count=total,
         scoped_count=len(scoped),
+        filtered_count=len(filtered),
         shown_count=len(shown),
         modes=tuple(sorted(modes)),
+        statuses=tuple(sorted(s for s in statuses if s)),
         empty_reason=empty_reason,
         rows=shown,
     )
@@ -615,6 +736,18 @@ def render_orders(report: OrdersReport) -> list[str]:
             f"outside scope={report.scope}. Widen it (--scope all) to see them."
         )
         return lines
+    if report.empty_reason == "status":
+        # The fourth empty state needs the fourth sentence. Without it this renderer prints its
+        # header, "showing 0 of N", and then nothing -- the silent blank the two branches above
+        # exist to prevent, and the one a reader is most likely to read as "keel never traded".
+        # Names the statuses the book DOES hold, because the next thing a reader wants is which
+        # filter would have worked.
+        held = ", ".join(report.statuses) if report.statuses else "none"
+        lines.append(
+            f"no orders with status={report.status} in this window -- the book holds "
+            f"{report.total_count}, with statuses: {held}."
+        )
+        return lines
 
     for row in report.rows:
         placement = "AUTONOMOUS" if row.confirmation_is_autonomous else (row.confirmation or "--")
@@ -654,6 +787,12 @@ def render_orders(report: OrdersReport) -> list[str]:
             lines.append(f"      venue order id: {row.venue_order_id}")
         else:
             lines.append(f"      {row.venue_order_id_detail}")
+        # The service resolves this for BOTH front-ends; rendering it only in the browser would
+        # leave `keel orders` unable to answer a question the report already holds.
+        if row.rule_name:
+            lines.append(f"      rule: {row.rule_name}")
+        else:
+            lines.append(f"      {row.rule_name_detail}")
         rule = "--" if row.rule_id is None else str(row.rule_id)
         lines.append(
             f"      rule={rule} placed={_utc(row.created_at)} updated={_utc(row.updated_at)}"
