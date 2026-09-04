@@ -53,9 +53,16 @@ class AssetBalanceRow:
 
     #: `qty * mark`, or `None` if ANY tranche of this product lacks a mark.
     #:
-    #: A partial sum is the most dangerous shape available here: it looks like a total and is
-    #: not one, so a holding half of which could not be priced would render as a smaller holding
+    #: A partial sum is the most dangerous shape available here: it looks like a total and is not
+    #: one, so a holding half of which could not be priced would render as a SMALLER holding
     #: rather than an unknown one. Unknown is the only reading that cannot be misread.
+    #:
+    #: Through `gather_positions` that state cannot arise -- it reads the mark once per product
+    #: and hands every tranche of it the same figure -- so the guard in `_assets_from` is
+    #: DEFENSIVE, not a description of something observed. It is kept, and pinned at the fold
+    #: level rather than through `gather_balances`, because what it protects is the FOLD: a
+    #: caller assembling rows from more than one read, or a mark cache that stops being
+    #: per-product, reaches it immediately.
     market_value: Decimal | None
 
 
@@ -63,8 +70,16 @@ class AssetBalanceRow:
 class BalancesReport:
     now_ts: int
 
-    #: `paper`, `live`, or `""` before the first cycle stamps one. The partition every figure
-    #: below is read through: `equity_points` holds both modes in one database.
+    #: `paper`, `live`, or `""` before the first cycle stamps one.
+    #:
+    #: The partition the CASH BLOCK is read through -- `equity_points` holds both modes in one
+    #: database, so cash, equity, unrealized, hwm and paper_cash are all selected by it.
+    #:
+    #: **It does NOT partition `assets`.** The `positions` table has no `mode` column: a tranche
+    #: is a tranche, whichever mode opened it. On a database that has flipped paper->live (which
+    #: `agent._clear_live_mode_if_needed` exists to handle) this page therefore shows live cash
+    #: beside holdings that may predate the flip. Recording a mode per tranche is the fix, and it
+    #: is an engine change, not something this report can infer after the fact.
     mode: str
 
     #: The newest recorded reading FOR THAT MODE, and the instant it was recorded. `cash` is
@@ -121,7 +136,10 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
         # one row off an index rather than the whole series read to take its last element.
         reading = recorded[-1] if recorded else None
 
-    positions = gather_positions(repo, config, now_ts=now_ts)
+    # `with_readiness=False`: this page shows quantity, mark and value and never the entry
+    # gate, so computing one would be three of every four candle reads plus a rules read and
+    # a rule construction, per request, on a view the console re-polls every 15 seconds.
+    positions = gather_positions(repo, config, now_ts=now_ts, with_readiness=False)
     return BalancesReport(
         now_ts=now_ts,
         mode=mode,
@@ -161,7 +179,9 @@ def _assets_from(
         marks = [row.mark for row in held]
         # ANY missing mark makes the VALUE unknown -- never a sum over the priced subset. The
         # quantity is still known and still shown: what is held is a fact, what it is worth is
-        # the part nobody observed.
+        # the part nobody observed. Defensive against a caller whose rows do not share one mark
+        # per product; `gather_positions` does, so this cannot fire through it (see
+        # `AssetBalanceRow.market_value`).
         if any(mark is None for mark in marks):
             value: Decimal | None = None
         else:

@@ -269,3 +269,123 @@ def test_an_unstamped_mode_reports_no_cash_rather_than_guessing(
     assert report.mode == ""
     assert report.cash is None
     assert report.has_recorded_cash is False
+
+
+# -- the mixed-mark guard, at the level where it can exist (#702 review) ------------------------
+
+
+def _position_row(product_id: str, qty: str, mark: str | None) -> Any:
+    from keel.commands.positions import PositionRow
+
+    price = None if mark is None else Decimal(mark)
+    return PositionRow(
+        id=1,
+        product_id=product_id,
+        rule_name="turtle_breakout",
+        opened_at=NOW_TS - DAY,
+        qty=Decimal(qty),
+        entry_fill=Decimal("100"),
+        entry_fee=Decimal("1"),
+        mark=price,
+        mark_ts=None if price is None else NOW_TS - 900,
+        market_value=None if price is None else Decimal(qty) * price,
+        unrealized_pnl=None,
+        initial_stop=None,
+        stop_distance=None,
+        stop_distance_pct=None,
+        realized_qty=Decimal("0"),
+        realized_proceeds=Decimal("0"),
+        realized_fees=Decimal("0"),
+        ready=True,
+        ready_reason=None,
+    )
+
+
+def test_one_unmarked_tranche_makes_the_whole_asset_value_unknown() -> None:
+    """The guard is DEFENSIVE and this is the only way to reach it.
+
+    `gather_positions` reads the mark once per product and hands every tranche of it the same
+    figure, so a product whose tranches disagree cannot arise through that caller -- which means
+    a test going through `gather_balances` cannot exercise this branch, and one that seeds two
+    different PRODUCTS (as the first version of this test did) is not exercising it either.
+
+    Driven through `_assets_from` directly, because the guard protects the FOLD, not that
+    caller: a future caller that assembles rows from more than one read, or a mark cache that
+    stops being per-product, would produce exactly this state -- and a sum over the priced subset
+    would render a holding as worth less than it is, which is the failure worth engineering
+    against on the page an operator checks to see what they have.
+    """
+    from keel.commands.balances import _assets_from
+
+    rows = [
+        _position_row("BTC-USD", "2", "150"),
+        _position_row("BTC-USD", "3", None),
+    ]
+
+    assets = _assets_from(rows, ("BTC-USD",))
+
+    assert assets[0].qty == Decimal("5"), "the holding is known"
+    assert assets[0].market_value is None, "its value is not -- never the priced subset's sum"
+
+
+def test_a_fully_marked_asset_still_sums(tmp_path: Path) -> None:
+    """The other side of the guard: nothing is withheld when every tranche has a mark."""
+    from keel.commands.balances import _assets_from
+
+    rows = [
+        _position_row("BTC-USD", "2", "150"),
+        _position_row("BTC-USD", "3", "150"),
+    ]
+
+    assert _assets_from(rows, ("BTC-USD",))[0].market_value == Decimal("750")
+
+
+def test_the_asset_order_follows_the_reports_product_order(tmp_path: Path) -> None:
+    """Pinned rather than argued. Sorted or set-ordered, the page would reorder itself between
+    reads for no reason a reader could see."""
+    from keel.commands.balances import _assets_from
+
+    rows = [
+        _position_row("SOL-USD", "1", "10"),
+        _position_row("BTC-USD", "2", "150"),
+    ]
+
+    assets = _assets_from(rows, ("SOL-USD", "BTC-USD"))
+
+    assert [row.product_id for row in assets] == ["SOL-USD", "BTC-USD"]
+
+
+# -- the read cost of one request (#702 review) ------------------------------------------------
+
+
+def test_balances_does_not_pay_for_the_entry_gate_it_never_renders(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """This page shows quantity, mark and value. It does not show the entry-gate verdict, and it
+    must not pay to compute one.
+
+    Measured before the fix: three products cost 12 candle reads and a rules read per request --
+    four reads per product, three of them for `entry_bar_ready` across every configured
+    granularity, on an endpoint the console re-polls every 15 seconds. The mark needs one read
+    per product and nothing else.
+    """
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(NOW_TS - 3600, "live", "250"))
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD", "granularity": "ONE_DAY"})
+    for product in ("BTC-USD", "ETH-USD", "SOL-USD"):
+        _tranche(repo, product, "2")
+        repo.upsert_candles(product, FINEST, [_candle(NOW_TS - 900, "150")])
+
+    reads = {"candles": 0}
+    original = repo.get_candles
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        reads["candles"] += 1
+        return original(*args, **kwargs)
+
+    repo.get_candles = counting  # type: ignore[method-assign]
+    gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert reads["candles"] == 3, (
+        f"one mark read per product and no more; got {reads['candles']} for 3 products"
+    )

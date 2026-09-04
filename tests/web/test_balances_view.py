@@ -94,6 +94,28 @@ def test_a_deployment_with_no_recorded_cycle_says_so(tmp_path: Path) -> None:
     assert built["recorded"]["display"]
 
 
+def test_a_recorded_cycle_with_no_split_reads_as_recorded_and_absent(tmp_path: Path) -> None:
+    """The combination `has_recorded_cash` exists to draw: a cycle DID run and record a reading,
+    and that reading had no cash split. "Nothing has been recorded" and "the last cycle could not
+    read a split" are different facts, and only the first means this page has nothing yet."""
+    from tests.commands.test_balances import _config, _reading
+
+    conn = connect(str(tmp_path / "split.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(BAL_NOW_TS - 3600, "live", None, equity="250"))
+
+    built = web_payload.balances_payload(
+        gather_balances(repo, _config(tmp_path), now_ts=BAL_NOW_TS)
+    )
+
+    assert built["recorded"]["value"] == "true", "a cycle did record a reading"
+    assert built["cash"]["state"] == "unknown", "it just had no split to record"
+    assert built["equity"]["value"] == "250"
+    assert built["cash_as_of"]["value"].endswith("Z"), "the reading still has a time"
+
+
 def test_paper_cash_crosses_only_in_paper_mode(tmp_path: Path) -> None:
     live = web_payload.balances_payload(_report(tmp_path, mode="live", paper_cash="9500"))
     nested = tmp_path / "p"

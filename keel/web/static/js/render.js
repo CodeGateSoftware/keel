@@ -1210,7 +1210,9 @@ export function balancesView(data, sort, onSort) {
         { label: "product", numeric: false, key: "product_id" },
         { label: "qty held", numeric: true, key: "qty" },
         { label: "mark", numeric: true, key: "mark" },
-        { label: "marked at", numeric: false, key: "mark_as_of" },
+        // No `key`: `/api/balances` does not declare `mark_as_of` sortable, and a key the
+        // server will not order by renders a header that looks clickable and is not.
+        { label: "marked at", numeric: false },
         { label: "value", numeric: true, key: "market_value" },
       ],
       assets.map(/** @param {any} row */ (row) => [
