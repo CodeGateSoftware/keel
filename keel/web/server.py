@@ -418,7 +418,12 @@ class KeelHandler(BaseHTTPRequestHandler):
         for name, value in _API_HEADERS:
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        # The same guard `_send`, `_send_json` and `_serve_static` all carry. `do_HEAD` delegates
+        # to `do_GET`, so without it a HEAD sends the headers AND the whole file -- and on a
+        # keep-alive connection those bytes are framed as the next response, which is a
+        # same-origin response desync rather than merely a wasted transfer.
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _send_json(self, code: int, document: dict[str, Any]) -> None:
         """One JSON response, with its own headers.
@@ -874,7 +879,23 @@ class KeelHandler(BaseHTTPRequestHandler):
             # loopback-plus-session model unchanged -- an export of the whole audit trail is the
             # last thing that should be reachable more easily than the page it came from.
             if parsed.path == api.CSV_EXPORT_PATH:
-                text, filename = api.export_timeline_csv(self.cfg, query)
+                # Wrapped, because `respond` is what normally guarantees this server never
+                # answers a GET by raising: it turns an `ApiRefusal` into a 400 and anything else
+                # into a 500 envelope. This branch does not go through it, so without this a
+                # `?limit=abc` propagated out of the handler -- the client saw a reset connection
+                # with no response at all, and a traceback of absolute source paths reached the
+                # stderr that `log_message` is overridden to keep quiet.
+                try:
+                    text, filename = api.export_timeline_csv(self.cfg, query)
+                except Exception as exc:  # noqa: BLE001 - a failed export must still answer
+                    # One arm, because nothing on the export path raises `ApiRefusal`: it reads
+                    # no `?limit=` and no `?sort=`, which are the two refusing helpers. A second
+                    # arm for it was written and removed -- an unreachable error path is one
+                    # nothing exercises, and it rots. Re-add it the day a refusing helper joins
+                    # this path.
+                    code, document = api.export_failure_envelope(exc)
+                    self._send_json(code, document)
+                    return
                 self._send_csv(text, filename)
                 return
             code, document = api.respond(self.cfg, parsed.path, query)

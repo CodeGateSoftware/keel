@@ -59,11 +59,14 @@ HASH_NOT_RECORDED = "NOT RECORDED"
 
 #: The characters a spreadsheet treats as the start of a formula. OWASP's list.
 #:
+#: `\n` and `\r` are here alongside `\t` because a cell can only be re-parsed from its start,
+#: and a leading line break is one of the ways a value smuggles itself into that position.
+#:
 #: `-` and `+` are here because they are formulas too, not only signs -- which means a negative
 #: figure gets quoted. That is the correct trade for an audit export: a spreadsheet shows
 #: `'-12.30` as text rather than evaluating it, the value is still readable and still
 #: re-importable, and losing numeric typing is a smaller harm than executing a cell.
-_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def csv_safe(value: Any) -> str:
@@ -85,7 +88,16 @@ def csv_safe(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
-    if text.startswith(_FORMULA_TRIGGERS):
+    # Checked against the LEADING-WHITESPACE-STRIPPED text, and the ORIGINAL is what gets quoted.
+    # A strict first-character test is defeated by one space: `" =cmd|..."` is a legal
+    # `coinbase_id` out of an imported venue CSV, it lands in a cell by itself, and Google Sheets
+    # and LibreOffice trim on import before deciding whether a cell is a formula. Excel treats a
+    # leading space as text -- but a defence that holds in one spreadsheet and not the two this
+    # file will also be opened in is not a defence.
+    # `lstrip(" ")` and not a bare `lstrip()`: tab and carriage return are TRIGGERS themselves,
+    # so stripping all whitespace would consume the very characters being looked for and let
+    # "\t=cmd" through. Spaces are the only thing skipped over.
+    if text.lstrip(" ").startswith(_FORMULA_TRIGGERS):
         return "'" + text
     return text
 
@@ -125,12 +137,14 @@ class TimelineReport:
     scope_start_ts: int | None
     #: The applied `kind` filter, echoed back, or `""` for every kind.
     kind: str
-    limit: int
+    #: The applied row cap, or `None` when the caller asked for no slice (the CSV export).
+    limit: int | None
     #: Rows across all four sources inside the scope, before `kind` and before `limit`.
     scoped_count: int
     #: Rows after `kind`, before `limit` -- what `rows` is a page of.
     filtered_count: int
     rows: tuple[TimelineRow, ...]
+
 
     #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order -- what a chip bar is
     #: built from. STORED rather than derived from `rows`, because `rows` is what the chip and
@@ -143,20 +157,49 @@ class TimelineReport:
     #: bar that reordered itself as history arrived would move under the reader.
     kinds_present: tuple[str, ...]
 
+    #: `read_log_window`'s own word for how the engine log read went: `ok`, `missing`, `empty`,
+    #: `oversized`, `unreadable`. Carried rather than acted on, so the page and the CSV can SAY
+    #: the log did not reach this report.
+    #:
+    #: The alternative was tried and was wrong in both directions. Discarding it made an
+    #: unreadable log indistinguishable from an idle engine -- under-reporting reality while
+    #: looking healthy, which `activity.py`'s own docstring names as the failure. RAISING on it
+    #: made an EMPTY log (an ordinary state: a fresh handler, the moment after a rotation) take
+    #: out orders, flows and attestations too, a total outage to report a non-problem.
+    log_status: str = "ok"
+
     @property
     def shown_count(self) -> int:
         """How many rows this report carries. Derived rather than stored, and held here because
         `keel/web/payload.py` may not call `len()` (Rule 6e)."""
         return len(self.rows)
 
+    @property
+    def log_gap(self) -> bool:
+        """Whether the engine log's contents are MISSING FROM this report.
+
+        `missing` is not a gap: a deployment that has never run has no log, and that is an
+        ordinary fact rather than a hole in the record. Every other non-`ok` status is -- the
+        file is there and what it holds did not reach this report, which is precisely what an
+        auditor reading the CSV needs told rather than left to infer from an absence of rows.
+        """
+        return self.log_status not in ("ok", "missing")
 
 
-#: The cap on one merged read. Four stores, three of them unbounded, joined into one response:
-#: without a cap this route's cost is the size of the deployment's whole history. Newest-first
-#: and capped means the page always answers, and the counts below say how much it did not show.
+
+#: The cap on one PAGE of the merged feed -- the response slice, not the read.
+#:
+#: Stated precisely because the first version of this note was wrong: the four reads underneath
+#: are unfiltered (`get_orders`, `get_transactions` and both attestation reads are `SELECT *`,
+#: scoped in Python afterwards), so the READ cost is the deployment's whole history whatever this
+#: number says. That matches `gather_orders`' own convention and is not a regression -- but the
+#: cap bounds what crosses the wire and what a browser renders, and claiming more than that is
+#: the kind of comfortable inaccuracy this codebase's documentation standard exists to catch.
+#:
+#: Newest-first and capped means the page always answers, and the counts say how much it did not
+#: show. `export_rows` deliberately does not use it.
 DEFAULT_TIMELINE_LIMIT = 200
 MAX_TIMELINE_LIMIT = 2000
-
 
 def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
     """`orders` -> trade rows.
@@ -316,8 +359,9 @@ def gather_timeline(
     now_ts: int,
     scope: str = "all",
     kind: str = "",
-    limit: int = DEFAULT_TIMELINE_LIMIT,
+    limit: int | None = DEFAULT_TIMELINE_LIMIT,
     cycles: Sequence[Any] = (),
+    log_status: str = "ok",
 ) -> TimelineReport:
     """One chronology over four stores, newest first, scoped, chip-filtered and capped.
 
@@ -334,8 +378,19 @@ def gather_timeline(
     filtering the rows it happened to receive and calling the result "every flow this month".
     """
     resolved_scope = normalise_scope(scope)
-    resolved_kind = (kind or "").strip().lower()
-    resolved_limit = max(1, min(int(limit), MAX_TIMELINE_LIMIT))
+    # An unrecognised kind is COLLAPSED to "every kind", not applied. `?kind=trades` -- the
+    # obvious typo, since the chips read "trade" -- would otherwise return a page that looks like
+    # an empty deployment: a non-zero `scoped_count`, zero rows, and no chip marked current.
+    # That is the outcome `normalise_scope`, which this function sits beside and reuses, exists
+    # to never produce. The applied value is echoed in `kind`, so the substitution is visible.
+    requested_kind = (kind or "").strip().lower()
+    resolved_kind = requested_kind if requested_kind in TIMELINE_KINDS else ""
+    # `None` means NO SLICE, and it has to be a distinct case rather than a very large number.
+    # The first attempt at an uncapped export passed `2**31` through this clamp, which is
+    # `min(2**31, 2000)` -- so the "whole scope" export quietly stopped at 2000 rows, and the
+    # test written for it seeded 225 and could not see that. A sentinel that the clamp silently
+    # eats is not a sentinel.
+    resolved_limit = None if limit is None else max(1, min(int(limit), MAX_TIMELINE_LIMIT))
     since = scope_start_ts(resolved_scope, now_ts)
 
     scoped: list[TimelineRow] = []
@@ -359,8 +414,47 @@ def gather_timeline(
         limit=resolved_limit,
         scoped_count=len(scoped),
         filtered_count=len(filtered),
-        rows=tuple(filtered[:resolved_limit]),
+        rows=tuple(filtered if resolved_limit is None else filtered[:resolved_limit]),
+        log_status=log_status,
         kinds_present=tuple(kind for kind in TIMELINE_KINDS if kind in present),
+    )
+
+
+def export_rows(
+    repo: Repository,
+    *,
+    now_ts: int,
+    scope: str = "all",
+    kind: str = "",
+    cycles: Sequence[Any] = (),
+    log_status: str = "ok",
+) -> TimelineReport:
+    """The whole scope, uncapped -- what the CSV export reads.
+
+    **Deliberately not `gather_timeline`'s cap.** That cap exists because the console polls the
+    JSON route every 15 seconds; an export is a deliberate download, requested once, of a record
+    an operator may hand to an auditor or a tax preparer. Inheriting the page's limit made the
+    file 200 rows of a 5,000-event deployment with nothing in it saying so -- a partial record
+    that reads as complete, which is worse than no export at all.
+
+    The SCOPE still bounds it: `?scope=today|7d|all` is the operator's own choice about how much
+    they are asking for, and `all` on a long-lived deployment is a large file by request rather
+    than by accident.
+
+    **The whole file is materialised in memory** -- as a `str`, then as `bytes`, because the
+    response carries a `Content-Length`. That is an accepted cost for a download an operator
+    asked for once, and it is the reason the paged route keeps its cap: the same read on a
+    15-second poll would not be acceptable. Streaming it is the change to make if `all` on a
+    multi-year deployment ever stops fitting comfortably.
+    """
+    return gather_timeline(
+        repo,
+        now_ts=now_ts,
+        scope=scope,
+        kind=kind,
+        limit=None,
+        cycles=cycles,
+        log_status=log_status,
     )
 
 
@@ -376,6 +470,18 @@ def to_csv(report: TimelineReport) -> str:
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
+    if report.log_gap:
+        # Stated IN THE FILE, above the header, because this file leaves the application. An
+        # auditor holding a CSV cannot ask the page whether a source was missing from it, and
+        # rows that are simply absent look identical to rows that never existed.
+        writer.writerow(
+            [
+                csv_safe(
+                    f"# NOTE: the engine log could not be read ({report.log_status}); "
+                    "cycle rows are missing from this export"
+                )
+            ]
+        )
     writer.writerow(
         [
             "ts",

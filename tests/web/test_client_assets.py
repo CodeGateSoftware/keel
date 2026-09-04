@@ -1523,6 +1523,7 @@ _BROWSER_GLOBALS = frozenset(
         "Object",
         "Set",
         "String",
+        "URL",
         "console",
         "document",
         "window",

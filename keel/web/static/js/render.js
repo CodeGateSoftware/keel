@@ -1193,10 +1193,14 @@ export function timelineView(data, sort, onSort, onKind) {
   // The export, carrying the page's own scope and chip so the file matches the screen.
   const actions = el("p", "note");
   const link = el("a", "chartaction", "Export CSV");
-  link.setAttribute(
-    "href",
-    ["/api/timeline/export.csv?scope=", plain(data.scope), "&kind=", plain(data.kind)].join(""),
-  );
+  // Encoded, like every other URL this client builds (`api.js` uses `searchParams`). `kind` is
+  // the server's echo of caller-supplied text, and a value carrying `&` or `#` would otherwise
+  // reshape the query rather than travel in it. Not reachable with hostile input today -- the
+  // params are in-memory and seeded from `data.kinds` -- so this is the convention, kept.
+  const target = new URL("/api/timeline/export.csv", window.location.origin);
+  target.searchParams.set("scope", plain(data.scope));
+  target.searchParams.set("kind", plain(data.kind));
+  link.setAttribute("href", target.pathname.concat(target.search));
   link.setAttribute("download", "");
   actions.append(link);
   actions.append(" — every row with its provenance; hashes are not recorded yet.");
@@ -1207,7 +1211,10 @@ export function timelineView(data, sort, onSort, onKind) {
     table(
       "h-timeline",
       [
-        { label: "when (UTC)", numeric: false, key: "ts" },
+        // `at`, matching the payload and `sortable`. It was left as `ts` when the server side
+        // was renamed, and `headerCell` only draws a sort control for a key the server declares
+        // -- so the timestamp column of a CHRONOLOGY page silently became an unclickable label.
+        { label: "when (UTC)", numeric: false, key: "at" },
         { label: "kind", numeric: false, key: "kind" },
         { label: "how we know", numeric: false, key: "provenance" },
         { label: "source", numeric: false, key: "source" },

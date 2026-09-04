@@ -359,15 +359,45 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
+def _log_cycles(config: Any) -> tuple[tuple[Any, ...], str]:
+    """`(cycles, status)` -- the engine log's cycles, and how the read of it went.
+
+    Read through `activity`'s own bounded window rather than re-parsed here: that module owns
+    finding the file, reading a bounded tail and turning it into cycles, and a second
+    implementation would be a second answer to "what did the agent do".
+
+    **A log that could not be READ is not a log with nothing in it**, and it is also not a
+    reason to fail the page. `read_log_window` returns a `LogWindow` for every outcome -- it
+    catches its own `OSError` -- and names the outcome in `status`. Both other options were tried
+    and both were wrong:
+
+    * Discarding the status dropped every `system` row and dropped `system` from the chips, which
+      in an auditor's CSV is indistinguishable from "the engine never ran". `activity.py`'s own
+      docstring names that failure: silently discarding input is how a feed comes to under-report
+      reality while looking healthy.
+    * RAISING on any status but `ok`/`missing` made an EMPTY log -- an ordinary state, a freshly
+      created handler or the moment after a rotation -- take out orders, flows and attestations
+      as well. A total outage to report a non-problem, and a divergence from `/api/activity`,
+      which renders these same statuses as a stated feed state.
+
+    So the status is returned, the report carries it, and the page and the CSV say it.
+    """
+    from keel.commands.activity import feed_from_lines, read_log_window, resolve_log_path
+
+    log_path = resolve_log_path(config)
+    window = read_log_window(log_path)
+    # `LogWindow` carries the lines and a read status, not the path -- `source` is the feed's own
+    # label for where the lines came from, so it is passed the path we resolved.
+    cycles = feed_from_lines(
+        window.lines, source=str(log_path), truncated=window.truncated
+    ).cycles
+    return cycles, window.status
+
+
 def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
     """The merged timeline for one request. Shared by the JSON route and the CSV export so the
     file an operator downloads is the same chronology the page showed them -- two builders would
     be two answers to "what happened", and the export is the one that goes to an auditor."""
-    from keel.commands.activity import (
-        feed_from_lines,
-        read_log_window,
-        resolve_log_path,
-    )
     from keel.commands.timeline import (
         DEFAULT_TIMELINE_LIMIT,
         MAX_TIMELINE_LIMIT,
@@ -380,23 +410,7 @@ def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
         DEFAULT_TIMELINE_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_TIMELINE_LIMIT)
     )
 
-    # The engine log is read through `activity`'s own bounded window rather than re-parsed here:
-    # that module owns finding the file, reading a bounded tail of it and turning it into cycles,
-    # and a second implementation would be a second answer to "what did the agent do".
-    cycles: tuple[Any, ...] = ()
-    try:
-        log_path = resolve_log_path(config)
-        window = read_log_window(log_path)
-        # `LogWindow` carries the lines and a read status, not the path -- `source` is the
-        # feed's own label for where the lines came from, so it is passed the path we resolved.
-        cycles = feed_from_lines(
-            window.lines, source=str(log_path), truncated=window.truncated
-        ).cycles
-    except OSError:
-        # No log yet, or an unreadable one. The timeline still has three other sources, and a
-        # missing log is not a reason to fail the whole page -- the `system` rows are simply
-        # absent, which is what an unread log honestly means.
-        cycles = ()
+    cycles, log_status = _log_cycles(config)
 
     repo = open_repo(cfg.db_path)
     try:
@@ -407,6 +421,7 @@ def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
             kind=_first(query, "kind") or "",
             limit=limit,
             cycles=cycles,
+            log_status=log_status,
         )
     finally:
         close_repo(repo)
@@ -702,7 +717,10 @@ API_ROUTES: dict[str, ApiRoute] = {
         html_route="/timeline",
         read=read_timeline,
         collection="rows",
-        sortable=("ts", "kind", "provenance", "source", "product_id"),
+        # `at`, not `ts`: the payload emits `at` (a `moment` field), and a `sortable` entry
+        # naming a key the rows do not carry is accepted, echoed back as applied, and silently
+        # does nothing -- which is the failure refusing an unknown column exists to prevent.
+        sortable=("at", "kind", "provenance", "source", "product_id"),
     ),
     "/api/rules": ApiRoute(
         html_route="/rules",
@@ -974,6 +992,19 @@ def sortable_columns() -> Mapping[str, Sequence[str]]:
 CSV_EXPORT_PATH = "/api/timeline/export.csv"
 
 
+def export_failure_envelope(exc: Exception) -> tuple[int, dict[str, Any]]:
+    """Any other export failure as `(status, document)` -- `respond`'s 500 arm, reachable from
+    the one route that is not in its table. Names the exception type and message, exactly as
+    `respond` does, so an operator has something to act on."""
+    now_ts = int(time.time())
+    return 500, payload.error_envelope(
+        now_ts,
+        status=500,
+        title="That export could not be built",
+        detail=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def export_timeline_csv(cfg: ServeConfig, query: Query) -> tuple[str, str]:
     """`(csv_text, filename)` for the timeline export.
 
@@ -984,9 +1015,25 @@ def export_timeline_csv(cfg: ServeConfig, query: Query) -> tuple[str, str]:
     to be opened in Excel or Sheets, both of which execute a cell beginning `=`, `+`, `-` or `@`,
     and several columns carry text keel did not write.
     """
-    from keel.commands.timeline import to_csv
+    from keel.commands.timeline import export_rows, to_csv
 
     now_ts = int(time.time())
-    report = _timeline_report(cfg, query, now_ts)
+    cycles, log_status = _log_cycles(load_config(cfg.config_path))
+    repo = open_repo(cfg.db_path)
+    try:
+        # `export_rows`, NOT `_timeline_report`: the paged read is capped because the console
+        # polls it every 15 seconds, and an audit record that silently inherited that cap would
+        # be 200 rows of a 5,000-event deployment with nothing in the file saying so -- a partial
+        # record that reads as complete, handed to a tax preparer. The scope still bounds it.
+        report = export_rows(
+            repo,
+            now_ts=now_ts,
+            scope=_first(query, "scope") or "all",
+            kind=_first(query, "kind") or "",
+            cycles=cycles,
+            log_status=log_status,
+        )
+    finally:
+        close_repo(repo)
     stamp = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y%m%d-%H%M%S")
     return to_csv(report), f"keel-activity-{stamp}.csv"

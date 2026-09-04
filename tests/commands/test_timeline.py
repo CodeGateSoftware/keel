@@ -12,6 +12,8 @@ care more about that than about the ordering.
 
 from __future__ import annotations
 
+import csv
+import io
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -97,14 +99,41 @@ def test_the_four_sources_merge_into_one_chronology(repo: Repository, tmp_path: 
 
 def test_rows_are_newest_first(repo: Repository, tmp_path: Path) -> None:
     """One chronology, and the newest thing that happened is the thing an operator opened this
-    page to see."""
-    _attestation(repo)  # oldest
-    _transaction(repo)
-    _order(repo)  # newest
+    page to see.
+
+    The timestamps are SCRAMBLED relative to the order the sources are concatenated in
+    (`_order_rows`, then `_transaction_rows`, then `_attestation_rows`). The first version of
+    this test seeded oldest-to-newest, which happened to match that concatenation -- so deleting
+    the sort entirely left it green. Here the orders are the OLDEST and the attestation the
+    newest, so an unsorted merge comes back ascending and fails.
+    """
+    _order(repo, created_at=NOW_TS - 10_000)
+    _order(repo, created_at=NOW_TS - 9_000)
+    _transaction(repo, ts=NOW_TS - 5_000)
+    _attestation(repo, attested_at=NOW_TS - 100)
 
     timestamps = [row.ts for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows]
 
-    assert timestamps == sorted(timestamps, reverse=True)
+    assert timestamps == [NOW_TS - 100, NOW_TS - 5_000, NOW_TS - 9_000, NOW_TS - 10_000]
+
+
+def test_two_events_at_one_instant_keep_a_stable_order(repo: Repository, tmp_path: Path) -> None:
+    """The tie-break. Without it two rows sharing a second come back in whatever order the merge
+    happened to produce, and the page reshuffles them between polls under a reader's cursor."""
+    _order(repo, created_at=NOW_TS - 60)
+    _transaction(repo, ts=NOW_TS - 60)
+    _attestation(repo, attested_at=NOW_TS - 60)
+
+    references = [row.reference for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows]
+
+    # The tie-break's CONTENT, not merely that two calls agree: `list.sort` is stable and the
+    # merge order deterministic, so a report with NO tie-break also returns the same list twice.
+    # Asserting repeatability alone passed against the missing tie-break.
+    assert references == sorted(references, reverse=True), (
+        "at one instant, `reference` descending is the order -- and it is what makes the page "
+        "stop reshuffling between polls"
+    )
+    assert len(set(references)) == 3, "three distinct events, not one collapsed row"
 
 
 def test_a_live_fill_is_venue_reported_and_a_paper_fill_is_not(
@@ -276,3 +305,130 @@ def test_an_empty_book_is_an_empty_timeline(repo: Repository, tmp_path: Path) ->
 
     assert report.rows == ()
     assert report.scoped_count == 0
+
+
+# -- every cell of the export is neutralised, not only the one with a test (#703 review) --------
+
+
+def test_every_text_column_of_the_export_is_neutralised(repo: Repository, tmp_path: Path) -> None:
+    """`csv_safe` is applied to all ten cells; before this, only `reference` was pinned.
+
+    Removing it from the other nine left the whole suite green -- so the module's load-bearing
+    claim ("applied to EVERY text cell, not to a list of the risky ones") was untested for nine
+    columns, including `summary`, which carries an imported `notes` field verbatim.
+
+    Every hostile value below lands at the START of its own cell, which is the only position a
+    spreadsheet evaluates.
+    """
+    from keel.commands.timeline import to_csv
+
+    # Hostile values in every cell whose content this module does NOT write: the reference, the
+    # summary's ingredients, and the amount. A fixture that leaves the rest keel-written pins
+    # three cells while the docstring claims ten -- which is how the previous version of this
+    # test passed while six columns were unprotected.
+    _order(
+        repo,
+        product_id="=cmd|product",
+        side="=cmd|side",
+        status="=cmd|status",
+        created_at=NOW_TS - 30,
+    )
+    _transaction(
+        repo,
+        coinbase_id="=cmd|ref",
+        type="=cmd|kind",
+        asset="=cmd|asset",
+        notes="",
+        total=Decimal("-500.25"),
+    )
+
+    rows = list(csv.reader(io.StringIO(to_csv(gather_timeline(repo, now_ts=NOW_TS, scope="all")))))
+    header = rows[0]
+    by_source = {r[header.index("source")]: dict(zip(header, r, strict=True)) for r in rows[1:]}
+
+    order_cells = by_source["orders"]
+    assert order_cells["product_id"].startswith("'"), "product_id"
+    assert order_cells["summary"].startswith("'"), "summary -- it begins with the status"
+
+    cells = by_source["transactions"]
+    assert cells["reference"].startswith("'"), "reference"
+    assert cells["summary"].startswith("'"), "summary -- it begins with the transaction type"
+    # A negative amount is a formula trigger and a real figure. Quoted, and still legible.
+    assert cells["amount"] == "'-500.25", cells["amount"]
+    # And nothing that was safe got mangled.
+    assert cells["kind"] == "flow"
+    assert cells["provenance"] == "imported-ledger"
+
+
+def test_the_export_carries_one_row_per_event_plus_a_header(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The shape an auditor's spreadsheet sees."""
+    from keel.commands.timeline import to_csv
+
+    _order(repo)
+    _transaction(repo)
+    _attestation(repo)
+
+    rows = list(csv.reader(io.StringIO(to_csv(gather_timeline(repo, now_ts=NOW_TS, scope="all")))))
+
+    assert rows[0][0] == "ts"
+    assert len(rows) == 4
+
+
+# -- a log that could not be read is a STATED gap, not a failed page (#703 review round 2) ------
+
+
+@pytest.mark.parametrize("status", ["ok", "missing", "empty", "oversized", "unreadable"])
+def test_every_log_read_outcome_still_produces_a_report(status: str, repo, tmp_path) -> None:
+    """Four sources, and one of them having nothing to say must not take out the other three.
+
+    The first fix for this raised on any status but `ok`/`missing` -- which made an EMPTY log
+    (an ordinary state: a freshly created handler, or the moment after a rotation) 500 the whole
+    Timeline page, losing orders, flows and attestations to report a non-problem. `read_log_window`
+    also returns `oversized` for one very long record, which is likewise not a read failure.
+
+    The report carries the outcome instead, so the page and the CSV can SAY the log was
+    unreadable rather than either failing or silently under-reporting.
+    """
+    _order(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", log_status=status)
+
+    assert report.rows, "the other sources still report"
+    assert report.log_status == status
+
+
+def test_a_healthy_log_reports_no_gap(repo, tmp_path) -> None:
+    _order(repo)
+
+    assert gather_timeline(repo, now_ts=NOW_TS, scope="all", log_status="ok").log_gap is False
+
+
+@pytest.mark.parametrize("status", ["empty", "oversized", "unreadable"])
+def test_an_unhealthy_log_is_reported_as_a_gap(status: str, repo, tmp_path) -> None:
+    """`missing` is not a gap -- a deployment that has never run has no log, and that is an
+    ordinary fact rather than a hole in the record. The rest are: the file is there and its
+    contents did not reach this report, which is exactly what an auditor needs told."""
+    _order(repo)
+
+    assert gather_timeline(repo, now_ts=NOW_TS, scope="all", log_status=status).log_gap is True
+
+
+def test_a_missing_log_is_not_a_gap(repo, tmp_path) -> None:
+    _order(repo)
+
+    assert gather_timeline(repo, now_ts=NOW_TS, scope="all", log_status="missing").log_gap is False
+
+
+def test_the_kind_collapse_is_applied_and_echoed(repo, tmp_path) -> None:
+    """An unrecognised kind is collapsed to "every kind", not applied -- `?kind=trades` (the
+    plural typo, since the chips read "trade") would otherwise return a page that looks like an
+    empty deployment. Unpinned until now: reverting the collapse left every test green."""
+    _order(repo)
+    _transaction(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="trades")
+
+    assert report.kind == "", "the applied value is echoed, so the substitution is visible"
+    assert report.shown_count == 2, "and nothing was filtered out"
