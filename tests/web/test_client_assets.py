@@ -1256,6 +1256,13 @@ def _status_view_keys() -> list[str]:
 _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("setupView", "data", "/api/setup"),
     ("activityView", "data", "/api/activity"),
+    # #659/#701/#702's views were added to the client without being added here, so nothing
+    # checked that they read keys their endpoint actually sends. Demonstrated on #702: renaming
+    # `data.hwm` to `data.high_water_mark` in `balancesView` left the whole web suite green, and
+    # the tile would have rendered blank forever with nothing in the console naming the gap.
+    ("ordersView", "data", "/api/orders"),
+    ("positionsView", "data", "/api/positions"),
+    ("balancesView", "data", "/api/balances"),
     ("insightsView", "insights", "/api/insights"),
     ("insightsView", "journal", "/api/journal"),
     ("rulesView", "data", "/api/rules"),

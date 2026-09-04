@@ -1139,6 +1139,99 @@ function jobPanel(job) {
  * @returns {DocumentFragment}
  */
 /**
+ * The Balances view (#702): what the account holds, as the last cycle recorded it.
+ *
+ * ── EVERY FIGURE IS STAMPED, BECAUSE EVERY FIGURE IS RECORDED ────────────────────────────────
+ *
+ * Nothing here came from a network call -- `keel serve` reads SQLite and nothing else, and
+ * `keel/commands/balances.py` carries why that is the design rather than a limitation. What
+ * makes that honest instead of merely quiet is the as-of stamp beside each tile: this is the
+ * cash the engine sized against when it last evaluated the rails, and the page says when.
+ *
+ * ── NO BUYING POWER, NO DEPOSIT, NO TRANSFER, NO CTA ─────────────────────────────────────────
+ *
+ * #702's refusal. Cash is a fact, not an affordance. keel is cash-spot by constitution, so a
+ * "buying power" tile would advertise leverage the engine refuses to take, and a deposit button
+ * would be this page's version of the close button the Positions view also does not have.
+ * Pinned by `tests/web/test_balances_view.py`.
+ *
+ * ── THE SETTLED SPLIT IS NAMED AS MISSING, NOT OMITTED ───────────────────────────────────────
+ *
+ * `settled_breakdown` is a field whose whole content is "unrecorded". Leaving the tiles out
+ * would let a reader assume the available figure IS the settled one; saying so is the only
+ * rendering that cannot be misread.
+ *
+ * @param {any} data  `/api/balances`'s `data`.
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @returns {DocumentFragment}
+ */
+export function balancesView(data, sort, onSort) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Balances"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.generated_at), " · ", field(data.recorded));
+  fragment.append(sub);
+
+  fragment.append(
+    gridCard([
+      kv("mode", plain(data.mode) || "unstamped"),
+      kv("available cash", data.cash),
+      kv("as of", data.cash_as_of),
+      kv("equity", data.equity),
+      kv("unrealized", data.unrealized),
+      kv("high water mark", data.hwm),
+    ]),
+  );
+
+  fragment.append(heading("h-settled", "Settled and unsettled"));
+  const settled = el("p", "note");
+  settled.append(field(data.settled_breakdown));
+  fragment.append(settled);
+  fragment.append(
+    gridCard([kv("settled", data.settled_cash), kv("total", data.total_cash)]),
+  );
+
+  if (plain(data.mode) === "paper") {
+    fragment.append(heading("h-paper", "Synthetic account"));
+    const note = el("p", "note");
+    note.append("The paper account's cash right now, beside the cycle's recorded reading above.");
+    fragment.append(note);
+    fragment.append(gridCard([kv("paper cash", data.paper_cash)]));
+  }
+
+  fragment.append(heading("h-assets", "Held assets"));
+  const assets = data.assets || [];
+  fragment.append(
+    table(
+      "h-assets",
+      [
+        { label: "product", numeric: false, key: "product_id" },
+        { label: "qty held", numeric: true, key: "qty" },
+        { label: "mark", numeric: true, key: "mark" },
+        // No `key`: `/api/balances` does not declare `mark_as_of` sortable, and a key the
+        // server will not order by renders a header that looks clickable and is not.
+        { label: "marked at", numeric: false },
+        { label: "value", numeric: true, key: "market_value" },
+      ],
+      assets.map(/** @param {any} row */ (row) => [
+        plain(row.product_id) || "—",
+        row.qty,
+        row.mark,
+        row.mark_as_of,
+        row.market_value,
+      ]),
+      "No held assets. keel is holding nothing right now.",
+      { sort: sort, onSort: onSort },
+    ),
+  );
+
+  return fragment;
+}
+
+
+/**
  * The Positions view (#701): what is held, what it is worth, and how close it is to its stop.
  *
  * ── NO CLOSE ACTION, AND THAT IS THE DESIGN ──────────────────────────────────────────────────

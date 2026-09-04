@@ -59,6 +59,7 @@ API_ROUTES = (
     "/api/activity",
     "/api/orders",
     "/api/positions",
+    "/api/balances",
     "/api/insights",
     "/api/journal",
     "/api/rules",
