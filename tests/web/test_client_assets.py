@@ -1495,3 +1495,97 @@ def test_every_table_emits_one_cell_per_declared_header() -> None:
     assert len(pairs) >= 6, f"the table scan found only {len(pairs)} tables; it has stopped working"
     mismatched = [(headers, cells) for headers, cells in pairs if headers != cells]
     assert mismatched == [], f"(headers, cells) mismatches: {mismatched}"
+
+
+#: Globals the browser provides, which no module declares and every module may call.
+#:
+#: Deliberately short. A long list is a list that absorbs a typo -- the whole value of the scan
+#: below is that an undefined name is loud, so anything added here should be a real browser API
+#: someone can point at.
+_BROWSER_GLOBALS = frozenset(
+    {
+        "Array",
+        "Boolean",
+        "Date",
+        "FormData",
+        "JSON",
+        "Map",
+        "Math",
+        "Number",
+        "Object",
+        "Set",
+        "String",
+        "console",
+        "document",
+        "window",
+    }
+)
+
+#: Keywords that are followed by a parenthesis and are not calls.
+_NOT_CALLS = frozenset(
+    {"await", "catch", "delete", "for", "function", "if", "instanceof", "new", "return",
+     "super", "switch", "typeof", "void", "while"}
+)
+
+
+def _undefined_calls(name: str) -> list[str]:
+    """Bare-identifier calls in `name` that are not in scope where they are made.
+
+    Scoped PER FUNCTION, and that is the whole difficulty. A first version collected every
+    function's parameters into one module-wide set, which made `sorting` -- a parameter of
+    `table` and of `headerCell` -- count as defined inside `positionsView`, and that is exactly
+    the bug this scan exists to catch. Parameters are in scope in their own function only.
+    """
+    code = _code_only(_source(name))
+
+    module_level = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", code))
+    module_level |= set(re.findall(r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", code, re.M))
+    for block in re.findall(r"import\s*\{([^}]*)\}", code):
+        for imported in block.split(","):
+            imported = imported.strip().split(" as ")[-1].strip()
+            if imported:
+                module_level.add(imported)
+
+    undefined: set[str] = set()
+    for match in re.finditer(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{", code):
+        body = _balanced_block(code, code.index("{", match.end() - 1))[0]
+        in_scope = set(module_level)
+        for param in match.group(2).split(","):
+            param = param.strip()
+            if param:
+                in_scope.add(param)
+        # Everything declared inside the body, at any depth, plus every arrow parameter -- a
+        # callback's own argument is in scope for the callback.
+        in_scope |= set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", body))
+        in_scope |= set(re.findall(r"\(([A-Za-z_$][\w$]*)\)\s*=>", body))
+        in_scope |= set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*=>", body))
+        called = {m.group(1) for m in re.finditer(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", body)}
+        undefined |= called - in_scope - _BROWSER_GLOBALS - _NOT_CALLS
+    return sorted(undefined)
+
+
+@pytest.mark.parametrize("name", _DERIVATION_FREE)
+def test_every_call_resolves_to_something_the_module_has(name: str) -> None:
+    """No JavaScript runs in this suite, so a call to a function that does not exist ships.
+
+    It is not hypothetical. #701's positions table was written calling `sorting(sort, onSort)` --
+    `sorting` is a TYPEDEF and a parameter name in this file, never a function -- and every gate
+    stayed green: mypy does not read JavaScript, ruff does not either, and the view tests assert
+    over source text rather than executing it. The page would have thrown `ReferenceError` on
+    first render.
+
+    Scoped to the two derivation-free modules rather than the whole client: they are the ones
+    that touch almost no browser API, so the short `_BROWSER_GLOBALS` list stays honest. Widening
+    it to `main.js` would mean listing `fetch`, `setTimeout`, `URL` and friends, and a list long
+    enough to cover those is long enough to hide a typo.
+    """
+    assert _undefined_calls(name) == []
+
+
+def test_the_call_scanner_can_fail() -> None:
+    """The premise. A scanner whose regex missed every call would pass any file."""
+    code = "function a() { return b(1); }"
+    called = {m.group(1) for m in re.finditer(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", code)}
+
+    assert "b" in called, "the call scanner does not find calls"
+    assert "a" in called or "a" in set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", code))

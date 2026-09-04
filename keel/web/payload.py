@@ -133,6 +133,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         RuleTrackRecord,
     )
     from keel.commands.orders import OrderRow, OrdersReport
+    from keel.commands.positions import PositionRow, PositionsReport
     from keel.commands.status import (
         AutonomyStatus,
         MarketSessionStatus,
@@ -1523,6 +1524,109 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
         "empty_reason": report.empty_reason,
         "empty_note": _EMPTY_NOTES.get(report.empty_reason, ""),
         "rows": [_order_row_payload(row) for row in report.rows],
+    }
+
+
+#: The entry-gate verdict, styled (#701). `entry_bar_ready`'s vocabulary, not a staleness one:
+#: these words say why the AGENT would refuse to open a position on this product right now.
+#:
+#: All three are WARN rather than BAD. None of them is a loss or a broken deployment -- a feed
+#: catches up, an unconfirmed bar confirms -- but each one means keel cannot act on this product
+#: at this moment, and a reader scanning for "why did nothing happen" must be able to find them.
+_READINESS_STATES: Mapping[str, str] = {
+    "missing": WARN,
+    "behind": WARN,
+    "unconfirmed": WARN,
+}
+
+#: What each verdict means, spelled out. The word alone is a term of art; the sentence is what a
+#: reader who has not read `freshness.py` can act on.
+_READINESS_NOTES: Mapping[str, str] = {
+    "missing": "no cached bar for the entry-gate series -- keel would not open here",
+    "behind": "the entry-gate series is behind its expected bar -- keel would not open here",
+    "unconfirmed": "the newest bar is not confirmed closed by a finer series -- keel would wait",
+}
+
+
+def _readiness_field(ready: bool, reason: str | None) -> Field:
+    """The freshness chip: the ENTRY GATE's own verdict for one product.
+
+    Deliberately not `_freshness_payload`'s age. That one answers "how old is this data", which
+    `freshness.assess` tolerates a forming bar for; this answers "would the agent trade on it",
+    which `entry_bar_ready` refuses a one-bar-late finer series for -- because that lag is
+    exactly the condition that produces a duplicate real-money order. A page showing the softer
+    number would tell a reader the feed is fine while the engine's own gate is refusing it.
+
+    A `ready` row says so plainly rather than going blank: "nothing is wrong" is a finding on a
+    page whose other rows explain why keel is idle.
+    """
+    if ready:
+        return label("ready", display="entry gate ready", state=GOOD)
+    word = reason or "unknown"
+    return label(
+        word,
+        display=_READINESS_NOTES.get(word, "the entry gate would not open here"),
+        state=_READINESS_STATES.get(word, UNKNOWN),
+    )
+
+
+def _position_row_payload(row: PositionRow) -> dict[str, Any]:
+    """One open tranche, placed. Nothing is decided here.
+
+    Every judgement was made by `keel/commands/positions.py`: what the mark is, whether there is
+    one, what the stop distance is and whether the entry gate would open. This function chooses a
+    `state` word and a symbol for each figure, which is all -- and is what makes this page and
+    `keel status` incapable of disagreeing about the same tranche.
+
+    **`unrealized` and `stop_distance` are the only two figures that carry a verdict**, because
+    they are the only two whose sign means something. A market value is a magnitude: an account
+    is not good for being worth something, and a glyph on every balance would hide the one figure
+    that matters. On `stop_distance`, negative means the tranche is trading THROUGH the
+    protection it was sized against -- keel is cash-spot and long-only (`CashAccountRequired`,
+    #372), so a stop always sits below the mark and the sign has one meaning.
+
+    **No notional, no cost basis, no ratio this layer computed.** Everything here is on the
+    report. `stop_distance_pct` crosses as the raw FRACTION with no `%`, the same posture `ratio`
+    documents for the drawdown scalars -- rescaling it by 100 would be arithmetic Rule 2 forbids.
+    """
+    return {
+        "id": str(row.id),
+        "product_id": row.product_id,
+        "rule_name": row.rule_name,
+        "opened_at": moment(row.opened_at),
+        "qty": quantity(row.qty),
+        "entry_fill": money(row.entry_fill),
+        "entry_fee": money(row.entry_fee),
+        "mark": money(row.mark),
+        "mark_at": moment(row.mark_ts),
+        "market_value": money(row.market_value),
+        "unrealized": money(row.unrealized_pnl, signed=True),
+        "initial_stop": money(row.initial_stop),
+        "stop_distance": money(row.stop_distance, signed=True),
+        "stop_distance_pct": ratio(row.stop_distance_pct),
+        "realized_qty": quantity(row.realized_qty),
+        "realized_proceeds": money(row.realized_proceeds),
+        "realized_fees": money(row.realized_fees),
+        "freshness": _readiness_field(row.ready, row.ready_reason),
+    }
+
+
+def positions_payload(report: PositionsReport) -> dict[str, Any]:
+    """`gather_positions`'s `PositionsReport`, as JSON.
+
+    `open_count` and `products` are READ from the report, never measured here -- Rule 6e bans
+    `len()` in this module, and both properties exist on the report so the ban costs nothing.
+
+    `products` is the grouping key a view renders sections from. It is the report's own list, in
+    its own order, so a client cannot build a second one and reach a different answer about which
+    products this book holds.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "open_count": count(report.open_count),
+        "products": [str(product) for product in report.products],
+        "rows": [_position_row_payload(row) for row in report.rows],
     }
 
 
