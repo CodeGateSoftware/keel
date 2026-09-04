@@ -332,7 +332,14 @@ export function equitySeriesChart(series, id) {
   }
 
   const figure = document.createElement("figure");
-  figure.className = "chart";
+  // `"chart series"`, never a bare `"chart"`. `svg.series` keeps the #602 POINTER gestures off
+  // this canvas, but `main.js` also reaches for the WRAPPER twice -- `highlightJournalRow` and
+  // the chart-action handler -- with `querySelector`, which takes the first match in document
+  // order, and this figure is appended ABOVE the curve's. Left as a bare `figure.chart` it
+  // intercepts both: `highlightTrade` finds no `.highlight` group here, returns early, and
+  // hovering a journal row silently stops highlighting anything. The second half of the fix is
+  // the `:not(.series)` in those two selectors.
+  figure.className = "chart series";
   const caption = document.createElement("figcaption");
   caption.className = "note";
   caption.id = id;

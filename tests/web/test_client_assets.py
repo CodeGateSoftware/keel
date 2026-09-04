@@ -1367,6 +1367,31 @@ def test_the_series_canvas_does_not_answer_to_the_curves_selector() -> None:
     assert series_at < curve_at, "the equity series is stacked ABOVE the closed-trade curve"
 
 
+def test_the_series_figure_does_not_intercept_the_curves_figure_lookups() -> None:
+    """The collision that `svg.series` alone does NOT fix, and that cost the journal-row
+    highlight once already.
+
+    `main.js` reaches for the chart's WRAPPER with `contentNode.querySelector("figure.chart")`
+    in two places -- `highlightJournalRow` and the chart-action handler -- and that takes the
+    first match in document order. The series figure is appended ABOVE the curve, so if it were
+    a bare `figure.chart` those lookups would land on it; `highlightTrade` would then find no
+    `.highlight` group, return early, and hovering a journal row would silently do nothing.
+    Both halves are pinned here: the class the series wears, and the selector that excludes it.
+    """
+    chart_code = _source("chart.js")
+    assert 'figure.className = "chart series"' in chart_code, (
+        "the series figure must be distinguishable from the curve's figure by class"
+    )
+
+    main_code = _source("main.js")
+    assert 'querySelector("figure.chart")' not in main_code, (
+        "a bare figure.chart lookup takes the series figure, which renders first"
+    )
+    assert main_code.count('querySelector("figure.chart:not(.series)")') == 2, (
+        "both figure lookups in main.js must exclude the series figure"
+    )
+
+
 def test_the_series_draws_each_mode_as_its_own_polyline() -> None:
     """The one thing this chart must never do is join two accounts into one line. It is checked
     on the source rather than a rendered DOM because a browser cannot run here: the loop over

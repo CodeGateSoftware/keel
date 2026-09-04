@@ -743,15 +743,32 @@ class Repository:
         self._conn.commit()
 
     def get_equity_points(
-        self, mode: str | None = None, since_ts: int | None = None
+        self,
+        mode: str | None = None,
+        since_ts: int | None = None,
+        limit: int | None = None,
     ) -> list[EquityReading]:
-        """The series, oldest first, optionally narrowed to one mode and/or a time window.
+        """The series, oldest first, optionally narrowed to one mode, a time window, or a count.
 
         `mode=None` returns paper AND live rows interleaved by time. That is the honest raw
         read, but it is NOT a curve: a caller drawing it as one line joins two unrelated
         accounts across the flip. Readers that plot must group by `mode` (`insights` does).
+
+        `limit` keeps the MOST RECENT `limit` readings and still returns them oldest first. Two
+        halves of one decision:
+
+        * **Most recent, not first.** This table is append-only and grows one row per cycle
+          forever -- at the default `auto_trade.interval_sec` of 900 that is ~35,000 rows a
+          year. A cap that kept the OLDEST rows would answer "where is this account now?" with
+          the readings furthest from the answer, and would freeze the chart the day the cap was
+          reached.
+        * **Still oldest first.** The ordering is the caller's contract, not an artefact of how
+          the rows were selected. `ORDER BY ts DESC LIMIT n` in a subquery, re-ordered outside
+          it, so a bounded read and an unbounded one differ only in how much they return.
+
+        A caller that bounds a read is showing a WINDOW of the record and must say so:
+        `count_equity_points` is how it learns what it is leaving out.
         """
-        query = "SELECT * FROM equity_points"
         clauses: list[str] = []
         params: list[object] = []
         if mode is not None:
@@ -760,12 +777,34 @@ class Repository:
         if since_ts is not None:
             clauses.append("ts >= ?")
             params.append(since_ts)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         # `id` breaks the tie so two readings at the same epoch second keep insertion order --
-        # `ts` alone leaves that to SQLite, and a chart would draw them in an arbitrary one.
-        query += " ORDER BY ts, id"
+        # `ts` alone leaves that to SQLite, and a chart would draw them in an arbitrary one. It
+        # is applied in BOTH directions below so the newest-N and the oldest-first re-order
+        # agree about which of two same-second readings is the newer.
+        if limit is None:
+            query = f"SELECT * FROM equity_points{where} ORDER BY ts, id"
+        else:
+            query = (
+                f"SELECT * FROM (SELECT * FROM equity_points{where} "
+                "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id"
+            )
+            params.append(limit)
         return [_equity_point_from_row(row) for row in self._conn.execute(query, params)]
+
+    def count_equity_points(self, mode: str | None = None) -> int:
+        """How many readings the table holds -- the total a bounded read is a window ONTO.
+
+        A `COUNT(*)`, never `len(get_equity_points())`: the entire point is to learn the size
+        without paying to materialise the rows, which is what the caller just declined to do.
+        """
+        query = "SELECT COUNT(*) AS n FROM equity_points"
+        params: list[object] = []
+        if mode is not None:
+            query += " WHERE mode = ?"
+            params.append(mode)
+        row = self._conn.execute(query, params).fetchone()
+        return int(row["n"])
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 

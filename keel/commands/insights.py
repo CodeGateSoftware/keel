@@ -282,6 +282,11 @@ class EquitySeries:
     high: Decimal
     width: Decimal
     height: Decimal
+    #: How many readings the TABLE holds, when the caller bounded its read and knows. `None`
+    #: means the caller did not say -- which is deliberately not the same as "nothing was left
+    #: out", because a series that asserted completeness on behalf of a caller that never
+    #: counted would be the chart lying about its own span.
+    total_recorded: int | None = None
 
     @property
     def point_count(self) -> int:
@@ -291,6 +296,19 @@ class EquitySeries:
         can drift from the list it describes, and `keel/web/payload.py` may not call `len()`.
         """
         return sum(len(segment.points) for segment in self.segments)
+
+    @property
+    def is_truncated(self) -> bool:
+        """Whether this series is a WINDOW onto a longer record.
+
+        What the text equivalent turns on. A bounded read is honest only if it says so: a chart
+        that quietly begins wherever a row cap fell would misstate the span of the record while
+        every individual point remained true, which is the harder kind of wrong to notice.
+
+        `False` when the total is unknown -- an unstated total is not a claim in either
+        direction, and inventing "complete" from silence is the failure this guards.
+        """
+        return self.total_recorded is not None and self.total_recorded > self.point_count
 
     @property
     def modes(self) -> list[str]:
@@ -332,6 +350,7 @@ def build_equity_series(
     readings: Sequence[EquityReading],
     *,
     max_total_dd_pct: Decimal | None = None,
+    total_recorded: int | None = None,
 ) -> EquitySeries:
     """The account-equity series over `readings`, oldest first, ready to draw (#698).
 
@@ -363,7 +382,12 @@ def build_equity_series(
     """
     if not readings:
         return EquitySeries(
-            segments=[], low=_ZERO, high=_ZERO, width=PLOT_WIDTH, height=PLOT_HEIGHT
+            segments=[],
+            low=_ZERO,
+            high=_ZERO,
+            width=PLOT_WIDTH,
+            height=PLOT_HEIGHT,
+            total_recorded=total_recorded,
         )
 
     floors = [
@@ -423,7 +447,12 @@ def build_equity_series(
         segments.append(EquitySeriesSegment(mode=str(current_mode), points=current))
 
     return EquitySeries(
-        segments=segments, low=low, high=high, width=PLOT_WIDTH, height=PLOT_HEIGHT
+        segments=segments,
+        low=low,
+        high=high,
+        width=PLOT_WIDTH,
+        height=PLOT_HEIGHT,
+        total_recorded=total_recorded,
     )
 
 

@@ -1090,15 +1090,22 @@ def equity_series_payload(series: EquitySeries) -> dict[str, Any]:
     """
     low, high = money(series.low), money(series.high)
     cycles = count(series.point_count)
+    truncated_from = count(series.total_recorded)
     if series.segments:
         # `series.modes` and `series.is_partitioned`, never a mode list assembled here: Rule 6e
         # bans `len()` in this module precisely so a count on the wire is one the report already
         # holds, and a serialiser deriving its own answer is how two answers start to differ.
         span = " and ".join(series.modes)
+        # "the most recent N", never a bare N, when the read was bounded. The sentence is the
+        # whole of what a reader who cannot see the chart is told about its span, so a window
+        # described as a history is a lie by omission that every individual point survives.
+        scope = "the most recent " if series.is_truncated else ""
         reading = (
-            f"Account equity over time across {cycles['display']} cycle(s) in {span}, "
+            f"Account equity over time across {scope}{cycles['display']} cycle(s) in {span}, "
             f"ranging from {low['display']} to {high['display']}."
         )
+        if series.is_truncated:
+            reading += f" {truncated_from['display']} readings are recorded in total."
         # Said only when there IS a partition. A deployment that has only ever run paper would
         # otherwise be told about a second line that is not on the chart -- the same false
         # continuity the segments exist to prevent, pointing the other way.
@@ -1113,6 +1120,13 @@ def equity_series_payload(series: EquitySeries) -> dict[str, Any]:
         "width": _plain(series.width),
         "height": _plain(series.height),
         "point_count": cycles,
+        "total_recorded": truncated_from,
+        # A `flag`, not a bare boolean: a client must not have to compare `point_count` against
+        # `total_recorded` to learn this. That comparison is arithmetic, and the answer is a
+        # statement about how much of the record the chart is showing -- a judgement, made here.
+        "is_truncated": flag(
+            series.is_truncated, on="a window onto a longer record", off="the whole record"
+        ),
         "low": low,
         "high": high,
         "reading": label("series", display=reading, state=NEUTRAL),

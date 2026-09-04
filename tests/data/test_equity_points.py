@@ -122,6 +122,48 @@ def test_a_since_window_is_bounded_by_epoch_order_not_string_order(repo: Reposit
     assert [p.ts for p in repo.get_equity_points(since_ts=NOW)] == [NOW]
 
 
+def test_a_limit_takes_the_MOST_RECENT_readings_still_oldest_first(repo: Repository) -> None:
+    """A bounded read has to keep the END of the series, not the beginning. The chart's subject
+    is where the account is now; the first N rows ever written are the least interesting answer
+    to that, and on a long-running deployment they are also the ones furthest from the truth."""
+    for offset in range(5):
+        repo.record_equity_point(_point(ts=NOW + offset * DAY, equity=str(1000 + offset)))
+
+    got = repo.get_equity_points(limit=2)
+
+    assert [p.ts for p in got] == [NOW + 3 * DAY, NOW + 4 * DAY]
+    assert [p.equity for p in got] == [Decimal("1003"), Decimal("1004")]
+
+
+def test_a_limit_larger_than_the_table_returns_everything(repo: Repository) -> None:
+    repo.record_equity_point(_point(ts=NOW))
+    assert len(repo.get_equity_points(limit=500)) == 1
+
+
+def test_a_limit_composes_with_the_mode_partition(repo: Repository) -> None:
+    """The limit must be applied WITHIN the mode, not to a blended read that is then filtered --
+    otherwise asking for the last two live readings on a paper-heavy database returns nothing."""
+    for offset in range(5):
+        repo.record_equity_point(_point(ts=NOW + offset * DAY, mode="paper"))
+    for offset in range(5, 8):
+        repo.record_equity_point(_point(ts=NOW + offset * DAY, mode="live", equity="250"))
+
+    got = repo.get_equity_points(mode="live", limit=2)
+
+    assert [p.ts for p in got] == [NOW + 6 * DAY, NOW + 7 * DAY]
+
+
+def test_the_recorded_count_is_readable_without_reading_the_rows(repo: Repository) -> None:
+    """What lets a bounded chart say how much it is NOT showing. A count is the whole reason the
+    truncation can be stated honestly instead of the series quietly starting wherever the cap
+    happened to fall."""
+    for offset in range(7):
+        repo.record_equity_point(_point(ts=NOW + offset * DAY))
+
+    assert repo.count_equity_points() == 7
+    assert repo.count_equity_points(mode="live") == 0
+
+
 def test_an_existing_database_gains_the_table_on_migration() -> None:
     conn = connect(":memory:")
     migrate(conn)

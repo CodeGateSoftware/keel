@@ -43,6 +43,35 @@ def _reading(
     )
 
 
+def test_a_window_onto_a_longer_record_knows_it_is_one() -> None:
+    """A bounded read must not draw as though it were the whole history. The chart's own claim
+    is that these are the numbers the engine acted on; starting the line wherever a row cap
+    happened to fall, silently, would make the span of the record a lie by omission."""
+    series = build_equity_series(
+        [_reading(NOW, "10000"), _reading(NOW + DAY, "10100")], total_recorded=900
+    )
+
+    assert series.is_truncated is True
+    assert series.total_recorded == 900
+    assert series.point_count == 2
+
+
+def test_a_series_holding_every_recorded_reading_is_not_truncated() -> None:
+    series = build_equity_series([_reading(NOW, "10000")], total_recorded=1)
+
+    assert series.is_truncated is False
+
+
+def test_an_unstated_total_is_not_a_claim_that_nothing_was_left_out() -> None:
+    """`total_recorded=None` means the caller did not say. Defaulting it to the point count
+    would have the series assert it is complete on behalf of a caller that never checked --
+    so the honest answer to "is this truncated?" is not-known, which reads as no claim."""
+    series = build_equity_series([_reading(NOW, "10000")])
+
+    assert series.total_recorded is None
+    assert series.is_truncated is False
+
+
 def test_the_series_names_the_modes_it_spans_in_the_order_they_appear() -> None:
     """The report holds this, not the serialiser. `keel/web/payload.py` may not call `len()`
     (Rule 6e of `tests/commands/test_console_thinness.py`), and the sentence it writes for a

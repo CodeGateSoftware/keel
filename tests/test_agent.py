@@ -1420,6 +1420,50 @@ def test_a_live_cycle_records_the_equity_point_with_its_cash_and_unrealized(
     assert point.equity == Decimal("1000000") + Decimal("2") * Decimal("100")
 
 
+def test_a_paper_cycle_records_the_split_off_the_synthetic_account(repo, monkeypatch) -> None:
+    """The paper branch's wiring, through the real loop rather than on `PaperTrader` alone.
+
+    The two are different code: `tests/strategy/test_paper.py` proves `get_cash()` and
+    `unrealized()` agree with `equity()` on one account state, and this proves the AGENT hands
+    those two to `update_drawdown` for the same cycle it read the equity from -- a paper account
+    that seeds itself DURING this cycle is exactly where the total and the split could come from
+    two different states of the account.
+    """
+    from keel.strategy.paper import PaperTrader
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+    trader.on_signal(
+        _paper_enter_signal(
+            product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"),
+            ts=0,
+        ),
+        qty=Decimal("10"),
+    )
+
+    broker = _MarketDataOnlyBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100"), _candle(86_400, "120")]}
+    )
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", 86_400)
+
+    run_once(broker, repo, cfg, now_ts=86_400)
+
+    point = repo.get_equity_points()[0]
+    assert point.mode == "paper"
+    assert point.cash == trader.get_cash()
+    assert point.cash is not None and point.unrealized is not None
+    # The reconciliation invariant, on the paper side and through the loop: the recorded parts
+    # add back to the recorded total. The entry fill is whatever slippage and fees made it, so
+    # the cost basis is read back rather than assumed.
+    entry_fill = repo.get_orders(mode="paper")[0]["actual_fill"]
+    assert point.cash + Decimal("10") * entry_fill + point.unrealized == point.equity
+
+
 def test_the_live_split_reconciles_against_the_equity_it_was_read_with(repo: Repository) -> None:
     """`cash + cost basis + unrealized == equity`, on ONE read of the account.
 

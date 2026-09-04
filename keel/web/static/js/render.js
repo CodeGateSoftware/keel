@@ -1686,8 +1686,19 @@ export function insightsView(insights, journal, sort, onSort, journalSort, onJou
   // reasonably assume the row cap above applies to both.
   const series = equitySeriesChart(insights.equity_series, "h-series");
   if (series) {
+    // What the top chart's span actually is, in words, next to the chart. `is_truncated` is a
+    // `flag` whose `display` already says which case this is -- the client never compares
+    // `point_count` against `total_recorded` to find out, because that comparison is arithmetic
+    // and the answer is a claim about how much of the record is on screen.
     const scope = el("p", "note");
-    scope.append("Every recorded cycle, not only the ", field(journal.shown_count), " shown below.");
+    scope.append(
+      field(insights.equity_series.point_count),
+      " of ",
+      field(insights.equity_series.total_recorded),
+      " recorded cycle(s) — ",
+      field(insights.equity_series.is_truncated),
+      ". Not narrowed by the journal row cap below.",
+    );
     fragment.append(series, scope);
   } else if (insights.equity_series) {
     fragment.append(el("p", "empty", plain(insights.equity_series.reading.display)));

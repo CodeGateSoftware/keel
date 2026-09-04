@@ -1512,6 +1512,28 @@ def test_a_single_mode_is_not_told_it_is_two_separate_accounts() -> None:
     assert "separate accounts" in _series_json()["reading"]["display"]
 
 
+def test_a_truncated_series_says_how_much_it_is_not_showing() -> None:
+    """A bounded read reaches the reader as a bounded read. The sentence is the only place a
+    screen-reader user is told the chart is a window rather than the whole record -- and a
+    sighted reader gets the same words, so neither is told a span that is not there."""
+    truncated = payload.equity_series_payload(
+        build_equity_series(_equity_readings(), total_recorded=900)
+    )
+
+    assert "most recent" in truncated["reading"]["display"]
+    assert truncated["total_recorded"]["value"] == "900"
+    assert truncated["is_truncated"]["value"] == "true"
+
+
+def test_a_complete_series_makes_no_truncation_claim() -> None:
+    complete = payload.equity_series_payload(
+        build_equity_series(_equity_readings(), total_recorded=3)
+    )
+
+    assert "most recent" not in complete["reading"]["display"]
+    assert complete["is_truncated"]["value"] == "false"
+
+
 def test_an_empty_series_says_so_rather_than_describing_an_empty_chart() -> None:
     """Not "the account was flat", and not an empty string. A deployment that has not completed a
     cycle since the upgrade has no readings at all, and which of those two a reader is looking at
