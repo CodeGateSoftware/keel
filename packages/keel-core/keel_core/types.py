@@ -42,6 +42,34 @@ class Candle:
 
 
 @dataclass(frozen=True)
+class EquityReading:
+    """One cycle's mark-to-market equity reading, as the agent computed it (#698).
+
+    `mode` is `"paper"` or `"live"` -- the same partition `agent._clear_live_mode_if_needed`
+    enforces on the shared high-water mark. Two modes share one database (ADR 0002 gives each
+    profile its own), and their equities are unrelated accounts: a reader that blends them draws
+    a cliff at the flip and calls it a drawdown.
+
+    `cash` and `unrealized` are `None` for "not recorded", never zero -- the `orders.filled_
+    quantity` convention. A cycle can know its total equity while the split is unavailable (an
+    unseeded paper account, a broker that answered for the total but not per-currency), and
+    writing a zero there would state a flat position that was never observed.
+
+    `hwm` is the high-water mark AFTER this reading was folded in, so a row carries the rail-11
+    ceiling that was actually in force when the agent acted on it -- the chart's drawdown
+    overlay reads it rather than recomputing a monotonic maximum the engine may have rebased
+    (`execution.equity.record_external_flow` shifts the HWM on a declared deposit).
+    """
+
+    ts: int
+    mode: str
+    equity: Decimal
+    cash: Decimal | None
+    unrealized: Decimal | None
+    hwm: Decimal
+
+
+@dataclass(frozen=True)
 class Profile:
     """The user's own settings, as opposed to operational state or file configuration.
 
@@ -70,4 +98,4 @@ class Profile:
         return now_ts < self.autonomous_until
 
 
-__all__ = ["Granularity", "Side", "Candle", "Profile"]
+__all__ = ["Granularity", "Side", "Candle", "EquityReading", "Profile"]

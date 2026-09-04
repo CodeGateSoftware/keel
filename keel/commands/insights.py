@@ -47,6 +47,7 @@ from decimal import Decimal
 from typing import Any
 
 import click
+from keel_core.types import EquityReading
 
 from keel import agent as agent_mod
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
@@ -151,6 +152,16 @@ _BASELINE = Decimal("0")
 #: readable in view-source, which is the whole argument for this interface.
 _COORD = Decimal("0.01")
 
+#: A plain arithmetic zero, deliberately NOT `_BASELINE`.
+#:
+#: `_BASELINE` is a claim about an axis -- "zero is always on this canvas" -- and it is
+#: true of cumulative net P&L, where zero separates a rule that has made money from one
+#: that has lost it. `build_equity_series` plots ACCOUNT EQUITY, which has no such line:
+#: an account is not up or down against nothing. Forcing zero into that range would
+#: squash a $10,000 account's real moves into a sliver at the top of a box that is
+#: mostly empty space, so the two zeros are kept apart by name.
+_ZERO = Decimal("0")
+
 
 @dataclass(frozen=True)
 class EquityPoint:
@@ -206,10 +217,185 @@ class EquityCurve:
         return len(self.points)
 
 
+@dataclass(frozen=True)
+class EquitySeriesPoint:
+    """One cycle's account equity, and where it is drawn (#698).
+
+    `equity`, `hwm` and `dd_floor` are the exact figures; `x` and `y` are plot coordinates in
+    the same `PLOT_WIDTH` x `PLOT_HEIGHT` box `EquityPoint` uses, with `y` growing DOWNWARD for
+    the reason documented there.
+
+    `hwm_y` and `dd_floor_y` are the overlay coordinates for the same instant, so the ceiling
+    lines are drawn from the same pass and cannot drift from the point they belong to.
+    `dd_floor` is `None` when no rail setting was supplied -- an unknown ceiling, which is not
+    the same as a ceiling of zero.
+    """
+
+    ts: int
+    mode: str
+    equity: Decimal
+    cash: Decimal | None
+    unrealized: Decimal | None
+    hwm: Decimal
+    dd_floor: Decimal | None
+    x: Decimal
+    y: Decimal
+    hwm_y: Decimal
+    dd_floor_y: Decimal | None
+
+
+@dataclass(frozen=True)
+class EquitySeriesSegment:
+    """A run of consecutive readings in ONE mode -- one unbroken polyline.
+
+    Segments exist because paper and live are different accounts sharing a database, and a line
+    drawn across the flip states a continuity that does not exist. A mode that resumes after a
+    flip is a NEW segment rather than a continuation of its earlier one: grouping by mode alone
+    would draw a line across the stretch the account spent somewhere else.
+    """
+
+    mode: str
+    points: list[EquitySeriesPoint]
+
+
+@dataclass(frozen=True)
+class EquitySeries:
+    """Account equity over TIME, as the agent marked it each cycle (#698).
+
+    A different chart from `EquityCurve`, not a replacement for it. That one plots cumulative
+    net P&L over closed TRADES and argues -- correctly, for that quantity -- that its axis
+    should be trade order. This plots what the account was worth whether or not it traded, and
+    for that the gaps between cycles are information: a week the agent did not run is a week
+    with no readings, and it has to look like one.
+
+    `low`/`high` are the axis bounds actually used and include the OVERLAYS, so a drawdown floor
+    is guaranteed to fit inside the box. A floor drawn off the bottom edge reads as absent, and
+    an absent rail ceiling is the one thing this chart must never imply.
+
+    Empty is a real answer: a deployment that has not completed a cycle since the v19 upgrade
+    has no series, and `segments == []` says exactly that. There is no synthetic flat line,
+    because a flat line is what an account that did not move looks like.
+    """
+
+    segments: list[EquitySeriesSegment]
+    low: Decimal
+    high: Decimal
+    width: Decimal
+    height: Decimal
+
+    @property
+    def point_count(self) -> int:
+        """How many readings the series holds, across every segment.
+
+        Derived rather than stored, for the reason `EquityCurve.point_count` is: a stored count
+        can drift from the list it describes, and `keel/web/payload.py` may not call `len()`.
+        """
+        return sum(len(segment.points) for segment in self.segments)
+
+
 def _plot_y(value: Decimal, *, low: Decimal, span: Decimal) -> Decimal:
     """`value` mapped into `0..PLOT_HEIGHT`, with the top of the box being `low + span`."""
     fraction = (value - low) / span
     return (PLOT_HEIGHT - PLOT_HEIGHT * fraction).quantize(_COORD)
+
+
+def build_equity_series(
+    readings: Sequence[EquityReading],
+    *,
+    max_total_dd_pct: Decimal | None = None,
+) -> EquitySeries:
+    """The account-equity series over `readings`, oldest first, ready to draw (#698).
+
+    **The horizontal axis is TIME**, unlike `build_equity_curve`'s. The quantity is different:
+    that curve plots closed trades, where a quiet week is not an event, while this plots what
+    the account was worth every cycle -- and there, a week with no readings IS the event. Even
+    spacing would draw a gap in the record as an ordinary step between two cycles.
+
+    **Readings are segmented by mode**, and by RUNS of it rather than by the mode set: paper,
+    live, paper is three segments. Paper and live are unrelated accounts that share a database
+    (they flip within one, which is why `agent._clear_live_mode_if_needed` wipes the shared
+    high-water mark), so a polyline crossing a flip asserts a continuity that does not exist --
+    a $10k paper account followed by a $250 live one would draw a 97.5% collapse that never
+    happened.
+
+    **`hwm` is read off each row, never recomputed.** It is not the running maximum of the
+    equity: `execution.equity.record_external_flow` REBASES it on a declared deposit so the
+    drawdown keeps measuring trading performance. The overlay's whole purpose is to show the
+    ceiling rail 11 actually had in force, so a recomputed maximum would be a different line
+    wearing its name.
+
+    `max_total_dd_pct` is the rail's own setting (`config.money_mgmt.max_total_dd_pct`). Given
+    it, each point carries the equity at which rail 11 would start vetoing entries -- derived
+    from THAT point's high-water mark, so the floor moves with the rebase. Omitted, `dd_floor`
+    is `None`: the ceiling is unknown, which is not a ceiling of zero.
+
+    Callers pass the readings they are displaying, so the chart and any table beside it can
+    never disagree about which cycles they describe.
+    """
+    if not readings:
+        return EquitySeries(
+            segments=[], low=_ZERO, high=_ZERO, width=PLOT_WIDTH, height=PLOT_HEIGHT
+        )
+
+    floors = [
+        None if max_total_dd_pct is None else reading.hwm * (Decimal("1") - max_total_dd_pct)
+        for reading in readings
+    ]
+
+    # The bounds span the OVERLAYS as well as the equity: the floor and the high-water mark are
+    # drawn in this box, and a line outside it is a line a reader cannot see.
+    values = [reading.equity for reading in readings]
+    values += [reading.hwm for reading in readings]
+    values += [floor for floor in floors if floor is not None]
+    low, high = min(values), max(values)
+    span = high - low
+
+    first_ts, last_ts = readings[0].ts, readings[-1].ts
+    time_span = last_ts - first_ts
+
+    def _y(value: Decimal) -> Decimal:
+        # Zero span has no range to normalise against, so a flat account is drawn mid-box:
+        # pinning it to an edge would imply it sat at an extreme of something.
+        if span == _ZERO:
+            return (PLOT_HEIGHT / 2).quantize(_COORD)
+        return _plot_y(value, low=low, span=span)
+
+    def _x(ts: int) -> Decimal:
+        # A single reading (or several within one second) has no span to place points along. The
+        # left edge, because one cycle is the BEGINNING of the record, not the whole of it.
+        if time_span <= 0:
+            return _ZERO
+        return (PLOT_WIDTH * (Decimal(ts - first_ts) / Decimal(time_span))).quantize(_COORD)
+
+    segments: list[EquitySeriesSegment] = []
+    current: list[EquitySeriesPoint] = []
+    current_mode: str | None = None
+    for reading, floor in zip(readings, floors):
+        if reading.mode != current_mode:
+            if current:
+                segments.append(EquitySeriesSegment(mode=str(current_mode), points=current))
+            current, current_mode = [], reading.mode
+        current.append(
+            EquitySeriesPoint(
+                ts=reading.ts,
+                mode=reading.mode,
+                equity=reading.equity,
+                cash=reading.cash,
+                unrealized=reading.unrealized,
+                hwm=reading.hwm,
+                dd_floor=floor,
+                x=_x(reading.ts),
+                y=_y(reading.equity),
+                hwm_y=_y(reading.hwm),
+                dd_floor_y=None if floor is None else _y(floor),
+            )
+        )
+    if current:
+        segments.append(EquitySeriesSegment(mode=str(current_mode), points=current))
+
+    return EquitySeries(
+        segments=segments, low=low, high=high, width=PLOT_WIDTH, height=PLOT_HEIGHT
+    )
 
 
 def build_equity_curve(entries: Sequence[JournalEntry]) -> EquityCurve:

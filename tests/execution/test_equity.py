@@ -238,3 +238,95 @@ def test_pending_purification_usd_is_zero_on_a_clean_ledger() -> None:
     repo.upsert_transaction(_reward_tx("cl1", "500", tx_type="Buy"))
 
     assert equity.pending_purification_usd(repo) == Decimal("0")
+
+
+# -- the persisted series (#698) ------------------------------------------------------------
+#
+# `equity_history` in `agent_state` is a 7-day window kept for the WEEKLY rail, and
+# `record_external_flow` rewrites every point in it on a declared deposit. It is a rail's
+# working set, so it cannot double as the record. These tests pin the durable one.
+
+
+def test_a_cycle_appends_one_point_to_the_series() -> None:
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    points = repo.get_equity_points()
+    assert len(points) == 1
+    assert points[0].ts == NOW
+    assert points[0].equity == Decimal("10000")
+
+
+def test_the_point_carries_the_high_water_mark_in_force_after_this_reading() -> None:
+    """The chart's rail-11 overlay reads `hwm` off the row rather than recomputing a running
+    maximum, because the two are not the same series: `record_external_flow` REBASES the HWM on
+    a declared deposit, and a recomputed maximum would draw a ceiling the rail never used."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("12000"), now_ts=NOW)
+    equity.update_drawdown(repo, equity=Decimal("9000"), now_ts=NOW + DAY)
+    assert [p.hwm for p in repo.get_equity_points()] == [Decimal("12000"), Decimal("12000")]
+
+
+def test_the_point_is_stamped_with_the_mode_that_produced_it() -> None:
+    """`equity_state_mode` is the same stamp `_clear_live_mode_if_needed` reads before wiping
+    the shared HWM on a flip. Deriving the mode a second way at the call site would let the two
+    disagree, and a mislabelled row is worse than a missing one -- it lands in the wrong curve."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(repo, equity=Decimal("250"), now_ts=NOW)
+    assert [p.mode for p in repo.get_equity_points()] == ["live"]
+
+
+def test_a_mode_flip_leaves_two_series_not_one_blended_curve() -> None:
+    """The whole reason for the `mode` column. Paper equity of $10k and live equity of $250 are
+    two unrelated accounts; joined into one line the flip reads as a 97.5% drawdown that never
+    happened."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    # What the agent does on a flip: the shared scalars are cleared, then the stamp changes.
+    repo.set_state("equity_high_water_mark", None)
+    repo.set_state("equity_history", [])
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(repo, equity=Decimal("250"), now_ts=NOW + DAY)
+
+    assert [p.equity for p in repo.get_equity_points(mode="paper")] == [Decimal("10000")]
+    assert [p.equity for p in repo.get_equity_points(mode="live")] == [Decimal("250")]
+
+
+def test_the_split_is_recorded_when_the_caller_knows_it() -> None:
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(
+        repo,
+        equity=Decimal("10000"),
+        now_ts=NOW,
+        cash=Decimal("9000"),
+        unrealized=Decimal("-25.50"),
+    )
+    point = repo.get_equity_points()[0]
+    assert point.cash == Decimal("9000")
+    assert point.unrealized == Decimal("-25.50")
+
+
+def test_an_unknown_split_is_recorded_as_none_not_zero() -> None:
+    """A caller that knows only the total says so. Zero would assert a flat cash balance and a
+    flat unrealized P&L, and nothing observed either."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    point = repo.get_equity_points()[0]
+    assert point.cash is None
+    assert point.unrealized is None
+
+
+def test_an_unstamped_mode_writes_no_point_and_still_updates_the_rail() -> None:
+    """Rail 11 must never be held hostage to the chart. The agent stamps the mode before every
+    `update_drawdown` (both branches do, unconditionally), so an unstamped call is not a real
+    cycle -- and a row labelled with a guessed mode would land in the wrong curve, which is the
+    one failure the partition exists to prevent. The scalars still advance."""
+    repo = _repo()
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    assert repo.get_equity_points() == []
+    assert repo.get_state("equity_high_water_mark") == Decimal("10000")

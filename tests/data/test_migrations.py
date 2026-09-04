@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 18
+    assert version == db.SCHEMA_VERSION == 19
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -612,7 +612,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 18
+    assert stamped == db.SCHEMA_VERSION == 19
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -773,7 +773,7 @@ def test_v15_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 18
+    assert stamped == db.SCHEMA_VERSION == 19
 
 
 def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
@@ -875,7 +875,7 @@ def test_an_existing_orders_table_gains_the_submit_book_by_ALTER() -> None:
     assert row["submit_best_bid"] is None
     assert row["submit_best_ask"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 18
+    assert stamped == db.SCHEMA_VERSION == 19
 
 
 def test_v16_is_idempotent_per_column() -> None:

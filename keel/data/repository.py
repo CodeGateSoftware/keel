@@ -18,7 +18,7 @@ from keel_core.cash_posture import CashPostureState, VenueCashPosture
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
-from keel.types import Candle, Granularity, Profile
+from keel.types import Candle, EquityReading, Granularity, Profile
 
 _TRANSACTION_COLUMNS = (
     "coinbase_id",
@@ -151,6 +151,24 @@ def _cash_posture_from_row(row: Any) -> VenueCashPosture:
         refuted_reason=row["refuted_reason"],
         credential_fingerprint=row["credential_fingerprint"],
     )
+
+
+def _equity_point_from_row(row: Any) -> EquityReading:
+    """Map an `equity_points` row to the domain record (#698).
+
+    `cash` and `unrealized` stay `None` when the column is NULL rather than becoming
+    `Decimal("0")`: the column means "not recorded", and a reader must be able to tell an
+    unobserved split from an observed flat one.
+    """
+    return EquityReading(
+        ts=int(row["ts"]),
+        mode=row["mode"],
+        equity=Decimal(row["equity"]),
+        cash=_text_to_dec(row["cash"]),
+        unrealized=_text_to_dec(row["unrealized"]),
+        hwm=Decimal(row["hwm"]),
+    )
+
 
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
@@ -695,6 +713,59 @@ class Repository:
         """Every recorded cash posture, ordered by venue."""
         rows = self._conn.execute("SELECT * FROM venue_cash_postures ORDER BY venue").fetchall()
         return [_cash_posture_from_row(row) for row in rows]
+
+    # -- equity points (the mark-to-market series; #698) --------------------
+
+    def record_equity_point(self, point: EquityReading) -> None:
+        """Append one cycle's mark-to-market reading. Append-only: never updated, never deleted.
+
+        There is no uniqueness constraint on `(ts, mode)` and deliberately so. This is an
+        observation log, not a keyed record: two readings that genuinely happened at the same
+        epoch second are two observations, and silently collapsing them with an upsert would
+        hide a double-run of the cycle -- exactly the operational fact an operator would want
+        the series to show. `update_drawdown` calls this once per cycle; anything more is a
+        symptom worth seeing.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO equity_points (ts, mode, equity, cash, unrealized, hwm)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                point.ts,
+                point.mode,
+                _dec_to_text(point.equity),
+                _dec_to_text(point.cash),
+                _dec_to_text(point.unrealized),
+                _dec_to_text(point.hwm),
+            ),
+        )
+        self._conn.commit()
+
+    def get_equity_points(
+        self, mode: str | None = None, since_ts: int | None = None
+    ) -> list[EquityReading]:
+        """The series, oldest first, optionally narrowed to one mode and/or a time window.
+
+        `mode=None` returns paper AND live rows interleaved by time. That is the honest raw
+        read, but it is NOT a curve: a caller drawing it as one line joins two unrelated
+        accounts across the flip. Readers that plot must group by `mode` (`insights` does).
+        """
+        query = "SELECT * FROM equity_points"
+        clauses: list[str] = []
+        params: list[object] = []
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        # `id` breaks the tie so two readings at the same epoch second keep insertion order --
+        # `ts` alone leaves that to SQLite, and a chart would draw them in an arbitrary one.
+        query += " ORDER BY ts, id"
+        return [_equity_point_from_row(row) for row in self._conn.execute(query, params)]
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 
