@@ -359,37 +359,39 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
-def _log_cycles(config: Any) -> tuple[Any, ...]:
-    """The engine log's cycles, and an honest answer when the log could not be read.
+def _log_cycles(config: Any) -> tuple[tuple[Any, ...], str]:
+    """`(cycles, status)` -- the engine log's cycles, and how the read of it went.
 
     Read through `activity`'s own bounded window rather than re-parsed here: that module owns
     finding the file, reading a bounded tail and turning it into cycles, and a second
     implementation would be a second answer to "what did the agent do".
 
-    **A log that could not be READ is not a log with nothing in it.** `read_log_window` returns a
-    `LogWindow` for every outcome -- it catches its own `OSError` -- and carries the outcome in
-    `status`. Discarding that would drop every `system` row AND drop `system` from the timeline's
-    chips, which in the CSV an auditor opens is indistinguishable from "the engine never ran".
-    `activity.py`'s own docstring names this failure: silently discarding input is how a feed
-    comes to under-report reality while looking healthy. So an unreadable log raises here, and
-    the caller turns it into a stated failure rather than a quiet gap.
+    **A log that could not be READ is not a log with nothing in it**, and it is also not a
+    reason to fail the page. `read_log_window` returns a `LogWindow` for every outcome -- it
+    catches its own `OSError` -- and names the outcome in `status`. Both other options were tried
+    and both were wrong:
+
+    * Discarding the status dropped every `system` row and dropped `system` from the chips, which
+      in an auditor's CSV is indistinguishable from "the engine never ran". `activity.py`'s own
+      docstring names that failure: silently discarding input is how a feed comes to under-report
+      reality while looking healthy.
+    * RAISING on any status but `ok`/`missing` made an EMPTY log -- an ordinary state, a freshly
+      created handler or the moment after a rotation -- take out orders, flows and attestations
+      as well. A total outage to report a non-problem, and a divergence from `/api/activity`,
+      which renders these same statuses as a stated feed state.
+
+    So the status is returned, the report carries it, and the page and the CSV say it.
     """
     from keel.commands.activity import feed_from_lines, read_log_window, resolve_log_path
 
     log_path = resolve_log_path(config)
     window = read_log_window(log_path)
-    if window.status not in ("ok", "missing"):
-        # "missing" is an ordinary state -- a deployment that has not run yet has no log, and the
-        # other three sources still have plenty to say. Anything else means the file is there and
-        # we could not read it, which is a fact about this answer's completeness.
-        raise RuntimeError(
-            f"the engine log could not be read ({window.status}): {window.detail or log_path}"
-        )
     # `LogWindow` carries the lines and a read status, not the path -- `source` is the feed's own
     # label for where the lines came from, so it is passed the path we resolved.
-    return feed_from_lines(
+    cycles = feed_from_lines(
         window.lines, source=str(log_path), truncated=window.truncated
     ).cycles
+    return cycles, window.status
 
 
 def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
@@ -408,7 +410,7 @@ def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
         DEFAULT_TIMELINE_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_TIMELINE_LIMIT)
     )
 
-    cycles = _log_cycles(config)
+    cycles, log_status = _log_cycles(config)
 
     repo = open_repo(cfg.db_path)
     try:
@@ -419,6 +421,7 @@ def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
             kind=_first(query, "kind") or "",
             limit=limit,
             cycles=cycles,
+            log_status=log_status,
         )
     finally:
         close_repo(repo)
@@ -989,20 +992,6 @@ def sortable_columns() -> Mapping[str, Sequence[str]]:
 CSV_EXPORT_PATH = "/api/timeline/export.csv"
 
 
-def refusal_envelope(refusal: ApiRefusal) -> tuple[int, dict[str, Any]]:
-    """An `ApiRefusal` as `(status, document)`, for a caller outside `respond`.
-
-    The CSV export does not go through `respond`, so it cannot inherit its refusal handling --
-    and a download route that answered a bad query by dropping the connection would tell a
-    browser "network error" and an operator nothing at all. The JSON envelope is the right answer
-    even from a route whose success case is CSV: the failure is not a file.
-    """
-    now_ts = int(time.time())
-    return refusal.status, payload.error_envelope(
-        now_ts, status=refusal.status, title=refusal.title, detail=refusal.detail
-    )
-
-
 def export_failure_envelope(exc: Exception) -> tuple[int, dict[str, Any]]:
     """Any other export failure as `(status, document)` -- `respond`'s 500 arm, reachable from
     the one route that is not in its table. Names the exception type and message, exactly as
@@ -1029,6 +1018,7 @@ def export_timeline_csv(cfg: ServeConfig, query: Query) -> tuple[str, str]:
     from keel.commands.timeline import export_rows, to_csv
 
     now_ts = int(time.time())
+    cycles, log_status = _log_cycles(load_config(cfg.config_path))
     repo = open_repo(cfg.db_path)
     try:
         # `export_rows`, NOT `_timeline_report`: the paged read is capped because the console
@@ -1040,7 +1030,8 @@ def export_timeline_csv(cfg: ServeConfig, query: Query) -> tuple[str, str]:
             now_ts=now_ts,
             scope=_first(query, "scope") or "all",
             kind=_first(query, "kind") or "",
-            cycles=_log_cycles(load_config(cfg.config_path)),
+            cycles=cycles,
+            log_status=log_status,
         )
     finally:
         close_repo(repo)

@@ -887,11 +887,12 @@ class KeelHandler(BaseHTTPRequestHandler):
                 # stderr that `log_message` is overridden to keep quiet.
                 try:
                     text, filename = api.export_timeline_csv(self.cfg, query)
-                except api.ApiRefusal as refusal:
-                    code, document = api.refusal_envelope(refusal)
-                    self._send_json(code, document)
-                    return
                 except Exception as exc:  # noqa: BLE001 - a failed export must still answer
+                    # One arm, because nothing on the export path raises `ApiRefusal`: it reads
+                    # no `?limit=` and no `?sort=`, which are the two refusing helpers. A second
+                    # arm for it was written and removed -- an unreachable error path is one
+                    # nothing exercises, and it rots. Re-add it the day a refusing helper joins
+                    # this path.
                     code, document = api.export_failure_envelope(exc)
                     self._send_json(code, document)
                     return

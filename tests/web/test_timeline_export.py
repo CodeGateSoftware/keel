@@ -214,15 +214,18 @@ def test_the_export_carries_every_row_in_scope_not_the_pages_worth(tmp_path: Pat
     -- 200 rows of a 5,000-event deployment, with nothing in the file saying so, handed to a tax
     preparer.
 
-    Driven through the exporter with more rows than the paged default so the difference is
-    visible: an export that stopped at `DEFAULT_TIMELINE_LIMIT` returns 200 data rows here.
+    Seeded above `MAX_TIMELINE_LIMIT`, not merely above the paged default. The first version of
+    this test used `DEFAULT_TIMELINE_LIMIT + 25` = 225 rows and passed while the export was still
+    capped at 2000: `export_rows` handed a huge `limit` to `gather_timeline`, which clamps it with
+    `min(limit, MAX_TIMELINE_LIMIT)`. A test whose fixture sits under the real cap cannot see the
+    cap -- which is the same failure this PR exists to fix, committed inside the fix.
     """
-    from keel.commands.timeline import DEFAULT_TIMELINE_LIMIT, export_rows, to_csv
+    from keel.commands.timeline import MAX_TIMELINE_LIMIT, export_rows, to_csv
 
     conn = connect(str(tmp_path / "keel.db"))
     migrate(conn)
     repo = Repository(conn)
-    total = DEFAULT_TIMELINE_LIMIT + 25
+    total = MAX_TIMELINE_LIMIT + 25
     for index in range(total):
         repo.upsert_transaction(
             {

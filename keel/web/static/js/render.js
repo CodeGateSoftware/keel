@@ -1211,7 +1211,10 @@ export function timelineView(data, sort, onSort, onKind) {
     table(
       "h-timeline",
       [
-        { label: "when (UTC)", numeric: false, key: "ts" },
+        // `at`, matching the payload and `sortable`. It was left as `ts` when the server side
+        // was renamed, and `headerCell` only draws a sort control for a key the server declares
+        // -- so the timestamp column of a CHRONOLOGY page silently became an unclickable label.
+        { label: "when (UTC)", numeric: false, key: "at" },
         { label: "kind", numeric: false, key: "kind" },
         { label: "how we know", numeric: false, key: "provenance" },
         { label: "source", numeric: false, key: "source" },

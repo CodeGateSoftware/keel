@@ -59,6 +59,9 @@ HASH_NOT_RECORDED = "NOT RECORDED"
 
 #: The characters a spreadsheet treats as the start of a formula. OWASP's list.
 #:
+#: `\n` and `\r` are here alongside `\t` because a cell can only be re-parsed from its start,
+#: and a leading line break is one of the ways a value smuggles itself into that position.
+#:
 #: `-` and `+` are here because they are formulas too, not only signs -- which means a negative
 #: figure gets quoted. That is the correct trade for an audit export: a spreadsheet shows
 #: `'-12.30` as text rather than evaluating it, the value is still readable and still
@@ -134,12 +137,14 @@ class TimelineReport:
     scope_start_ts: int | None
     #: The applied `kind` filter, echoed back, or `""` for every kind.
     kind: str
-    limit: int
+    #: The applied row cap, or `None` when the caller asked for no slice (the CSV export).
+    limit: int | None
     #: Rows across all four sources inside the scope, before `kind` and before `limit`.
     scoped_count: int
     #: Rows after `kind`, before `limit` -- what `rows` is a page of.
     filtered_count: int
     rows: tuple[TimelineRow, ...]
+
 
     #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order -- what a chip bar is
     #: built from. STORED rather than derived from `rows`, because `rows` is what the chip and
@@ -152,11 +157,33 @@ class TimelineReport:
     #: bar that reordered itself as history arrived would move under the reader.
     kinds_present: tuple[str, ...]
 
+    #: `read_log_window`'s own word for how the engine log read went: `ok`, `missing`, `empty`,
+    #: `oversized`, `unreadable`. Carried rather than acted on, so the page and the CSV can SAY
+    #: the log did not reach this report.
+    #:
+    #: The alternative was tried and was wrong in both directions. Discarding it made an
+    #: unreadable log indistinguishable from an idle engine -- under-reporting reality while
+    #: looking healthy, which `activity.py`'s own docstring names as the failure. RAISING on it
+    #: made an EMPTY log (an ordinary state: a fresh handler, the moment after a rotation) take
+    #: out orders, flows and attestations too, a total outage to report a non-problem.
+    log_status: str = "ok"
+
     @property
     def shown_count(self) -> int:
         """How many rows this report carries. Derived rather than stored, and held here because
         `keel/web/payload.py` may not call `len()` (Rule 6e)."""
         return len(self.rows)
+
+    @property
+    def log_gap(self) -> bool:
+        """Whether the engine log's contents are MISSING FROM this report.
+
+        `missing` is not a gap: a deployment that has never run has no log, and that is an
+        ordinary fact rather than a hole in the record. Every other non-`ok` status is -- the
+        file is there and what it holds did not reach this report, which is precisely what an
+        auditor reading the CSV needs told rather than left to infer from an absence of rows.
+        """
+        return self.log_status not in ("ok", "missing")
 
 
 
@@ -173,12 +200,6 @@ class TimelineReport:
 #: show. `export_rows` deliberately does not use it.
 DEFAULT_TIMELINE_LIMIT = 200
 MAX_TIMELINE_LIMIT = 2000
-
-#: The cap `export_rows` passes: none. Spelled as a constant rather than an `Optional` parameter
-#: so the uncapped read is a named decision at its one call site rather than a `None` that could
-#: arrive by accident from anywhere.
-_UNCAPPED = 2**31
-
 
 def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
     """`orders` -> trade rows.
@@ -338,8 +359,9 @@ def gather_timeline(
     now_ts: int,
     scope: str = "all",
     kind: str = "",
-    limit: int = DEFAULT_TIMELINE_LIMIT,
+    limit: int | None = DEFAULT_TIMELINE_LIMIT,
     cycles: Sequence[Any] = (),
+    log_status: str = "ok",
 ) -> TimelineReport:
     """One chronology over four stores, newest first, scoped, chip-filtered and capped.
 
@@ -363,7 +385,12 @@ def gather_timeline(
     # to never produce. The applied value is echoed in `kind`, so the substitution is visible.
     requested_kind = (kind or "").strip().lower()
     resolved_kind = requested_kind if requested_kind in TIMELINE_KINDS else ""
-    resolved_limit = max(1, min(int(limit), MAX_TIMELINE_LIMIT))
+    # `None` means NO SLICE, and it has to be a distinct case rather than a very large number.
+    # The first attempt at an uncapped export passed `2**31` through this clamp, which is
+    # `min(2**31, 2000)` -- so the "whole scope" export quietly stopped at 2000 rows, and the
+    # test written for it seeded 225 and could not see that. A sentinel that the clamp silently
+    # eats is not a sentinel.
+    resolved_limit = None if limit is None else max(1, min(int(limit), MAX_TIMELINE_LIMIT))
     since = scope_start_ts(resolved_scope, now_ts)
 
     scoped: list[TimelineRow] = []
@@ -387,7 +414,8 @@ def gather_timeline(
         limit=resolved_limit,
         scoped_count=len(scoped),
         filtered_count=len(filtered),
-        rows=tuple(filtered[:resolved_limit]),
+        rows=tuple(filtered if resolved_limit is None else filtered[:resolved_limit]),
+        log_status=log_status,
         kinds_present=tuple(kind for kind in TIMELINE_KINDS if kind in present),
     )
 
@@ -399,6 +427,7 @@ def export_rows(
     scope: str = "all",
     kind: str = "",
     cycles: Sequence[Any] = (),
+    log_status: str = "ok",
 ) -> TimelineReport:
     """The whole scope, uncapped -- what the CSV export reads.
 
@@ -411,9 +440,21 @@ def export_rows(
     The SCOPE still bounds it: `?scope=today|7d|all` is the operator's own choice about how much
     they are asking for, and `all` on a long-lived deployment is a large file by request rather
     than by accident.
+
+    **The whole file is materialised in memory** -- as a `str`, then as `bytes`, because the
+    response carries a `Content-Length`. That is an accepted cost for a download an operator
+    asked for once, and it is the reason the paged route keeps its cap: the same read on a
+    15-second poll would not be acceptable. Streaming it is the change to make if `all` on a
+    multi-year deployment ever stops fitting comfortably.
     """
     return gather_timeline(
-        repo, now_ts=now_ts, scope=scope, kind=kind, limit=_UNCAPPED, cycles=cycles
+        repo,
+        now_ts=now_ts,
+        scope=scope,
+        kind=kind,
+        limit=None,
+        cycles=cycles,
+        log_status=log_status,
     )
 
 
@@ -429,6 +470,18 @@ def to_csv(report: TimelineReport) -> str:
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
+    if report.log_gap:
+        # Stated IN THE FILE, above the header, because this file leaves the application. An
+        # auditor holding a CSV cannot ask the page whether a source was missing from it, and
+        # rows that are simply absent look identical to rows that never existed.
+        writer.writerow(
+            [
+                csv_safe(
+                    f"# NOTE: the engine log could not be read ({report.log_status}); "
+                    "cycle rows are missing from this export"
+                )
+            ]
+        )
     writer.writerow(
         [
             "ts",
