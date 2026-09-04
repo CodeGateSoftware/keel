@@ -60,12 +60,30 @@ API_ROUTES = (
     "/api/orders",
     "/api/positions",
     "/api/balances",
+    "/api/timeline",
     "/api/insights",
     "/api/journal",
     "/api/rules",
     "/api/venues",
     "/api/gates",
 )
+
+
+def test_the_csv_export_is_deliberately_outside_the_json_route_table() -> None:
+    """#703's export answers `text/csv`, so it must NOT be an `ApiRoute`.
+
+    Everything in `API_ROUTES` is wrapped in the JSON envelope by `respond`, and every pin in
+    this module is parametrised over that table -- the envelope, the no-JSON-number walk, the
+    JSON MIME assertion. A CSV route inside it would either break those or force each one to
+    grow an exception, and an exception carved into a security pin is how the pin stops meaning
+    anything. Its headers are pinned separately, in `test_timeline_export.py`.
+    """
+    from keel.web import api as web_api
+
+    assert web_api.CSV_EXPORT_PATH not in web_api.API_ROUTES
+    assert web_api.CSV_EXPORT_PATH.startswith("/api/"), (
+        "it still lives under /api/, so it still passes the same admission check"
+    )
 
 
 def test_this_module_pins_every_route_the_server_serves() -> None:

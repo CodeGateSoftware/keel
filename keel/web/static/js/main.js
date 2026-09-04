@@ -46,6 +46,7 @@ import {
   modeBadge,
   ordersView,
   balancesView,
+  timelineView,
   positionsView,
   refusedView,
   rulesView,
@@ -101,6 +102,7 @@ const ROUTES = [
   { name: "orders", label: "Orders", endpoints: ["orders"] },
   { name: "positions", label: "Positions", endpoints: ["positions"] },
   { name: "balances", label: "Balances", endpoints: ["balances"] },
+  { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
@@ -430,6 +432,15 @@ function mount(route, readings) {
   }
   if (route.name === "positions") return positionsView(data, primary.sort, onSort);
   if (route.name === "balances") return balancesView(data, primary.sort, onSort);
+  if (route.name === "timeline") {
+    return timelineView(data, primary.sort, onSort, (kind) => {
+      // #703: the chip re-asks the SERVER, like the Orders status tabs. Filtering the
+      // capped page here would filter the rows that happened to arrive and present the
+      // result as "every flow this month".
+      paramsFor(route.endpoints[0]).kind = kind;
+      void paint(route, true, true);
+    });
+  }
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);

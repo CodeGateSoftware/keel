@@ -390,6 +390,36 @@ class KeelHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(payload)
 
+    def _send_csv(self, text: str, filename: str) -> None:
+        """One CSV export, with its own headers (#703).
+
+        `nosniff` matters MORE here than on the JSON routes, not less: this body is a file a
+        browser is being told to save, and a sniffing browser that decided some other type for it
+        would be deciding what a downloaded file IS.
+
+        `Content-Disposition: attachment` is the second half of that. Without it a browser may
+        render the CSV inline, and an inline-rendered document from this origin is a different
+        security question from a saved file -- `attachment` keeps it a download, and names it so
+        the operator has a dated artefact rather than `export.csv` among ten others.
+
+        `no-store` for the same reason every API response carries it: this is the operator's
+        whole audit trail, and a copy of it in a shared cache is a copy nobody chose to make.
+
+        The filename is server-generated and never echoed from the query string -- a
+        caller-supplied one would put attacker-controlled text into a response header, which is
+        the header-injection version of the formula injection `csv_safe` already defends the body
+        against.
+        """
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        for name, value in _API_HEADERS:
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, code: int, document: dict[str, Any]) -> None:
         """One JSON response, with its own headers.
 
@@ -839,6 +869,14 @@ class KeelHandler(BaseHTTPRequestHandler):
             # not exempt from the loopback-plus-session model for being machine-readable. What it
             # does NOT additionally require is `X-Keel-Client` -- that header gates POSTs, and its
             # docstring explains why a GET is not the gap it closes.
+            # #703's CSV export is the one path under `/api/` that does not answer JSON. It is
+            # checked HERE, inside the same admission the JSON routes passed, so it inherits the
+            # loopback-plus-session model unchanged -- an export of the whole audit trail is the
+            # last thing that should be reachable more easily than the page it came from.
+            if parsed.path == api.CSV_EXPORT_PATH:
+                text, filename = api.export_timeline_csv(self.cfg, query)
+                self._send_csv(text, filename)
+                return
             code, document = api.respond(self.cfg, parsed.path, query)
             self._send_json(code, document)
             return
