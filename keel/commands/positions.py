@@ -133,9 +133,10 @@ class PositionsReport:
 def _safe_ratio(numerator: Decimal, denominator: Decimal) -> Decimal | None:
     """`numerator / denominator`, or `None` when that is not a finite answer.
 
-    A non-positive or non-finite mark reaches here from the candle cache, which is data this
-    module did not write. `Decimal` raises on a zero denominator rather than returning an
-    infinity, and an unguarded division would take a read-only page down over one bad row.
+    `_mark_for` already refuses a non-positive close, so the only caller cannot pass a zero
+    denominator today -- this is the guard for the day a second caller arrives, and for the
+    non-finite results `Decimal` can produce from values this module did not write. Stated as
+    a guard rather than removed because a read-only page must not 500 over one bad row.
     """
     if denominator == 0:
         return None
@@ -162,28 +163,91 @@ def _mark_for(
         return None, None
     newest = candles[-1]
     if newest.close <= 0:
-        return None, newest.ts
+        # No mark AND no time for it. Returning the bar's ts beside a `None` close would put a
+        # valuation time on the row for a valuation the row says it does not have.
+        return None, None
     return newest.close, newest.ts
 
 
 def _readiness_for(
-    repo: Repository, product_id: str, config: Config, now_ts: int
+    repo: Repository,
+    product_id: str,
+    granularity: Granularity | None,
+    config: Config,
+    now_ts: int,
 ) -> tuple[bool, str | None]:
-    """`entry_bar_ready`'s verdict for this product, as `(ready, reason)`.
+    """`entry_bar_ready`'s verdict for one product on ONE gate granularity, as `(ready, reason)`.
 
     The ENTRY-GATE question, not a staleness alert: `freshness.assess` tolerates the normal
     forming-bar lag on purpose, and `entry_bar_ready` deliberately does not, because a one-bar-
     late finer series is exactly the condition that produces a duplicate real-money order. A
     positions page showing the softer verdict would tell a reader the feed is fine while the
     agent's own gate is refusing to trade on it.
+
+    `granularity` is the caller's, and it must be the one `_entry_gate_granularity` would pick
+    for THIS position's rule -- see `_gate_granularity_for`. Asking about the coarsest series for
+    every row (the first version of this) reports that function's FALLBACK as though it were its
+    answer: correct for a daily deployment, wrong for any rule seeded on a finer timeframe, and
+    worded with the same confidence either way.
     """
     granularities = config.market_data.granularities
-    coarsest = max(granularities, key=_granularity_rank) if granularities else None
-    if coarsest is None:
+    if granularity is None or not granularities:
         return False, "missing"
     candles_by_tf = {g: repo.get_candles(product_id, g) for g in granularities}
-    verdict = freshness_mod.entry_bar_ready(candles_by_tf, coarsest, now_ts)
+    verdict = freshness_mod.entry_bar_ready(candles_by_tf, granularity, now_ts)
     return verdict.ready, verdict.reason
+
+
+def _gate_granularities(repo: Repository, config: Config) -> dict[str, Granularity | None]:
+    """`{rule name: the granularity the agent's entry gate would use}`, built ONCE.
+
+    Keyed on the rule's `name` and NOT on `rules.kind`, because `positions.rule_name` holds the
+    name -- a constructor argument that defaults to the kind and is not the same field. Keyed by
+    kind, two `turtle_breakout` rows on different timeframes (a configuration this codebase
+    supports) collapse to whichever row was read last, and one tranche silently inherits the
+    other's granularity.
+
+    Each rule is built once here rather than once per tranche: `_build_rule` runs the rule's real
+    constructor with its validation, and a DCA book is one rule with many tranches, so per-row
+    building is the common case rather than the edge one.
+
+    A NAME THAT ANSWERS TO TWO DIFFERENT GRANULARITIES maps to `None`. `rules.name` is not unique
+    in the schema, so which row opened a given tranche is genuinely unknowable from `rule_name`
+    alone -- and a chip that picked one and stated it with the same confidence as a resolved one
+    would be asserting something nobody can check. `None` sends the caller to the fallback, which
+    is what the agent itself uses for a rule that declares nothing.
+
+    A row whose params no longer build -- a renamed field, a kind since removed -- is skipped for
+    the same reason: unknowable, so fall back rather than raise. A chip is not worth a 500.
+    """
+    granularities = list(config.market_data.granularities)
+    gates: dict[str, Granularity | None] = {}
+    seen: set[str] = set()
+    for row in repo.get_rules():
+        try:
+            rule = agent_mod._build_rule(row)
+        except Exception:
+            continue
+        name = str(getattr(rule, "name", "") or row.get("kind") or "")
+        if not name:
+            continue
+        gate = agent_mod._entry_gate_granularity(rule, granularities)
+        if name in seen and gates.get(name) != gate:
+            gates[name] = None
+        else:
+            gates[name] = gate
+        seen.add(name)
+    return gates
+
+
+def _fallback_granularity(config: Config) -> Granularity | None:
+    """What the agent gates a rule on when the rule declares nothing: the COARSEST configured
+    series. `_entry_gate_granularity`'s own fallback, and for its reason -- `Dca` reads the daily
+    bar directly, so gating it on the finest would miss a weeks-stale daily bar entirely."""
+    granularities = list(config.market_data.granularities)
+    if not granularities:
+        return None
+    return max(granularities, key=_granularity_rank)
 
 
 def _granularity_rank(granularity: Granularity) -> int:
@@ -203,18 +267,32 @@ def gather_positions(repo: Repository, config: Config, *, now_ts: int) -> Positi
     several tranches of the same product (that is what tranches are for), and a per-row read
     would be one query per tranche for one answer they all share.
     """
-    granularity = agent_mod._finest_granularity(list(config.market_data.granularities))
+    mark_granularity = agent_mod._finest_granularity(list(config.market_data.granularities))
+    # ONE read of the rules table and ONE build per rule, before the row loop -- see
+    # `_gate_granularities`. A lookup per tranche would be one query and one constructor call per
+    # row for an answer the rows share, and would be invisible on any fixture small enough to
+    # read.
+    gates = _gate_granularities(repo, config)
+    fallback = _fallback_granularity(config)
 
     marks: dict[str, tuple[Decimal | None, int | None]] = {}
-    readiness: dict[str, tuple[bool, str | None]] = {}
+    # Keyed on (product, gate granularity), NOT on product alone: one product can hold tranches
+    # opened by rules on different timeframes, and a per-product cache would hand the second
+    # tranche the first one's verdict.
+    readiness: dict[tuple[str, Granularity | None], tuple[bool, str | None]] = {}
     rows: list[PositionRow] = []
     for raw in repo.get_open_positions():
         product_id = str(raw.get("product_id") or "")
         if product_id not in marks:
-            marks[product_id] = _mark_for(repo, product_id, granularity)
-            readiness[product_id] = _readiness_for(repo, product_id, config, now_ts)
+            marks[product_id] = _mark_for(repo, product_id, mark_granularity)
+        # `.get(...) or fallback` collapses the two unresolvable cases onto one answer: a name
+        # nothing matches, and a name two rules answer to with different granularities.
+        gate = gates.get(str(raw.get("rule_name") or "")) or fallback
+        key = (product_id, gate)
+        if key not in readiness:
+            readiness[key] = _readiness_for(repo, product_id, gate, config, now_ts)
         mark, mark_ts = marks[product_id]
-        ready, ready_reason = readiness[product_id]
+        ready, ready_reason = readiness[key]
         rows.append(_row_from_dict(raw, mark, mark_ts, ready, ready_reason))
     return PositionsReport(now_ts=now_ts, rows=tuple(rows))
 
@@ -228,8 +306,12 @@ def _row_from_dict(
 ) -> PositionRow:
     """One repository dict, projected. Every judgement this report makes is made here, once, so
     no renderer has to make it twice."""
-    qty = raw.get("qty") or Decimal("0")
-    entry_fill = raw.get("entry_fill") or Decimal("0")
+    # Direct reads, not `raw.get(...) or Decimal("0")`. These three columns are NOT NULL in the
+    # `positions` DDL, so the fallback could only ever rewrite a zero as itself -- while quietly
+    # substituting one the day a column became nullable. That is the substitution
+    # `_position_row_to_dict` deliberately refuses for `initial_stop`, for the same reason.
+    qty = raw["qty"]
+    entry_fill = raw["entry_fill"]
     initial_stop = raw.get("initial_stop")
 
     market_value = None if mark is None else qty * mark
@@ -246,10 +328,10 @@ def _row_from_dict(
         id=int(raw["id"]),
         product_id=str(raw.get("product_id") or ""),
         rule_name=str(raw.get("rule_name") or ""),
-        opened_at=int(raw.get("opened_at") or 0),
+        opened_at=int(raw["opened_at"]),
         qty=qty,
         entry_fill=entry_fill,
-        entry_fee=raw.get("entry_fee") or Decimal("0"),
+        entry_fee=raw["entry_fee"],
         mark=mark,
         mark_ts=mark_ts,
         market_value=market_value,

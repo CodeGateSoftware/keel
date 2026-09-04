@@ -1527,13 +1527,17 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
     }
 
 
-#: The entry-gate verdict, styled (#701). `entry_bar_ready`'s vocabulary, not a staleness one:
-#: these words say why the AGENT would refuse to open a position on this product right now.
+#: The entry-gate verdict, styled (#701). Named `_ENTRY_GATE_*` and not `_READINESS_*`: this
+#: module already has a `_READINESS_STATE` for `VenueReadiness`, an unrelated vocabulary, and
+#: two names one character apart in one file is a mis-edit waiting to happen.
+#:
+#: `entry_bar_ready`'s vocabulary, not a staleness one: these words say why the AGENT would
+#: refuse to open a position on this product right now.
 #:
 #: All three are WARN rather than BAD. None of them is a loss or a broken deployment -- a feed
 #: catches up, an unconfirmed bar confirms -- but each one means keel cannot act on this product
 #: at this moment, and a reader scanning for "why did nothing happen" must be able to find them.
-_READINESS_STATES: Mapping[str, str] = {
+_ENTRY_GATE_STATES: Mapping[str, str] = {
     "missing": WARN,
     "behind": WARN,
     "unconfirmed": WARN,
@@ -1541,7 +1545,7 @@ _READINESS_STATES: Mapping[str, str] = {
 
 #: What each verdict means, spelled out. The word alone is a term of art; the sentence is what a
 #: reader who has not read `freshness.py` can act on.
-_READINESS_NOTES: Mapping[str, str] = {
+_ENTRY_GATE_NOTES: Mapping[str, str] = {
     "missing": "no cached bar for the entry-gate series -- keel would not open here",
     "behind": "the entry-gate series is behind its expected bar -- keel would not open here",
     "unconfirmed": "the newest bar is not confirmed closed by a finer series -- keel would wait",
@@ -1565,8 +1569,8 @@ def _readiness_field(ready: bool, reason: str | None) -> Field:
     word = reason or "unknown"
     return label(
         word,
-        display=_READINESS_NOTES.get(word, "the entry gate would not open here"),
-        state=_READINESS_STATES.get(word, UNKNOWN),
+        display=_ENTRY_GATE_NOTES.get(word, "the entry gate would not open here"),
+        state=_ENTRY_GATE_STATES.get(word, UNKNOWN),
     )
 
 
@@ -1603,7 +1607,11 @@ def _position_row_payload(row: PositionRow) -> dict[str, Any]:
         "unrealized": money(row.unrealized_pnl, signed=True),
         "initial_stop": money(row.initial_stop),
         "stop_distance": money(row.stop_distance, signed=True),
-        "stop_distance_pct": ratio(row.stop_distance_pct),
+        # FOUR places, not `ratio`'s default two. At two, a tranche 0.2% through its stop and one
+        # 0.2% above it render as "-0.00" and "0.00" side by side -- illegible in exactly the
+        # range this column exists to show, since a position near its stop is the one worth
+        # finding. The paired `stop_distance` still carries the verdict.
+        "stop_distance_pct": ratio(row.stop_distance_pct, places=4),
         "realized_qty": quantity(row.realized_qty),
         "realized_proceeds": money(row.realized_proceeds),
         "realized_fees": money(row.realized_fees),

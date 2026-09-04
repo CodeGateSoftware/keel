@@ -300,3 +300,204 @@ def test_the_unrealized_total_reconciles_with_the_agents_own_equity_read(
 
     assert parts is not None
     assert page_total == parts.unrealized == Decimal("100")
+
+
+# -- the chip must ask the question the AGENT asks (#701 review finding) ------------------------
+#
+# `_entry_gate_granularity` gates a rule on the timeframe the rule DECLARES, and falls back to
+# the coarsest configured series only when it declares none. A chip that always asked about the
+# coarsest would be reporting the fallback as though it were the answer -- right for a daily
+# deployment, wrong for any rule seeded on a finer timeframe, and confidently worded either way.
+
+
+def test_the_gate_verdict_follows_the_rules_own_declared_timeframe(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """A rule seeded on ONE_HOUR is gated on ONE_HOUR. Here the DAILY series is present and the
+    HOURLY one is absent, so the two possible readings disagree: the coarsest series says
+    something other than "missing", and the rule's own series says "missing"."""
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, "granularity": "ONE_HOUR"})
+    _open_tranche(repo, rule_name="turtle_breakout")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(NOW_TS - DAY, "100")])
+
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.ready is False
+    assert row.ready_reason == "missing", "the ONE_HOUR series this rule trades on has no bars"
+
+
+def test_a_rule_that_declares_nothing_falls_back_to_the_coarsest_series(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`_entry_gate_granularity`'s own fallback, and the reason for it: a rule silent about its
+    timeframe is most likely keying off the coarsest series (DCA reads the daily bar directly),
+    so gating on the finest would miss a weeks-stale daily bar entirely."""
+    repo.insert_rule("dca", {"product_id": PRODUCT})
+    _open_tranche(repo, rule_name="dca")
+
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.ready is False
+    assert row.ready_reason == "missing"
+
+
+def test_an_unmatched_rule_name_degrades_to_the_coarsest_rather_than_crashing(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`positions.rule_name` is the rule's `name`, which is a separate constructor argument from
+    the `kind` the rules table is keyed on -- they coincide by default and are not guaranteed to.
+    An unmatched name must leave the chip on the safe fallback, not take the page down."""
+    _open_tranche(repo, rule_name="a_rule_no_longer_in_the_book")
+
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.ready_reason == "missing"
+
+
+def test_two_tranches_of_one_product_on_different_timeframes_get_their_own_verdicts(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The per-product cache the first version used cannot express this: one product, two rules,
+    two gate granularities, two answers. Caching by product alone would give the second tranche
+    the first one's verdict."""
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, "granularity": "ONE_DAY"})
+    repo.insert_rule("pullback_continuation", {"product_id": PRODUCT, "granularity": "ONE_HOUR"})
+    _open_tranche(repo, rule_name="turtle_breakout")
+    _open_tranche(repo, rule_name="pullback_continuation")
+    # Only the DAILY series exists, and it is at its expected bar.
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(NOW_TS - DAY, "100")])
+
+    rows = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows
+    by_rule = {row.rule_name: row for row in rows}
+
+    assert by_rule["pullback_continuation"].ready_reason == "missing"
+    assert by_rule["turtle_breakout"].ready_reason != "missing"
+
+
+def test_the_rules_table_is_read_once_however_many_tranches(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """Resolving a gate granularity per row would be one rules read per tranche. The map is built
+    once, like `gather_orders`' rule-name map."""
+    repo.insert_rule("turtle_breakout", {"product_id": PRODUCT, "granularity": "ONE_DAY"})
+    for _ in range(6):
+        _open_tranche(repo, rule_name="turtle_breakout")
+
+    reads = {"n": 0}
+    original = repo.get_rules
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        reads["n"] += 1
+        return original(*args, **kwargs)
+
+    repo.get_rules = counting  # type: ignore[method-assign]
+    gather_positions(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert reads["n"] == 1
+
+
+# -- the rule lookup is by NAME, and names can collide (#701 review) ----------------------------
+
+
+def test_two_rules_of_one_kind_on_different_timeframes_keep_their_own_verdicts(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The map is keyed on what `positions.rule_name` actually holds -- the rule's `name`, a
+    constructor argument -- and NOT on `rules.kind`. Two `turtle_breakout` rows on different
+    timeframes is a configuration this codebase supports; keyed by kind they collapse to
+    whichever row was read last, and one tranche silently inherits the other's granularity."""
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "name": "turtle_daily"},
+    )
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": PRODUCT, "granularity": "ONE_HOUR", "name": "turtle_hourly"},
+    )
+    _open_tranche(repo, rule_name="turtle_daily")
+    _open_tranche(repo, rule_name="turtle_hourly")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(NOW_TS - DAY, "100")])
+
+    rows = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows
+    by_rule = {row.rule_name: row for row in rows}
+
+    assert by_rule["turtle_hourly"].ready_reason == "missing", "gated on the absent ONE_HOUR"
+    assert by_rule["turtle_daily"].ready_reason != "missing", "gated on the present ONE_DAY"
+
+
+def test_two_rules_sharing_a_name_degrade_to_the_fallback(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`name` is not unique in the schema. When two rows answer to one name with DIFFERENT gate
+    granularities, which one opened a tranche is genuinely unknowable from `rule_name` alone --
+    so the chip takes the fallback rather than picking one and stating it with confidence."""
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": PRODUCT, "granularity": "ONE_DAY", "name": "same"}
+    )
+    repo.insert_rule(
+        "turtle_breakout", {"product_id": PRODUCT, "granularity": "ONE_HOUR", "name": "same"}
+    )
+    _open_tranche(repo, rule_name="same")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(NOW_TS - DAY, "100")])
+
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    # The fallback is the COARSEST series, which is present here -- so "not missing" is the
+    # observable consequence of having declined to guess.
+    assert row.ready_reason != "missing"
+
+
+def test_each_rule_is_built_once_however_many_tranches_it_opened(
+    repo: Repository, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`_build_rule` runs a rule's real constructor, with its validation. Doing that per TRANCHE
+    is the same waste as a per-row query, and on a DCA book (one rule, many tranches) it is the
+    common case rather than the edge one."""
+    repo.insert_rule(
+        "turtle_breakout",
+        {"product_id": PRODUCT, "granularity": "ONE_DAY", "name": "turtle_breakout"},
+    )
+    for _ in range(6):
+        _open_tranche(repo, rule_name="turtle_breakout")
+
+    builds = {"n": 0}
+    original = agent_mod._build_rule
+
+    def counting(row: Any) -> Any:
+        builds["n"] += 1
+        return original(row)
+
+    monkeypatch.setattr(agent_mod, "_build_rule", counting)
+    gather_positions(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert builds["n"] == 1, f"built the rule {builds['n']} times for 6 tranches"
+
+
+def test_the_mark_cache_does_not_leak_between_products(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """A cache keyed carelessly would hand product B product A's price, and every figure derived
+    from it would be confidently wrong with nothing in the row to show it."""
+    _open_tranche(repo, product_id="BTC-USD")
+    _open_tranche(repo, product_id="ETH-USD")
+    repo.upsert_candles("BTC-USD", FINEST, [_candle(NOW_TS - 900, "150")])
+    repo.upsert_candles("ETH-USD", FINEST, [_candle(NOW_TS - 900, "20")])
+
+    rows = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows
+    by_product = {row.product_id: row for row in rows}
+
+    assert by_product["BTC-USD"].mark == Decimal("150")
+    assert by_product["ETH-USD"].mark == Decimal("20")
+
+
+def test_the_products_list_is_in_first_seen_order(repo: Repository, tmp_path: Path) -> None:
+    """What a grouped view renders sections from. Sorted or set-ordered, the page would reorder
+    itself between reads for no reason a reader could see."""
+    _open_tranche(repo, product_id="SOL-USD")
+    _open_tranche(repo, product_id="BTC-USD")
+    _open_tranche(repo, product_id="SOL-USD")
+
+    assert gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).products == (
+        "SOL-USD",
+        "BTC-USD",
+    )

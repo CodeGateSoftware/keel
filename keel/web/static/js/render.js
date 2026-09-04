@@ -1139,36 +1139,6 @@ function jobPanel(job) {
  * @returns {DocumentFragment}
  */
 /**
- * The orders view (#659): what keel actually bought and sold, and whether anybody agreed to it.
- *
- * **`placement` is the first column, and that is the argument this view exists to make.** On a
- * deployment running `autonomy: ON`, "did I approve this, or did keel place it alone" is the
- * first question about an order, not the last -- so it leads the row, ahead of the product and
- * ahead of the price. The word and its tone both arrive already decided
- * (`payload._order_row_payload`), because `bypass` meaning the same thing as `autonomous` is a
- * judgement, and judgements are made in Python.
- *
- * **`expected` and `actual` are adjacent, with the divergence between them.** That difference is
- * realised slippage. Its tone is side-aware and comes from the server for the reason
- * `_order_row_payload` states: paying more than expected is bad on a buy and good on a sell, so
- * a client colouring the minus sign would be wrong on half the rows.
- *
- * **`fee` is the figure as recorded and never a rate.** No percentage is computed here, and none
- * crosses the wire. A paper row's fee carries a `modelled` badge instead, because
- * `PaperTrader` derives it from the configured rate and reading it back as a measurement of that
- * rate is circular.
- *
- * **`raw_response` is not in the payload at all**, so this function could not render it if it
- * tried. The venue's order id is, when there is one, and a sentence saying why there is not,
- * when there is not.
- *
- * @param {any} data
- * @param {any} sort
- * @param {(column: string) => void} onSort
- * @param {(scope: string) => void} onScope
- * @returns {DocumentFragment}
- */
-/**
  * The Positions view (#701): what is held, what it is worth, and how close it is to its stop.
  *
  * ── NO CLOSE ACTION, AND THAT IS THE DESIGN ──────────────────────────────────────────────────
@@ -1191,6 +1161,10 @@ function jobPanel(job) {
  * `freshness` is the ENTRY GATE's verdict, not a data age: `missing`/`behind`/`unconfirmed` are
  * the agent's own reasons for refusing to open here. It is the most common answer to "why has
  * nothing happened", which is why it sits beside the money rather than under a disclosure.
+ *
+ * It is a COLUMN and not a per-product chip, because the gate granularity is the one the RULE
+ * that opened the tranche declares. Two tranches of one product, opened by rules on different
+ * timeframes, have two verdicts -- and a chip above the table would have to pick one.
  *
  * @param {any} data  `/api/positions`'s `data`.
  * @param {any} sort
@@ -1223,9 +1197,6 @@ export function positionsView(data, sort, onSort) {
     // every tranche of one product shares one verdict and repeating it per row would suggest
     // they could differ.
     if (held.length === 0) continue;
-    const chip = el("p", "note");
-    chip.append("entry gate: ", field(held[0].freshness));
-    fragment.append(chip);
 
     fragment.append(
       table(
@@ -1242,6 +1213,11 @@ export function positionsView(data, sort, onSort) {
           { label: "stop", numeric: true, key: "initial_stop" },
           { label: "to stop", numeric: true, key: "stop_distance" },
           { label: "to stop %", numeric: true, key: "stop_distance_pct" },
+          // PER TRANCHE, not per product. The gate granularity comes from the RULE that opened
+          // this tranche (`_gate_granularity_for`), so one product holding tranches from rules
+          // on different timeframes has two verdicts -- a single chip above the table would
+          // state one of them over the other.
+          { label: "entry gate", numeric: false, key: "freshness" },
         ],
         held.map(/** @param {any} row */ (row) => [
           row.opened_at,
@@ -1255,6 +1231,7 @@ export function positionsView(data, sort, onSort) {
           row.initial_stop,
           row.stop_distance,
           row.stop_distance_pct,
+          row.freshness,
         ]),
         "No open tranches for this product.",
         { sort: sort, onSort: onSort },
@@ -1285,6 +1262,36 @@ export function positionsView(data, sort, onSort) {
 }
 
 
+/**
+ * The orders view (#659): what keel actually bought and sold, and whether anybody agreed to it.
+ *
+ * **`placement` is the first column, and that is the argument this view exists to make.** On a
+ * deployment running `autonomy: ON`, "did I approve this, or did keel place it alone" is the
+ * first question about an order, not the last -- so it leads the row, ahead of the product and
+ * ahead of the price. The word and its tone both arrive already decided
+ * (`payload._order_row_payload`), because `bypass` meaning the same thing as `autonomous` is a
+ * judgement, and judgements are made in Python.
+ *
+ * **`expected` and `actual` are adjacent, with the divergence between them.** That difference is
+ * realised slippage. Its tone is side-aware and comes from the server for the reason
+ * `_order_row_payload` states: paying more than expected is bad on a buy and good on a sell, so
+ * a client colouring the minus sign would be wrong on half the rows.
+ *
+ * **`fee` is the figure as recorded and never a rate.** No percentage is computed here, and none
+ * crosses the wire. A paper row's fee carries a `modelled` badge instead, because
+ * `PaperTrader` derives it from the configured rate and reading it back as a measurement of that
+ * rate is circular.
+ *
+ * **`raw_response` is not in the payload at all**, so this function could not render it if it
+ * tried. The venue's order id is, when there is one, and a sentence saying why there is not,
+ * when there is not.
+ *
+ * @param {any} data
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @param {(scope: string) => void} onScope
+ * @returns {DocumentFragment}
+ */
 export function ordersView(data, sort, onSort, onScope, onStatus) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Orders"));

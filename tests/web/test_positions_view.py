@@ -177,6 +177,18 @@ def _code(name: str) -> str:
     return _comments_only(_source(name))
 
 
+def _function_body(name: str, function: str) -> str:
+    """The source of ONE exported function, ending where the next one begins.
+
+    A fixed `[:4000]` slice ran 1362 characters past `positionsView` into `ordersView`, which
+    made the no-close-action assertion below partly a statement about a different view: it would
+    have started failing, or passing, on edits to code it does not describe.
+    """
+    after = _code(name).split("export function " + function)[1]
+    end = after.find("export function ")
+    return after if end == -1 else after[:end]
+
+
 def test_the_positions_view_is_wired_into_the_client_router() -> None:
     """A view in `main.js` alone routes on a click and 404s on a reload; a route in Python alone
     is a page with nothing to render. Both tables and the renderer, or none of them."""
@@ -197,7 +209,7 @@ def test_the_positions_view_has_no_close_action_anywhere() -> None:
     kind of affordance that arrives later as an obvious convenience, so the absence is asserted
     on the source and will fail the build the day someone adds one.
     """
-    view = _code("render.js").split("export function positionsView")[1][:4000]
+    view = _function_body("render.js", "positionsView")
     for banned in ("close", "sell", "exit", "cancel", "liquidate"):
         assert banned not in view.lower(), f"the positions view must offer no {banned} action"
 
@@ -211,12 +223,22 @@ def test_the_positions_view_groups_by_the_reports_own_product_list() -> None:
 def test_the_positions_view_shows_the_freshness_chip_per_row() -> None:
     """The entry-gate verdict, on the page. It is the thing that explains an idle deployment, so
     a view that carried every figure and not this one would leave the most common question
-    unanswered."""
-    view = _code("render.js").split("export function positionsView")[1][:4000]
-    assert "freshness" in view
+    unanswered.
+
+    PER ROW, not per product: the gate granularity comes from the RULE that opened the tranche,
+    so one product holding two tranches from rules on different timeframes has two verdicts. A
+    chip read off the first row and captioned for the whole product would state one tranche's
+    verdict over another's."""
+    view = _function_body("render.js", "positionsView")
+
+    assert '"freshness"' in view, "the entry-gate verdict must be a column of the table"
+    assert "held[0]" not in view, (
+        "a per-product chip read off one row cannot represent tranches whose rules gate on "
+        "different granularities"
+    )
 
 
 def test_the_positions_view_names_the_stop_distance_both_ways() -> None:
-    view = _code("render.js").split("export function positionsView")[1][:4000]
+    view = _function_body("render.js", "positionsView")
     assert "stop_distance" in view
     assert "stop_distance_pct" in view
