@@ -1304,6 +1304,134 @@ function kindSwitch(current, kinds, onKind) {
  * @param {(column: string) => void} onSort
  * @returns {DocumentFragment}
  */
+/**
+ * The Research Hub's trials ledger (#708): every experiment keel has run, rejected ones included.
+ *
+ * ── NO SORT CONTROL ON THIS PAGE, ANYWHERE ───────────────────────────────────────────────────
+ *
+ * Note the signature: `data` and nothing else. Every other table view here takes `(data, sort,
+ * onSort)`; this one takes neither, and not one of its columns declares a `key`. That is the
+ * Strathern rail, and it is deliberate to the point of being awkward.
+ *
+ * `headerCell` draws a clickable header for any column with a `key`, and `/api/research/trials`
+ * declares an empty `sortable` -- so a key here would render a control the server answers with a
+ * 400. But that is the small reason. The real one is in `keel/commands/research_record.py`: a research
+ * record that can be ordered best-first is a leaderboard, and a leaderboard turns a record of
+ * what was TRIED into an argument for what to TRADE. The rail is held in three places (service,
+ * endpoint, view) because a reader who could sort this table would stop reading it as evidence.
+ *
+ * ── AND NO ACTION ────────────────────────────────────────────────────────────────────────────
+ *
+ * No promote, no re-run, no listener of any kind, pinned by
+ * `tests/web/test_research_view.py::test_the_research_view_offers_no_action_of_any_kind`. A page
+ * whose entire argument is that selection happened under a discipline must not put the selection
+ * behind a control on the same screen.
+ *
+ * @param {any} data  the `/api/research/trials` payload.
+ * @returns {DocumentFragment}
+ */
+export function researchView(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Research"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.generated_at), " · ");
+  sub.append(field(data.shown_count), " trials in the record");
+  fragment.append(sub);
+
+  fragment.append(
+    note(
+      "Every trial keel has run, in the order it ran them — the rejected ones beside the ".concat(
+        "selected ones. A record showing only its selections would be a highlight reel.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("ledger", data.ledger),
+      kv("tamper check", data.chain),
+      kv("trials run", data.trials_run),
+      kv("decisions", data.decisions),
+    ]),
+  );
+
+  const breaks = stringList(data.chain_errors, "breaks");
+  if (breaks) {
+    fragment.append(heading("h-breaks", "Rows that do not verify"));
+    fragment.append(
+      note(
+        "Each line names the row whose recorded hash no longer matches its content. ".concat(
+          "Every row after the first break is affected.",
+        ),
+      ),
+    );
+    fragment.append(breaks);
+  }
+
+  fragment.append(heading("h-explored", "What each rule has been tried on"));
+  fragment.append(
+    note(
+      "Trials held in this ledger, against the cells the rule declares. Two numbers and not a "
+        .concat("coverage figure: pricing a swept range against its declaration is a judgement ")
+        .concat("the research driver makes by refusing, not one a page computes."),
+    ),
+  );
+  fragment.append(
+    table(
+      "h-explored",
+      [
+        { label: "rule", numeric: false },
+        { label: "trials here", numeric: true },
+        { label: "cells declared", numeric: true },
+      ],
+      (data.exploration || []).map(/** @param {any} row */ (row) => [
+        plain(row.rule) || "—",
+        row.trials,
+        row.declared_cells,
+      ]),
+      "No trials in this ledger.",
+    ),
+  );
+
+  fragment.append(heading("h-trials", "Every trial"));
+  fragment.append(
+    table(
+      "h-trials",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "rule", numeric: false },
+        { label: "kind", numeric: false },
+        { label: "outcome", numeric: false },
+        { label: "how the parameters were chosen", numeric: false },
+        { label: "series", numeric: false },
+        { label: "parameters", numeric: false },
+        { label: "summary", numeric: false },
+        { label: "row hash", numeric: false },
+      ],
+      (data.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.rule) || "—",
+        plain(row.kind) || "—",
+        row.decision,
+        row.provenance,
+        row.series,
+        plain(row.params) || "—",
+        plain(row.summary) || "—",
+        row.row_hash,
+      ]),
+      // From the payload, never written here. There are two kinds of empty -- no ledger, and a
+      // ledger with no trials in it -- and a hard-coded sentence said the first over both, which
+      // is a false statement about a deployment that simply has not run anything yet. Choosing
+      // between them is a judgement, and judgements are made in Python (Rule 2).
+      plain(data.empty_note),
+    ),
+  );
+
+  return fragment;
+}
+
+
 export function balancesView(data, sort, onSort) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Balances"));

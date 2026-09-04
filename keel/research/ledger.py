@@ -231,14 +231,35 @@ def read_trials(path: Path | str) -> list[TrialRecord]:
 
 
 def verify_chain(path: Path | str) -> list[str]:
-    """Return a list of human-readable chain errors; empty means intact.
+    """Return a list of human-readable chain errors for the ledger at `path`; empty means intact.
 
     Reports rather than raises: a broken chain is a finding to surface in a report, and the
     caller usually wants every break rather than only the first.
+
+    Reads the file itself, which is right for `keel trials verify` and wrong for a caller that has
+    already read it -- see `verify_records`.
+    """
+    return verify_records(read_trials(path))
+
+
+def verify_records(records: Iterable[TrialRecord]) -> list[str]:
+    """The chain check over records already in memory. `verify_chain` is this plus a read.
+
+    Split out for the callers that have the rows in hand. `keel/commands/research_record.py` reads
+    the ledger for its rows and then needs a verdict about THOSE rows: going back through
+    `verify_chain` parsed the same file a second time, so the badge on the page described a
+    different read of the file from the rows beside it -- and a trial appended between the two
+    would have the verdict cover a row the page never showed.
+
+    **An empty sequence returns no errors, and that is not the same as "verified".** Nothing was
+    checked. The distinction belongs to the caller, because only the caller knows whether empty
+    means "no trials yet" or "no ledger at all" -- `keel/web/payload.py::_chain_payload` is where
+    it is held for the web view, and it is the difference between an honest badge and a green
+    light over a file nothing read.
     """
     errors: list[str] = []
     expected_prev = ZERO_HASH
-    for index, record in enumerate(read_trials(path), start=1):
+    for index, record in enumerate(records, start=1):
         if record.prev_hash != expected_prev:
             errors.append(
                 f"row {index} ({record.trial_id}): prev_hash {record.prev_hash[:12]}... "

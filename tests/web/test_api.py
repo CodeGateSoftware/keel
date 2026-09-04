@@ -63,6 +63,7 @@ API_ROUTES = (
     "/api/timeline",
     "/api/insights",
     "/api/journal",
+    "/api/research/trials",
     "/api/rules",
     "/api/venues",
     "/api/gates",
@@ -212,6 +213,26 @@ def _seed_positions(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> Non
                 "INSERT INTO positions (product_id, rule_name, opened_at, qty, entry_fill, "
                 "entry_fee, status) VALUES (?, ?, ?, ?, ?, ?, 'open')",
                 (product_id, f"rule-{index}", 1_700_000_000 + index, qty, entry_fill, "0"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_orders(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> None:
+    """Placed orders, written straight into the table `gather_timeline` reads.
+
+    Separate from `_seed_positions` because the two tables are not the same store and the
+    timeline does not read `positions` at all -- which is how `/api/timeline` joined the sort
+    pin below asserting on rows that nothing in this module had ever written. The assertion
+    caught it (`assert rows` is not decorative), so the fix is here rather than in the pin."""
+    conn = sqlite3.connect(db_path)
+    try:
+        for index, (product_id, side, fill) in enumerate(rows):
+            conn.execute(
+                "INSERT INTO orders (mode, product_id, side, qty, status, actual_fill, "
+                "created_at) VALUES ('paper', ?, ?, '0.01', 'filled', ?, ?)",
+                (product_id, side, fill, 1_700_000_000 + index),
             )
         conn.commit()
     finally:
@@ -539,6 +560,7 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     exact rot this pin exists for, and it went unnoticed because the route was not in it."""
     _seed_positions(running.db_path, (("BTC-USD", "0.01", "50000"),))
     _seed_rules(running.db_path, ("breakout",))
+    _seed_orders(running.db_path, (("BTC-USD", "buy", "50000"),))
 
     for path, collection in (
         ("/api/status", "open_positions"),

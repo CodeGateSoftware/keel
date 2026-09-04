@@ -145,6 +145,7 @@ CLIENT_ROUTES: tuple[str, ...] = (
     "balances",
     "timeline",
     "insights",
+    "research",
     "rules",
     "venues",
     "gates",

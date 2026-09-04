@@ -49,6 +49,7 @@ import {
   timelineView,
   positionsView,
   refusedView,
+  researchView,
   rulesView,
   setupView,
   statusView,
@@ -104,6 +105,7 @@ const ROUTES = [
   { name: "balances", label: "Balances", endpoints: ["balances"] },
   { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
+  { name: "research", label: "Research", endpoints: ["research/trials"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
   { name: "gates", label: "Gates", endpoints: ["gates"] },
@@ -441,6 +443,10 @@ function mount(route, readings) {
       void paint(route, true, true);
     });
   }
+  // No `sort`/`onSort`, unlike every other table view here. See `researchView`: the
+  // endpoint declares no sortable column, and a research record that can be ordered
+  // best-first is a leaderboard.
+  if (route.name === "research") return researchView(data);
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);
